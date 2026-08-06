@@ -22,11 +22,16 @@ export interface JsonEnvelope {
   result: unknown;
 }
 
+export interface CliTextResult {
+  value: string;
+  truncated: boolean;
+}
+
 const MAX_EVIDENCE_BYTES = 50_000;
 
-function bounded(value: string, limit = MAX_EVIDENCE_BYTES): { value: string; truncated: boolean } {
+function bounded(value: string, limit = MAX_EVIDENCE_BYTES): { value: string; content: string; truncated: boolean } {
   const result = truncateTail(value, { maxBytes: limit, maxLines: 2_000 });
-  return { value: result.truncated ? `${result.content}\n[output truncated]` : result.content, truncated: result.truncated };
+  return { value: result.truncated ? `${result.content}\n[output truncated]` : result.content, content: result.content, truncated: result.truncated };
 }
 
 function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES): CliProtocolError {
@@ -77,7 +82,7 @@ export class HerdrCli {
     return parseEnvelope(result.stdout, this.evidenceLimit);
   }
 
-  async runText(argv: string[], signal: AbortSignal): Promise<string> {
+  async runTextResult(argv: string[], signal: AbortSignal): Promise<CliTextResult> {
     const result = await this.runRaw(argv, signal);
     if (result.code !== 0 || result.killed) {
       const stdout = bounded(result.stdout, this.evidenceLimit);
@@ -91,7 +96,13 @@ export class HerdrCli {
         stderrTruncated: stderr.truncated
       });
     }
-    return bounded(result.stdout, this.evidenceLimit).value;
+    const output = bounded(result.stdout, this.evidenceLimit);
+    return { value: output.content, truncated: output.truncated };
+  }
+
+  async runText(argv: string[], signal: AbortSignal): Promise<string> {
+    const output = await this.runTextResult(argv, signal);
+    return output.truncated ? `${output.value}\n[output truncated]` : output.value;
   }
 
   private async runRaw(argv: string[], signal: AbortSignal): Promise<ExecResult> {

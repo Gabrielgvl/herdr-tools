@@ -72,6 +72,11 @@ describe("HerdrCli", () => {
 
     const success = vi.fn<PiExec>().mockResolvedValue(response("status\n"));
     await expect(new HerdrCli(success).runText(["status"], signal)).resolves.toBe("status\n");
+
+    const large = vi.fn<PiExec>().mockResolvedValue(response("x".repeat(256)));
+    const boundedCli = new HerdrCli(large, 1000, 128);
+    await expect(boundedCli.runTextResult(["pane", "read"], signal)).resolves.toMatchObject({ truncated: true, value: expect.not.stringContaining("[output truncated]") });
+    await expect(boundedCli.runText(["pane", "read"], signal)).resolves.toContain("[output truncated]");
   });
 
   it("rejects before execution when already aborted and observes abort after execution", async () => {

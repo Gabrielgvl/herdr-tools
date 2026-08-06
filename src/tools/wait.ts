@@ -1,9 +1,10 @@
+import RE2 from "re2";
 import type { AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { HerdrCli, JsonEnvelope } from "../cli.js";
+import type { CliTextResult, HerdrCli, JsonEnvelope } from "../cli.js";
 import { loadSettings, type Settings } from "../settings.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
-import { validateWaitParams, WaitParamsSchema, type WaitCondition, type WaitParams } from "../wait-schema.js";
+import { validateWaitParams, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams } from "../wait-schema.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface WaitClock {
@@ -29,6 +30,7 @@ export const realClock: WaitClock = {
 export interface WaitCli {
   runJson(argv: string[], signal: AbortSignal): Promise<JsonEnvelope>;
   runText(argv: string[], signal: AbortSignal): Promise<string>;
+  runTextResult?(argv: string[], signal: AbortSignal): Promise<CliTextResult>;
 }
 
 export interface WaitTargetSnapshot {
@@ -36,6 +38,7 @@ export interface WaitTargetSnapshot {
   targetId: string;
   metadata: Record<string, unknown>;
   recentUnwrappedLines: string[];
+  outputTruncated?: boolean;
   observedAtMs: number;
   matched: boolean;
 }
@@ -91,9 +94,13 @@ function asRecord(value: unknown, message: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function paneFrom(result: unknown): Record<string, unknown> {
+function paneFrom(result: unknown, expectedPaneId: string): Record<string, unknown> {
   const record = asRecord(result, "CLI_PROTOCOL_ERROR: pane response is invalid");
-  return asRecord(record.pane ?? record, "CLI_PROTOCOL_ERROR: pane response is invalid");
+  const pane = asRecord(record.pane ?? record, "CLI_PROTOCOL_ERROR: pane response is invalid");
+  if (typeof pane.pane_id !== "string" || pane.pane_id.length === 0 || pane.pane_id !== expectedPaneId) {
+    throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: pane response is missing the requested pane");
+  }
+  return pane;
 }
 
 export function boundedLines(output: string): string[] {
@@ -113,10 +120,10 @@ export function matchesState(state: string, requested: string): boolean {
   return requested === "needs_input" && state === "blocked";
 }
 
-export function matches(snapshot: WaitTargetSnapshot, condition: WaitCondition, regex?: RegExp): boolean {
+export function matches(snapshot: WaitTargetSnapshot, condition: WaitCondition, regex?: SafeRegex): boolean {
   if (condition.kind === "state") return matchesState(rawState(snapshot.metadata), condition.state);
-  const output = snapshot.recentUnwrappedLines.join("\n");
-  return condition.match.kind === "literal" ? output.includes(condition.match.value) : (regex ?? new RegExp(condition.match.value)).test(output);
+  const output = snapshot.recentUnwrappedLines.filter((line) => !(snapshot.outputTruncated && line === "[output truncated]")).join("\n");
+  return condition.match.kind === "literal" ? output.includes(condition.match.value) : (regex ?? new RE2(condition.match.value)).test(output);
 }
 
 function samePrefix(previous: string[], current: string[]): number {
@@ -151,10 +158,11 @@ function emitUpdate(onUpdate: AgentToolUpdateCallback<WaitDetails> | undefined, 
 async function readTarget(cli: WaitCli, resolved: ResolvedTarget, ref: string, clock: WaitClock, signal: AbortSignal): Promise<WaitTargetSnapshot> {
   checkAbort(signal);
   try {
-    const pane = paneFrom((await cli.runJson(["pane", "get", resolved.paneId!], signal)).result);
-    const output = await cli.runText(["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", resolved.paneId!], signal);
+    const pane = paneFrom((await cli.runJson(["pane", "get", resolved.paneId!], signal)).result, resolved.paneId!);
+    const readArgs = ["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", resolved.paneId!];
+    const output = cli.runTextResult ? await cli.runTextResult(readArgs, signal) : { value: await cli.runText(readArgs, signal), truncated: false };
     checkAbort(signal);
-    return { target: ref, targetId: resolved.paneId!, metadata: pane, recentUnwrappedLines: boundedLines(output), observedAtMs: clock.now(), matched: false };
+    return { target: ref, targetId: resolved.paneId!, metadata: pane, recentUnwrappedLines: boundedLines(output.value), outputTruncated: output.truncated, observedAtMs: clock.now(), matched: false };
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;
@@ -169,6 +177,13 @@ async function readAll(cli: WaitCli, resolved: ReadonlyArray<{ ref: string; targ
   return values;
 }
 
+async function readAndMatch(cli: WaitCli, resolved: ReadonlyArray<{ ref: string; target: ResolvedTarget }>, clock: WaitClock, signal: AbortSignal, deadline: number, condition: WaitCondition, regex?: SafeRegex): Promise<{ snapshots: WaitTargetSnapshot[]; expired: boolean }> {
+  const snapshots = await readAll(cli, resolved, clock, signal);
+  if (expired(clock, deadline, snapshots)) return { snapshots, expired: true };
+  snapshots.forEach((snapshot) => { snapshot.matched = matches(snapshot, condition, regex); });
+  return { snapshots, expired: expired(clock, deadline, snapshots) };
+}
+
 function resultDetails(params: WaitParams, snapshots: WaitTargetSnapshot[], outcome: WaitDetails["outcome"], reason: WaitDetails["reason"], reviewerSummaries?: ReviewerSummary[]): WaitDetails {
   return { operation: "wait", outcome, matched: outcome === "success", reason, match: params.match, condition: params.condition, targets: snapshots, ...(reviewerSummaries && reviewerSummaries.length > 0 ? { reviewerSummaries } : {}) };
 }
@@ -176,6 +191,26 @@ function resultDetails(params: WaitParams, snapshots: WaitTargetSnapshot[], outc
 function aggregate(params: WaitParams, snapshots: WaitTargetSnapshot[]): boolean {
   const count = snapshots.filter((snapshot) => snapshot.matched).length;
   return params.match === "any" ? count > 0 : count === snapshots.length;
+}
+
+function expired(clock: WaitClock, deadline: number, snapshots: WaitTargetSnapshot[]): boolean {
+  if (clock.now() < deadline) return false;
+  snapshots.forEach((snapshot) => { snapshot.matched = false; });
+  return true;
+}
+
+function timeoutResult(params: WaitParams, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[]) {
+  const details = resultDetails(params, snapshots, "timeout", "timeout", reviewerSummaries);
+  return { content: [{ type: "text" as const, text: formatResult({ operation: "wait", outcome: "timeout" }) }], details };
+}
+
+function successResult(params: WaitParams, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[]) {
+  const details = resultDetails(params, snapshots, "success", "condition_met", reviewerSummaries);
+  return { content: [{ type: "text" as const, text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
+}
+
+function timeoutIfExpired(params: WaitParams, read: { snapshots: WaitTargetSnapshot[]; expired: boolean }, reviewerSummaries?: ReviewerSummary[]) {
+  return read.expired ? timeoutResult(params, read.snapshots, reviewerSummaries) : undefined;
 }
 
 export function mapReviewerFailure(error: unknown): WaitError {
@@ -221,12 +256,11 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
       const deadline = start + params.timeoutMs;
       const cadenceMs = settings.reviewCadenceMinutes * 60_000;
       const longWait = params.timeoutMs > cadenceMs;
-      let snapshots = await readAll(deps.cli, resolved, clock, activeSignal);
-      snapshots.forEach((snapshot) => { snapshot.matched = matches(snapshot, params.condition, validation.regex); });
-      if (aggregate(params, snapshots)) {
-        const details = resultDetails(params, snapshots, "success", "condition_met");
-        return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
-      }
+      let read = await readAndMatch(deps.cli, resolved, clock, activeSignal, deadline, params.condition, validation.regex);
+      let snapshots = read.snapshots;
+      const initialTimeout = timeoutIfExpired(params, read);
+      if (initialTimeout) return initialTimeout;
+      if (aggregate(params, snapshots)) return successResult(params, snapshots);
       let reviewer: WaitReviewer | undefined;
       if (longWait) {
         try {
@@ -249,31 +283,21 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
           return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
         }
         const now = clock.now();
-        if (now >= deadline) {
-          snapshots = await readAll(deps.cli, resolved, clock, activeSignal);
-          snapshots.forEach((snapshot) => { snapshot.matched = matches(snapshot, params.condition, validation.regex); });
-          if (aggregate(params, snapshots)) {
-            const details = resultDetails(params, snapshots, "success", "condition_met", reviewerSummaries);
-            return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
-          }
-          const details = resultDetails(params, snapshots, "timeout", "timeout", reviewerSummaries);
-          return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "timeout" }) }], details };
-        }
+        if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
         const untilReview = longWait ? Math.max(0, nextReview - now) : Number.MAX_SAFE_INTEGER;
         await clock.sleep(Math.min(deps.pollIntervalMs ?? 250, deadline - now, untilReview), activeSignal);
         checkAbort(activeSignal);
-        snapshots = await readAll(deps.cli, resolved, clock, activeSignal);
-        snapshots.forEach((snapshot) => { snapshot.matched = matches(snapshot, params.condition, validation.regex); });
+        if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
+        read = await readAndMatch(deps.cli, resolved, clock, activeSignal, deadline, params.condition, validation.regex);
+        snapshots = read.snapshots;
+        const pollTimeout = timeoutIfExpired(params, read, reviewerSummaries);
+        if (pollTimeout) return pollTimeout;
         const newStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
         if (newStates.some((state, index) => state !== lastStates[index])) {
           progress(`state changed: ${newStates.join(", ")}`);
           lastStates = newStates;
         }
         if (aggregate(params, snapshots)) continue;
-        if (clock.now() >= deadline) {
-          const details = resultDetails(params, snapshots, "timeout", "timeout", reviewerSummaries);
-          return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "timeout" }) }], details };
-        }
         if (!longWait || clock.now() < nextReview) continue;
         nextReview += cadenceMs;
         const requests: ReviewerRequest[] = snapshots.map((snapshot) => {
@@ -299,8 +323,12 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
           progress(`review ${review.targetId}: ${review.classification} ${review.summary}`, terminal ? "manager_judgment_required" : "progress");
         }
         if (managerJudgment) {
-          snapshots = await readAll(deps.cli, resolved, clock, activeSignal);
-          snapshots.forEach((snapshot) => { snapshot.matched = matches(snapshot, params.condition, validation.regex); });
+          if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
+          read = await readAndMatch(deps.cli, resolved, clock, activeSignal, deadline, params.condition, validation.regex);
+          snapshots = read.snapshots;
+          const refreshTimeout = timeoutIfExpired(params, read, reviewerSummaries);
+          if (refreshTimeout) return refreshTimeout;
+          if (aggregate(params, snapshots)) return successResult(params, snapshots, reviewerSummaries);
           const details = resultDetails(params, snapshots, "manager_judgment_required", "manager_judgment_required", reviewerSummaries);
           return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "error", code: "MANAGER_JUDGMENT_REQUIRED" }) }], details };
         }

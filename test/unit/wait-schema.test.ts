@@ -23,6 +23,12 @@ describe("herdr_wait schema and runtime validation", () => {
     expect(validation.regex).toBeUndefined();
   });
 
+  it("uses the bounded RE2 engine for pathological regex input", () => {
+    const validation = validateWaitParams({ targets: ["p"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "(a+)+$" } }, timeoutMs: 1 });
+    expect(validation.regex?.constructor.name).toBe("RE2");
+    expect(validation.regex?.test(`${"a".repeat(10_000)}!`)).toBe(false);
+  });
+
   it("rejects every malformed runtime shape before polling", () => {
     const valid = { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 };
     const invalid: unknown[] = [

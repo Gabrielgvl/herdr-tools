@@ -53,8 +53,8 @@ describe("herdr_wait", () => {
     const cli = fakeCli({ p1: "already done", p2: "x" });
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: ".*" } }, timeoutMs: 1 }, { clock: clock() });
     expect(result.details).toMatchObject({ outcome: "timeout", matched: false });
-    expect(cli.calls.filter((call) => call[1] === "read")).toHaveLength(2);
-    const regex = await execute(fakeCli({ p1: "already done", p2: "x" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "done" } }, timeoutMs: 1 });
+    expect(cli.calls.filter((call) => call[1] === "read")).toHaveLength(1);
+    const regex = await execute(fakeCli({ p1: "already done", p2: "x" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "done" } }, timeoutMs: 1 }, { clock: clock() });
     expect(regex.details).toMatchObject({ outcome: "success", matched: true });
   });
 
@@ -86,6 +86,26 @@ describe("herdr_wait", () => {
     expect(entered).toEqual(["p1", "p2"]);
     expect(result.details).toMatchObject({ outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" });
     expect(result.details.reviewerSummaries).toHaveLength(2);
+  });
+
+  it("honors an authoritative condition that becomes true during reviewer refresh", async () => {
+    let reviewerReleased = false;
+    const cli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        const pane = snapshot.snapshot.panes[0];
+        return { id: "pane", result: { pane: { ...pane, agent_status: reviewerReleased ? "idle" : "working" } } };
+      },
+      async runText() { return "still working"; }
+    };
+    const reviewer: WaitReviewer = {
+      review: async ({ targetId }) => {
+        reviewerReleased = true;
+        return { targetId, classification: "blocked", summary: "stale evidence" };
+      }
+    };
+    const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 120_001 }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
+    expect(result.details).toMatchObject({ outcome: "success", matched: true, reason: "condition_met" });
   });
 
   it("reviews each target concurrently with bounded transcript deltas", async () => {
@@ -173,9 +193,9 @@ describe("herdr_wait", () => {
       { targets: ["missing"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 },
       { targets: ["p1", "one"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }
     ]) await expect(execute(cli, params)).rejects.toMatchObject({ code: params.targets[0] === "missing" ? "TARGET_NOT_FOUND" : "INVALID_INPUT" });
-    const ambiguousSnapshot = { ...snapshot, snapshot: { ...snapshot.snapshot, panes: [...snapshot.snapshot.panes, { ...snapshot.snapshot.panes[1], pane_id: "p3", label: "same", agent_name: "same" }], agents: [...snapshot.snapshot.agents, { pane_id: "p3", name: "same", agent_status: "idle" }] } };
-    const alternateCli: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: ambiguousSnapshot }; return { id: "pane", result: { pane: ambiguousSnapshot.snapshot.panes[0] } }; }, async runText() { return ""; } };
-    await expect(execute(alternateCli, { targets: ["same"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).resolves.toMatchObject({ details: { outcome: "success" } });
+    const ambiguousSnapshot = { ...snapshot, snapshot: { ...snapshot.snapshot, panes: [...snapshot.snapshot.panes, { ...snapshot.snapshot.panes[1], pane_id: "p3", label: "same", agent_name: "same", agent_status: "idle" }], agents: [...snapshot.snapshot.agents, { pane_id: "p3", name: "same", agent_status: "idle" }] } };
+    const alternateCli: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: ambiguousSnapshot }; return { id: "pane", result: { pane: ambiguousSnapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }; }, async runText() { return ""; } };
+    await expect(execute(alternateCli, { targets: ["same"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).resolves.toMatchObject({ details: { outcome: "success" } });
     const trulyAmbiguous = { ...ambiguousSnapshot, snapshot: { ...ambiguousSnapshot.snapshot, panes: [...ambiguousSnapshot.snapshot.panes.map((pane) => pane.pane_id === "p3" ? { ...pane, agent_name: "same2" } : pane), { ...ambiguousSnapshot.snapshot.panes[0], pane_id: "p4", label: "same", agent_name: "other" }], agents: [...ambiguousSnapshot.snapshot.agents.map((agent) => agent.pane_id === "p3" ? { ...agent, name: "same2" } : agent), { pane_id: "p4", name: "other", agent_status: "idle" }] } };
     const trulyAmbiguousCli: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: trulyAmbiguous }; return { id: "pane", result: { pane: trulyAmbiguous.snapshot.panes[0] } }; }, async runText() { return ""; } };
     await expect(execute(trulyAmbiguousCli, { targets: ["same"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "TARGET_AMBIGUOUS" });
@@ -190,6 +210,30 @@ describe("herdr_wait", () => {
     const reviewerError: WaitReviewer = { review: async () => { throw new Error("model down"); } };
     await expect(execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewerError })).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { cause: "model down" } });
     await expect(execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000 })).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
+  });
+
+  it("returns timeout when review supervision itself reaches the deadline", async () => {
+    let now = 0;
+    const reviewer: WaitReviewer = { review: async () => { now = 60_001; return { targetId: "p1", classification: "blocked", summary: "deadline" }; } };
+    const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+  });
+
+  it("returns timeout when the reviewer refresh read reaches the deadline", async () => {
+    let now = 0;
+    let paneReads = 0;
+    const cli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        paneReads += 1;
+        if (paneReads > 2) now = 60_001;
+        return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: "working" } } };
+      },
+      async runText() { return ""; }
+    };
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification: "blocked", summary: "refresh deadline" }) };
+    const result = await execute(cli, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("preserves an unknown reviewer target in the manager summary", async () => {
@@ -250,13 +294,55 @@ describe("herdr_wait", () => {
     expect(final.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
+  it("does not accept a read that completes after the deadline", async () => {
+    let now = 0;
+    const cli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        now = 2;
+        return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: "idle" } } };
+      },
+      async runText() { return ""; }
+    };
+    const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: { now: () => now, sleep: async () => undefined } });
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+  });
+
+  it("rejects a match if the deadline passes while evaluating the read", async () => {
+    let calls = 0;
+    const result = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: { now: () => ++calls === 4 ? 2 : 0, sleep: async () => undefined } });
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+  });
+
+  it("returns a timeout when a polling read finishes after the deadline", async () => {
+    let paneReads = 0;
+    let now = 0;
+    const cli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        paneReads += 1;
+        if (paneReads > 1) now = 2;
+        return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: "working" } } };
+      },
+      async runText() { return ""; }
+    };
+    const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: { now: () => now, sleep: async () => undefined } });
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+  });
+
+  it("checks the deadline before starting another poll", async () => {
+    let calls = 0;
+    const result = await execute(fakeCli({ p1: "not yet" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 1 }, { clock: { now: () => ++calls > 4 ? 2 : 0, sleep: async () => undefined } });
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+  });
+
   it("covers deadline final reads and polling continuation", async () => {
     let calls = 0;
     const deadlineClock: WaitClock = { now: () => ++calls > 1 ? 2 : 0, sleep: async () => undefined };
     let paneReads = 0;
     const finalCli: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: snapshot }; paneReads += 1; return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: paneReads > 1 ? "idle" : "working" } } }; }, async runText() { return ""; } };
     const finalMatch = await execute(finalCli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: deadlineClock });
-    expect(finalMatch.details).toMatchObject({ outcome: "success", matched: true });
+    expect(finalMatch.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
     let finalNow = 0;
     const finalTimeout = await execute(fakeCli({ p1: "not done" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 1 }, { clock: { now: () => finalNow, sleep: async () => { finalNow = 2; } } });
     expect(finalTimeout.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
@@ -296,7 +382,7 @@ describe("herdr_wait", () => {
       },
       async runText() { return ""; }
     };
-    await expect(execute(paneFallback, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 1 })).resolves.toMatchObject({ details: { outcome: "success" } });
+    await expect(execute(paneFallback, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const malformed: WaitCli = {
       async runJson(argv) {
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
@@ -336,6 +422,13 @@ describe("herdr_wait", () => {
     const tool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
     await expect(tool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 } as never, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
     expect(entered).toBe(true);
+  });
+
+  it("does not match a synthetic truncation marker", async () => {
+    const cli = fakeCli({ p1: "actual output" });
+    cli.runTextResult = async () => ({ value: "actual output\n[output truncated]", truncated: true });
+    const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "[output truncated]" } }, timeoutMs: 1 }, { clock: clock(), pollIntervalMs: 1 });
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("returns timeout snapshots and keeps abort distinct from timeout", async () => {

@@ -1,3 +1,4 @@
+import RE2 from "re2";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import type { Static } from "typebox";
@@ -39,9 +40,13 @@ export type WaitSemanticState = Static<typeof SemanticStateSchema>;
 export type WaitCondition = Static<typeof WaitStateConditionSchema> | Static<typeof WaitOutputConditionSchema>;
 export type WaitParams = Static<typeof WaitParamsSchema>;
 
+export interface SafeRegex {
+  test(value: string): boolean;
+}
+
 export interface WaitValidation {
   params: WaitParams;
-  regex?: RegExp;
+  regex?: SafeRegex;
 }
 
 function invalid(message: string): never {
@@ -51,7 +56,7 @@ function invalid(message: string): never {
 /**
  * Runtime checks complement the JSON schema: TypeBox can reject duplicate
  * strings, but it cannot reject duplicate resources after target resolution,
- * nor can it validate JavaScript regular-expression syntax.
+ * nor can it validate safe regular-expression syntax.
  */
 export function validateWaitParams(value: unknown): WaitValidation {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalid("INVALID_INPUT: wait input must be an object");
@@ -76,7 +81,7 @@ export function validateWaitParams(value: unknown): WaitValidation {
     if ((output.kind !== "literal" && output.kind !== "regex") || typeof output.value !== "string" || output.value.length === 0) invalid("INVALID_INPUT: output match is invalid");
     if (output.kind === "regex") {
       try {
-        return { params: params as WaitParams, regex: new RegExp(output.value) };
+        return { params: params as WaitParams, regex: new RE2(output.value) };
       } catch (error) {
         invalid(`INVALID_INPUT: regex syntax is invalid: ${String(error)}`);
       }

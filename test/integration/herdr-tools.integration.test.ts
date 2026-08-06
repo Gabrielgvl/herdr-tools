@@ -94,9 +94,11 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
       const registered = new Map<string, ExecutableTool>();
       const handlers: Array<{ event: string; handler: () => unknown }> = [];
+      const cliCalls: string[][] = [];
       const pi = {
         async exec(command: string, args: string[], options?: { signal?: AbortSignal; timeout?: number }) {
           expect(command).toBe("herdr");
+          cliCalls.push([...args]);
           try {
             const result = await execFileAsync(command, ["--session", REQUIRED_SESSION, ...args], { cwd, encoding: "utf8", maxBuffer: 2_000_000, signal: options?.signal, timeout: options?.timeout });
             return { stdout: String(result.stdout), stderr: String(result.stderr), code: 0, killed: false };
@@ -127,16 +129,22 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         }
       }
       expect([...registered.keys()]).toEqual([...CORE_TOOL_NAMES]);
+      expect([...registered.values()].every((tool) => typeof tool.execute === "function")).toBe(true);
       expect(handlers.map((entry) => entry.event)).toEqual(["session_shutdown", "session_start"]);
 
       const toolContext = { cwd, hasUI: false } as ExtensionContext;
       const signal = new AbortController().signal;
       const inspected = await registered.get("herdr_inspect")!.execute("inspect", { mode: "collection", collection: "panes" }, signal, undefined, toolContext);
-      expect(resultObject(inspected.details).items).toBeDefined();
+      const inspectedItems = resultObject(inspected.details).items;
+      expect(Array.isArray(inspectedItems)).toBe(true);
+      expect(inspectedItems).toEqual(expect.arrayContaining([expect.objectContaining({ workspace_id: workspaceId })]));
+      expect(cliCalls).toEqual(expect.arrayContaining([["api", "snapshot"]]));
       const createdTab = await registered.get("herdr_tab")!.execute("create-tab", { operation: "create", label: "extension-smoke" }, signal, undefined, toolContext);
       const createdTabId = resultObject(createdTab.details).tabId;
       if (typeof createdTabId !== "string") throw new Error("extension tab create omitted its authoritative ID");
       await registered.get("herdr_tab")!.execute("close-tab", { operation: "close", target: createdTabId }, signal, undefined, toolContext);
+      expect(cliCalls.some((args) => args[0] === "tab" && args[1] === "create")).toBe(true);
+      expect(cliCalls.some((args) => args[0] === "tab" && args[1] === "close")).toBe(true);
 
       const defaultAfter = resultObject(resultObject(await run("api", "snapshot")).result).snapshot;
       expect(topologyIds(resultObject(defaultAfter))).toEqual(currentBaseline);

@@ -424,11 +424,24 @@ describe("herdr_wait", () => {
     expect(entered).toBe(true);
   });
 
-  it("does not match a synthetic truncation marker", async () => {
+  it("matches a real output line equal to the truncation marker", async () => {
     const cli = fakeCli({ p1: "actual output" });
     cli.runTextResult = async () => ({ value: "actual output\n[output truncated]", truncated: true });
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "[output truncated]" } }, timeoutMs: 1 }, { clock: clock(), pollIntervalMs: 1 });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(result.details).toMatchObject({
+      outcome: "success",
+      matched: true,
+      reason: "condition_met",
+      targets: [{ recentUnwrappedLines: ["actual output", "[output truncated]"], outputTruncated: true, matched: true }]
+    });
+  });
+
+  it("does not match a synthetic truncation marker", async () => {
+    const cli = fakeCli({ p1: "actual output" });
+    cli.runText = async () => "actual output\n[output truncated]";
+    cli.runTextResult = async () => ({ value: "actual output", truncated: true });
+    const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "[output truncated]" } }, timeoutMs: 1 }, { clock: clock(), pollIntervalMs: 1 });
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout", targets: [{ recentUnwrappedLines: ["actual output"], outputTruncated: true }] });
   });
 
   it("returns timeout snapshots and keeps abort distinct from timeout", async () => {

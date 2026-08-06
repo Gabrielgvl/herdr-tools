@@ -122,7 +122,7 @@ export function matchesState(state: string, requested: string): boolean {
 
 export function matches(snapshot: WaitTargetSnapshot, condition: WaitCondition, regex?: SafeRegex): boolean {
   if (condition.kind === "state") return matchesState(rawState(snapshot.metadata), condition.state);
-  const output = snapshot.recentUnwrappedLines.filter((line) => !(snapshot.outputTruncated && line === "[output truncated]")).join("\n");
+  const output = snapshot.recentUnwrappedLines.join("\n");
   return condition.match.kind === "literal" ? output.includes(condition.match.value) : (regex ?? new RE2(condition.match.value)).test(output);
 }
 

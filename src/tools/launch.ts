@@ -172,11 +172,11 @@ function progress(onUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined, 
   });
 }
 
-async function run(cli: LaunchCli, argv: string[], signal: AbortSignal): Promise<unknown> {
+async function run(cli: LaunchCli, argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<unknown> {
   if (signal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
   try {
     const response = await cli.runJson(argv, signal);
-    if (signal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
+    if (signal.aborted && !preserveCompletedMutation) throw new LaunchError("ABORTED", "Operation aborted");
     return response.result;
   } catch (error) {
     if (signal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
@@ -216,7 +216,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           paneId = existingTarget!.paneId!;
           tabId = existingTarget!.tabId;
         } else if (placement.mode === "new_tab") {
-          const result = tabRefFrom(await run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...focusArgs(params.focus === true), ...envArgs(params.env)], abortSignal));
+          const result = tabRefFrom(await run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...focusArgs(params.focus === true), ...envArgs(params.env)], abortSignal, true));
           tabId = result.tabId;
           paneId = result.paneId;
           created.tabId = tabId;
@@ -226,7 +226,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           }
           created.paneId = paneId;
         } else {
-          const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...focusArgs(params.focus === true), "--cwd", cwd, ...envArgs(params.env)], abortSignal));
+          const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...focusArgs(params.focus === true), "--cwd", cwd, ...envArgs(params.env)], abortSignal, true));
           paneId = result.paneId;
           tabId = result.tabId ?? deps.context.tabId;
           created.paneId = paneId;
@@ -241,7 +241,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         progress(onUpdate, phase, created);
         const startArgs = ["agent", "start", params.name, "--kind", params.kind, "--pane", resolvedPaneId, "--timeout", "30000"];
         if (params.argv !== undefined && params.argv.length > 0) startArgs.push("--", ...params.argv);
-        const started = await run(deps.cli, startArgs, abortSignal);
+        const started = await run(deps.cli, startArgs, abortSignal, true);
         const agent = record(started) && record(started.agent) ? started.agent : started;
         const agentId = idFrom(agent, "agent_id") ?? idFrom(agent, "id");
         const returnedName = stringFrom(agent, "name");

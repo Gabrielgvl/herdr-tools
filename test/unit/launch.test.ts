@@ -261,7 +261,12 @@ describe("herdr_launch", () => {
     const malformedSnapshot: LaunchCli = { runJson: vi.fn<LaunchCli["runJson"]>(async (argv) => ok("x", argv[0] === "api" ? { type: "wrong" } : {})) };
     await expect(createLaunchTool({ cli: malformedSnapshot, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
 
-    for (const pane of [null, {}, { pane: null }, { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1" } }]) {
+    for (const [pane, expectedCode] of [
+      [null, "LAUNCH_FAILED"],
+      [{}, "LAUNCH_FAILED"],
+      [{ pane: null }, "LAUNCH_FAILED"],
+      [{ pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1" } }, "POSTSTATE_UNAVAILABLE"]
+    ] as const) {
       const { cli } = makeCli();
       cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv) => {
         if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot });
@@ -272,7 +277,7 @@ describe("herdr_launch", () => {
         if (argv[0] === "pane" && argv[1] === "get") return ok("get", pane);
         throw new Error(`unexpected argv: ${argv.join(" ")}`);
       });
-      await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "go" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "go" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: expectedCode });
     }
   });
 

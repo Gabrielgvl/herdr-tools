@@ -1,6 +1,5 @@
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Api, AssistantMessage, Context, Model, ProviderStreamOptions, TextContent } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 export const REVIEW_CLASSIFICATIONS = ["progress", "stalled", "blocked", "risk", "completed", "unknown"] as const;
 export type ReviewClassification = (typeof REVIEW_CLASSIFICATIONS)[number];
@@ -118,6 +117,6 @@ export class PiModelReviewer implements WaitReviewer {
   }
 }
 
-export function createPiModelReviewer(ctx: Pick<{ modelRegistry: ModelRegistry }, "modelRegistry">, modelIdentifier: string): WaitReviewer {
+export function createPiModelReviewer(ctx: { modelRegistry: ModelRegistrySeam }, modelIdentifier: string): WaitReviewer {
   return new PiModelReviewer(ctx.modelRegistry, modelIdentifier);
 }

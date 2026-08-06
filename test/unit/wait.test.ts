@@ -131,7 +131,7 @@ describe("herdr_wait", () => {
 
   it("covers all wait predicates and bounded transcript helpers", () => {
     const base = { target: "p", targetId: "p", metadata: {}, recentUnwrappedLines: ["hello .* world"], observedAtMs: 0, matched: false };
-    for (const state of ["idle", "working", "blocked", "done", "unknown"]) {
+    for (const state of ["idle", "working", "blocked", "done", "unknown"] as const) {
       expect(matchesState(state, state)).toBe(true);
       expect(matches({ ...base, metadata: { agent_status: state } }, { kind: "state", state })).toBe(true);
     }
@@ -209,7 +209,7 @@ describe("herdr_wait", () => {
     };
     const updates: string[] = [];
     const tool = createWaitTool({ cli, context, settingsLoader: async () => settings, clock: clock(), pollIntervalMs: 1 });
-    const result = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "matched" } }, timeoutMs: 10 } as never, new AbortController().signal, (update) => updates.push(update.content[0].text), extensionContext);
+    const result = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "matched" } }, timeoutMs: 10 } as never, new AbortController().signal, (update) => updates.push(update.content[0]?.type === "text" ? update.content[0].text : ""), extensionContext);
     expect(result.details).toMatchObject({ outcome: "success", matched: true });
     expect(updates[0]).toBe("waiting");
     expect(cli.calls.filter((call) => call[1] === "read").length).toBeGreaterThan(1);
@@ -240,7 +240,8 @@ describe("herdr_wait", () => {
     const finalCli: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: snapshot }; paneReads += 1; return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: paneReads > 1 ? "idle" : "working" } } }; }, async runText() { return ""; } };
     const finalMatch = await execute(finalCli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: deadlineClock });
     expect(finalMatch.details).toMatchObject({ outcome: "success", matched: true });
-    const finalTimeout = await execute(fakeCli({ p1: "not done" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 1 }, { clock: { now: () => 2, sleep: async () => undefined } });
+    let finalNow = 0;
+    const finalTimeout = await execute(fakeCli({ p1: "not done" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 1 }, { clock: { now: () => finalNow, sleep: async () => { finalNow = 2; } } });
     expect(finalTimeout.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
     const noMatch = await execute(fakeCli({ p1: "not done" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 2 }, { clock: clock(), pollIntervalMs: 1 });
     expect(noMatch.details).toMatchObject({ outcome: "timeout", reason: "timeout" });

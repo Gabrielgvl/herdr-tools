@@ -159,7 +159,7 @@ async function readTarget(cli: WaitCli, resolved: ResolvedTarget, ref: string, c
   checkAbort(signal);
   try {
     const pane = paneFrom((await cli.runJson(["pane", "get", resolved.paneId!], signal)).result, resolved.paneId!);
-    const readArgs = ["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", resolved.paneId!];
+    const readArgs = ["pane", "read", resolved.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"];
     const output = cli.runTextResult ? await cli.runTextResult(readArgs, signal) : { value: await cli.runText(readArgs, signal), truncated: false };
     checkAbort(signal);
     return { target: ref, targetId: resolved.paneId!, metadata: pane, recentUnwrappedLines: boundedLines(output.value), outputTruncated: output.truncated, observedAtMs: clock.now(), matched: false };

@@ -29,7 +29,7 @@ function fakeCli(outputs: Record<string, string> = { p1: "already done", p2: "st
     },
     async runText(argv) {
       calls.push(argv);
-      return outputs[argv[argv.length - 1]] ?? "";
+      return outputs[argv[0] === "pane" && argv[1] === "read" ? argv[2]! : argv[argv.length - 1]!] ?? "";
     }
   };
 }
@@ -53,7 +53,9 @@ describe("herdr_wait", () => {
     const cli = fakeCli({ p1: "already done", p2: "x" });
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: ".*" } }, timeoutMs: 1 }, { clock: clock() });
     expect(result.details).toMatchObject({ outcome: "timeout", matched: false });
-    expect(cli.calls.filter((call) => call[1] === "read")).toHaveLength(1);
+    expect(cli.calls.filter((call) => call[1] === "read")).toEqual([
+      ["pane", "read", "p1", "--source", "recent-unwrapped", "--lines", "100", "--format", "text"]
+    ]);
     const regex = await execute(fakeCli({ p1: "already done", p2: "x" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "done" } }, timeoutMs: 1 }, { clock: clock() });
     expect(regex.details).toMatchObject({ outcome: "success", matched: true });
   });

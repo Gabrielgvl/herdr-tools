@@ -1,6 +1,6 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
@@ -18,6 +18,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
     let workspaceId: string | undefined;
     let fixtureCreated = false;
+    let sessionStarted = false;
+    let server: ChildProcess | undefined;
     let failure: unknown;
     const cwd = await mkdtemp(`${tmpdir()}/herdr-tools-it-`);
     const label = `pi-herdr-tools-it-${process.pid}`;
@@ -44,21 +46,38 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       const existing = Array.isArray(sessions.sessions) && sessions.sessions.some((session) => resultObject(session).name === REQUIRED_SESSION);
       if (existing) throw new Error(`refusing to reuse existing session ${REQUIRED_SESSION}`);
 
+      let startupError = "";
+      server = spawn("herdr", ["--session", REQUIRED_SESSION, "server"], { cwd, stdio: ["ignore", "ignore", "pipe"] });
+      server.stderr?.on("data", (chunk: Buffer) => { startupError = (startupError + chunk.toString()).slice(-2_000); });
+      const startupDeadline = Date.now() + 10_000;
+      while (Date.now() < startupDeadline) {
+        if (server.exitCode !== null) throw new Error(`named Herdr server exited during startup: ${startupError}`);
+        const listed = resultObject(await run("session", "list", "--json"));
+        sessionStarted = Array.isArray(listed.sessions) && listed.sessions.some((session) => {
+          const value = resultObject(session);
+          return value.name === REQUIRED_SESSION && value.running === true;
+        });
+        if (sessionStarted) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (!sessionStarted) throw new Error(`named Herdr server did not become ready: ${startupError}`);
+
       const currentSnapshot = resultObject(await run("api", "snapshot"));
       const currentResult = resultObject(currentSnapshot.result);
       const current = resultObject(currentResult.snapshot);
       const currentWorkspaceIds = Array.isArray(current.workspaces) ? current.workspaces.map((item) => resultObject(item).workspace_id) : [];
       expect(currentIds.every((id) => typeof id === "string" && !currentWorkspaceIds.includes(id))).toBe(false);
+      const currentBaseline = JSON.stringify(current);
       const created = await runNamed(["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"]);
       workspaceId = returnedWorkspaceId(created);
       fixtureCreated = true;
-      expect(currentIds).not.toContain(workspaceId);
 
       const fixtureSnapshot = resultObject(await runNamed(["api", "snapshot"]));
       const fixtureResult = resultObject(fixtureSnapshot.result);
       const fixture = resultObject(fixtureResult.snapshot);
       expect(JSON.stringify(fixture)).toContain(workspaceId);
-      expect(JSON.stringify(fixture)).not.toContain(String(process.env.HERDR_WORKSPACE_ID));
+      const defaultAfter = resultObject(resultObject(await run("api", "snapshot")).result).snapshot;
+      expect(JSON.stringify(defaultAfter)).toBe(currentBaseline);
     } catch (error) {
       failure = error;
       process.stderr.write(`INTEGRATION_FAILURE_RECORDED ${error instanceof Error ? error.message : String(error)}\n`);
@@ -68,10 +87,11 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       if (fixtureCreated && workspaceId && !currentIds.includes(workspaceId)) {
         await runNamed(["workspace", "close", workspaceId]).catch((error) => process.stderr.write(`INTEGRATION_TEARDOWN_FAILURE ${String(error)}\n`));
       }
-      if (fixtureCreated) {
+      if (sessionStarted) {
         await run("session", "stop", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_STOP_FAILURE ${String(error)}\n`));
         await run("session", "delete", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
       }
+      if (server?.exitCode === null) server.kill("SIGTERM");
       await rm(cwd, { recursive: true, force: true });
     }
   });

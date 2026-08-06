@@ -28,7 +28,7 @@ export interface ClosePolicyContext {
 
 export type ClosePolicyResult =
   | { allowed: true; requiresConfirmation: false; resourceIds: string[] }
-  | { allowed: false; code: "PROTECTED_RESOURCE" | "CONFIRMATION_UNAVAILABLE"; resourceIds: string[] }
+  | { allowed: false; code: "PROTECTED_RESOURCE" | "CONFIRMATION_UNAVAILABLE" | "TOPOLOGY_INVALID"; resourceIds: string[] }
   | { allowed: false; requiresConfirmation: true; resourceIds: string[] };
 
 function nodeKey(kind: OwnedResourceKind, id: string): string {
@@ -52,7 +52,12 @@ function parentNode(nodes: Map<string, TopologyNode>, node: TopologyNode): Topol
   return [...nodes.values()].find((candidate) => candidate.id === node.parentId || nodeKey(candidate.kind, candidate.id) === node.parentId);
 }
 
-function affectedResources(topology: CloseTopology, target: OwnedResource): OwnedResource[] {
+interface AffectedResources {
+  resources: OwnedResource[];
+  malformed: boolean;
+}
+
+function collectAffectedResources(topology: CloseTopology, target: OwnedResource): AffectedResources {
   const nodes = new Map(topology.nodes.map((node) => [nodeKey(node.kind, node.id), node]));
   const root = nodes.get(nodeKey(target.kind, target.id)) ?? { ...target };
   const result: OwnedResource[] = [];
@@ -67,15 +72,25 @@ function affectedResources(topology: CloseTopology, target: OwnedResource): Owne
   visit(root);
 
   let child = nodes.get(nodeKey(root.kind, root.id));
+  let malformed = false;
   while (child) {
     const parent = parentNode(nodes, child);
     if (!parent) break;
+    const parentKey = nodeKey(parent.kind, parent.id);
+    if (visited.has(parentKey)) {
+      malformed = true;
+      break;
+    }
     const remainingChildren = directChildren(nodes, parent).filter((candidate) => !visited.has(nodeKey(candidate.kind, candidate.id)));
     if (remainingChildren.length > 0) break;
     visit(parent);
     child = parent;
   }
-  return result;
+  return { resources: result, malformed };
+}
+
+function affectedResources(topology: CloseTopology, target: OwnedResource): OwnedResource[] {
+  return collectAffectedResources(topology, target).resources;
 }
 
 function protectedByCaller(topology: CloseTopology, affected: OwnedResource[], target: OwnedResource): boolean {
@@ -125,8 +140,10 @@ export class RuntimeOwnership {
   }
 
   policy(context: ClosePolicyContext): ClosePolicyResult {
-    const resources = affectedResources(context.topology, context.target);
+    const affected = collectAffectedResources(context.topology, context.target);
+    const resources = affected.resources;
     const resourceIds = resources.map((resource) => resource.id);
+    if (affected.malformed) return { allowed: false, code: "TOPOLOGY_INVALID", resourceIds };
     if (protectedByCaller(context.topology, resources, context.target)) {
       return { allowed: false, code: "PROTECTED_RESOURCE", resourceIds };
     }

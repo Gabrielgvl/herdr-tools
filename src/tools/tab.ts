@@ -55,6 +55,50 @@ function createdTab(value: unknown): { tabId: string; rootPaneId?: string } {
   return { tabId: tab.tab_id, rootPaneId };
 }
 
+function postStateTab(value: unknown, expectedTabId: string, expectedWorkspaceId: string): TabRecord {
+  const tab = tabFrom(value);
+  if (tab.tab_id !== expectedTabId || tab.workspace_id !== expectedWorkspaceId) {
+    throw Object.assign(new Error("Herdr tab post-state does not match the requested tab"), {
+      code: "POSTSTATE_UNAVAILABLE",
+      details: {
+        expectedTabId,
+        actualTabId: tab.tab_id,
+        expectedWorkspaceId,
+        actualWorkspaceId: tab.workspace_id
+      }
+    });
+  }
+  return tab;
+}
+
+function authoritativeCreatedResources(before: HerdrSnapshot, after: HerdrSnapshot, resource: { tabId: string; rootPaneId?: string }, workspaceId: string): { tab: TabRecord; rootPaneId: string } {
+  if (before.tabs.some((tab) => tab.tab_id === resource.tabId)) {
+    throw Object.assign(new Error("Herdr tab create response reused an existing tab ID"), { code: "POSTSTATE_UNAVAILABLE" });
+  }
+  const matchingWorkspaces = after.workspaces.filter((workspace) => workspace.workspace_id === workspaceId);
+  const matchingTabs = after.tabs.filter((tab) => tab.tab_id === resource.tabId && tab.workspace_id === workspaceId);
+  if (matchingWorkspaces.length !== 1 || matchingTabs.length !== 1) {
+    throw Object.assign(new Error("Created Herdr tab is not uniquely present in the caller workspace"), { code: "POSTSTATE_UNAVAILABLE" });
+  }
+  const [tab] = matchingTabs;
+  const matchingPanes = resource.rootPaneId
+    ? after.panes.filter((pane) => pane.pane_id === resource.rootPaneId)
+    : after.panes.filter((pane) => pane.tab_id === resource.tabId && pane.workspace_id === workspaceId);
+  if (matchingPanes.length !== 1) {
+    throw Object.assign(new Error(resource.rootPaneId ? "Selected Herdr tab root pane is not uniquely present" : "Herdr tab create response omitted a uniquely discoverable root pane"), {
+      code: resource.rootPaneId ? "POSTSTATE_UNAVAILABLE" : "CLI_PROTOCOL_ERROR"
+    });
+  }
+  const [rootPane] = matchingPanes;
+  if (rootPane.tab_id !== tab.tab_id || rootPane.workspace_id !== tab.workspace_id) {
+    throw Object.assign(new Error("Selected Herdr tab root pane does not belong to the created tab and workspace"), { code: "POSTSTATE_UNAVAILABLE" });
+  }
+  if (before.panes.some((pane) => pane.pane_id === rootPane.pane_id)) {
+    throw Object.assign(new Error("Herdr tab create response reused an existing root pane ID"), { code: "POSTSTATE_UNAVAILABLE" });
+  }
+  return { tab, rootPaneId: rootPane.pane_id };
+}
+
 async function snapshot(cli: HerdrCli, signal: AbortSignal): Promise<HerdrSnapshot> {
   return parseSnapshotResult((await cli.runJson(["api", "snapshot"], signal)).result);
 }
@@ -143,30 +187,25 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
           ...envArgs(params.env)
         ], activeSignal);
         const resource = createdTab(created.result);
+        const afterCreate = await snapshot(deps.cli, activeSignal);
+        const authoritative = authoritativeCreatedResources(current, afterCreate, resource, workspaceId);
+        const postState = postStateTab((await deps.cli.runJson(["tab", "get", resource.tabId], activeSignal)).result, resource.tabId, workspaceId);
         const ledger = deps.ownership ?? runtimeOwnership;
-        ledger.record({ kind: "tab", id: resource.tabId, parentId: deps.context.workspaceId });
-        let rootPaneId = resource.rootPaneId;
-        if (!rootPaneId) {
-          const afterCreate = await snapshot(deps.cli, activeSignal);
-          const createdPanes = afterCreate.panes.filter((pane) => pane.tab_id === resource.tabId);
-          if (createdPanes.length !== 1) throw Object.assign(new Error("Herdr tab create response omitted a uniquely discoverable root pane"), { code: "CLI_PROTOCOL_ERROR" });
-          rootPaneId = createdPanes[0]!.pane_id;
-        }
-        ledger.record({ kind: "pane", id: rootPaneId, parentId: resource.tabId });
-        const postState = tabFrom((await deps.cli.runJson(["tab", "get", resource.tabId], activeSignal)).result);
-        return tabResult({ operation: "create", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, rootPaneId, postState: withoutEnvironment(postState) }, "create", postState.tab_id);
+        ledger.record({ kind: "tab", id: authoritative.tab.tab_id, parentId: authoritative.tab.workspace_id });
+        ledger.record({ kind: "pane", id: authoritative.rootPaneId, parentId: authoritative.tab.tab_id });
+        return tabResult({ operation: "create", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, rootPaneId: authoritative.rootPaneId, postState: withoutEnvironment(postState) }, "create", postState.tab_id);
       }
       const current = await snapshot(deps.cli, activeSignal);
       const target = tabTarget(current, params.target, deps.context);
       if (params.operation === "rename") {
         assertSafeIdentifier(params.label, "label");
         await deps.cli.runJson(["tab", "rename", target.tab_id, params.label], activeSignal);
-        const postState = tabFrom((await deps.cli.runJson(["tab", "get", target.tab_id], activeSignal)).result);
+        const postState = postStateTab((await deps.cli.runJson(["tab", "get", target.tab_id], activeSignal)).result, target.tab_id, target.workspace_id);
         return tabResult({ operation: "rename", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "rename", postState.tab_id);
       }
       if (params.operation === "focus") {
         await deps.cli.runJson(["tab", "focus", target.tab_id], activeSignal);
-        const postState = tabFrom((await deps.cli.runJson(["tab", "get", target.tab_id], activeSignal)).result);
+        const postState = postStateTab((await deps.cli.runJson(["tab", "get", target.tab_id], activeSignal)).result, target.tab_id, target.workspace_id);
         return tabResult({ operation: "focus", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "focus", postState.tab_id);
       }
       const details = await closeTab(deps, params, activeSignal, ctx);

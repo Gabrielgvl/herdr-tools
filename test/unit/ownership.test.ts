@@ -61,6 +61,26 @@ describe("runtime topology ownership", () => {
     ]);
   });
 
+  it("terminates on parent cycles and fails closed instead of granting ownership", () => {
+    const cyclic: CloseTopology = {
+      nodes: [
+        { kind: "pane", id: "p1", parentId: "p2" },
+        { kind: "pane", id: "p2", parentId: "p1" }
+      ]
+    };
+    const ledger = new RuntimeOwnership();
+    ledger.recordMany([{ kind: "pane", id: "p1", parentId: "p2" }, { kind: "pane", id: "p2", parentId: "p1" }]);
+    expect(descendantsForClose(cyclic, { kind: "pane", id: "p1" })).toEqual([
+      { kind: "pane", id: "p1", parentId: "p2" },
+      { kind: "pane", id: "p2", parentId: "p1" }
+    ]);
+    expect(closePolicy({ topology: cyclic, target: { kind: "pane", id: "p1" }, hasUI: true }, ledger)).toEqual({
+      allowed: false,
+      code: "TOPOLOGY_INVALID",
+      resourceIds: ["p1", "p2"]
+    });
+  });
+
   it("silently permits an explicitly requested wholly owned tree", () => {
     const ledger = new RuntimeOwnership();
     ledger.recordMany([

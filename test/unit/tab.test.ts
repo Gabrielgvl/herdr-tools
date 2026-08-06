@@ -126,11 +126,15 @@ describe("herdr_tab", () => {
     expect(JSON.stringify(result)).not.toContain("do-not-leak");
   });
 
-  it("accepts the authoritative create_result tab shape and handles missing context", async () => {
+  it("accepts authoritative tab shapes and rejects malformed post-state", async () => {
     const harness = makeHarness();
     harness.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "tab" && argv[1] === "create") return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4", workspace_id: "w1" }, root_pane: { pane_id: "p4" } } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "create") {
+        harness.snapshot.tabs.push({ tab_id: "t4", workspace_id: "w1", label: "created" });
+        harness.snapshot.panes.push({ pane_id: "p4", tab_id: "t4", workspace_id: "w1", label: "root" });
+        return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4", workspace_id: "w1" }, root_pane: { pane_id: "p4" } } }), stderr: "", code: 0, killed: false };
+      }
       if (argv[0] === "tab" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { tab: { tab_id: "t4", workspace_id: "w1", label: "created" } } }), stderr: "", code: 0, killed: false };
       throw new Error(`unexpected argv ${argv.join(" ")}`);
     }));
@@ -138,27 +142,43 @@ describe("herdr_tab", () => {
     await expect(createTabTool({ cli: harness.cli, context: {} }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
 
     const invalidCreate = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: fixture() } }), stderr: "", code: 0, killed: false };
       return { stdout: JSON.stringify({ id: "create", result: { tab: [] } }), stderr: "", code: 0, killed: false };
     }));
     await expect(createTabTool({ cli: invalidCreate, context }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
 
+    const invalidPostSnapshot = fixture();
     const invalidPost = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "tab" && argv[1] === "create") return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4" }, root_pane: { pane_id: "p4" } } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: invalidPostSnapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "create") {
+        invalidPostSnapshot.tabs.push({ tab_id: "t4", workspace_id: "w1", label: "created" });
+        invalidPostSnapshot.panes.push({ pane_id: "p4", tab_id: "t4", workspace_id: "w1", label: "root" });
+        return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4" }, root_pane: { pane_id: "p4" } } }), stderr: "", code: 0, killed: false };
+      }
       return { stdout: JSON.stringify({ id: "get", result: { tab: { tab_id: "t4" } } }), stderr: "", code: 0, killed: false };
     }));
     await expect(createTabTool({ cli: invalidPost, context }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+
+    const invalidObjectSnapshot = fixture();
     const invalidObject = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "tab" && argv[1] === "create") return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4" } } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: invalidObjectSnapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "create") {
+        invalidObjectSnapshot.tabs.push({ tab_id: "t4", workspace_id: "w1", label: "created" });
+        invalidObjectSnapshot.panes.push({ pane_id: "p4", tab_id: "t4", workspace_id: "w1", label: "root" });
+        return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4" } } }), stderr: "", code: 0, killed: false };
+      }
       return { stdout: JSON.stringify({ id: "get", result: null }), stderr: "", code: 0, killed: false };
     }));
     await expect(createTabTool({ cli: invalidObject, context }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
 
+    const directSnapshot = fixture();
     const directTab = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "tab" && argv[1] === "create") return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t5" }, root_pane: { pane_id: "p5" } } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: directSnapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "create") {
+        directSnapshot.tabs.push({ tab_id: "t5", workspace_id: "w1", label: "direct" });
+        directSnapshot.panes.push({ pane_id: "p5", tab_id: "t5", workspace_id: "w1", label: "root" });
+        return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t5" }, root_pane: { pane_id: "p5" } } }), stderr: "", code: 0, killed: false };
+      }
       return { stdout: JSON.stringify({ id: "get", result: { tab_id: "t5", workspace_id: "w1", label: "direct" } }), stderr: "", code: 0, killed: false };
     }));
     await expect(createTabTool({ cli: directTab, context }).execute("id", { operation: "create", label: "direct" }, undefined, undefined, harness.ctx)).resolves.toMatchObject({ details: { tabId: "t5", rootPaneId: "p5" } });
@@ -180,19 +200,125 @@ describe("herdr_tab", () => {
     expect(runtimeOwnership.snapshot()).toContainEqual({ kind: "pane", id: "p4", parentId: "t4" });
   });
 
-  it("records returned tab resources before a post-create read fails", async () => {
+  it("does not record tab resources before a post-create read succeeds", async () => {
     const harness = makeHarness();
     harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv) => {
       if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } };
-      if (argv[0] === "tab" && argv[1] === "create") return { id: "create", result: { tab: { tab_id: "t4" }, root_pane: { pane_id: "p4" } } };
+      if (argv[0] === "tab" && argv[1] === "create") {
+        harness.snapshot.tabs.push({ tab_id: "t4", workspace_id: "w1", label: "retained" });
+        harness.snapshot.panes.push({ pane_id: "p4", tab_id: "t4", workspace_id: "w1", label: "root" });
+        return { id: "create", result: { tab: { tab_id: "t4" }, root_pane: { pane_id: "p4" } } };
+      }
       if (argv[0] === "tab" && argv[1] === "get") throw Object.assign(new Error("post-read failed"), { code: "CLI_PROTOCOL_ERROR" });
       throw new Error(`unexpected argv ${argv.join(" ")}`);
     });
     await expect(execute(harness, { operation: "create", label: "retained" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
-    expect(runtimeOwnership.snapshot()).toEqual([
-      { kind: "tab", id: "t4", parentId: "w1" },
-      { kind: "pane", id: "p4", parentId: "t4" }
-    ]);
+    expect(runtimeOwnership.snapshot()).toEqual([]);
+  });
+
+  it("rejects contradictory create topology and tab mutation post-state before ownership", async () => {
+    const contradictory = makeHarness();
+    const base = contradictory.cli.runJson.bind(contradictory.cli);
+    contradictory.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "tab" && argv[1] === "create") {
+        contradictory.snapshot.tabs.push({ tab_id: "t3", workspace_id: "w1", label: "created" });
+        contradictory.snapshot.panes.push({ pane_id: "p3", tab_id: "t3", workspace_id: "w1", label: "root" });
+        return { id: "create", result: { tab: { tab_id: "t3", workspace_id: "wrong" }, root_pane: { pane_id: "p2" } } };
+      }
+      return base(argv, signal);
+    });
+    await expect(execute(contradictory, { operation: "create", label: "created" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    expect(runtimeOwnership.snapshot()).toEqual([]);
+    expect(contradictory.calls.some((call) => call[0] === "tab" && call[1] === "get")).toBe(false);
+
+    for (const operation of ["rename", "focus"] as const) {
+      const mismatch = makeHarness();
+      const mismatchBase = mismatch.cli.runJson.bind(mismatch.cli);
+      mismatch.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+        if (argv[0] === "tab" && argv[1] === "get") return { id: "get", result: { tab: { tab_id: "t1", workspace_id: "w1", label: "wrong" } } };
+        return mismatchBase(argv, signal);
+      });
+      const params = operation === "rename" ? { operation, target: "t2", label: "new" } : { operation, target: "t2" };
+      await expect(execute(mismatch, params)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    }
+  });
+
+  it("fails closed when create identity is absent, ambiguous, or reuses a root pane", async () => {
+    const existingTab = makeHarness();
+    const existingBase = existingTab.cli.runJson.bind(existingTab.cli);
+    existingTab.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "tab" && argv[1] === "create") return { id: "create", result: { tab: { tab_id: "t2" }, root_pane: { pane_id: "p2" } } };
+      return existingBase(argv, signal);
+    });
+    await expect(execute(existingTab, { operation: "create", label: "existing" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+
+    const missingTab = makeHarness();
+    const missingBase = missingTab.cli.runJson.bind(missingTab.cli);
+    missingTab.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "tab" && argv[1] === "create") return { id: "create", result: { tab: { tab_id: "missing" }, root_pane: { pane_id: "missing-pane" } } };
+      return missingBase(argv, signal);
+    });
+    await expect(execute(missingTab, { operation: "create", label: "missing" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+
+    const missingWorkspace = makeHarness();
+    const missingWorkspaceBase = missingWorkspace.cli.runJson.bind(missingWorkspace.cli);
+    missingWorkspace.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "tab" && argv[1] === "create") {
+        missingWorkspace.snapshot.workspaces = [];
+        missingWorkspace.snapshot.tabs.push({ tab_id: "t3", workspace_id: "w1", label: "missing workspace" });
+        missingWorkspace.snapshot.panes.push({ pane_id: "p3", tab_id: "t3", workspace_id: "w1", label: "root" });
+        return { id: "create", result: { tab: { tab_id: "t3" }, root_pane: { pane_id: "p3" } } };
+      }
+      return missingWorkspaceBase(argv, signal);
+    });
+    await expect(execute(missingWorkspace, { operation: "create", label: "missing workspace" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+
+    const missingRoot = makeHarness();
+    const missingRootBase = missingRoot.cli.runJson.bind(missingRoot.cli);
+    missingRoot.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "tab" && argv[1] === "create") {
+        missingRoot.snapshot.tabs.push({ tab_id: "t3", workspace_id: "w1", label: "missing root" });
+        return { id: "create", result: { tab: { tab_id: "t3" }, root_pane: { pane_id: "p3" } } };
+      }
+      return missingRootBase(argv, signal);
+    });
+    await expect(execute(missingRoot, { operation: "create", label: "missing root" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+
+    const ambiguousRoot = makeHarness();
+    const ambiguousBase = ambiguousRoot.cli.runJson.bind(ambiguousRoot.cli);
+    ambiguousRoot.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "tab" && argv[1] === "create") {
+        ambiguousRoot.snapshot.tabs.push({ tab_id: "t3", workspace_id: "w1", label: "ambiguous root" });
+        ambiguousRoot.snapshot.panes.push(
+          { pane_id: "p3", tab_id: "t3", workspace_id: "w1", label: "root 1" },
+          { pane_id: "p4", tab_id: "t3", workspace_id: "w1", label: "root 2" }
+        );
+        return { id: "create", result: { tab: { tab_id: "t3" } } };
+      }
+      return ambiguousBase(argv, signal);
+    });
+    await expect(execute(ambiguousRoot, { operation: "create", label: "ambiguous root" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+
+    const reusedRoot = makeHarness();
+    const before = fixture();
+    before.panes.push({ pane_id: "p3", tab_id: "t1", workspace_id: "w1", label: "old root" });
+    const after = fixture();
+    let snapshotReads = 0;
+    reusedRoot.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") {
+        snapshotReads += 1;
+        const snapshot = snapshotReads === 1 ? before : after;
+        return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot } }), stderr: "", code: 0, killed: false };
+      }
+      if (argv[0] === "tab" && argv[1] === "create") {
+        after.tabs.push({ tab_id: "t3", workspace_id: "w1", label: "new" });
+        after.panes.push({ pane_id: "p3", tab_id: "t3", workspace_id: "w1", label: "new root" });
+        return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t3" }, root_pane: { pane_id: "p3" } } }), stderr: "", code: 0, killed: false };
+      }
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    }));
+    await expect(execute(reusedRoot, { operation: "create", label: "reused root" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    expect(runtimeOwnership.snapshot()).toEqual([]);
   });
 
   it("rejects confirmation declines and contradictory close post-state", async () => {

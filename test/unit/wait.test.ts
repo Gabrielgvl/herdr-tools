@@ -61,9 +61,9 @@ describe("herdr_wait", () => {
   });
 
   it("implements semantic states and any/all aggregation", async () => {
-    const any = await execute(fakeCli(), { targets: ["p1", "p2"], match: "any", condition: { kind: "state", state: "completed" }, timeoutMs: 1 });
+    const any = await execute(fakeCli(), { targets: ["p1", "p2"], match: "any", condition: { kind: "state", state: "completed" }, timeoutMs: 1 }, { clock: clock() });
     expect(any.details).toMatchObject({ outcome: "success", matched: true });
-    const all = await execute(fakeCli(), { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "completed" }, timeoutMs: 1 });
+    const all = await execute(fakeCli(), { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "completed" }, timeoutMs: 1 }, { clock: clock() });
     expect(all.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
     expect(all.details.targets).toHaveLength(2);
   });

@@ -11,7 +11,7 @@
     "test": "npm run test:unit",
     "test:unit": "vitest run --coverage",
     "coverage": "npm run test:unit && echo COVERAGE_RESULT: PASS",
-    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration": "tsx scripts/test-integration.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "build": "tsc"

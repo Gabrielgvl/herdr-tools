@@ -52,7 +52,7 @@ function makeHarness(): Harness {
     }
     if (argv[0] === "pane" && argv[1] === "get") {
       const pane = snapshot.panes.find((item) => item.pane_id === argv[2]);
-      return response("get", { pane: pane ?? null, environment: { SECRET: "do-not-leak" } });
+      return response("get", { pane: pane ? { ...pane, environment: { SECRET: "do-not-leak" }, environment_overrides: { SNAKE_SECRET: "do-not-leak-snake" } } : null });
     }
     if (argv[0] === "pane" && argv[1] === "layout") {
       return response("layout", { layout: { tab_id: "t1", focused_pane_id: focusedPaneId, panes: [
@@ -103,6 +103,14 @@ describe("herdr_pane", () => {
     expect(harness.calls).toContainEqual(["pane", "split", "p1", "--direction", "right", "--cwd", "/cwd", "--no-focus"]);
     expect(harness.calls).toContainEqual(["pane", "rename", "p3", "new pane"]);
     expect(harness.calls).toContainEqual(["pane", "get", "p3"]);
+  });
+
+  it("prioritizes an exact agent ID over a conflicting pane label for pane mutations", async () => {
+    const harness = makeHarness();
+    harness.snapshot.panes[0]!.label = "agent-7";
+    harness.snapshot.agents.push({ pane_id: "p2", agent_id: "agent-7", name: "worker" });
+    await expect(execute(harness, { operation: "rename", target: "agent-7", label: "renamed" })).resolves.toMatchObject({ details: { paneId: "p2" } });
+    expect(harness.calls).toContainEqual(["pane", "rename", "p2", "renamed"]);
   });
 
   it("honors down/focus/cwd/env and never echoes environment values", async () => {

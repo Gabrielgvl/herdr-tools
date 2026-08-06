@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TargetResolutionError, parseSnapshotResult, resolveTarget, type HerdrSnapshot } from "../../src/targets.js";
+import { TargetResolutionError, parseSnapshotResult, resolvePaneOrAgentTarget, resolveTarget, type HerdrSnapshot } from "../../src/targets.js";
 
 const snapshot: HerdrSnapshot = {
   version: "0.8.0",
@@ -31,6 +31,31 @@ describe("exact target resolution", () => {
     expect(resolveTarget(snapshot, "reviewer", "pane", context).paneId).toBe("w1:p2");
     expect(resolveTarget(snapshot, "reviewer", "agent", context).paneId).toBe("w1:p2");
     expect(resolveTarget(snapshot, "agent-7", "agent", context)).toMatchObject({ id: "w1:p2", paneId: "w1:p2", agentName: "reviewer" });
+  });
+
+  it("prioritizes exact agent IDs over pane labels while preserving pane IDs and ambiguity safety", () => {
+    const prioritized = {
+      ...snapshot,
+      panes: snapshot.panes.map((pane) => pane.pane_id === "w1:p1" ? { ...pane, label: "agent-7" } : pane)
+    };
+    expect(resolvePaneOrAgentTarget(prioritized, "agent-7", context)).toMatchObject({ paneId: "w1:p2" });
+
+    const collidingPaneId = {
+      ...prioritized,
+      panes: [...prioritized.panes, { ...snapshot.panes[3], pane_id: "w1:p5", agent_id: "w1:p2" }],
+      agents: [...prioritized.agents, { pane_id: "w1:p5", agent_id: "w1:p2", name: "collision" }]
+    };
+    expect(resolvePaneOrAgentTarget(collidingPaneId, "w1:p2", context)).toMatchObject({ paneId: "w1:p2" });
+
+    const ambiguousAgentId = {
+      ...prioritized,
+      agents: [...prioritized.agents, { pane_id: "w1:p4", agent_id: "agent-7", name: "other" }]
+    };
+    expect(() => resolvePaneOrAgentTarget(ambiguousAgentId, "agent-7", context)).toThrowError(/TARGET_AMBIGUOUS/);
+    expect(() => resolvePaneOrAgentTarget(snapshot, "", context)).toThrowError(/INVALID_INPUT/);
+    expect(() => resolvePaneOrAgentTarget(snapshot, "same", context)).toThrowError(/TARGET_AMBIGUOUS/);
+    const ambiguousPaneLabel = { ...snapshot, panes: [...snapshot.panes, { ...snapshot.panes[1], pane_id: "w1:p5", label: "duplicate" }] };
+    expect(() => resolvePaneOrAgentTarget(ambiguousPaneLabel, "duplicate", context)).toThrowError(/TARGET_AMBIGUOUS/);
   });
 
   it("resolves current from injected context rather than focused metadata", () => {

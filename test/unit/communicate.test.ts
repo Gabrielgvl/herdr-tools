@@ -47,6 +47,29 @@ describe("herdr_communicate", () => {
     expect(calls).toContainEqual(["agent", "send-keys", "w1:p2", "enter"]);
   });
 
+  it("rejects pane get identity mismatches before and after mutation", async () => {
+    const beforeExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, pane_id: "w1:wrong", agent_status: "idle" } } }), stderr: "", code: 0, killed: false };
+      throw new Error(`mutation should not run: ${argv.join(" ")}`);
+    });
+    await expect(createCommunicateTool({ cli: new HerdrCli(beforeExec), context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { expectedPaneId: "w1:p2", actualPaneId: "w1:wrong" } });
+    expect(beforeExec.mock.calls.some((call) => call[1][0] === "agent")).toBe(false);
+
+    let gets = 0;
+    const afterExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "get") {
+        gets += 1;
+        return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, pane_id: gets === 1 ? pane.pane_id : "w1:wrong", agent_status: gets === 1 ? "idle" : "working" } } }), stderr: "", code: 0, killed: false };
+      }
+      if (argv[0] === "agent" && argv[1] === "prompt") return { stdout: JSON.stringify({ id: "prompt", result: { ok: true } }), stderr: "", code: 0, killed: false };
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    });
+    await expect(createCommunicateTool({ cli: new HerdrCli(afterExec), context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { expectedPaneId: "w1:p2", actualPaneId: "w1:wrong" } });
+    expect(afterExec.mock.calls.some((call) => call[1][0] === "agent" && call[1][1] === "prompt")).toBe(true);
+  });
+
   it("steers with named Escape before the prompt and verifies working", async () => {
     const { cli, calls } = makeCli();
     const result = await createCommunicateTool({ cli, context }).execute("id", { target: "reviewer", operation: "steer", text: "new direction" }, new AbortController().signal, undefined, extensionContext);
@@ -111,7 +134,7 @@ describe("herdr_communicate", () => {
     const sensitive = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane" && argv[1] === "get") {
-        return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, agent_status: "working", environment: { SECRET: "hidden" }, nested: { environment_variables: { TOKEN: "nested-hidden" } }, history: [{ env: { ARRAY_SECRET: "array-hidden" } }] } } }), stderr: "", code: 0, killed: false };
+        return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, agent_status: "working", environment: { SECRET: "hidden" }, environment_overrides: { SNAKE_SECRET: "snake-hidden" }, nested: { environment_variables: { TOKEN: "nested-hidden" }, environment_overrides: { NESTED_SNAKE_SECRET: "nested-snake-hidden" } }, history: [{ env: { ARRAY_SECRET: "array-hidden" }, environment_overrides: { ARRAY_SNAKE_SECRET: "array-snake-hidden" } }] } } }), stderr: "", code: 0, killed: false };
       }
       return { stdout: JSON.stringify({ id: "keys", result: { ok: true } }), stderr: "", code: 0, killed: false };
     });
@@ -119,6 +142,8 @@ describe("herdr_communicate", () => {
     expect(result.details.postState).toMatchObject({ pane_id: "w1:p2", agent_status: "working" });
     expect(JSON.stringify(result)).not.toContain("hidden");
     expect(JSON.stringify(result)).not.toContain("TOKEN");
+    expect(JSON.stringify(result)).not.toContain("snake-hidden");
+    expect(JSON.stringify(result)).not.toContain("environment_overrides");
   });
 
   it("validates keys before CLI and never asks for confirmation", async () => {

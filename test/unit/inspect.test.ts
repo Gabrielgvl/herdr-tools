@@ -20,7 +20,10 @@ function makeCli(readOutput?: string, snapshotValue: HerdrSnapshot = snapshot) {
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
     calls.push(argv);
     if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot: snapshotValue, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { pane: snapshotValue.panes[0], type: "pane_info" } }), stderr: "", code: 0, killed: false };
+    if (argv[0] === "pane" && argv[1] === "get") {
+      const pane = snapshotValue.panes.find((item) => item.pane_id === argv[2]) ?? snapshotValue.panes[0];
+      return { stdout: JSON.stringify({ id: "get", result: { pane, type: "pane_info" } }), stderr: "", code: 0, killed: false };
+    }
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: output, stderr: "", code: 0, killed: false };
     throw new Error(`unexpected argv ${argv.join(" ")}`);
   });
@@ -98,6 +101,20 @@ describe("herdr_inspect", () => {
     await expect(execute(cli, { mode: "target", target: "w1:t1" })).rejects.toMatchObject({ code: "TARGET_TYPE_MISMATCH" });
     const invalidContext = createInspectTool({ cli, context: { workspaceId: "w1", tabId: "w1:t1" } });
     await expect(invalidContext.execute("id", { mode: "collection", collection: "panes" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
+  });
+
+  it("prioritizes an exact agent ID over a conflicting pane label", async () => {
+    const agentSnapshot: HerdrSnapshot = {
+      ...snapshot,
+      panes: [
+        { ...snapshot.panes[0], label: "agent-7" },
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "other", agent_name: "worker", agent_status: "idle" }
+      ],
+      agents: [snapshot.agents[0], { pane_id: "w1:p2", agent_id: "agent-7", name: "worker", agent_status: "idle" }]
+    };
+    const { cli, calls } = makeCli(undefined, agentSnapshot);
+    await expect(execute(cli, { mode: "target", target: "agent-7" })).resolves.toMatchObject({ details: { target: { paneId: "w1:p2", agentName: "worker" } } });
+    expect(calls).toContainEqual(["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", "w1:p2"]);
   });
 
   it("reports health without exposing the socket path", async () => {

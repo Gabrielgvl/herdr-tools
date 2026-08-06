@@ -93,9 +93,14 @@ function validateParams(params: LaunchParams): void {
   }
 }
 
-function paneRecord(value: unknown): Record<string, unknown> {
+function paneRecord(value: unknown, expectedPaneId: string): Record<string, unknown> {
   if (!record(value) || !record(value.pane)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr did not return a pane post-state");
-  return value.pane;
+  const pane = value.pane;
+  const actualPaneId = idFrom(pane, "pane_id");
+  if (actualPaneId !== expectedPaneId) {
+    throw new LaunchError("POSTSTATE_UNAVAILABLE", "Herdr pane post-state does not match the resolved pane", { expectedPaneId, actualPaneId });
+  }
+  return pane;
 }
 
 function agentIdentity(value: unknown): { name?: string; agentId?: string } {
@@ -276,7 +281,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           initialPromptSent = true;
           progress(onUpdate, phase, created);
         }
-        const postState = paneRecord(await run(deps.cli, ["pane", "get", resolvedPaneId], abortSignal));
+        const postState = paneRecord(await run(deps.cli, ["pane", "get", resolvedPaneId], abortSignal), resolvedPaneId);
         if (params.initialPrompt !== undefined && stateFrom(postState) !== "working") {
           throw new LaunchError("POSTSTATE_UNAVAILABLE", "Initial prompt did not produce a verified working state");
         }

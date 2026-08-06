@@ -2,7 +2,7 @@ import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@earendi
 import type { HerdrCli } from "../cli.js";
 import { closePolicy, recordCreatedResource, runtimeOwnership, type CloseTopology, type RuntimeOwnership } from "../ownership.js";
 import { assertSafeEnvironment, assertSafeIdentifier, PaneParamsSchema, type PaneParams } from "../topology-schema.js";
-import { parseSnapshotResult, resolveTarget, type CurrentContext, type HerdrSnapshot, type PaneRecord, type ResolvedTarget } from "../targets.js";
+import { parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot, type PaneRecord, type ResolvedTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface PaneDetails {
@@ -54,7 +54,7 @@ function withoutEnvironment(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutEnvironment);
   if (typeof value !== "object" || value === null) return value;
   return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !/^(env|environment|env_vars|environment_variables|environmentoverrides)$/i.test(key))
+    .filter(([key]) => !/^(env|environment|env_vars|environment_variables|environment_overrides|environmentoverrides)$/i.test(key))
     .map(([key, item]) => [key, withoutEnvironment(item)]));
 }
 
@@ -303,12 +303,7 @@ function exactTabTarget(snapshot: HerdrSnapshot, ref: string, context: CurrentCo
 }
 
 function resolvePaneRef(snapshot: HerdrSnapshot, ref: string, context: CurrentContext): ResolvedTarget {
-  try {
-    return resolveTarget(snapshot, ref, "pane", context);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "TARGET_NOT_FOUND") return resolveTarget(snapshot, ref, "agent", context);
-    throw error;
-  }
+  return resolvePaneOrAgentTarget(snapshot, ref, context);
 }
 
 function isDirection(value: string): value is "right" | "down" | "left" | "up" {

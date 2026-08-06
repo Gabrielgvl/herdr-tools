@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
-import { assertCurrentContext, parseSnapshotResult, resolveTarget, TargetResolutionError, type CurrentContext, type HerdrSnapshot } from "../targets.js";
+import { assertCurrentContext, parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 interface InspectDetails {
@@ -72,15 +72,6 @@ function compactCollection(snapshot: HerdrSnapshot, collection: "panes" | "agent
     .map((agent) => compactCollectionRecord(agent, collection));
 }
 
-function resolvePaneOrAgent(snapshot: HerdrSnapshot, ref: string, context: CurrentContext) {
-  try {
-    return resolveTarget(snapshot, ref, "pane", context);
-  } catch (error) {
-    if (error instanceof TargetResolutionError && error.code === "TARGET_NOT_FOUND") return resolveTarget(snapshot, ref, "agent", context);
-    throw error;
-  }
-}
-
 function parseHealth(text: string): Pick<InspectDetails, "client" | "server" | "socketReachable" | "compatible"> {
   let parsed: unknown;
   try {
@@ -142,7 +133,7 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         const items = compactCollection(snapshot, input.collection!, deps.context);
         return { content: [{ type: "text", text: `Inspected ${input.collection}` }], details: { operation: "inspect", kind: "collection", outcome: "success", collection: input.collection, items } };
       }
-      const target = resolvePaneOrAgent(snapshot, targetRef, deps.context);
+      const target = resolvePaneOrAgentTarget(snapshot, targetRef, deps.context);
       const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], signal!)).result);
       const raw = await deps.cli.runText(["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", target.paneId!], signal!);
       const recentUnwrappedLines = raw.length === 0 ? [] : raw.split(/\r?\n/).slice(-100);

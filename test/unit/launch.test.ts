@@ -60,6 +60,19 @@ describe("herdr_launch", () => {
     expect(result.details).toMatchObject({ outcome: "launched", name: "worker", kind: "pi", paneId: "w1:p2", tabId: "w1:t1", agentId: "agent-7", postState: { agent_status: "working" } });
   });
 
+  it("rejects a pane post-state whose pane ID differs from the resolved placement", async () => {
+    const { cli } = makeCli();
+    const base = cli.runJson;
+    cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserveCompletedMutation) => {
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:wrong", tab_id: "w1:t1", workspace_id: "w1", agent_status: "working" } });
+      return base(argv, signal, preserveCompletedMutation);
+    });
+    await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({
+      code: "POSTSTATE_UNAVAILABLE",
+      details: { causeCode: "POSTSTATE_UNAVAILABLE", expectedPaneId: "w1:p2" }
+    });
+  });
+
   it("records returned launch resources through the narrow shared registry", async () => {
     const { cli } = makeCli();
     const record = vi.fn();

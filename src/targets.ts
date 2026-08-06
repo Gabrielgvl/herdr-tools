@@ -169,6 +169,28 @@ function candidates(snapshot: HerdrSnapshot, ref: string, kind: ResourceKind): R
   return [...named, ...labelled.filter((item) => !named.some((candidate) => candidate.id === item.id))];
 }
 
+export function resolvePaneOrAgentTarget(snapshot: HerdrSnapshot, ref: TargetRef, context: CurrentContext): ResolvedTarget {
+  if (ref.length === 0 || /[\n\r\0]/.test(ref)) throw new TargetResolutionError("INVALID_INPUT", "INVALID_INPUT: target must be a single non-empty identifier");
+  if (ref === "current") return resolveTarget(snapshot, ref, "pane", context);
+
+  const byPaneId = exactId(snapshot, ref);
+  if (byPaneId) {
+    if (byPaneId.kind !== "pane") throw new TargetResolutionError("TARGET_TYPE_MISMATCH", `TARGET_TYPE_MISMATCH: target ${ref} is not a pane`, { target: ref, actualKind: byPaneId.kind });
+    return byPaneId;
+  }
+
+  const byAgentId = exactAgentIds(snapshot, ref);
+  if (byAgentId.length > 1) throw new TargetResolutionError("TARGET_AMBIGUOUS", `TARGET_AMBIGUOUS: multiple exact agent targets matched ${ref}`, { target: ref, candidates: byAgentId.map((item) => item.id) });
+  if (byAgentId.length === 1) return byAgentId[0];
+
+  try {
+    return resolveTarget(snapshot, ref, "pane", context);
+  } catch (error) {
+    if (error instanceof TargetResolutionError && error.code === "TARGET_NOT_FOUND") return resolveTarget(snapshot, ref, "agent", context);
+    throw error;
+  }
+}
+
 export function resolveTarget(snapshot: HerdrSnapshot, ref: TargetRef, kind: ResourceKind, context: CurrentContext): ResolvedTarget {
   if (ref.length === 0 || /[\n\r\0]/.test(ref)) throw new TargetResolutionError("INVALID_INPUT", "INVALID_INPUT: target must be a single non-empty identifier");
   if (ref === "current") {

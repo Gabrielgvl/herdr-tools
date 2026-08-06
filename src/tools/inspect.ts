@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
-import { parseSnapshotResult, resolveTarget, type CurrentContext } from "../targets.js";
+import { assertCurrentContext, parseSnapshotResult, resolveTarget, TargetResolutionError, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 interface InspectDetails {
@@ -39,6 +39,46 @@ function asPane(result: unknown): Record<string, unknown> {
     throw Object.assign(new Error("Invalid Herdr pane response"), { code: "CLI_PROTOCOL_ERROR" });
   }
   return (result as { pane: Record<string, unknown> }).pane;
+}
+
+const COMPACT_COLLECTION_KEYS: Record<"panes" | "agents" | "tabs", readonly string[]> = {
+  panes: ["pane_id", "tab_id", "workspace_id", "parent_id", "agent_id", "label", "agent_name", "agent", "agent_status", "status"],
+  agents: ["agent_id", "pane_id", "parent_id", "name", "agent", "agent_status", "status"],
+  tabs: ["tab_id", "workspace_id", "parent_id", "label"]
+};
+
+function compactCollectionRecord(value: Record<string, unknown>, collection: "panes" | "agents" | "tabs"): Record<string, unknown> {
+  const allowed = new Set(COMPACT_COLLECTION_KEYS[collection]);
+  return Object.fromEntries(Object.entries(value).filter(([key, item]) => allowed.has(key) && typeof item === "string"));
+}
+
+function compactCollection(snapshot: HerdrSnapshot, collection: "panes" | "agents" | "tabs", context: CurrentContext): Record<string, unknown>[] {
+  assertCurrentContext(snapshot, context);
+  if (collection === "panes") {
+    return snapshot.panes
+      .filter((pane) => pane.workspace_id === context.workspaceId && pane.tab_id === context.tabId)
+      .map((pane) => compactCollectionRecord(pane, collection));
+  }
+  if (collection === "tabs") {
+    return snapshot.tabs
+      .filter((tab) => tab.workspace_id === context.workspaceId)
+      .map((tab) => compactCollectionRecord(tab, collection));
+  }
+  const currentPaneIds = new Set(snapshot.panes
+    .filter((pane) => pane.workspace_id === context.workspaceId && pane.tab_id === context.tabId)
+    .map((pane) => pane.pane_id));
+  return snapshot.agents
+    .filter((agent) => currentPaneIds.has(agent.pane_id))
+    .map((agent) => compactCollectionRecord(agent, collection));
+}
+
+function resolvePaneOrAgent(snapshot: HerdrSnapshot, ref: string, context: CurrentContext) {
+  try {
+    return resolveTarget(snapshot, ref, "pane", context);
+  } catch (error) {
+    if (error instanceof TargetResolutionError && error.code === "TARGET_NOT_FOUND") return resolveTarget(snapshot, ref, "agent", context);
+    throw error;
+  }
 }
 
 function parseHealth(text: string): Pick<InspectDetails, "client" | "server" | "socketReachable" | "compatible"> {
@@ -99,10 +139,10 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       const snapshot = parseSnapshotResult((await deps.cli.runJson(["api", "snapshot"], signal!)).result);
       const targetRef = input.target ?? "current";
       if (mode === "collection") {
-        const items = input.collection === "panes" ? snapshot.panes : input.collection === "agents" ? snapshot.agents : snapshot.tabs;
+        const items = compactCollection(snapshot, input.collection!, deps.context);
         return { content: [{ type: "text", text: `Inspected ${input.collection}` }], details: { operation: "inspect", kind: "collection", outcome: "success", collection: input.collection, items } };
       }
-      const target = resolveTarget(snapshot, targetRef, "pane", deps.context);
+      const target = resolvePaneOrAgent(snapshot, targetRef, deps.context);
       const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], signal!)).result);
       const raw = await deps.cli.runText(["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", target.paneId!], signal!);
       const recentUnwrappedLines = raw.length === 0 ? [] : raw.split(/\r?\n/).slice(-100);

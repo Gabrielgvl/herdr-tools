@@ -16,15 +16,35 @@ export interface CommunicateDependencies {
   context: CurrentContext;
 }
 
+const AUTHORITATIVE_STATES = new Set(["idle", "working", "blocked", "done", "unknown"]);
+
+function withoutSensitiveMetadata(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutSensitiveMetadata);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !/^(env|environment|env_vars|environment_variables|environmentoverrides)$/i.test(key))
+    .map(([key, item]) => [key, withoutSensitiveMetadata(item)]));
+}
+
 function paneFrom(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || typeof (value as { pane?: unknown }).pane !== "object" || (value as { pane?: unknown }).pane === null) {
     throw Object.assign(new Error("Invalid Herdr pane response"), { code: "CLI_PROTOCOL_ERROR" });
   }
-  return (value as { pane: Record<string, unknown> }).pane;
+  const pane = (value as { pane: Record<string, unknown> }).pane;
+  if (!["pane_id", "tab_id", "workspace_id"].every((field) => typeof pane[field] === "string" && (pane[field] as string).length > 0)) {
+    throw Object.assign(new Error("Herdr pane response is missing authoritative identifiers"), { code: "CLI_PROTOCOL_ERROR" });
+  }
+  return pane;
 }
 
 function stateOf(pane: Record<string, unknown>): string {
-  return typeof pane.agent_status === "string" ? pane.agent_status : "unknown";
+  return pane.agent_status as string;
+}
+
+function assertPostState(pane: Record<string, unknown>): void {
+  if (typeof pane.agent_status !== "string" || !AUTHORITATIVE_STATES.has(pane.agent_status)) {
+    throw Object.assign(new Error("Authoritative target post-state is unavailable"), { code: "POSTSTATE_UNAVAILABLE", details: { postState: withoutSensitiveMetadata(pane) } });
+  }
 }
 
 export function createCommunicateTool(deps: CommunicateDependencies): ToolDefinition<typeof CommunicateParamsSchema, CommunicateDetails> {
@@ -40,6 +60,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       const snapshot = parseSnapshotResult((await deps.cli.runJson(["api", "snapshot"], signal!)).result);
       const target = resolveTarget(snapshot, params.target, "agent", deps.context);
       const before = paneFrom((await deps.cli.runJson(["pane", "get", target.paneId!], signal!)).result);
+      assertPostState(before);
       if (params.operation === "prompt" && stateOf(before) === "working") {
         throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: target.paneId } });
       }
@@ -54,14 +75,15 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       }
 
       const postState = paneFrom((await deps.cli.runJson(["pane", "get", target.paneId!], signal!)).result);
+      assertPostState(postState);
       if (params.operation !== "keys" && stateOf(postState) !== "working") {
-        throw Object.assign(new Error("Target did not enter working state"), { code: "POSTSTATE_UNAVAILABLE", details: { target: target.paneId, postState } });
+        throw Object.assign(new Error("Target did not enter working state"), { code: "POSTSTATE_UNAVAILABLE", details: { target: target.paneId, postState: withoutSensitiveMetadata(postState) } });
       }
       const details: CommunicateDetails = {
         operation: params.operation,
         outcome: "sent",
         target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName },
-        postState
+        postState: withoutSensitiveMetadata(postState) as Record<string, unknown>
       };
       return { content: [{ type: "text", text: formatResult({ operation: "communicate", outcome: "success", targetId: target.paneId, postState: { agent_status: stateOf(postState) } }) }], details };
     },

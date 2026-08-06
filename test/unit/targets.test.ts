@@ -15,8 +15,8 @@ const snapshot: HerdrSnapshot = {
     { pane_id: "w1:p4", tab_id: "w1:t1", workspace_id: "w1", label: "other", agent_status: "idle", agent_name: "same" }
   ],
   agents: [
-    { pane_id: "w1:p1", name: "foundation", agent_status: "working" },
-    { pane_id: "w1:p2", name: "reviewer", agent_status: "idle" },
+    { pane_id: "w1:p1", agent_id: "agent-1", name: "foundation", agent_status: "working" },
+    { pane_id: "w1:p2", agent_id: "agent-7", name: "reviewer", agent_status: "idle" },
     { pane_id: "w1:p3", name: "same", agent_status: "idle" },
     { pane_id: "w1:p4", name: "same", agent_status: "idle" }
   ]
@@ -30,6 +30,7 @@ describe("exact target resolution", () => {
     expect(resolveTarget(snapshot, "w1:p2", "pane", context).paneId).toBe("w1:p2");
     expect(resolveTarget(snapshot, "reviewer", "pane", context).paneId).toBe("w1:p2");
     expect(resolveTarget(snapshot, "reviewer", "agent", context).paneId).toBe("w1:p2");
+    expect(resolveTarget(snapshot, "agent-7", "agent", context)).toMatchObject({ id: "w1:p2", paneId: "w1:p2", agentName: "reviewer" });
   });
 
   it("resolves current from injected context rather than focused metadata", () => {
@@ -68,11 +69,26 @@ describe("exact target resolution", () => {
     expect(resolveTarget(unnamed, "reviewer", "agent", context)).toMatchObject({ id: "w1:p2", label: "reviewer", agentName: undefined });
   });
 
-  it("fails closed for ambiguous pane labels and preserves orphan agent metadata", () => {
+  it("fails closed for ambiguous pane labels and agent IDs while preserving orphan agent metadata", () => {
     const duplicate = { ...snapshot, panes: [...snapshot.panes, { ...snapshot.panes[1], pane_id: "w1:p5", label: "reviewer" }] };
     expect(() => resolveTarget(duplicate, "reviewer", "pane", context)).toThrowError(/TARGET_AMBIGUOUS/);
-    const orphan = { ...snapshot, agents: [...snapshot.agents, { pane_id: "orphan", name: "orphan" }] };
+    const duplicateAgentId = { ...snapshot, agents: [...snapshot.agents, { pane_id: "w1:p4", agent_id: "agent-7", name: "other-agent" }] };
+    expect(() => resolveTarget(duplicateAgentId, "agent-7", "agent", context)).toThrowError(/TARGET_AMBIGUOUS/);
+    const paneOnlyAgentId = {
+      ...snapshot,
+      panes: snapshot.panes.map((pane) => pane.pane_id === "w1:p2" ? { ...pane, agent_id: "pane-agent-7" } : pane),
+      agents: snapshot.agents.map((agent) => ({ pane_id: agent.pane_id, name: agent.name, agent_status: agent.agent_status }))
+    };
+    expect(resolveTarget(paneOnlyAgentId, "pane-agent-7", "agent", context)).toMatchObject({ id: "w1:p2", paneId: "w1:p2", agentName: "reviewer" });
+    const paneAndAgentId = {
+      ...snapshot,
+      panes: snapshot.panes.map((pane) => pane.pane_id === "w1:p2" ? { ...pane, agent_id: "agent-fallback" } : pane),
+      agents: snapshot.agents.map((agent) => agent.pane_id === "w1:p2" ? { ...agent, agent_id: "agent-fallback", name: undefined } : agent)
+    };
+    expect(resolveTarget(paneAndAgentId, "agent-fallback", "agent", context)).toMatchObject({ id: "w1:p2", paneId: "w1:p2", agentName: "reviewer" });
+    const orphan = { ...snapshot, agents: [...snapshot.agents, { pane_id: "orphan", name: "orphan" }, { pane_id: "orphan-id", agent_id: "orphan-7", name: "orphan-id" }] };
     expect(resolveTarget(orphan, "orphan", "agent", context)).toMatchObject({ id: "orphan", workspaceId: "", tabId: undefined, label: undefined, agentName: "orphan" });
+    expect(resolveTarget(orphan, "orphan-7", "agent", context)).toMatchObject({ id: "orphan-id", workspaceId: "", tabId: undefined, label: undefined, agentName: "orphan-id" });
   });
 });
 

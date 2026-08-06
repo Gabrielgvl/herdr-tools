@@ -27,6 +27,7 @@ export interface PaneRecord {
   tab_id: string;
   workspace_id: string;
   label?: string;
+  agent_id?: string;
   agent_status?: string;
   agent_name?: string;
   agent?: string;
@@ -35,6 +36,7 @@ export interface PaneRecord {
 
 export interface AgentRecord {
   pane_id: string;
+  agent_id?: string;
   name?: string;
   agent?: string;
   agent_status?: string;
@@ -142,6 +144,19 @@ function exactId(snapshot: HerdrSnapshot, ref: string): ResolvedTarget | undefin
   return undefined;
 }
 
+function exactAgentIds(snapshot: HerdrSnapshot, ref: string): ResolvedTarget[] {
+  const targets = snapshot.agents.filter((item) => item.agent_id === ref).map((item) => {
+    const pane = snapshot.panes.find((candidate) => candidate.pane_id === item.pane_id);
+    return { kind: "agent" as const, id: item.pane_id, workspaceId: pane?.workspace_id ?? "", tabId: pane?.tab_id, paneId: item.pane_id, label: pane?.label, agentName: item.name ?? pane?.agent_name, record: item };
+  });
+  for (const pane of snapshot.panes.filter((item) => item.agent_id === ref)) {
+    if (!targets.some((target) => target.id === pane.pane_id)) {
+      targets.push({ kind: "agent", id: pane.pane_id, workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, label: pane.label, agentName: pane.agent_name, record: pane });
+    }
+  }
+  return targets;
+}
+
 function candidates(snapshot: HerdrSnapshot, ref: string, kind: ResourceKind): ResolvedTarget[] {
   if (kind === "workspace") return snapshot.workspaces.filter((item) => item.label === ref).map((item) => ({ kind, id: item.workspace_id, workspaceId: item.workspace_id, label: item.label, record: item }));
   if (kind === "tab") return snapshot.tabs.filter((item) => item.label === ref).map((item) => ({ kind, id: item.tab_id, workspaceId: item.workspace_id, tabId: item.tab_id, label: item.label, record: item }));
@@ -161,6 +176,12 @@ export function resolveTarget(snapshot: HerdrSnapshot, ref: TargetRef, kind: Res
     if (kind === "pane" || kind === "agent") return resolveTarget(snapshot, context.paneId!, kind, context);
     if (kind === "tab") return resolveTarget(snapshot, context.tabId!, kind, context);
     return resolveTarget(snapshot, context.workspaceId!, kind, context);
+  }
+
+  if (kind === "agent") {
+    const byAgentId = exactAgentIds(snapshot, ref);
+    if (byAgentId.length > 1) throw new TargetResolutionError("TARGET_AMBIGUOUS", `TARGET_AMBIGUOUS: multiple exact agent targets matched ${ref}`, { target: ref, candidates: byAgentId.map((item) => item.id) });
+    if (byAgentId.length === 1) return byAgentId[0];
   }
 
   const byId = exactId(snapshot, ref);

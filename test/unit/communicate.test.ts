@@ -4,12 +4,12 @@ import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
-const pane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "reviewer", agent_status: "idle", agent_name: "reviewer" };
+const pane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "reviewer", agent_id: "agent-7", agent_status: "idle", agent_name: "reviewer" };
 const snapshot: HerdrSnapshot = {
   version: "0.8.0", protocol: 19,
   workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
   tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
-  panes: [pane], agents: [{ pane_id: "w1:p2", name: "reviewer", agent_status: "idle" }]
+  panes: [pane], agents: [{ pane_id: "w1:p2", agent_id: "agent-7", name: "reviewer", agent_status: "idle" }]
 };
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p2" };
 const extensionContext = {} as ExtensionContext;
@@ -41,6 +41,12 @@ describe("herdr_communicate", () => {
     expect(calls).toContainEqual(["agent", "prompt", "w1:p2", "hello", "--wait", "--until", "working", "--timeout", "5000"]);
   });
 
+  it("resolves an authoritative agent ID to the pane used by communication", async () => {
+    const { cli, calls } = makeCli();
+    await expect(createCommunicateTool({ cli, context }).execute("id", { target: "agent-7", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { target: { paneId: "w1:p2" } } });
+    expect(calls).toContainEqual(["agent", "send-keys", "w1:p2", "enter"]);
+  });
+
   it("steers with named Escape before the prompt and verifies working", async () => {
     const { cli, calls } = makeCli();
     const result = await createCommunicateTool({ cli, context }).execute("id", { target: "reviewer", operation: "steer", text: "new direction" }, new AbortController().signal, undefined, extensionContext);
@@ -70,7 +76,7 @@ describe("herdr_communicate", () => {
       }
       return { stdout: JSON.stringify({ id: "keys", result: { ok: true } }), stderr: "", code: 0, killed: false };
     });
-    await expect(createCommunicateTool({ cli: new HerdrCli(unknownState), context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { outcome: "sent" } });
+    await expect(createCommunicateTool({ cli: new HerdrCli(unknownState), context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
 
     let gets = 0;
     const contradictory = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
@@ -83,6 +89,36 @@ describe("herdr_communicate", () => {
       return { stdout: JSON.stringify({ id: "prompt", result: { ok: true } }), stderr: "", code: 0, killed: false };
     });
     await expect(createCommunicateTool({ cli: new HerdrCli(contradictory), context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+  });
+
+  it("requires an authoritative key post-state and strips sensitive metadata", async () => {
+    for (const postPane of [
+      { ...pane, agent_status: undefined, environment: { SECRET: "missing-state" }, nested: { env_vars: { TOKEN: "nested-secret" } } },
+      { ...pane, agent_status: "not-a-state", environment: { SECRET: "invalid-state" } }
+    ]) {
+      let gets = 0;
+      const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+        if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
+        if (argv[0] === "pane" && argv[1] === "get") {
+          gets += 1;
+          return { stdout: JSON.stringify({ id: "get", result: { pane: gets === 1 ? pane : postPane } }), stderr: "", code: 0, killed: false };
+        }
+        return { stdout: JSON.stringify({ id: "keys", result: { ok: true } }), stderr: "", code: 0, killed: false };
+      });
+      await expect(createCommunicateTool({ cli: new HerdrCli(exec), context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    }
+
+    const sensitive = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "get") {
+        return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, agent_status: "working", environment: { SECRET: "hidden" }, nested: { environment_variables: { TOKEN: "nested-hidden" } }, history: [{ env: { ARRAY_SECRET: "array-hidden" } }] } } }), stderr: "", code: 0, killed: false };
+      }
+      return { stdout: JSON.stringify({ id: "keys", result: { ok: true } }), stderr: "", code: 0, killed: false };
+    });
+    const result = await createCommunicateTool({ cli: new HerdrCli(sensitive), context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext);
+    expect(result.details.postState).toMatchObject({ pane_id: "w1:p2", agent_status: "working" });
+    expect(JSON.stringify(result)).not.toContain("hidden");
+    expect(JSON.stringify(result)).not.toContain("TOKEN");
   });
 
   it("validates keys before CLI and never asks for confirmation", async () => {

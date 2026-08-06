@@ -13,14 +13,14 @@ const snapshot: HerdrSnapshot = {
   agents: [{ pane_id: "w1:p1", name: "caller", agent_status: "idle" }]
 };
 
-function makeCli(readOutput?: string) {
+function makeCli(readOutput?: string, snapshotValue: HerdrSnapshot = snapshot) {
   const calls: string[][] = [];
   const lines = Array.from({ length: 137 }, (_, i) => `line-${i + 1}`);
   const output = readOutput ?? lines.join("\n");
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
     calls.push(argv);
-    if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { pane: snapshot.panes[0], type: "pane_info" } }), stderr: "", code: 0, killed: false };
+    if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot: snapshotValue, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
+    if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { pane: snapshotValue.panes[0], type: "pane_info" } }), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: output, stderr: "", code: 0, killed: false };
     throw new Error(`unexpected argv ${argv.join(" ")}`);
   });
@@ -49,6 +49,55 @@ describe("herdr_inspect", () => {
     expect(result.details).toMatchObject({ kind: "collection", collection: "panes" });
     expect(result.details.items).toEqual([{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle", agent_name: "caller" }]);
     expect(calls.some((call) => call[1] === "read")).toBe(false);
+  });
+
+  it("scopes collections to the current workspace/tab and strips non-compact fields", async () => {
+    const scopedSnapshot: HerdrSnapshot = {
+      ...snapshot,
+      workspaces: [...snapshot.workspaces, { workspace_id: "w2", label: "other workspace", secret: "workspace-secret" }],
+      tabs: [
+        { ...snapshot.tabs[0], secret: "tab-secret" },
+        { tab_id: "w1:t2", workspace_id: "w1", label: "other tab", focused: false },
+        { tab_id: "w2:t1", workspace_id: "w2", label: "other workspace tab" }
+      ],
+      panes: [
+        { ...snapshot.panes[0], environment: { SECRET: "pane-secret" }, cwd: "/secret" },
+        { pane_id: "w1:p2", tab_id: "w1:t2", workspace_id: "w1", label: "other tab pane", agent_name: "other-tab", agent_status: "idle", secret: "other-pane-secret" },
+        { pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2", label: "other workspace pane", agent_name: "other-workspace", agent_status: "idle" }
+      ],
+      agents: [
+        { ...snapshot.agents[0], agent_id: "agent-1", environment: { SECRET: "agent-secret" } },
+        { pane_id: "w1:p2", name: "other-tab", agent_status: "idle" },
+        { pane_id: "w2:p1", name: "other-workspace", agent_status: "idle" }
+      ]
+    };
+    const { cli } = makeCli(undefined, scopedSnapshot);
+    await expect(execute(cli, { mode: "collection", collection: "panes" })).resolves.toMatchObject({ details: { items: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle", agent_name: "caller" }] } });
+    await expect(execute(cli, { mode: "collection", collection: "agents" })).resolves.toMatchObject({ details: { items: [{ agent_id: "agent-1", pane_id: "w1:p1", name: "caller", agent_status: "idle" }] } });
+    await expect(execute(cli, { mode: "collection", collection: "tabs" })).resolves.toMatchObject({ details: { items: [
+      { tab_id: "w1:t1", workspace_id: "w1", label: "main" },
+      { tab_id: "w1:t2", workspace_id: "w1", label: "other tab" }
+    ] } });
+    const results = await Promise.all([
+      execute(cli, { mode: "collection", collection: "panes" }),
+      execute(cli, { mode: "collection", collection: "agents" }),
+      execute(cli, { mode: "collection", collection: "tabs" })
+    ]);
+    expect(JSON.stringify(results)).not.toContain("secret");
+    expect(JSON.stringify(results)).not.toContain("focused");
+  });
+
+  it("resolves an exact agent name when its pane label differs and rejects unavailable collection context", async () => {
+    const agentSnapshot: HerdrSnapshot = {
+      ...snapshot,
+      panes: [{ ...snapshot.panes[0], agent_name: "worker" }],
+      agents: [{ ...snapshot.agents[0], name: "worker" }]
+    };
+    const { cli } = makeCli(undefined, agentSnapshot);
+    await expect(execute(cli, { mode: "target", target: "worker" })).resolves.toMatchObject({ details: { target: { paneId: "w1:p1", agentName: "worker" } } });
+    await expect(execute(cli, { mode: "target", target: "w1:t1" })).rejects.toMatchObject({ code: "TARGET_TYPE_MISMATCH" });
+    const invalidContext = createInspectTool({ cli, context: { workspaceId: "w1", tabId: "w1:t1" } });
+    await expect(invalidContext.execute("id", { mode: "collection", collection: "panes" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
   });
 
   it("reports health without exposing the socket path", async () => {

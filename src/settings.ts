@@ -52,7 +52,7 @@ function parseSettings(value: unknown): Settings {
   if (!Number.isInteger(cadence) || (cadence as number) < 1 || (cadence as number) > 30) {
     throw new SettingsError("wait.reviewCadenceMinutes must be an integer from 1 through 30");
   }
-  if (typeof model !== "string" || model.trim() === "" || model !== model.trim() || /[\n\r\0]/.test(model)) {
+  if (typeof model !== "string" || model.trim() === "" || model !== model.trim() || !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(model)) {
     throw new SettingsError("wait.reviewerModel must be a non-empty model identifier");
   }
   return { reviewCadenceMinutes: cadence as number, reviewerModel: model, reviewerThinking: "low" };

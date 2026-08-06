@@ -239,7 +239,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           tabId = result.tabId ?? deps.context.tabId!;
           created.paneId = paneId;
           created.tabId = tabId;
-          deps.ownership?.record({ kind: "pane", id: paneId, parentId: tabId });
+          deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId! });
         }
         const resolvedPaneId = paneId!;
         if (placement.mode !== "existing_pane") {

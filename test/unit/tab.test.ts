@@ -169,7 +169,7 @@ describe("herdr_tab", () => {
     harness.confirm.mockResolvedValueOnce(false);
     await expect(execute(harness, { operation: "close", target: "t2" })).rejects.toMatchObject({ code: "CONFIRMATION_DECLINED" });
     const original = harness.cli;
-    original.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+    original.runJson = vi.fn<HerdrCli["runJson"]>(async (argv) => {
       if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } };
       if (argv[0] === "tab" && argv[1] === "close") return { id: "close", result: { ok: true } };
       if (argv[0] === "tab" && argv[1] === "get") return { id: "get", result: { tab: harness.snapshot.tabs[1] } };

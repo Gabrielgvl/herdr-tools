@@ -108,10 +108,10 @@ describe("runtime topology ownership", () => {
     expect(closePolicy({ topology: { nodes: [] }, target: { kind: "pane", id: "orphan" }, hasUI: false }, ledger)).toMatchObject({ allowed: true });
     expect(closePolicy({ topology: { nodes: [] }, target: { kind: "pane", id: "other" }, hasUI: false }, new RuntimeOwnership())).toMatchObject({ allowed: false, code: "CONFIRMATION_UNAVAILABLE" });
     expect(closePolicy({ topology: { nodes: [] }, target: { kind: "pane", id: "orphan" }, hasUI: true, } as never, ledger)).toMatchObject({ allowed: true });
-    expect(closePolicy({ topology: { nodes: [] }, caller: { paneId: "protected" }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
-    expect(closePolicy({ topology: { nodes: [] }, caller: { tabId: "protected" }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
-    expect(closePolicy({ topology: { nodes: [] }, caller: { workspaceId: "protected" }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
-    expect(closePolicy({ topology: { nodes: [] }, caller: { paneId: "", tabId: "", workspaceId: "" }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [], caller: { paneId: "protected" } }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [], caller: { tabId: "protected" } }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [], caller: { workspaceId: "protected" } }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [], caller: { paneId: "", tabId: "", workspaceId: "" } }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
   });
 
   it("protects the caller pane, tab, workspace, and descendants of those ancestors", () => {

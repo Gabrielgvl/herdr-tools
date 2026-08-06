@@ -87,6 +87,9 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     resetOwnership(runtime.ownership);
   });
+  pi.on("session_start", async () => {
+    resetOwnership(runtime.ownership);
+  });
 
   pi.registerTool(createInspectTool({ cli: runtime.cli, context: runtime.context, environment }));
   pi.registerTool(createCommunicateTool({ cli: runtime.cli, context: runtime.context }));

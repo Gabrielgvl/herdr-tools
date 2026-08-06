@@ -60,7 +60,7 @@ describe("global extension registration", () => {
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_command");
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_workspace");
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_admin");
-    expect(handlers.map((entry) => entry.event)).toEqual(["session_shutdown"]);
+    expect(handlers.map((entry) => entry.event)).toEqual(["session_shutdown", "session_start"]);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 
@@ -88,15 +88,18 @@ describe("global extension registration", () => {
     await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "low" });
   });
 
-  it("resets only in-memory ownership on session shutdown", async () => {
+  it("resets only in-memory ownership on every session transition", async () => {
     enable();
     const reset = vi.spyOn(RuntimeOwnership.prototype, "reset");
     const { pi, handlers } = fakePi();
     extension(pi);
-    const shutdown = handlers[0]?.handler;
+    const shutdown = handlers.find((entry) => entry.event === "session_shutdown")?.handler;
+    const start = handlers.find((entry) => entry.event === "session_start")?.handler;
     expect(shutdown).toBeDefined();
+    expect(start).toBeDefined();
     await shutdown?.({} as never, {} as never);
-    expect(reset).toHaveBeenCalledTimes(1);
+    await start?.({} as never, {} as never);
+    expect(reset).toHaveBeenCalledTimes(2);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 });

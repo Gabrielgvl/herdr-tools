@@ -1,6 +1,6 @@
 # Specification: Herdr Tools Pi Extension
 
-**Status:** Specification only. No implementation or tests are included in this deliverable.
+**Status:** Implemented and release-validated.
 
 ## Objective
 
@@ -181,7 +181,7 @@ A wait whose timeout is longer than the configured review cadence is a long wait
 
 Long waits use mandatory in-process, tool-less reviewer calls:
 
-- The reviewer model is the extension-owned setting from `config.json`, default `luna`; the tool cannot select or override it.
+- The reviewer model is the extension-owned setting from `config.json`, default `openai-codex/gpt-5.6-luna`; the tool cannot select or override it.
 - Reviewer thinking is fixed at `low`; the tool cannot select or override it.
 - At every review interval, one independent reviewer call is made per target, all concurrently, with no target-count cap.
 - Reviewer calls are not Herdr panes, are invisible in Herdr topology, receive no tools, and cannot mutate or communicate.
@@ -322,13 +322,13 @@ The optional extension-owned `config.json` uses this JSON shape:
 {
   "wait": {
     "reviewCadenceMinutes": 5,
-    "reviewerModel": "luna"
+    "reviewerModel": "openai-codex/gpt-5.6-luna"
   }
 }
 ```
 
 - `wait.reviewCadenceMinutes`: integer, default `5`, inclusive range `1..30`.
-- `wait.reviewerModel`: model identifier, default `luna`.
+- `wait.reviewerModel`: model identifier, default `openai-codex/gpt-5.6-luna`.
 - Reviewer thinking level is fixed to `low` and is not configurable by a tool call.
 
 If `config.json` is absent, use the specified defaults. If it is present but malformed or invalid, fail closed with `INVALID_SETTINGS`; do not coerce values or fall back to defaults or another reviewer model. A configured reviewer model that cannot be resolved or authenticated causes a long wait to fail with `REVIEWER_FAILED`; there is no fallback model.
@@ -544,7 +544,7 @@ The feature is complete only when all of the following are true:
 - Inspection has the specified current, single-target, collection, and health behavior.
 - Communication distinguishes normal prompt, explicit steer, and named keys; normal prompt never interrupts a working target; no communication operation waits for completion.
 - Wait supports the specified raw/semantic states, literal/regex output, any/all, explicit one-hour maximum, structured timeout snapshots, and mandatory reviewer supervision for long waits.
-- Reviewer calls are in-process, tool-less, concurrent per target, bounded, non-mutating, fixed at low thinking, use the extension-owned reviewer model (default `luna`), and fail immediately without fallback when unavailable.
+- Reviewer calls are in-process, tool-less, concurrent per target, bounded, non-mutating, fixed at low thinking, use the extension-owned reviewer model (default `openai-codex/gpt-5.6-luna`), and fail immediately without fallback when unavailable.
 - Launch requires a unique caller name and supported kind, uses the specified placement defaults, supports argv without arbitrary executables, verifies initial work, streams progress, and never cleans failed launches.
 - Pane and tab topology operations implement the specified defaults, labels, environment behavior, ownership confirmations, protected ancestors, and authoritative post-state.
 - Results are structured and concise, custom rows are compact, and waits/launches stream progress.

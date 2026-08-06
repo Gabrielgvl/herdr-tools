@@ -20,7 +20,7 @@ Pi discovers the directory through its root `index.ts` when it is installed at `
 {
   "wait": {
     "reviewCadenceMinutes": 5,
-    "reviewerModel": "luna"
+    "reviewerModel": "openai-codex/gpt-5.6-luna"
   }
 }
 ```

@@ -1,6 +1,6 @@
 {
   "wait": {
     "reviewCadenceMinutes": 5,
-    "reviewerModel": "luna"
+    "reviewerModel": "openai-codex/gpt-5.6-luna"
   }
 }

@@ -85,7 +85,7 @@ describe("global extension registration", () => {
     expect(runtime.idsPresent).toBe(true);
     expect(runtime.idsValid).toBe(true);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
-    await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "low" });
+    await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "low" });
   });
 
   it("resets only in-memory ownership on session shutdown", async () => {

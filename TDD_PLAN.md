@@ -151,7 +151,7 @@ must not consult project config, environment values, or tool-call fields.
 The settings contract under test is:
 
 - missing `config.json`: defaults to `reviewCadenceMinutes: 5`,
-  `reviewerModel: "luna"`, and fixed reviewer thinking `low`;
+  `reviewerModel: "openai-codex/gpt-5.6-luna"`, and fixed reviewer thinking `low`;
 - valid JSON: loads the documented cadence/model values without coercion;
 - malformed JSON: fails closed with `INVALID_SETTINGS` before Herdr or reviewer
   work, and never rewrites the file;
@@ -185,7 +185,7 @@ project-local file. The loader must distinguish a missing file from malformed
 JSON and invalid values:
 
 - missing `config.json` returns defaults `{ reviewCadenceMinutes: 5,
-  reviewerModel: "luna", reviewerThinking: "low" }` without creating the file;
+  reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "low" }` without creating the file;
 - valid JSON accepts only the documented settings shape and preserves the
   configured values without coercion;
 - malformed JSON returns `INVALID_SETTINGS` before any Herdr or reviewer call;

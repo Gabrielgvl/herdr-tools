@@ -1,0 +1,136 @@
+import { describe, expect, it } from "vitest";
+import { TargetResolutionError, parseSnapshotResult, resolveTarget, type HerdrSnapshot } from "../../src/targets.js";
+
+const snapshot: HerdrSnapshot = {
+  version: "0.8.0",
+  protocol: 19,
+  workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
+  tabs: [
+    { tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }
+  ],
+  panes: [
+    { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "working", agent_name: "foundation" },
+    { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "reviewer", agent_status: "idle", agent_name: "reviewer" },
+    { pane_id: "w1:p3", tab_id: "w1:t1", workspace_id: "w1", label: "duplicate", agent_status: "idle", agent_name: "same" },
+    { pane_id: "w1:p4", tab_id: "w1:t1", workspace_id: "w1", label: "other", agent_status: "idle", agent_name: "same" }
+  ],
+  agents: [
+    { pane_id: "w1:p1", name: "foundation", agent_status: "working" },
+    { pane_id: "w1:p2", name: "reviewer", agent_status: "idle" },
+    { pane_id: "w1:p3", name: "same", agent_status: "idle" },
+    { pane_id: "w1:p4", name: "same", agent_status: "idle" }
+  ]
+};
+
+const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
+
+describe("exact target resolution", () => {
+  it("resolves current, opaque IDs, labels, and unique agent names", () => {
+    expect(resolveTarget(snapshot, "current", "pane", context).paneId).toBe("w1:p1");
+    expect(resolveTarget(snapshot, "w1:p2", "pane", context).paneId).toBe("w1:p2");
+    expect(resolveTarget(snapshot, "reviewer", "pane", context).paneId).toBe("w1:p2");
+    expect(resolveTarget(snapshot, "reviewer", "agent", context).paneId).toBe("w1:p2");
+  });
+
+  it("resolves current from injected context rather than focused metadata", () => {
+    const unfocused = { ...context, paneId: "w1:p2" };
+    expect(resolveTarget(snapshot, "current", "pane", unfocused).paneId).toBe("w1:p2");
+  });
+
+  it("fails closed for missing, ambiguous, fuzzy, case-variant, and wrong-kind targets", () => {
+    for (const ref of ["missing", "rev", "REVIEWER"]) {
+      expect(() => resolveTarget(snapshot, ref, "pane", context)).toThrow(TargetResolutionError);
+    }
+    expect(() => resolveTarget(snapshot, "same", "agent", context)).toThrowError(/TARGET_AMBIGUOUS/);
+    expect(() => resolveTarget(snapshot, "w1:t1", "pane", context)).toThrowError(/TARGET_TYPE_MISMATCH/);
+    expect(() => resolveTarget(snapshot, "w1:p2", "tab", context)).toThrowError(/TARGET_TYPE_MISMATCH/);
+  });
+
+  it("rejects an unavailable current context before any fallback", () => {
+    expect(() => resolveTarget(snapshot, "current", "pane", { workspaceId: "w1", tabId: "w1:t1" })).toThrowError(/CONTEXT_UNAVAILABLE/);
+    expect(() => resolveTarget(snapshot, "", "pane", context)).toThrowError(/INVALID_INPUT/);
+    expect(() => resolveTarget(snapshot, "bad\nvalue", "pane", context)).toThrowError(/INVALID_INPUT/);
+  });
+
+  it("resolves workspace and tab IDs, labels, and current context by kind", () => {
+    expect(resolveTarget(snapshot, "w1", "workspace", context).id).toBe("w1");
+    expect(resolveTarget(snapshot, "workspace", "workspace", context).id).toBe("w1");
+    expect(resolveTarget(snapshot, "w1:t1", "tab", context).id).toBe("w1:t1");
+    expect(resolveTarget(snapshot, "main", "tab", context).id).toBe("w1:t1");
+    expect(resolveTarget(snapshot, "current", "tab", context).id).toBe("w1:t1");
+    expect(resolveTarget(snapshot, "current", "workspace", context).id).toBe("w1");
+    expect(resolveTarget(snapshot, "current", "agent", context).id).toBe("w1:p1");
+  });
+
+  it("resolves an exact pane label for an unnamed agent", () => {
+    const unnamed = { ...snapshot, panes: snapshot.panes.map((pane) => pane.pane_id === "w1:p2" ? { ...pane, agent_name: undefined } : pane), agents: snapshot.agents.map((agent) => agent.pane_id === "w1:p2" ? { pane_id: agent.pane_id, agent_status: agent.agent_status } : agent) };
+    expect(resolveTarget(unnamed, "reviewer", "agent", context)).toMatchObject({ id: "w1:p2", label: "reviewer", agentName: undefined });
+  });
+
+  it("fails closed for ambiguous pane labels and preserves orphan agent metadata", () => {
+    const duplicate = { ...snapshot, panes: [...snapshot.panes, { ...snapshot.panes[1], pane_id: "w1:p5", label: "reviewer" }] };
+    expect(() => resolveTarget(duplicate, "reviewer", "pane", context)).toThrowError(/TARGET_AMBIGUOUS/);
+    const orphan = { ...snapshot, agents: [...snapshot.agents, { pane_id: "orphan", name: "orphan" }] };
+    expect(resolveTarget(orphan, "orphan", "agent", context)).toMatchObject({ id: "orphan", workspaceId: "", tabId: undefined, label: undefined, agentName: "orphan" });
+  });
+});
+
+describe("authoritative snapshot parser", () => {
+  const rawSnapshot = {
+    version: "0.8.0",
+    protocol: 19,
+    workspaces: [{ workspace_id: "w1", label: "workspace" }],
+    tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main" }],
+    panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi" }],
+    agents: [{ pane_id: "w1:p1", agent: "pi" }]
+  };
+
+  it("normalizes the installed snapshot wrapper and authoritative agent names", () => {
+    const parsed = parseSnapshotResult({ type: "session_snapshot", snapshot: rawSnapshot });
+    expect(parsed.panes[0].agent_name).toBeUndefined();
+    expect(parsed.agents[0].name).toBeUndefined();
+  });
+
+  it.each([
+    null,
+    {},
+    { type: "wrong", snapshot: rawSnapshot },
+    { type: "session_snapshot", snapshot: { ...rawSnapshot, workspaces: null } },
+    { type: "session_snapshot", snapshot: { ...rawSnapshot, tabs: null } },
+    { type: "session_snapshot", snapshot: { ...rawSnapshot, panes: null } },
+    { type: "session_snapshot", snapshot: { ...rawSnapshot, agents: null } },
+    { type: "session_snapshot", snapshot: { ...rawSnapshot, version: 1 } },
+    { type: "session_snapshot", snapshot: { ...rawSnapshot, protocol: "19" } }
+  ])("rejects incompatible top-level snapshots: %s", (value) => {
+    expect(() => parseSnapshotResult(value)).toThrow();
+  });
+
+  it("rejects malformed workspace, tab, pane, and agent records", () => {
+    const cases = [
+      { workspaces: [null] },
+      { workspaces: [{ workspace_id: "", label: "workspace" }] },
+      { workspaces: [{ workspace_id: "w1", label: "" }] },
+      { tabs: [null] },
+      { tabs: [{ tab_id: "", workspace_id: "w1", label: "main" }] },
+      { tabs: [{ tab_id: "t", workspace_id: "", label: "main" }] },
+      { tabs: [{ tab_id: "t", workspace_id: "w1", label: "" }] },
+      { panes: [null] },
+      { panes: [{ pane_id: "", tab_id: "t", workspace_id: "w1" }] },
+      { panes: [{ pane_id: "p", tab_id: "", workspace_id: "w1" }] },
+      { panes: [{ pane_id: "p", tab_id: "t", workspace_id: "" }] },
+      { agents: [null] },
+      { agents: [{ pane_id: "" }] }
+    ];
+    for (const change of cases) {
+      expect(() => parseSnapshotResult({ type: "session_snapshot", snapshot: { ...rawSnapshot, ...change } })).toThrow();
+    }
+  });
+
+  it("accepts explicit agent names and rejects non-finite protocol values", () => {
+    const explicit = { ...rawSnapshot, panes: [{ ...rawSnapshot.panes[0], name: "named-pane" }], agents: [{ pane_id: "w1:p1", name: "named" }] };
+    const parsed = parseSnapshotResult({ type: "session_snapshot", snapshot: explicit });
+    expect(parsed.panes[0].agent_name).toBe("named-pane");
+    expect(parsed.agents[0].name).toBe("named");
+    expect(() => parseSnapshotResult({ type: "session_snapshot", snapshot: { ...rawSnapshot, protocol: Number.NaN } })).toThrowError(/Snapshot field protocol/);
+  });
+});

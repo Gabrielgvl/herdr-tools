@@ -104,6 +104,6 @@ describe("herdr_communicate", () => {
     expect(result?.render(80)).toEqual(["sent · w1:p2 · working"]);
     result?.invalidate();
     const empty = tool.renderResult?.({ content: [], isError: true } as never, {} as never, {} as never, {} as never);
-    expect(empty?.render(80)).toEqual(["sent"]);
+    expect(empty?.render(80)).toEqual(["error UNKNOWN"]);
   });
 });

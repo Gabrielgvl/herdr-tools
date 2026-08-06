@@ -59,6 +59,23 @@ describe("herdr_launch", () => {
     expect(result.details).toMatchObject({ outcome: "launched", name: "worker", kind: "pi", paneId: "w1:p2", tabId: "w1:t1", agentId: "agent-7", postState: { agent_status: "working" } });
   });
 
+  it("records returned launch resources through the narrow shared registry", async () => {
+    const { cli } = makeCli();
+    const record = vi.fn();
+    await createLaunchTool({ cli, context, cwd: "/repo", ownership: { record } }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext);
+    expect(record).toHaveBeenCalledWith({ kind: "pane", id: "w1:p2", parentId: "w1:t1" });
+  });
+
+  it("keeps caller-provided names when the start response is not an object", async () => {
+    const { cli } = makeCli();
+    const base = cli.runJson;
+    cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "agent" && argv[1] === "start") return ok("start", null);
+      return base(argv, signal);
+    });
+    await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { name: "worker" } });
+  });
+
   it("passes arbitrary environment values unchanged and does not mutate process.env", async () => {
     const before = process.env.LAUNCH_TEST_SECRET;
     const { promise, calls } = launch({ env: { LAUNCH_TEST_SECRET: "value with spaces", OTHER: "a=b" } });
@@ -78,10 +95,10 @@ describe("herdr_launch", () => {
       if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1", label: "worker", agent_status: "idle" } });
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
     });
-    const result = await createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "claude", placement: { mode: "new_tab", tabLabel: "agents" }, focus: false }, new AbortController().signal, undefined, extensionContext);
+    const result = await createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "claude", placement: { mode: "new_tab", tabLabel: "agents" }, focus: true }, new AbortController().signal, undefined, extensionContext);
     expect(calls).toEqual([
       ["api", "snapshot"],
-      ["tab", "create", "--workspace", "w1", "--cwd", "/repo", "--label", "agents", "--no-focus"],
+      ["tab", "create", "--workspace", "w1", "--cwd", "/repo", "--label", "agents", "--focus"],
       ["pane", "rename", "w1:p3", "worker"],
       ["agent", "start", "worker", "--kind", "claude", "--pane", "w1:p3", "--timeout", "30000"],
       ["pane", "get", "w1:p3"]
@@ -191,6 +208,7 @@ describe("herdr_launch", () => {
 
   it("handles authoritative response variants and rejects missing placement IDs", async () => {
     const variants = [
+      { new_pane: { pane_id: "w1:p2" } },
       { new_pane: { pane_id: "w1:p2", tab_id: "w1:t1" } },
       { child_pane: { pane_id: "w1:p2", tab_id: "w1:t1" } },
       { created_pane: { pane_id: "w1:p2", tab_id: "w1:t1" } },
@@ -218,6 +236,16 @@ describe("herdr_launch", () => {
     });
     await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
     expect(calls.some((call) => call[0] === "pane" && call[1] === "close")).toBe(false);
+  });
+
+  it("rejects non-object pane placement responses before any dependent mutation", async () => {
+    const { cli } = makeCli();
+    cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv) => {
+      if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot });
+      if (argv[0] === "pane" && argv[1] === "split") return ok("split", null);
+      throw new Error(`unexpected argv: ${argv.join(" ")}`);
+    });
+    await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
   });
 
   it("uses the tab lookup fallback and rejects malformed tab responses", async () => {

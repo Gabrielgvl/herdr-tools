@@ -46,8 +46,9 @@ describe("exact target resolution", () => {
     expect(() => resolveTarget(snapshot, "w1:p2", "tab", context)).toThrowError(/TARGET_TYPE_MISMATCH/);
   });
 
-  it("rejects an unavailable current context before any fallback", () => {
+  it("rejects an unavailable or inconsistent current context before any fallback", () => {
     expect(() => resolveTarget(snapshot, "current", "pane", { workspaceId: "w1", tabId: "w1:t1" })).toThrowError(/CONTEXT_UNAVAILABLE/);
+    expect(() => resolveTarget(snapshot, "current", "pane", { workspaceId: "w1", tabId: "w1:t1", paneId: "missing" })).toThrowError(/CONTEXT_UNAVAILABLE/);
     expect(() => resolveTarget(snapshot, "", "pane", context)).toThrowError(/INVALID_INPUT/);
     expect(() => resolveTarget(snapshot, "bad\nvalue", "pane", context)).toThrowError(/INVALID_INPUT/);
   });

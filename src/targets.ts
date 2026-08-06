@@ -100,6 +100,18 @@ export function parseSnapshotResult(value: unknown): HerdrSnapshot {
   return { ...raw, version: requiredString(raw.version, "version"), protocol: requiredNumber(raw.protocol, "protocol"), workspaces, tabs, panes, agents } as HerdrSnapshot;
 }
 
+export function assertCurrentContext(snapshot: HerdrSnapshot, context: CurrentContext): void {
+  if (!context.workspaceId || !context.tabId || !context.paneId) {
+    throw new TargetResolutionError("CONTEXT_UNAVAILABLE", "CONTEXT_UNAVAILABLE: current Herdr context is unavailable");
+  }
+  const workspace = snapshot.workspaces.find((item) => item.workspace_id === context.workspaceId);
+  const tab = snapshot.tabs.find((item) => item.tab_id === context.tabId);
+  const pane = snapshot.panes.find((item) => item.pane_id === context.paneId);
+  if (!workspace || !tab || !pane || tab.workspace_id !== workspace.workspace_id || pane.tab_id !== tab.tab_id || pane.workspace_id !== workspace.workspace_id) {
+    throw new TargetResolutionError("CONTEXT_UNAVAILABLE", "CONTEXT_UNAVAILABLE: injected Herdr context is inconsistent", { workspaceId: context.workspaceId, tabId: context.tabId, paneId: context.paneId });
+  }
+}
+
 export interface ResolvedTarget {
   kind: ResourceKind;
   id: string;
@@ -145,10 +157,10 @@ function candidates(snapshot: HerdrSnapshot, ref: string, kind: ResourceKind): R
 export function resolveTarget(snapshot: HerdrSnapshot, ref: TargetRef, kind: ResourceKind, context: CurrentContext): ResolvedTarget {
   if (ref.length === 0 || /[\n\r\0]/.test(ref)) throw new TargetResolutionError("INVALID_INPUT", "INVALID_INPUT: target must be a single non-empty identifier");
   if (ref === "current") {
-    if (!context.workspaceId || !context.tabId || !context.paneId) throw new TargetResolutionError("CONTEXT_UNAVAILABLE", "CONTEXT_UNAVAILABLE: current Herdr context is unavailable");
-    if (kind === "pane" || kind === "agent") return resolveTarget(snapshot, context.paneId, kind, context);
-    if (kind === "tab") return resolveTarget(snapshot, context.tabId, kind, context);
-    return resolveTarget(snapshot, context.workspaceId, kind, context);
+    assertCurrentContext(snapshot, context);
+    if (kind === "pane" || kind === "agent") return resolveTarget(snapshot, context.paneId!, kind, context);
+    if (kind === "tab") return resolveTarget(snapshot, context.tabId!, kind, context);
+    return resolveTarget(snapshot, context.workspaceId!, kind, context);
   }
 
   const byId = exactId(snapshot, ref);

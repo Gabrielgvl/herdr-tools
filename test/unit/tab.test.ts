@@ -126,6 +126,58 @@ describe("herdr_tab", () => {
     expect(JSON.stringify(result)).not.toContain("do-not-leak");
   });
 
+  it("accepts the authoritative create_result tab shape and handles missing context", async () => {
+    const harness = makeHarness();
+    harness.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "create") return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4", workspace_id: "w1" }, root_pane: { pane_id: "p4" } } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { tab: { tab_id: "t4", workspace_id: "w1", label: "created" } } }), stderr: "", code: 0, killed: false };
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    }));
+    await expect(execute(harness, { operation: "create", label: "created" })).resolves.toMatchObject({ details: { tabId: "t4", rootPaneId: "p4" } });
+    await expect(createTabTool({ cli: harness.cli, context: {} }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
+
+    const invalidCreate = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "" } } }), stderr: "", code: 0, killed: false };
+    }));
+    await expect(createTabTool({ cli: invalidCreate, context }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+
+    const invalidPost = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "create") return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4" } } }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ id: "get", result: { tab: { tab_id: "t4" } } }), stderr: "", code: 0, killed: false };
+    }));
+    await expect(createTabTool({ cli: invalidPost, context }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    const invalidObject = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "create") return { stdout: JSON.stringify({ id: "create", result: { tab: { tab_id: "t4" } } }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ id: "get", result: null }), stderr: "", code: 0, killed: false };
+    }));
+    await expect(createTabTool({ cli: invalidObject, context }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+
+    const directTab = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "tab" && argv[1] === "create") return { stdout: JSON.stringify({ id: "create", result: { tab_id: "t5", root_pane: {} } }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ id: "get", result: { tab_id: "t5", workspace_id: "w1", label: "direct" } }), stderr: "", code: 0, killed: false };
+    }));
+    await expect(createTabTool({ cli: directTab, context }).execute("id", { operation: "create", label: "direct" }, undefined, undefined, harness.ctx)).resolves.toMatchObject({ details: { tabId: "t5", rootPaneId: undefined } });
+  });
+
+  it("rejects confirmation declines and contradictory close post-state", async () => {
+    const harness = makeHarness();
+    harness.confirm.mockResolvedValueOnce(false);
+    await expect(execute(harness, { operation: "close", target: "t2" })).rejects.toMatchObject({ code: "CONFIRMATION_DECLINED" });
+    const original = harness.cli;
+    original.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } };
+      if (argv[0] === "tab" && argv[1] === "close") return { id: "close", result: { ok: true } };
+      if (argv[0] === "tab" && argv[1] === "get") return { id: "get", result: { tab: harness.snapshot.tabs[1] } };
+      return { id: "other", result: {} };
+    });
+    await expect(execute(harness, { operation: "close", target: "t2" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+  });
+
   it("fails closed when tab creation does not return an opaque ID and renders compact rows", async () => {
     const harness = makeHarness();
     const badExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
@@ -134,10 +186,13 @@ describe("herdr_tab", () => {
     });
     await expect(createTabTool({ cli: new HerdrCli(badExec), context }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const tool = createTabTool({ cli: harness.cli, context });
-    const call = tool.renderCall?.({ operation: "focus", target: "t2" } as never, {} as never, {} as never);
-    expect(call?.render(80)).toEqual(["herdr_tab · focus · t2"]);
+    const call = tool.renderCall?.({ operation: "create", label: "new" } as never, {} as never, {} as never);
+    expect(call?.render(80)).toEqual(["herdr_tab · create"]);
+    const targetedCall = tool.renderCall?.({ operation: "focus", target: "t2" } as never, {} as never, {} as never);
+    expect(targetedCall?.render(80)).toEqual(["herdr_tab · focus · t2"]);
+    targetedCall?.invalidate();
     call?.invalidate();
-    const result = tool.renderResult?.({ content: [], details: { operation: "focus", outcome: "success", tabId: "t2" } } as never, { expanded: false, isPartial: false } as never, {} as never, { isError: false } as never);
+    const result = tool.renderResult?.({ content: [], details: { operation: "create", outcome: "success", tabId: "t2" } } as never, { expanded: false, isPartial: false } as never, {} as never, { isError: false } as never);
     expect(result?.render(80)).toEqual(["tab · t2"]);
     result?.invalidate();
   });

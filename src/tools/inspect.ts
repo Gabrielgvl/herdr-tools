@@ -2,7 +2,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext } from "../targets.js";
-import { formatCall, formatResult } from "../tui.js";
+import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 interface InspectDetails {
   operation: "inspect";
@@ -17,11 +17,21 @@ interface InspectDetails {
   server?: { status: string; version?: string; protocol?: number };
   socketReachable?: boolean;
   compatible?: boolean;
+  environment?: {
+    enabled: boolean;
+    currentIdsPresent: boolean;
+    currentIdsValid: boolean;
+  };
 }
 
 export interface InspectDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  environment?: {
+    enabled: boolean;
+    currentIdsPresent: boolean;
+    currentIdsValid: boolean;
+  };
 }
 
 function asPane(result: unknown): Record<string, unknown> {
@@ -67,7 +77,16 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       if (mode === "health") {
         if (input.target !== undefined || input.collection !== undefined) throw Object.assign(new Error("health does not accept target or collection"), { code: "INVALID_INPUT" });
         const health = parseHealth(await deps.cli.runText(["status", "--json"], signal!));
-        return { content: [{ type: "text", text: "Herdr health inspected" }], details: { operation: "inspect", kind: "health", outcome: "success", ...health } };
+        return {
+          content: [{ type: "text", text: "Herdr health inspected" }],
+          details: {
+            operation: "inspect",
+            kind: "health",
+            outcome: "success",
+            environment: deps.environment ?? { enabled: true, currentIdsPresent: Boolean(deps.context.workspaceId && deps.context.tabId && deps.context.paneId), currentIdsValid: true },
+            ...health,
+          },
+        };
       }
       if (mode === "collection") {
         if (!input.collection || input.target !== undefined) throw Object.assign(new Error("collection mode requires collection and rejects target"), { code: "INVALID_INPUT" });
@@ -90,10 +109,12 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       const details: InspectDetails = { operation: "inspect", kind: "target", outcome: "success", target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName }, metadata: pane, recentUnwrappedLines };
       return { content: [{ type: "text", text: formatResult({ operation: "inspect", outcome: "success", targetId: target.id }) }], details };
     },
-    renderCall(rawArgs) {
+    renderCall(rawArgs, theme) {
       const args = rawArgs as unknown as InspectParams;
-      return { render: () => [formatCall("herdr_inspect", args.mode ?? "context", args.target)], invalidate() {} };
+      return textComponent(formatCall("herdr_inspect", args.mode ?? "context", args.target), theme, "accent");
     },
-    renderResult(result) { return { render: () => [formatResult({ operation: "inspect", outcome: "success", targetId: result.details?.target?.paneId })], invalidate() {} }; }
+    renderResult(result, options, theme) {
+      return renderResultComponent("inspect", result, options, theme, result.details?.target?.paneId);
+    }
   };
 }

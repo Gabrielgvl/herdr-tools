@@ -3,7 +3,7 @@ import type { HerdrCli } from "../cli.js";
 import { closePolicy, recordCreatedResource, runtimeOwnership, type CloseTopology, type RuntimeOwnership } from "../ownership.js";
 import { assertSafeEnvironment, assertSafeIdentifier, TabParamsSchema, type TabParams } from "../topology-schema.js";
 import { parseSnapshotResult, type CurrentContext, type HerdrSnapshot, type TabRecord } from "../targets.js";
-import { formatCall, formatResult } from "../tui.js";
+import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface TabDetails {
   operation: TabParams["operation"];
@@ -44,10 +44,9 @@ function tabFrom(value: unknown): TabRecord {
 
 function createdTab(value: unknown): { tabId: string; rootPaneId?: string } {
   const root = object(value);
-  const createResult = typeof root.create_result === "object" && root.create_result !== null && !Array.isArray(root.create_result) ? root.create_result as Record<string, unknown> : undefined;
-  const tab = object(root.tab ?? createResult?.tab);
+  const tab = object(root.tab ?? root);
   if (typeof tab.tab_id !== "string" || tab.tab_id.length === 0) throw Object.assign(new Error("Herdr tab create response is missing tab_id"), { code: "CLI_PROTOCOL_ERROR" });
-  const rootPane = root.root_pane ?? root.rootPane ?? createResult?.root_pane;
+  const rootPane = root.root_pane ?? root.rootPane;
   let rootPaneId: string | undefined;
   if (typeof rootPane === "object" && rootPane !== null && !Array.isArray(rootPane)) {
     const candidate = (rootPane as Record<string, unknown>).pane_id;
@@ -75,8 +74,7 @@ function assertContext(snapshotValue: HerdrSnapshot, context: CurrentContext): v
 function tabTarget(snapshotValue: HerdrSnapshot, ref: string, context: CurrentContext): TabRecord {
   assertContext(snapshotValue, context);
   assertSafeIdentifier(ref, "target");
-  const id = ref === "current" ? context.tabId : ref;
-  if (!id) throw Object.assign(new Error("CONTEXT_UNAVAILABLE: current tab is unavailable"), { code: "CONTEXT_UNAVAILABLE" });
+  const id = ref === "current" ? context.tabId! : ref;
   const tab = snapshotValue.tabs.find((candidate) => candidate.tab_id === id);
   if (!tab) throw Object.assign(new Error(`TARGET_NOT_FOUND: no exact tab ID matched ${ref}`), { code: "TARGET_NOT_FOUND", details: { target: ref } });
   return tab;
@@ -137,8 +135,7 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
         assertSafeEnvironment(params.env);
         const current = await snapshot(deps.cli, activeSignal);
         assertContext(current, deps.context);
-        const workspaceId = deps.context.workspaceId;
-        if (!workspaceId) throw Object.assign(new Error("CONTEXT_UNAVAILABLE: current workspace is unavailable"), { code: "CONTEXT_UNAVAILABLE" });
+        const workspaceId = deps.context.workspaceId!;
         const created = await deps.cli.runJson([
           "tab", "create", "--workspace", workspaceId, "--label", params.label,
           "--cwd", params.cwd ?? deps.cwd ?? ctx.cwd,
@@ -167,10 +164,11 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
       const details = await closeTab(deps, params, activeSignal, ctx);
       return { content: [{ type: "text", text: formatResult({ operation: "tab", outcome: "success", targetId: details.tabId }) }], details };
     },
-    renderCall(args) { return { render: () => [formatCall("herdr_tab", args.operation, "target" in args ? args.target : undefined)], invalidate() {} }; },
-    renderResult(output: AgentToolResult<TabDetails>) {
-      const details = output.details;
-      return { render: () => [formatResult({ operation: "tab", outcome: details ? "success" : "error", targetId: details?.tabId, code: details ? undefined : "UNKNOWN" })], invalidate() {} };
+    renderCall(args, theme) {
+      return textComponent(formatCall("herdr_tab", args.operation, "target" in args ? args.target : undefined), theme, "accent");
+    },
+    renderResult(output: AgentToolResult<TabDetails>, options, theme) {
+      return renderResultComponent("tab", output, options, theme, output.details?.tabId);
     }
   };
 }

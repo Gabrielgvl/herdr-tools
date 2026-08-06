@@ -2,7 +2,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
 import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext } from "../targets.js";
-import { formatCall, formatResult } from "../tui.js";
+import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 interface CommunicateDetails {
   operation: "prompt" | "steer" | "keys";
@@ -65,7 +65,11 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       };
       return { content: [{ type: "text", text: formatResult({ operation: "communicate", outcome: "success", targetId: target.paneId, postState: { agent_status: stateOf(postState) } }) }], details };
     },
-    renderCall(args) { return { render: () => [formatCall("herdr_communicate", args.operation, args.target)], invalidate() {} }; },
-    renderResult(result) { return { render: () => [formatResult({ operation: "communicate", outcome: "success", targetId: result.details?.target.paneId, postState: result.details?.postState as { agent_status?: string } })], invalidate() {} }; }
+    renderCall(args, theme) {
+      return textComponent(formatCall("herdr_communicate", args.operation, args.target), theme, "accent");
+    },
+    renderResult(result, options, theme) {
+      return renderResultComponent("communicate", result, options, theme, result.details?.target.paneId);
+    }
   };
 }

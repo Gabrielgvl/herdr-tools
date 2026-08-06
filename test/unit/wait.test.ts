@@ -184,11 +184,18 @@ describe("herdr_wait", () => {
     const settingsError = Object.assign(new Error("bad config"), { code: "INVALID_SETTINGS" });
     await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { settingsLoader: async () => { throw settingsError; } })).rejects.toBe(settingsError);
     await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { settingsLoader: async () => { throw "bad config"; } })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { settingsLoader: async () => { throw new Error("settings down"); } })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     const defaultLoader = createWaitTool({ cli, context, clock: clock() });
     await expect(defaultLoader.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { outcome: "success" } });
     const reviewerError: WaitReviewer = { review: async () => { throw new Error("model down"); } };
     await expect(execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewerError })).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { cause: "model down" } });
     await expect(execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000 })).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
+  });
+
+  it("preserves an unknown reviewer target in the manager summary", async () => {
+    const reviewer: WaitReviewer = { review: async () => ({ targetId: "external", classification: "blocked", summary: "attention" }) };
+    const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
+    expect(result.details.reviewerSummaries?.[0]?.target).toBe("external");
   });
 
   it("polls authoritatively, streams bounded progress, and supports renderers", async () => {
@@ -216,6 +223,9 @@ describe("herdr_wait", () => {
     const call = tool.renderCall?.({ targets: ["p1"], match: "any" } as never, {} as never, {} as never);
     expect(call?.render(80)).toEqual(["herdr_wait · any · p1"]);
     call?.invalidate();
+    const defaultCall = tool.renderCall?.({} as never, {} as never, {} as never);
+    expect(defaultCall?.render(80)).toEqual(["herdr_wait · wait"]);
+    defaultCall?.invalidate();
     const rendered = tool.renderResult?.({ content: [], details: result.details, isError: false } as never, {} as never, {} as never, {} as never);
     expect(rendered?.render(80)).toEqual(["wait"]);
     rendered?.invalidate();
@@ -231,6 +241,13 @@ describe("herdr_wait", () => {
     const managerRendered = tool.renderResult?.({ content: [], details: { ...result.details, outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" }, isError: false } as never, {} as never, {} as never, {} as never);
     expect(managerRendered?.render(80)).toEqual(["error MANAGER_JUDGMENT_REQUIRED"]);
     managerRendered?.invalidate();
+  });
+
+  it("returns the final authoritative timeout branch when the deadline is observed before sleeping", async () => {
+    const cli = fakeCli({ p1: "not done" });
+    let nowCalls = 0;
+    const final = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 1 }, { clock: { now: () => nowCalls++ === 0 ? 0 : 2, sleep: async () => undefined } });
+    expect(final.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("covers deadline final reads and polling continuation", async () => {
@@ -256,6 +273,19 @@ describe("herdr_wait", () => {
     const pending = realClock.sleep(10_000, controller.signal);
     controller.abort();
     await expect(pending).rejects.toMatchObject({ code: "ABORTED" });
+  });
+
+  it("maps a generic read failure to a structured wait error", async () => {
+    const rejected: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        throw new Error("backend down");
+      },
+      async runText() { return ""; }
+    };
+    await expect(execute(rejected, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    const stringRejected: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: snapshot }; throw "backend down"; }, async runText() { return ""; } };
+    await expect(execute(stringRejected, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
   });
 
   it("preserves read failures as truthful structured errors", async () => {

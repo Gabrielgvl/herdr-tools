@@ -1,18 +1,23 @@
 import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { JsonEnvelope } from "../cli.js";
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
-import { parseSnapshotResult, resolveTarget } from "../targets.js";
-import { formatCall, formatResult } from "../tui.js";
+import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
+import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { isLaunchAgentKind, LaunchParamsSchema, type LaunchParams, type LaunchPlacement } from "../launch-schema.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal): Promise<JsonEnvelope>;
 }
 
+export interface LaunchResourceRegistry {
+  record(resource: { kind: "pane" | "tab"; id: string; parentId?: string }): void;
+}
+
 export interface LaunchDependencies {
   cli: LaunchCli;
   context: CurrentContext;
   cwd?: string;
+  ownership?: LaunchResourceRegistry;
 }
 
 export interface LaunchResourceIds {
@@ -198,6 +203,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       const placement = params.placement ?? { mode: "same_tab" as const };
       const label = params.label ?? params.name;
       const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
+      assertCurrentContext(snapshot, deps.context);
       if (existingAgentNames(snapshot).filter((name) => name === params.name).length > 0) {
         throw new LaunchError("INVALID_INPUT", `Agent name is already in use: ${params.name}`);
       }
@@ -205,7 +211,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         throw new LaunchError("INVALID_INPUT", "Environment overrides are supported only when Herdr creates the child pane or tab");
       }
       const existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, deps.context) : undefined;
-      const workspaceId = placement.mode === "new_tab" ? requiredContext(deps.context, "workspaceId") : undefined;
+      const workspaceId = placement.mode === "new_tab" ? deps.context.workspaceId! : undefined;
       let paneId: string | undefined;
       let tabId: string | undefined;
       let phase: LaunchDetails["phase"] = "placement";
@@ -220,18 +226,20 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           tabId = result.tabId;
           paneId = result.paneId;
           created.tabId = tabId;
+          deps.ownership?.record({ kind: "tab", id: tabId, parentId: workspaceId });
           if (!paneId) {
             const tab = await run(deps.cli, ["tab", "get", tabId], abortSignal);
             paneId = paneRefFrom(tab).paneId;
           }
           created.paneId = paneId;
+          deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
         } else {
           const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...focusArgs(params.focus === true), "--cwd", cwd, ...envArgs(params.env)], abortSignal, true));
           paneId = result.paneId;
-          tabId = result.tabId ?? deps.context.tabId;
+          tabId = result.tabId ?? deps.context.tabId!;
           created.paneId = paneId;
-          if (tabId) created.tabId = tabId;
-          if (!paneId || !tabId) throw new LaunchError("CLI_PROTOCOL_ERROR", "Created pane did not return an authoritative pane ID and tab context");
+          created.tabId = tabId;
+          deps.ownership?.record({ kind: "pane", id: paneId, parentId: tabId });
         }
         const resolvedPaneId = paneId!;
         if (placement.mode !== "existing_pane") {
@@ -279,19 +287,13 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         throw partialError(error, created, phase);
       }
     },
-    renderCall(args) {
-      return { render: () => [formatCall("herdr_launch", args.kind, args.name)], invalidate() {} };
+    renderCall(args, theme) {
+      return textComponent(formatCall("herdr_launch", args.kind, args.name), theme, "accent");
     },
-    renderResult(result) {
-      return { render: () => [formatResult({ operation: "launch", outcome: result.details?.outcome === "launched" ? "success" : "partial", targetId: result.details?.paneId })], invalidate() {} };
+    renderResult(result, options, theme) {
+      return renderResultComponent("launch", result, options, theme, result.details?.paneId);
     }
   };
-}
-
-function requiredContext(context: CurrentContext, field: "workspaceId" | "tabId" | "paneId"): string {
-  const value = context[field];
-  if (!value) throw new LaunchError("CONTEXT_UNAVAILABLE", `Current Herdr ${field} is unavailable`);
-  return value;
 }
 
 export { validateParams as validateLaunchParams };

@@ -115,6 +115,6 @@ describe("herdr_inspect", () => {
     expect(result?.render(80)).toEqual(["inspected · w1:p1"]);
     result?.invalidate();
     const empty = tool.renderResult?.({ content: [], isError: true } as never, {} as never, {} as never, {} as never);
-    expect(empty?.render(80)).toEqual(["inspected"]);
+    expect(empty?.render(80)).toEqual(["error UNKNOWN"]);
   });
 });

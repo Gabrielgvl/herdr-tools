@@ -4,7 +4,7 @@ import { loadSettings, type Settings } from "../settings.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
 import { validateWaitParams, WaitParamsSchema, type WaitCondition, type WaitParams } from "../wait-schema.js";
-import { formatCall, formatResult } from "../tui.js";
+import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface WaitClock {
   now(): number;
@@ -239,7 +239,7 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
       const sentLines = new Map<string, string[]>();
       let nextReview = start + cadenceMs;
       let lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
-      const progress = (text: string, outcome: WaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, snapshots, outcome, outcome === "success" ? "condition_met" : undefined, reviewerSummaries), text.slice(0, 500));
+      const progress = (text: string, outcome: WaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, snapshots, outcome, undefined, reviewerSummaries), text.slice(0, 500));
       progress("waiting");
 
       while (true) {
@@ -306,13 +306,12 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
         }
       }
     },
-    renderCall(rawArgs) {
+    renderCall(rawArgs, theme) {
       const args = rawArgs as WaitParams;
-      return { render: () => [formatCall("herdr_wait", `${args.match ?? "wait"}`, args.targets?.join(","))], invalidate() {} };
+      return textComponent(formatCall("herdr_wait", `${args.match ?? "wait"}`, args.targets?.join(",")), theme, "accent");
     },
-    renderResult(result) {
-      const details = result.details;
-      return { render: () => [formatResult({ operation: "wait", outcome: details?.outcome === "success" ? "success" : details?.outcome === "timeout" ? "timeout" : details?.outcome === "progress" ? "partial" : "error", code: details?.reason === "manager_judgment_required" ? "MANAGER_JUDGMENT_REQUIRED" : undefined })], invalidate() {} };
+    renderResult(result, options, theme) {
+      return renderResultComponent("wait", result, options, theme);
     }
   };
 }

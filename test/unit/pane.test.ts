@@ -153,6 +153,137 @@ describe("herdr_pane", () => {
     expect(harness.confirm).toHaveBeenCalled();
   });
 
+  it("uses all authoritative split response shapes and explicit topology variants", async () => {
+    for (const responseShape of [
+      { split_result: { pane: { pane_id: "p3" } } },
+      { move_result: { pane: { pane_id: "p3" } } },
+      { pane: { pane_id: "p3" } },
+    ]) {
+      const harness = makeHarness();
+      harness.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+        harness.calls.push(argv);
+        if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
+        if (argv[0] === "pane" && argv[1] === "split") return { stdout: JSON.stringify({ id: "split", result: responseShape }), stderr: "", code: 0, killed: false };
+        if (argv[0] === "pane" && argv[1] === "rename") return { stdout: JSON.stringify({ id: "rename", result: {} }), stderr: "", code: 0, killed: false };
+        if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { pane: { pane_id: "p3", tab_id: "t1", workspace_id: "w1", label: "new", environment: { SECRET: "hidden" } } } }), stderr: "", code: 0, killed: false };
+        throw new Error(`unexpected argv ${argv.join(" ")}`);
+      }));
+      await expect(execute(harness, { operation: "split", label: "new" })).resolves.toMatchObject({ details: { paneId: "p3" } });
+    }
+    await expect(execute(makeHarness(), { operation: "zoom", target: "p2", mode: "on" })).resolves.toMatchObject({ details: { operation: "zoom" } });
+    await expect(execute(makeHarness(), { operation: "zoom", target: "p2", mode: "off" })).resolves.toMatchObject({ details: { operation: "zoom" } });
+    await expect(execute(makeHarness(), { operation: "zoom", target: "p2" })).resolves.toMatchObject({ details: { operation: "zoom" } });
+  });
+
+  it("moves to a returned new tab and resolves agent-only exact names", async () => {
+    const harness = makeHarness();
+    runtimeOwnership.record({ kind: "pane", id: "p2", parentId: "t1" });
+    harness.snapshot.agents.push({ pane_id: "p2", name: "agent-only" });
+    await expect(execute(harness, { operation: "move", target: "agent-only", destination: { kind: "new_tab", label: "moved" } })).resolves.toMatchObject({ details: { operation: "move", paneId: "p2", tabId: "t-new" } });
+    await expect(execute(harness, { operation: "move", target: "p2", destination: { kind: "tab", target: "current" } })).resolves.toMatchObject({ details: { operation: "move", paneId: "p2", tabId: "t1" } });
+    expect(harness.calls).toContainEqual(["pane", "move", "p2", "--new-tab", "--workspace", "w1", "--tab-label", "moved", "--no-focus"]);
+    const transferred = makeHarness();
+    runtimeOwnership.record({ kind: "pane", id: "p2", parentId: "t1" });
+    const base = transferred.cli.runJson.bind(transferred.cli);
+    transferred.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "move") return { id: "move", result: { pane: { pane_id: "p9" } } };
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "p9", tab_id: "t2", workspace_id: "w1" } } };
+      return base(argv, signal);
+    });
+    await expect(execute(transferred, { operation: "move", target: "p2", destination: { kind: "tab", target: "t2" } })).resolves.toMatchObject({ details: { paneId: "p9" } });
+    expect(runtimeOwnership.has({ kind: "pane", id: "p9" })).toBe(true);
+  });
+
+  it("covers authoritative parser failures and every focus direction", async () => {
+    const malformed = makeHarness();
+    malformed.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: malformed.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "rename") return { stdout: JSON.stringify({ id: "rename", result: {} }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: null }), stderr: "", code: 0, killed: false };
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    }));
+    await expect(execute(malformed, { operation: "rename", target: "p2", label: "x" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    const missingField = makeHarness();
+    const missingExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: missingField.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "rename") return { stdout: JSON.stringify({ id: "rename", result: {} }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ id: "get", result: { pane: { pane_id: "p2", tab_id: "t1" } } }), stderr: "", code: 0, killed: false };
+    });
+    await expect(createPaneTool({ cli: new HerdrCli(missingExec), context }).execute("id", { operation: "rename", target: "p2", label: "x" } as never, new AbortController().signal, undefined, missingField.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    const invalidLayout = makeHarness();
+    invalidLayout.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: invalidLayout.snapshot } }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ id: "layout", result: null }), stderr: "", code: 0, killed: false };
+    }));
+    await expect(execute(invalidLayout, { operation: "focus", target: "p2" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    const badShape = makeHarness();
+    const badShapeExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: badShape.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "layout") return { stdout: JSON.stringify({ id: "layout", result: { layout: { tab_id: "t1", focused_pane_id: "p1", panes: [{ pane_id: "p1", rect: null }] } } }), stderr: "", code: 0, killed: false };
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    });
+    await expect(createPaneTool({ cli: new HerdrCli(badShapeExec), context }).execute("id", { operation: "focus", target: "p2" } as never, new AbortController().signal, undefined, badShape.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    const badLayoutShape = makeHarness();
+    const badLayoutExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: badLayoutShape.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "layout") return { stdout: JSON.stringify({ id: "layout", result: { layout: { tab_id: 1, focused_pane_id: "p1", panes: [] } } }), stderr: "", code: 0, killed: false };
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    });
+    await expect(createPaneTool({ cli: new HerdrCli(badLayoutExec), context }).execute("id", { operation: "focus", target: "p2" } as never, new AbortController().signal, undefined, badLayoutShape.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    const badRectExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: badLayoutShape.snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "layout") return { stdout: JSON.stringify({ id: "layout", result: { layout: { tab_id: "t1", focused_pane_id: "p1", panes: [{ pane_id: "p1", rect: { x: "bad", y: 0, width: 1, height: 1 } }] } } }), stderr: "", code: 0, killed: false };
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    });
+    await expect(createPaneTool({ cli: new HerdrCli(badRectExec), context }).execute("id", { operation: "focus", target: "p2" } as never, new AbortController().signal, undefined, badLayoutShape.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    await expect(createPaneTool({ cli: invalidLayout.cli, context: {} }).execute("id", { operation: "split", label: "x" } as never, new AbortController().signal, undefined, invalidLayout.ctx)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
+    await expect(createPaneTool({ cli: invalidLayout.cli, context: { workspaceId: "wrong", tabId: "t1", paneId: "p1" } }).execute("id", { operation: "split", label: "x" } as never, new AbortController().signal, undefined, invalidLayout.ctx)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
+    await expect(execute(invalidLayout, { operation: "move", target: "t1", destination: { kind: "tab", target: "t2" } })).rejects.toMatchObject({ code: "TARGET_TYPE_MISMATCH" });
+
+    const focusCase = async (rects: Array<{ pane_id: string; rect: { x: number; y: number; width: number; height: number } }>, expectedFailure = false, differentTab = false) => {
+      const harness = makeHarness();
+      if (differentTab) {
+        harness.snapshot.tabs.push({ tab_id: "t3", workspace_id: "w1", label: "other" });
+        harness.snapshot.panes[1]!.tab_id = "t3";
+      }
+      let focused = "p1";
+      const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+        if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
+        if (argv[0] === "pane" && argv[1] === "layout") return { stdout: JSON.stringify({ id: "layout", result: { layout: { tab_id: "t1", focused_pane_id: focused, panes: rects } } }), stderr: "", code: 0, killed: false };
+        if (argv[0] === "tab" && argv[1] === "focus") return { stdout: JSON.stringify({ id: "tab-focus", result: {} }), stderr: "", code: 0, killed: false };
+        if (argv[0] === "pane" && argv[1] === "focus") { focused = "p2"; return { stdout: JSON.stringify({ id: "focus", result: {} }), stderr: "", code: 0, killed: false }; }
+        if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { pane: { pane_id: "p2", tab_id: "t1", workspace_id: "w1" } } }), stderr: "", code: 0, killed: false };
+        throw new Error(`unexpected argv ${argv.join(" ")}`);
+      });
+      const promise = createPaneTool({ cli: new HerdrCli(exec), context }).execute("id", { operation: "focus", target: "p2" } as never, new AbortController().signal, undefined, malformed.ctx);
+      if (expectedFailure) await expect(promise).rejects.toMatchObject({ code: "TARGET_NOT_FOUND" });
+      else await expect(promise).resolves.toMatchObject({ details: { paneId: "p2" } });
+    };
+    await focusCase([{ pane_id: "p1", rect: { x: 0, y: 0, width: 10, height: 10 } }, { pane_id: "p2", rect: { x: 10, y: 0, width: 10, height: 10 } }]);
+    await focusCase([{ pane_id: "p1", rect: { x: 10, y: 0, width: 10, height: 10 } }, { pane_id: "p2", rect: { x: 0, y: 0, width: 10, height: 10 } }]);
+    await focusCase([{ pane_id: "p1", rect: { x: 0, y: 0, width: 10, height: 10 } }, { pane_id: "p2", rect: { x: 0, y: 10, width: 10, height: 10 } }]);
+    await focusCase([{ pane_id: "p1", rect: { x: 0, y: 10, width: 10, height: 10 } }, { pane_id: "p2", rect: { x: 0, y: 0, width: 10, height: 10 } }]);
+    await focusCase([{ pane_id: "p1", rect: { x: 0, y: 0, width: 10, height: 10 } }, { pane_id: "p2", rect: { x: 5, y: 5, width: 10, height: 10 } }]);
+    await focusCase([{ pane_id: "p1", rect: { x: 0, y: 0, width: 100, height: 10 } }, { pane_id: "p2", rect: { x: 50, y: 1, width: 10, height: 100 } }]);
+    await focusCase([{ pane_id: "p1", rect: { x: 0, y: 0, width: 100, height: 100 } }, { pane_id: "p2", rect: { x: -50, y: 0, width: 100, height: 100 } }]);
+    await focusCase([{ pane_id: "p1", rect: { x: 0, y: 100, width: 100, height: 100 } }, { pane_id: "p2", rect: { x: 50, y: 50, width: 10, height: 100 } }]);
+    await focusCase([{ pane_id: "p2", rect: { x: 5, y: 5, width: 10, height: 10 } }], true);
+    await focusCase([{ pane_id: "p1", rect: { x: 0, y: 0, width: 10, height: 10 } }, { pane_id: "p2", rect: { x: 5, y: 5, width: 10, height: 10 } }], false, true);
+  });
+
+  it("rejects declined confirmation and contradictory close post-state", async () => {
+    const declined = makeHarness();
+    declined.confirm.mockResolvedValueOnce(false);
+    await expect(execute(declined, { operation: "close", target: "p2" })).rejects.toMatchObject({ code: "CONFIRMATION_DECLINED" });
+    const contradictory = makeHarness();
+    const base = contradictory.cli.runJson.bind(contradictory.cli);
+    contradictory.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "close") return { id: "close", result: {} };
+      return base(argv, signal);
+    });
+    await expect(execute(contradictory, { operation: "close", target: "p2" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+  });
+
   it("protects the caller pane from close and fails closed on malformed create responses", async () => {
     const harness = makeHarness();
     await expect(execute(harness, { operation: "close", target: "current" })).rejects.toMatchObject({ code: "PROTECTED_RESOURCE" });
@@ -164,11 +295,32 @@ describe("herdr_pane", () => {
     await expect(createPaneTool({ cli: new HerdrCli(badExec), context }).execute("id", { operation: "split", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
   });
 
+  it("covers direct CLI records, defaults, and optional signal paths", async () => {
+    const direct = makeHarness();
+    const base = direct.cli.runJson.bind(direct.cli);
+    direct.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane_id: "p2", tab_id: "t1", workspace_id: "w1", environment: { SECRET: "hidden" } } };
+      if (argv[0] === "pane" && argv[1] === "layout") return { id: "layout", result: { tab_id: "t1", focused_pane_id: "p2", panes: [] } };
+      return base(argv, signal);
+    });
+    await expect(createPaneTool({ cli: direct.cli, context }).execute("id", { operation: "rename", target: "p2", label: "direct" } as never, undefined, undefined, direct.ctx)).resolves.toMatchObject({ details: { paneId: "p2" } });
+    await expect(createPaneTool({ cli: direct.cli, context }).execute("id", { operation: "focus", target: "p2" } as never, undefined, undefined, direct.ctx)).resolves.toMatchObject({ details: { paneId: "p2" } });
+    direct.snapshot.panes[1]!.parent_id = "p1";
+    await expect(execute(direct, { operation: "close", target: "p2" })).resolves.toMatchObject({ details: { operation: "close" } });
+
+  });
+
   it("renders compact calls and results without raw topology", () => {
     const harness = makeHarness();
     const tool = createPaneTool({ cli: harness.cli, context });
     const call = tool.renderCall?.({ operation: "rename", target: "p2", label: "x" } as never, {} as never, {} as never);
     expect(call?.render(80)).toEqual(["herdr_pane · rename · p2"]);
+    const splitCall = tool.renderCall?.({ operation: "split", label: "x" } as never, {} as never, {} as never);
+    expect(splitCall?.render(80)).toEqual(["herdr_pane · split"]);
+    splitCall?.invalidate();
+    const swapCall = tool.renderCall?.({ operation: "swap", source: "p1", with: "right" } as never, {} as never, {} as never);
+    expect(swapCall?.render(80)).toEqual(["herdr_pane · swap · p1"]);
+    swapCall?.invalidate();
     call?.invalidate();
     const result = tool.renderResult?.({ content: [], details: { operation: "rename", outcome: "success", paneId: "p2" } } as never, { expanded: false, isPartial: false } as never, {} as never, { isError: false } as never);
     expect(result?.render(80)).toEqual(["pane · p2"]);

@@ -3,7 +3,7 @@ import type { HerdrCli } from "../cli.js";
 import { closePolicy, recordCreatedResource, runtimeOwnership, type CloseTopology, type RuntimeOwnership } from "../ownership.js";
 import { assertSafeEnvironment, assertSafeIdentifier, PaneParamsSchema, type PaneParams } from "../topology-schema.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext, type HerdrSnapshot, type PaneRecord, type ResolvedTarget } from "../targets.js";
-import { formatCall, formatResult } from "../tui.js";
+import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface PaneDetails {
   operation: PaneParams["operation"];
@@ -35,22 +35,19 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function nestedRecord(value: unknown, key: string): Record<string, unknown> | undefined {
-  const parent = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-  const candidate = parent?.[key];
+function nestedRecord(value: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const candidate = value[key];
   return typeof candidate === "object" && candidate !== null && !Array.isArray(candidate) ? candidate as Record<string, unknown> : undefined;
 }
 
-function resourceId(value: unknown, key: "pane_id" | "tab_id"): string {
+function resourceId(value: unknown): string {
   const root = record(value);
-  const preferred = key === "pane_id"
-    ? [root.pane, nestedRecord(root, "split_result")?.pane, nestedRecord(root, "move_result")?.pane]
-    : [root.tab, nestedRecord(root, "create_result")?.tab];
+  const preferred = [root.pane, nestedRecord(root, "split_result")?.pane, nestedRecord(root, "move_result")?.pane];
   for (const candidate of preferred) {
     const object = typeof candidate === "object" && candidate !== null && !Array.isArray(candidate) ? candidate as Record<string, unknown> : undefined;
-    if (typeof object?.[key] === "string" && object[key].length > 0) return object[key];
+    if (typeof object?.pane_id === "string" && object.pane_id.length > 0) return object.pane_id;
   }
-  throw Object.assign(new Error(`Herdr mutation response is missing ${key}`), { code: "CLI_PROTOCOL_ERROR" });
+  throw Object.assign(new Error("Herdr mutation response is missing pane_id"), { code: "CLI_PROTOCOL_ERROR" });
 }
 
 function withoutEnvironment(value: unknown): unknown {
@@ -162,8 +159,7 @@ async function readPane(cli: HerdrCli, paneId: string, signal: AbortSignal): Pro
 async function focusExactPane(cli: HerdrCli, target: ResolvedTarget, signal: AbortSignal): Promise<void> {
   let layout = layoutFrom((await cli.runJson(["pane", "layout", "--current"], signal)).result);
   if (layout.tabId !== target.tabId) {
-    if (!target.tabId) throw Object.assign(new Error("Target pane has no containing tab"), { code: "CLI_PROTOCOL_ERROR" });
-    await cli.runJson(["tab", "focus", target.tabId], signal);
+    await cli.runJson(["tab", "focus", target.tabId!], signal);
     layout = layoutFrom((await cli.runJson(["pane", "layout", "--current"], signal)).result);
   }
   for (let step = 0; step <= layout.panes.length; step += 1) {
@@ -193,7 +189,7 @@ async function closePane(deps: PaneDependencies, params: Extract<PaneParams, { o
   if (after.panes.some((pane) => pane.pane_id === target.id)) throw Object.assign(new Error("Closed pane remains in authoritative topology"), { code: "POSTSTATE_UNAVAILABLE" });
   const afterIds = new Set(allSnapshotIds(after));
   const removed = allSnapshotIds(before).filter((id) => !afterIds.has(id));
-  return { operation: "close", outcome: "success", paneId: target.id, tabId: target.tabId, workspaceId: target.workspaceId, removedIds: removed.length > 0 ? removed : [target.id], containingContext: { tabId: target.tabId, workspaceId: target.workspaceId }, postState: withoutEnvironment(after) };
+  return { operation: "close", outcome: "success", paneId: target.id, tabId: target.tabId, workspaceId: target.workspaceId, removedIds: removed, containingContext: { tabId: target.tabId, workspaceId: target.workspaceId }, postState: withoutEnvironment(after) };
 }
 
 export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof PaneParamsSchema, PaneDetails> {
@@ -216,7 +212,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
           ...(params.focus ? ["--focus"] : ["--no-focus"]),
           ...envArgs(params.env)
         ], activeSignal);
-        const paneId = resourceId(newPaneResponse.result, "pane_id");
+        const paneId = resourceId(newPaneResponse.result);
         recordCreatedResource({ kind: "pane", id: paneId, parentId: target.tabId }, deps.ownership ?? runtimeOwnership);
         await deps.cli.runJson(["pane", "rename", paneId, params.label], activeSignal);
         const postState = await readPane(deps.cli, paneId, activeSignal);
@@ -236,7 +232,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         }
         argv = [...argv, ...(params.focus ? ["--focus"] : ["--no-focus"] )];
         const moved = await deps.cli.runJson(argv, activeSignal);
-        const paneId = resourceId(moved.result, "pane_id");
+        const paneId = resourceId(moved.result);
         const postState = await readPane(deps.cli, paneId, activeSignal);
         const ledger = deps.ownership ?? runtimeOwnership;
         if (ledger.has({ kind: "pane", id: source.id })) {
@@ -288,18 +284,18 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
       const details = await closePane(deps, params, activeSignal, ctx);
       return { content: [{ type: "text", text: formatResult({ operation: "pane", outcome: "success", targetId: details.paneId }) }], details };
     },
-    renderCall(args) { return { render: () => [formatCall("herdr_pane", args.operation, "target" in args ? args.target : "source" in args ? args.source : undefined)], invalidate() {} }; },
-    renderResult(output: AgentToolResult<PaneDetails>) {
-      const details = output.details;
-      return { render: () => [formatResult({ operation: "pane", outcome: details ? "success" : "error", targetId: details?.paneId, code: details ? undefined : "UNKNOWN" })], invalidate() {} };
+    renderCall(args, theme) {
+      return textComponent(formatCall("herdr_pane", args.operation, "target" in args ? args.target : "source" in args ? args.source : undefined), theme, "accent");
+    },
+    renderResult(output: AgentToolResult<PaneDetails>, options, theme) {
+      return renderResultComponent("pane", output, options, theme, output.details?.paneId);
     }
   };
 }
 
 function exactTabTarget(snapshot: HerdrSnapshot, ref: string, context: CurrentContext): ResolvedTarget {
   assertSafeIdentifier(ref, "destination.target");
-  const id = ref === "current" ? context.tabId : ref;
-  if (!id) throw Object.assign(new Error("CONTEXT_UNAVAILABLE: current tab is unavailable"), { code: "CONTEXT_UNAVAILABLE" });
+  const id = ref === "current" ? context.tabId! : ref;
   const tab = snapshot.tabs.find((candidate) => candidate.tab_id === id);
   if (!tab) throw Object.assign(new Error(`TARGET_NOT_FOUND: no exact tab ID matched ${ref}`), { code: "TARGET_NOT_FOUND", details: { target: ref } });
   return { kind: "tab", id: tab.tab_id, workspaceId: tab.workspace_id, tabId: tab.tab_id, label: tab.label, record: tab };

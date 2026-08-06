@@ -1,0 +1,6 @@
+{
+  "wait": {
+    "reviewCadenceMinutes": 5,
+    "reviewerModel": "luna"
+  }
+}

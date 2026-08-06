@@ -86,6 +86,34 @@ describe("runtime topology ownership", () => {
     expect(closePolicy({ topology, target: { kind: "pane", id: "p1" }, hasUI: false }, new RuntimeOwnership())).toMatchObject({ allowed: false, code: "CONFIRMATION_UNAVAILABLE" });
   });
 
+  it("covers orphan roots, explicit child IDs, duplicate ancestry, and an unprotected caller", () => {
+    const ledger = new RuntimeOwnership();
+    ledger.record({ kind: "pane", id: "orphan" });
+    expect(descendantsForClose({ nodes: [] }, { kind: "pane", id: "orphan" })).toEqual([{ kind: "pane", id: "orphan" }]);
+    const topologyWithDuplicate = { nodes: [
+      { kind: "pane" as const, id: "root", children: ["child", "child2"] },
+      { kind: "pane" as const, id: "child", parentId: "root", children: ["root"] },
+      { kind: "pane" as const, id: "child2" },
+      { kind: "pane" as const, id: "missing" }
+    ] };
+    expect(descendantsForClose(topologyWithDuplicate, { kind: "pane", id: "root" })).toEqual([
+      { kind: "pane", id: "root", parentId: undefined },
+      { kind: "pane", id: "child", parentId: "root" },
+      { kind: "pane", id: "child2", parentId: undefined }
+    ]);
+    ledger.record({ kind: "pane", id: "root" });
+    ledger.record({ kind: "pane", id: "child", parentId: "root" });
+    expect(closePolicy({ topology: topologyWithDuplicate, target: { kind: "pane", id: "root" }, hasUI: false }, ledger)).toMatchObject({ allowed: false, code: "CONFIRMATION_UNAVAILABLE" });
+    expect(closePolicy({ topology: { nodes: [] }, target: { kind: "pane", id: "orphan" }, hasUI: false }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [] }, target: { kind: "pane", id: "orphan" }, hasUI: false }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [] }, target: { kind: "pane", id: "other" }, hasUI: false }, new RuntimeOwnership())).toMatchObject({ allowed: false, code: "CONFIRMATION_UNAVAILABLE" });
+    expect(closePolicy({ topology: { nodes: [] }, target: { kind: "pane", id: "orphan" }, hasUI: true, } as never, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [] }, caller: { paneId: "protected" }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [] }, caller: { tabId: "protected" }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [] }, caller: { workspaceId: "protected" }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+    expect(closePolicy({ topology: { nodes: [] }, caller: { paneId: "", tabId: "", workspaceId: "" }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+  });
+
   it("protects the caller pane, tab, workspace, and descendants of those ancestors", () => {
     const ledger = new RuntimeOwnership();
     ledger.recordMany([{ kind: "tab", id: "t1" }, { kind: "pane", id: "p1" }, { kind: "pane", id: "p2" }, { kind: "pane", id: "p3" }]);

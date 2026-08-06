@@ -54,14 +54,14 @@ function parseHealth(text: string): Pick<InspectDetails, "client" | "server" | "
   const parsedRecord = parsed as Record<string, unknown>;
   const client = parsedRecord.client as Record<string, unknown>;
   const server = parsedRecord.server as Record<string, unknown>;
-  if (typeof client.version !== "string" || typeof client.protocol !== "number" || typeof server.status !== "string" || typeof server.version !== "string" || typeof server.protocol !== "number" || typeof parsedRecord.compatible !== "boolean") {
+  if (typeof client.version !== "string" || typeof client.protocol !== "number" || typeof server.status !== "string" || typeof server.version !== "string" || typeof server.protocol !== "number" || typeof server.compatible !== "boolean") {
     throw Object.assign(new Error("Health output is incompatible"), { code: "CLI_PROTOCOL_ERROR" });
   }
   return {
     client: { version: client.version, protocol: client.protocol },
     server: { status: server.status, version: server.version, protocol: server.protocol },
     socketReachable: server.status === "running",
-    compatible: parsedRecord.compatible
+    compatible: server.compatible
   };
 }
 

@@ -135,7 +135,7 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       }
       const target = resolvePaneOrAgentTarget(snapshot, targetRef, deps.context);
       const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], signal!)).result);
-      const raw = await deps.cli.runText(["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", target.paneId!], signal!);
+      const raw = await deps.cli.runText(["pane", "read", target.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal!);
       const recentUnwrappedLines = raw.length === 0 ? [] : raw.split(/\r?\n/).slice(-100);
       const details: InspectDetails = { operation: "inspect", kind: "target", outcome: "success", target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName }, metadata: pane, recentUnwrappedLines };
       return { content: [{ type: "text", text: formatResult({ operation: "inspect", outcome: "success", targetId: target.id }) }], details };

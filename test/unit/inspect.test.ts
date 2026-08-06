@@ -43,7 +43,7 @@ describe("herdr_inspect", () => {
     const result = await execute(cli, {});
     expect(result.details).toMatchObject({ kind: "target", target: { paneId: "w1:p1" } });
     expect(result.details.recentUnwrappedLines).toEqual(Array.from({ length: 100 }, (_, i) => `line-${i + 38}`));
-    expect(calls).toContainEqual(["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", "w1:p1"]);
+    expect(calls).toContainEqual(["pane", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "100", "--format", "text"]);
   });
 
   it("returns compact collections without reading transcripts", async () => {
@@ -114,7 +114,7 @@ describe("herdr_inspect", () => {
     };
     const { cli, calls } = makeCli(undefined, agentSnapshot);
     await expect(execute(cli, { mode: "target", target: "agent-7" })).resolves.toMatchObject({ details: { target: { paneId: "w1:p2", agentName: "worker" } } });
-    expect(calls).toContainEqual(["pane", "read", "--source", "recent-unwrapped", "--lines", "100", "--format", "text", "w1:p2"]);
+    expect(calls).toContainEqual(["pane", "read", "w1:p2", "--source", "recent-unwrapped", "--lines", "100", "--format", "text"]);
   });
 
   it("reports health without exposing the socket path", async () => {

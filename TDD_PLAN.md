@@ -1,0 +1,834 @@
+# TDD Plan: Global Pi Herdr Tools
+
+## Scope and non-goals
+
+This plan is the tests-first contract for a new global extension at
+`/home/gabriel/.pi/agent/extensions/herdr-tools/`. `herdr-tools` is a standalone
+Git repository rooted at that directory; it is not a package inside the Courier
+repository and its commands, coverage configuration, and integration fixtures
+must resolve from this repository root. The extension registers **exactly six**
+tools:
+
+1. `herdr_inspect`
+2. `herdr_communicate`
+3. `herdr_wait`
+4. `herdr_launch`
+5. `herdr_pane`
+6. `herdr_tab`
+
+`herdr_command`, `herdr_workspace`, and `herdr_admin` are deferred. They must not
+be registered, advertised, or called by this package. Do not edit
+`herdr-question-alert.ts` or the Herdr-managed `herdr-agent-state.ts`.
+
+This is a plan only. No implementation code is part of this change.
+
+## Governing TDD contract
+
+Follow `/home/gabriel/workspace/courier/.pi/skills/tdd/source-skill.md`:
+
+- Write each test before the implementation slice it specifies.
+- Run the new test red and verify that it fails for the intended missing behavior,
+  not because of a malformed fixture or test harness.
+- Make the smallest implementation change that turns the slice green.
+- Refactor only while green.
+- End with clean tests, build, lint, and 100% coverage on every changed source
+  file. Record any deviation rather than silently weakening a test.
+- Do not add compatibility aliases, fuzzy matching, generic fallbacks, or hidden
+  cleanup behavior.
+
+Pi extension constraints from `docs/extensions.md` and the extension examples:
+
+- Register tools with `pi.registerTool()` and the normal execute signature
+  `(toolCallId, params, signal, onUpdate, ctx)`.
+- Use `pi.exec("herdr", argv, { signal })`; never construct a shell command string.
+- Return Pi's structured `content` plus machine-readable `details`; throw only
+  for a genuine whole-call error that must be marked `isError`.
+- Use `StringEnum` for string enum parameters and a compact `Text` renderer for
+  `renderCall`/`renderResult`.
+- Use the supplied `AbortSignal` for every CLI and reviewer operation.
+- Do not start background processes or timers from the extension factory. Start
+  session-scoped behavior from lifecycle/tool execution and clear it on session
+  replacement.
+
+## Invariants and terminology
+
+- **Herdr enabled:** registration and execution are available only when
+  `process.env.HERDR_ENV === "1"`. Disabled mode must not call Herdr or touch UI.
+- **Target:** an explicit opaque ID, `current` resolved from the caller's Herdr
+  context, or a unique exact label/agent name. Exact means case-sensitive and
+  whole-string. No prefix, substring, case-folded, display-number, or focused-pane
+  fallback is permitted.
+- **Authoritative read:** after every mutating command, use the ID returned by the
+  command response and read the resulting resource from Herdr before returning it
+  or using it for a dependent mutation. Never predict an ID.
+- **Current Courier workspace:** the workspace/pane represented by the caller's
+  Herdr environment. It is always protected by the tests and is never used for
+  integration setup or cleanup.
+- **Owned resource:** a pane/tab/resource tree created by this extension during
+  the current in-memory Pi session, with every transitive descendant still owned.
+  Ownership is not persisted in session entries.
+- **Reviewer:** one independent, tool-less, in-process model review per target for
+  a wait that passes the configured review interval. It is not a Herdr pane or
+  agent and receives only bounded metadata and transcript deltas.
+
+The implementation must resolve the exact Herdr CLI syntax from the installed
+binary's help output. Unit tests assert logical operation, argv tokens, returned
+IDs, and safety flags without hard-coding predicted IDs.
+
+Global wait-review settings are owned by this extension in
+`/home/gabriel/.pi/agent/extensions/herdr-tools/config.json`. Do not read or
+write Pi's settings file for these values: Pi has no extension namespace there.
+Do not add project-local settings, per-tool settings, or tool-call overrides.
+
+## Acceptance-invariant trace
+
+Every row maps an acceptance statement to a named test and requires both positive
+and negative assertions. “No mutation” includes no mutating CLI invocation, no
+focus change, no UI prompt, no ownership change, and no current-Courier change.
+
+| Criterion | Test name(s) | Expected mutation | Expected non-mutation |
+|---|---|---|---|
+| Register only inside Herdr | `registers_exactly_six_tools_when_herdr_env_is_1`; `registers_no_tools_and_makes_no_calls_when_herdr_env_is_not_1` | The Pi registry contains exactly the six named tools in enabled mode. | Disabled mode registers none of the six, invokes no CLI, and makes no UI call. |
+| Only the six core tools are in scope | `does_not_register_deferred_command_workspace_or_admin_tools` | None beyond the six registrations. | Registry and CLI trace contain no deferred tool or deferred operation. |
+| All Herdr calls use `pi.exec` CLI | `uses_pi_exec_with_herdr_argv_not_shell_commands` | Fake `pi.exec` receives `command: "herdr"` and an argv array. | No shell string, `execSync`, raw socket, or direct process call is used. |
+| Every call receives the tool AbortSignal | `passes_the_same_abort_signal_to_every_cli_call`; `passes_abort_signal_to_reviewer` | Runner/reviewer observe the supplied signal. | No operation silently substitutes an unabortable signal. |
+| Use explicit returned IDs | `chains_mutations_using_returned_opaque_ids`; `never_constructs_ids_from_display_numbers` | Dependent reads/mutations target IDs returned by fixtures. | Predicted IDs, sidebar indexes, workspace suffixes, and stale IDs never appear in argv. |
+| Mutations are followed by authoritative reads | `authoritative_post_read_follows_create_split_move_and_launch`; `authoritative_read_wins_over_stale_mutation_response` | Returned result contains the post-read resource. | A stale create/split/start response is never returned as current state. |
+| Target IDs/current/exact unique labels or agent names only | `resolves_exact_id_current_and_unique_exact_name`; `current_resolves_from_caller_context_not_focus` | The intended exact resource is selected. | Missing, ambiguous, fuzzy, case-variant, and focused-only selectors cause zero mutation. |
+| Missing and ambiguous targets fail closed | `missing_target_fails_before_mutation`; `ambiguous_exact_agent_name_fails_before_mutation` | A structured target-resolution error is returned. | No prompt, steer, split, launch, focus, close, or wait-side effect occurs. |
+| Inspect default is one target plus metadata and 100 recent-unwrapped lines | `inspect_single_defaults_to_metadata_and_exactly_100_recent_unwrapped_lines` | A single authoritative snapshot contains target metadata and the last 100 lines. | It does not read an unbounded transcript or silently use rendered/soft-wrapped output. |
+| Inspect collections stay compact | `inspect_collection_returns_compact_records_without_transcripts` | Collection metadata is returned for each requested collection. | Collection inspection does not read per-pane transcripts or inflate output to single-target detail. |
+| Health includes version and protocol | `inspect_health_returns_version_and_protocol` | Health details contain both fields from the CLI. | Health does not mutate Herdr or invent a protocol value when absent. |
+| Prompt fails while target is working | `communicate_prompt_rejects_working_agent_without_mutation` | A structured precondition failure is returned. | No prompt, interrupt, focus, or confirmation occurs. |
+| Steer interrupts explicitly, then prompts | `communicate_steer_sends_named_interrupt_before_prompt` | The trace is named interrupt, prompt, authoritative read. | No raw key bytes, prompt-before-interrupt, or confirmation occurs. |
+| Prompt/steer verify working but do not wait completion | `communicate_prompt_verifies_working_without_waiting_completion`; `communicate_steer_verifies_working_without_waiting_completion` | The post-read shows `working`. | No `agent wait`, completion poll, reviewer, or done/idle wait is issued. |
+| Communicate uses named keys and no confirmation | `communicate_uses_named_keys_only`; `communicate_never_calls_confirmation_ui` | Only the CLI's named interrupt key token is sent for steer. | No escape-byte sequence, arbitrary key bytes, or UI confirmation is sent. |
+| Wait supports single and multi-target any/all | `wait_supports_single_target`; `wait_multi_target_any_returns_first_match`; `wait_multi_target_all_waits_for_every_match` | The matching target set and snapshots are returned. | Any does not wait for unrelated targets; all does not return before every target matches. |
+| Wait supports semantic and raw conditions | `wait_matches_semantic_condition`; `wait_matches_raw_literal`; `wait_matches_raw_regex`; `wait_combines_raw_and_semantic_conditions` | A condition is satisfied only by the requested predicate. | Status is not inferred from text, and literal matching is not accidentally regex matching. |
+| Wait timeout is explicit and capped | `wait_requires_explicit_timeout`; `wait_accepts_timeout_of_3600_seconds`; `wait_rejects_timeout_above_3600_seconds` | Valid timeout starts bounded polling. | Missing, zero/invalid, or over-limit timeout starts no poll or reviewer. |
+| Timeout includes structured snapshots | `wait_timeout_returns_structured_outcome_with_latest_snapshots` | Result has `outcome: "timeout"`, elapsed/deadline data, and latest per-target snapshots. | Timeout is never represented as a successful match or an empty generic error. |
+| Wait cancellation is truthful | `wait_cancellation_aborts_polling_and_returns_cancelled`; `wait_cancellation_cannot_apply_late_result` | In-flight work observes abort and result says cancelled. | No later poll, reviewer, focus, mutation, or false success occurs after cancellation. |
+| Waits over the configured interval require review | `wait_over_configured_interval_starts_reviewers`; `wait_under_configured_interval_starts_no_review` | One reviewer per target starts after the configured threshold. | A per-call threshold cannot bypass or change the configured gate. |
+| Reviewer config defaults and bounds are fixed | `review_interval_defaults_to_five_minutes`; `review_interval_accepts_only_one_to_thirty_minutes`; `review_interval_is_not_a_wait_argument`; `review_model_defaults_to_luna_low_and_is_not_a_wait_argument` | Extension-owned config supplies the reviewer cadence and model. | Tool input cannot override interval, model, or thinking; out-of-range config fails before waiting. |
+| Extension-owned config path is authoritative | `settings_read_only_from_extension_owned_config`; `settings_do_not_read_pi_or_project_config`; `settings_do_not_read_tool_override_fields`; `project_config_override_is_absent`; `tool_settings_override_is_absent` | The loader reads only `/home/gabriel/.pi/agent/extensions/herdr-tools/config.json`. | Pi settings, project config, environment fallback, and tool arguments cannot supply or override these settings. |
+| Absent config uses defaults | `absent_config_uses_default_cadence_and_reviewer_model` | Missing `config.json` yields cadence `5` minutes and model `luna` with fixed thinking `low`. | No file is created, no warning is converted into a mutation, and no per-call override is accepted. |
+| Valid config is loaded | `valid_config_loads_cadence_and_reviewer_model` | A valid extension-owned JSON file supplies the configured cadence/model for a wait. | The loader does not coerce unrelated fields or read a project/tool override. |
+| Malformed JSON fails closed | `malformed_config_json_returns_invalid_settings_before_waiting` | The wait returns `INVALID_SETTINGS` with the config path/error context. | No Herdr poll, reviewer call, fallback defaults, or config rewrite occurs. |
+| Cadence validation is strict | `invalid_cadence_below_one_fails_before_waiting`; `invalid_cadence_above_thirty_fails_before_waiting`; `invalid_cadence_noninteger_fails_before_waiting` | Invalid config returns `INVALID_SETTINGS`. | Values are not clamped, rounded, or silently replaced with defaults; no CLI/reviewer work starts. |
+| Reviewer model validation is strict | `invalid_reviewer_model_fails_before_waiting`; `unresolvable_reviewer_model_ends_long_wait_without_fallback` | Invalid syntax fails as `INVALID_SETTINGS`; an unavailable configured model ends a required review as `REVIEWER_FAILED`. | No fallback model, project setting, tool argument, or pane reviewer is used. |
+| Config reload follows the SPEC sampling rule | `config_change_is_sampled_by_next_wait`; `active_wait_keeps_its_start_config_snapshot` | Each new wait observes the current valid `config.json`; an active wait keeps its validated start snapshot. | A file change does not mutate an active wait mid-flight, and reload does not persist ownership or create resources. |
+| Reviewers are independent, concurrent, and uncapped | `starts_one_toolless_reviewer_per_target`; `starts_all_reviewers_concurrently`; `reviewer_target_count_has_no_artificial_cap` | Every target gets one independent in-process review, including a large fixture set. | No reviewer pane, Herdr agent, serial target bottleneck, or arbitrary target cap is introduced. |
+| Reviewer input is bounded and delta-based | `reviewer_receives_bounded_metadata_and_transcript_delta`; `reviewer_delta_excludes_prior_transcript`; `reviewer_input_contains_no_tools_or_actions` | Only the specified bounded current metadata and new transcript delta are passed. | Full scrollback, unrelated panes, tool definitions, UI handles, and action methods are absent. |
+| Reviewer terminal findings end a wait | `reviewer_stalled_ends_wait_early`; `reviewer_blocked_ends_wait_early`; `reviewer_risk_ends_wait_early`; `reviewer_unknown_ends_wait_early`; `reviewer_failure_ends_wait_early` | Wait ends with the finding/failure and latest snapshots. | No further poll, prompt, pane, focus, or automatic remediation follows. |
+| Reviewer healthy result continues normally | `healthy_reviewer_does_not_fake_completion` | Ordinary polling continues until match or timeout. | A healthy review is not returned as a target match and does not create a pane. |
+| Launch accepts known kind and argv | `launch_accepts_each_known_agent_kind`; `launch_rejects_unknown_kind_before_mutation`; `launch_passes_argv_as_separate_tokens` | Known kind starts in the selected Herdr pane. | Unknown kind, shell reinterpretation, or argv concatenation cannot execute. |
+| Launch requires a unique name | `launch_requires_nonempty_name`; `launch_rejects_duplicate_exact_name_before_creation`; `launch_rejects_ambiguous_name_before_creation` | A unique named launch is allowed. | Duplicate/ambiguous names do not create a tab, pane, process, or focus change. |
+| Launch defaults label/name and placement safely | `launch_defaults_label_to_name`; `launch_defaults_right_no_focus_and_current_cwd` | Defaults are included in creation argv. | Default launch never focuses, changes cwd, or selects a different direction. |
+| Launch supports tab/pane placement | `launch_can_create_new_tab`; `launch_can_use_existing_exact_pane`; `launch_rejects_conflicting_tab_and_pane_targets` | Only the requested returned tab/pane receives the agent. | No inferred tab/pane, focused-pane fallback, or unrelated resource mutation occurs. |
+| Launch prompts only after readiness and verifies working | `launch_optional_prompt_waits_for_ready_then_verifies_working`; `launch_prompt_does_not_wait_for_completion` | Prompt is sent to the returned pane after readiness; post-read observes working. | Prompt is not sent early and launch does not wait for done/idle completion. |
+| Launch accepts arbitrary environment overrides | `launch_passes_arbitrary_env_overrides_unchanged`; `launch_env_overrides_do_not_mutate_process_env` | Each provided key/value reaches Herdr. | No allowlist rejection, environment global mutation, or shell interpolation occurs. |
+| Launch never auto-cleans resources | `launch_success_never_closes_resources`; `launch_partial_failure_preserves_created_resources`; `session_shutdown_does_not_auto_cleanup` | Created resources remain available for explicit user/admin handling. | No implicit close/delete on success, failure, cancellation, reload, or shutdown. |
+| Pane creation requires a label and safe defaults | `pane_create_requires_label`; `pane_create_defaults_right_and_no_focus`; `pane_create_honors_explicit_down_and_focus` | Labeled pane is created with requested direction/focus. | Missing label fails before CLI mutation; defaults never focus. |
+| Tab creation requires label and honors focus | `tab_create_requires_label`; `tab_create_defaults_no_focus`; `tab_create_honors_explicit_focus` | Labeled tab is created and post-read. | Missing label and omitted focus never mutate/focus. |
+| Pane/tab calls never close anything | `herdr_pane_has_no_close_or_cleanup_path`; `herdr_tab_has_no_close_or_cleanup_path`; `public_pane_tab_calls_never_issue_close` | Only requested create/split/move/focus operations occur. | No pane, tab, workspace, or tree close occurs, including on error. |
+| Ownership is current-session in-memory only | `ownership_records_only_current_session_resources`; `ownership_is_not_persisted_in_session_entries` | Created resource IDs are tracked in memory. | No `appendEntry`, file, global, or resumed-session ownership state is written. |
+| Ownership clears on lifecycle replacement | `ownership_clears_on_reload`; `ownership_clears_on_resume`; `ownership_clears_on_new_session`; `ownership_clears_on_session_change` | A new session begins with an empty ownership set. | Old IDs cannot authorize close after replacement. |
+| Only wholly owned transitive trees may close without confirmation | `owned_transitive_tree_closes_without_confirmation`; `mixed_transitive_tree_requires_confirmation`; `unowned_tree_requires_confirmation` | The explicit policy seam permits close only for a wholly owned tree, or after UI confirmation. | A descendant owned by another session/user is never silently closed. |
+| No-UI close is fail-closed | `no_ui_unowned_tree_close_fails_closed`; `no_ui_mixed_tree_close_fails_closed`; `owned_tree_close_does_not_request_confirmation` | UI-enabled explicit policy can confirm; wholly owned policy can proceed without confirmation. | No-UI never assumes consent and never issues a close for an unowned/mixed tree. |
+| Current Courier resources are protected | `ownership_cannot_claim_current_courier_resource`; `integration_cleanup_never_targets_current_courier_tree` | Only disposable test IDs may be cleaned by explicit test teardown. | Current workspace/tab/pane IDs remain byte-for-byte unchanged. |
+| Results, renderers, cancellation, and partial failures are truthful | `results_include_structured_details_and_compact_text`; `renderers_are_compact_by_default`; `partial_results_preserve_each_target_truth`; `renderers_show_timeout_cancel_and_error_states`; `all_late_races_are_non_mutating` | Each result exposes operation/outcome/IDs/snapshots/errors suitable for the LLM and renderer. | No raw JSON dump, swallowed per-target error, false all-success, or late side effect is shown. |
+| Unit and integration safety gates exist | `unit_harness_uses_fakes_only`; `integration_uses_disposable_named_session_not_current_courier`; `coverage_gate_requires_changed_files_at_100_percent` | Disposable integration state is created and explicitly torn down by the test harness. | Unit tests never control real Herdr; integration never creates in the Courier workspace. |
+
+## Extension-owned global configuration
+
+`herdr-tools` is a standalone Git repository rooted at
+`/home/gabriel/.pi/agent/extensions/herdr-tools`. Its global wait-review
+configuration is owned by the extension at the absolute path
+`/home/gabriel/.pi/agent/extensions/herdr-tools/config.json`. Pi settings must
+not be used for these values because Pi has no extension namespace. The loader
+must not consult project config, environment values, or tool-call fields.
+
+The settings contract under test is:
+
+- missing `config.json`: defaults to `reviewCadenceMinutes: 5`,
+  `reviewerModel: "luna"`, and fixed reviewer thinking `low`;
+- valid JSON: loads the documented cadence/model values without coercion;
+- malformed JSON: fails closed with `INVALID_SETTINGS` before Herdr or reviewer
+  work, and never rewrites the file;
+- cadence: an integer in inclusive range `1..30`; below `1`, above `30`, and
+  noninteger values are invalid, not clamped or rounded;
+- reviewer model: a nonempty valid model identifier that resolves through the
+  injected model registry; invalid or unresolvable values have no fallback;
+- no project-level or tool-call override exists; any such supplied value is
+  ignored or rejected and cannot change the extension-owned settings;
+- because the SPEC specifies cadence sampling for each wait, each new wait reads
+  a fresh validated settings snapshot, while an active wait retains the snapshot
+  captured at its start if `config.json` changes.
+
+No config file is created when absent, and no config reload mutates ownership or
+creates/cleans Herdr resources. If the implementation adds an explicit reload
+hook, it must obey the same validation and snapshot rules; otherwise the
+next-wait sampling tests are the reload contract.
+
+## Proposed test seams and fake fixtures
+
+The implementation should expose or inject narrow test seams rather than making
+unit tests spawn Herdr or call a real model:
+
+### Extension-owned settings loader
+
+The settings seam must read exactly
+`/home/gabriel/.pi/agent/extensions/herdr-tools/config.json`. This is an
+extension-owned global file in the standalone `herdr-tools` repository. It is
+not Pi's settings file, because Pi has no extension namespace, and it is not a
+project-local file. The loader must distinguish a missing file from malformed
+JSON and invalid values:
+
+- missing `config.json` returns defaults `{ reviewCadenceMinutes: 5,
+  reviewerModel: "luna", reviewerThinking: "low" }` without creating the file;
+- valid JSON accepts only the documented settings shape and preserves the
+  configured values without coercion;
+- malformed JSON returns `INVALID_SETTINGS` before any Herdr or reviewer call;
+- cadence must be an integer in the inclusive range `1..30`; values below `1`,
+  above `30`, and nonintegers are invalid;
+- reviewer model must be a nonempty valid model identifier and must resolve via
+  the injected model registry before a required review; there is no fallback;
+- project config, Pi settings, environment values, and `herdr_wait` input cannot
+  override these settings;
+- each new wait samples a validated settings snapshot. A wait already in flight
+  keeps its start snapshot if `config.json` changes; a config change does not
+  mutate active reviewer cadence or model.
+
+The settings fake records every attempted file path, file read, write, model
+resolution, and input field. It fails if any path other than the extension-owned
+absolute path is read or if the loader creates/rewrites the absent or malformed
+file. The fake filesystem supplies these cases independently: absent file,
+valid file, malformed JSON, cadence `0`, cadence `31`, cadence `5.5`, invalid
+model identifier, and a valid file changed between two waits.
+
+### Fake command runner
+
+The fake records, for every call:
+
+- command (`herdr`), argv tokens, and exact options;
+- the received `AbortSignal` identity and aborted state;
+- fixture response, exit code, stderr, and whether the call was cancelled;
+- a controllable barrier for ordering/race tests.
+
+It must support queued responses, a response function keyed by logical command,
+forced CLI failure, delayed completion, and an abort-aware pending call. The fake
+must reject a shell string, raw key bytes, a missing signal, or an ID not present in
+the fixture registry so unsafe behavior fails loudly.
+
+### Fake model reviewer
+
+The fake records one request per target and exposes a barrier so tests can prove
+concurrent start. It accepts only bounded review input and an `AbortSignal`; it
+has no command runner, tool list, pane ID, UI, or action callback. It can return
+`healthy`, `stalled`, `blocked`, `risk`, `unknown`, or a structured failure.
+
+The model adapter test fixes the configured model to `luna/low` and verifies that
+wait input cannot replace it. The real Luna provider need not be called by unit
+suite tests.
+
+### Fake UI and clock
+
+The fake UI records `confirm` calls and supplies `hasUI: true/false`. It must make
+an unexpected confirmation call fail the test. A monotonic fake clock controls
+poll intervals, the review threshold, timeout, and same-tick races; tests must
+not sleep in real time.
+
+### JSON fixture samples
+
+These are representative fixture contracts. Exact CLI envelope fields may be
+adapted to the installed Herdr version, but the test meanings and safety fields
+must remain stable.
+
+#### `health.json`
+
+```json
+{
+  "ok": true,
+  "version": "6.0.0",
+  "protocol": 6
+}
+```
+
+#### `pane-single.json`
+
+```json
+{
+  "pane": {
+    "pane_id": "w9:p27",
+    "tab_id": "w9:t4",
+    "workspace_id": "w9",
+    "label": "reviewer",
+    "cwd": "/tmp/herdr-tools-it",
+    "agent": "reviewer",
+    "agent_status": "working",
+    "revision": 42
+  },
+  "read": {
+    "source": "recent-unwrapped",
+    "line_count": 100,
+    "lines_first": ["line-038"],
+    "lines_last": ["line-137"]
+  }
+}
+```
+
+The actual fixture generator contains 137 ordered lines and asserts that the
+returned slice is exactly lines 38 through 137, not a 100-line approximation.
+
+#### `collections-compact.json`
+
+```json
+{
+  "workspaces": [{"workspace_id": "w9", "label": "it"}],
+  "tabs": [{"tab_id": "w9:t4", "workspace_id": "w9", "label": "reviewer"}],
+  "panes": [{"pane_id": "w9:p27", "tab_id": "w9:t4", "label": "reviewer", "agent_status": "working"}]
+}
+```
+
+#### Returned-ID mutation and authoritative post-read fixtures
+
+```json
+{
+  "split_response": {
+    "ok": true,
+    "pane": {"pane_id": "w9:p27", "label": "reviewer"}
+  },
+  "post_read": {
+    "pane_id": "w9:p27",
+    "label": "reviewer",
+    "direction": "right",
+    "focused": false,
+    "cwd": "/tmp/herdr-tools-it",
+    "agent_status": "idle",
+    "revision": 43
+  }
+}
+```
+
+The test deliberately makes `split_response` stale (`agent_status` omitted) and
+requires the post-read fixture to be returned. `w9:p27` must be used verbatim;
+no ID may be derived from `w9`, `p27`, or display order.
+
+#### `wait-snapshots.json`
+
+```json
+{
+  "snapshots": [
+    {
+      "target": "w9:p27",
+      "metadata": {"agent_status": "working", "revision": 51},
+      "transcript_delta": ["still running"],
+      "observed_at_ms": 300000
+    },
+    {
+      "target": "w9:p28",
+      "metadata": {"agent_status": "blocked", "revision": 12},
+      "transcript_delta": ["Need credentials"],
+      "observed_at_ms": 300000
+    }
+  ]
+}
+```
+
+#### `reviewer-results.json`
+
+```json
+{
+  "review_requests": [
+    {
+      "target": "w9:p27",
+      "metadata": {"agent_status": "working", "revision": 51},
+      "transcript_delta": ["still running"],
+      "transcript_delta_line_count": 1,
+      "tools": null
+    }
+  ],
+  "results": [{"target": "w9:p27", "status": "stalled", "reason": "no progress"}]
+}
+```
+
+The test additionally supplies a transcript delta larger than the configured
+bound and asserts truncation before the model call, with no full transcript in
+the request.
+
+#### Partial and timeout results
+
+```json
+{
+  "outcome": "partial",
+  "targets": [
+    {"target": "w9:p27", "outcome": "success", "snapshot_revision": 52},
+    {"target": "w9:p28", "outcome": "error", "error": {"code": "CLI_FAILED", "message": "read failed"}}
+  ]
+}
+```
+
+```json
+{
+  "outcome": "timeout",
+  "timeout_seconds": 30,
+  "latest_snapshots": [{"target": "w9:p27", "agent_status": "working", "revision": 52}],
+  "matched": false
+}
+```
+
+## Exact tests grouped by module and tool
+
+The following names are required. A test may cover more than one trace row, but
+renaming or dropping a required test is a TDD-plan deviation.
+
+### `settings.test.ts`, `registration.test.ts`, and `cli-runner.test.ts`
+
+#### `settings.test.ts` / extension-owned `config.json`
+
+- `settings_read_only_from_extension_owned_config`
+- `settings_do_not_read_pi_or_project_config`
+- `settings_do_not_read_tool_override_fields`
+- `project_config_override_is_absent`
+- `tool_settings_override_is_absent`
+- `absent_config_uses_default_cadence_and_reviewer_model`
+- `valid_config_loads_cadence_and_reviewer_model`
+- `malformed_config_json_returns_invalid_settings_before_waiting`
+- `invalid_cadence_below_one_fails_before_waiting`
+- `invalid_cadence_above_thirty_fails_before_waiting`
+- `invalid_cadence_noninteger_fails_before_waiting`
+- `invalid_reviewer_model_fails_before_waiting`
+- `unresolvable_reviewer_model_ends_long_wait_without_fallback`
+- `config_change_is_sampled_by_next_wait`
+- `active_wait_keeps_its_start_config_snapshot`
+- `settings_loader_does_not_create_or_rewrite_config`
+
+The valid fixture uses the extension-owned file shape:
+
+```json
+{
+  "wait": {
+    "reviewCadenceMinutes": 10,
+    "reviewerModel": "luna"
+  }
+}
+```
+
+The absent fixture has no `config.json` and expects cadence `5`, model `luna`,
+and fixed thinking `low`. Malformed JSON, cadence values `0`, `31`, and `5.5`,
+and invalid model values such as `""`, whitespace, or a malformed identifier
+must fail before any Herdr poll or reviewer call. A project fixture with a competing setting and a tool input containing cadence,
+model, or thinking fields must be absent from the settings source and must be
+ignored or rejected, never used as an override. The reload tests follow the SPEC
+sampling rule: a subsequent wait sees a changed valid file, while an active wait
+uses the validated snapshot captured at its start.
+
+#### `registration.test.ts` and `cli-runner.test.ts`
+
+- `registers_exactly_six_tools_when_herdr_env_is_1`
+- `registers_no_tools_and_makes_no_calls_when_herdr_env_is_not_1`
+- `does_not_register_deferred_command_workspace_or_admin_tools`
+- `uses_pi_exec_with_herdr_argv_not_shell_commands`
+- `passes_the_same_abort_signal_to_every_cli_call`
+- `rejects_non_json_cli_output_as_structured_cli_error`
+- `rejects_nonzero_cli_exit_as_structured_cli_error`
+- `chains_mutations_using_returned_opaque_ids`
+- `never_constructs_ids_from_display_numbers`
+- `authoritative_post_read_follows_create_split_move_and_launch`
+- `authoritative_read_wins_over_stale_mutation_response`
+- `cancellation_between_mutation_and_post_read_does_not_report_success`
+
+### `targets.test.ts`
+
+- `resolves_exact_id_current_and_unique_exact_name`
+- `current_resolves_from_caller_context_not_focus`
+- `resolves_exact_agent_name_only_when_unique`
+- `missing_target_fails_before_mutation`
+- `ambiguous_exact_agent_name_fails_before_mutation`
+- `rejects_fuzzy_prefix_target`
+- `rejects_substring_target`
+- `rejects_case_variant_target`
+- `does_not_use_focused_pane_when_target_is_omitted`
+- `target_resolution_error_contains_candidates_without_mutating`
+
+### `inspect.test.ts` / `herdr_inspect`
+
+- `inspect_single_defaults_to_metadata_and_exactly_100_recent_unwrapped_lines`
+- `inspect_single_requests_recent_unwrapped_source`
+- `inspect_single_preserves_authoritative_post_read_metadata`
+- `inspect_collection_returns_compact_records_without_transcripts`
+- `inspect_collection_does_not_read_transcripts`
+- `inspect_health_returns_version_and_protocol`
+- `inspect_missing_target_returns_structured_error_without_mutation`
+- `inspect_never_changes_focus_or_ownership`
+
+### `communicate.test.ts` / `herdr_communicate`
+
+- `communicate_prompt_rejects_working_agent_without_mutation`
+- `communicate_prompt_sends_text_without_wait_flags`
+- `communicate_prompt_verifies_working_without_waiting_completion`
+- `communicate_steer_requires_resolved_working_target`
+- `communicate_steer_sends_named_interrupt_before_prompt`
+- `communicate_steer_uses_named_keys_only`
+- `communicate_never_calls_confirmation_ui`
+- `communicate_does_not_prompt_after_resolution_failure`
+- `communicate_does_not_prompt_after_interrupt_failure`
+- `communicate_completion_race_returns_verified_working_or_truthful_error`
+
+### `wait-predicates.test.ts`, `wait-orchestration.test.ts`, and `herdr_wait`
+
+- `wait_supports_single_target`
+- `wait_multi_target_any_returns_first_match`
+- `wait_multi_target_all_waits_for_every_match`
+- `wait_matches_semantic_status_condition`
+- `wait_matches_raw_literal_output`
+- `wait_matches_raw_regex_output`
+- `wait_combines_raw_and_semantic_conditions`
+- `wait_literal_does_not_enable_regex_semantics`
+- `wait_regex_uses_explicit_regex_mode_only`
+- `wait_requires_explicit_timeout`
+- `wait_accepts_timeout_of_3600_seconds`
+- `wait_rejects_timeout_above_3600_seconds`
+- `wait_rejects_nonpositive_or_nonfinite_timeout`
+- `wait_returns_structured_timeout_with_latest_snapshots`
+- `wait_timeout_does_not_report_success`
+- `wait_cancellation_aborts_polling_and_returns_cancelled`
+- `wait_cancellation_cannot_apply_late_result`
+- `wait_polling_uses_authoritative_reads`
+- `wait_missing_target_fails_before_polling`
+- `wait_ambiguous_target_fails_before_polling`
+- `wait_partial_target_failures_preserve_per_target_truth`
+- `wait_and_timeout_same_tick_follow_documented_precedence`
+- `wait_reviewer_and_match_race_returns_one_terminal_outcome`
+
+### `reviewer.test.ts` / mandatory wait reviewer
+
+- `review_interval_defaults_to_five_minutes`
+- `review_interval_accepts_only_one_to_thirty_minutes`
+- `review_interval_out_of_bounds_fails_configuration`
+- `review_settings_are_snapshotted_for_each_wait`
+- `review_interval_is_not_a_wait_argument`
+- `review_model_defaults_to_luna_low`
+- `review_model_is_not_a_wait_argument`
+- `wait_under_configured_interval_starts_no_review`
+- `wait_over_configured_interval_starts_reviewers`
+- `starts_one_toolless_reviewer_per_target`
+- `starts_all_reviewers_concurrently`
+- `reviewer_target_count_has_no_artificial_cap`
+- `reviewer_receives_bounded_metadata_and_transcript_delta`
+- `reviewer_delta_excludes_prior_transcript`
+- `reviewer_input_contains_no_tools_or_actions`
+- `reviewer_receives_abort_signal`
+- `reviewer_stalled_ends_wait_early`
+- `reviewer_blocked_ends_wait_early`
+- `reviewer_risk_ends_wait_early`
+- `reviewer_unknown_ends_wait_early`
+- `reviewer_failure_ends_wait_early`
+- `healthy_reviewer_does_not_fake_completion`
+- `reviewer_is_not_rendered_as_or_launched_in_a_pane`
+- `reviewer_cancellation_cannot_finish_after_wait_cancellation`
+
+The concurrency test uses a barrier: all reviewer requests must enter before any
+is released. The no-cap test uses a generated target set larger than any expected
+UI or implementation batch limit and verifies one request per target.
+
+### `launch.test.ts` / `herdr_launch`
+
+- `launch_accepts_each_known_agent_kind`
+- `launch_rejects_unknown_kind_before_mutation`
+- `launch_requires_nonempty_name`
+- `launch_rejects_duplicate_exact_name_before_creation`
+- `launch_rejects_ambiguous_name_before_creation`
+- `launch_passes_argv_as_separate_tokens`
+- `launch_defaults_label_to_name`
+- `launch_defaults_right_no_focus_and_current_cwd`
+- `launch_can_create_new_tab`
+- `launch_can_use_existing_exact_pane`
+- `launch_rejects_conflicting_tab_and_pane_targets`
+- `launch_uses_returned_pane_id_for_agent_start`
+- `launch_optional_prompt_waits_for_ready_then_verifies_working`
+- `launch_prompt_does_not_wait_for_completion`
+- `launch_accepts_arbitrary_env_overrides_unchanged`
+- `launch_env_overrides_do_not_mutate_process_env`
+- `launch_success_never_closes_resources`
+- `launch_partial_failure_preserves_created_resources`
+- `launch_cancellation_preserves_truthful_partial_state`
+
+Known kinds are the explicitly supported interactive agent kinds from the Herdr
+boundary (`pi`, `codex`, `claude`, `opencode`, and `omp`, subject to the installed
+CLI's authoritative help). The test must fail closed for any other kind; it must
+not turn an arbitrary string into a shell command.
+
+### `pane.test.ts` / `herdr_pane`
+
+- `pane_create_requires_label`
+- `pane_create_defaults_right_and_no_focus`
+- `pane_create_honors_explicit_down`
+- `pane_create_honors_explicit_focus`
+- `pane_create_uses_current_cwd_by_default`
+- `pane_create_uses_returned_id_for_post_read`
+- `pane_create_missing_label_fails_before_cli_mutation`
+- `herdr_pane_has_no_close_or_cleanup_path`
+- `public_pane_calls_never_issue_close`
+- `pane_partial_failure_is_truthful`
+
+### `tab.test.ts` / `herdr_tab`
+
+- `tab_create_requires_label`
+- `tab_create_defaults_no_focus`
+- `tab_create_honors_explicit_focus`
+- `tab_create_defaults_current_workspace`
+- `tab_create_uses_returned_tab_id_for_post_read`
+- `tab_create_missing_label_fails_before_cli_mutation`
+- `herdr_tab_has_no_close_or_cleanup_path`
+- `public_tab_calls_never_issue_close`
+- `tab_creation_does_not_close_calling_pane`
+- `tab_partial_failure_is_truthful`
+
+### `ownership.test.ts`
+
+The close matrix is tested at the internal ownership-policy seam and through a
+synthetic explicit teardown invocation only. It is **not** exposed as a seventh
+tool, and none of the six public tools may invoke it automatically.
+
+- `ownership_records_only_current_session_resources`
+- `ownership_is_not_persisted_in_session_entries`
+- `ownership_clears_on_reload`
+- `ownership_clears_on_resume`
+- `ownership_clears_on_new_session`
+- `ownership_clears_on_session_change`
+- `owned_transitive_pane_tree_is_wholly_owned`
+- `owned_transitive_tab_tree_is_wholly_owned`
+- `owned_transitive_tree_closes_without_confirmation`
+- `mixed_transitive_tree_requires_confirmation`
+- `unowned_tree_requires_confirmation`
+- `no_ui_mixed_tree_close_fails_closed`
+- `no_ui_unowned_tree_close_fails_closed`
+- `owned_tree_close_does_not_request_confirmation`
+- `current_courier_resource_cannot_be_claimed`
+- `public_pane_tab_calls_never_close_owned_or_unowned_resources`
+- `session_shutdown_does_not_auto_cleanup`
+- `close_failure_does_not_claim_cleanup_success`
+
+Transitive fixtures include an owned parent with owned descendants, an owned
+parent with one foreign descendant, a foreign parent with an owned descendant,
+and a tree whose ownership was cleared by reload. The expected close decision is
+based on every descendant, not only the requested root.
+
+### `results-rendering.test.ts`
+
+- `results_include_structured_details_and_compact_text`
+- `result_details_include_operation_target_ids_and_outcome`
+- `partial_results_preserve_each_target_truth`
+- `cancelled_results_include_latest_safe_snapshot`
+- `timeout_results_include_latest_safe_snapshots`
+- `render_call_is_compact_for_each_tool`
+- `render_result_is_compact_when_collapsed`
+- `render_result_expands_target_details_only_when_requested`
+- `renderers_show_partial_timeout_cancel_and_error_states`
+- `renderers_do_not_dump_raw_json_or_full_transcripts`
+- `renderer_handles_missing_details_without_throwing`
+- `renderer_handles_partial_update_without_claiming_completion`
+
+Use deterministic fake themes and fixed widths. Assert rendered lines, collapsed
+versus expanded behavior, and bounded transcript display rather than terminal
+escape colors. Partial rendering must say that work is in progress or partial;
+it must not display a success checkmark prematurely.
+
+## Ordered red-green-refactor slices
+
+Each slice follows the same loop: add the named tests, run them red, verify the
+failure is the missing behavior, implement only enough to turn them green, then
+refactor while all prior tests remain green.
+
+1. **Standalone repository, settings, and test harness first.** Work from
+   `/home/gabriel/.pi/agent/extensions/herdr-tools` as the standalone Git repo;
+   establish its test runner, TypeScript build, lint, fake filesystem/settings
+   loader, fake runner, fake reviewer, fake UI, fake clock, and fixture loader.
+   Add all settings tests above plus registration/disabled-mode tests. No tool
+   implementation exists when the first tests are written. Verify no test
+   command resolves files from the Courier repository.
+2. **Registration and runner contract.** Make the six registration tests green;
+   add signal propagation, JSON/error decoding, no-shell, and cancellation tests.
+3. **Exact target resolution.** Add exact ID/current/unique-name resolution and
+   fail-closed tests before any mutating tool is implemented.
+4. **Inspect.** Implement single-target metadata plus exactly 100
+   `recent-unwrapped` lines, compact collections, and health version/protocol.
+   Confirm inspect has no mutation or focus path.
+5. **Communicate.** Implement prompt precondition, steer named interrupt then
+   prompt, authoritative working verification, no completion wait, and no UI
+   confirmation.
+6. **Pane/tab creation.** Implement required labels, right/down direction,
+   explicit focus, current cwd/workspace defaults, returned IDs, post-reads, and
+   no-close behavior.
+7. **Ownership policy seam.** Add current-session ownership tracking and lifecycle
+   clearing. Red-test the transitive owned/mixed/unowned close matrix and
+   no-UI fail-closed behavior; keep all automatic/public close paths absent.
+8. **Launch.** Add known kind validation, unique name preflight, exact argv/env
+   passing, default label/placement, new-tab/existing-pane choices, ready prompt,
+   working verification, and no cleanup.
+9. **Wait predicates and polling.** Add semantic/raw literal/raw regex
+   conjunctions, single/multi target any/all, explicit bounded timeout, latest
+   snapshots, authoritative polling, partial failures, and cancellation.
+10. **Mandatory reviewer and config sampling.** Add extension-owned
+    `config.json` defaults/validation and per-wait snapshot semantics, then add
+    the one-per-target tool-less in-process reviewer, bounded deltas, concurrent
+    uncapped fan-out, terminal findings, reviewer failure, and reviewer
+    cancellation races.
+11. **Results and renderers.** Add structured success/error/partial/timeout/
+    cancelled details, compact call/result renderers, expansion, bounded output,
+    and partial-progress behavior.
+12. **Disposable integration.** Run the named Herdr session procedure below. Add
+    only integration assertions not reliable with fakes; do not weaken unit tests.
+13. **Final gates and bounded refactor.** Run the configured test, coverage,
+    build, and lint commands. Stop after the agreed final review pass; record any
+    remaining issue as a deviation/escalation rather than starting an endless
+    review/fix loop.
+
+Meaningful green slices may be committed as WIP according to the TDD skill. Never
+commit a red test, broken build, or unreported deviation.
+
+## Cancellation, timeout, and race matrix
+
+The fake clock and runner must cover these deterministic orderings:
+
+- abort before target resolution: zero CLI calls and a cancelled result;
+- abort while a read is pending: runner sees the signal, polling stops, and no
+  result from the late read is applied;
+- abort while reviewers are behind a barrier: every reviewer sees abort and none
+  can terminate the wait after cancellation;
+- condition match immediately before deadline: match is returned;
+- deadline before condition read completes: timeout with latest completed snapshot;
+- condition and timeout in one scheduler turn: follow one documented precedence,
+  test both sides, and never emit two terminal outcomes;
+- reviewer terminal finding racing with condition match: exactly one outcome is
+  selected, with a snapshot and reason for the losing observation;
+- cancellation between create/start and post-read: never claim a fully verified
+  resource and never issue compensating close;
+- prompt/steer post-read racing with state transition: report the observed state,
+  not an optimistic working state;
+- one target failing in a multi-target operation: preserve successful target
+  results and failed target error, without converting the whole result to success.
+
+## Ownership and cleanup contract
+
+Ownership is a memory-only safety ledger tied to the current Pi session. The
+extension must clear it on `session_shutdown`/replacement and rebuild an empty
+ledger on `session_start` for reload, resume, new session, or session change. It
+must not use `pi.appendEntry`, a file, or an environment variable to preserve
+ownership.
+
+The current six-tool public surface has no automatic cleanup and no cleanup tool.
+An explicit internal ownership-policy test seam may be exercised by tests to prove
+that a wholly owned transitive tree could be closed without confirmation, while a
+mixed/unowned tree requires `ctx.ui.confirm` and a no-UI context fails closed. This
+seam must not be invoked from `herdr_pane`, `herdr_tab`, `herdr_launch`, session
+shutdown, reload, cancellation, or error handling. The public trace must contain
+zero close operations. Deferred admin/cleanup behavior remains deferred.
+
+For every ownership test, assert both the policy decision and the fake runner's
+close-call list. For integration, assert current Courier IDs are absent from all
+teardown argv and compare their pre/post snapshots.
+
+## Disposable integration procedure
+
+Integration is opt-in, serial, and never runs against the current Courier
+workspace.
+
+1. Verify `HERDR_ENV=1`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and
+   `HERDR_PANE_ID` exist. Save a read-only snapshot of those current resources.
+2. Create a unique disposable named Herdr session/workspace using the installed
+   CLI's authoritative help syntax, with a disposable temporary cwd and a label
+   such as `pi-herdr-tools-it-<run-id>`.
+3. Parse every workspace/tab/pane ID from JSON responses. Assert the disposable
+   workspace ID differs from `HERDR_WORKSPACE_ID`; never infer IDs.
+4. Load the extension in a Pi integration process with the six tools enabled.
+   Assert registration count and that no deferred tool appears.
+5. Exercise inspect health, compact collections, single-pane metadata/transcript,
+   pane creation, tab creation, launch of a harmless supported kind, communicate,
+   and bounded wait. Assert labels, direction, focus, cwd, status, transcript
+   source, returned IDs, and post-read state.
+6. Exercise timeout snapshots and the reviewer using a deterministic fake reviewer
+   or a local configured reviewer adapter; do not require a paid network model.
+7. On success or failure, teardown is test-harness code only. Close/delete only
+   resources created by this named disposable integration session, after a final
+   ownership/ID assertion. The product extension must issue no automatic cleanup.
+8. Re-read current Courier workspace/tab/pane and compare protected fields with the
+   initial snapshot. Fail if any current ID was mutated or appears in teardown.
+9. If setup fails after creating resources, print the owned disposable IDs for
+   manual recovery; never broaden cleanup to the current/focused workspace.
+
+Integration must be skipped, not silently redirected, when Herdr is unavailable.
+A skipped integration run is not a passing compatibility result; report it
+separately from the unit gates.
+
+## Build, lint, and coverage gates
+
+This is a new standalone Git repository, so the first red slice must define its
+package scripts and test configuration at
+`/home/gabriel/.pi/agent/extensions/herdr-tools` before implementation. Do not
+claim a configured gate until it exists, and do not inherit scripts or config from
+Courier. The package must provide these commands (using the repository's existing
+test tools when available):
+
+```text
+cd /home/gabriel/.pi/agent/extensions/herdr-tools
+npm test                 # unit suite
+npm run coverage         # unit suite with coverage and coverage summary
+npm run build            # TypeScript type/build check
+npm run lint             # lint all changed package source and tests
+npm run test:integration # opt-in disposable Herdr integration suite
+```
+
+`npm run coverage` must enforce 100% statements, branches, functions, and lines
+for every changed source file and print exactly `COVERAGE_RESULT: PASS` only when
+those thresholds pass. Tests and fixtures may be excluded only when the coverage
+configuration documents why they are not changed source. If no existing coverage
+command can be reused, define the command and its configuration in the package's
+first setup slice before implementation; do not invent a green result.
+
+The final run order is:
+
+```text
+npm test
+npm run coverage
+npm run build
+npm run lint
+```
+
+Record the actual command output and any deviation in the implementation report.
+A passing test suite without `COVERAGE_RESULT: PASS`, clean build, and clean lint
+is not done.
+
+## Deterministic verification for untestable or environment-dependent items
+
+Some properties cannot be completely proven by pure unit tests. Mark them
+`UNTESTABLE` in the implementation report and attach the following deterministic
+evidence rather than omitting them:
+
+- **Pi global discovery and runtime registration — UNTESTABLE in unit tests:**
+  launch Pi in print/JSON mode twice with `HERDR_ENV=1` and unset, inspect the
+  registered tool metadata, and record exactly six versus zero. Use a disposable
+  Pi process, not the current session.
+- **Installed Herdr CLI protocol/syntax — UNTESTABLE with static fixtures:**
+  capture `herdr --help`/relevant group help and health output in the disposable
+  integration session, parse version/protocol, and compare the runner's logical
+  operation mapping. Never probe mutating commands by omitting arguments.
+- **Actual renderer appearance — UNTESTABLE as a visual property:**
+  use deterministic renderer snapshots at fixed widths/themes for call, result,
+  expanded, partial, timeout, cancelled, and error states. A human visual check
+  may supplement snapshots but cannot replace them.
+- **Actual Luna provider availability — UNTESTABLE without a live model dependency:**
+  resolve `luna/low` through an injected model registry/configuration adapter and
+  verify no per-call override. A live paid call is not required for the unit gate.
+- **Wall-clock review/timeout behavior — UNTESTABLE without slow tests:** use the
+  fake monotonic clock for all unit assertions and, if needed, one bounded local
+  smoke test. Never use real five-minute sleeps in the unit suite.
+- **No current-Courier mutation — UNTESTABLE by fakes alone:** the integration
+  procedure must snapshot current IDs before and after and inspect every mutation
+  and teardown argv for those IDs.
+
+Any implementation choice that contradicts an acceptance invariant is an
+escalation, not a reason to rewrite this trace. The final implementation report
+must include TDD-plan deviations, architecture deviations, scope deviations,
+and concerns for the reviewer, as required by the source TDD skill.

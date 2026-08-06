@@ -6,7 +6,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 import { isLaunchAgentKind, LaunchParamsSchema, type LaunchParams, type LaunchPlacement } from "../launch-schema.js";
 
 export interface LaunchCli {
-  runJson(argv: string[], signal: AbortSignal): Promise<JsonEnvelope>;
+  runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
 }
 
 export interface LaunchResourceRegistry {
@@ -73,6 +73,7 @@ function validateParams(params: LaunchParams): void {
     if (!record(params.env)) throw new LaunchError("INVALID_INPUT", "env must be a string map");
     for (const [key, value] of Object.entries(params.env)) {
       identifier(key, "environment variable name");
+      if (key.includes("=")) throw new LaunchError("INVALID_INPUT", "environment variable names must not contain =");
       if (typeof value !== "string" || /\0/.test(value)) throw new LaunchError("INVALID_INPUT", "environment values must be strings without NUL");
     }
   }
@@ -97,6 +98,15 @@ function paneRecord(value: unknown): Record<string, unknown> {
   return value.pane;
 }
 
+function agentIdentity(value: unknown): { name?: string; agentId?: string } {
+  if (!record(value)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr agent-start response is incompatible");
+  const agent = Object.prototype.hasOwnProperty.call(value, "agent") ? value.agent : value;
+  const name = stringFrom(agent, "name");
+  const agentId = idFrom(agent, "agent_id") ?? idFrom(agent, "id");
+  if (!name && !agentId) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr agent-start response omitted authoritative agent identity");
+  return { name, agentId };
+}
+
 function idFrom(value: unknown, field: string): string | undefined {
   if (!record(value)) return undefined;
   const candidate = value[field];
@@ -111,7 +121,7 @@ function stringFrom(value: unknown, field: string): string | undefined {
 
 function paneRefFrom(result: unknown): LaunchResourceIds {
   if (!record(result)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr placement response is incompatible");
-  const candidates = [result.pane, result.new_pane, result.child_pane, result.created_pane, result];
+  const candidates = [result.pane, result.root_pane, result.rootPane, result.new_pane, result.child_pane, result.created_pane, result];
   for (const candidate of candidates) {
     const paneId = idFrom(candidate, "pane_id");
     if (paneId) return { paneId, tabId: idFrom(candidate, "tab_id") };
@@ -124,7 +134,7 @@ function tabRefFrom(result: unknown): { tabId: string; paneId?: string } {
   const tab = record(result.tab) ? result.tab : result;
   const tabId = idFrom(tab, "tab_id");
   if (!tabId) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr tab response omitted the authoritative tab ID");
-  const pane = result.pane ?? (tab as Record<string, unknown>).pane;
+  const pane = result.pane ?? result.root_pane ?? result.rootPane ?? (tab as Record<string, unknown>).pane;
   const paneId = idFrom(pane, "pane_id");
   return { tabId, paneId };
 }
@@ -180,7 +190,7 @@ function progress(onUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined, 
 async function run(cli: LaunchCli, argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<unknown> {
   if (signal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
   try {
-    const response = await cli.runJson(argv, signal);
+    const response = await cli.runJson(argv, signal, preserveCompletedMutation);
     if (signal.aborted && !preserveCompletedMutation) throw new LaunchError("ABORTED", "Operation aborted");
     return response.result;
   } catch (error) {
@@ -250,9 +260,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         const startArgs = ["agent", "start", params.name, "--kind", params.kind, "--pane", resolvedPaneId, "--timeout", "30000"];
         if (params.argv !== undefined && params.argv.length > 0) startArgs.push("--", ...params.argv);
         const started = await run(deps.cli, startArgs, abortSignal, true);
-        const agent = record(started) && record(started.agent) ? started.agent : started;
-        const agentId = idFrom(agent, "agent_id") ?? idFrom(agent, "id");
-        const returnedName = stringFrom(agent, "name");
+        const startedAgent = agentIdentity(started);
+        let agentId = startedAgent.agentId;
+        const returnedName = startedAgent.name;
         if (agentId) {
           created.agentId = agentId;
         }
@@ -270,10 +280,13 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (params.initialPrompt !== undefined && stateFrom(postState) !== "working") {
           throw new LaunchError("POSTSTATE_UNAVAILABLE", "Initial prompt did not produce a verified working state");
         }
+        agentId ??= idFrom(postState, "agent_id");
+        const authoritativeName = returnedName ?? stringFrom(postState, "agent_name") ?? stringFrom(postState, "name");
+        if (!authoritativeName) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr launch post-state omitted authoritative agent name");
         const details: LaunchDetails = {
           operation: "launch",
           outcome: "launched",
-          name: returnedName ?? stringFrom(postState, "agent_name") ?? stringFrom(postState, "name") ?? params.name,
+          name: authoritativeName,
           kind: params.kind,
           placement,
           tabId,

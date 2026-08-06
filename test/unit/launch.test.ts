@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { createLaunchTool, validateLaunchParams, type LaunchCli } from "../../src/tools/launch.js";
 import { LAUNCH_AGENT_KINDS, LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
@@ -66,14 +67,35 @@ describe("herdr_launch", () => {
     expect(record).toHaveBeenCalledWith({ kind: "pane", id: "w1:p2", parentId: "w1:t1" });
   });
 
-  it("keeps caller-provided names when the start response is not an object", async () => {
+  it("requires an authoritative agent-start identity instead of fabricating launch success", async () => {
+    for (const startResult of [null, {}, { agent: {} }, { agent: null }]) {
+      const { cli } = makeCli();
+      const base = cli.runJson;
+      cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal) => {
+        if (argv[0] === "agent" && argv[1] === "start") return ok("start", startResult);
+        return base(argv, signal);
+      });
+      await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
+    }
+  });
+
+  it("uses a post-state agent name only when the start response supplies an ID", async () => {
     const { cli } = makeCli();
     const base = cli.runJson;
     cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal) => {
-      if (argv[0] === "agent" && argv[1] === "start") return ok("start", null);
+      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { agent_id: "agent-only" } });
       return base(argv, signal);
     });
-    await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { name: "worker" } });
+    await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { name: "worker", agentId: "agent-only" } });
+
+    const noName = makeCli();
+    const noNameBase = noName.cli.runJson;
+    noName.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { agent_id: "agent-only" } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "idle" } });
+      return noNameBase(argv, signal);
+    });
+    await expect(createLaunchTool({ cli: noName.cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
   });
 
   it("passes arbitrary environment values unchanged and does not mutate process.env", async () => {
@@ -89,7 +111,7 @@ describe("herdr_launch", () => {
     cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv) => {
       calls.push(argv);
       if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot });
-      if (argv[0] === "tab" && argv[1] === "create") return ok("tab", { tab: { tab_id: "w1:t2", workspace_id: "w1" }, pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1" } });
+      if (argv[0] === "tab" && argv[1] === "create") return ok("tab", { tab: { tab_id: "w1:t2", workspace_id: "w1" }, root_pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1" } });
       if (argv[0] === "pane" && argv[1] === "rename") return ok("rename", { pane: { pane_id: "w1:p3" } });
       if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker", pane_id: "w1:p3" } });
       if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1", label: "worker", agent_status: "idle" } });
@@ -103,6 +125,7 @@ describe("herdr_launch", () => {
       ["agent", "start", "worker", "--kind", "claude", "--pane", "w1:p3", "--timeout", "30000"],
       ["pane", "get", "w1:p3"]
     ]);
+    expect(calls.some((call) => call[0] === "tab" && call[1] === "get")).toBe(false);
     expect(result.details).toMatchObject({ paneId: "w1:p3", tabId: "w1:t2", placement: { mode: "new_tab", tabLabel: "agents" } });
   });
 
@@ -190,6 +213,7 @@ describe("herdr_launch", () => {
       { ...valid, env: null },
       { ...valid, env: { "": "value" } },
       { ...valid, env: { KEY: 1 } },
+      { ...valid, env: { "A=B": "value" } },
       { ...valid, placement: null },
       { ...valid, placement: 1 },
       { ...valid, placement: { mode: 1 } },
@@ -220,7 +244,7 @@ describe("herdr_launch", () => {
         if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot });
         if (argv[0] === "pane" && argv[1] === "split") return ok("split", placement);
         if (argv[0] === "pane" && argv[1] === "rename") return ok("rename", {});
-        if (argv[0] === "agent" && argv[1] === "start") return ok("start", {});
+        if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker" } });
         if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "idle" } });
         throw new Error(`unexpected argv: ${argv.join(" ")}`);
       });
@@ -263,7 +287,7 @@ describe("herdr_launch", () => {
     await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", placement: { mode: "new_tab", tabLabel: "agents" } }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { name: "authoritative-name", tabId: "w1:t2", paneId: "w1:p3" } });
     expect(calls).toContainEqual(["tab", "get", "w1:t2"]);
 
-    const malformed = [null, {}, { tab: {} }];
+    const malformed = [null, {}, { tab: {} }, { tab: [] }];
     for (const result of malformed) {
       const malformedCli: LaunchCli = { runJson: vi.fn<LaunchCli["runJson"]>(async (argv) => {
         if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot });
@@ -300,7 +324,7 @@ describe("herdr_launch", () => {
         if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot });
         if (argv[0] === "pane" && argv[1] === "split") return ok("split", { pane: { pane_id: "w1:p2", tab_id: "w1:t1" } });
         if (argv[0] === "pane" && argv[1] === "rename") return ok("rename", {});
-        if (argv[0] === "agent" && argv[1] === "start") return ok("start", {});
+        if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker" } });
         if (argv[0] === "agent" && argv[1] === "prompt") return ok("prompt", {});
         if (argv[0] === "pane" && argv[1] === "get") return ok("get", pane);
         throw new Error(`unexpected argv: ${argv.join(" ")}`);
@@ -347,7 +371,7 @@ describe("herdr_launch", () => {
     const focusFailure = makeCli();
     focusFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv) => {
       if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot });
-      if (argv[0] === "agent" && argv[1] === "start") return ok("start", {});
+      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker" } });
       if (argv[0] === "agent" && argv[1] === "focus") throw Object.assign(new Error("focus timed out"), { code: "CLI_TIMEOUT" });
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
     });
@@ -371,6 +395,23 @@ describe("herdr_launch", () => {
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
     });
     await expect(createLaunchTool({ cli: stringCli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
+  });
+
+  it("preserves IDs from a completed production placement when abort races the CLI response", async () => {
+    const controller = new AbortController();
+    const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane" && argv[1] === "split") {
+        controller.abort();
+        return { stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: "w1:p9", tab_id: "w1:t1" } } }), stderr: "", code: 0, killed: false };
+      }
+      throw new Error(`unexpected argv: ${argv.join(" ")}`);
+    });
+    const tool = createLaunchTool({ cli: new HerdrCli(exec), context, cwd: "/repo" });
+    await expect(tool.execute("id", { name: "worker", kind: "pi" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({
+      code: "ABORTED",
+      details: { created: { paneId: "w1:p9", tabId: "w1:t1" } }
+    });
   });
 
   it("renders compact calls and results", () => {

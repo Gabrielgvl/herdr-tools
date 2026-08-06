@@ -180,6 +180,7 @@ describe("herdr_pane", () => {
     runtimeOwnership.record({ kind: "pane", id: "p2", parentId: "t1" });
     harness.snapshot.agents.push({ pane_id: "p2", name: "agent-only" });
     await expect(execute(harness, { operation: "move", target: "agent-only", destination: { kind: "new_tab", label: "moved" } })).resolves.toMatchObject({ details: { operation: "move", paneId: "p2", tabId: "t-new" } });
+    expect(runtimeOwnership.has({ kind: "tab", id: "t-new" })).toBe(true);
     await expect(execute(harness, { operation: "move", target: "p2", destination: { kind: "tab", target: "current" } })).resolves.toMatchObject({ details: { operation: "move", paneId: "p2", tabId: "t1" } });
     expect(harness.calls).toContainEqual(["pane", "move", "p2", "--new-tab", "--workspace", "w1", "--tab-label", "moved", "--no-focus"]);
     const transferred = makeHarness();
@@ -192,6 +193,33 @@ describe("herdr_pane", () => {
     });
     await expect(execute(transferred, { operation: "move", target: "p2", destination: { kind: "tab", target: "t2" } })).resolves.toMatchObject({ details: { paneId: "p9" } });
     expect(runtimeOwnership.has({ kind: "pane", id: "p9" })).toBe(true);
+  });
+
+  it("creates moved tabs in the caller workspace even for cross-workspace sources", async () => {
+    const harness = makeHarness();
+    harness.snapshot.workspaces.push({ workspace_id: "w2", label: "other workspace" });
+    harness.snapshot.tabs.push({ tab_id: "t3", workspace_id: "w2", label: "source" });
+    harness.snapshot.panes.push({ ...basePane("p-cross", "t3", "cross-workspace"), workspace_id: "w2" });
+    const base = harness.cli.runJson.bind(harness.cli);
+    harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      harness.calls.push(argv);
+      if (argv[0] === "pane" && argv[1] === "move") {
+        expect(argv).toContainEqual("--workspace");
+        expect(argv[argv.indexOf("--workspace") + 1]).toBe("w1");
+        harness.snapshot.tabs.push({ tab_id: "t-new-cross", workspace_id: "w1", label: "moved" });
+        const pane = harness.snapshot.panes.find((item) => item.pane_id === "p-cross");
+        if (pane) {
+          pane.tab_id = "t-new-cross";
+          pane.workspace_id = "w1";
+        }
+        return { id: "move", result: { pane: { pane_id: "p-cross" }, tab: { tab_id: "t-new-cross" } } };
+      }
+      return base(argv, signal);
+    });
+    await expect(execute(harness, { operation: "move", target: "p-cross", destination: { kind: "new_tab", label: "moved" } })).resolves.toMatchObject({
+      details: { paneId: "p-cross", tabId: "t-new-cross", workspaceId: "w1" }
+    });
+    expect(harness.calls).toContainEqual(["pane", "move", "p-cross", "--new-tab", "--workspace", "w1", "--tab-label", "moved", "--no-focus"]);
   });
 
   it("covers authoritative parser failures and every focus direction", async () => {
@@ -305,7 +333,7 @@ describe("herdr_pane", () => {
     });
     await expect(createPaneTool({ cli: direct.cli, context }).execute("id", { operation: "rename", target: "p2", label: "direct" } as never, undefined, undefined, direct.ctx)).resolves.toMatchObject({ details: { paneId: "p2" } });
     await expect(createPaneTool({ cli: direct.cli, context }).execute("id", { operation: "focus", target: "p2" } as never, undefined, undefined, direct.ctx)).resolves.toMatchObject({ details: { paneId: "p2" } });
-    direct.snapshot.panes[1]!.parent_id = "p1";
+    direct.snapshot.panes[1]!.parent_id = "p2-parent";
     await expect(execute(direct, { operation: "close", target: "p2" })).resolves.toMatchObject({ details: { operation: "close" } });
 
   });

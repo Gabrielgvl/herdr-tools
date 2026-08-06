@@ -228,13 +228,14 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
           argv = [...argv, "--tab", tab.id, "--split", params.direction ?? "right"];
         } else {
           assertSafeIdentifier(destination.label, "destination.label");
-          argv = [...argv, "--new-tab", "--workspace", source.workspaceId, "--tab-label", destination.label];
+          argv = [...argv, "--new-tab", "--workspace", deps.context.workspaceId!, "--tab-label", destination.label];
         }
         argv = [...argv, ...(params.focus ? ["--focus"] : ["--no-focus"] )];
         const moved = await deps.cli.runJson(argv, activeSignal);
         const paneId = resourceId(moved.result);
         const postState = await readPane(deps.cli, paneId, activeSignal);
         const ledger = deps.ownership ?? runtimeOwnership;
+        if (destination.kind === "new_tab") ledger.record({ kind: "tab", id: postState.tab_id, parentId: postState.workspace_id });
         if (ledger.has({ kind: "pane", id: source.id })) {
           if (source.id === paneId) ledger.record({ kind: "pane", id: paneId, parentId: postState.tab_id });
           else ledger.transfer({ kind: "pane", id: source.id }, { kind: "pane", id: paneId, parentId: postState.tab_id });

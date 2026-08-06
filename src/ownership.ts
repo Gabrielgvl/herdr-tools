@@ -47,6 +47,11 @@ function directChildren(nodes: Map<string, TopologyNode>, node: TopologyNode): T
   return result;
 }
 
+function parentNode(nodes: Map<string, TopologyNode>, node: TopologyNode): TopologyNode | undefined {
+  if (!node.parentId) return undefined;
+  return [...nodes.values()].find((candidate) => candidate.id === node.parentId || nodeKey(candidate.kind, candidate.id) === node.parentId);
+}
+
 function affectedResources(topology: CloseTopology, target: OwnedResource): OwnedResource[] {
   const nodes = new Map(topology.nodes.map((node) => [nodeKey(node.kind, node.id), node]));
   const root = nodes.get(nodeKey(target.kind, target.id)) ?? { ...target };
@@ -60,6 +65,16 @@ function affectedResources(topology: CloseTopology, target: OwnedResource): Owne
     for (const child of directChildren(nodes, node)) visit(child);
   };
   visit(root);
+
+  let child = nodes.get(nodeKey(root.kind, root.id));
+  while (child) {
+    const parent = parentNode(nodes, child);
+    if (!parent) break;
+    const remainingChildren = directChildren(nodes, parent).filter((candidate) => !visited.has(nodeKey(candidate.kind, candidate.id)));
+    if (remainingChildren.length > 0) break;
+    visit(parent);
+    child = parent;
+  }
   return result;
 }
 

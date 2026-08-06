@@ -76,8 +76,8 @@ export class HerdrCli {
     private readonly evidenceLimit = MAX_EVIDENCE_BYTES
   ) {}
 
-  async runJson(argv: string[], signal: AbortSignal): Promise<JsonEnvelope> {
-    const result = await this.runRaw(argv, signal);
+  async runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<JsonEnvelope> {
+    const result = await this.runRaw(argv, signal, preserveCompletedMutation);
     if (result.code !== 0 || result.killed) throw failureFromExec(result, this.evidenceLimit);
     return parseEnvelope(result.stdout, this.evidenceLimit);
   }
@@ -105,11 +105,12 @@ export class HerdrCli {
     return output.truncated ? `${output.value}\n[output truncated]` : output.value;
   }
 
-  private async runRaw(argv: string[], signal: AbortSignal): Promise<ExecResult> {
+  private async runRaw(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<ExecResult> {
     if (signal.aborted) throw new CliProtocolError("ABORTED", "Operation aborted");
     try {
-      const result = await this.exec("herdr", argv, { signal, timeout: this.timeout });
-      if (signal.aborted) throw new CliProtocolError("ABORTED", "Operation aborted");
+      const timeout = argv[0] === "agent" && argv[1] === "start" ? Math.max(this.timeout, 30_000) : this.timeout;
+      const result = await this.exec("herdr", argv, { signal, timeout });
+      if (signal.aborted && !preserveCompletedMutation) throw new CliProtocolError("ABORTED", "Operation aborted");
       return result;
     } catch (error) {
       if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {

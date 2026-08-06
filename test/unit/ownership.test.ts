@@ -17,9 +17,11 @@ describe("runtime topology ownership", () => {
     nodes: [
       { kind: "workspace", id: "w1" },
       { kind: "tab", id: "t1", parentId: "w1" },
+      { kind: "tab", id: "t2", parentId: "w1" },
       { kind: "pane", id: "p1", parentId: "t1", children: ["p3"] },
       { kind: "pane", id: "p2", parentId: "pane:p1" },
-      { kind: "pane", id: "p3", parentId: "p1" }
+      { kind: "pane", id: "p3", parentId: "p1" },
+      { kind: "pane", id: "p4", parentId: "t1" }
     ]
   };
 
@@ -112,6 +114,29 @@ describe("runtime topology ownership", () => {
     expect(closePolicy({ topology: { nodes: [], caller: { tabId: "protected" } }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
     expect(closePolicy({ topology: { nodes: [], caller: { workspaceId: "protected" } }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
     expect(closePolicy({ topology: { nodes: [], caller: { paneId: "", tabId: "", workspaceId: "" } }, target: { kind: "pane", id: "orphan" }, hasUI: true }, ledger)).toMatchObject({ allowed: true });
+  });
+
+  it("includes implicitly closed final-child ancestors in ownership and protection checks", () => {
+    const topologyWithFinalChildren: CloseTopology = {
+      caller: { workspaceId: "w-caller", tabId: "t-caller", paneId: "p-caller" },
+      nodes: [
+        { kind: "workspace", id: "w1" },
+        { kind: "tab", id: "t1", parentId: "w1" },
+        { kind: "pane", id: "p1", parentId: "t1" }
+      ]
+    };
+    const ledger = new RuntimeOwnership();
+    ledger.record({ kind: "pane", id: "p1", parentId: "t1" });
+    expect(closePolicy({ topology: topologyWithFinalChildren, target: { kind: "pane", id: "p1" }, hasUI: false }, ledger)).toEqual({
+      allowed: false,
+      code: "CONFIRMATION_UNAVAILABLE",
+      resourceIds: ["p1", "t1", "w1"]
+    });
+    expect(closePolicy({ topology: { ...topologyWithFinalChildren, caller: { workspaceId: "w1", tabId: "t1", paneId: "p-caller" } }, target: { kind: "pane", id: "p1" }, hasUI: true }, ledger)).toMatchObject({
+      allowed: false,
+      code: "PROTECTED_RESOURCE",
+      resourceIds: ["p1", "t1", "w1"]
+    });
   });
 
   it("protects the caller pane, tab, workspace, and descendants of those ancestors", () => {

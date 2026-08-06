@@ -1,6 +1,6 @@
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
-import { closePolicy, recordCreatedResource, runtimeOwnership, type CloseTopology, type RuntimeOwnership } from "../ownership.js";
+import { closePolicy, runtimeOwnership, type CloseTopology, type RuntimeOwnership } from "../ownership.js";
 import { assertSafeEnvironment, assertSafeIdentifier, TabParamsSchema, type TabParams } from "../topology-schema.js";
 import { parseSnapshotResult, type CurrentContext, type HerdrSnapshot, type TabRecord } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
@@ -46,7 +46,7 @@ function createdTab(value: unknown): { tabId: string; rootPaneId?: string } {
   const root = object(value);
   const tab = object(root.tab ?? root);
   if (typeof tab.tab_id !== "string" || tab.tab_id.length === 0) throw Object.assign(new Error("Herdr tab create response is missing tab_id"), { code: "CLI_PROTOCOL_ERROR" });
-  const rootPane = root.root_pane ?? root.rootPane;
+  const rootPane = root.root_pane ?? root.rootPane ?? root.pane ?? (tab as Record<string, unknown>).pane;
   let rootPaneId: string | undefined;
   if (typeof rootPane === "object" && rootPane !== null && !Array.isArray(rootPane)) {
     const candidate = (rootPane as Record<string, unknown>).pane_id;
@@ -143,10 +143,18 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
           ...envArgs(params.env)
         ], activeSignal);
         const resource = createdTab(created.result);
+        const ledger = deps.ownership ?? runtimeOwnership;
+        ledger.record({ kind: "tab", id: resource.tabId, parentId: deps.context.workspaceId });
+        let rootPaneId = resource.rootPaneId;
+        if (!rootPaneId) {
+          const afterCreate = await snapshot(deps.cli, activeSignal);
+          const createdPanes = afterCreate.panes.filter((pane) => pane.tab_id === resource.tabId);
+          if (createdPanes.length !== 1) throw Object.assign(new Error("Herdr tab create response omitted a uniquely discoverable root pane"), { code: "CLI_PROTOCOL_ERROR" });
+          rootPaneId = createdPanes[0]!.pane_id;
+        }
+        ledger.record({ kind: "pane", id: rootPaneId, parentId: resource.tabId });
         const postState = tabFrom((await deps.cli.runJson(["tab", "get", resource.tabId], activeSignal)).result);
-        recordCreatedResource({ kind: "tab", id: resource.tabId, parentId: postState.workspace_id }, deps.ownership ?? runtimeOwnership);
-        if (resource.rootPaneId) recordCreatedResource({ kind: "pane", id: resource.rootPaneId, parentId: resource.tabId }, deps.ownership ?? runtimeOwnership);
-        return tabResult({ operation: "create", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, rootPaneId: resource.rootPaneId, postState: withoutEnvironment(postState) }, "create", postState.tab_id);
+        return tabResult({ operation: "create", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, rootPaneId, postState: withoutEnvironment(postState) }, "create", postState.tab_id);
       }
       const current = await snapshot(deps.cli, activeSignal);
       const target = tabTarget(current, params.target, deps.context);

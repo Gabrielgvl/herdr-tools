@@ -19,6 +19,22 @@ describe("HerdrCli", () => {
     expect(exec).toHaveBeenCalledWith("herdr", ["pane", "get", "w1:p1"], { signal, timeout: 4321 });
   });
 
+  it("gives agent startup its full thirty-second readiness window", async () => {
+    const exec = vi.fn<PiExec>().mockResolvedValue(response('{"id":"start","result":{"agent":{"name":"worker"}}}'));
+    const cli = new HerdrCli(exec);
+    await cli.runJson(["agent", "start", "worker", "--timeout", "30000"], signal);
+    expect(exec).toHaveBeenCalledWith("herdr", ["agent", "start", "worker", "--timeout", "30000"], { signal, timeout: 30_000 });
+  });
+
+  it("preserves a completed mutation response when abort arrives after execution", async () => {
+    const controller = new AbortController();
+    const exec = vi.fn<PiExec>().mockImplementation(async () => {
+      controller.abort();
+      return response('{"id":"split","result":{"pane":{"pane_id":"p2"}}}');
+    });
+    await expect(new HerdrCli(exec).runJson(["pane", "split"], controller.signal, true)).resolves.toMatchObject({ result: { pane: { pane_id: "p2" } } });
+  });
+
   it("rejects malformed JSON envelopes and preserves bounded evidence", async () => {
     const exec = vi.fn<PiExec>().mockResolvedValue(response("not-json", 2, "bad request"));
     const cli = new HerdrCli(exec, 1000);

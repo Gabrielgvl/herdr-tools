@@ -164,10 +164,13 @@ describe("herdr_launch", () => {
     expect(result.details).toMatchObject({ postState: { agent_status: "working" }, initialPromptSent: true });
   });
 
-  it("rejects unknown kinds, empty names, duplicate names, and invalid placement before mutation", async () => {
+  it("rejects unknown kinds, invalid Herdr names, and invalid placement before mutation", async () => {
     const cases: LaunchParams[] = [
       { name: "worker", kind: "unknown" as never },
       { name: "", kind: "pi" },
+      { name: "Worker", kind: "pi" },
+      { name: "worker.name", kind: "pi" },
+      { name: `w${"x".repeat(32)}`, kind: "pi" },
       { name: "worker", kind: "pi", placement: { mode: "new_tab", tabLabel: "" } },
       { name: "worker", kind: "pi", placement: { mode: "existing_pane", target: "missing" } }
     ];

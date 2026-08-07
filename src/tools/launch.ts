@@ -58,7 +58,9 @@ function identifier(value: unknown, field: string): asserts value is string {
 
 function validateParams(params: LaunchParams): void {
   if (!record(params)) throw new LaunchError("INVALID_INPUT", "launch parameters must be an object");
-  identifier(params.name, "name");
+  if (typeof params.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
+    throw new LaunchError("INVALID_INPUT", "name must start with a lowercase letter and contain only lowercase letters, digits, - or _ (1-32 characters)");
+  }
   if (!isLaunchAgentKind(params.kind)) throw new LaunchError("INVALID_INPUT", `Unsupported Herdr agent kind: ${String(params.kind)}`);
   if (params.argv !== undefined && (!Array.isArray(params.argv) || params.argv.some((arg) => typeof arg !== "string" || /\0/.test(arg)))) {
     throw new LaunchError("INVALID_INPUT", "argv must contain only strings representable by the CLI transport");

@@ -101,7 +101,7 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Inspect collections stay compact | `inspect_collection_returns_compact_records_without_transcripts` | Collection metadata is returned for each requested collection. | Collection inspection does not read per-pane transcripts or inflate output to single-target detail. |
 | Health includes version and protocol | `inspect_health_returns_version_and_protocol` | Health details contain both fields from the CLI. | Health does not mutate Herdr or invent a protocol value when absent. |
 | Prompt fails while target is working | `communicate_prompt_rejects_working_agent_without_mutation` | A structured precondition failure is returned. | No prompt, interrupt, focus, or confirmation occurs. |
-| Steer submits directly without interruption | `communicate_steer_direct_for_idle_done_blocked_working`; `communicate_steer_never_sends_escape` | Idle/done/blocked/working steer submits through `agent prompt`; working input is interpreted by the target agent TUI. | Unknown/malformed state sends zero bytes; no steer path sends Escape or waits for settlement. |
+| Steer submits directly without interruption | `communicate_steer_direct_for_idle_done_blocked_working`; `communicate_steer_never_sends_escape`; `communicate_working_steer_omits_wait_flags` | Idle/done/blocked/working steer submits through `agent prompt`; working input is interpreted by the target agent TUI and uses no wait flags. | Unknown/malformed state sends zero bytes; no steer path sends Escape or waits for settlement, and an already-working steer cannot falsely time out after dispatch. |
 | Prompt/steer verify working but do not wait completion | `communicate_prompt_verifies_working_without_waiting_completion`; `communicate_steer_verifies_working_without_waiting_completion` | The post-read shows `working` and operation IDs correlate each Herdr envelope. | Normal prompt refuses working; steer submits directly and never waits for completion. |
 | Communicate uses named keys and no confirmation | `communicate_uses_named_keys_only`; `communicate_never_calls_confirmation_ui` | Only caller-requested validated named keys are sent. | No synthesized Escape, raw control bytes, arbitrary key bytes, or UI confirmation is sent. |
 | Wait supports single and multi-target any/all | `wait_supports_single_target`; `wait_multi_target_any_returns_first_match`; `wait_multi_target_all_waits_for_every_match` | The matching target set and snapshots are returned. | Any does not wait for unrelated targets; all does not return before every target matches. |
@@ -471,6 +471,7 @@ uses the validated snapshot captured at its start.
 - `communicate_steer_direct_for_idle_done_blocked_working`
 - `communicate_steer_never_sends_escape`
 - `communicate_steer_uses_prompt_submission`
+- `communicate_working_steer_omits_wait_flags`
 - `communicate_unknown_state_sends_no_bytes`
 - `communicate_does_not_prompt_after_resolution_failure`
 - `communicate_completion_race_returns_verified_working_or_truthful_error`

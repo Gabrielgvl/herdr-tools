@@ -113,7 +113,10 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...params.keys], activeSignal);
       } else {
         route = params.operation === "steer" ? "steer_direct" : "prompt_direct";
-        prompt = await deps.cli.runJson(["agent", "prompt", target.paneId!, params.text, "--wait", "--until", "working", "--timeout", "5000"], activeSignal);
+        const promptArgs = params.operation === "steer" && beforeState === "working"
+          ? ["agent", "prompt", target.paneId!, params.text]
+          : ["agent", "prompt", target.paneId!, params.text, "--wait", "--until", "working", "--timeout", "5000"];
+        prompt = await deps.cli.runJson(promptArgs, activeSignal);
       }
 
       const postEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);

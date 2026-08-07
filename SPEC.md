@@ -149,9 +149,9 @@ Rules:
 
 - Every operation reads and classifies the authoritative pre-state before sending bytes. `unknown` or malformed state returns a typed no-send error.
 - `prompt` refuses to interrupt `working` targets and fails with `TARGET_BUSY`; idle, done, and blocked targets receive the bounded prompt command directly.
-- `steer` never sends Escape or any other interrupt key. For idle, working, done, or blocked targets it submits the text directly through Herdr's `agent prompt` path; when the agent is working, its own TUI receives that submitted prompt as steering input. Unknown or malformed state is a typed no-send failure.
+- `steer` never sends Escape or any other interrupt key. For idle, working, done, or blocked targets it submits the text directly through Herdr's `agent prompt` path; when the agent is working, its own TUI receives that submitted prompt as steering input. A working steer omits Herdr's `--wait` flags because Herdr 0.8 can time out that wait after successfully dispatching to an already-working agent; the prompt envelope and immediate authoritative post-read provide bounded submission evidence. Unknown or malformed state is a typed no-send failure.
 - `keys` sends only validated named keys. There is no additional confirmation prompt for keys.
-- For `prompt` and `steer`, the tool briefly verifies that the target enters `working` and returns immediately after that verification. It never waits for completion.
+- Idle/done/blocked `prompt` and `steer` briefly wait for the target to enter `working`. A steer whose authoritative pre-state is already `working` submits without wait flags and verifies the immediate post-state. No communication operation waits for completion.
 - Every Herdr envelope ID is retained for prompt/key/post-state calls. Details include bounded pre/post state and route (`prompt_direct` or `steer_direct`).
 - After every operation, the tool returns the authoritative target post-state. A verification timeout or contradictory post-state is a structured failure, not a fabricated success.
 

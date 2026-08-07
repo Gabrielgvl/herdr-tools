@@ -19,7 +19,8 @@ The installed Herdr 0.8 implementation has no dedicated `agent steer` command. `
 3. `operation:"prompt"` remains distinct: it rejects a `working` target with `TARGET_BUSY` rather than intentionally steering it.
 4. Unknown or malformed target state remains a typed no-send failure.
 5. Communication details report route `steer_direct` or `prompt_direct` and retain the prompt/post-state Herdr envelope IDs. Obsolete interrupt and settle-wait IDs are removed.
-6. Post-submission authoritative state is still verified, but the adapter does not claim turn-level acknowledgement because Herdr does not track a newly submitted turn when the target was already working.
+6. A steer whose authoritative pre-state is already `working` invokes `agent prompt` without `--wait`. Herdr 0.8 can dispatch the prompt and then time out `--wait --until working` against an already-working target, producing a false failure. Idle/done/blocked submissions retain the bounded wait for the transition to `working`.
+7. Post-submission authoritative state is still verified, but the adapter does not claim turn-level acknowledgement because Herdr does not track a newly submitted turn when the target was already working.
 
 ## Alternatives considered
 
@@ -39,5 +40,5 @@ Deferred. A future Herdr API could provide agent-specific acknowledgement and tu
 
 - A working agent receives steering input without cancellation.
 - Idle/done/blocked agents receive the same direct prompt submission and begin work normally.
-- The adapter no longer waits for an artificial settled state before steering.
+- The adapter no longer waits for an artificial settled state before steering and avoids Herdr's false timeout path for an already-working target.
 - Herdr still cannot prove that a working agent TUI accepted the text as a distinct steering turn; the result proves prompt submission and observed post-state, not turn-level consumption.

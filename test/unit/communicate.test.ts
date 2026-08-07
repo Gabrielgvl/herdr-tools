@@ -71,7 +71,7 @@ describe("herdr_communicate", () => {
     expect(harness.calls).toEqual([
       ["api", "snapshot"],
       ["pane", "get", "w1:p2"],
-      ["agent", "prompt", "w1:p2", "replace direction", "--wait", "--until", "working", "--timeout", "5000"],
+      ["agent", "prompt", "w1:p2", "replace direction"],
       ["pane", "get", "w1:p2"]
     ]);
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "send-keys")).toBe(false);

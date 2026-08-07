@@ -89,8 +89,8 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 
 | Criterion | Test name(s) | Expected mutation | Expected non-mutation |
 |---|---|---|---|
-| Register only inside Herdr | `registers_exactly_six_tools_when_herdr_env_is_1`; `registers_no_tools_and_makes_no_calls_when_herdr_env_is_not_1` | The Pi registry contains exactly the six named tools in enabled mode. | Disabled mode registers none of the six, invokes no CLI, and makes no UI call. |
-| Only the six core tools are in scope | `does_not_register_deferred_command_workspace_or_admin_tools` | None beyond the six registrations. | Registry and CLI trace contain no deferred tool or deferred operation. |
+| Register only inside Herdr | `registers_exactly_seven_tools_when_herdr_env_is_1`; `registers_no_tools_and_makes_no_calls_when_herdr_env_is_not_1` | The Pi registry contains exactly the seven named tools in enabled mode. | Disabled mode registers none of the seven, invokes no CLI, and makes no UI call. |
+| Only the seven core tools are in scope | `does_not_register_deferred_command_workspace_or_admin_tools` | None beyond the seven registrations. | Registry and CLI trace contain no deferred tool or deferred operation. |
 | All Herdr calls use `pi.exec` CLI | `uses_pi_exec_with_herdr_argv_not_shell_commands` | Fake `pi.exec` receives `command: "herdr"` and an argv array. | No shell string, `execSync`, raw socket, or direct process call is used. |
 | Every call receives the tool AbortSignal | `passes_the_same_abort_signal_to_every_cli_call`; `passes_abort_signal_to_reviewer` | Runner/reviewer observe the supplied signal. | No operation silently substitutes an unabortable signal. |
 | Use explicit returned IDs | `chains_mutations_using_returned_opaque_ids`; `never_constructs_ids_from_display_numbers` | Dependent reads/mutations target IDs returned by fixtures. | Predicted IDs, sidebar indexes, workspace suffixes, and stale IDs never appear in argv. |
@@ -426,7 +426,7 @@ uses the validated snapshot captured at its start.
 
 #### `registration.test.ts` and `cli-runner.test.ts`
 
-- `registers_exactly_six_tools_when_herdr_env_is_1`
+- `registers_exactly_seven_tools_when_herdr_env_is_1`
 - `registers_no_tools_and_makes_no_calls_when_herdr_env_is_not_1`
 - `does_not_register_deferred_command_workspace_or_admin_tools`
 - `uses_pi_exec_with_herdr_argv_not_shell_commands`
@@ -590,7 +590,7 @@ not turn an arbitrary string into a shell command.
 
 The close matrix is tested at the internal ownership-policy seam and through a
 synthetic explicit teardown invocation only. It is **not** exposed as a seventh
-tool, and none of the six public tools may invoke it automatically.
+tool, and none of the seven public tools may invoke it automatically.
 
 - `ownership_records_only_current_session_resources`
 - `ownership_is_not_persisted_in_session_entries`
@@ -649,7 +649,7 @@ refactor while all prior tests remain green.
    Add all settings tests above plus registration/disabled-mode tests. No tool
    implementation exists when the first tests are written. Verify no test
    command resolves files from the Courier repository.
-2. **Registration and runner contract.** Make the six registration tests green;
+2. **Registration and runner contract.** Make the seven registration tests green;
    add signal propagation, JSON/error decoding, no-shell, and cancellation tests.
 3. **Exact target resolution.** Add exact ID/current/unique-name resolution and
    fail-closed tests before any mutating tool is implemented.
@@ -719,7 +719,7 @@ ledger on `session_start` for reload, resume, new session, or session change. It
 must not use `pi.appendEntry`, a file, or an environment variable to preserve
 ownership.
 
-The current six-tool public surface has no automatic cleanup and no cleanup tool.
+The current seven-tool public surface has no automatic cleanup and no cleanup tool.
 An explicit internal ownership-policy test seam may be exercised by tests to prove
 that a wholly owned transitive tree could be closed without confirmation, while a
 mixed/unowned tree requires `ctx.ui.confirm` and a no-UI context fails closed. This

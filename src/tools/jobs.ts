@@ -30,6 +30,10 @@ function detailContent(detail: JobDetail): string {
   return jobDetailContent(detail);
 }
 
+function resultFor(value: JobsDetails): { content: Array<{ type: "text"; text: string }>; details: JobsDetails } {
+  return { content: [{ type: "text", text: boundedContent(value) }], details: value };
+}
+
 export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof JobsParamsSchema, JobsDetails> {
   return {
     name: "herdr_jobs",
@@ -45,25 +49,16 @@ export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof Job
       }
       if (params.operation === "list") {
         const page = registry.list(params.status, params.offset ?? 0, params.limit ?? 20);
-        return {
-          content: [{ type: "text", text: `jobs · ${page.jobs.length}/${page.total}` }],
-          details: { operation: "jobs", kind: "list", ...page }
-        };
+        return resultFor({ operation: "jobs", kind: "list", ...page });
       }
       const job = registry.get(params.jobId);
       if (!job) throw new JobsError("JOB_NOT_FOUND", `JOB_NOT_FOUND: unknown Herdr job ${params.jobId}`, { jobId: params.jobId });
       if (params.operation === "cancel") {
         const cancelled = registry.cancel(params.jobId);
         if (!cancelled) throw new JobsError("JOB_NOT_FOUND", `JOB_NOT_FOUND: unknown Herdr job ${params.jobId}`, { jobId: params.jobId });
-        return {
-          content: [{ type: "text", text: `job ${cancelled.jobId} · ${cancelled.status}` }],
-          details: { operation: "jobs", kind: "job", ...cancelled }
-        };
+        return resultFor({ operation: "jobs", kind: "job", ...cancelled });
       }
-      return {
-        content: [{ type: "text", text: `job ${job.jobId} · ${job.status}` }],
-        details: { operation: "jobs", kind: "job", ...job }
-      };
+      return resultFor({ operation: "jobs", kind: "job", ...job });
     },
     renderCall(rawArgs, theme) {
       const args = rawArgs as JobsParams;

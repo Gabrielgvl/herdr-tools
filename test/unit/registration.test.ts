@@ -112,7 +112,33 @@ describe("global extension registration", () => {
     const notification = notificationForJob(detail);
     expect(notification.content).toContain("HIGH PRIORITY: MANAGER JUDGMENT REQUIRED");
     expect(notification.content).not.toContain("review\nsummary");
-    expect(notification.details).toMatchObject({ priority: "high", jobId: "job_notify" });
+    expect(notification.details).toMatchObject({ priority: "high", jobId: "job_notify", matchedTargets: [] });
+    const successAny = notificationForJob({
+      ...detail,
+      outcome: "success",
+      result: {
+        outcome: "success",
+        matched: true,
+        targets: [
+          { target: "first", targetId: "p1", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: false },
+          { target: "second", targetId: "p2", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: true }
+        ]
+      }
+    });
+    expect(successAny.content).toContain("matchedTargets=second (p2)");
+    expect(successAny.content).not.toContain("matchedTargets=first");
+    expect(successAny.details).toMatchObject({ matchedTargets: ["p2"] });
+    const timeoutWithMatchedSnapshot = notificationForJob({
+      ...detail,
+      outcome: "timeout",
+      result: {
+        outcome: "timeout",
+        matched: false,
+        targets: [{ target: "second", targetId: "p2", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: true }]
+      }
+    });
+    expect(timeoutWithMatchedSnapshot.content).toContain("matchedTargets=none");
+    expect(timeoutWithMatchedSnapshot.details).toMatchObject({ matchedTargets: [] });
     const fallback = notificationForJob({ ...detail, jobId: 123 as never, status: "completed", outcome: undefined, result: undefined, request: { ...detail.request, targets: ["target"], targetIds: [] } });
     expect(fallback).toMatchObject({ details: { outcome: "completed", reason: "completed", priority: "normal" } });
     expect(fallback.content).toContain("target (unknown)");

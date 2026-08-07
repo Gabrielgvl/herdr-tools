@@ -21,6 +21,7 @@ describe("compact tool rows", () => {
     expect(resultForRender("wait", { details: { outcome: "timeout" } })).toEqual({ text: "timeout", tone: "warning" });
     expect(resultForRender("wait", { details: { outcome: "aborted" } })).toEqual({ text: "aborted", tone: "warning" });
     expect(resultForRender("wait", { details: { outcome: "aborted" } }, {}, "p1")).toEqual({ text: "aborted · p1", tone: "warning" });
+    expect(resultForRender("wait", { details: { outcome: "background" } })).toEqual({ text: "background", tone: "success" });
     expect(resultForRender("wait", { details: { outcome: "progress" } }, { isPartial: true })).toEqual({ text: "partial · wait", tone: "warning" });
     expect(resultForRender("wait", {}, {})).toEqual({ text: "error UNKNOWN", tone: "error" });
     expect(resultForRender("wait", { isError: true, details: { code: "REVIEWER_FAILED" } })).toEqual({ text: "error REVIEWER_FAILED", tone: "error" });

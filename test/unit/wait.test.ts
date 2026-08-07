@@ -88,7 +88,7 @@ describe("herdr_wait", () => {
     const result = await execute(cli, { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
     expect(entered).toEqual(["p1", "p2"]);
     expect(result.details).toMatchObject({ outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" });
-    expect(result.details.reviewerSummaries).toHaveLength(2);
+    expect((result.details as { reviewerSummaries?: unknown[] }).reviewerSummaries).toHaveLength(2);
   });
 
   it("honors an authoritative condition that becomes true during reviewer refresh", async () => {
@@ -246,7 +246,7 @@ describe("herdr_wait", () => {
   it("preserves an unknown reviewer target in the manager summary", async () => {
     const reviewer: WaitReviewer = { review: async () => ({ targetId: "external", classification: "blocked", summary: "attention" }) };
     const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
-    expect(result.details.reviewerSummaries?.[0]?.target).toBe("external");
+    expect((result.details as { reviewerSummaries?: Array<{ target?: string }> }).reviewerSummaries?.[0]?.target).toBe("external");
   });
 
   it("polls authoritatively, streams bounded progress, and supports renderers", async () => {
@@ -505,7 +505,7 @@ describe("herdr_wait", () => {
     const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 100, runInBackground: true } as never, initiating.signal, updates, extensionContext);
     expect(started).toMatchObject({ content: [{ type: "text", text: "background wait started · job_background" }], details: { operation: "wait", outcome: "background", jobId: "job_background", targets: ["p1"], targetIds: ["p1"] } });
     const backgroundRendered = tool.renderResult?.(started as never, { expanded: false, isPartial: false }, {} as never, {} as never);
-    expect(backgroundRendered?.render(80)).toEqual(["wait"]);
+    expect(backgroundRendered?.render(80)).toEqual(["background · job_background"]);
     backgroundRendered?.invalidate();
     initiating.abort();
     release();

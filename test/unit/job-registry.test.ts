@@ -86,6 +86,9 @@ describe("JobRegistry", () => {
     const stringFailure = registry.register({ ...request, targetIds: ["p2"] }, async () => { throw "string failure"; });
     await stringFailure.promise;
     expect(registry.get(stringFailure.jobId)).toMatchObject({ status: "failed", error: { message: "string failure" } });
+    const oversizedFailure = registry.register(request, async () => { throw Object.assign(new Error("large failure"), { details: { evidence: "x".repeat(100_000) } }); });
+    await oversizedFailure.promise;
+    expect(registry.get(oversizedFailure.jobId)).toMatchObject({ truncation: { errorDetails: true }, error: { details: { truncated: true } } });
     expect(registry.list("failed").jobs).toEqual(expect.arrayContaining([expect.objectContaining({ error: { code: "BROKEN", message: "broken" } }), expect.objectContaining({ error: { message: "string failure" } })]));
     const generation = registry.captureGeneration();
     registry.shutdown();
@@ -128,19 +131,19 @@ describe("JobRegistry", () => {
   it("bounds uncloneable and oversized progress details", () => {
     const registry = new JobRegistry({ idFactory: () => "job_details" });
     const handle = registry.register(request, async (_signal, update) => { update("progress", () => undefined); return new Promise(() => undefined); });
-    expect(registry.get(handle.jobId)?.progress?.details).toBe("[details unavailable]");
+    expect(registry.get(handle.jobId)?.progress?.details).toMatchObject({ truncated: true, content: "[details unavailable]" });
     const oversized = { text: "x".repeat(100_000) };
     registry.update(handle.jobId, "progress", oversized);
     expect(JSON.stringify(registry.get(handle.jobId)?.progress).length).toBeLessThan(50_000);
     registry.update(handle.jobId, "progress", { truncated: true, content: "x".repeat(100_000) });
     expect(registry.get(handle.jobId)?.progress?.details).toMatchObject({ truncated: true, content: expect.any(String) });
     registry.update(handle.jobId, "bigint", 1n);
-    expect(registry.get(handle.jobId)?.progress?.details).toBe("[details unavailable]");
+    expect(registry.get(handle.jobId)?.progress?.details).toMatchObject({ truncated: true, content: "[details unavailable]" });
     registry.cancel(handle.jobId);
 
     const truncatedRegistry = new JobRegistry({ idFactory: () => "job_truncated_detail" });
     const large = truncatedRegistry.register({ ...request, condition: { transcript: "x".repeat(100_000) } }, async () => new Promise<never>(() => undefined));
-    expect(jobDetailContent(truncatedRegistry.get(large.jobId)!)).toContain("[output truncated]");
+    expect(jobDetailContent(truncatedRegistry.get(large.jobId)!)).toContain('"requestCondition": true');
     truncatedRegistry.cancel(large.jobId);
   });
 

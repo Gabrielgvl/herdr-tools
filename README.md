@@ -60,7 +60,7 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `index.ts` gates registration, builds the `pi.exec` CLI adapter, shares runtime ownership, and clears only in-memory ownership on session shutdown and session start.
 - `src/cli.ts` bounds and validates CLI responses.
 - `src/targets.ts` resolves exact targets and injected current context.
-- `src/tools/` contains the six public tools.
+- `src/tools/` contains the seven public tools.
 - `src/reviewer.ts` contains the tool-less in-process model reviewer used by long waits.
 - `src/tui.ts` uses Pi `Text` components with bounded semantic rows.
 

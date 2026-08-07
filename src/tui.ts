@@ -58,8 +58,9 @@ export function resultForRender(
   targetId?: string,
 ): { text: string; tone: "success" | "warning" | "error" | "muted" } {
   if (options.isPartial) return { text: `partial · ${operation}`, tone: "warning" };
-  const details = result.details as { outcome?: unknown; reason?: unknown; code?: unknown; postState?: { agent_status?: string }; paneId?: string; tabId?: string } | undefined;
+  const details = result.details as { outcome?: unknown; reason?: unknown; code?: unknown; postState?: { agent_status?: string }; paneId?: string; tabId?: string; jobId?: string } | undefined;
   if (details?.outcome === "partial" || details?.outcome === "progress") return { text: `partial${targetId ? ` · ${targetId}` : ""}`, tone: "warning" };
+  if (details?.outcome === "background") return { text: `background${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "success" };
   if (result.isError) {
     const code = typeof details?.code === "string" ? details.code : "UNKNOWN";
     return { text: formatResult({ operation, outcome: "error", code, targetId }), tone: "error" };

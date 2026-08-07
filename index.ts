@@ -78,18 +78,23 @@ export function notificationForJob(detail: JobDetail): { content: string; detail
   const manager = detail.outcome === "manager_judgment_required";
   const status = detail.status === "completed" ? detail.outcome ?? "completed" : detail.status;
   const reason = detail.result?.reason ?? detail.cancelReason ?? detail.error?.code ?? detail.error?.message ?? "completed";
-  const targets = detail.request.targets.map((target, index) => `${safeNotificationPart(target)} (${safeNotificationPart(detail.request.targetIds[index] ?? "unknown")})`).join(", ");
+  const requestedTargets = detail.request.targets.map((target, index) => `${safeNotificationPart(target)} (${safeNotificationPart(detail.request.targetIds[index] ?? "unknown")})`).join(", ");
+  const matchedTargets = detail.status === "completed" && detail.outcome === "success"
+    ? detail.result?.targets?.filter((target) => target.matched).map((target) => `${safeNotificationPart(target.target)} (${safeNotificationPart(target.targetId)})`).join(", ") ?? ""
+    : "";
   const reviewer = detail.result?.reviewerSummaries?.map((summary) => `${safeNotificationPart(summary.targetId)}: ${safeNotificationPart(summary.summary)}`).join("; ");
   const error = detail.error ? `${safeNotificationPart(detail.error.code ?? "error")}: ${safeNotificationPart(detail.error.message)}` : undefined;
   const prefix = manager ? "HIGH PRIORITY: MANAGER JUDGMENT REQUIRED\n" : "";
-  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} finished: outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)}, targets=${safeNotificationPart(targets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
+  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} finished: outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)}, matchedTargets=${safeNotificationPart(matchedTargets || "none", 2_000)}, requestedTargets=${safeNotificationPart(requestedTargets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
   return {
     content: content.slice(0, 8_000),
     details: {
       jobId: detail.jobId,
       outcome: status,
       reason: safeNotificationPart(reason),
-      targets: detail.request.targetIds.slice(),
+      targets: detail.status === "completed" && detail.outcome === "success" ? detail.result?.targets?.filter((target) => target.matched).map((target) => target.targetId) ?? [] : [],
+      matchedTargets: detail.status === "completed" && detail.outcome === "success" ? detail.result?.targets?.filter((target) => target.matched).map((target) => target.targetId) ?? [] : [],
+      requestedTargets: detail.request.targetIds.slice(),
       priority: manager ? "high" : "normal"
     }
   };

@@ -79,6 +79,63 @@ describe("herdr_jobs", () => {
     cancelledRendered?.invalidate();
   });
 
+  it("returns model-visible summaries and bounded aggregate public results", async () => {
+    const jobs = registry();
+    const tool = createJobsTool(jobs);
+    const oversizedRequest: JobRequestSnapshot = {
+      ...request,
+      targets: Array.from({ length: 100 }, (_, index) => `target-${index}-${"x".repeat(1_000)}`),
+      targetIds: Array.from({ length: 100 }, (_, index) => `pane-${index}-${"y".repeat(1_000)}`),
+      condition: { kind: "output", match: { kind: "literal", value: "z".repeat(100_000) } }
+    };
+    const oversized = jobs.register(oversizedRequest, async (_signal, update) => {
+      update("progress ".repeat(500), { evidence: "d".repeat(100_000) });
+      return {
+        outcome: "success",
+        matched: true,
+        reason: "condition_met",
+        targets: Array.from({ length: 100 }, (_, index) => ({
+          target: `target-${index}`,
+          targetId: `pane-${index}`,
+          metadata: { agent_status: "done", evidence: "m".repeat(100_000) },
+          recentUnwrappedLines: Array.from({ length: 100 }, (__, line) => `line-${line}-${"l".repeat(2_000)}`),
+          observedAtMs: index,
+          matched: index === 3
+        })),
+        reviewerSummaries: Array.from({ length: 100 }, (_, index) => ({ target: `target-${index}`, targetId: `pane-${index}`, classification: "progress", summary: "review ".repeat(500) }))
+      };
+    });
+    await oversized.promise;
+    const summaryPage = jobs.list("completed", 0, 100);
+    expect(summaryPage.jobs[0]).toMatchObject({ truncation: { targetIds: 96, targets: 96 } });
+    const got = await tool.execute("id", { operation: "get", jobId: oversized.jobId } as never, undefined, undefined, {} as never);
+    const detailText = JSON.stringify(got.details, null, 2);
+    const contentText = got.content.map((item) => item.type === "text" ? item.text : "").join("\\n");
+    expect(detailText).toContain('"truncation"');
+    expect(detailText).toContain('"resultTargets"');
+    expect(detailText).toContain('"outcome": "success"');
+    expect(Buffer.byteLength(detailText, "utf8")).toBeLessThan(50_000);
+    expect(detailText.split("\\n").length).toBeLessThanOrEqual(2_000);
+    expect(Buffer.byteLength(contentText, "utf8")).toBeLessThan(50_000);
+    expect(contentText.split("\\n").length).toBeLessThanOrEqual(2_000);
+    expect(contentText).toContain(oversized.jobId);
+    expect(contentText).toContain("condition_met");
+
+    const listRegistry = registry();
+    const listTool = createJobsTool(listRegistry);
+    const pending = new Promise<never>(() => undefined);
+    const running = Array.from({ length: 30 }, (_, index) => listRegistry.register({ ...request, targets: [`worker-${index}`], targetIds: [`p-${index}`] }, async (_signal, update) => { update("progress ".repeat(500)); return pending; }));
+    const listed = await listTool.execute("id", { operation: "list", limit: 100 } as never, undefined, undefined, {} as never);
+    const listedText = listed.content.map((item) => item.type === "text" ? item.text : "").join("\\n");
+    expect((listed.details as { jobs: unknown[]; truncation?: { jobs: number } }).jobs.length).toBe(20);
+    expect(listed.details).toMatchObject({ truncation: { jobs: 10 }, nextOffset: 20 });
+    expect(listedText).toContain("job_1");
+    expect(listedText).toContain('"status": "running"');
+    expect(Buffer.byteLength(JSON.stringify(listed.details, null, 2), "utf8")).toBeLessThan(50_000);
+    expect(listedText.split("\\n").length).toBeLessThanOrEqual(2_000);
+    running.forEach((handle) => listRegistry.cancel(handle.jobId));
+  });
+
   it("supports strict pagination and bounded list/get render content", async () => {
     const jobs = registry();
     const tool = createJobsTool(jobs);

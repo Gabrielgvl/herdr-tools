@@ -1,4 +1,5 @@
 import RE2 from "re2";
+import { truncateTail } from "@earendil-works/pi-coding-agent";
 import type { AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CliTextResult, HerdrCli, JsonEnvelope } from "../cli.js";
 import { loadSettings, type Settings } from "../settings.js";
@@ -56,7 +57,7 @@ export interface ReviewerSummary {
   summary: string;
 }
 
-export interface WaitDetails {
+export interface ForegroundWaitDetails {
   operation: "wait";
   outcome: "progress" | "success" | "timeout" | "manager_judgment_required";
   matched: boolean;
@@ -66,6 +67,17 @@ export interface WaitDetails {
   targets: WaitTargetSnapshot[];
   reviewerSummaries?: ReviewerSummary[];
 }
+
+export interface BackgroundWaitDetails {
+  operation: "wait";
+  outcome: "background";
+  jobId: string;
+  targets: string[];
+  targetIds: string[];
+  truncation: { targets: number; targetIds: number };
+}
+
+export type WaitDetails = ForegroundWaitDetails | BackgroundWaitDetails;
 
 export class WaitError extends Error {
   constructor(readonly code: "INVALID_INPUT" | "ABORTED" | "REVIEWER_FAILED" | "CLI_PROTOCOL_ERROR" | "CLI_TIMEOUT" | "TARGET_NOT_FOUND" | "TARGET_AMBIGUOUS" | "TARGET_TYPE_MISMATCH" | "CONTEXT_UNAVAILABLE" | "SESSION_REPLACED", message: string, readonly details: Record<string, unknown> = {}) {
@@ -166,6 +178,8 @@ export function deltaLines(previous: string[], current: string[]): string[] {
 }
 
 const COMPACT_METADATA_KEYS = ["pane_id", "tab_id", "workspace_id", "label", "agent_name", "agent", "agent_status", "status", "cwd", "revision"] as const;
+const BACKGROUND_TARGET_LIMIT = 16;
+const BACKGROUND_TARGET_BYTES = 256;
 export function compactMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(COMPACT_METADATA_KEYS.filter((key) => metadata[key] !== undefined).map((key) => [key, metadata[key]]));
 }
@@ -203,7 +217,21 @@ async function readAndMatch(cli: WaitCli, resolved: ReadonlyArray<{ ref: string;
   return { snapshots, expired: expired(clock, deadline, snapshots) };
 }
 
-function resultDetails(params: WaitParams, snapshots: WaitTargetSnapshot[], outcome: WaitDetails["outcome"], reason: WaitDetails["reason"], reviewerSummaries?: ReviewerSummary[]): WaitDetails {
+function boundedBackgroundDetails(jobId: string, params: WaitParams, targetIds: string[]): BackgroundWaitDetails {
+  return {
+    operation: "wait",
+    outcome: "background",
+    jobId: truncateTail(jobId, { maxBytes: BACKGROUND_TARGET_BYTES, maxLines: 1 }).content,
+    targets: params.targets.slice(0, BACKGROUND_TARGET_LIMIT).map((target) => truncateTail(target, { maxBytes: BACKGROUND_TARGET_BYTES, maxLines: 1 }).content),
+    targetIds: targetIds.slice(0, BACKGROUND_TARGET_LIMIT).map((targetId) => truncateTail(targetId, { maxBytes: BACKGROUND_TARGET_BYTES, maxLines: 1 }).content),
+    truncation: {
+      targets: Math.max(0, params.targets.length - BACKGROUND_TARGET_LIMIT),
+      targetIds: Math.max(0, targetIds.length - BACKGROUND_TARGET_LIMIT)
+    }
+  };
+}
+
+function resultDetails(params: WaitParams, snapshots: WaitTargetSnapshot[], outcome: ForegroundWaitDetails["outcome"], reason: ForegroundWaitDetails["reason"], reviewerSummaries?: ReviewerSummary[]): ForegroundWaitDetails {
   return { operation: "wait", outcome, matched: outcome === "success", reason, match: params.match, condition: params.condition, targets: snapshots, ...(reviewerSummaries && reviewerSummaries.length > 0 ? { reviewerSummaries } : {}) };
 }
 
@@ -218,17 +246,17 @@ function expired(clock: WaitClock, deadline: number, snapshots: WaitTargetSnapsh
   return true;
 }
 
-function timeoutResult(params: WaitParams, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[]) {
+function timeoutResult(params: WaitParams, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[]): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } {
   const details = resultDetails(params, snapshots, "timeout", "timeout", reviewerSummaries);
   return { content: [{ type: "text" as const, text: formatResult({ operation: "wait", outcome: "timeout" }) }], details };
 }
 
-function successResult(params: WaitParams, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[]) {
+function successResult(params: WaitParams, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[]): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } {
   const details = resultDetails(params, snapshots, "success", "condition_met", reviewerSummaries);
   return { content: [{ type: "text" as const, text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
 }
 
-function timeoutIfExpired(params: WaitParams, read: { snapshots: WaitTargetSnapshot[]; expired: boolean }, reviewerSummaries?: ReviewerSummary[]) {
+function timeoutIfExpired(params: WaitParams, read: { snapshots: WaitTargetSnapshot[]; expired: boolean }, reviewerSummaries?: ReviewerSummary[]): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } | undefined {
   return read.expired ? timeoutResult(params, read.snapshots, reviewerSummaries) : undefined;
 }
 
@@ -287,7 +315,7 @@ export async function runPreparedWait(
   signal: AbortSignal,
   onUpdate: AgentToolUpdateCallback<WaitDetails> | undefined,
   context: ExtensionContext
-): Promise<{ content: Array<{ type: "text"; text: string }>; details: WaitDetails }> {
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails }> {
   const { params, validation, settings, resolved } = prepared;
   const clock = deps.clock ?? realClock;
   const start = clock.now();
@@ -311,7 +339,7 @@ export async function runPreparedWait(
   const sentLines = new Map<string, string[]>();
   let nextReview = start + cadenceMs;
   let lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
-  const progress = (text: string, outcome: WaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, snapshots, outcome, undefined, reviewerSummaries), text.slice(0, 500));
+  const progress = (text: string, outcome: ForegroundWaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, snapshots, outcome, undefined, reviewerSummaries), text.slice(0, 500));
   progress("waiting");
 
   while (true) {
@@ -403,15 +431,11 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
           },
           generation
         );
+        const targetIds = prepared.resolved.map((item) => item.target.id);
+        const details = boundedBackgroundDetails(registered.jobId, prepared.params, targetIds);
         return {
-          content: [{ type: "text", text: `background wait started · ${registered.jobId}` }],
-          details: {
-            operation: "wait",
-            outcome: "background",
-            jobId: registered.jobId,
-            targets: [...prepared.params.targets],
-            targetIds: prepared.resolved.map((item) => item.target.id)
-          } as unknown as WaitDetails
+          content: [{ type: "text", text: `background wait started · ${details.jobId}` }],
+          details
         };
       }
       return runPreparedWait({ ...deps, settingsLoader }, prepared, activeSignal, onUpdate, context);

@@ -39,7 +39,7 @@ The extension must not edit `/home/gabriel/.pi/agent/extensions/herdr-agent-stat
 - The entry point is a global Pi extension discovered from the `herdr-tools` directory beside the existing global extensions.
 - The extension factory checks `process.env.HERDR_ENV` before registering anything.
 - When `HERDR_ENV !== "1"`, the factory registers no tools, starts no timers, opens no sockets, makes no CLI calls, and creates no background resources.
-- When enabled, the factory registers only the six core tools. Registration uses Pi's custom-tool API and strict schemas. There are no compatibility aliases or deprecated input fields.
+- When enabled, the factory registers only the seven core tools. Registration uses Pi's custom-tool API and strict schemas. There are no compatibility aliases or deprecated input fields.
 - Tool calls use Pi's `execute` contract, including `AbortSignal`, `onUpdate`, structured `details`, and compact custom call/result renderers.
 
 ### CLI adapter
@@ -432,7 +432,7 @@ The implementation belongs only under the separate directory below:
 ```text
 /home/gabriel/.pi/agent/extensions/herdr-tools/
 ├── SPEC.md                         # this specification
-├── index.ts                        # global extension factory and six registrations
+├── index.ts                        # global extension factory and seven registrations
 ├── package.json                    # only if dependencies/scripts are needed
 ├── config.json                     # optional extension-owned configuration
 ├── src/
@@ -442,7 +442,7 @@ The implementation belongs only under the separate directory below:
 │   ├── ownership.ts                # current-runtime ownership and close guards
 │   ├── settings.ts                 # extension-owned settings validation
 │   ├── wait-review.ts              # bounded, tool-less in-process reviewers
-│   ├── tools/                      # six tool implementations
+│   ├── tools/                      # seven tool implementations
 │   └── tui.ts                      # compact call/result/progress rendering
 ├── test/unit/                      # mocked CLI/model unit tests
 └── test/integration/               # disposable named-session tests
@@ -483,7 +483,7 @@ Testing is test-first. Tests are written before the corresponding implementation
 
 Mock `pi.exec`, CLI stdout/stderr/exit codes, target listings, post-state reads, ownership records, Pi UI confirmation, `AbortSignal`, `onUpdate`, and in-process model calls. Cover:
 
-- disabled registration and exact six-tool registration;
+- disabled registration and exact seven-tool registration;
 - strict schemas and cross-field validation;
 - exact ID/current/label/name resolution, missing and ambiguous matches;
 - current-context protection from UI focus;
@@ -522,7 +522,7 @@ All of the following must pass before implementation is considered complete:
 ## Phased implementation tasks
 
 1. **Scaffold and registration gate**
-   - Acceptance: separate global entry point exists; disabled mode registers nothing; enabled mode registers exactly six tools; existing sibling files are untouched.
+   - Acceptance: separate global entry point exists; disabled mode registers nothing; enabled mode registers exactly seven tools; existing sibling files are untouched.
    - Verify: mocked registration tests and typecheck.
    - Files: extension entry point, schemas/types, package scripts if required.
 
@@ -556,7 +556,7 @@ All of the following must pass before implementation is considered complete:
 The feature is complete only when all of the following are true:
 
 - A Pi process outside Herdr exposes none of the seven tools.
-- A Pi process inside Herdr exposes exactly the six named core tools and no deferred tool.
+- A Pi process inside Herdr exposes exactly the seven named core tools and no deferred tool.
 - Every target operation uses an exact stable ID/current context, exact pane label, or unique agent name and fails closed otherwise.
 - Inspection has the specified current, single-target, collection, and health behavior.
 - Communication distinguishes normal prompt, explicit steer, and named keys; normal prompt never interrupts a working target; no communication operation waits for completion.
@@ -586,7 +586,7 @@ There are no approved open product questions for the core scope. Any implementat
 ## Boundaries and implementation style
 
 - **Always:** use strict TypeScript types and Pi custom-tool schemas; use `StringEnum` for string enums where required by Pi provider compatibility; pass `AbortSignal`; use explicit CLI argv; validate before mutation; re-read authoritative post-state; keep output bounded; run tests before release validation.
-- **Ask first:** adding dependencies, changing the extension-owned settings path or JSON schema, changing the six public schemas, changing ownership lifetime, adding a new Herdr command group, or touching an existing managed extension.
+- **Ask first:** adding dependencies, changing the extension-owned settings path or JSON schema, changing the seven public schemas, changing ownership lifetime, adding a new Herdr command group, or touching an existing managed extension.
 - **Never:** edit `herdr-agent-state.ts`; add compatibility aliases; add deferred tools; infer IDs; target UI focus implicitly; execute arbitrary commands/executables; send raw key sequences; read settings from Pi's global namespace or project-local files; accept tool-call settings overrides; auto-clean failed launches; auto-close unowned/mixed resources without UI; use fallback models or generic success fallbacks; mutate the active Courier workspace in integration tests.
 
 The implementation should keep CLI access, target resolution, ownership, wait supervision, tool registration, and TUI rendering modular. It should follow Pi's custom-tool result shape and renderer lifecycle from the reviewed extension API documentation without introducing an abstraction that is not required by these contracts.

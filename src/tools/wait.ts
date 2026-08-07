@@ -123,7 +123,12 @@ export function matchesState(state: string, requested: string): boolean {
 export function matches(snapshot: WaitTargetSnapshot, condition: WaitCondition, regex?: SafeRegex): boolean {
   if (condition.kind === "state") return matchesState(rawState(snapshot.metadata), condition.state);
   const output = snapshot.recentUnwrappedLines.join("\n");
-  return condition.match.kind === "literal" ? output.includes(condition.match.value) : (regex ?? new RE2(condition.match.value)).test(output);
+  const compactOutput = snapshot.recentUnwrappedLines.map((line) => line.trim()).join("");
+  if (condition.match.kind === "literal") {
+    return output.includes(condition.match.value) || (!/\s/.test(condition.match.value) && compactOutput.includes(condition.match.value));
+  }
+  const safeRegex = regex ?? new RE2(condition.match.value);
+  return safeRegex.test(output) || safeRegex.test(compactOutput);
 }
 
 function samePrefix(previous: string[], current: string[]): number {

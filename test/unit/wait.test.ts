@@ -166,6 +166,10 @@ describe("herdr_wait", () => {
     expect(matches({ ...base, metadata: { status: "working" } }, { kind: "state", state: "started" })).toBe(true);
     expect(matches({ ...base, metadata: {} }, { kind: "state", state: "unknown" })).toBe(true);
     expect(matches({ ...base, recentUnwrappedLines: ["literal only"] }, { kind: "output", match: { kind: "literal", value: ".*" } })).toBe(false);
+    const wrappedToken = { ...base, recentUnwrappedLines: [" REVIEW_P", " ROGRESS_", " DONE"] };
+    expect(matches(wrappedToken, { kind: "output", match: { kind: "literal", value: "REVIEW_PROGRESS_DONE" } })).toBe(true);
+    expect(matches(wrappedToken, { kind: "output", match: { kind: "regex", value: "REVIEW_PROGRESS_D(?:ONE)" } })).toBe(true);
+    expect(matches(wrappedToken, { kind: "output", match: { kind: "literal", value: "REVIEW PROGRESS DONE" } })).toBe(false);
     expect(matches(base, { kind: "output", match: { kind: "regex", value: "hello \\.\\* world" } })).toBe(true);
     expect(matches(base, { kind: "output", match: { kind: "regex", value: "hello" } }, /hello/)).toBe(true);
     expect(boundedLines("")).toEqual([]);

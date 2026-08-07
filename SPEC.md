@@ -131,6 +131,24 @@ Rules:
 
 **Structured result:** `kind`, normalized current/target/collection metadata, authoritative raw metadata fields where needed for forward compatibility, and for a single target `recentUnwrappedLines` capped at 100. Collection entries contain only compact IDs, parent IDs, labels, agent names, and states available from the authoritative response.
 
+### Inter-agent message provenance
+
+Every cross-pane text delivery made by `herdr_communicate` (`prompt` or `steer`) and every `herdr_launch.initialPrompt` is wrapped in this mandatory recipient-visible envelope:
+
+```text
+[HERDR AGENT MESSAGE v1]
+from: coordinator (w1:p1)
+kind: steer
+authority: agent; not user/owner
+payload: all text after this blank line is sender-authored
+
+<caller-supplied payload>
+```
+
+The extension generates the complete header; callers supply only the payload and cannot override or suppress provenance or authority. `kind` is `assignment` for launch initial prompts and preserves `prompt` or `steer` for communication. Sender display identity is resolved from the fresh authoritative snapshot in this order: explicit agent name, pane label, agent kind, then the stable pane ID alone. The pane ID is always included. If the caller pane is absent from the fresh snapshot, delivery fails with `SENDER_IDENTITY_UNAVAILABLE` before sending text. `herdr_communicate` rejects a target whose pane ID equals the caller pane ID with `SELF_TARGET_REJECTED`.
+
+The first-line sentinel and version are stable protocol. All metadata values are normalized to one line so they cannot inject fields; the original payload is preserved after the single separating blank line. This is clear cooperative provenance, not cryptographic authentication: ordinary terminal or raw Herdr CLI/API input can imitate the text, and those paths are outside this extension's guarantee. Named-key delivery is control input, not a message, and is never wrapped.
+
 ### `herdr_communicate`
 
 **Execution:** This mutating tool is registered with `executionMode: "sequential"` so prompt/key/steer calls cannot overlap.
@@ -148,6 +166,7 @@ Rules:
 Rules:
 
 - Every operation reads and classifies the authoritative pre-state before sending bytes. `unknown` or malformed state returns a typed no-send error.
+- `prompt` and `steer` resolve the authoritative sender from the same fresh snapshot used for target resolution, reject self-targeting, and send the mandatory v1 inter-agent envelope. There is no raw-text or provenance opt-out.
 - `prompt` refuses to interrupt `working` targets and fails with `TARGET_BUSY`; idle, done, and blocked targets receive the bounded prompt command directly.
 - `steer` never sends Escape or any other interrupt key. For idle, working, done, or blocked targets it submits the text directly through Herdr's `agent prompt` path; when the agent is working, its own TUI receives that submitted prompt as steering input. A working steer omits Herdr's `--wait` flags because Herdr 0.8 can time out that wait after successfully dispatching to an already-working agent; the prompt envelope and immediate authoritative post-read provide bounded submission evidence. Unknown or malformed state is a typed no-send failure.
 - `keys` sends only validated named keys. There is no additional confirmation prompt for keys.
@@ -247,7 +266,7 @@ Rules:
 - `new_tab` explicitly creates a labeled tab in the current workspace, with no focus by default. Any pane returned/created for the new tab is labeled before the agent is started.
 - `existing_pane` explicitly starts in the resolved existing pane and does not create a replacement pane.
 - `focus: true` is the only way this tool changes focus.
-- If `initialPrompt` is provided, the tool waits only for the new agent to be ready, sends the prompt, and briefly verifies `working`; it does not wait for completion.
+- If `initialPrompt` is provided, the tool resolves the caller sender from the pre-mutation snapshot, wraps the payload in the mandatory v1 envelope with `kind: assignment`, waits only for the new agent to be ready, sends the wrapped prompt, and briefly verifies `working`; it does not wait for completion.
 - Progress is streamed for placement, agent start, readiness, and prompt verification.
 - A failed launch is never automatically cleaned up. Any pane or tab already created remains visible and is returned in failure details for manual handling.
 - Launch returns the authoritative agent name, agent ID if supplied by Herdr, pane ID, tab ID, placement, and post-state. IDs are always read from Herdr responses.
@@ -395,6 +414,8 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `TARGET_AMBIGUOUS`: multiple exact target matches.
 - `TARGET_TYPE_MISMATCH`: exact target exists but cannot serve the requested operation.
 - `TARGET_BUSY`: normal prompt attempted against a working target.
+- `SELF_TARGET_REJECTED`: inter-agent communication targeted the caller's own pane; no text was sent.
+- `SENDER_IDENTITY_UNAVAILABLE`: the caller pane was absent from the fresh authoritative snapshot; no text was sent.
 - `TARGET_STATE_UNKNOWN`: authoritative target state is explicitly unknown; no prompt or key bytes were sent.
 - `TARGET_STATE_UNAVAILABLE`: authoritative target state is malformed or unavailable; no prompt or key bytes were sent.
 - `KEY_REJECTED`: key is not a supported named key.

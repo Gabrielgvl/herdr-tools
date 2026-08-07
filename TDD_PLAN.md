@@ -100,6 +100,8 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Inspect default is one target plus metadata and 100 recent-unwrapped lines | `inspect_single_defaults_to_metadata_and_exactly_100_recent_unwrapped_lines` | A single authoritative snapshot contains target metadata and the last 100 lines. | It does not read an unbounded transcript or silently use rendered/soft-wrapped output. |
 | Inspect collections stay compact | `inspect_collection_returns_compact_records_without_transcripts` | Collection metadata is returned for each requested collection. | Collection inspection does not read per-pane transcripts or inflate output to single-target detail. |
 | Health includes version and protocol | `inspect_health_returns_version_and_protocol` | Health details contain both fields from the CLI. | Health does not mutate Herdr or invent a protocol value when absent. |
+| Inter-agent text has mandatory provenance | `communicate_wraps_prompt_and_steer_with_v1_sender_envelope`; `launch_wraps_initial_prompt_as_assignment`; `message_envelope_preserves_payload_and_sanitizes_metadata` | Recipient text begins with the exact v1 header, authoritative sender name/label/kind plus pane ID, kind, agent authority boundary, then the unchanged payload. | No caller-controlled metadata, provenance opt-out, unlabeled communicate text, or mislabeled launch assignment is delivered. |
+| Sender resolution is authoritative and self-send is rejected | `communicate_sender_precedence_name_label_kind_pane`; `communicate_missing_caller_fails_before_send`; `communicate_self_target_fails_before_send`; `launch_missing_caller_fails_before_mutation` | Name→label→kind→pane-only precedence is deterministic; caller pane must exist in the fresh snapshot; communicate target differs from caller. | No invented identity, stale/environment-only sender, self-message, placement, agent start, or prompt occurs after a failed sender preflight. |
 | Prompt fails while target is working | `communicate_prompt_rejects_working_agent_without_mutation` | A structured precondition failure is returned. | No prompt, interrupt, focus, or confirmation occurs. |
 | Steer submits directly without interruption | `communicate_steer_direct_for_idle_done_blocked_working`; `communicate_steer_never_sends_escape`; `communicate_working_steer_omits_wait_flags` | Idle/done/blocked/working steer submits through `agent prompt`; working input is interpreted by the target agent TUI and uses no wait flags. | Unknown/malformed state sends zero bytes; no steer path sends Escape or waits for settlement, and an already-working steer cannot falsely time out after dispatch. |
 | Prompt/steer verify working but do not wait completion | `communicate_prompt_verifies_working_without_waiting_completion`; `communicate_steer_verifies_working_without_waiting_completion` | The post-read shows `working` and operation IDs correlate each Herdr envelope. | Normal prompt refuses working; steer submits directly and never waits for completion. |
@@ -465,6 +467,11 @@ uses the validated snapshot captured at its start.
 
 ### `communicate.test.ts` / `herdr_communicate`
 
+- `communicate_wraps_prompt_and_steer_with_v1_sender_envelope`
+- `communicate_sender_precedence_name_label_kind_pane`
+- `communicate_missing_caller_fails_before_send`
+- `communicate_self_target_fails_before_send`
+- `message_envelope_preserves_payload_and_sanitizes_metadata`
 - `communicate_prompt_rejects_working_agent_without_mutation`
 - `communicate_prompt_sends_text_without_wait_flags`
 - `communicate_prompt_verifies_working_without_waiting_completion`
@@ -547,6 +554,8 @@ UI or implementation batch limit and verifies one request per target.
 - `launch_can_use_existing_exact_pane`
 - `launch_rejects_conflicting_tab_and_pane_targets`
 - `launch_uses_returned_pane_id_for_agent_start`
+- `launch_wraps_initial_prompt_as_assignment`
+- `launch_missing_caller_fails_before_mutation`
 - `launch_optional_prompt_waits_for_ready_then_verifies_working`
 - `launch_prompt_does_not_wait_for_completion`
 - `launch_accepts_arbitrary_env_overrides_unchanged`
@@ -654,9 +663,11 @@ refactor while all prior tests remain green.
 4. **Inspect.** Implement single-target metadata plus exactly 100
    `recent-unwrapped` lines, compact collections, and health version/protocol.
    Confirm inspect has no mutation or focus path.
-5. **Communicate.** Implement state-aware prompt/steer preconditions, direct
-   prompt submission for steer without synthesized interrupt keys, authoritative
-   working verification, envelope correlation, no completion wait, and no UI confirmation.
+5. **Inter-agent provenance and communicate.** Implement the shared v1 envelope,
+   authoritative sender resolution, self-target rejection, state-aware prompt/steer
+   preconditions, direct steer submission without synthesized interrupt keys,
+   authoritative working verification, envelope correlation, no completion wait,
+   and no UI confirmation. Reuse the same envelope for launch initial assignments.
 6. **Pane/tab creation.** Implement required labels, right/down direction,
    explicit focus, current cwd/workspace defaults, returned IDs, post-reads, and
    no implicit-close behavior.

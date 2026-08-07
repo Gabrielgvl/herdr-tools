@@ -101,9 +101,9 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Inspect collections stay compact | `inspect_collection_returns_compact_records_without_transcripts` | Collection metadata is returned for each requested collection. | Collection inspection does not read per-pane transcripts or inflate output to single-target detail. |
 | Health includes version and protocol | `inspect_health_returns_version_and_protocol` | Health details contain both fields from the CLI. | Health does not mutate Herdr or invent a protocol value when absent. |
 | Prompt fails while target is working | `communicate_prompt_rejects_working_agent_without_mutation` | A structured precondition failure is returned. | No prompt, interrupt, focus, or confirmation occurs. |
-| Steer interrupts explicitly, then prompts | `communicate_steer_sends_named_interrupt_before_prompt` | The trace is named interrupt, prompt, authoritative read. | No raw key bytes, prompt-before-interrupt, or confirmation occurs. |
-| Prompt/steer verify working but do not wait completion | `communicate_prompt_verifies_working_without_waiting_completion`; `communicate_steer_verifies_working_without_waiting_completion` | The post-read shows `working`. | No `agent wait`, completion poll, reviewer, or done/idle wait is issued. |
-| Communicate uses named keys and no confirmation | `communicate_uses_named_keys_only`; `communicate_never_calls_confirmation_ui` | Only the CLI's named interrupt key token is sent for steer. | No escape-byte sequence, arbitrary key bytes, or UI confirmation is sent. |
+| Steer is state-aware and prompts only after a working target settles | `communicate_steer_direct_for_idle_done_blocked`; `communicate_steer_interrupts_working_then_waits`; `communicate_steer_settle_failure_sends_no_prompt` | Idle/done/blocked steer is direct; working steer is named Escape, bounded settle wait, then prompt. | Unknown/malformed state sends zero bytes; prompt never precedes a successful settle acknowledgement. |
+| Prompt/steer verify working but do not wait completion | `communicate_prompt_verifies_working_without_waiting_completion`; `communicate_steer_verifies_working_without_waiting_completion` | The post-read shows `working` and operation IDs correlate each Herdr envelope. | Normal prompt refuses working; steer only waits for interrupt settlement, never completion. |
+| Communicate uses named keys and no confirmation | `communicate_uses_named_keys_only`; `communicate_never_calls_confirmation_ui` | Only validated named keys and canonical `esc` are sent. | No raw escape bytes, arbitrary key bytes, or UI confirmation is sent. |
 | Wait supports single and multi-target any/all | `wait_supports_single_target`; `wait_multi_target_any_returns_first_match`; `wait_multi_target_all_waits_for_every_match` | The matching target set and snapshots are returned. | Any does not wait for unrelated targets; all does not return before every target matches. |
 | Wait supports semantic and raw conditions | `wait_matches_semantic_condition`; `wait_matches_raw_literal`; `wait_matches_raw_regex`; `wait_combines_raw_and_semantic_conditions` | A condition is satisfied only by the requested predicate. | Status is not inferred from text, and literal matching is not accidentally regex matching. |
 | Wait timeout is explicit and capped | `wait_requires_explicit_timeout`; `wait_accepts_timeout_of_3600_seconds`; `wait_rejects_timeout_above_3600_seconds` | Valid timeout starts bounded polling. | Missing, zero/invalid, or over-limit timeout starts no poll or reviewer. |
@@ -134,8 +134,8 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Pane/tab calls never close anything | `herdr_pane_has_no_close_or_cleanup_path`; `herdr_tab_has_no_close_or_cleanup_path`; `public_pane_tab_calls_never_issue_close` | Only requested create/split/move/focus operations occur. | No pane, tab, workspace, or tree close occurs, including on error. |
 | Ownership is current-session in-memory only | `ownership_records_only_current_session_resources`; `ownership_is_not_persisted_in_session_entries` | Created resource IDs are tracked in memory. | No `appendEntry`, file, global, or resumed-session ownership state is written. |
 | Ownership clears on lifecycle replacement | `ownership_clears_on_reload`; `ownership_clears_on_resume`; `ownership_clears_on_new_session`; `ownership_clears_on_session_change` | A new session begins with an empty ownership set. | Old IDs cannot authorize close after replacement. |
-| Only wholly owned transitive trees may close without confirmation | `owned_transitive_tree_closes_without_confirmation`; `mixed_transitive_tree_requires_confirmation`; `unowned_tree_requires_confirmation` | The explicit policy seam permits close only for a wholly owned tree, or after UI confirmation. | A descendant owned by another session/user is never silently closed. |
-| No-UI close is fail-closed | `no_ui_unowned_tree_close_fails_closed`; `no_ui_mixed_tree_close_fails_closed`; `owned_tree_close_does_not_request_confirmation` | UI-enabled explicit policy can confirm; wholly owned policy can proceed without confirmation. | No-UI never assumes consent and never issues a close for an unowned/mixed tree. |
+| Exact pane/tab close is autonomous after protected-topology validation | `pane_close_unowned_without_ui`; `tab_close_unowned_without_ui`; `close_protects_caller_resources`; `close_rejects_malformed_topology` | Any exact non-caller target may close after fresh topology validation, with Herdr-returned operation IDs and compact post-state. | No modal confirmation or ownership gate exists; caller resources and malformed topology remain protected. |
+| Close preserves completed mutations and reconciles uncertain responses | `close_preserves_completed_mutation_after_abort`; `close_reconciles_lost_response_when_absent`; `close_uncertain_when_present_or_readback_fails` | Fresh independent post-read proves absence or returns `MUTATION_UNCERTAIN` with bounded evidence. | No generic success, blind retry, or `No result provided` terminal result is returned. |
 | Current Courier resources are protected | `ownership_cannot_claim_current_courier_resource`; `integration_cleanup_never_targets_current_courier_tree` | Only disposable test IDs may be cleaned by explicit test teardown. | Current workspace/tab/pane IDs remain byte-for-byte unchanged. |
 | Results, renderers, cancellation, and partial failures are truthful | `results_include_structured_details_and_compact_text`; `renderers_are_compact_by_default`; `partial_results_preserve_each_target_truth`; `renderers_show_timeout_cancel_and_error_states`; `all_late_races_are_non_mutating` | Each result exposes operation/outcome/IDs/snapshots/errors suitable for the LLM and renderer. | No raw JSON dump, swallowed per-target error, false all-success, or late side effect is shown. |
 | Unit and integration safety gates exist | `unit_harness_uses_fakes_only`; `integration_uses_disposable_named_session_not_current_courier`; `coverage_gate_requires_changed_files_at_100_percent` | Disposable integration state is created and explicitly torn down by the test harness. | Unit tests never control real Herdr; integration never creates in the Courier workspace. |
@@ -232,12 +232,12 @@ The model adapter test fixes the configured model to `luna/low` and verifies tha
 wait input cannot replace it. The real Luna provider need not be called by unit
 suite tests.
 
-### Fake UI and clock
+### Fake context and clock
 
-The fake UI records `confirm` calls and supplies `hasUI: true/false`. It must make
-an unexpected confirmation call fail the test. A monotonic fake clock controls
-poll intervals, the review threshold, timeout, and same-tick races; tests must
-not sleep in real time.
+The fake context supplies caller IDs and may omit UI entirely because explicit
+pane/tab close is autonomous. Tests assert that no confirmation callback is
+looked up or invoked. A monotonic fake clock controls poll intervals, the review
+threshold, timeout, and same-tick races; tests must not sleep in real time.
 
 ### JSON fixture samples
 
@@ -468,10 +468,10 @@ uses the validated snapshot captured at its start.
 - `communicate_prompt_rejects_working_agent_without_mutation`
 - `communicate_prompt_sends_text_without_wait_flags`
 - `communicate_prompt_verifies_working_without_waiting_completion`
-- `communicate_steer_requires_resolved_working_target`
-- `communicate_steer_sends_named_interrupt_before_prompt`
+- `communicate_steer_direct_for_idle_done_blocked`
+- `communicate_steer_sends_named_interrupt_wait_before_prompt`
 - `communicate_steer_uses_named_keys_only`
-- `communicate_never_calls_confirmation_ui`
+- `communicate_unknown_state_sends_no_bytes`
 - `communicate_does_not_prompt_after_resolution_failure`
 - `communicate_does_not_prompt_after_interrupt_failure`
 - `communicate_completion_race_returns_verified_working_or_truthful_error`
@@ -588,9 +588,10 @@ not turn an arbitrary string into a shell command.
 
 ### `ownership.test.ts`
 
-The close matrix is tested at the internal ownership-policy seam and through a
-synthetic explicit teardown invocation only. It is **not** exposed as a seventh
-tool, and none of the seven public tools may invoke it automatically.
+Close validation is tested in a dedicated topology seam and through both
+public pane/tab close tools. It is **not** exposed as an additional tool. Runtime
+ownership remains bookkeeping for created resources, but never authorizes or
+blocks an explicit exact close.
 
 - `ownership_records_only_current_session_resources`
 - `ownership_is_not_persisted_in_session_entries`
@@ -598,23 +599,20 @@ tool, and none of the seven public tools may invoke it automatically.
 - `ownership_clears_on_resume`
 - `ownership_clears_on_new_session`
 - `ownership_clears_on_session_change`
-- `owned_transitive_pane_tree_is_wholly_owned`
-- `owned_transitive_tab_tree_is_wholly_owned`
-- `owned_transitive_tree_closes_without_confirmation`
-- `mixed_transitive_tree_requires_confirmation`
-- `unowned_tree_requires_confirmation`
-- `no_ui_mixed_tree_close_fails_closed`
-- `no_ui_unowned_tree_close_fails_closed`
-- `owned_tree_close_does_not_request_confirmation`
-- `current_courier_resource_cannot_be_claimed`
-- `public_pane_tab_calls_never_close_owned_or_unowned_resources`
+- `pane_close_unowned_without_ui`
+- `tab_close_unowned_without_ui`
+- `close_protects_caller_resources`
+- `close_rejects_duplicate_cyclic_and_dangling_topology`
+- `close_returns_operation_id_and_compact_post_state`
+- `close_preserves_completed_mutation_after_abort`
+- `close_reconciles_lost_response_when_absent`
+- `close_uncertain_when_present_or_readback_fails`
+- `public_pane_tab_calls_never_close_protected_resources`
 - `session_shutdown_does_not_auto_cleanup`
-- `close_failure_does_not_claim_cleanup_success`
 
-Transitive fixtures include an owned parent with owned descendants, an owned
-parent with one foreign descendant, a foreign parent with an owned descendant,
-and a tree whose ownership was cleared by reload. The expected close decision is
-based on every descendant, not only the requested root.
+Fixtures include sibling resources, transitive Herdr close effects, protected
+caller ancestors, and malformed duplicate/cyclic/dangling topology. The
+validation decision is based on fresh authoritative topology, not ownership.
 
 ### `results-rendering.test.ts`
 
@@ -656,15 +654,16 @@ refactor while all prior tests remain green.
 4. **Inspect.** Implement single-target metadata plus exactly 100
    `recent-unwrapped` lines, compact collections, and health version/protocol.
    Confirm inspect has no mutation or focus path.
-5. **Communicate.** Implement prompt precondition, steer named interrupt then
-   prompt, authoritative working verification, no completion wait, and no UI
-   confirmation.
+5. **Communicate.** Implement state-aware prompt/steer preconditions, named
+   interrupt plus bounded settle wait for working steer, authoritative working
+   verification, envelope correlation, no completion wait, and no UI confirmation.
 6. **Pane/tab creation.** Implement required labels, right/down direction,
    explicit focus, current cwd/workspace defaults, returned IDs, post-reads, and
    no-close behavior.
-7. **Ownership policy seam.** Add current-session ownership tracking and lifecycle
-   clearing. Red-test the transitive owned/mixed/unowned close matrix and
-   no-UI fail-closed behavior; keep all automatic/public close paths absent.
+7. **Close reliability.** Add current-session resource bookkeeping and lifecycle
+   clearing, protected topology validation, sequential mutation registration,
+   completed-mutation preservation, fresh post-readback, reconciliation, and
+   typed uncertainty; keep caller resources protected and never retry a lost close.
 8. **Launch.** Add known kind validation, unique name preflight, exact argv/env
    passing, default label/placement, new-tab/existing-pane choices, ready prompt,
    working verification, and no cleanup.
@@ -708,6 +707,10 @@ The fake clock and runner must cover these deterministic orderings:
   resource and never issue compensating close;
 - prompt/steer post-read racing with state transition: report the observed state,
   not an optimistic working state;
+- close command completing just before the initiating signal abort: fresh readback
+  preserves completed mutation evidence;
+- close response loss with absent/present/unavailable readback: reconcile only
+  proven absence and otherwise return typed uncertainty;
 - one target failing in a multi-target operation: preserve successful target
   results and failed target error, without converting the whole result to success.
 
@@ -720,16 +723,17 @@ must not use `pi.appendEntry`, a file, or an environment variable to preserve
 ownership.
 
 The current seven-tool public surface has no automatic cleanup and no cleanup tool.
-An explicit internal ownership-policy test seam may be exercised by tests to prove
-that a wholly owned transitive tree could be closed without confirmation, while a
-mixed/unowned tree requires `ctx.ui.confirm` and a no-UI context fails closed. This
-seam must not be invoked from `herdr_pane`, `herdr_tab`, `herdr_launch`, session
-shutdown, reload, cancellation, or error handling. The public trace must contain
-zero close operations. Deferred admin/cleanup behavior remains deferred.
+Explicit `herdr_pane`/`herdr_tab` close is an autonomous mutation for an exact
+non-caller target only after fresh protected-topology validation. It is serialized
+with all other mutating calls. Lost or aborted close responses are reconciled once
+from a fresh authoritative readback; target presence or readback failure returns
+`MUTATION_UNCERTAIN` and never retries. For every close test, assert operation
+order, completed-mutation preservation, compact sanitized post-state, caller
+protection, and absence of modal UI access. Deferred admin/cleanup behavior
+remains deferred.
 
-For every ownership test, assert both the policy decision and the fake runner's
-close-call list. For integration, assert current Courier IDs are absent from all
-teardown argv and compare their pre/post snapshots.
+For integration, assert current Courier IDs are absent from all teardown argv and
+compare their pre/post snapshots.
 
 ## Disposable integration procedure
 

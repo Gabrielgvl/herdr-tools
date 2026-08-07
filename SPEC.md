@@ -434,11 +434,11 @@ Each tool has a compact custom call/result row using Pi's extension renderer API
 
 - Call rows show the tool name, operation, and resolved human-readable target label/name when known.
 - Result rows show a short status such as inspected, sent, waiting, launched, updated, or closed, plus IDs/statuses needed for the next action.
-- `working`, `blocked`, `idle`/`done`, timeout, reviewer failure, and protected/confirmation states use distinct semantic styling.
+- `working`, `blocked`, `idle`/`done`, timeout, reviewer failure, protected, reconciled, and uncertain states use distinct semantic styling.
 - `herdr_wait` and `herdr_launch` stream bounded progress through `onUpdate`. Wait progress includes target state changes and reviewer summaries; launch progress includes placement, readiness, and prompt verification.
 - Default output never prints full transcripts, environment values, raw CLI JSON, or reviewer prompts. Expanded details may show the fixed bounded transcript and structured metadata.
 - Errors render their stable code and concise reason. They do not look like successful operations.
-- TUI-specific rendering is guarded by Pi mode capabilities; RPC receives structured results, and non-UI modes never attempt interactive confirmation.
+- TUI-specific rendering is guarded by Pi mode capabilities; RPC receives structured results, and close operations never require interactive UI confirmation.
 
 ## Project structure
 
@@ -454,7 +454,9 @@ The implementation belongs only under the separate directory below:
 │   ├── cli.ts                      # pi.exec-based Herdr adapter
 │   ├── targets.ts                  # exact target resolution
 │   ├── schemas.ts                  # strict public tool schemas/types
-│   ├── ownership.ts                # current-runtime ownership and close guards
+│   ├── ownership.ts                # current-runtime resource bookkeeping
+│   ├── close.ts                    # protected-resource topology validation and compact summaries
+│   ├── mutations.ts                # completed-mutation preservation and close reconciliation
 │   ├── settings.ts                 # extension-owned settings validation
 │   ├── wait-review.ts              # bounded, tool-less in-process reviewers
 │   ├── tools/                      # seven tool implementations
@@ -496,7 +498,7 @@ Testing is test-first. Tests are written before the corresponding implementation
 
 ### Mocked unit tests
 
-Mock `pi.exec`, CLI stdout/stderr/exit codes, target listings, post-state reads, ownership records, Pi UI confirmation, `AbortSignal`, `onUpdate`, and in-process model calls. Cover:
+Mock `pi.exec`, CLI stdout/stderr/exit codes, target listings, post-state reads, resource records, `AbortSignal`, `onUpdate`, and in-process model calls. Cover:
 
 - disabled registration and exact seven-tool registration;
 - strict schemas and cross-field validation;
@@ -512,7 +514,7 @@ Mock `pi.exec`, CLI stdout/stderr/exit codes, target listings, post-state reads,
 - unique launch names, supported kinds, placement defaults, argv separation, initial prompt readiness, post-state reads, and failed-launch retention;
 - all pane/tab topology operations and default direction/focus behavior;
 - environment overrides without an extension key allowlist and without value echoing;
-- ownership loss, owned-only close, mixed/unowned confirmation, no-UI fail-closed behavior, and caller ancestor protection;
+- autonomous exact pane/tab close, lost-response reconciliation, mutation uncertainty, compact post-topology evidence, malformed topology, and caller ancestor protection;
 - AbortSignal propagation and malformed CLI output.
 
 ### Disposable-session integration tests
@@ -557,7 +559,7 @@ All of the following must pass before implementation is considered complete:
    - Files: wait tool, review supervisor, settings.
 
 5. **Launch and topology gate**
-   - Acceptance: launch and pane/tab mutations use explicit placement, labels, ownership, confirmations, protected ancestors, and authoritative post-state reads.
+   - Acceptance: launch and pane/tab mutations use explicit placement, labels, resource bookkeeping, autonomous exact close, protected ancestors, and authoritative post-state reads.
    - Verify: mocked mutation/ownership tests followed by disposable-session integration tests.
    - Files: launch, pane, tab, ownership, CLI adapter.
 
@@ -578,7 +580,7 @@ The feature is complete only when all of the following are true:
 - Wait supports the specified raw/semantic states, literal/regex output, any/all, explicit one-hour maximum, structured timeout snapshots, and mandatory reviewer supervision for long waits.
 - Reviewer calls are in-process, tool-less, concurrent per target, bounded, non-mutating, fixed at low thinking, use the extension-owned reviewer model (default `openai-codex/gpt-5.6-luna`), and fail immediately without fallback when unavailable.
 - Launch requires a unique caller name and supported kind, uses the specified placement defaults, supports argv without arbitrary executables, verifies initial work, streams progress, and never cleans failed launches.
-- Pane and tab topology operations implement the specified defaults, labels, environment behavior, ownership confirmations, protected ancestors, and authoritative post-state.
+- Pane and tab topology operations implement the specified defaults, labels, environment behavior, autonomous exact close, protected ancestors, bounded reconciliation, and authoritative post-state.
 - Results are structured and concise, custom rows are compact, and waits/launches stream progress.
 - Abort signals reach CLI and model work.
 - Mocked unit tests achieve 100% changed-file coverage; disposable named-session integration tests, build, lint, and typecheck are clean.
@@ -593,7 +595,7 @@ The feature is complete only when all of the following are true:
 3. The installed Herdr CLI may add or remove supported agent kinds or adjust output fields. The adapter treats the installed CLI as authoritative and reports compatibility/protocol failures instead of guessing.
 4. `Escape` is the installed CLI's named interrupt mapping for explicit steer. The implementation must validate/use the CLI-supported named-key path, not send raw terminal bytes.
 5. New tabs may cause Herdr to return an initial child pane. That pane must be labeled from the caller's requested/default launch label before it is used.
-6. Ownership intentionally does not survive extension reload or Pi session changes, even when the Herdr resources remain alive.
+6. Ownership bookkeeping intentionally does not survive extension reload or Pi session changes, even when the Herdr resources remain alive; close authorization is based on the explicit exact target and fresh protected topology, not ownership.
 7. The extension directory is a standalone Git repository with no remote initially. The implementation phase must run `git init`, verify the empty remote list, and create the initial commit containing the reviewed `SPEC.md` before implementation proceeds.
 
 There are no approved open product questions for the core scope. Any implementation ambiguity not resolved by this document must fail closed and be raised for review rather than expanded into a new capability.

@@ -59,6 +59,8 @@ The installed CLI is authoritative for command syntax, supported agent kinds, re
 
 Read-only discovery may use the installed command groups shown by `herdr --help`, including `herdr status`, `herdr api snapshot`, `herdr api schema --json`, and the relevant `pane`, `agent`, and `tab` commands. No update, server stop, workspace mutation, or admin operation is in scope.
 
+Herdr 0.8 does not expose conditional compare-and-send or compare-and-close flags. Adapter-side preflight and post-state verification therefore provide bounded fail-closed behavior but cannot make the check-and-mutation atomic. The residual atomicity gap is an upstream Herdr limitation and remains visible rather than being hidden by compatibility shims.
+
 ### Target resolver
 
 `TargetRef` is a non-empty string supplied by the caller. Resolution is exact and fail-closed:
@@ -131,6 +133,8 @@ Rules:
 
 ### `herdr_communicate`
 
+**Execution:** This mutating tool is registered with `executionMode: "sequential"` so prompt/key/steer calls cannot overlap.
+
 **Purpose:** Send a normal prompt, explicitly steer an agent, or send named keys. This tool does not wait for completion.
 
 **Input:** exactly one of these operation shapes:
@@ -143,10 +147,12 @@ Rules:
 
 Rules:
 
-- `prompt` resolves the target and reads its authoritative state first. If it is `working`, the operation fails with `TARGET_BUSY`; it must not silently interrupt the agent.
-- `steer` is explicit. It sends the installed CLI's named interrupt operation first, then sends the prompt. The current CLI mapping is the named `Escape` key through the agent/pane key path; the adapter must use the CLI authority rather than raw terminal escape bytes. If the interrupt fails, the prompt is not sent.
+- Every operation reads and classifies the authoritative pre-state before sending bytes. `unknown` or malformed state returns a typed no-send error.
+- `prompt` refuses to interrupt `working` targets and fails with `TARGET_BUSY`; idle, done, and blocked targets receive the bounded prompt command directly.
+- `steer` is state-aware. Idle, done, and blocked targets receive the bounded prompt directly with no Escape. Working targets receive canonical named `esc`, then a bounded `agent wait ... --until idle --until done --until blocked --timeout 5000`; only a successful settle acknowledgement permits the prompt. Unknown/unavailable states are typed no-send failures.
 - `keys` sends only validated named keys. There is no additional confirmation prompt for keys.
 - For `prompt` and `steer`, the tool briefly verifies that the target enters `working` and returns immediately after that verification. It never waits for completion.
+- Every Herdr envelope ID is retained for interrupt/wait/prompt/post-state calls. Details include bounded pre/post state and route (`prompt_direct` or `interrupt_then_prompt`).
 - After every operation, the tool returns the authoritative target post-state. A verification timeout or contradictory post-state is a structured failure, not a fabricated success.
 
 ### `herdr_wait`
@@ -248,6 +254,8 @@ Rules:
 
 ### `herdr_pane`
 
+**Execution:** This mutating tool is registered with `executionMode: "sequential"` across all pane operations, including close.
+
 **Purpose:** Perform pane topology mutations only: split, move, rename, focus, resize, swap, zoom, or close.
 
 **Input:** a strict discriminated operation union:
@@ -299,10 +307,14 @@ Rules:
 - Move may place an existing pane in an existing tab or a newly created, caller-labeled tab in the current workspace. Workspace creation/movement is not supported.
 - `swap` accepts either a direction relative to `source` or an explicit second target, but never both.
 - Resize requires a finite positive amount and an explicit direction.
-- Close applies the ownership and protected-resource rules below. It never performs automatic cleanup or cascaded cleanup.
-- Every successful mutation re-reads affected pane/layout/tab context and returns authoritative post-state. Close returns the containing context and removed IDs.
+- Close is autonomous after fresh topology validation for an exact non-caller target; it never asks for modal confirmation and never performs automatic cleanup or cascaded cleanup beyond Herdr's own close semantics.
+- Close preserves completed mutation evidence: it captures the Herdr envelope ID/result, invokes the mutation with completed-mutation preservation, and performs an independent fresh post-topology read after dispatch even if the initiating signal aborts.
+- If the close response is lost or invalid, one independent readback reconciles only proven target absence. Otherwise it throws `MUTATION_UNCERTAIN` with bounded original/readback evidence and never retries.
+- Every successful mutation re-reads affected pane/layout/tab context and returns authoritative post-state. Close returns compact containing topology, operation ID, target ID, and removed IDs.
 
 ### `herdr_tab`
+
+**Execution:** This mutating tool is registered with `executionMode: "sequential"` across all tab operations, including close.
 
 **Purpose:** Create, rename, focus, or close tabs.
 
@@ -326,7 +338,8 @@ Rules:
 - Created tabs always have a caller-provided non-empty label and no focus unless explicitly requested.
 - Environment overrides have no extension key restrictions and carry the visibility warning described for pane creation.
 - Tab targets are stable tab IDs or `current`; no fuzzy tab-label resolution is added.
-- Close applies the ownership and protected-resource rules. The tool cannot close the tab containing the calling pane or cause the calling workspace to close.
+- Close is autonomous after fresh topology validation for an exact non-caller target and does not require UI access. The tool cannot close the tab containing the calling pane or cause the calling workspace to close.
+- Close captures the Herdr envelope ID/result, preserves completed mutations across signal abort, performs a fresh post-topology read, and reconciles one lost/invalid response only when target absence is proven. A present or unreadable target produces `MUTATION_UNCERTAIN`; the tool never retries.
 - Every successful mutation re-reads authoritative tab and current-context state. A created tab's authoritative child pane metadata is included without inventing a pane ID.
 
 ## Settings
@@ -360,8 +373,7 @@ Ownership is an in-memory property of the current extension runtime and current 
 - Resources found by inspection, passed as existing targets, or created before the current extension runtime are unowned.
 - Reload, resume, fork, new session, or any session change loses all ownership. Ownership must not be reconstructed from session entries, labels, timestamps, Herdr metadata, or a prior runtime.
 - Ownership is not persisted in `pi.appendEntry` or any sidecar file.
-- A resource may be closed without an interactive confirmation only when the close was explicitly requested and the resource plus every descendant that would be affected is owned by this current runtime.
-- Unowned or mixed-owned resources require an interactive confirmation through `ctx.ui`. If `ctx.hasUI` is false, confirmation is unavailable and the operation fails closed with `CONFIRMATION_UNAVAILABLE`; it must not assume consent.
+- An explicit exact close is authorized for any non-caller target after fresh topology validation; ownership is not consulted for close authorization and no confirmation UI path exists.
 - The pane containing the calling Pi agent, its containing tab, and its containing workspace are protected and can never be closed by these topology tools. Preflight must also reject an operation that would implicitly close one of those ancestors.
 - Failed launches do not trigger ownership-based cleanup. Created resources remain available for inspection and manual closure.
 
@@ -389,7 +401,7 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `READY_TIMEOUT`: launch readiness verification timed out.
 - `OWNERSHIP_LOST`: a required owned-resource fact is no longer valid in this runtime.
 - `PROTECTED_RESOURCE`: operation would close the caller pane or its containing tab/workspace.
-- `CONFIRMATION_UNAVAILABLE`: destructive operation needs UI confirmation but no UI is available.
+- `MUTATION_UNCERTAIN`: a dispatched destructive mutation has no trustworthy response and post-state cannot prove target absence.
 - `ABORTED`: caller `AbortSignal` was aborted.
 - `WAIT_REVIEW_REQUIRED`: a long wait cannot be supervised under the configured rules.
 - `REVIEWER_FAILED`: any required in-process reviewer/model call failed.
@@ -406,10 +418,10 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `herdr_launch` accepts a Herdr-supported `kind` and arguments only, never an executable string.
 - Target resolution is exact and fail-closed. The extension never relies on UI focus or guesses an ID.
 - Named keys are validated symbols, never raw escape/control strings. Key delivery does not add a second confirmation dialog.
-- Destructive close operations are ownership-aware and UI-confirmed for unowned/mixed resources. No UI means no confirmation and no close.
+- Destructive close operations are autonomous only after exact target and protected-topology validation. No UI is required, but malformed topology fails closed.
 - Environment overrides accept arbitrary variable names by product decision. They can expose secrets or control process behavior to the launched child and may be visible through Herdr process/session inspection; normal tool output must not echo their values. Callers remain responsible for not supplying sensitive values in a shared session.
 - Long-wait reviewers receive only bounded metadata/transcript deltas, have no tools, cannot mutate or communicate, and are not visible as Herdr panes. Reviewer failures fail closed.
-- Every CLI and model call observes `AbortSignal`.
+- Every CLI and model call observes `AbortSignal`; close post-readback uses a fresh independent signal so completed destructive mutations cannot lose terminal evidence.
 - The extension does not read, write, replace, or report state through `herdr-agent-state.ts`; Herdr's managed state integration remains the authority for the calling Pi pane's lifecycle state.
 - Integration tests use a disposable named Herdr session and never mutate the active Courier workspace.
 

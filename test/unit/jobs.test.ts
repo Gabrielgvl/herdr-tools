@@ -27,6 +27,56 @@ describe("herdr_jobs", () => {
     await expect(tool.execute("id", { operation: "get", jobId: "job_unknown" } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "JOB_NOT_FOUND" });
     await expect(tool.execute("id", { operation: "list", limit: 101 } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(tool.execute("id", { operation: "list", snake_case: true } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    const hostile = new Proxy({ operation: "list" }, { get: () => { throw "malformed jobs input"; } });
+    await expect(tool.execute("id", hostile as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "INVALID_INPUT", message: "malformed jobs input" });
+  });
+
+  it("handles a cancellation race after the job was inspected", async () => {
+    const jobs = registry();
+    const pending = new Promise<never>(() => undefined);
+    const handle = jobs.register(request, async () => pending);
+    const raceRegistry = {
+      get: () => jobs.get(handle.jobId),
+      cancel: () => undefined,
+    } as unknown as JobRegistry;
+    const tool = createJobsTool(raceRegistry);
+    await expect(tool.execute("id", { operation: "cancel", jobId: handle.jobId } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "JOB_NOT_FOUND" });
+    jobs.cancel(handle.jobId);
+  });
+
+  it("renders list, unknown errors, and terminal status tones", async () => {
+    const jobs = registry();
+    const tool = createJobsTool(jobs);
+    const listCall = tool.renderCall?.({ operation: "list" } as never, {} as never, {} as never);
+    expect(listCall?.render(80)).toEqual(["herdr_jobs · list"]);
+    listCall?.invalidate();
+    const defaultCall = tool.renderCall?.({} as never, {} as never, {} as never);
+    expect(defaultCall?.render(80)).toEqual(["herdr_jobs · jobs"]);
+    defaultCall?.invalidate();
+    const listResult = tool.renderResult?.({ content: [], details: { operation: "jobs", kind: "list", jobs: [], total: 0, offset: 0, limit: 20, nextOffset: null }, isError: false } as never, { expanded: false, isPartial: false }, {} as never, {} as never);
+    expect(listResult?.render(80)).toEqual(["jobs · 0/0"]);
+    listResult?.invalidate();
+    const small = boundedContent({ ok: true });
+    expect(small).toBe("{\n  \"ok\": true\n}");
+    const unknownError = tool.renderResult?.({ content: [], details: {}, isError: true } as never, { expanded: false, isPartial: false }, {} as never, {} as never);
+    expect(unknownError?.render(80)).toEqual(["error UNKNOWN"]);
+    unknownError?.invalidate();
+    const malformed = tool.renderResult?.({ content: [], details: { operation: "other" }, isError: false } as never, { expanded: false, isPartial: false }, {} as never, {} as never);
+    expect(malformed?.render(80)).toEqual(["error UNKNOWN"]);
+    malformed?.invalidate();
+
+    const failed = jobs.register(request, async () => { throw new Error("failed"); });
+    await failed.promise;
+    const failedResult = await tool.execute("id", { operation: "get", jobId: failed.jobId } as never, undefined, undefined, {} as never);
+    const failedRendered = tool.renderResult?.(failedResult as never, { expanded: false, isPartial: false }, {} as never, {} as never);
+    expect(failedRendered?.render(80)).toEqual(["job · failed"]);
+    failedRendered?.invalidate();
+    const cancelled = jobs.register(request, async () => new Promise<never>(() => undefined));
+    jobs.cancel(cancelled.jobId);
+    const cancelledResult = await tool.execute("id", { operation: "get", jobId: cancelled.jobId } as never, undefined, undefined, {} as never);
+    const cancelledRendered = tool.renderResult?.(cancelledResult as never, { expanded: false, isPartial: false }, {} as never, {} as never);
+    expect(cancelledRendered?.render(80)).toEqual(["job · cancelled"]);
+    cancelledRendered?.invalidate();
   });
 
   it("supports strict pagination and bounded list/get render content", async () => {

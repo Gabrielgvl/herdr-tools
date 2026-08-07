@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { JobRegistry, type JobRequestSnapshot, type JobRunResult } from "../../src/job-registry.js";
+import { JobRegistry, jobDetailContent, type JobRequestSnapshot, type JobRunResult } from "../../src/job-registry.js";
 
 const request: JobRequestSnapshot = {
   targets: ["one"],
@@ -42,6 +42,7 @@ describe("JobRegistry", () => {
     let now = 0;
     const registry = new JobRegistry({ idFactory: () => `job_${++id}`, clock: { now: () => ++now } });
     const handles = [0, 1, 2].map(() => registry.register(request, async () => success));
+    registry.update(handles[0]!.jobId, "still running");
     await Promise.all(handles.map((handle) => handle.promise));
     const page = registry.list("completed", 1, 1);
     expect(page.total).toBe(3);
@@ -71,15 +72,21 @@ describe("JobRegistry", () => {
     pending.resolve(success);
     await handle.promise;
     expect(registry.get(handle.jobId)).toMatchObject({ status: "cancelled" });
+    expect(registry.list().jobs[0]).toMatchObject({ status: "cancelled", reason: "cancelled" });
     expect(terminal).not.toHaveBeenCalled();
     expect(registry.cancel("job_missing")).toBeUndefined();
   });
 
   it("maps failures and protects generation and shutdown", async () => {
-    const registry = new JobRegistry({ idFactory: () => "job_failure", clock: { now: () => 1 } });
+    let failureId = 0;
+    const registry = new JobRegistry({ idFactory: () => `job_failure_${++failureId}`, clock: { now: () => 1 } });
     const failure = registry.register(request, async () => { throw Object.assign(new Error("broken"), { code: "BROKEN", details: { safe: true } }); });
     await failure.promise;
     expect(registry.get(failure.jobId)).toMatchObject({ status: "failed", error: { code: "BROKEN", message: "broken" } });
+    const stringFailure = registry.register({ ...request, targetIds: ["p2"] }, async () => { throw "string failure"; });
+    await stringFailure.promise;
+    expect(registry.get(stringFailure.jobId)).toMatchObject({ status: "failed", error: { message: "string failure" } });
+    expect(registry.list("failed").jobs).toEqual(expect.arrayContaining([expect.objectContaining({ error: { code: "BROKEN", message: "broken" } }), expect.objectContaining({ error: { message: "string failure" } })]));
     const generation = registry.captureGeneration();
     registry.shutdown();
     expect(registry.isCurrent(generation)).toBe(false);
@@ -125,7 +132,30 @@ describe("JobRegistry", () => {
     const oversized = { text: "x".repeat(100_000) };
     registry.update(handle.jobId, "progress", oversized);
     expect(JSON.stringify(registry.get(handle.jobId)?.progress).length).toBeLessThan(50_000);
+    registry.update(handle.jobId, "progress", { truncated: true, content: "x".repeat(100_000) });
+    expect(registry.get(handle.jobId)?.progress?.details).toMatchObject({ truncated: true, content: expect.any(String) });
+    registry.update(handle.jobId, "bigint", 1n);
+    expect(registry.get(handle.jobId)?.progress?.details).toBe("[details unavailable]");
     registry.cancel(handle.jobId);
+
+    const truncatedRegistry = new JobRegistry({ idFactory: () => "job_truncated_detail" });
+    const large = truncatedRegistry.register({ ...request, condition: { transcript: "x".repeat(100_000) } }, async () => new Promise<never>(() => undefined));
+    expect(jobDetailContent(truncatedRegistry.get(large.jobId)!)).toContain("[output truncated]");
+    truncatedRegistry.cancel(large.jobId);
+  });
+
+  it("copies optional result fields and keeps small public details untruncated", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_optional" });
+    const handle = registry.register(request, async () => ({
+      outcome: "success",
+      matched: true,
+      targets: [{ target: "one", targetId: "p1", metadata: { agent_status: "done" }, recentUnwrappedLines: ["done"], outputTruncated: true, observedAtMs: 1, matched: true }]
+    }));
+    await handle.promise;
+    const detail = registry.get(handle.jobId)!;
+    expect(detail.result).toMatchObject({ outcome: "success", targets: [{ outputTruncated: true }] });
+    expect(detail.result?.reason).toBeUndefined();
+    expect(jobDetailContent(detail)).not.toContain("[output truncated]");
   });
 
   it("does not let notification failures escape", async () => {
@@ -133,5 +163,10 @@ describe("JobRegistry", () => {
     const handle = registry.register(request, async () => success);
     await expect(handle.promise).resolves.toBeUndefined();
     expect(registry.get(handle.jobId)).toMatchObject({ status: "completed" });
+
+    const rejected = new JobRegistry({ idFactory: () => "job_notify_async", onTerminal: async () => { throw new Error("async ui down"); } });
+    const asyncHandle = rejected.register(request, async () => success);
+    await expect(asyncHandle.promise).resolves.toBeUndefined();
+    expect(rejected.get(asyncHandle.jobId)).toMatchObject({ status: "completed" });
   });
 });

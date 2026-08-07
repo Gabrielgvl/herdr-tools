@@ -113,6 +113,17 @@ describe("global extension registration", () => {
     expect(notification.content).toContain("HIGH PRIORITY: MANAGER JUDGMENT REQUIRED");
     expect(notification.content).not.toContain("review\nsummary");
     expect(notification.details).toMatchObject({ priority: "high", jobId: "job_notify" });
+    const fallback = notificationForJob({ ...detail, jobId: 123 as never, status: "completed", outcome: undefined, result: undefined, request: { ...detail.request, targets: ["target"], targetIds: [] } });
+    expect(fallback).toMatchObject({ details: { outcome: "completed", reason: "completed", priority: "normal" } });
+    expect(fallback.content).toContain("target (unknown)");
+    const cancelled = notificationForJob({ ...detail, status: "cancelled", outcome: undefined, result: undefined, cancelReason: "cancelled" });
+    expect(cancelled).toMatchObject({ details: { outcome: "cancelled", reason: "cancelled", priority: "normal" } });
+    const codedFailure = notificationForJob({ ...detail, status: "failed", outcome: undefined, result: undefined, error: { code: "BROKEN", message: "backend down" } });
+    expect(codedFailure.content).toContain("reason=BROKEN");
+    expect(codedFailure.content).toContain("error=BROKEN: backend down");
+    const uncodedFailure = notificationForJob({ ...detail, status: "failed", outcome: undefined, result: undefined, error: { message: "backend down" } });
+    expect(uncodedFailure.content).toContain("reason=backend down");
+    expect(uncodedFailure.content).toContain("error=error: backend down");
     enable();
     const { pi } = fakePi();
     const runtime = createRuntime(pi, process.env);
@@ -121,6 +132,22 @@ describe("global extension registration", () => {
     expect((pi.sendMessage as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(expect.objectContaining({ customType: "herdr-wait-job", display: true }), { deliverAs: "steer", triggerTurn: true });
     const sentContent = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]?.content as string;
     expect(sentContent).toContain("outcome=success");
+
+    const noNotifier = createRuntime({ exec: vi.fn() }, process.env);
+    const noNotifierHandle = noNotifier.jobs.register(detail.request, async () => ({ outcome: "success", matched: true }));
+    await noNotifierHandle.promise;
+
+    const syncThrow = vi.fn(() => { throw new Error("Pi is shutting down"); });
+    const throwingRuntime = createRuntime({ exec: vi.fn(), sendMessage: syncThrow }, process.env);
+    const throwingHandle = throwingRuntime.jobs.register(detail.request, async () => ({ outcome: "success", matched: true }));
+    await throwingHandle.promise;
+    expect(syncThrow).toHaveBeenCalledTimes(1);
+    const asyncReject = vi.fn().mockRejectedValue(new Error("Pi is unavailable"));
+    const rejectingRuntime = createRuntime({ exec: vi.fn(), sendMessage: asyncReject }, process.env);
+    const rejectingHandle = rejectingRuntime.jobs.register(detail.request, async () => ({ outcome: "success", matched: true }));
+    await rejectingHandle.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(asyncReject).toHaveBeenCalledTimes(1);
   });
 
   it("suppresses notification for explicit cancel and shutdown", async () => {

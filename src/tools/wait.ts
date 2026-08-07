@@ -392,11 +392,11 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
         const registered = deps.jobRegistry!.register(
           jobRequestFromPrepared(prepared),
           async (jobSignal, update): Promise<JobRunResult> => {
-            const result = await runPreparedWait({ ...deps, settingsLoader }, prepared, jobSignal, (next) => update(next.content[0]?.type === "text" ? next.content[0].text : "", next.details), context);
+            const result = await runPreparedWait({ ...deps, settingsLoader }, prepared, jobSignal, (next) => update((next.content[0] as { type: "text"; text: string }).text, next.details), context);
             return {
-              outcome: result.details.outcome === "progress" ? "timeout" : result.details.outcome,
+              outcome: result.details.outcome as JobRunResult["outcome"],
               matched: result.details.matched,
-              ...(result.details.reason ? { reason: result.details.reason } : {}),
+              reason: result.details.reason,
               targets: result.details.targets,
               reviewerSummaries: result.details.reviewerSummaries
             };

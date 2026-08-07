@@ -141,7 +141,6 @@ interface JobRecord {
   detail: JobDetail;
   controller: AbortController;
   generation: JobGeneration;
-  terminalNotified: boolean;
 }
 
 function clone<T>(value: T): T {
@@ -153,8 +152,7 @@ function boundedText(value: string, limit = MAX_SUMMARY_CHARS): string {
 }
 
 function jsonBytes(value: unknown): number {
-  const serialized = JSON.stringify(value);
-  return serialized === undefined ? 0 : Buffer.byteLength(serialized, "utf8");
+  return Buffer.byteLength(JSON.stringify(value) as string, "utf8");
 }
 
 function truncateContent(content: string, maxBytes: number): string {
@@ -175,20 +173,18 @@ function truncateContent(content: string, maxBytes: number): string {
 }
 
 function boundedDetails(value: unknown, maxBytes = MAX_PUBLIC_JSON_BYTES): unknown {
-  if (value === undefined) return undefined;
   let cloned: unknown;
   try {
     cloned = clone(value);
   } catch {
     return "[details unavailable]";
   }
-  let serialized: string | undefined;
+  let serialized: string;
   try {
-    serialized = JSON.stringify(cloned);
+    serialized = JSON.stringify(cloned) as string;
   } catch {
     return "[details unavailable]";
   }
-  if (serialized === undefined) return undefined;
   if (jsonBytes(cloned) <= maxBytes) return cloned;
   if (typeof cloned === "object" && cloned !== null && !Array.isArray(cloned) && (cloned as { truncated?: unknown }).truncated === true && typeof (cloned as { content?: unknown }).content === "string") {
     return { truncated: true, content: truncateContent((cloned as { content: string }).content, maxBytes) };
@@ -202,7 +198,7 @@ function boundedProgress(progress: JobProgress): JobProgress {
   const prefixBytes = jsonBytes({ ...base, details: null }) - Buffer.byteLength("null", "utf8");
   const maxDetailBytes = Math.max(0, MAX_PUBLIC_JSON_BYTES - prefixBytes);
   const details = boundedDetails(progress.details, maxDetailBytes);
-  return details === undefined ? base : { ...base, details };
+  return { ...base, details };
 }
 
 function copyRequest(request: JobRequestSnapshot): JobRequestSnapshot {
@@ -247,7 +243,7 @@ function copyDetail(detail: JobDetail): JobDetail {
     status: detail.status,
     sequence: detail.sequence,
     createdAtMs: detail.createdAtMs,
-    ...(detail.startedAtMs === undefined ? {} : { startedAtMs: detail.startedAtMs }),
+    startedAtMs: detail.startedAtMs,
     ...(detail.finishedAtMs === undefined ? {} : { finishedAtMs: detail.finishedAtMs }),
     request: copyRequest(detail.request),
     ...(detail.progress ? { progress: boundedProgress(detail.progress) } : {}),
@@ -271,7 +267,7 @@ function summary(detail: JobDetail): JobSummary {
     status: detail.status,
     sequence: detail.sequence,
     createdAtMs: detail.createdAtMs,
-    ...(detail.startedAtMs === undefined ? {} : { startedAtMs: detail.startedAtMs }),
+    startedAtMs: detail.startedAtMs,
     ...(detail.finishedAtMs === undefined ? {} : { finishedAtMs: detail.finishedAtMs }),
     targetIds: [...detail.request.targetIds],
     targets: [...detail.request.targets],
@@ -341,7 +337,7 @@ export class JobRegistry {
       createdAtMs: this.clock.now(),
       request: copyRequest(request)
     };
-    const record: JobRecord = { detail, controller, generation, terminalNotified: false };
+    const record: JobRecord = { detail, controller, generation };
     this.jobs.set(jobId, record);
     const promise = this.execute(record, run);
     return { jobId, generation, signal: controller.signal, detail: copyDetail(detail), promise };
@@ -372,8 +368,6 @@ export class JobRegistry {
   }
 
   private notifyTerminal(record: JobRecord): void {
-    if (record.terminalNotified || !this.accepting) return;
-    record.terminalNotified = true;
     if (!this.onTerminal) return;
     try {
       void Promise.resolve(this.onTerminal(copyDetail(record.detail))).catch(() => undefined);

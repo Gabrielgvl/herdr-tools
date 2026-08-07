@@ -65,6 +65,8 @@ describe("global extension registration", () => {
     extension(pi);
     expect(tools.map((tool) => (tool as { name: string }).name)).toEqual([...CORE_TOOL_NAMES]);
     expect(tools).toHaveLength(7);
+    expect(tools.filter((tool) => ["herdr_communicate", "herdr_pane", "herdr_tab"].includes((tool as { name: string }).name)).map((tool) => (tool as { executionMode?: string }).executionMode)).toEqual(["sequential", "sequential", "sequential"]);
+    expect(tools.filter((tool) => !["herdr_communicate", "herdr_pane", "herdr_tab"].includes((tool as { name: string }).name)).some((tool) => "executionMode" in (tool as object))).toBe(false);
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_command");
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_workspace");
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_admin");

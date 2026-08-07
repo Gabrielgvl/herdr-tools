@@ -1,5 +1,6 @@
 import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { JsonEnvelope } from "../cli.js";
+import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
@@ -37,6 +38,8 @@ export interface LaunchDetails extends LaunchResourceIds {
   phase?: "placement" | "agent_start" | "ready" | "prompt_verification";
   created?: LaunchResourceIds;
   causeCode?: string;
+  sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
+  envelope?: { version: "v1"; kind: "assignment" };
 }
 
 class LaunchError extends Error {
@@ -220,6 +223,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       const placement = params.placement ?? { mode: "same_tab" as const };
       const label = params.label ?? params.name;
       const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
+      const sender = params.initialPrompt !== undefined ? resolveSender(snapshot, deps.context.paneId) : undefined;
       assertCurrentContext(snapshot, deps.context);
       if (existingAgentNames(snapshot).filter((name) => name === params.name).length > 0) {
         throw new LaunchError("INVALID_INPUT", `Agent name is already in use: ${params.name}`);
@@ -279,7 +283,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         let initialPromptSent = false;
         if (params.initialPrompt !== undefined) {
           phase = "prompt_verification";
-          await run(deps.cli, ["agent", "prompt", resolvedPaneId, params.initialPrompt, "--wait", "--until", "working", "--timeout", "5000"], abortSignal);
+          const envelope = buildEnvelope(sender!, "assignment", params.initialPrompt);
+          await run(deps.cli, ["agent", "prompt", resolvedPaneId, envelope, "--wait", "--until", "working", "--timeout", "5000"], abortSignal);
           initialPromptSent = true;
           progress(onUpdate, phase, created);
         }
@@ -300,7 +305,11 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           paneId: resolvedPaneId,
           ...(agentId ? { agentId } : {}),
           postState,
-          initialPromptSent
+          initialPromptSent,
+          ...(sender ? {
+            sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
+            envelope: { version: "v1" as const, kind: "assignment" as const }
+          } : {})
         };
         return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId }) }], details };
       } catch (error) {

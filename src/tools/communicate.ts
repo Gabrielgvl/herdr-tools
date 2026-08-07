@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli, JsonEnvelope } from "../cli.js";
+import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
@@ -21,6 +22,8 @@ export interface CommunicateDetails {
     keys?: string;
     postState?: string;
   };
+  sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
+  envelope?: { version: "v1"; kind: "prompt" | "steer" };
 }
 
 export interface CommunicateDependencies {
@@ -98,7 +101,14 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
 
       const snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], activeSignal);
       const snapshot = parseSnapshotResult(snapshotEnvelope.result);
+      const sender = resolveSender(snapshot, deps.context.paneId);
+      if (params.operation !== "keys" && (params.target === "current" || params.target === sender.paneId)) {
+        throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: sender.paneId } });
+      }
       const target = resolveTarget(snapshot, params.target, "agent", deps.context);
+      if (params.operation !== "keys" && target.paneId === sender.paneId) {
+        throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: target.paneId } });
+      }
       const preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
       const before = paneFrom(preEnvelope.result, target.paneId!);
       const beforeState = assertSendableState(before);
@@ -113,9 +123,10 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...params.keys], activeSignal);
       } else {
         route = params.operation === "steer" ? "steer_direct" : "prompt_direct";
+        const envelope = buildEnvelope(sender, params.operation, params.text);
         const promptArgs = params.operation === "steer" && beforeState === "working"
-          ? ["agent", "prompt", target.paneId!, params.text]
-          : ["agent", "prompt", target.paneId!, params.text, "--wait", "--until", "working", "--timeout", "5000"];
+          ? ["agent", "prompt", target.paneId!, envelope]
+          : ["agent", "prompt", target.paneId!, envelope, "--wait", "--until", "working", "--timeout", "5000"];
         prompt = await deps.cli.runJson(promptArgs, activeSignal);
       }
 
@@ -139,7 +150,11 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           ...(prompt ? { prompt: operationId(prompt) } : {}),
           ...(keys ? { keys: operationId(keys) } : {}),
           postState: operationId(postEnvelope)
-        }
+        },
+        ...(params.operation !== "keys" ? {
+          sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
+          envelope: { version: "v1" as const, kind: params.operation }
+        } : {})
       };
       return { content: [{ type: "text", text: formatResult({ operation: "communicate", outcome: "success", targetId: target.paneId, postState: { agent_status: afterState } }) }], details };
     },

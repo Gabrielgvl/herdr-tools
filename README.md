@@ -43,6 +43,8 @@ herdr_tab({"operation":"create","label":"review"})
 
 Targets are exact opaque IDs, `current`, exact pane labels, or unique exact agent names where the operation permits. No focused-pane, prefix, display-number, or fuzzy fallback exists. Launch and topology mutations return authoritative post-state, and failed launches retain any resources already created for manual handling.
 
+Communication prompts and launch initial prompts always include the visible `[HERDR AGENT MESSAGE v1]` sender envelope; the caller payload remains unchanged after the envelope blank line. Named-key delivery is not wrapped, and there is no provenance opt-out.
+
 ## Commands
 
 | Command | Purpose |

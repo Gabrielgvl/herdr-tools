@@ -14,6 +14,7 @@ const snapshot: HerdrSnapshot = {
   agents: []
 };
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
+const assignmentEnvelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const extensionContext = { cwd: "/repo", hasUI: false } as ExtensionContext;
 const ok = (id: string, result: unknown) => ({ id, result });
 
@@ -159,9 +160,21 @@ describe("herdr_launch", () => {
     const { promise, calls } = launch({ initialPrompt: "begin" });
     const result = await promise;
     expect(calls[3]).toEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "30000"]);
-    expect(calls[4]).toEqual(["agent", "prompt", "w1:p2", "begin", "--wait", "--until", "working", "--timeout", "5000"]);
+    expect(calls[4]).toEqual(["agent", "prompt", "w1:p2", assignmentEnvelope("begin"), "--wait", "--until", "working", "--timeout", "5000"]);
     expect(calls[5]).toEqual(["pane", "get", "w1:p2"]);
-    expect(result.details).toMatchObject({ postState: { agent_status: "working" }, initialPromptSent: true });
+    expect(result.details).toMatchObject({ postState: { agent_status: "working" }, initialPromptSent: true, envelope: { version: "v1", kind: "assignment" }, sender: { paneId: "w1:p1", display: "caller" } });
+  });
+
+  it("fails before placement when an initial-prompt caller pane is absent", async () => {
+    const { cli, calls } = makeCli();
+    const snapshotWithoutCaller = { ...snapshot, panes: [] };
+    cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv) => {
+      calls.push(argv);
+      if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: snapshotWithoutCaller });
+      throw new Error(`unexpected mutation: ${argv.join(" ")}`);
+    });
+    await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "begin" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "SENDER_IDENTITY_UNAVAILABLE" });
+    expect(calls).toEqual([["api", "snapshot"]]);
   });
 
   it("rejects unknown kinds, invalid Herdr names, and invalid placement before mutation", async () => {

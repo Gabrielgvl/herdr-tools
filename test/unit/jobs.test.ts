@@ -107,7 +107,7 @@ describe("herdr_jobs", () => {
     });
     await oversized.promise;
     const summaryPage = jobs.list("completed", 0, 100);
-    expect(summaryPage.jobs[0]).toMatchObject({ truncation: { targetIds: 96, targets: 96 } });
+    expect(summaryPage.jobs[0]).toMatchObject({ truncation: { targetIds: 98, targets: 98 } });
     const got = await tool.execute("id", { operation: "get", jobId: oversized.jobId } as never, undefined, undefined, {} as never);
     const detailText = JSON.stringify(got.details, null, 2);
     const contentText = got.content.map((item) => item.type === "text" ? item.text : "").join("\\n");
@@ -127,13 +127,38 @@ describe("herdr_jobs", () => {
     const running = Array.from({ length: 30 }, (_, index) => listRegistry.register({ ...request, targets: [`worker-${index}`], targetIds: [`p-${index}`] }, async (_signal, update) => { update("progress ".repeat(500)); return pending; }));
     const listed = await listTool.execute("id", { operation: "list", limit: 100 } as never, undefined, undefined, {} as never);
     const listedText = listed.content.map((item) => item.type === "text" ? item.text : "").join("\\n");
-    expect((listed.details as { jobs: unknown[]; truncation?: { jobs: number } }).jobs.length).toBe(20);
-    expect(listed.details).toMatchObject({ truncation: { jobs: 10 }, nextOffset: 20 });
+    expect((listed.details as { jobs: unknown[]; truncation?: { jobs: number } }).jobs.length).toBe(30);
+    expect(listed.details).toMatchObject({ nextOffset: null });
     expect(listedText).toContain("job_1");
     expect(listedText).toContain('"status": "running"');
     expect(Buffer.byteLength(JSON.stringify(listed.details, null, 2), "utf8")).toBeLessThan(50_000);
     expect(listedText.split("\\n").length).toBeLessThanOrEqual(2_000);
+    const cancelled = await listTool.execute("id", { operation: "cancel", jobId: running[0]!.jobId } as never, undefined, undefined, {} as never);
+    const cancelledText = cancelled.content.map((item) => item.type === "text" ? item.text : "").join("\\n");
+    expect(cancelled.details).toMatchObject({ status: "cancelled" });
+    expect(Buffer.byteLength(JSON.stringify(cancelled.details, null, 2), "utf8")).toBeLessThan(50_000);
+    expect(Buffer.byteLength(cancelledText, "utf8")).toBeLessThan(50_000);
     running.forEach((handle) => listRegistry.cancel(handle.jobId));
+  });
+
+  it("returns 100 requested summaries without changing pagination semantics", async () => {
+    const jobs = registry();
+    const tool = createJobsTool(jobs);
+    const pending = new Promise<never>(() => undefined);
+    const handles = Array.from({ length: 100 }, (_, index) => jobs.register({ ...request, targets: [`worker-${index}`], targetIds: [`p-${index}`] }, async () => pending));
+    const listed = await tool.execute("id", { operation: "list", limit: 100 } as never, undefined, undefined, {} as never);
+    const detailsText = JSON.stringify(listed.details, null, 2);
+    const contentText = listed.content.map((item) => item.type === "text" ? item.text : "").join("\\n");
+    expect((listed.details as { jobs: unknown[] }).jobs).toHaveLength(100);
+    expect(listed.details).toMatchObject({ total: 100, offset: 0, limit: 100, nextOffset: null });
+    expect(Buffer.byteLength(detailsText, "utf8")).toBeLessThan(50_000);
+    expect(detailsText.split("\\n").length).toBeLessThanOrEqual(2_000);
+    expect(Buffer.byteLength(contentText, "utf8")).toBeLessThan(50_000);
+    expect(contentText.split("\\n").length).toBeLessThanOrEqual(2_000);
+    const offsetPage = await tool.execute("id", { operation: "list", offset: 30, limit: 100 } as never, undefined, undefined, {} as never);
+    expect(offsetPage.details).toMatchObject({ total: 100, offset: 30, limit: 100, nextOffset: null });
+    expect((offsetPage.details as { jobs: unknown[] }).jobs).toHaveLength(70);
+    handles.forEach((handle) => jobs.cancel(handle.jobId));
   });
 
   it("supports strict pagination and bounded list/get render content", async () => {

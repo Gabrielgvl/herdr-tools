@@ -7,7 +7,7 @@ import { createLaunchTool } from "./src/tools/launch.js";
 import { createPaneTool } from "./src/tools/pane.js";
 import { createTabTool } from "./src/tools/tab.js";
 import { createWaitTool } from "./src/tools/wait.js";
-import { JobRegistry, type JobDetail } from "./src/job-registry.js";
+import { boundedText, JobRegistry, type JobDetail } from "./src/job-registry.js";
 import { RuntimeOwnership, resetOwnership, type OwnedResource } from "./src/ownership.js";
 import { loadSettings, type Settings } from "./src/settings.js";
 import type { CurrentContext } from "./src/targets.js";
@@ -68,33 +68,42 @@ export function readInjectedContext(env: NodeJS.ProcessEnv = process.env): Injec
 
 function safeNotificationPart(value: unknown, limit = 500): string {
   const text = typeof value === "string" ? value : String(value);
-  return [...text].map((character) => {
+  const safe = [...text].map((character) => {
     const code = character.charCodeAt(0);
     return code <= 31 || code === 127 ? " " : character;
-  }).join("").slice(0, limit);
+  }).join("");
+  return boundedText(safe, limit);
 }
 
 export function notificationForJob(detail: JobDetail): { content: string; details: Record<string, unknown> } {
   const manager = detail.outcome === "manager_judgment_required";
+  const success = detail.status === "completed" && detail.outcome === "success";
   const status = detail.status === "completed" ? detail.outcome ?? "completed" : detail.status;
   const reason = detail.result?.reason ?? detail.cancelReason ?? detail.error?.code ?? detail.error?.message ?? "completed";
   const requestedTargets = detail.request.targets.map((target, index) => `${safeNotificationPart(target)} (${safeNotificationPart(detail.request.targetIds[index] ?? "unknown")})`).join(", ");
-  const matchedTargets = detail.status === "completed" && detail.outcome === "success"
-    ? detail.result?.targets?.filter((target) => target.matched).map((target) => `${safeNotificationPart(target.target)} (${safeNotificationPart(target.targetId)})`).join(", ") ?? ""
-    : "";
+  const matchedRefs = success ? detail.result?.matchedTargets ?? detail.result?.targets?.filter((target) => target.matched).map((target) => ({ target: target.target, targetId: target.targetId })) ?? [] : [];
+  const matchedCount = success ? detail.result?.matchedTargetCount ?? matchedRefs.length : 0;
+  const matchedOmitted = success ? Math.max(detail.truncation?.resultMatchedTargets ?? 0, matchedCount - matchedRefs.length) : 0;
+  const matchedTargets = matchedRefs.map((target) => `${safeNotificationPart(target.target)} (${safeNotificationPart(target.targetId)})`).join(", ");
+  const matchedSuffix = matchedOmitted > 0 ? `; matchedTargetsOmitted=${matchedOmitted}` : "";
   const reviewer = detail.result?.reviewerSummaries?.map((summary) => `${safeNotificationPart(summary.targetId)}: ${safeNotificationPart(summary.summary)}`).join("; ");
   const error = detail.error ? `${safeNotificationPart(detail.error.code ?? "error")}: ${safeNotificationPart(detail.error.message)}` : undefined;
   const prefix = manager ? "HIGH PRIORITY: MANAGER JUDGMENT REQUIRED\n" : "";
-  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} finished: outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)}, matchedTargets=${safeNotificationPart(matchedTargets || "none", 2_000)}, requestedTargets=${safeNotificationPart(requestedTargets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
+  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} finished: outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)}, matchedTargets=${safeNotificationPart(matchedTargets || "none", 2_000)}${matchedSuffix}, requestedTargets=${safeNotificationPart(requestedTargets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
+  const requestedIds = detail.request.targetIds.slice(0, 16).map((targetId) => safeNotificationPart(targetId, 256));
+  const requestedOmitted = Math.max(detail.truncation?.requestTargetIds ?? 0, detail.request.targetIds.length - requestedIds.length);
   return {
-    content: content.slice(0, 8_000),
+    content: boundedText(content, 8_000),
     details: {
-      jobId: detail.jobId,
+      jobId: safeNotificationPart(detail.jobId, 256),
       outcome: status,
       reason: safeNotificationPart(reason),
-      targets: detail.status === "completed" && detail.outcome === "success" ? detail.result?.targets?.filter((target) => target.matched).map((target) => target.targetId) ?? [] : [],
-      matchedTargets: detail.status === "completed" && detail.outcome === "success" ? detail.result?.targets?.filter((target) => target.matched).map((target) => target.targetId) ?? [] : [],
-      requestedTargets: detail.request.targetIds.slice(),
+      targets: matchedRefs.slice(0, 16).map((target) => safeNotificationPart(target.targetId, 256)),
+      matchedTargets: matchedRefs.slice(0, 16).map((target) => safeNotificationPart(target.targetId, 256)),
+      matchedTargetCount: matchedCount,
+      ...(matchedOmitted > 0 ? { matchedTargetsOmitted: matchedOmitted } : {}),
+      requestedTargets: requestedIds,
+      ...(requestedOmitted > 0 ? { requestedTargetsOmitted: requestedOmitted } : {}),
       priority: manager ? "high" : "normal"
     }
   };

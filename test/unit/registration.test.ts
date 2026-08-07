@@ -127,7 +127,27 @@ describe("global extension registration", () => {
     });
     expect(successAny.content).toContain("matchedTargets=second (p2)");
     expect(successAny.content).not.toContain("matchedTargets=first");
-    expect(successAny.details).toMatchObject({ matchedTargets: ["p2"] });
+    expect(successAny.details).toMatchObject({ matchedTargets: ["p2"], matchedTargetCount: 1 });
+    const successBeyondEvidence = notificationForJob({
+      ...detail,
+      outcome: "success",
+      result: {
+        outcome: "success",
+        matched: true,
+        targets: Array.from({ length: 101 }, (_, index) => ({ target: `target-${index + 1}`, targetId: `p${index + 1}`, metadata: {}, recentUnwrappedLines: [], observedAtMs: index, matched: index === 100 }))
+      }
+    });
+    expect(successBeyondEvidence.content).toContain("matchedTargets=target-101 (p101)");
+    expect(successBeyondEvidence.details).toMatchObject({ matchedTargets: ["p101"], matchedTargetCount: 1 });
+    const boundedSuccess = notificationForJob({
+      ...detail,
+      request: { ...detail.request, targets: Array.from({ length: 20 }, (_, index) => `target-${index}`), targetIds: Array.from({ length: 20 }, (_, index) => `p${index}`) },
+      outcome: "success",
+      result: { outcome: "success", matched: true, matchedTargetCount: 20, matchedTargets: [{ target: "target-1", targetId: "p1" }] },
+      truncation: { resultMatchedTargets: 19 }
+    });
+    expect(boundedSuccess.content).toContain("matchedTargetsOmitted=19");
+    expect(boundedSuccess.details).toMatchObject({ matchedTargetCount: 20, matchedTargetsOmitted: 19, requestedTargetsOmitted: 4 });
     const timeoutWithMatchedSnapshot = notificationForJob({
       ...detail,
       outcome: "timeout",

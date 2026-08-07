@@ -1,12 +1,11 @@
 import RE2 from "re2";
-import { truncateTail } from "@earendil-works/pi-coding-agent";
 import type { AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CliTextResult, HerdrCli, JsonEnvelope } from "../cli.js";
 import { loadSettings, type Settings } from "../settings.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
 import { validateWaitParams, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams } from "../wait-schema.js";
-import type { JobRegistry, JobRequestSnapshot, JobRunResult } from "../job-registry.js";
+import { boundedText, type JobRegistry, type JobRequestSnapshot, type JobRunResult } from "../job-registry.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface WaitClock {
@@ -74,7 +73,13 @@ export interface BackgroundWaitDetails {
   jobId: string;
   targets: string[];
   targetIds: string[];
-  truncation: { targets: number; targetIds: number };
+  truncation: {
+    targets: number;
+    targetIds: number;
+    jobIdClipped?: boolean;
+    targetsClipped?: number;
+    targetIdsClipped?: number;
+  };
 }
 
 export type WaitDetails = ForegroundWaitDetails | BackgroundWaitDetails;
@@ -217,16 +222,22 @@ async function readAndMatch(cli: WaitCli, resolved: ReadonlyArray<{ ref: string;
   return { snapshots, expired: expired(clock, deadline, snapshots) };
 }
 
-function boundedBackgroundDetails(jobId: string, params: WaitParams, targetIds: string[]): BackgroundWaitDetails {
+export function boundedBackgroundDetails(jobId: string, params: WaitParams, targetIds: string[]): BackgroundWaitDetails {
+  const boundedJobId = boundedText(jobId, BACKGROUND_TARGET_BYTES);
+  const boundedTargets = params.targets.slice(0, BACKGROUND_TARGET_LIMIT).map((target) => boundedText(target, BACKGROUND_TARGET_BYTES));
+  const boundedTargetIds = targetIds.slice(0, BACKGROUND_TARGET_LIMIT).map((targetId) => boundedText(targetId, BACKGROUND_TARGET_BYTES));
   return {
     operation: "wait",
     outcome: "background",
-    jobId: truncateTail(jobId, { maxBytes: BACKGROUND_TARGET_BYTES, maxLines: 1 }).content,
-    targets: params.targets.slice(0, BACKGROUND_TARGET_LIMIT).map((target) => truncateTail(target, { maxBytes: BACKGROUND_TARGET_BYTES, maxLines: 1 }).content),
-    targetIds: targetIds.slice(0, BACKGROUND_TARGET_LIMIT).map((targetId) => truncateTail(targetId, { maxBytes: BACKGROUND_TARGET_BYTES, maxLines: 1 }).content),
+    jobId: boundedJobId,
+    targets: boundedTargets,
+    targetIds: boundedTargetIds,
     truncation: {
       targets: Math.max(0, params.targets.length - BACKGROUND_TARGET_LIMIT),
-      targetIds: Math.max(0, targetIds.length - BACKGROUND_TARGET_LIMIT)
+      targetIds: Math.max(0, targetIds.length - BACKGROUND_TARGET_LIMIT),
+      ...(boundedJobId !== jobId ? { jobIdClipped: true } : {}),
+      ...(boundedTargets.filter((target, index) => target !== params.targets[index]).length > 0 ? { targetsClipped: boundedTargets.filter((target, index) => target !== params.targets[index]).length } : {}),
+      ...(boundedTargetIds.filter((targetId, index) => targetId !== targetIds[index]).length > 0 ? { targetIdsClipped: boundedTargetIds.filter((targetId, index) => targetId !== targetIds[index]).length } : {})
     }
   };
 }

@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { ReviewerFailure, type WaitReviewer } from "../../src/reviewer.js";
-import { WaitError, createWaitTool, deltaLines, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
+import { WaitError, boundedBackgroundDetails, createWaitTool, deltaLines, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
 import { JobRegistry } from "../../src/job-registry.js";
 
 const snapshot = {
@@ -541,6 +541,16 @@ describe("herdr_wait", () => {
     expect(started.details).toMatchObject({ outcome: "background", jobId: "job_runner_failure" });
     for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     expect(registry.get("job_runner_failure")).toMatchObject({ status: "failed", error: { code: "CLI_PROTOCOL_ERROR" } });
+  });
+
+  it("reports clipped and omitted values in a background acknowledgement", () => {
+    const params = { targets: Array.from({ length: 17 }, (_, index) => `target-${index}-${"t".repeat(2_000)}`), match: "any" as const, condition: { kind: "state" as const, state: "done" as const }, timeoutMs: 1 };
+    const targetIds = params.targets.map((_, index) => `pane-${index}-${"p".repeat(2_000)}`);
+    const details = boundedBackgroundDetails(`job_${"j".repeat(2_000)}`, params, targetIds);
+    expect(details.targets).toHaveLength(16);
+    expect(details.targetIds).toHaveLength(16);
+    expect(details.truncation).toMatchObject({ targets: 1, targetIds: 1, jobIdClipped: true, targetsClipped: 16, targetIdsClipped: 16 });
+    expect(JSON.stringify(details).length).toBeLessThan(50_000);
   });
 
   it("maps background reviewer failure and manager judgment", async () => {

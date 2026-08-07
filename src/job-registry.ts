@@ -8,17 +8,22 @@ export type WaitOutcome = (typeof WAIT_OUTCOMES)[number];
 
 const MAX_TEXT_BYTES = 50_000;
 const MAX_TEXT_LINES = 2_000;
+const MAX_PUBLIC_BYTES = MAX_TEXT_BYTES - 1;
 const MAX_SUMMARY_CHARS = 1_000;
 const PUBLIC_REQUEST_ITEMS = 8;
 const PUBLIC_RESULT_TARGETS = 6;
 const PUBLIC_TARGET_LINES = 4;
 const PUBLIC_REVIEWER_SUMMARIES = 6;
-const PUBLIC_LIST_JOBS = 20;
+const PUBLIC_LIST_JOBS = 100;
+const PUBLIC_SUMMARY_ITEMS = 2;
 const PUBLIC_FIELD_BYTES = 256;
 
 export interface TruncatedDetails {
   truncated: true;
   content: string;
+  omittedBytes?: number;
+  omittedLines?: number;
+  clipped?: true;
 }
 
 export type PublicDetails = Record<string, unknown> | TruncatedDetails;
@@ -51,6 +56,9 @@ export interface JobResultSnapshot {
   outcome: WaitOutcome;
   matched: boolean;
   reason?: string;
+  /** Exact match facts are independent from the bounded evidence window. */
+  matchedTargetCount?: number;
+  matchedTargets?: Array<{ target: string; targetId: string }>;
   targets?: Array<{
     target: string;
     targetId: string;
@@ -76,14 +84,28 @@ export interface JobErrorSnapshot {
 
 export interface JobTruncation {
   requestTargets?: number;
+  requestTargetsClipped?: number;
   requestTargetIds?: number;
+  requestTargetIdsClipped?: number;
   requestCondition?: boolean;
+  requestConditionClipped?: boolean;
+  requestReviewerModelClipped?: boolean;
+  jobIdClipped?: boolean;
   progressDetails?: boolean;
+  progressTextClipped?: boolean;
   resultTargets?: number;
+  resultMatchedTargets?: number;
+  resultTargetValuesClipped?: number;
+  resultTargetIdsClipped?: number;
   resultTargetLines?: number;
+  resultTargetLinesClipped?: number;
   resultTargetMetadata?: number;
   reviewerSummaries?: number;
+  reviewerFieldsClipped?: number;
   errorDetails?: boolean;
+  errorCodeClipped?: boolean;
+  errorMessageClipped?: boolean;
+  publicEvidenceOmitted?: boolean;
 }
 
 export interface JobDetail {
@@ -115,7 +137,7 @@ export interface JobSummary {
   reason?: string;
   progress?: { text: string; atMs: number };
   error?: { code?: string; message: string };
-  truncation?: { targetIds?: number; targets?: number; progress?: boolean };
+  truncation?: { targetIds?: number; targetIdsClipped?: number; targets?: number; targetsClipped?: number; progress?: boolean; jobIdClipped?: boolean };
 }
 
 export interface JobListResult {
@@ -124,7 +146,7 @@ export interface JobListResult {
   offset: number;
   limit: number;
   nextOffset: number | null;
-  truncation?: { jobs: number };
+  truncation?: { jobs?: number; jobIdsClipped?: number };
 }
 
 export interface JobClock {
@@ -139,6 +161,8 @@ export interface JobRunResult {
   outcome: WaitOutcome;
   matched: boolean;
   reason?: string;
+  matchedTargetCount?: number;
+  matchedTargets?: JobResultSnapshot["matchedTargets"];
   targets?: JobResultSnapshot["targets"];
   reviewerSummaries?: JobResultSnapshot["reviewerSummaries"];
 }
@@ -185,12 +209,31 @@ function jsonLines(value: unknown): number {
   return jsonText(value, true).split("\n").length;
 }
 
-function boundedText(value: string, limit = MAX_SUMMARY_CHARS): string {
-  return truncateTail(value, { maxBytes: limit, maxLines: MAX_TEXT_LINES }).content;
+function fitJsonString(value: string, maxBytes: number): string {
+  if (jsonBytes(value) <= maxBytes) return value;
+  const characters = Array.from(value);
+  let low = 0;
+  let high = characters.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (jsonBytes(characters.slice(0, middle).join("")) <= maxBytes) low = middle;
+    else high = middle - 1;
+  }
+  return characters.slice(0, low).join("");
 }
 
-function truncatedDetails(content: string): TruncatedDetails {
-  return { truncated: true, content };
+export function boundedText(value: string, limit = MAX_SUMMARY_CHARS): string {
+  const lineBounded = truncateTail(value, { maxBytes: limit, maxLines: MAX_TEXT_LINES }).content;
+  return fitJsonString(lineBounded, Math.max(2, limit));
+}
+
+function truncatedDetails(content: string, maxBytes = PUBLIC_FIELD_BYTES): TruncatedDetails {
+  const omittedBytes = Buffer.byteLength(content, "utf8");
+  const omittedLines = content.split("\n").length;
+  let marker: TruncatedDetails = { truncated: true, content: "", omittedBytes, omittedLines, clipped: true };
+  const contentBudget = Math.max(0, maxBytes - jsonBytes(marker));
+  marker = { ...marker, content: fitJsonString(content, contentBudget) };
+  return marker;
 }
 
 function hasTruncatedMarker(value: unknown): boolean {
@@ -201,10 +244,9 @@ function boundedDetails(value: unknown, maxBytes = PUBLIC_FIELD_BYTES): unknown 
   try {
     const copied = clone(value);
     if (jsonBytes(copied) <= maxBytes && jsonLines(copied) <= MAX_TEXT_LINES) return copied;
-    const serialized = jsonText(copied);
-    return truncatedDetails(boundedText(serialized, Math.max(64, maxBytes - 64)));
+    return truncatedDetails(jsonText(copied), maxBytes);
   } catch {
-    return truncatedDetails("[details unavailable]");
+    return truncatedDetails("[details unavailable]", maxBytes);
   }
 }
 
@@ -213,35 +255,44 @@ function boundedMetadata(value: Record<string, unknown>): PublicDetails {
 }
 
 function boundedCondition(value: unknown, truncation: JobTruncation, maxBytes = PUBLIC_FIELD_BYTES): unknown {
-  const copied = clone(value);
+  let copied: unknown;
+  try {
+    copied = clone(value);
+  } catch {
+    truncation.requestCondition = true;
+    return truncatedDetails("[condition unavailable]", maxBytes);
+  }
   if (jsonBytes(copied) <= maxBytes && jsonLines(copied) <= MAX_TEXT_LINES) return copied;
   const condition = copied as { kind?: unknown; match?: { kind?: unknown; value?: unknown } };
-  if (condition.kind !== "output") {
-    truncation.requestCondition = true;
-    return { truncated: true, kind: "object" };
-  }
   truncation.requestCondition = true;
-  return { kind: "output", match: { kind: condition.match!.kind, value: boundedText(condition.match!.value as string, maxBytes) } };
+  if (condition.kind !== "output" || !condition.match || typeof condition.match.value !== "string") return { truncated: true, kind: "object" };
+  const valueText = boundedText(condition.match.value, maxBytes);
+  if (valueText !== condition.match.value) truncation.requestConditionClipped = true;
+  return { kind: "output", match: { kind: condition.match.kind, value: valueText } };
 }
 
-function boundedStrings(values: string[], limit: number, truncation: JobTruncation, key: "requestTargets" | "requestTargetIds"): string[] {
-  const copied = values.slice(0, limit).map((value) => boundedText(value, PUBLIC_FIELD_BYTES));
+function boundedStrings(values: string[], limit: number, truncation: JobTruncation, key: "requestTargets" | "requestTargetIds", clippedKey: "requestTargetsClipped" | "requestTargetIdsClipped"): string[] {
+  const selected = values.slice(0, limit);
+  const copied = selected.map((value) => boundedText(value, PUBLIC_FIELD_BYTES));
   const omitted = values.length - copied.length;
-  const shortened = values.slice(0, copied.length).filter((value, index) => copied[index]!.length < value.length).length;
-  if (omitted + shortened > 0) truncation[key] = omitted + shortened;
+  const clipped = selected.filter((value, index) => copied[index] !== value).length;
+  if (omitted > 0) truncation[key] = omitted;
+  if (clipped > 0) truncation[clippedKey] = clipped;
   return copied;
 }
 
 function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): JobRequestSnapshot {
+  const reviewerModel = boundedText(request.settings.reviewerModel, PUBLIC_FIELD_BYTES);
+  if (reviewerModel !== request.settings.reviewerModel) truncation.requestReviewerModelClipped = true;
   return {
-    targets: boundedStrings(request.targets, PUBLIC_REQUEST_ITEMS, truncation, "requestTargets"),
-    targetIds: boundedStrings(request.targetIds, PUBLIC_REQUEST_ITEMS, truncation, "requestTargetIds"),
+    targets: boundedStrings(request.targets, PUBLIC_REQUEST_ITEMS, truncation, "requestTargets", "requestTargetsClipped"),
+    targetIds: boundedStrings(request.targetIds, PUBLIC_REQUEST_ITEMS, truncation, "requestTargetIds", "requestTargetIdsClipped"),
     match: request.match,
     condition: boundedCondition(request.condition, truncation),
     timeoutMs: request.timeoutMs,
     settings: {
       reviewCadenceMinutes: request.settings.reviewCadenceMinutes,
-      reviewerModel: boundedText(request.settings.reviewerModel, PUBLIC_FIELD_BYTES),
+      reviewerModel,
       reviewerThinking: request.settings.reviewerThinking
     }
   };
@@ -249,55 +300,149 @@ function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): Jo
 
 function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit = PUBLIC_RESULT_TARGETS, lineLimit = PUBLIC_TARGET_LINES, reviewerLimit = PUBLIC_REVIEWER_SUMMARIES): JobResultSnapshot {
   const sourceTargets = result.targets ?? [];
-  const targets = sourceTargets.slice(0, targetLimit).map((target) => {
+  const matchedSourceTargets = result.outcome === "success" ? sourceTargets.filter((target) => target.matched) : [];
+  const matchedSourceRefs = result.outcome === "success" ? result.matchedTargets ?? matchedSourceTargets.map((target) => ({ target: target.target, targetId: target.targetId })) : [];
+  const matchedTargetCount = result.outcome === "success" ? result.matchedTargetCount ?? matchedSourceTargets.length : 0;
+  const selectedTargets = [...matchedSourceTargets, ...sourceTargets.filter((target) => !target.matched)].slice(0, targetLimit);
+  const targets = selectedTargets.map((target) => {
     const lines = target.recentUnwrappedLines.slice(-lineLimit);
     if (target.recentUnwrappedLines.length > lines.length) truncation.resultTargetLines = (truncation.resultTargetLines ?? 0) + target.recentUnwrappedLines.length - lines.length;
+    const targetValue = boundedText(target.target, PUBLIC_FIELD_BYTES);
+    const targetId = boundedText(target.targetId, PUBLIC_FIELD_BYTES);
+    if (targetValue !== target.target) truncation.resultTargetValuesClipped = (truncation.resultTargetValuesClipped ?? 0) + 1;
+    if (targetId !== target.targetId) truncation.resultTargetIdsClipped = (truncation.resultTargetIdsClipped ?? 0) + 1;
+    const recentUnwrappedLines = lines.map((line) => {
+      const bounded = boundedText(line, PUBLIC_FIELD_BYTES);
+      if (bounded !== line) truncation.resultTargetLinesClipped = (truncation.resultTargetLinesClipped ?? 0) + 1;
+      return bounded;
+    });
     return {
-      target: boundedText(target.target, PUBLIC_FIELD_BYTES),
-      targetId: boundedText(target.targetId, PUBLIC_FIELD_BYTES),
+      target: targetValue,
+      targetId,
       metadata: boundedMetadata(target.metadata as Record<string, unknown>),
-      recentUnwrappedLines: lines.map((line) => boundedText(line, PUBLIC_FIELD_BYTES)),
+      recentUnwrappedLines,
       ...(target.outputTruncated === undefined ? {} : { outputTruncated: target.outputTruncated }),
       observedAtMs: target.observedAtMs,
       matched: target.matched
     };
   });
   if (sourceTargets.length > targets.length) truncation.resultTargets = sourceTargets.length - targets.length;
-  const sourceReviews = result.reviewerSummaries ?? [];
-  const reviewerSummaries = sourceReviews.slice(0, reviewerLimit).map((summary) => ({
-    target: boundedText(summary.target, PUBLIC_FIELD_BYTES),
-    targetId: boundedText(summary.targetId, PUBLIC_FIELD_BYTES),
-    classification: boundedText(summary.classification, PUBLIC_FIELD_BYTES),
-    summary: boundedText(summary.summary, PUBLIC_FIELD_BYTES)
+
+  const matchedTargets = matchedSourceRefs.slice(0, targetLimit).map((target) => ({
+    target: boundedText(target.target, PUBLIC_FIELD_BYTES),
+    targetId: boundedText(target.targetId, PUBLIC_FIELD_BYTES)
   }));
+  if (matchedTargetCount > matchedTargets.length) truncation.resultMatchedTargets = Math.max(truncation.resultMatchedTargets ?? 0, matchedTargetCount - matchedTargets.length);
+
+  const sourceReviews = result.reviewerSummaries ?? [];
+  const reviewerSummaries = sourceReviews.slice(0, reviewerLimit).map((summary) => {
+    const target = boundedText(summary.target, PUBLIC_FIELD_BYTES);
+    const targetId = boundedText(summary.targetId, PUBLIC_FIELD_BYTES);
+    const classification = boundedText(summary.classification, PUBLIC_FIELD_BYTES);
+    const summaryText = boundedText(summary.summary, PUBLIC_FIELD_BYTES);
+    if (target !== summary.target || targetId !== summary.targetId || classification !== summary.classification || summaryText !== summary.summary) truncation.reviewerFieldsClipped = (truncation.reviewerFieldsClipped ?? 0) + 1;
+    return { target, targetId, classification, summary: summaryText };
+  });
   if (sourceReviews.length > reviewerSummaries.length) truncation.reviewerSummaries = sourceReviews.length - reviewerSummaries.length;
   return {
     outcome: result.outcome,
     matched: result.matched,
+    ...(matchedTargetCount > 0 ? { matchedTargetCount, matchedTargets } : {}),
     ...(result.reason ? { reason: boundedText(result.reason) } : {}),
     ...(sourceTargets.length > 0 ? { targets } : {}),
     ...(sourceReviews.length > 0 ? { reviewerSummaries } : {})
   };
 }
 
-function copyProgress(progress: JobProgress): JobProgress {
-  const copied: JobProgress = { text: boundedText(progress.text), atMs: progress.atMs };
+function copyProgress(progress: JobProgress, truncation: JobTruncation): JobProgress {
+  const text = boundedText(progress.text);
+  if (text !== progress.text) truncation.progressTextClipped = true;
+  const copied: JobProgress = { text, atMs: progress.atMs };
   if (progress.details === undefined) return copied;
   copied.details = boundedDetails(progress.details);
+  if (hasTruncatedMarker(copied.details)) truncation.progressDetails = true;
   return copied;
 }
 
-function publicDetail(detail: JobDetail): JobDetail {
-  const truncation: JobTruncation = { ...detail.truncation };
+const TRUNCATION_KEYS = [
+  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestCondition", "requestConditionClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "reviewerSummaries", "reviewerFieldsClipped", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted"
+] as const;
+
+function boundedTruncation(value: JobTruncation | undefined): JobTruncation {
+  const bounded: JobTruncation = {};
+  for (const key of TRUNCATION_KEYS) {
+    const entry = value?.[key];
+    if (typeof entry === "number" || typeof entry === "boolean") Object.assign(bounded, { [key]: entry });
+  }
+  return bounded;
+}
+
+export function fitsPublic(value: unknown, maxBytes = MAX_PUBLIC_BYTES): boolean {
+  try {
+    return jsonBytes(value) < maxBytes && jsonLines(value) <= MAX_TEXT_LINES;
+  } catch {
+    return false;
+  }
+}
+
+function compactDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
+  if (copy.progress?.details !== undefined) {
+    delete copy.progress.details;
+    truncation.progressDetails = true;
+    truncation.publicEvidenceOmitted = true;
+  }
+  if (copy.result?.targets) {
+    const lineCount = copy.result.targets.reduce((total, target) => total + target.recentUnwrappedLines.length, 0);
+    copy.result.targets = copy.result.targets.map((target) => ({ ...target, metadata: { truncated: true, content: "[metadata omitted]" }, recentUnwrappedLines: [] }));
+    truncation.resultTargetMetadata = copy.result.targets.length;
+    if (lineCount > 0) truncation.resultTargetLines = (truncation.resultTargetLines ?? 0) + lineCount;
+    truncation.publicEvidenceOmitted = true;
+  }
+  if (copy.result?.reviewerSummaries) {
+    delete copy.result.reviewerSummaries;
+    truncation.reviewerSummaries = (truncation.reviewerSummaries ?? 0) + 1;
+    truncation.publicEvidenceOmitted = true;
+  }
+  return copy;
+}
+
+function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
+  truncation.publicEvidenceOmitted = true;
+  return {
+    jobId: boundedText(copy.jobId, 128),
+    status: copy.status,
+    sequence: copy.sequence,
+    createdAtMs: copy.createdAtMs,
+    ...(copy.startedAtMs === undefined ? {} : { startedAtMs: copy.startedAtMs }),
+    ...(copy.finishedAtMs === undefined ? {} : { finishedAtMs: copy.finishedAtMs }),
+    request: {
+      targets: [],
+      targetIds: [],
+      match: copy.request.match,
+      condition: { truncated: true, kind: "object" },
+      timeoutMs: copy.request.timeoutMs,
+      settings: copy.request.settings
+    },
+    ...(copy.outcome ? { outcome: copy.outcome } : {}),
+    ...(copy.result ? { result: { outcome: copy.result.outcome, matched: copy.result.matched, ...(copy.result.matchedTargetCount === undefined ? {} : { matchedTargetCount: copy.result.matchedTargetCount }), ...(copy.result.matchedTargets ? { matchedTargets: copy.result.matchedTargets.slice(0, 1) } : {}) } } : {}),
+    ...(copy.cancelReason ? { cancelReason: copy.cancelReason } : {}),
+    truncation
+  };
+}
+
+export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): JobDetail {
+  const truncation: JobTruncation = boundedTruncation(detail.truncation);
+  const jobId = boundedText(detail.jobId, PUBLIC_FIELD_BYTES);
+  if (jobId !== detail.jobId) truncation.jobIdClipped = true;
   const copy: JobDetail = {
-    jobId: boundedText(detail.jobId, PUBLIC_FIELD_BYTES),
+    jobId,
     status: detail.status,
     sequence: detail.sequence,
     createdAtMs: detail.createdAtMs,
     startedAtMs: detail.startedAtMs,
     finishedAtMs: detail.finishedAtMs,
     request: copyRequest(detail.request, truncation),
-    ...(detail.progress ? { progress: copyProgress(detail.progress) } : {}),
+    ...(detail.progress ? { progress: copyProgress(detail.progress, truncation) } : {}),
     ...(detail.outcome ? { outcome: detail.outcome } : {}),
     ...(detail.result ? { result: copyResult(detail.result, truncation) } : {}),
     ...(detail.error ? {
@@ -309,23 +454,32 @@ function publicDetail(detail: JobDetail): JobDetail {
     } : {}),
     ...(detail.cancelReason ? { cancelReason: detail.cancelReason } : {})
   };
-  if (hasTruncatedMarker(copy.progress?.details)) truncation.progressDetails = true;
-  if (detail.result?.targets?.some((target) => hasTruncatedMarker(target.metadata))) truncation.resultTargetMetadata = detail.result.targets.filter((target) => hasTruncatedMarker(target.metadata)).length;
+  if (detail.error?.code && boundedText(detail.error.code, PUBLIC_FIELD_BYTES) !== detail.error.code) truncation.errorCodeClipped = true;
+  if (detail.error && boundedText(detail.error.message) !== detail.error.message) truncation.errorMessageClipped = true;
   if (hasTruncatedMarker(copy.error?.details)) truncation.errorDetails = true;
+  if (copy.result?.targets?.some((target) => hasTruncatedMarker(target.metadata))) truncation.resultTargetMetadata = copy.result.targets.filter((target) => hasTruncatedMarker(target.metadata)).length;
   if (Object.keys(truncation).length > 0) copy.truncation = truncation;
-  return clone(copy);
+  if (!fitsPublic(copy, maxBytes)) compactDetail(copy, truncation);
+  if (Object.keys(truncation).length > 0) copy.truncation = truncation;
+  return clone(fitsPublic(copy, maxBytes) ? copy : minimalDetail(copy, truncation));
 }
 
 function summary(detail: JobDetail): JobSummary {
   const truncation: NonNullable<JobSummary["truncation"]> = {};
-  const targetIds = detail.request.targetIds.slice(0, 4).map((value) => boundedText(value, 64));
-  const targets = detail.request.targets.slice(0, 4).map((value) => boundedText(value, 64));
+  const targetIds = detail.request.targetIds.slice(0, PUBLIC_SUMMARY_ITEMS).map((value) => boundedText(value, 48));
+  const targets = detail.request.targets.slice(0, PUBLIC_SUMMARY_ITEMS).map((value) => boundedText(value, 48));
   if (detail.request.targetIds.length > targetIds.length) truncation.targetIds = detail.request.targetIds.length - targetIds.length;
   if (detail.request.targets.length > targets.length) truncation.targets = detail.request.targets.length - targets.length;
-  const progress = detail.progress ? { text: boundedText(detail.progress.text, 256), atMs: detail.progress.atMs } : undefined;
+  const clippedTargetIds = detail.request.targetIds.slice(0, targetIds.length).filter((value, index) => targetIds[index] !== value).length;
+  const clippedTargets = detail.request.targets.slice(0, targets.length).filter((value, index) => targets[index] !== value).length;
+  if (clippedTargetIds > 0) truncation.targetIdsClipped = clippedTargetIds;
+  if (clippedTargets > 0) truncation.targetsClipped = clippedTargets;
+  const progress = detail.progress ? { text: boundedText(detail.progress.text, 128), atMs: detail.progress.atMs } : undefined;
   if (detail.progress && progress && progress.text !== detail.progress.text) truncation.progress = true;
+  const jobId = boundedText(detail.jobId, 64);
+  if (jobId !== detail.jobId) truncation.jobIdClipped = true;
   return clone({
-    jobId: boundedText(detail.jobId, PUBLIC_FIELD_BYTES),
+    jobId,
     status: detail.status,
     sequence: detail.sequence,
     createdAtMs: detail.createdAtMs,
@@ -334,12 +488,55 @@ function summary(detail: JobDetail): JobSummary {
     targetIds,
     targets,
     ...(detail.outcome ? { outcome: detail.outcome } : {}),
-    ...(detail.result?.reason ? { reason: boundedText(detail.result.reason, 256) } : {}),
+    ...(detail.result?.reason ? { reason: boundedText(detail.result.reason, 128) } : {}),
     ...(detail.cancelReason ? { reason: detail.cancelReason } : {}),
     ...(progress ? { progress } : {}),
-    ...(detail.error ? { error: { ...(detail.error.code ? { code: boundedText(detail.error.code, 64) } : {}), message: boundedText(detail.error.message, 256) } } : {}),
+    ...(detail.error ? { error: { ...(detail.error.code ? { code: boundedText(detail.error.code, 48) } : {}), message: boundedText(detail.error.message, 128) } } : {}),
     ...(Object.keys(truncation).length > 0 ? { truncation } : {})
   });
+}
+
+function compactSummaryForList(value: JobSummary): JobSummary {
+  const jobIdClipped = value.jobId.length > 32 || value.truncation?.jobIdClipped === true;
+  const truncation = { ...value.truncation, ...(jobIdClipped ? { jobIdClipped: true } : {}) };
+  return {
+    jobId: boundedText(value.jobId, 32),
+    status: value.status,
+    sequence: value.sequence,
+    createdAtMs: value.createdAtMs,
+    startedAtMs: value.startedAtMs,
+    finishedAtMs: value.finishedAtMs,
+    targetIds: [],
+    targets: [],
+    ...(value.outcome ? { outcome: value.outcome } : {}),
+    ...(value.reason ? { reason: boundedText(value.reason, 64) } : {}),
+    ...(value.progress ? { progress: { text: boundedText(value.progress.text, 64), atMs: value.progress.atMs } } : {}),
+    ...(value.error ? { error: { ...(value.error.code ? { code: boundedText(value.error.code, 32) } : {}), message: boundedText(value.error.message, 64) } } : {}),
+    ...(Object.keys(truncation).length > 0 ? { truncation } : {})
+  };
+}
+
+export function boundedList(result: JobListResult): JobListResult {
+  if (fitsPublic(result)) return clone(result);
+  const compact = { ...result, jobs: result.jobs.map(compactSummaryForList) };
+  if (fitsPublic(compact)) return clone(compact);
+  const minimalJobs = result.jobs.map((job) => ({
+    jobId: boundedText(job.jobId, 16),
+    status: job.status,
+    sequence: job.sequence,
+    createdAtMs: job.createdAtMs,
+    ...(job.startedAtMs === undefined ? {} : { startedAtMs: job.startedAtMs }),
+    ...(job.finishedAtMs === undefined ? {} : { finishedAtMs: job.finishedAtMs }),
+    ...(job.outcome ? { outcome: job.outcome } : {}),
+    targetIds: [],
+    targets: [],
+    truncation: { ...(job.truncation ?? {}), jobIdClipped: true }
+  }));
+  const truncation = {
+    ...(result.truncation?.jobs === undefined ? {} : { jobs: result.truncation.jobs }),
+    jobIdsClipped: result.jobs.length
+  };
+  return clone({ ...result, jobs: minimalJobs, truncation });
 }
 
 export class JobRegistry {
@@ -413,7 +610,18 @@ export class JobRegistry {
       if (record.detail.status !== "running") return;
       record.detail.status = "completed";
       record.detail.outcome = result.outcome;
-      record.detail.result = copyResult(result, {}, 100, 100, 100);
+      // Keep the authoritative terminal snapshots intact. Every public read performs
+      // one bounded projection from this original result, so match facts cannot be
+      // changed by an intermediate evidence window.
+      record.detail.result = clone({
+        outcome: result.outcome,
+        matched: result.matched,
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(result.matchedTargetCount === undefined ? {} : { matchedTargetCount: result.matchedTargetCount }),
+        ...(result.matchedTargets ? { matchedTargets: result.matchedTargets } : {}),
+        ...(result.targets ? { targets: result.targets } : {}),
+        ...(result.reviewerSummaries ? { reviewerSummaries: result.reviewerSummaries } : {})
+      });
       record.detail.finishedAtMs = this.clock.now();
       this.notifyTerminal(record);
     } catch (error) {
@@ -456,17 +664,16 @@ export class JobRegistry {
     const filtered = [...this.jobs.values()]
       .filter((record) => status === undefined || record.detail.status === status)
       .sort((left, right) => right.detail.sequence - left.detail.sequence);
-    const requested = filtered.slice(offset, offset + limit).map((record) => summary(record.detail));
-    const jobs = requested.slice(0, PUBLIC_LIST_JOBS);
+    const pageLimit = Math.min(Math.max(1, limit), PUBLIC_LIST_JOBS);
+    const jobs = filtered.slice(offset, offset + pageLimit).map((record) => summary(record.detail));
     const result: JobListResult = {
-      jobs: clone(jobs),
+      jobs,
       total: filtered.length,
       offset,
-      limit,
-      nextOffset: offset + jobs.length < filtered.length ? offset + jobs.length : null,
-      ...(requested.length > jobs.length ? { truncation: { jobs: requested.length - jobs.length } } : {})
+      limit: pageLimit,
+      nextOffset: offset + jobs.length < filtered.length ? offset + jobs.length : null
     };
-    return clone(result);
+    return boundedList(result);
   }
 
   cancel(jobId: string): JobDetail | undefined {

@@ -4,6 +4,8 @@ import { jobDetailContent, JOB_OUTPUT_LIMITS, type JobDetail, type JobListResult
 import { formatCall, textComponent } from "../tui.js";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 
+const OUTPUT_TRUNCATION_MARKER = "\n[output truncated]";
+
 export type JobsDetails =
   | ({ operation: "jobs"; kind: "list" } & JobListResult)
   | ({ operation: "jobs"; kind: "job" } & JobDetail);
@@ -17,8 +19,11 @@ export class JobsError extends Error {
 
 function boundedContent(value: unknown): string {
   const serialized = JSON.stringify(value, null, 2);
-  const bounded = truncateTail(serialized, { maxBytes: JOB_OUTPUT_LIMITS.maxBytes, maxLines: JOB_OUTPUT_LIMITS.maxLines });
-  return bounded.truncated ? `${bounded.content}\n[output truncated]` : bounded.content;
+  const bounded = truncateTail(serialized, {
+    maxBytes: JOB_OUTPUT_LIMITS.maxBytes - 1 - Buffer.byteLength(OUTPUT_TRUNCATION_MARKER, "utf8"),
+    maxLines: JOB_OUTPUT_LIMITS.maxLines
+  });
+  return bounded.truncated ? `${bounded.content}${OUTPUT_TRUNCATION_MARKER}` : bounded.content;
 }
 
 function detailContent(detail: JobDetail): string {

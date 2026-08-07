@@ -9,6 +9,8 @@ export type WaitOutcome = (typeof WAIT_OUTCOMES)[number];
 const MAX_TEXT_BYTES = 50_000;
 const MAX_TEXT_LINES = 2_000;
 const MAX_SUMMARY_CHARS = 1_000;
+const MAX_PUBLIC_JSON_BYTES = MAX_TEXT_BYTES - 1;
+const OUTPUT_TRUNCATION_MARKER = "\n[output truncated]";
 
 export interface JobTargetRef {
   target: string;
@@ -150,7 +152,29 @@ function boundedText(value: string, limit = MAX_SUMMARY_CHARS): string {
   return truncateTail(value, { maxBytes: limit, maxLines: MAX_TEXT_LINES }).content;
 }
 
-function boundedDetails(value: unknown): unknown {
+function jsonBytes(value: unknown): number {
+  const serialized = JSON.stringify(value);
+  return serialized === undefined ? 0 : Buffer.byteLength(serialized, "utf8");
+}
+
+function truncateContent(content: string, maxBytes: number): string {
+  let low = 0;
+  let high = Math.min(maxBytes, Buffer.byteLength(content, "utf8"));
+  let best = "";
+  while (low <= high) {
+    const candidateLimit = Math.floor((low + high) / 2);
+    const candidate = truncateTail(content, { maxBytes: candidateLimit, maxLines: MAX_TEXT_LINES }).content;
+    if (jsonBytes({ truncated: true, content: candidate }) <= maxBytes) {
+      best = candidate;
+      low = candidateLimit + 1;
+    } else {
+      high = candidateLimit - 1;
+    }
+  }
+  return best;
+}
+
+function boundedDetails(value: unknown, maxBytes = MAX_PUBLIC_JSON_BYTES): unknown {
   if (value === undefined) return undefined;
   let cloned: unknown;
   try {
@@ -158,11 +182,27 @@ function boundedDetails(value: unknown): unknown {
   } catch {
     return "[details unavailable]";
   }
-  const serialized = JSON.stringify(cloned);
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(cloned);
+  } catch {
+    return "[details unavailable]";
+  }
   if (serialized === undefined) return undefined;
-  const bounded = truncateTail(serialized, { maxBytes: MAX_TEXT_BYTES, maxLines: MAX_TEXT_LINES });
-  if (!bounded.truncated) return cloned;
-  return { truncated: true, content: bounded.content };
+  if (jsonBytes(cloned) <= maxBytes) return cloned;
+  if (typeof cloned === "object" && cloned !== null && !Array.isArray(cloned) && (cloned as { truncated?: unknown }).truncated === true && typeof (cloned as { content?: unknown }).content === "string") {
+    return { truncated: true, content: truncateContent((cloned as { content: string }).content, maxBytes) };
+  }
+  return { truncated: true, content: truncateContent(serialized, maxBytes) };
+}
+
+function boundedProgress(progress: JobProgress): JobProgress {
+  const base = { text: boundedText(progress.text), atMs: progress.atMs };
+  if (progress.details === undefined) return base;
+  const prefixBytes = jsonBytes({ ...base, details: null }) - Buffer.byteLength("null", "utf8");
+  const maxDetailBytes = Math.max(0, MAX_PUBLIC_JSON_BYTES - prefixBytes);
+  const details = boundedDetails(progress.details, maxDetailBytes);
+  return details === undefined ? base : { ...base, details };
 }
 
 function copyRequest(request: JobRequestSnapshot): JobRequestSnapshot {
@@ -210,13 +250,7 @@ function copyDetail(detail: JobDetail): JobDetail {
     ...(detail.startedAtMs === undefined ? {} : { startedAtMs: detail.startedAtMs }),
     ...(detail.finishedAtMs === undefined ? {} : { finishedAtMs: detail.finishedAtMs }),
     request: copyRequest(detail.request),
-    ...(detail.progress ? {
-      progress: {
-        text: boundedText(detail.progress.text),
-        atMs: detail.progress.atMs,
-        ...(detail.progress.details === undefined ? {} : { details: boundedDetails(detail.progress.details) })
-      }
-    } : {}),
+    ...(detail.progress ? { progress: boundedProgress(detail.progress) } : {}),
     ...(detail.outcome ? { outcome: detail.outcome } : {}),
     ...(detail.result ? { result: copyResult(detail.result) } : {}),
     ...(detail.error ? {
@@ -352,11 +386,7 @@ export class JobRegistry {
     const record = this.jobs.get(jobId);
     if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
     if (record.detail.status !== "running") return copyDetail(record.detail);
-    record.detail.progress = {
-      text: boundedText(text),
-      atMs: this.clock.now(),
-      ...(details === undefined ? {} : { details: boundedDetails(details) })
-    };
+    record.detail.progress = boundedProgress({ text, atMs: this.clock.now(), ...(details === undefined ? {} : { details }) });
     return copyDetail(record.detail);
   }
 
@@ -405,8 +435,11 @@ export class JobRegistry {
 
 export function jobDetailContent(detail: JobDetail): string {
   const serialized = JSON.stringify(copyDetail(detail), null, 2);
-  const bounded = truncateTail(serialized, { maxBytes: MAX_TEXT_BYTES, maxLines: MAX_TEXT_LINES });
-  return bounded.truncated ? `${bounded.content}\n[output truncated]` : bounded.content;
+  const bounded = truncateTail(serialized, {
+    maxBytes: MAX_PUBLIC_JSON_BYTES - Buffer.byteLength(OUTPUT_TRUNCATION_MARKER, "utf8"),
+    maxLines: MAX_TEXT_LINES
+  });
+  return bounded.truncated ? `${bounded.content}${OUTPUT_TRUNCATION_MARKER}` : bounded.content;
 }
 
 export const JOB_OUTPUT_LIMITS = Object.freeze({ maxBytes: MAX_TEXT_BYTES, maxLines: MAX_TEXT_LINES });

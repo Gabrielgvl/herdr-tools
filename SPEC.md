@@ -395,6 +395,9 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `TARGET_AMBIGUOUS`: multiple exact target matches.
 - `TARGET_TYPE_MISMATCH`: exact target exists but cannot serve the requested operation.
 - `TARGET_BUSY`: normal prompt attempted against a working target.
+- `TARGET_STATE_UNKNOWN`: authoritative target state is explicitly unknown; no prompt or key bytes were sent.
+- `TARGET_STATE_UNAVAILABLE`: authoritative target state is malformed or unavailable; no prompt or key bytes were sent.
+- `SETTLE_FAILED`: a working steer did not receive a successful bounded settled-state acknowledgement; no replacement prompt was sent.
 - `KEY_REJECTED`: key is not a supported named key.
 - `POSTSTATE_UNAVAILABLE`: mutation completed or may have completed, but authoritative post-state could not be read.
 - `LAUNCH_FAILED`: agent start failed; any created resources remain.

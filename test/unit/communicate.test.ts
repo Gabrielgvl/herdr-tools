@@ -1,170 +1,181 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
-import { createCommunicateTool } from "../../src/tools/communicate.js";
+import { compactPane, createCommunicateTool, paneFrom } from "../../src/tools/communicate.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
-const pane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "reviewer", agent_id: "agent-7", agent_status: "idle", agent_name: "reviewer" };
-const snapshot: HerdrSnapshot = {
-  version: "0.8.0", protocol: 19,
+const basePane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "reviewer", agent_id: "agent-7", agent_status: "idle", agent_name: "reviewer" };
+const baseSnapshot: HerdrSnapshot = {
+  version: "0.8.0",
+  protocol: 19,
   workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
   tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
-  panes: [pane], agents: [{ pane_id: "w1:p2", agent_id: "agent-7", name: "reviewer", agent_status: "idle" }]
+  panes: [basePane],
+  agents: [{ pane_id: "w1:p2", agent_id: "agent-7", name: "reviewer", agent_status: "idle" }]
 };
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p2" };
-const extensionContext = {} as ExtensionContext;
+const extensionContext = { signal: undefined, hasUI: false } as unknown as ExtensionContext;
 
-function makeCli(initial: "idle" | "working" = "idle") {
+type State = "idle" | "working" | "blocked" | "done" | "unknown" | "malformed";
+
+function makeCli(initial: State = "idle", options: { settleFails?: boolean; postState?: State } = {}) {
   const calls: string[][] = [];
+  const states: State[] = [];
   let state = initial;
+  const response = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
     calls.push(argv);
-    if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot: { ...snapshot, panes: [{ ...pane, agent_status: state }], agents: [{ pane_id: "w1:p2", name: "reviewer", agent_status: state }] }, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, agent_status: state }, type: "pane_info" } }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "agent" && argv[1] === "send-keys") { state = "working"; return { stdout: JSON.stringify({ id: "keys", result: { ok: true } }), stderr: "", code: 0, killed: false }; }
-    if (argv[0] === "agent" && argv[1] === "prompt") { state = "working"; return { stdout: JSON.stringify({ id: "prompt", result: { ok: true } }), stderr: "", code: 0, killed: false }; }
+    if (argv[0] === "api") {
+      return response("snapshot-1", { snapshot: { ...baseSnapshot, panes: [{ ...basePane, agent_status: state }], agents: [{ ...baseSnapshot.agents[0]!, agent_status: state }] }, type: "session_snapshot" });
+    }
+    if (argv[0] === "pane" && argv[1] === "get") {
+      const readState = options.postState && calls.filter((call) => call[0] === "pane" && call[1] === "get").length > 1 ? options.postState : state;
+      states.push(readState);
+      const pane = readState === "malformed" ? { ...basePane, agent_status: undefined } : { ...basePane, agent_status: readState };
+      return response(`pane-${states.length}`, { pane });
+    }
+    if (argv[0] === "agent" && argv[1] === "send-keys") {
+      state = argv[3] === "esc" ? "idle" : "working";
+      return response("interrupt-1", { ok: true });
+    }
+    if (argv[0] === "agent" && argv[1] === "wait") {
+      if (options.settleFails) return response("wait-1", { ok: false, matched: false });
+      state = "idle";
+      return response("wait-1", { ok: true, matched: true });
+    }
+    if (argv[0] === "agent" && argv[1] === "prompt") {
+      state = "working";
+      return response("prompt-1", { ok: true });
+    }
     throw new Error(`unexpected argv ${argv.join(" ")}`);
   });
-  return { cli: new HerdrCli(exec), calls };
+  return { cli: new HerdrCli(exec), calls, exec };
+}
+
+function execute(cli: HerdrCli, params: Record<string, unknown>) {
+  return createCommunicateTool({ cli, context }).execute("id", params as never, new AbortController().signal, undefined, extensionContext);
 }
 
 describe("herdr_communicate", () => {
-  it("refuses a normal prompt while the target is working without mutation", async () => {
-    const { cli, calls } = makeCli("working");
-    await expect(createCommunicateTool({ cli, context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "TARGET_BUSY" });
-    expect(calls.some((call) => call[0] === "agent" && (call[1] === "prompt" || call[1] === "send-keys"))).toBe(false);
-  });
-
-  it("sends a normal prompt with bounded working verification", async () => {
-    const { cli, calls } = makeCli();
-    await expect(createCommunicateTool({ cli, context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { operation: "prompt", outcome: "sent", postState: { agent_status: "working" } } });
-    expect(calls).toContainEqual(["agent", "prompt", "w1:p2", "hello", "--wait", "--until", "working", "--timeout", "5000"]);
-  });
-
-  it("resolves an authoritative agent ID to the pane used by communication", async () => {
-    const { cli, calls } = makeCli();
-    await expect(createCommunicateTool({ cli, context }).execute("id", { target: "agent-7", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { target: { paneId: "w1:p2" } } });
-    expect(calls).toContainEqual(["agent", "send-keys", "w1:p2", "enter"]);
-  });
-
-  it("rejects pane get identity mismatches before and after mutation", async () => {
-    const beforeExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, pane_id: "w1:wrong", agent_status: "idle" } } }), stderr: "", code: 0, killed: false };
-      throw new Error(`mutation should not run: ${argv.join(" ")}`);
-    });
-    await expect(createCommunicateTool({ cli: new HerdrCli(beforeExec), context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { expectedPaneId: "w1:p2", actualPaneId: "w1:wrong" } });
-    expect(beforeExec.mock.calls.some((call) => call[1][0] === "agent")).toBe(false);
-
-    let gets = 0;
-    const afterExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "pane" && argv[1] === "get") {
-        gets += 1;
-        return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, pane_id: gets === 1 ? pane.pane_id : "w1:wrong", agent_status: gets === 1 ? "idle" : "working" } } }), stderr: "", code: 0, killed: false };
-      }
-      if (argv[0] === "agent" && argv[1] === "prompt") return { stdout: JSON.stringify({ id: "prompt", result: { ok: true } }), stderr: "", code: 0, killed: false };
-      throw new Error(`unexpected argv ${argv.join(" ")}`);
-    });
-    await expect(createCommunicateTool({ cli: new HerdrCli(afterExec), context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { expectedPaneId: "w1:p2", actualPaneId: "w1:wrong" } });
-    expect(afterExec.mock.calls.some((call) => call[1][0] === "agent" && call[1][1] === "prompt")).toBe(true);
-  });
-
-  it("steers with named Escape before the prompt and verifies working", async () => {
-    const { cli, calls } = makeCli();
-    const result = await createCommunicateTool({ cli, context }).execute("id", { target: "reviewer", operation: "steer", text: "new direction" }, new AbortController().signal, undefined, extensionContext);
-    expect(calls).toEqual([
+  it.each(["idle", "done", "blocked"] as const)("steers %s directly without Escape", async (state) => {
+    const harness = makeCli(state);
+    const result = await execute(harness.cli, { target: "reviewer", operation: "steer", text: "new direction" });
+    expect(harness.calls).toEqual([
       ["api", "snapshot"],
       ["pane", "get", "w1:p2"],
-      ["agent", "send-keys", "w1:p2", "esc"],
       ["agent", "prompt", "w1:p2", "new direction", "--wait", "--until", "working", "--timeout", "5000"],
       ["pane", "get", "w1:p2"]
     ]);
-    expect(result.details).toMatchObject({ operation: "steer", outcome: "sent", target: { paneId: "w1:p2" }, postState: { agent_status: "working" } });
+    expect(harness.calls.some((call) => call.includes("esc"))).toBe(false);
+    expect(result.details).toMatchObject({ route: "prompt_direct", preState: { agent_status: state }, postState: { agent_status: "working" }, operationIds: { prompt: "prompt-1", postState: "pane-2" } });
   });
 
-  it("fails closed for malformed pane responses and contradictory post-state", async () => {
-    for (const paneResult of [null, {}, { pane: null }]) {
-      const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-        if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-        return { stdout: JSON.stringify({ id: "get", result: paneResult }), stderr: "", code: 0, killed: false };
-      });
-      await expect(createCommunicateTool({ cli: new HerdrCli(exec), context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+  it("interrupts working steer, waits for a settled acknowledgement, then prompts", async () => {
+    const harness = makeCli("working");
+    const result = await execute(harness.cli, { target: "reviewer", operation: "steer", text: "replace direction" });
+    expect(harness.calls).toEqual([
+      ["api", "snapshot"],
+      ["pane", "get", "w1:p2"],
+      ["agent", "send-keys", "w1:p2", "esc"],
+      ["agent", "wait", "w1:p2", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "5000"],
+      ["agent", "prompt", "w1:p2", "replace direction", "--wait", "--until", "working", "--timeout", "5000"],
+      ["pane", "get", "w1:p2"]
+    ]);
+    expect(result.details).toMatchObject({ route: "interrupt_then_prompt", preState: { agent_status: "working" }, operationIds: { interrupt: "interrupt-1", settleWait: "wait-1", prompt: "prompt-1", postState: "pane-2" } });
+  });
+
+  it("accepts a successful settle envelope with a non-object result", async () => {
+    const harness = makeCli("working");
+    const original = harness.cli.runJson.bind(harness.cli);
+    harness.cli.runJson = vi.fn(async (argv: string[], signal: AbortSignal, preserve?: boolean) => {
+      if (argv[0] === "agent" && argv[1] === "wait") return { id: "wait-primitive", result: null };
+      return original(argv, signal, preserve);
+    });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "new direction" })).resolves.toMatchObject({ details: { operationIds: { settleWait: "wait-primitive" } } });
+  });
+
+  it("refuses prompt against working without mutation", async () => {
+    const harness = makeCli("working");
+    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code: "TARGET_BUSY" });
+    expect(harness.calls.some((call) => call[0] === "agent")).toBe(false);
+  });
+
+  it("prompts idle directly and returns bounded operation IDs and states", async () => {
+    const harness = makeCli();
+    const result = await execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" });
+    expect(result.details).toMatchObject({ operation: "prompt", route: "prompt_direct", preState: { agent_status: "idle" }, postState: { agent_status: "working" }, operationIds: { snapshot: "snapshot-1", preState: "pane-1", prompt: "prompt-1", postState: "pane-2" } });
+    expect(JSON.stringify(result)).not.toContain("environment");
+  });
+
+  it("sends validated named keys and rejects unsupported keys before CLI", async () => {
+    const harness = makeCli();
+    await expect(execute(harness.cli, { target: "agent-7", operation: "keys", keys: ["enter", "ctrl+c"] })).resolves.toMatchObject({ details: { operation: "keys", operationIds: { keys: "interrupt-1", postState: "pane-2" } } });
+    const callsBefore = harness.calls.length;
+    await expect(execute(harness.cli, { target: "reviewer", operation: "keys", keys: ["raw-byte"] })).rejects.toMatchObject({ code: "KEY_REJECTED" });
+    expect(harness.calls).toHaveLength(callsBefore);
+  });
+
+  it("fails typed and sends zero prompt/key bytes for unknown or malformed states", async () => {
+    for (const state of ["unknown", "malformed"] as const) {
+      const harness = makeCli(state);
+      await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "must not send" })).rejects.toMatchObject({ code: state === "unknown" ? "TARGET_STATE_UNKNOWN" : "TARGET_STATE_UNAVAILABLE" });
+      expect(harness.calls.some((call) => call[0] === "agent")).toBe(false);
     }
-
-    const unknownState = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "pane" && argv[1] === "get") {
-        return { stdout: JSON.stringify({ id: "get", result: { pane: {} } }), stderr: "", code: 0, killed: false };
-      }
-      return { stdout: JSON.stringify({ id: "keys", result: { ok: true } }), stderr: "", code: 0, killed: false };
-    });
-    await expect(createCommunicateTool({ cli: new HerdrCli(unknownState), context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
-
-    let gets = 0;
-    const contradictory = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "pane" && argv[1] === "get") {
-        gets += 1;
-        const state = gets === 1 ? "idle" : "idle";
-        return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, agent_status: state } } }), stderr: "", code: 0, killed: false };
-      }
-      return { stdout: JSON.stringify({ id: "prompt", result: { ok: true } }), stderr: "", code: 0, killed: false };
-    });
-    await expect(createCommunicateTool({ cli: new HerdrCli(contradictory), context }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
   });
 
-  it("requires an authoritative key post-state and strips sensitive metadata", async () => {
-    for (const postPane of [
-      { ...pane, agent_status: undefined, environment: { SECRET: "missing-state" }, nested: { env_vars: { TOKEN: "nested-secret" } } },
-      { ...pane, agent_status: "not-a-state", environment: { SECRET: "invalid-state" } }
-    ]) {
-      let gets = 0;
+  it("does not prompt when interrupt settle fails", async () => {
+    const harness = makeCli("working", { settleFails: true });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "blocked" })).rejects.toMatchObject({ code: "SETTLE_FAILED" });
+    expect(harness.calls.map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["pane", "get"], ["agent", "send-keys"], ["agent", "wait"]]);
+  });
+
+  it("fails on contradictory or unknown post-state after prompt", async () => {
+    const contradictory = makeCli("idle", { postState: "idle" });
+    await expect(execute(contradictory.cli, { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    const unknown = makeCli("idle", { postState: "unknown" });
+    await expect(execute(unknown.cli, { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+  });
+
+  it("fails closed on malformed pane protocol responses", async () => {
+    const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot: baseSnapshot } }), stderr: "", code: 0, killed: false };
+      return { stdout: JSON.stringify({ id: "pane", result: { pane: null } }), stderr: "", code: 0, killed: false };
+    });
+    await expect(execute(new HerdrCli(exec), { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+  });
+
+  it("rejects missing authoritative identifiers and identity mismatches before bytes", async () => {
+    for (const malformedPane of [{ pane: { ...basePane, pane_id: "" } }, { pane: { ...basePane, tab_id: "" } }, { pane: { ...basePane, workspace_id: "" } }, { pane: { ...basePane, pane_id: "wrong" } }]) {
       const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-        if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-        if (argv[0] === "pane" && argv[1] === "get") {
-          gets += 1;
-          return { stdout: JSON.stringify({ id: "get", result: { pane: gets === 1 ? pane : postPane } }), stderr: "", code: 0, killed: false };
-        }
-        return { stdout: JSON.stringify({ id: "keys", result: { ok: true } }), stderr: "", code: 0, killed: false };
+        if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot: baseSnapshot } }), stderr: "", code: 0, killed: false };
+        return { stdout: JSON.stringify({ id: "pane", result: malformedPane }), stderr: "", code: 0, killed: false };
       });
-      await expect(createCommunicateTool({ cli: new HerdrCli(exec), context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+      await expect(execute(new HerdrCli(exec), { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+      expect(exec.mock.calls.some((call) => call[1][0] === "agent")).toBe(false);
     }
-
-    const sensitive = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
-      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
-      if (argv[0] === "pane" && argv[1] === "get") {
-        return { stdout: JSON.stringify({ id: "get", result: { pane: { ...pane, agent_status: "working", environment: { SECRET: "hidden" }, environment_overrides: { SNAKE_SECRET: "snake-hidden" }, nested: { environment_variables: { TOKEN: "nested-hidden" }, environment_overrides: { NESTED_SNAKE_SECRET: "nested-snake-hidden" } }, history: [{ env: { ARRAY_SECRET: "array-hidden" }, environment_overrides: { ARRAY_SNAKE_SECRET: "array-snake-hidden" } }] } } }), stderr: "", code: 0, killed: false };
-      }
-      return { stdout: JSON.stringify({ id: "keys", result: { ok: true } }), stderr: "", code: 0, killed: false };
-    });
-    const result = await createCommunicateTool({ cli: new HerdrCli(sensitive), context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext);
-    expect(result.details.postState).toMatchObject({ pane_id: "w1:p2", agent_status: "working" });
-    expect(JSON.stringify(result)).not.toContain("hidden");
-    expect(JSON.stringify(result)).not.toContain("TOKEN");
-    expect(JSON.stringify(result)).not.toContain("snake-hidden");
-    expect(JSON.stringify(result)).not.toContain("environment_overrides");
   });
 
-  it("validates keys before CLI and never asks for confirmation", async () => {
-    const { cli, calls } = makeCli();
-    await expect(createCommunicateTool({ cli, context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter", "ctrl+c"] }, new AbortController().signal, undefined, extensionContext)).resolves.toMatchObject({ details: { outcome: "sent" } });
-    expect(calls).toContainEqual(["agent", "send-keys", "w1:p2", "enter", "ctrl+c"]);
-
-    const before = calls.length;
-    await expect(createCommunicateTool({ cli, context }).execute("id", { target: "reviewer", operation: "keys", keys: ["\\u001b" as never] }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "KEY_REJECTED" });
-    expect(calls).toHaveLength(before);
+  it("validates pane envelopes, identifiers, and identity directly", () => {
+    expect(() => paneFrom(null, "w1:p2")).toThrowError(/Invalid Herdr pane response/);
+    expect(() => paneFrom({ pane: {} }, "w1:p2")).toThrowError(/missing authoritative identifiers/);
+    expect(() => paneFrom({ pane: { pane_id: "wrong", tab_id: "t1", workspace_id: "w1" } }, "w1:p2")).toThrowError(/does not match/);
+    expect(paneFrom({ pane: { pane_id: "w1:p2", tab_id: "t1", workspace_id: "w1" } }, "w1:p2")).toMatchObject({ pane_id: "w1:p2" });
   });
 
-  it("renders compact call and result rows", () => {
+  it("covers compact optional metadata and omitted-signal execution", async () => {
+    expect(compactPane({ pane_id: "p", tab_id: "t", workspace_id: "w", agent_status: "idle" })).toEqual({ pane_id: "p", tab_id: "t", workspace_id: "w", agent_status: "idle" });
+    const harness = makeCli();
+    const tool = createCommunicateTool({ cli: harness.cli, context });
+    await expect(tool.execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { operation: "prompt" } });
+  });
+
+  it("renders compact call/result rows", () => {
     const tool = createCommunicateTool({ cli: makeCli().cli, context });
     const call = tool.renderCall?.({ target: "reviewer", operation: "prompt", text: "hi" } as never, {} as never, {} as never);
     expect(call?.render(80)).toEqual(["herdr_communicate · prompt · reviewer"]);
     call?.invalidate();
-    const result = tool.renderResult?.({ content: [], details: { operation: "prompt", outcome: "sent", target: { paneId: "w1:p2" }, postState: { agent_status: "working" } }, isError: false } as never, {} as never, {} as never, {} as never);
+    const result = tool.renderResult?.({ content: [], details: { operation: "prompt", outcome: "sent", target: { paneId: "w1:p2" }, preState: {}, postState: { agent_status: "working" }, operationIds: {} }, isError: false } as never, {} as never, {} as never, {} as never);
     expect(result?.render(80)).toEqual(["sent · w1:p2 · working"]);
     result?.invalidate();
-    const empty = tool.renderResult?.({ content: [], isError: true } as never, {} as never, {} as never, {} as never);
-    expect(empty?.render(80)).toEqual(["error UNKNOWN"]);
   });
 });

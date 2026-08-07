@@ -131,7 +131,7 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Launch never auto-cleans resources | `launch_success_never_closes_resources`; `launch_partial_failure_preserves_created_resources`; `session_shutdown_does_not_auto_cleanup` | Created resources remain available for explicit user/admin handling. | No implicit close/delete on success, failure, cancellation, reload, or shutdown. |
 | Pane creation requires a label and safe defaults | `pane_create_requires_label`; `pane_create_defaults_right_and_no_focus`; `pane_create_honors_explicit_down_and_focus` | Labeled pane is created with requested direction/focus. | Missing label fails before CLI mutation; defaults never focus. |
 | Tab creation requires label and honors focus | `tab_create_requires_label`; `tab_create_defaults_no_focus`; `tab_create_honors_explicit_focus` | Labeled tab is created and post-read. | Missing label and omitted focus never mutate/focus. |
-| Pane/tab calls never close anything | `herdr_pane_has_no_close_or_cleanup_path`; `herdr_tab_has_no_close_or_cleanup_path`; `public_pane_tab_calls_never_issue_close` | Only requested create/split/move/focus operations occur. | No pane, tab, workspace, or tree close occurs, including on error. |
+| Pane/tab close is explicit, sequential, and bounded | `herdr_pane_close_is_sequential_and_autonomous`; `herdr_tab_close_is_sequential_and_autonomous`; `close_lost_response_reconciles_or_is_uncertain` | Only an explicit exact close dispatches close, followed by a fresh compact post-read. | No implicit cleanup, retry, modal confirmation, or protected-resource close occurs. |
 | Ownership is current-session in-memory only | `ownership_records_only_current_session_resources`; `ownership_is_not_persisted_in_session_entries` | Created resource IDs are tracked in memory. | No `appendEntry`, file, global, or resumed-session ownership state is written. |
 | Ownership clears on lifecycle replacement | `ownership_clears_on_reload`; `ownership_clears_on_resume`; `ownership_clears_on_new_session`; `ownership_clears_on_session_change` | A new session begins with an empty ownership set. | Old IDs cannot authorize close after replacement. |
 | Exact pane/tab close is autonomous after protected-topology validation | `pane_close_unowned_without_ui`; `tab_close_unowned_without_ui`; `close_protects_caller_resources`; `close_rejects_malformed_topology` | Any exact non-caller target may close after fresh topology validation, with Herdr-returned operation IDs and compact post-state. | No modal confirmation or ownership gate exists; caller resources and malformed topology remain protected. |
@@ -659,7 +659,7 @@ refactor while all prior tests remain green.
    verification, envelope correlation, no completion wait, and no UI confirmation.
 6. **Pane/tab creation.** Implement required labels, right/down direction,
    explicit focus, current cwd/workspace defaults, returned IDs, post-reads, and
-   no-close behavior.
+   no implicit-close behavior.
 7. **Close reliability.** Add current-session resource bookkeeping and lifecycle
    clearing, protected topology validation, sequential mutation registration,
    completed-mutation preservation, fresh post-readback, reconciliation, and

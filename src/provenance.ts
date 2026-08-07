@@ -63,14 +63,14 @@ export function resolveSender(snapshot: HerdrSnapshot, paneId: string | undefine
     [label, "label"],
     [agentKind, "agent_kind"]
   ];
-  const selected = candidates.find(([value]) => value !== undefined && value !== stablePaneId && !value.includes(stablePaneId));
+  const selected = candidates.find(([value]) => value !== undefined && value !== stablePaneId);
   const display = selected?.[0] ?? stablePaneId;
   const source = selected?.[1] ?? "pane_id";
   return {
     paneId: stablePaneId,
     display,
     source,
-    from: source === "pane_id" ? stablePaneId : `${display} (${stablePaneId})`
+    from: source === "pane_id" || display.includes(stablePaneId) ? display : `${display} (${stablePaneId})`
   };
 }
 

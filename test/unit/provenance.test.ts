@@ -29,10 +29,10 @@ describe("inter-agent provenance", () => {
     expect(resolveSender(snapshot({ ...basePane, kind: "gemini" }), "w1:p1").source).toBe("agent_kind");
   });
 
-  it("uses pane ID alone when metadata is absent or would duplicate the ID", () => {
+  it("uses pane ID alone when metadata is absent and preserves precedence without duplicating the ID", () => {
     expect(resolveSender(snapshot(basePane), "w1:p1")).toMatchObject({ display: "w1:p1", source: "pane_id", from: "w1:p1" });
     expect(resolveSender(snapshot({ ...basePane, label: "w1:p1" }), "w1:p1")).toMatchObject({ source: "pane_id", from: "w1:p1" });
-    expect(resolveSender(snapshot({ ...basePane, label: "caller w1:p1" }), "w1:p1")).toMatchObject({ source: "pane_id", from: "w1:p1" });
+    expect(resolveSender(snapshot({ ...basePane, label: "caller w1:p1" }), "w1:p1")).toMatchObject({ display: "caller w1:p1", source: "label", from: "caller w1:p1" });
   });
 
   it("normalizes and bounds metadata without changing payload bytes", () => {

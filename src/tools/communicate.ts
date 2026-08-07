@@ -101,12 +101,12 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
 
       const snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], activeSignal);
       const snapshot = parseSnapshotResult(snapshotEnvelope.result);
-      const sender = resolveSender(snapshot, deps.context.paneId);
-      if (params.operation !== "keys" && (params.target === "current" || params.target === sender.paneId)) {
+      const sender = params.operation === "keys" ? undefined : resolveSender(snapshot, deps.context.paneId);
+      if (sender && (params.target === "current" || params.target === sender.paneId)) {
         throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: sender.paneId } });
       }
       const target = resolveTarget(snapshot, params.target, "agent", deps.context);
-      if (params.operation !== "keys" && target.paneId === sender.paneId) {
+      if (sender && target.paneId === sender.paneId) {
         throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: target.paneId } });
       }
       const preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
@@ -123,7 +123,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...params.keys], activeSignal);
       } else {
         route = params.operation === "steer" ? "steer_direct" : "prompt_direct";
-        const envelope = buildEnvelope(sender, params.operation, params.text);
+        const envelope = buildEnvelope(sender!, params.operation, params.text);
         const promptArgs = params.operation === "steer" && beforeState === "working"
           ? ["agent", "prompt", target.paneId!, envelope]
           : ["agent", "prompt", target.paneId!, envelope, "--wait", "--until", "working", "--timeout", "5000"];
@@ -152,7 +152,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           postState: operationId(postEnvelope)
         },
         ...(params.operation !== "keys" ? {
-          sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
+          sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
           envelope: { version: "v1" as const, kind: params.operation }
         } : {})
       };

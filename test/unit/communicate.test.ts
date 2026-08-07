@@ -129,6 +129,22 @@ describe("herdr_communicate", () => {
     expect(harness.calls).toHaveLength(callsBefore);
   });
 
+  it("keeps named-key delivery independent of text sender provenance", async () => {
+    const calls: string[][] = [];
+    const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      calls.push(argv);
+      const response = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
+      if (argv[0] === "api") return response("snapshot", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [basePane], agents: [baseSnapshot.agents[1]!] } });
+      if (argv[0] === "pane" && argv[1] === "get") return response("pane", { pane: basePane });
+      if (argv[0] === "agent" && argv[1] === "send-keys") return response("keys", { ok: true });
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    });
+    const result = await execute(new HerdrCli(exec), { target: "reviewer", operation: "keys", keys: ["enter"] });
+    expect(calls).toEqual([["api", "snapshot"], ["pane", "get", "w1:p2"], ["agent", "send-keys", "w1:p2", "enter"], ["pane", "get", "w1:p2"]]);
+    expect(result.details).not.toHaveProperty("sender");
+    expect(result.details).not.toHaveProperty("envelope");
+  });
+
   it("fails typed and sends zero prompt/key bytes for unknown or malformed states", async () => {
     for (const state of ["unknown", "malformed"] as const) {
       const harness = makeCli(state);

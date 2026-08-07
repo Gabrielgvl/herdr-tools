@@ -1,6 +1,6 @@
 # Specification: Herdr Tools Pi Extension
 
-**Status:** Implemented and release-validated.
+**Status:** Approved contract; implementation in progress.
 
 ## Objective
 
@@ -12,14 +12,15 @@ The core user is an agent operating inside Herdr. Success means the agent can sa
 
 ## Scope and authoritative decisions
 
-The core release registers exactly these six custom tools and no others:
+The core release registers exactly these seven custom tools and no others:
 
 1. `herdr_inspect`
 2. `herdr_communicate`
 3. `herdr_wait`
-4. `herdr_launch`
-5. `herdr_pane`
-6. `herdr_tab`
+4. `herdr_jobs`
+5. `herdr_launch`
+6. `herdr_pane`
+7. `herdr_tab`
 
 The following are explicitly deferred and must not be registered, aliased, or implemented as hidden behavior:
 
@@ -190,6 +191,22 @@ Long waits use mandatory in-process, tool-less reviewer calls:
 - A reviewer result that says manager judgment is required ends the wait early with `matched: false`, `reason: "manager_judgment_required"`, final snapshots, and reviewer summaries.
 - Reviewer/model failure ends the wait immediately with `REVIEWER_FAILED`; there is no fallback model, pane, or silent continuation.
 - Reviewer summaries appear in streamed progress and final tool details. The reviewer never changes the authoritative wait condition: only Herdr state/output can satisfy it.
+
+### Detached wait jobs and `herdr_jobs`
+
+`herdr_wait` accepts an optional camelCase `runInBackground` boolean. Its schema is strict: omitted or `false` retains the blocking behavior, while snake_case and unknown fields are rejected. Background mode performs parameter validation, extension-owned settings loading, one authoritative snapshot read, exact target resolution, and duplicate resolved-resource rejection before registering anything. These preflight steps use the initiating tool signal and throw directly on failure without creating a job.
+
+After preflight, the extension registers a stable opaque `job_${randomUUID()}` identifier and runs the same prepared wait engine used by foreground waits under a fresh per-job `AbortController`. The prepared params, settings, and resolved IDs are copied at registration. Timeout starts after preflight. The initiating signal and call-scoped update callback are never used by post-registration work. A session generation/token check prevents stale preflight from registering into a replacement session.
+
+The in-memory, session-wide registry has no concurrency cap and retains terminal jobs until shutdown. Generic job status is `running`, `completed`, `failed`, or `cancelled`; wait outcome is separately `success`, `timeout`, or `manager_judgment_required`. Only latest bounded progress is stored. Terminal transitions are first-wins. `herdr_jobs` is the sole public registry view and is strict:
+
+- `{operation:"list", status?, offset?, limit?}` filters by generic status, orders newest-first by insertion sequence, filters before pagination, defaults offset to `0` and limit to `20`, caps limit at `100`, and returns `{total,nextOffset,jobs}` with transcript-free summaries.
+- `{operation:"get", jobId}` returns a bounded, typed full current/terminal detail for an owned job.
+- `{operation:"cancel", jobId}` marks a running job cancelled before aborting it, returns immediately without awaiting cleanup, and is idempotent. Unknown IDs are structured `JOB_NOT_FOUND`; terminal jobs are returned unchanged.
+
+On session shutdown, notification delivery is disabled first, running jobs are marked/aborted, cleanup is allowed to settle safely, and registry ownership/generation is reset. `/tree` does not cancel jobs. Completion notifications target the current active branch and are best-effort. Background success, timeout, failure, and manager judgment send one compact visible custom Pi message with `deliverAs: "steer"` and `triggerTurn: true`; explicit cancel and shutdown cancellation never notify. Manager judgment messages start with `HIGH PRIORITY: MANAGER JUDGMENT REQUIRED` and use details priority `high`; other outcomes use normal priority. Messages include the job ID, outcome/reason, matched targets, and bounded error/reviewer summary, treating pane/output text as untrusted data. Pi's normal queue is used without custom debounce.
+
+All model-visible content, list summaries, completion notifications, and renderers enforce Pi's 50KB/2,000-line bounds with explicit truncation and no full transcripts. No background resource starts in the extension factory; only tool execution registers jobs.
 
 ### `herdr_launch`
 

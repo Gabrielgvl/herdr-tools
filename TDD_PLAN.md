@@ -6,15 +6,16 @@ This plan is the tests-first contract for a new global extension at
 `/home/gabriel/.pi/agent/extensions/herdr-tools/`. `herdr-tools` is a standalone
 Git repository rooted at that directory; it is not a package inside the Courier
 repository and its commands, coverage configuration, and integration fixtures
-must resolve from this repository root. The extension registers **exactly six**
+must resolve from this repository root. The extension registers **exactly seven**
 tools:
 
 1. `herdr_inspect`
 2. `herdr_communicate`
 3. `herdr_wait`
-4. `herdr_launch`
-5. `herdr_pane`
-6. `herdr_tab`
+4. `herdr_jobs`
+5. `herdr_launch`
+6. `herdr_pane`
+7. `herdr_tab`
 
 `herdr_command`, `herdr_workspace`, and `herdr_admin` are deferred. They must not
 be registered, advertised, or called by this package. Do not edit
@@ -832,3 +833,18 @@ Any implementation choice that contradicts an acceptance invariant is an
 escalation, not a reason to rewrite this trace. The final implementation report
 must include TDD-plan deviations, architecture deviations, scope deviations,
 and concerns for the reviewer, as required by the source TDD skill.
+
+## Approved detached wait-job amendment
+
+The detached wait contract is now part of this plan. Add red/green coverage for
+strict `runInBackground`, preflight-before-ID, fresh-signal execution, frozen
+settings/target resolution, shared wait-runner outcome mapping, and unused
+initiating progress callbacks. Add registry tests for first-wins transitions,
+newest-first filtered pagination, uncapped starts, latest-progress replacement,
+immutable views, cancellation races, generation/shutdown staleness, and terminal
+retention. Add `herdr_jobs` tool tests for strict list/get/cancel input, structured
+`JOB_NOT_FOUND`, bounded output and renderers. Add runtime tests for exactly seven
+registrations, active-branch completion pushes and their `deliverAs`/`triggerTurn`
+options, manager-judgment priority, normal queue behavior, and cancellation or
+shutdown suppression. Integration remains opt-in and must record the exact
+blocker if unavailable; no test may weaken the 100% repository threshold.

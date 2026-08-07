@@ -1,6 +1,6 @@
 # Herdr Tools Pi Extension
 
-A global Pi extension for safe inspection and coordination of Herdr panes, agents, tabs, and topology. It is inert outside a Herdr pane (`HERDR_ENV=1`) and registers exactly six tools: `herdr_inspect`, `herdr_communicate`, `herdr_wait`, `herdr_launch`, `herdr_pane`, and `herdr_tab`.
+A global Pi extension for safe inspection and coordination of Herdr panes, agents, tabs, and topology. It is inert outside a Herdr pane (`HERDR_ENV=1`) and registers exactly seven tools: `herdr_inspect`, `herdr_communicate`, `herdr_wait`, `herdr_jobs`, `herdr_launch`, `herdr_pane`, and `herdr_tab`.
 
 ## Quick start
 
@@ -34,6 +34,8 @@ herdr_inspect({"mode":"context"})
 herdr_inspect({"mode":"target","target":"worker-id"})
 herdr_communicate({"target":"worker-id","operation":"prompt","text":"Continue the implementation"})
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000})
+herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000,"runInBackground":true})
+herdr_jobs({"operation":"list","status":"running"})
 herdr_launch({"name":"reviewer","kind":"pi","initialPrompt":"Inspect the current changes"})
 herdr_pane({"operation":"split","label":"worker","direction":"right"})
 herdr_tab({"operation":"create","label":"review"})
@@ -58,7 +60,7 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `index.ts` gates registration, builds the `pi.exec` CLI adapter, shares runtime ownership, and clears only in-memory ownership on session shutdown and session start.
 - `src/cli.ts` bounds and validates CLI responses.
 - `src/targets.ts` resolves exact targets and injected current context.
-- `src/tools/` contains the six public tools.
+- `src/tools/` contains the seven public tools.
 - `src/reviewer.ts` contains the tool-less in-process model reviewer used by long waits.
 - `src/tui.ts` uses Pi `Text` components with bounded semantic rows.
 

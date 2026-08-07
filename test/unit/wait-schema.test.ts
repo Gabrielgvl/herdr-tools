@@ -8,6 +8,8 @@ describe("herdr_wait schema and runtime validation", () => {
     expect(Value.Check(WaitParamsSchema, { targets: ["w1:p1"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 3_600_000 })).toBe(true);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "done" } }, timeoutMs: 1, reviewerModel: "bad" })).toBe(false);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "bad" }, timeoutMs: 1 })).toBe(false);
+    expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true })).toBe(true);
+    expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, run_in_background: true })).toBe(false);
   });
 
   it("rejects exact duplicate and resolved-invalid input at runtime", () => {
@@ -35,6 +37,8 @@ describe("herdr_wait schema and runtime validation", () => {
       null,
       [],
       { ...valid, extra: true },
+      { ...valid, run_in_background: true },
+      { ...valid, runInBackground: "yes" },
       { ...valid, targets: [] },
       { ...valid, targets: ["\0"] },
       { ...valid, match: "sometimes" },
@@ -53,6 +57,7 @@ describe("herdr_wait schema and runtime validation", () => {
       { ...valid, condition: { kind: "unknown" } }
     ];
     for (const value of invalid) expect(() => validateWaitParams(value)).toThrowError(/INVALID_INPUT/);
+    expect(validateWaitParams({ ...valid, runInBackground: false }).params.runInBackground).toBe(false);
   });
 
   it("covers state helpers and schema duplicate rejection", () => {

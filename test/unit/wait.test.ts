@@ -1,7 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ReviewerFailure, type WaitReviewer } from "../../src/reviewer.js";
-import { WaitError, createWaitTool, deltaLines, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, realClock, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
+import { WaitError, boundedBackgroundDetails, createWaitTool, deltaLines, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
+import { JobRegistry } from "../../src/job-registry.js";
 
 const snapshot = {
   type: "session_snapshot",
@@ -87,7 +88,7 @@ describe("herdr_wait", () => {
     const result = await execute(cli, { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
     expect(entered).toEqual(["p1", "p2"]);
     expect(result.details).toMatchObject({ outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" });
-    expect(result.details.reviewerSummaries).toHaveLength(2);
+    expect((result.details as { reviewerSummaries?: unknown[] }).reviewerSummaries).toHaveLength(2);
   });
 
   it("honors an authoritative condition that becomes true during reviewer refresh", async () => {
@@ -245,7 +246,7 @@ describe("herdr_wait", () => {
   it("preserves an unknown reviewer target in the manager summary", async () => {
     const reviewer: WaitReviewer = { review: async () => ({ targetId: "external", classification: "blocked", summary: "attention" }) };
     const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
-    expect(result.details.reviewerSummaries?.[0]?.target).toBe("external");
+    expect((result.details as { reviewerSummaries?: Array<{ target?: string }> }).reviewerSummaries?.[0]?.target).toBe("external");
   });
 
   it("polls authoritatively, streams bounded progress, and supports renderers", async () => {
@@ -457,5 +458,112 @@ describe("herdr_wait", () => {
     const pending: WaitClock = { now: () => 0, sleep: async (_ms, signal) => { signal.addEventListener("abort", () => undefined); controller.abort(); throw Object.assign(new Error("cancel"), { code: "ABORTED" }); } };
     const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, clock: pending });
     await expect(tool.execute("id", { targets: ["p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 } as never, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+  });
+
+  it("uses the default settings loader during direct preflight", async () => {
+    const prepared = await prepareWait({ cli: fakeCli(), context }, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, new AbortController().signal);
+    expect(prepared.params.targets).toEqual(["p1"]);
+    expect(prepared.settings.reviewerThinking).toBe("low");
+  });
+
+  it("rejects background waits when the registry is unavailable", async () => {
+    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings });
+    await expect(tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT", message: "INVALID_INPUT: background waits are unavailable in this runtime" });
+  });
+
+  it("preflights background waits before creating an ID and rejects stale sessions", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_preflight" });
+    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
+    await expect(tool.execute("id", { targets: ["missing"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "TARGET_NOT_FOUND" });
+    expect(registry.size()).toBe(0);
+    const staleGeneration = registry.captureGeneration();
+    const staleTool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => { registry.beginSession(); return settings; }, jobRegistry: registry });
+    await expect(staleTool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "SESSION_REPLACED" });
+    expect(registry.isCurrent(staleGeneration)).toBe(false);
+    const invalid = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: registry });
+    await expect(invalid.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, snake_case: true, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(registry.size()).toBe(0);
+  });
+
+  it("runs background waits on a fresh signal without the initiating update callback", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_background" });
+    const entered: AbortSignal[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const cli: WaitCli = {
+      async runJson(argv, signal) {
+        entered.push(signal);
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        await gate;
+        return { id: "pane", result: { pane: snapshot.snapshot.panes[0] } };
+      },
+      async runText(_argv, signal) { entered.push(signal); await gate; return "done"; }
+    };
+    const initiating = new AbortController();
+    const updates = vi.fn(() => { throw new Error("initiating update used"); });
+    const tool = createWaitTool({ cli, context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
+    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 100, runInBackground: true } as never, initiating.signal, updates, extensionContext);
+    expect(started).toMatchObject({ content: [{ type: "text", text: "background wait started · job_background" }], details: { operation: "wait", outcome: "background", jobId: "job_background", targets: ["p1"], targetIds: ["p1"] } });
+    const backgroundRendered = tool.renderResult?.(started as never, { expanded: false, isPartial: false }, {} as never, {} as never);
+    expect(backgroundRendered?.render(80)).toEqual(["background · job_background"]);
+    backgroundRendered?.invalidate();
+    initiating.abort();
+    release();
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(registry.get("job_background")).toMatchObject({ status: "completed", outcome: "success" });
+    expect(updates).not.toHaveBeenCalled();
+    expect(entered.length).toBeGreaterThan(0);
+    expect(entered.slice(1).every((signal) => signal !== initiating.signal)).toBe(true);
+  });
+
+  it.each([
+    ["success", "done", { kind: "state", state: "completed" }, "success"],
+    ["timeout", "working", { kind: "state", state: "done" }, "timeout"]
+  ] as const)("maps background %s outcomes", async (_name, output, condition, expected) => {
+    const registry = new JobRegistry({ idFactory: () => `job_${expected}` });
+    const tool = createWaitTool({ cli: fakeCli({ p1: output }), context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock(), pollIntervalMs: 1 });
+    await tool.execute("id", { targets: ["p1"], match: "any", condition, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(registry.get(`job_${expected}`)).toMatchObject({ status: "completed", outcome: expected });
+  });
+
+  it("records a background runner protocol failure without escaping the tool call", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_runner_failure" });
+    const malformedCli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        return { id: "pane", result: {} };
+      },
+      async runText() { return ""; }
+    };
+    const tool = createWaitTool({ cli: malformedCli, context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
+    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    expect(started.details).toMatchObject({ outcome: "background", jobId: "job_runner_failure" });
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(registry.get("job_runner_failure")).toMatchObject({ status: "failed", error: { code: "CLI_PROTOCOL_ERROR" } });
+  });
+
+  it("reports clipped and omitted values in a background acknowledgement", () => {
+    const params = { targets: Array.from({ length: 17 }, (_, index) => `target-${index}-${"t".repeat(2_000)}`), match: "any" as const, condition: { kind: "state" as const, state: "done" as const }, timeoutMs: 1 };
+    const targetIds = params.targets.map((_, index) => `pane-${index}-${"p".repeat(2_000)}`);
+    const details = boundedBackgroundDetails(`job_${"j".repeat(2_000)}`, params, targetIds);
+    expect(details.targets).toHaveLength(16);
+    expect(details.targetIds).toHaveLength(16);
+    expect(details.truncation).toMatchObject({ targets: 1, targetIds: 1, jobIdClipped: true, targetsClipped: 16, targetIdsClipped: 16 });
+    expect(JSON.stringify(details).length).toBeLessThan(50_000);
+  });
+
+  it("maps background reviewer failure and manager judgment", async () => {
+    const failureRegistry = new JobRegistry({ idFactory: () => "job_failure_bg" });
+    const failing: WaitReviewer = { review: async () => { throw new Error("review down"); } };
+    const failingTool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: failureRegistry, clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => failing });
+    await failingTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(failureRegistry.get("job_failure_bg")).toMatchObject({ status: "failed", error: { code: "REVIEWER_FAILED" } });
+    const managerRegistry = new JobRegistry({ idFactory: () => "job_manager_bg" });
+    const managerTool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: managerRegistry, clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => ({ review: async ({ targetId }) => ({ targetId, classification: "blocked", summary: "manual" }) }) });
+    await managerTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(managerRegistry.get("job_manager_bg")).toMatchObject({ status: "completed", outcome: "manager_judgment_required" });
   });
 });

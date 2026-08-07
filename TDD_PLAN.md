@@ -6,15 +6,16 @@ This plan is the tests-first contract for a new global extension at
 `/home/gabriel/.pi/agent/extensions/herdr-tools/`. `herdr-tools` is a standalone
 Git repository rooted at that directory; it is not a package inside the Courier
 repository and its commands, coverage configuration, and integration fixtures
-must resolve from this repository root. The extension registers **exactly six**
+must resolve from this repository root. The extension registers **exactly seven**
 tools:
 
 1. `herdr_inspect`
 2. `herdr_communicate`
 3. `herdr_wait`
-4. `herdr_launch`
-5. `herdr_pane`
-6. `herdr_tab`
+4. `herdr_jobs`
+5. `herdr_launch`
+6. `herdr_pane`
+7. `herdr_tab`
 
 `herdr_command`, `herdr_workspace`, and `herdr_admin` are deferred. They must not
 be registered, advertised, or called by this package. Do not edit
@@ -88,8 +89,8 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 
 | Criterion | Test name(s) | Expected mutation | Expected non-mutation |
 |---|---|---|---|
-| Register only inside Herdr | `registers_exactly_six_tools_when_herdr_env_is_1`; `registers_no_tools_and_makes_no_calls_when_herdr_env_is_not_1` | The Pi registry contains exactly the six named tools in enabled mode. | Disabled mode registers none of the six, invokes no CLI, and makes no UI call. |
-| Only the six core tools are in scope | `does_not_register_deferred_command_workspace_or_admin_tools` | None beyond the six registrations. | Registry and CLI trace contain no deferred tool or deferred operation. |
+| Register only inside Herdr | `registers_exactly_seven_tools_when_herdr_env_is_1`; `registers_no_tools_and_makes_no_calls_when_herdr_env_is_not_1` | The Pi registry contains exactly the seven named tools in enabled mode. | Disabled mode registers none of the seven, invokes no CLI, and makes no UI call. |
+| Only the seven core tools are in scope | `does_not_register_deferred_command_workspace_or_admin_tools` | None beyond the seven registrations. | Registry and CLI trace contain no deferred tool or deferred operation. |
 | All Herdr calls use `pi.exec` CLI | `uses_pi_exec_with_herdr_argv_not_shell_commands` | Fake `pi.exec` receives `command: "herdr"` and an argv array. | No shell string, `execSync`, raw socket, or direct process call is used. |
 | Every call receives the tool AbortSignal | `passes_the_same_abort_signal_to_every_cli_call`; `passes_abort_signal_to_reviewer` | Runner/reviewer observe the supplied signal. | No operation silently substitutes an unabortable signal. |
 | Use explicit returned IDs | `chains_mutations_using_returned_opaque_ids`; `never_constructs_ids_from_display_numbers` | Dependent reads/mutations target IDs returned by fixtures. | Predicted IDs, sidebar indexes, workspace suffixes, and stale IDs never appear in argv. |
@@ -425,7 +426,7 @@ uses the validated snapshot captured at its start.
 
 #### `registration.test.ts` and `cli-runner.test.ts`
 
-- `registers_exactly_six_tools_when_herdr_env_is_1`
+- `registers_exactly_seven_tools_when_herdr_env_is_1`
 - `registers_no_tools_and_makes_no_calls_when_herdr_env_is_not_1`
 - `does_not_register_deferred_command_workspace_or_admin_tools`
 - `uses_pi_exec_with_herdr_argv_not_shell_commands`
@@ -589,7 +590,7 @@ not turn an arbitrary string into a shell command.
 
 The close matrix is tested at the internal ownership-policy seam and through a
 synthetic explicit teardown invocation only. It is **not** exposed as a seventh
-tool, and none of the six public tools may invoke it automatically.
+tool, and none of the seven public tools may invoke it automatically.
 
 - `ownership_records_only_current_session_resources`
 - `ownership_is_not_persisted_in_session_entries`
@@ -648,7 +649,7 @@ refactor while all prior tests remain green.
    Add all settings tests above plus registration/disabled-mode tests. No tool
    implementation exists when the first tests are written. Verify no test
    command resolves files from the Courier repository.
-2. **Registration and runner contract.** Make the six registration tests green;
+2. **Registration and runner contract.** Make the seven registration tests green;
    add signal propagation, JSON/error decoding, no-shell, and cancellation tests.
 3. **Exact target resolution.** Add exact ID/current/unique-name resolution and
    fail-closed tests before any mutating tool is implemented.
@@ -718,7 +719,7 @@ ledger on `session_start` for reload, resume, new session, or session change. It
 must not use `pi.appendEntry`, a file, or an environment variable to preserve
 ownership.
 
-The current six-tool public surface has no automatic cleanup and no cleanup tool.
+The current seven-tool public surface has no automatic cleanup and no cleanup tool.
 An explicit internal ownership-policy test seam may be exercised by tests to prove
 that a wholly owned transitive tree could be closed without confirmation, while a
 mixed/unowned tree requires `ctx.ui.confirm` and a no-UI context fails closed. This
@@ -742,7 +743,7 @@ workspace.
    such as `pi-herdr-tools-it-<run-id>`.
 3. Parse every workspace/tab/pane ID from JSON responses. Assert the disposable
    workspace ID differs from `HERDR_WORKSPACE_ID`; never infer IDs.
-4. Load the extension in a Pi integration process with the six tools enabled.
+4. Load the extension in a Pi integration process with the seven tools enabled.
    Assert registration count and that no deferred tool appears.
 5. Exercise inspect health, compact collections, single-pane metadata/transcript,
    pane creation, tab creation, launch of a harmless supported kind, communicate,
@@ -808,7 +809,7 @@ evidence rather than omitting them:
 
 - **Pi global discovery and runtime registration — UNTESTABLE in unit tests:**
   launch Pi in print/JSON mode twice with `HERDR_ENV=1` and unset, inspect the
-  registered tool metadata, and record exactly six versus zero. Use a disposable
+  registered tool metadata, and record exactly seven versus zero. Use a disposable
   Pi process, not the current session.
 - **Installed Herdr CLI protocol/syntax — UNTESTABLE with static fixtures:**
   capture `herdr --help`/relevant group help and health output in the disposable
@@ -832,3 +833,18 @@ Any implementation choice that contradicts an acceptance invariant is an
 escalation, not a reason to rewrite this trace. The final implementation report
 must include TDD-plan deviations, architecture deviations, scope deviations,
 and concerns for the reviewer, as required by the source TDD skill.
+
+## Approved detached wait-job amendment
+
+The detached wait contract is now part of this plan. Add red/green coverage for
+strict `runInBackground`, preflight-before-ID, fresh-signal execution, frozen
+settings/target resolution, shared wait-runner outcome mapping, and unused
+initiating progress callbacks. Add registry tests for first-wins transitions,
+newest-first filtered pagination, uncapped starts, latest-progress replacement,
+immutable views, cancellation races, generation/shutdown staleness, and terminal
+retention. Add `herdr_jobs` tool tests for strict list/get/cancel input, structured
+`JOB_NOT_FOUND`, bounded output and renderers. Add runtime tests for exactly seven
+registrations, active-branch completion pushes and their `deliverAs`/`triggerTurn`
+options, manager-judgment priority, normal queue behavior, and cancellation or
+shutdown suppression. Integration remains opt-in and must record the exact
+blocker if unavailable; no test may weaken the 100% repository threshold.

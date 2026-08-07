@@ -47,7 +47,7 @@ function makeHarness(): Harness {
     }
     if (argv[0] === "tab" && argv[1] === "get") {
       const tab = snapshot.tabs.find((item) => item.tab_id === argv[2]);
-      return response("get", { tab: tab ?? null, environment: { SECRET: "do-not-leak" } });
+      return response("get", { tab: tab ? { ...tab, history: [{ env: { ARRAY_SECRET: "do-not-leak-array" } }] } : null, environment: { SECRET: "do-not-leak" } });
     }
     if (argv[0] === "tab" && argv[1] === "rename") {
       const tab = snapshot.tabs.find((item) => item.tab_id === argv[2]);
@@ -70,9 +70,9 @@ function makeHarness(): Harness {
   return { cli, calls, snapshot, confirm, ctx };
 }
 
-function execute(harness: Harness, params: Record<string, unknown>, overrides: Partial<ExtensionContext> = {}) {
+function execute(harness: Harness, params: Record<string, unknown>, overrides: Partial<ExtensionContext> = {}, signal: AbortSignal = new AbortController().signal) {
   const tool = createTabTool({ cli: harness.cli, context, cwd: "/cwd" });
-  return tool.execute("call", params as never, new AbortController().signal, undefined, { ...harness.ctx, ...overrides } as ExtensionContext);
+  return tool.execute("call", params as never, signal, undefined, { ...harness.ctx, ...overrides } as ExtensionContext);
 }
 
 afterEach(() => resetOwnership());
@@ -114,15 +114,16 @@ describe("herdr_tab", () => {
     const created = await execute(harness, { operation: "create", label: "owned" });
     await expect(execute(harness, { operation: "close", target: created.details.tabId as string }, { hasUI: false })).resolves.toMatchObject({ details: { tabId: "t3", removedIds: ["t3", "p3"] } });
     await expect(execute(harness, { operation: "close", target: "t2" })).resolves.toMatchObject({ details: { tabId: "t2" } });
-    expect(harness.confirm).toHaveBeenCalled();
+    expect(harness.confirm).not.toHaveBeenCalled();
   });
 
-  it("protects the caller tab, rejects no-UI unowned close, and does not echo response environment fields", async () => {
+  it("protects the caller tab and closes unowned tabs without UI", async () => {
     const harness = makeHarness();
     await expect(execute(harness, { operation: "close", target: "current" })).rejects.toMatchObject({ code: "PROTECTED_RESOURCE" });
-    await expect(execute(harness, { operation: "close", target: "t2" }, { hasUI: false })).rejects.toMatchObject({ code: "CONFIRMATION_UNAVAILABLE" });
     expect(harness.calls.some((call) => call[1] === "close")).toBe(false);
-    const result = await execute(harness, { operation: "rename", target: "t2", label: "safe" });
+    await expect(execute(harness, { operation: "close", target: "t2" }, { hasUI: false })).resolves.toMatchObject({ details: { tabId: "t2", outcome: "success", operationId: "close", removedIds: ["t2", "p2"], postState: { tabCount: 1 } } });
+    expect(harness.confirm).not.toHaveBeenCalled();
+    const result = await execute(harness, { operation: "rename", target: "t1", label: "safe" });
     expect(JSON.stringify(result)).not.toContain("do-not-leak");
   });
 
@@ -321,18 +322,48 @@ describe("herdr_tab", () => {
     expect(runtimeOwnership.snapshot()).toEqual([]);
   });
 
-  it("rejects confirmation declines and contradictory close post-state", async () => {
+  it("reconciles a lost tab close response from target absence", async () => {
     const harness = makeHarness();
-    harness.confirm.mockResolvedValueOnce(false);
-    await expect(execute(harness, { operation: "close", target: "t2" })).rejects.toMatchObject({ code: "CONFIRMATION_DECLINED" });
+    const original = harness.cli.runJson.bind(harness.cli);
+    harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "tab" && argv[1] === "close") {
+        harness.snapshot.tabs = harness.snapshot.tabs.filter((tab) => tab.tab_id !== "t2");
+        harness.snapshot.panes = harness.snapshot.panes.filter((pane) => pane.tab_id !== "t2");
+        throw Object.assign(new Error("response lost"), { code: "CLI_PROTOCOL_ERROR" });
+      }
+      return original(argv, signal, preserve);
+    });
+    const result = await execute(harness, { operation: "close", target: "t2" }, { hasUI: false });
+    expect(result.details).toMatchObject({ operation: "close", outcome: "reconciled", tabId: "t2", reconciliation: { targetAbsent: true, causality: "absence_proven_only", operationIdAvailable: false }, removedIds: ["t2", "p2"], postState: { tabCount: 1 } });
+    expect(result.details.operationId).toBeUndefined();
+  });
+
+  it("preserves a completed tab close when the initiating signal aborts", async () => {
+    const harness = makeHarness();
+    const controller = new AbortController();
+    const original = harness.cli.runJson.bind(harness.cli);
+    const signals: AbortSignal[] = [];
+    harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal, preserve) => {
+      signals.push(signal);
+      const result = await original(argv, signal, preserve);
+      if (argv[0] === "tab" && argv[1] === "close") controller.abort();
+      return result;
+    });
+    const result = await execute(harness, { operation: "close", target: "t2" }, {}, controller.signal);
+    expect(result.details).toMatchObject({ outcome: "success", operationId: "close", removedIds: ["t2", "p2"] });
+    expect(signals.at(-1)).not.toBe(controller.signal);
+  });
+
+  it("reports uncertainty when a tab close response leaves the target present", async () => {
+    const harness = makeHarness();
     const original = harness.cli;
     original.runJson = vi.fn<HerdrCli["runJson"]>(async (argv) => {
       if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } };
       if (argv[0] === "tab" && argv[1] === "close") return { id: "close", result: { ok: true } };
-      if (argv[0] === "tab" && argv[1] === "get") return { id: "get", result: { tab: harness.snapshot.tabs[1] } };
       return { id: "other", result: {} };
     });
-    await expect(execute(harness, { operation: "close", target: "t2" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    await expect(execute(harness, { operation: "close", target: "t2" })).rejects.toMatchObject({ code: "MUTATION_UNCERTAIN", details: { targetId: "t2" } });
+    expect(harness.confirm).not.toHaveBeenCalled();
   });
 
   it("fails closed when tab creation does not return an opaque ID and renders compact rows", async () => {

@@ -1,16 +1,21 @@
-import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
-import { closePolicy, runtimeOwnership, type CloseTopology, type RuntimeOwnership } from "../ownership.js";
+import { runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
+import { tabCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
+import { closeWithReadback } from "../mutations.js";
 import { assertSafeEnvironment, assertSafeIdentifier, TabParamsSchema, type TabParams } from "../topology-schema.js";
 import { parseSnapshotResult, type CurrentContext, type HerdrSnapshot, type TabRecord } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface TabDetails {
   operation: TabParams["operation"];
-  outcome: "success";
+  outcome: "success" | "reconciled";
   tabId?: string;
   workspaceId?: string;
   rootPaneId?: string;
+  operationId?: string;
+  mutationResult?: unknown;
+  reconciliation?: { targetAbsent: true; causality: "absence_proven_only"; operationIdAvailable: false };
   removedIds?: string[];
   postState?: unknown;
 }
@@ -124,45 +129,40 @@ function tabTarget(snapshotValue: HerdrSnapshot, ref: string, context: CurrentCo
   return tab;
 }
 
-function tabTopology(snapshotValue: HerdrSnapshot, context: CurrentContext): CloseTopology {
-  return {
-    caller: context,
-    nodes: [
-      ...snapshotValue.workspaces.map((workspace) => ({ kind: "workspace" as const, id: workspace.workspace_id })),
-      ...snapshotValue.tabs.map((tab) => ({ kind: "tab" as const, id: tab.tab_id, parentId: tab.workspace_id })),
-      ...snapshotValue.panes.map((pane) => ({ kind: "pane" as const, id: pane.pane_id, parentId: pane.tab_id }))
-    ]
-  };
-}
-
-function ids(snapshotValue: HerdrSnapshot): string[] {
-  return [
-    ...snapshotValue.workspaces.map((item) => item.workspace_id),
-    ...snapshotValue.tabs.map((item) => item.tab_id),
-    ...snapshotValue.panes.map((item) => item.pane_id)
-  ];
-}
-
 function envArgs(env: Record<string, string> | undefined): string[] {
   assertSafeEnvironment(env);
   return Object.entries(env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
 }
 
-async function closeTab(deps: TabDependencies, params: Extract<TabParams, { operation: "close" }>, signal: AbortSignal, ctx: ExtensionContext): Promise<TabDetails> {
+async function closeTab(deps: TabDependencies, params: Extract<TabParams, { operation: "close" }>, signal: AbortSignal): Promise<TabDetails> {
   const before = await snapshot(deps.cli, signal);
   const target = tabTarget(before, params.target, deps.context);
-  const policy = closePolicy({ topology: tabTopology(before, deps.context), target: { kind: "tab", id: target.tab_id, parentId: target.workspace_id }, hasUI: ctx.hasUI }, deps.ownership ?? runtimeOwnership);
-  if (policy.allowed === false && "requiresConfirmation" in policy && policy.requiresConfirmation) {
-    if (!await ctx.ui.confirm("Close Herdr tab", `Close tab ${target.tab_id} and its descendants?`)) throw Object.assign(new Error("Close confirmation was declined"), { code: "CONFIRMATION_DECLINED" });
-  } else if (policy.allowed === false) {
-    throw Object.assign(new Error(`${policy.code}: tab close is not permitted`), { code: policy.code, details: { resourceIds: policy.resourceIds } });
+  const validation = validateClose(tabCloseTopology(before, deps.context), { kind: "tab", id: target.tab_id, parentId: target.workspace_id });
+  if (!validation.allowed) {
+    throw Object.assign(new Error(`${validation.code}: tab close is not permitted`), { code: validation.code, details: { resourceIds: validation.resourceIds } });
   }
-  await deps.cli.runJson(["tab", "close", target.tab_id], signal);
-  const after = await snapshot(deps.cli, signal);
-  if (after.tabs.some((tab) => tab.tab_id === target.tab_id)) throw Object.assign(new Error("Closed tab remains in authoritative topology"), { code: "POSTSTATE_UNAVAILABLE" });
-  const afterIds = new Set(ids(after));
-  const removedIds = ids(before).filter((id) => !afterIds.has(id));
-  return { operation: "close", outcome: "success", tabId: target.tab_id, workspaceId: target.workspace_id, removedIds, postState: withoutEnvironment(after) };
+  const closed = await closeWithReadback({
+    cli: deps.cli,
+    argv: ["tab", "close", target.tab_id],
+    signal,
+    targetId: target.tab_id,
+    readback: (readbackSignal) => snapshot(deps.cli, readbackSignal),
+    targetPresent: (snapshotValue) => snapshotValue.tabs.some((tab) => tab.tab_id === target.tab_id),
+    summarize: topologySummary
+  });
+  const afterIds = new Set(snapshotIds(closed.readback));
+  const removedIds = snapshotIds(before).filter((id) => !afterIds.has(id));
+  return {
+    operation: "close",
+    outcome: closed.reconciled ? "reconciled" : "success",
+    tabId: target.tab_id,
+    workspaceId: target.workspace_id,
+    ...(closed.operationId ? { operationId: closed.operationId } : {}),
+    ...(closed.mutationResult === undefined ? {} : { mutationResult: closed.mutationResult }),
+    ...(closed.reconciled ? { reconciliation: { targetAbsent: true, causality: "absence_proven_only" as const, operationIdAvailable: false } } : {}),
+    removedIds,
+    postState: topologySummary(closed.readback)
+  };
 }
 
 export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabParamsSchema, TabDetails> {
@@ -170,6 +170,7 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
     name: "herdr_tab",
     label: "Herdr Tab",
     description: "Create and mutate Herdr tabs using stable tab IDs or the explicit current tab.",
+    executionMode: "sequential",
     parameters: TabParamsSchema,
     async execute(_id, rawParams, signal, _onUpdate, ctx) {
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
@@ -208,8 +209,8 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
         const postState = postStateTab((await deps.cli.runJson(["tab", "get", target.tab_id], activeSignal)).result, target.tab_id, target.workspace_id);
         return tabResult({ operation: "focus", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "focus", postState.tab_id);
       }
-      const details = await closeTab(deps, params, activeSignal, ctx);
-      return { content: [{ type: "text", text: formatResult({ operation: "tab", outcome: "success", targetId: details.tabId }) }], details };
+      const details = await closeTab(deps, params, activeSignal);
+      return { content: [{ type: "text", text: formatResult({ operation: "tab", outcome: details.outcome, targetId: details.tabId }) }], details };
     },
     renderCall(args, theme) {
       return textComponent(formatCall("herdr_tab", args.operation, "target" in args ? args.target : undefined), theme, "accent");

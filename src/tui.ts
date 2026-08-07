@@ -2,7 +2,7 @@ import { Text, type Component } from "@earendil-works/pi-tui";
 
 export interface CompactResult {
   operation: string;
-  outcome: "success" | "error" | "timeout" | "aborted" | "partial";
+  outcome: "success" | "reconciled" | "error" | "timeout" | "aborted" | "partial";
   targetId?: string;
   code?: string;
   postState?: { agent_status?: string };

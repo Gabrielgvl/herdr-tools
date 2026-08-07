@@ -1,16 +1,21 @@
-import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
-import { closePolicy, recordCreatedResource, runtimeOwnership, type CloseTopology, type RuntimeOwnership } from "../ownership.js";
+import { recordCreatedResource, runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
+import { paneCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
+import { closeWithReadback } from "../mutations.js";
 import { assertSafeEnvironment, assertSafeIdentifier, PaneParamsSchema, type PaneParams } from "../topology-schema.js";
 import { parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot, type PaneRecord, type ResolvedTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface PaneDetails {
   operation: PaneParams["operation"];
-  outcome: "success";
+  outcome: "success" | "reconciled";
   paneId?: string;
   tabId?: string;
   workspaceId?: string;
+  operationId?: string;
+  mutationResult?: unknown;
+  reconciliation?: { targetAbsent: true; causality: "absence_proven_only"; operationIdAvailable: false };
   removedIds?: string[];
   containingContext?: { tabId?: string; workspaceId?: string };
   postState?: unknown;
@@ -104,29 +109,6 @@ function stateTarget(snapshot: HerdrSnapshot, ref: string | undefined, context: 
   return resolvePaneRef(snapshot, ref ?? "current", context);
 }
 
-function paneTopology(snapshot: HerdrSnapshot, context: CurrentContext): CloseTopology {
-  return {
-    caller: context,
-    nodes: [
-      ...snapshot.workspaces.map((workspace) => ({ kind: "workspace" as const, id: workspace.workspace_id })),
-      ...snapshot.tabs.map((tab) => ({ kind: "tab" as const, id: tab.tab_id, parentId: tab.workspace_id })),
-      ...snapshot.panes.map((pane) => ({
-        kind: "pane" as const,
-        id: pane.pane_id,
-        parentId: typeof pane.parent_id === "string" ? pane.parent_id : pane.tab_id
-      }))
-    ]
-  };
-}
-
-function allSnapshotIds(snapshot: HerdrSnapshot): string[] {
-  return [
-    ...snapshot.workspaces.map((item) => item.workspace_id),
-    ...snapshot.tabs.map((item) => item.tab_id),
-    ...snapshot.panes.map((item) => item.pane_id)
-  ];
-}
-
 function envArgs(env: Record<string, string> | undefined): string[] {
   assertSafeEnvironment(env);
   return Object.entries(env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
@@ -174,22 +156,37 @@ async function focusExactPane(cli: HerdrCli, target: ResolvedTarget, signal: Abo
   throw Object.assign(new Error("Herdr could not reach the exact pane through authoritative layout"), { code: "CLI_PROTOCOL_ERROR" });
 }
 
-async function closePane(deps: PaneDependencies, params: Extract<PaneParams, { operation: "close" }>, signal: AbortSignal, ctx: ExtensionContext): Promise<PaneDetails> {
+async function closePane(deps: PaneDependencies, params: Extract<PaneParams, { operation: "close" }>, signal: AbortSignal): Promise<PaneDetails> {
   const before = await readSnapshot(deps.cli, signal);
   const target = stateTarget(before, params.target, deps.context);
-  const ownership = deps.ownership ?? runtimeOwnership;
-  const policy = closePolicy({ topology: paneTopology(before, deps.context), target: { kind: "pane", id: target.id, parentId: target.tabId }, hasUI: ctx.hasUI }, ownership);
-  if (policy.allowed === false && "requiresConfirmation" in policy && policy.requiresConfirmation) {
-    if (!await ctx.ui.confirm("Close Herdr pane", `Close pane ${target.id} and its descendants?`)) throw Object.assign(new Error("Close confirmation was declined"), { code: "CONFIRMATION_DECLINED" });
-  } else if (policy.allowed === false) {
-    throw Object.assign(new Error(`${policy.code}: pane close is not permitted`), { code: policy.code, details: { resourceIds: policy.resourceIds } });
+  const validation = validateClose(paneCloseTopology(before, deps.context), { kind: "pane", id: target.id, parentId: target.tabId });
+  if (!validation.allowed) {
+    throw Object.assign(new Error(`${validation.code}: pane close is not permitted`), { code: validation.code, details: { resourceIds: validation.resourceIds } });
   }
-  await deps.cli.runJson(["pane", "close", target.id], signal);
-  const after = await readSnapshot(deps.cli, signal);
-  if (after.panes.some((pane) => pane.pane_id === target.id)) throw Object.assign(new Error("Closed pane remains in authoritative topology"), { code: "POSTSTATE_UNAVAILABLE" });
-  const afterIds = new Set(allSnapshotIds(after));
-  const removed = allSnapshotIds(before).filter((id) => !afterIds.has(id));
-  return { operation: "close", outcome: "success", paneId: target.id, tabId: target.tabId, workspaceId: target.workspaceId, removedIds: removed, containingContext: { tabId: target.tabId, workspaceId: target.workspaceId }, postState: withoutEnvironment(after) };
+  const closed = await closeWithReadback({
+    cli: deps.cli,
+    argv: ["pane", "close", target.id],
+    signal,
+    targetId: target.id,
+    readback: (readbackSignal) => readSnapshot(deps.cli, readbackSignal),
+    targetPresent: (snapshot) => snapshot.panes.some((pane) => pane.pane_id === target.id),
+    summarize: topologySummary
+  });
+  const afterIds = new Set(snapshotIds(closed.readback));
+  const removed = snapshotIds(before).filter((id) => !afterIds.has(id));
+  return {
+    operation: "close",
+    outcome: closed.reconciled ? "reconciled" : "success",
+    paneId: target.id,
+    tabId: target.tabId,
+    workspaceId: target.workspaceId,
+    ...(closed.operationId ? { operationId: closed.operationId } : {}),
+    ...(closed.mutationResult === undefined ? {} : { mutationResult: closed.mutationResult }),
+    ...(closed.reconciled ? { reconciliation: { targetAbsent: true, causality: "absence_proven_only" as const, operationIdAvailable: false } } : {}),
+    removedIds: removed,
+    containingContext: { tabId: target.tabId, workspaceId: target.workspaceId },
+    postState: topologySummary(closed.readback)
+  };
 }
 
 export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof PaneParamsSchema, PaneDetails> {
@@ -197,6 +194,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
     name: "herdr_pane",
     label: "Herdr Pane",
     description: "Inspect and mutate exact Herdr pane topology through explicit stable targets.",
+    executionMode: "sequential",
     parameters: PaneParamsSchema,
     async execute(_id, rawParams, signal, _onUpdate, ctx) {
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
@@ -282,8 +280,8 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         const postState = await readPane(deps.cli, target.id, activeSignal);
         return result({ operation: "zoom", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "zoom", postState.pane_id);
       }
-      const details = await closePane(deps, params, activeSignal, ctx);
-      return { content: [{ type: "text", text: formatResult({ operation: "pane", outcome: "success", targetId: details.paneId }) }], details };
+      const details = await closePane(deps, params, activeSignal);
+      return { content: [{ type: "text", text: formatResult({ operation: "pane", outcome: details.outcome, targetId: details.paneId }) }], details };
     },
     renderCall(args, theme) {
       return textComponent(formatCall("herdr_pane", args.operation, "target" in args ? args.target : "source" in args ? args.source : undefined), theme, "accent");

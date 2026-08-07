@@ -52,7 +52,7 @@ function makeHarness(): Harness {
     }
     if (argv[0] === "pane" && argv[1] === "get") {
       const pane = snapshot.panes.find((item) => item.pane_id === argv[2]);
-      return response("get", { pane: pane ? { ...pane, environment: { SECRET: "do-not-leak" }, environment_overrides: { SNAKE_SECRET: "do-not-leak-snake" } } : null });
+      return response("get", { pane: pane ? { ...pane, environment: { SECRET: "do-not-leak" }, environment_overrides: { SNAKE_SECRET: "do-not-leak-snake" }, history: [{ env: { ARRAY_SECRET: "do-not-leak-array" } }] } : null });
     }
     if (argv[0] === "pane" && argv[1] === "layout") {
       return response("layout", { layout: { tab_id: "t1", focused_pane_id: focusedPaneId, panes: [
@@ -88,9 +88,9 @@ function makeHarness(): Harness {
   return { cli, calls, snapshot, confirm, ctx };
 }
 
-function execute(harness: Harness, params: Record<string, unknown>, overrides: Partial<ExtensionContext> = {}) {
+function execute(harness: Harness, params: Record<string, unknown>, overrides: Partial<ExtensionContext> = {}, signal: AbortSignal = new AbortController().signal) {
   const tool = createPaneTool({ cli: harness.cli, context, cwd: "/cwd" });
-  return tool.execute("call", params as never, new AbortController().signal, undefined, { ...harness.ctx, ...overrides } as ExtensionContext);
+  return tool.execute("call", params as never, signal, undefined, { ...harness.ctx, ...overrides } as ExtensionContext);
 }
 
 afterEach(() => resetOwnership());
@@ -149,16 +149,14 @@ describe("herdr_pane", () => {
     expect(harness.calls.filter((call) => call[1] === "layout").length).toBeGreaterThan(0);
   });
 
-  it("creates and closes only owned non-caller panes, confirms mixed/unowned panes, and fails closed without UI", async () => {
+  it("closes owned and unowned exact non-caller panes autonomously without UI", async () => {
     const harness = makeHarness();
     const created = await execute(harness, { operation: "split", label: "owned" });
     const ownedId = created.details.paneId as string;
     expect(runtimeOwnership.has({ kind: "pane", id: ownedId })).toBe(true);
-    await expect(execute(harness, { operation: "close", target: ownedId }, { hasUI: false })).resolves.toMatchObject({ details: { operation: "close", removedIds: [ownedId] } });
-    await expect(execute(harness, { operation: "close", target: "p2" }, { hasUI: false })).rejects.toMatchObject({ code: "CONFIRMATION_UNAVAILABLE" });
-    expect(harness.calls.some((call) => call[1] === "close" && call[2] === "p2")).toBe(false);
-    await expect(execute(harness, { operation: "close", target: "p2" })).resolves.toMatchObject({ details: { operation: "close", paneId: "p2" } });
-    expect(harness.confirm).toHaveBeenCalled();
+    await expect(execute(harness, { operation: "close", target: ownedId }, { hasUI: false })).resolves.toMatchObject({ details: { operation: "close", outcome: "success", removedIds: [ownedId], operationId: "close", postState: { paneCount: 2 } } });
+    await expect(execute(harness, { operation: "close", target: "p2" }, { hasUI: false })).resolves.toMatchObject({ details: { operation: "close", paneId: "p2", outcome: "success", operationId: "close" } });
+    expect(harness.confirm).not.toHaveBeenCalled();
   });
 
   it("uses all authoritative split response shapes and explicit topology variants", async () => {
@@ -307,17 +305,46 @@ describe("herdr_pane", () => {
     await focusCase([{ pane_id: "p1", rect: { x: 0, y: 0, width: 10, height: 10 } }, { pane_id: "p2", rect: { x: 5, y: 5, width: 10, height: 10 } }], false, true);
   });
 
-  it("rejects declined confirmation and contradictory close post-state", async () => {
-    const declined = makeHarness();
-    declined.confirm.mockResolvedValueOnce(false);
-    await expect(execute(declined, { operation: "close", target: "p2" })).rejects.toMatchObject({ code: "CONFIRMATION_DECLINED" });
+  it("reconciles a lost close response from target absence", async () => {
+    const harness = makeHarness();
+    const original = harness.cli.runJson.bind(harness.cli);
+    harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "pane" && argv[1] === "close") {
+        harness.snapshot.panes = harness.snapshot.panes.filter((pane) => pane.pane_id !== "p2");
+        throw Object.assign(new Error("response lost"), { code: "CLI_PROTOCOL_ERROR" });
+      }
+      return original(argv, signal, preserve);
+    });
+    const result = await execute(harness, { operation: "close", target: "p2" }, { hasUI: false });
+    expect(result.details).toMatchObject({ operation: "close", outcome: "reconciled", paneId: "p2", reconciliation: { targetAbsent: true, causality: "absence_proven_only", operationIdAvailable: false }, removedIds: ["p2"], postState: { paneCount: 1 } });
+    expect(result.details.operationId).toBeUndefined();
+  });
+
+  it("preserves a completed close when the initiating signal aborts", async () => {
+    const harness = makeHarness();
+    const controller = new AbortController();
+    const original = harness.cli.runJson.bind(harness.cli);
+    const signals: AbortSignal[] = [];
+    harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal, preserve) => {
+      signals.push(signal);
+      const result = await original(argv, signal, preserve);
+      if (argv[0] === "pane" && argv[1] === "close") controller.abort();
+      return result;
+    });
+    const result = await execute(harness, { operation: "close", target: "p2" }, {}, controller.signal);
+    expect(result.details).toMatchObject({ outcome: "success", operationId: "close", removedIds: ["p2"] });
+    expect(signals.at(-1)).not.toBe(controller.signal);
+  });
+
+  it("does not use confirmation and reports uncertainty when target remains", async () => {
     const contradictory = makeHarness();
     const base = contradictory.cli.runJson.bind(contradictory.cli);
     contradictory.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
       if (argv[0] === "pane" && argv[1] === "close") return { id: "close", result: {} };
       return base(argv, signal);
     });
-    await expect(execute(contradictory, { operation: "close", target: "p2" })).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    await expect(execute(contradictory, { operation: "close", target: "p2" })).rejects.toMatchObject({ code: "MUTATION_UNCERTAIN", details: { targetId: "p2", readback: { status: "target_present" } } });
+    expect(contradictory.confirm).not.toHaveBeenCalled();
   });
 
   it("protects the caller pane from close and fails closed on malformed create responses", async () => {
@@ -342,7 +369,7 @@ describe("herdr_pane", () => {
     await expect(createPaneTool({ cli: direct.cli, context }).execute("id", { operation: "rename", target: "p2", label: "direct" } as never, undefined, undefined, direct.ctx)).resolves.toMatchObject({ details: { paneId: "p2" } });
     await expect(createPaneTool({ cli: direct.cli, context }).execute("id", { operation: "focus", target: "p2" } as never, undefined, undefined, direct.ctx)).resolves.toMatchObject({ details: { paneId: "p2" } });
     direct.snapshot.panes[1]!.parent_id = "p2-parent";
-    await expect(execute(direct, { operation: "close", target: "p2" })).resolves.toMatchObject({ details: { operation: "close" } });
+    await expect(execute(direct, { operation: "close", target: "p2" })).rejects.toMatchObject({ code: "TOPOLOGY_INVALID" });
 
   });
 

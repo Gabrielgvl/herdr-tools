@@ -57,7 +57,9 @@ function collectAffected(topology: CloseTopology, target: CloseResource): { reso
   }
   for (const node of nodes.values()) {
     if (node.parentId && ![...nodes.values()].some((candidate) => candidate.id === node.parentId || key(candidate) === node.parentId)) malformed = true;
-    if ((node.children ?? []).some((childId) => ![...nodes.values()].some((candidate) => candidate.id === childId))) malformed = true;
+    const children = node.children ?? [];
+    if (new Set(children).size !== children.length) malformed = true;
+    if (children.some((childId) => ![...nodes.values()].some((candidate) => candidate.id === childId))) malformed = true;
   }
   const root = nodes.get(key(target)) ?? { ...target };
   const resources: CloseResource[] = [];

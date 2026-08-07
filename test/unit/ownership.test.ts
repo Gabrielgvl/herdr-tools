@@ -74,7 +74,7 @@ describe("autonomous close validation", () => {
       ]
     };
     expect(validateClose(topology, { kind: "tab", id: "target", parentId: "w1" })).toMatchObject({ allowed: false, code: "TOPOLOGY_INVALID" });
-    const completeTopology = { ...topology, nodes: topology.nodes.map((node) => node.id === "target" && node.kind === "tab" ? { ...node, children: ["p-child", "p-child", "p-explicit"] } : node) };
+    const completeTopology = { ...topology, nodes: topology.nodes.map((node) => node.id === "target" && node.kind === "tab" ? { ...node, children: ["p-child", "p-explicit"] } : node) };
     expect(validateClose(completeTopology, { kind: "tab", id: "target", parentId: "w1" })).toEqual({ allowed: true, resourceIds: ["target", "p-child", "p-explicit"] });
   });
 

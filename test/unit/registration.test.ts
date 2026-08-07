@@ -1,5 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const readFileMock = vi.hoisted(() => vi.fn());
+vi.mock("node:fs/promises", () => ({ readFile: readFileMock }));
+
 import extension, { CORE_TOOL_NAMES, createRuntime, readInjectedContext } from "../../index.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
 
@@ -9,6 +13,8 @@ const original = {
   tab: process.env.HERDR_TAB_ID,
   pane: process.env.HERDR_PANE_ID,
 };
+
+beforeEach(() => readFileMock.mockReset());
 
 afterEach(() => {
   for (const [key, value] of Object.entries({ HERDR_ENV: original.env, HERDR_WORKSPACE_ID: original.workspace, HERDR_TAB_ID: original.tab, HERDR_PANE_ID: original.pane })) {
@@ -85,6 +91,8 @@ describe("global extension registration", () => {
     expect(runtime.idsPresent).toBe(true);
     expect(runtime.idsValid).toBe(true);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    expect(runtime.settings.load).toBeTypeOf("function");
+    readFileMock.mockRejectedValueOnce(Object.assign(new Error("missing"), { code: "ENOENT" }));
     await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "low" });
   });
 

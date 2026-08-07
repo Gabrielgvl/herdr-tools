@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const readFileMock = vi.hoisted(() => vi.fn());
+vi.mock("node:fs/promises", () => ({ readFile: readFileMock }));
+
 import { DEFAULT_SETTINGS, SettingsError, loadSettings, type SettingsFile } from "../../src/settings.js";
 
 function fsWith(value: string | undefined) {
@@ -14,6 +18,8 @@ function fsWith(value: string | undefined) {
 }
 
 describe("extension-owned settings", () => {
+  beforeEach(() => readFileMock.mockReset());
+
   it("uses defaults when the extension-owned config is absent", async () => {
     const fake = fsWith(undefined);
     await expect(loadSettings({ readFile: fake.readFile })).resolves.toEqual(DEFAULT_SETTINGS);
@@ -21,7 +27,9 @@ describe("extension-owned settings", () => {
   });
 
   it("uses the default filesystem seam when the extension config is absent", async () => {
+    readFileMock.mockRejectedValueOnce(Object.assign(new Error("missing"), { code: "ENOENT" }));
     await expect(loadSettings()).resolves.toEqual(DEFAULT_SETTINGS);
+    expect(readFileMock).toHaveBeenCalledWith("/home/gabriel/.pi/agent/extensions/herdr-tools/config.json", "utf8");
   });
 
   it("loads only the documented extension-owned shape without coercion", async () => {

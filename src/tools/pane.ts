@@ -228,7 +228,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
           argv = [...argv, "--tab", tab.id, "--split", params.direction ?? "right"];
         } else {
           assertSafeIdentifier(destination.label, "destination.label");
-          argv = [...argv, "--new-tab", "--workspace", deps.context.workspaceId!, "--tab-label", destination.label];
+          argv = [...argv, "--new-tab", "--workspace", deps.context.workspaceId!, "--label", destination.label];
         }
         argv = [...argv, ...(params.focus ? ["--focus"] : ["--no-focus"] )];
         const moved = await deps.cli.runJson(argv, activeSignal);

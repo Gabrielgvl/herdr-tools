@@ -70,7 +70,7 @@ function makeHarness(): Harness {
       if (pane && tabIndex >= 0) pane.tab_id = argv[tabIndex + 1];
       const result: Record<string, unknown> = { pane: { pane_id: argv[2] } };
       if (argv.includes("--new-tab")) {
-        snapshot.tabs.push({ tab_id: "t-new", workspace_id: "w1", label: argv[argv.indexOf("--tab-label") + 1] });
+        snapshot.tabs.push({ tab_id: "t-new", workspace_id: "w1", label: argv[argv.indexOf("--label") + 1] });
         if (pane) pane.tab_id = "t-new";
         result.tab = { tab_id: "t-new" };
       }
@@ -190,7 +190,7 @@ describe("herdr_pane", () => {
     await expect(execute(harness, { operation: "move", target: "agent-only", destination: { kind: "new_tab", label: "moved" } })).resolves.toMatchObject({ details: { operation: "move", paneId: "p2", tabId: "t-new" } });
     expect(runtimeOwnership.has({ kind: "tab", id: "t-new" })).toBe(true);
     await expect(execute(harness, { operation: "move", target: "p2", destination: { kind: "tab", target: "current" } })).resolves.toMatchObject({ details: { operation: "move", paneId: "p2", tabId: "t1" } });
-    expect(harness.calls).toContainEqual(["pane", "move", "p2", "--new-tab", "--workspace", "w1", "--tab-label", "moved", "--no-focus"]);
+    expect(harness.calls).toContainEqual(["pane", "move", "p2", "--new-tab", "--workspace", "w1", "--label", "moved", "--no-focus"]);
     const transferred = makeHarness();
     runtimeOwnership.record({ kind: "pane", id: "p2", parentId: "t1" });
     const base = transferred.cli.runJson.bind(transferred.cli);
@@ -227,7 +227,7 @@ describe("herdr_pane", () => {
     await expect(execute(harness, { operation: "move", target: "p-cross", destination: { kind: "new_tab", label: "moved" } })).resolves.toMatchObject({
       details: { paneId: "p-cross", tabId: "t-new-cross", workspaceId: "w1" }
     });
-    expect(harness.calls).toContainEqual(["pane", "move", "p-cross", "--new-tab", "--workspace", "w1", "--tab-label", "moved", "--no-focus"]);
+    expect(harness.calls).toContainEqual(["pane", "move", "p-cross", "--new-tab", "--workspace", "w1", "--label", "moved", "--no-focus"]);
   });
 
   it("covers authoritative parser failures and every focus direction", async () => {

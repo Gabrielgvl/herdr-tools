@@ -371,9 +371,9 @@ describe("herdr_wait", () => {
       },
       async runText() { return ""; }
     };
-    await expect(execute(rejected, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    await expect(execute(rejected, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const stringRejected: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: snapshot }; throw "backend down"; }, async runText() { return ""; } };
-    await expect(execute(stringRejected, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    await expect(execute(stringRejected, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
   });
 
   it("preserves read failures as truthful structured errors", async () => {
@@ -384,7 +384,7 @@ describe("herdr_wait", () => {
       },
       async runText() { return ""; }
     };
-    await expect(execute(paneFallback, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    await expect(execute(paneFallback, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const malformed: WaitCli = {
       async runJson(argv) {
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
@@ -392,7 +392,7 @@ describe("herdr_wait", () => {
       },
       async runText() { return ""; }
     };
-    await expect(execute(malformed, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    await expect(execute(malformed, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const rejected: WaitCli = {
       async runJson(argv) {
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
@@ -400,7 +400,7 @@ describe("herdr_wait", () => {
       },
       async runText() { return ""; }
     };
-    await expect(execute(rejected, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    await expect(execute(rejected, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const aborted: WaitCli = {
       async runJson(argv) {
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
@@ -408,8 +408,8 @@ describe("herdr_wait", () => {
       },
       async runText() { return ""; }
     };
-    await expect(execute(aborted, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "ABORTED" });
-    const throwingSettings = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 });
+    await expect(execute(aborted, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "ABORTED" });
+    const throwingSettings = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() });
     expect(throwingSettings.details.outcome).toBe("success");
   });
 

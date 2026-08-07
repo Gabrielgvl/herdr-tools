@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const readFileMock = vi.hoisted(() => vi.fn());
 vi.mock("node:fs/promises", () => ({ readFile: readFileMock }));
 
-import extension, { CORE_TOOL_NAMES, createRuntime, readInjectedContext } from "../../index.js";
+import extension, { CORE_TOOL_NAMES, createRuntime, notificationForJob, readInjectedContext } from "../../index.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
 
 const original = {
@@ -29,6 +29,7 @@ function fakePi() {
   const handlers: Array<{ event: string; handler: (...args: never[]) => unknown }> = [];
   const pi = {
     exec: vi.fn(),
+    sendMessage: vi.fn(),
     registerTool: vi.fn((tool: unknown) => tools.push(tool)),
     on: vi.fn((event: string, handler: (...args: never[]) => unknown) => handlers.push({ event, handler })),
   } as unknown as ExtensionAPI;
@@ -58,11 +59,12 @@ describe("global extension registration", () => {
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 
-  it("registers exactly the six core tools and no deferred aliases", () => {
+  it("registers exactly the seven core tools and no deferred aliases", () => {
     enable();
     const { pi, tools, handlers } = fakePi();
     extension(pi);
     expect(tools.map((tool) => (tool as { name: string }).name)).toEqual([...CORE_TOOL_NAMES]);
+    expect(tools).toHaveLength(7);
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_command");
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_workspace");
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_admin");
@@ -78,7 +80,7 @@ describe("global extension registration", () => {
     expect(readInjectedContext()).toMatchObject({ idsPresent: false, idsValid: false, context: {} });
     const { pi, tools } = fakePi();
     extension(pi);
-    expect(tools).toHaveLength(6);
+    expect(tools).toHaveLength(7);
   });
 
   it("constructs production runtime dependencies without reading settings or calling Herdr", async () => {
@@ -94,6 +96,47 @@ describe("global extension registration", () => {
     expect(runtime.settings.load).toBeTypeOf("function");
     readFileMock.mockRejectedValueOnce(Object.assign(new Error("missing"), { code: "ENOENT" }));
     await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "low" });
+  });
+
+  it("pushes bounded terminal notifications with queue and priority semantics", async () => {
+    const detail = {
+      jobId: "job_notify",
+      status: "completed" as const,
+      sequence: 1,
+      createdAtMs: 0,
+      finishedAtMs: 1,
+      request: { targets: ["worker\\n<untrusted>"], targetIds: ["p1"], match: "any" as const, condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const } },
+      outcome: "manager_judgment_required" as const,
+      result: { outcome: "manager_judgment_required" as const, matched: false, reason: "manager_judgment_required", reviewerSummaries: [{ target: "worker", targetId: "p1", classification: "blocked", summary: "review\nsummary" }] }
+    };
+    const notification = notificationForJob(detail);
+    expect(notification.content).toContain("HIGH PRIORITY: MANAGER JUDGMENT REQUIRED");
+    expect(notification.content).not.toContain("review\nsummary");
+    expect(notification.details).toMatchObject({ priority: "high", jobId: "job_notify" });
+    enable();
+    const { pi } = fakePi();
+    const runtime = createRuntime(pi, process.env);
+    const handle = runtime.jobs.register({ ...detail.request, condition: { kind: "state", state: "done" } }, async () => ({ outcome: "success", matched: true, reason: "condition_met" }));
+    await handle.promise;
+    expect((pi.sendMessage as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(expect.objectContaining({ customType: "herdr-wait-job", display: true }), { deliverAs: "steer", triggerTurn: true });
+    const sentContent = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]?.content as string;
+    expect(sentContent).toContain("outcome=success");
+  });
+
+  it("suppresses notification for explicit cancel and shutdown", async () => {
+    enable();
+    const { pi } = fakePi();
+    const runtime = createRuntime(pi, process.env);
+    const pending = new Promise<never>(() => undefined);
+    const handle = runtime.jobs.register({ targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } }, async () => pending);
+    runtime.jobs.cancel(handle.jobId);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect((pi.sendMessage as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    const second = runtime.jobs.register({ targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } }, async () => pending);
+    runtime.jobs.shutdown();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(runtime.jobs.get(second.jobId)).toBeUndefined();
+    expect((pi.sendMessage as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 
   it("resets only in-memory ownership on every session transition", async () => {

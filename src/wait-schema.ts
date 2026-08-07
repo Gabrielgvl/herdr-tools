@@ -32,7 +32,8 @@ export const WaitParamsSchema = Type.Object({
   targets: Type.Array(WaitTargetSchema, { minItems: 1, uniqueItems: true }),
   match: StringEnum(["any", "all"] as const),
   condition: Type.Union([WaitStateConditionSchema, WaitOutputConditionSchema]),
-  timeoutMs: Type.Integer({ minimum: 1, maximum: 3_600_000 })
+  timeoutMs: Type.Integer({ minimum: 1, maximum: 3_600_000 }),
+  runInBackground: Type.Optional(Type.Boolean())
 }, { additionalProperties: false });
 
 export type WaitRawState = Static<typeof RawStateSchema>;
@@ -49,6 +50,10 @@ export interface WaitValidation {
   regex?: SafeRegex;
 }
 
+export interface WaitRequest extends WaitParams {
+  runInBackground?: boolean;
+}
+
 function invalid(message: string): never {
   throw Object.assign(new Error(message), { code: "INVALID_INPUT" });
 }
@@ -62,8 +67,9 @@ export function validateWaitParams(value: unknown): WaitValidation {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalid("INVALID_INPUT: wait input must be an object");
   const params = value as Partial<WaitParams>;
   const topLevelKeys = Object.keys(value as object);
-  if (topLevelKeys.some((key) => !["targets", "match", "condition", "timeoutMs"].includes(key))) invalid("INVALID_INPUT: unknown wait fields are not allowed");
+  if (topLevelKeys.some((key) => !["targets", "match", "condition", "timeoutMs", "runInBackground"].includes(key))) invalid("INVALID_INPUT: unknown wait fields are not allowed");
   if (!Array.isArray(params.targets) || params.targets.length === 0) invalid("INVALID_INPUT: targets must contain at least one target");
+  if (params.runInBackground !== undefined && typeof params.runInBackground !== "boolean") invalid("INVALID_INPUT: runInBackground must be a boolean");
   if (params.targets.some((target) => typeof target !== "string" || target.length === 0 || target.includes(String.fromCharCode(0)) || target.includes("\r") || target.includes("\n"))) invalid("INVALID_INPUT: targets must be non-empty single-line identifiers");
   if (new Set(params.targets).size !== params.targets.length) invalid("INVALID_INPUT: duplicate target references are not allowed");
   if (params.match !== "any" && params.match !== "all") invalid("INVALID_INPUT: match must be any or all");

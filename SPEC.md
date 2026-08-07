@@ -555,7 +555,7 @@ All of the following must pass before implementation is considered complete:
 
 The feature is complete only when all of the following are true:
 
-- A Pi process outside Herdr exposes none of the six tools.
+- A Pi process outside Herdr exposes none of the seven tools.
 - A Pi process inside Herdr exposes exactly the six named core tools and no deferred tool.
 - Every target operation uses an exact stable ID/current context, exact pane label, or unique agent name and fails closed otherwise.
 - Inspection has the specified current, single-target, collection, and health behavior.

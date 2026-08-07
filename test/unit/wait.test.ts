@@ -1,7 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ReviewerFailure, type WaitReviewer } from "../../src/reviewer.js";
 import { WaitError, createWaitTool, deltaLines, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, realClock, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
+import { JobRegistry } from "../../src/job-registry.js";
 
 const snapshot = {
   type: "session_snapshot",
@@ -457,5 +458,72 @@ describe("herdr_wait", () => {
     const pending: WaitClock = { now: () => 0, sleep: async (_ms, signal) => { signal.addEventListener("abort", () => undefined); controller.abort(); throw Object.assign(new Error("cancel"), { code: "ABORTED" }); } };
     const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, clock: pending });
     await expect(tool.execute("id", { targets: ["p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 } as never, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+  });
+
+  it("preflights background waits before creating an ID and rejects stale sessions", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_preflight" });
+    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
+    await expect(tool.execute("id", { targets: ["missing"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "TARGET_NOT_FOUND" });
+    expect(registry.size()).toBe(0);
+    const staleGeneration = registry.captureGeneration();
+    const staleTool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => { registry.beginSession(); return settings; }, jobRegistry: registry });
+    await expect(staleTool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "SESSION_REPLACED" });
+    expect(registry.isCurrent(staleGeneration)).toBe(false);
+    const invalid = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: registry });
+    await expect(invalid.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, snake_case: true, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(registry.size()).toBe(0);
+  });
+
+  it("runs background waits on a fresh signal without the initiating update callback", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_background" });
+    const entered: AbortSignal[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const cli: WaitCli = {
+      async runJson(argv, signal) {
+        entered.push(signal);
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        await gate;
+        return { id: "pane", result: { pane: snapshot.snapshot.panes[0] } };
+      },
+      async runText(_argv, signal) { entered.push(signal); await gate; return "done"; }
+    };
+    const initiating = new AbortController();
+    const updates = vi.fn(() => { throw new Error("initiating update used"); });
+    const tool = createWaitTool({ cli, context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
+    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 100, runInBackground: true } as never, initiating.signal, updates, extensionContext);
+    expect(started.details).toMatchObject({ outcome: "background", jobId: "job_background" });
+    initiating.abort();
+    release();
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(registry.get("job_background")).toMatchObject({ status: "completed", outcome: "success" });
+    expect(updates).not.toHaveBeenCalled();
+    expect(entered.length).toBeGreaterThan(0);
+    expect(entered.slice(1).every((signal) => signal !== initiating.signal)).toBe(true);
+  });
+
+  it.each([
+    ["success", "done", { kind: "state", state: "completed" }, "success"],
+    ["timeout", "working", { kind: "state", state: "done" }, "timeout"]
+  ] as const)("maps background %s outcomes", async (_name, output, condition, expected) => {
+    const registry = new JobRegistry({ idFactory: () => `job_${expected}` });
+    const tool = createWaitTool({ cli: fakeCli({ p1: output }), context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock(), pollIntervalMs: 1 });
+    await tool.execute("id", { targets: ["p1"], match: "any", condition, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(registry.get(`job_${expected}`)).toMatchObject({ status: "completed", outcome: expected });
+  });
+
+  it("maps background reviewer failure and manager judgment", async () => {
+    const failureRegistry = new JobRegistry({ idFactory: () => "job_failure_bg" });
+    const failing: WaitReviewer = { review: async () => { throw new Error("review down"); } };
+    const failingTool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: failureRegistry, clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => failing });
+    await failingTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(failureRegistry.get("job_failure_bg")).toMatchObject({ status: "failed", error: { code: "REVIEWER_FAILED" } });
+    const managerRegistry = new JobRegistry({ idFactory: () => "job_manager_bg" });
+    const managerTool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: managerRegistry, clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => ({ review: async ({ targetId }) => ({ targetId, classification: "blocked", summary: "manual" }) }) });
+    await managerTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(managerRegistry.get("job_manager_bg")).toMatchObject({ status: "completed", outcome: "manager_judgment_required" });
   });
 });

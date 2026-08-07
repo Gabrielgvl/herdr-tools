@@ -2,10 +2,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HerdrCli } from "./src/cli.js";
 import { createCommunicateTool } from "./src/tools/communicate.js";
 import { createInspectTool } from "./src/tools/inspect.js";
+import { createJobsTool } from "./src/tools/jobs.js";
 import { createLaunchTool } from "./src/tools/launch.js";
 import { createPaneTool } from "./src/tools/pane.js";
 import { createTabTool } from "./src/tools/tab.js";
 import { createWaitTool } from "./src/tools/wait.js";
+import { JobRegistry, type JobDetail } from "./src/job-registry.js";
 import { RuntimeOwnership, resetOwnership, type OwnedResource } from "./src/ownership.js";
 import { loadSettings, type Settings } from "./src/settings.js";
 import type { CurrentContext } from "./src/targets.js";
@@ -14,6 +16,7 @@ export const CORE_TOOL_NAMES = [
   "herdr_inspect",
   "herdr_communicate",
   "herdr_wait",
+  "herdr_jobs",
   "herdr_launch",
   "herdr_pane",
   "herdr_tab",
@@ -33,6 +36,7 @@ export interface ExtensionRuntime {
   cli: HerdrCli;
   context: CurrentContext;
   ownership: RuntimeOwnership;
+  jobs: JobRegistry;
   settings: { load: () => Promise<Settings> };
   idsPresent: boolean;
   idsValid: boolean;
@@ -62,12 +66,53 @@ export function readInjectedContext(env: NodeJS.ProcessEnv = process.env): Injec
   };
 }
 
-export function createRuntime(pi: Pick<ExtensionAPI, "exec">, env: NodeJS.ProcessEnv = process.env): ExtensionRuntime {
+function safeNotificationPart(value: unknown, limit = 500): string {
+  const text = typeof value === "string" ? value : String(value);
+  return [...text].map((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127 ? " " : character;
+  }).join("").slice(0, limit);
+}
+
+export function notificationForJob(detail: JobDetail): { content: string; details: Record<string, unknown> } {
+  const manager = detail.outcome === "manager_judgment_required";
+  const status = detail.status === "completed" ? detail.outcome ?? "completed" : detail.status;
+  const reason = detail.result?.reason ?? detail.cancelReason ?? detail.error?.code ?? detail.error?.message ?? "completed";
+  const targets = detail.request.targets.map((target, index) => `${safeNotificationPart(target)} (${safeNotificationPart(detail.request.targetIds[index] ?? "unknown")})`).join(", ");
+  const reviewer = detail.result?.reviewerSummaries?.map((summary) => `${safeNotificationPart(summary.targetId)}: ${safeNotificationPart(summary.summary)}`).join("; ");
+  const error = detail.error ? `${safeNotificationPart(detail.error.code ?? "error")}: ${safeNotificationPart(detail.error.message)}` : undefined;
+  const prefix = manager ? "HIGH PRIORITY: MANAGER JUDGMENT REQUIRED\n" : "";
+  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} finished: outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)}, targets=${safeNotificationPart(targets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
+  return {
+    content: content.slice(0, 8_000),
+    details: {
+      jobId: detail.jobId,
+      outcome: status,
+      reason: safeNotificationPart(reason),
+      targets: detail.request.targetIds.slice(),
+      priority: manager ? "high" : "normal"
+    }
+  };
+}
+
+export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<ExtensionAPI, "sendMessage">>, env: NodeJS.ProcessEnv = process.env): ExtensionRuntime {
   const injected = readInjectedContext(env);
+  const jobs = new JobRegistry({
+    onTerminal: (detail) => {
+      if (!pi.sendMessage) return;
+      const notification = notificationForJob(detail);
+      try {
+        void Promise.resolve(pi.sendMessage({ customType: "herdr-wait-job", content: notification.content, display: true, details: notification.details }, { deliverAs: "steer", triggerTurn: true })).catch(() => undefined);
+      } catch {
+        // Pi may be shutting down; notification is best effort.
+      }
+    }
+  });
   return {
     cli: new HerdrCli(pi.exec.bind(pi)),
     context: injected.context,
     ownership: new RuntimeOwnership(),
+    jobs,
     settings: { load: () => loadSettings() },
     idsPresent: injected.idsPresent,
     idsValid: injected.idsValid,
@@ -85,9 +130,11 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
   };
 
   pi.on("session_shutdown", async () => {
+    runtime.jobs.shutdown();
     resetOwnership(runtime.ownership);
   });
   pi.on("session_start", async () => {
+    runtime.jobs.beginSession();
     resetOwnership(runtime.ownership);
   });
 
@@ -97,7 +144,9 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     cli: runtime.cli,
     context: runtime.context,
     settingsLoader: runtime.settings.load,
+    jobRegistry: runtime.jobs,
   }));
+  pi.registerTool(createJobsTool(runtime.jobs));
   pi.registerTool(createLaunchTool({
     cli: runtime.cli,
     context: runtime.context,
@@ -117,4 +166,3 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     ownership: runtime.ownership,
   }));
 }
-

@@ -743,7 +743,7 @@ workspace.
    such as `pi-herdr-tools-it-<run-id>`.
 3. Parse every workspace/tab/pane ID from JSON responses. Assert the disposable
    workspace ID differs from `HERDR_WORKSPACE_ID`; never infer IDs.
-4. Load the extension in a Pi integration process with the six tools enabled.
+4. Load the extension in a Pi integration process with the seven tools enabled.
    Assert registration count and that no deferred tool appears.
 5. Exercise inspect health, compact collections, single-pane metadata/transcript,
    pane creation, tab creation, launch of a harmless supported kind, communicate,
@@ -809,7 +809,7 @@ evidence rather than omitting them:
 
 - **Pi global discovery and runtime registration — UNTESTABLE in unit tests:**
   launch Pi in print/JSON mode twice with `HERDR_ENV=1` and unset, inspect the
-  registered tool metadata, and record exactly six versus zero. Use a disposable
+  registered tool metadata, and record exactly seven versus zero. Use a disposable
   Pi process, not the current session.
 - **Installed Herdr CLI protocol/syntax — UNTESTABLE with static fixtures:**
   capture `herdr --help`/relevant group help and health output in the disposable

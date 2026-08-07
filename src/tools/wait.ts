@@ -5,6 +5,7 @@ import { loadSettings, type Settings } from "../settings.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
 import { validateWaitParams, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams } from "../wait-schema.js";
+import type { JobRegistry, JobRequestSnapshot, JobRunResult } from "../job-registry.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export interface WaitClock {
@@ -19,11 +20,16 @@ export const realClock: WaitClock = {
       reject(Object.assign(new Error("Operation aborted"), { code: "ABORTED" }));
       return;
     }
-    const timer = setTimeout(resolve, milliseconds);
-    signal.addEventListener("abort", () => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
       clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
       reject(Object.assign(new Error("Operation aborted"), { code: "ABORTED" }));
-    }, { once: true });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
   })
 };
 
@@ -62,7 +68,7 @@ export interface WaitDetails {
 }
 
 export class WaitError extends Error {
-  constructor(readonly code: "INVALID_INPUT" | "ABORTED" | "REVIEWER_FAILED" | "CLI_PROTOCOL_ERROR" | "CLI_TIMEOUT" | "TARGET_NOT_FOUND" | "TARGET_AMBIGUOUS" | "TARGET_TYPE_MISMATCH" | "CONTEXT_UNAVAILABLE", message: string, readonly details: Record<string, unknown> = {}) {
+  constructor(readonly code: "INVALID_INPUT" | "ABORTED" | "REVIEWER_FAILED" | "CLI_PROTOCOL_ERROR" | "CLI_TIMEOUT" | "TARGET_NOT_FOUND" | "TARGET_AMBIGUOUS" | "TARGET_TYPE_MISMATCH" | "CONTEXT_UNAVAILABLE" | "SESSION_REPLACED", message: string, readonly details: Record<string, unknown> = {}) {
     super(message);
     this.name = "WaitError";
   }
@@ -75,6 +81,14 @@ export interface WaitDependencies {
   clock?: WaitClock;
   pollIntervalMs?: number;
   reviewerFactory?: (settings: Settings, context: ExtensionContext) => WaitReviewer;
+  jobRegistry?: JobRegistry;
+}
+
+export interface PreparedWait {
+  readonly params: WaitParams;
+  readonly validation: { regex?: SafeRegex };
+  readonly settings: Settings;
+  readonly resolved: ReadonlyArray<{ ref: string; target: ResolvedTarget }>;
 }
 
 export function errorCode(error: unknown): string | undefined {
@@ -224,8 +238,142 @@ export function mapReviewerFailure(error: unknown): WaitError {
   return new WaitError("REVIEWER_FAILED", "REVIEWER_FAILED: reviewer call failed", { cause: error instanceof Error ? error.message : String(error) });
 }
 
-export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof WaitParamsSchema, WaitDetails> {
+export async function prepareWait(deps: WaitDependencies, rawParams: unknown, signal: AbortSignal): Promise<PreparedWait> {
+  checkAbort(signal);
+  let validation;
+  try {
+    validation = validateWaitParams(rawParams);
+  } catch (error) {
+    throw new WaitError("INVALID_INPUT", String(error));
+  }
+  const params = validation.params;
+  let settings: Settings;
+  try {
+    settings = await (deps.settingsLoader ?? (() => loadSettings()))();
+  } catch (error) {
+    if (error instanceof Error && errorCode(error) === "INVALID_SETTINGS") throw error;
+    throw new WaitError("INVALID_INPUT", "INVALID_SETTINGS: extension-owned wait settings are invalid", { cause: error instanceof Error ? error.message : String(error) });
+  }
+  checkAbort(signal);
+  const initial = parseSnapshotResult((await deps.cli.runJson(["api", "snapshot"], signal)).result);
+  const resolved = params.targets.map((ref) => ({ ref, target: resolveTarget(initial, ref, "agent", deps.context) }));
+  const ids = new Set<string>();
+  for (const item of resolved) {
+    if (ids.has(item.target.id)) throw new WaitError("INVALID_INPUT", "INVALID_INPUT: target references resolve to the same resource", { targetId: item.target.id });
+    ids.add(item.target.id);
+  }
+  return {
+    params: structuredClone(params),
+    validation: { ...(validation.regex ? { regex: validation.regex } : {}) },
+    settings: { ...settings },
+    resolved: resolved.map((item) => ({ ref: item.ref, target: { ...item.target, record: structuredClone(item.target.record) } }))
+  };
+}
+
+export function jobRequestFromPrepared(prepared: PreparedWait): JobRequestSnapshot {
+  return {
+    targets: [...prepared.params.targets],
+    targetIds: prepared.resolved.map((item) => item.target.id),
+    match: prepared.params.match,
+    condition: structuredClone(prepared.params.condition),
+    timeoutMs: prepared.params.timeoutMs,
+    settings: { ...prepared.settings }
+  };
+}
+
+export async function runPreparedWait(
+  deps: WaitDependencies,
+  prepared: PreparedWait,
+  signal: AbortSignal,
+  onUpdate: AgentToolUpdateCallback<WaitDetails> | undefined,
+  context: ExtensionContext
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: WaitDetails }> {
+  const { params, validation, settings, resolved } = prepared;
   const clock = deps.clock ?? realClock;
+  const start = clock.now();
+  const deadline = start + params.timeoutMs;
+  const cadenceMs = settings.reviewCadenceMinutes * 60_000;
+  const longWait = params.timeoutMs > cadenceMs;
+  let read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
+  let snapshots = read.snapshots;
+  const initialTimeout = timeoutIfExpired(params, read);
+  if (initialTimeout) return initialTimeout;
+  if (aggregate(params, snapshots)) return successResult(params, snapshots);
+  let reviewer: WaitReviewer | undefined;
+  if (longWait) {
+    try {
+      reviewer = deps.reviewerFactory ? deps.reviewerFactory(settings, context) : createPiModelReviewer(context, settings.reviewerModel);
+    } catch (error) {
+      throw mapReviewerFailure(error);
+    }
+  }
+  const reviewerSummaries: ReviewerSummary[] = [];
+  const sentLines = new Map<string, string[]>();
+  let nextReview = start + cadenceMs;
+  let lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
+  const progress = (text: string, outcome: WaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, snapshots, outcome, undefined, reviewerSummaries), text.slice(0, 500));
+  progress("waiting");
+
+  while (true) {
+    checkAbort(signal);
+    if (aggregate(params, snapshots)) {
+      const details = resultDetails(params, snapshots, "success", "condition_met", reviewerSummaries);
+      return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
+    }
+    const now = clock.now();
+    if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
+    const untilReview = longWait ? Math.max(0, nextReview - now) : Number.MAX_SAFE_INTEGER;
+    await clock.sleep(Math.min(deps.pollIntervalMs ?? 250, deadline - now, untilReview), signal);
+    checkAbort(signal);
+    if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
+    read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
+    snapshots = read.snapshots;
+    const pollTimeout = timeoutIfExpired(params, read, reviewerSummaries);
+    if (pollTimeout) return pollTimeout;
+    const newStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
+    if (newStates.some((state, index) => state !== lastStates[index])) {
+      progress(`state changed: ${newStates.join(", ")}`);
+      lastStates = newStates;
+    }
+    if (aggregate(params, snapshots)) continue;
+    if (!longWait || clock.now() < nextReview) continue;
+    nextReview += cadenceMs;
+    const requests: ReviewerRequest[] = snapshots.map((snapshot) => {
+      const previous = sentLines.get(snapshot.targetId) ?? [];
+      const delta = deltaLines(previous, snapshot.recentUnwrappedLines);
+      sentLines.set(snapshot.targetId, snapshot.recentUnwrappedLines.slice(-100));
+      return { targetId: snapshot.targetId, metadata: compactMetadata(snapshot.metadata), transcriptDelta: delta.slice(-100) };
+    });
+    let reviews: ReviewerResult[];
+    try {
+      reviews = await Promise.all(requests.map((request) => reviewer!.review(request, signal)));
+      checkAbort(signal);
+    } catch (error) {
+      if (signal.aborted || errorCode(error) === "ABORTED") abort();
+      throw mapReviewerFailure(error);
+    }
+    let managerJudgment = false;
+    for (const review of reviews) {
+      const summary: ReviewerSummary = { target: resolved.find((item) => item.target.paneId === review.targetId)?.ref ?? review.targetId, targetId: review.targetId, classification: review.classification, summary: review.summary.slice(0, 500) };
+      reviewerSummaries.push(summary);
+      const terminal = review.classification === "stalled" || review.classification === "blocked" || review.classification === "risk" || review.classification === "unknown";
+      managerJudgment ||= terminal;
+      progress(`review ${review.targetId}: ${review.classification} ${review.summary}`, terminal ? "manager_judgment_required" : "progress");
+    }
+    if (managerJudgment) {
+      if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
+      read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
+      snapshots = read.snapshots;
+      const refreshTimeout = timeoutIfExpired(params, read, reviewerSummaries);
+      if (refreshTimeout) return refreshTimeout;
+      if (aggregate(params, snapshots)) return successResult(params, snapshots, reviewerSummaries);
+      const details = resultDetails(params, snapshots, "manager_judgment_required", "manager_judgment_required", reviewerSummaries);
+      return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "error", code: "MANAGER_JUDGMENT_REQUIRED" }) }], details };
+    }
+  }
+}
+
+export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof WaitParamsSchema, WaitDetails> {
   const settingsLoader = deps.settingsLoader ?? (() => loadSettings());
   return {
     name: "herdr_wait",
@@ -235,109 +383,38 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
     async execute(_id, rawParams, signal, onUpdate, context) {
       const activeSignal = signal ?? new AbortController().signal;
       checkAbort(activeSignal);
-      let validation;
-      try {
-        validation = validateWaitParams(rawParams);
-      } catch (error) {
-        throw new WaitError("INVALID_INPUT", String(error));
+      const runInBackground = typeof rawParams === "object" && rawParams !== null && !Array.isArray(rawParams) && (rawParams as { runInBackground?: unknown }).runInBackground === true;
+      const generation = runInBackground ? deps.jobRegistry?.captureGeneration() : undefined;
+      if (runInBackground && !deps.jobRegistry) throw new WaitError("INVALID_INPUT", "INVALID_INPUT: background waits are unavailable in this runtime");
+      const prepared = await prepareWait({ ...deps, settingsLoader }, rawParams, activeSignal);
+      if (runInBackground) {
+        if (!generation || !deps.jobRegistry!.isCurrent(generation)) throw new WaitError("SESSION_REPLACED", "SESSION_REPLACED: wait session was replaced before registration");
+        const registered = deps.jobRegistry!.register(
+          jobRequestFromPrepared(prepared),
+          async (jobSignal, update): Promise<JobRunResult> => {
+            const result = await runPreparedWait({ ...deps, settingsLoader }, prepared, jobSignal, (next) => update(next.content[0]?.type === "text" ? next.content[0].text : "", next.details), context);
+            return {
+              outcome: result.details.outcome === "progress" ? "timeout" : result.details.outcome,
+              matched: result.details.matched,
+              ...(result.details.reason ? { reason: result.details.reason } : {}),
+              targets: result.details.targets,
+              reviewerSummaries: result.details.reviewerSummaries
+            };
+          },
+          generation
+        );
+        return {
+          content: [{ type: "text", text: `background wait started · ${registered.jobId}` }],
+          details: {
+            operation: "wait",
+            outcome: "background",
+            jobId: registered.jobId,
+            targets: [...prepared.params.targets],
+            targetIds: prepared.resolved.map((item) => item.target.id)
+          } as unknown as WaitDetails
+        };
       }
-      const params = validation.params;
-      let settings: Settings;
-      try {
-        settings = await settingsLoader();
-      } catch (error) {
-        if (error instanceof Error && errorCode(error) === "INVALID_SETTINGS") throw error;
-        throw new WaitError("INVALID_INPUT", "INVALID_SETTINGS: extension-owned wait settings are invalid", { cause: error instanceof Error ? error.message : String(error) });
-      }
-      checkAbort(activeSignal);
-      const initial = parseSnapshotResult((await deps.cli.runJson(["api", "snapshot"], activeSignal)).result);
-      const resolved = params.targets.map((ref) => ({ ref, target: resolveTarget(initial, ref, "agent", deps.context) }));
-      const ids = new Set<string>();
-      for (const item of resolved) {
-        if (ids.has(item.target.id)) throw new WaitError("INVALID_INPUT", "INVALID_INPUT: target references resolve to the same resource", { targetId: item.target.id });
-        ids.add(item.target.id);
-      }
-      const start = clock.now();
-      const deadline = start + params.timeoutMs;
-      const cadenceMs = settings.reviewCadenceMinutes * 60_000;
-      const longWait = params.timeoutMs > cadenceMs;
-      let read = await readAndMatch(deps.cli, resolved, clock, activeSignal, deadline, params.condition, validation.regex);
-      let snapshots = read.snapshots;
-      const initialTimeout = timeoutIfExpired(params, read);
-      if (initialTimeout) return initialTimeout;
-      if (aggregate(params, snapshots)) return successResult(params, snapshots);
-      let reviewer: WaitReviewer | undefined;
-      if (longWait) {
-        try {
-          reviewer = deps.reviewerFactory ? deps.reviewerFactory(settings, context) : createPiModelReviewer(context, settings.reviewerModel);
-        } catch (error) {
-          throw mapReviewerFailure(error);
-        }
-      }
-      const reviewerSummaries: ReviewerSummary[] = [];
-      const sentLines = new Map<string, string[]>();
-      let nextReview = start + cadenceMs;
-      let lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
-      const progress = (text: string, outcome: WaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, snapshots, outcome, undefined, reviewerSummaries), text.slice(0, 500));
-      progress("waiting");
-
-      while (true) {
-        checkAbort(activeSignal);
-        if (aggregate(params, snapshots)) {
-          const details = resultDetails(params, snapshots, "success", "condition_met", reviewerSummaries);
-          return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
-        }
-        const now = clock.now();
-        if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
-        const untilReview = longWait ? Math.max(0, nextReview - now) : Number.MAX_SAFE_INTEGER;
-        await clock.sleep(Math.min(deps.pollIntervalMs ?? 250, deadline - now, untilReview), activeSignal);
-        checkAbort(activeSignal);
-        if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
-        read = await readAndMatch(deps.cli, resolved, clock, activeSignal, deadline, params.condition, validation.regex);
-        snapshots = read.snapshots;
-        const pollTimeout = timeoutIfExpired(params, read, reviewerSummaries);
-        if (pollTimeout) return pollTimeout;
-        const newStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
-        if (newStates.some((state, index) => state !== lastStates[index])) {
-          progress(`state changed: ${newStates.join(", ")}`);
-          lastStates = newStates;
-        }
-        if (aggregate(params, snapshots)) continue;
-        if (!longWait || clock.now() < nextReview) continue;
-        nextReview += cadenceMs;
-        const requests: ReviewerRequest[] = snapshots.map((snapshot) => {
-          const previous = sentLines.get(snapshot.targetId) ?? [];
-          const delta = deltaLines(previous, snapshot.recentUnwrappedLines);
-          sentLines.set(snapshot.targetId, snapshot.recentUnwrappedLines.slice(-100));
-          return { targetId: snapshot.targetId, metadata: compactMetadata(snapshot.metadata), transcriptDelta: delta.slice(-100) };
-        });
-        let reviews: ReviewerResult[];
-        try {
-          reviews = await Promise.all(requests.map((request) => reviewer!.review(request, activeSignal)));
-          checkAbort(activeSignal);
-        } catch (error) {
-          if (activeSignal.aborted || errorCode(error) === "ABORTED") abort();
-          throw mapReviewerFailure(error);
-        }
-        let managerJudgment = false;
-        for (const review of reviews) {
-          const summary: ReviewerSummary = { target: resolved.find((item) => item.target.paneId === review.targetId)?.ref ?? review.targetId, targetId: review.targetId, classification: review.classification, summary: review.summary.slice(0, 500) };
-          reviewerSummaries.push(summary);
-          const terminal = review.classification === "stalled" || review.classification === "blocked" || review.classification === "risk" || review.classification === "unknown";
-          managerJudgment ||= terminal;
-          progress(`review ${review.targetId}: ${review.classification} ${review.summary}`, terminal ? "manager_judgment_required" : "progress");
-        }
-        if (managerJudgment) {
-          if (expired(clock, deadline, snapshots)) return timeoutResult(params, snapshots, reviewerSummaries);
-          read = await readAndMatch(deps.cli, resolved, clock, activeSignal, deadline, params.condition, validation.regex);
-          snapshots = read.snapshots;
-          const refreshTimeout = timeoutIfExpired(params, read, reviewerSummaries);
-          if (refreshTimeout) return refreshTimeout;
-          if (aggregate(params, snapshots)) return successResult(params, snapshots, reviewerSummaries);
-          const details = resultDetails(params, snapshots, "manager_judgment_required", "manager_judgment_required", reviewerSummaries);
-          return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "error", code: "MANAGER_JUDGMENT_REQUIRED" }) }], details };
-        }
-      }
+      return runPreparedWait({ ...deps, settingsLoader }, prepared, activeSignal, onUpdate, context);
     },
     renderCall(rawArgs, theme) {
       const args = rawArgs as WaitParams;

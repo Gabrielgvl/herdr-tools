@@ -60,6 +60,12 @@ export interface CloseReadbackOptions<TSnapshot> {
   summarize: (snapshot: TSnapshot) => unknown;
 }
 
+function isPreDispatchFailure(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "CLI_NOT_FOUND" || code === "BACKEND_UNAVAILABLE";
+}
+
 export async function closeWithReadback<TSnapshot>(options: CloseReadbackOptions<TSnapshot>): Promise<CloseReadbackResult<TSnapshot>> {
   if (options.signal.aborted) {
     throw Object.assign(new Error("Operation aborted before close dispatch"), { code: "ABORTED" });
@@ -70,6 +76,7 @@ export async function closeWithReadback<TSnapshot>(options: CloseReadbackOptions
   try {
     mutation = await options.cli.runJson(options.argv, options.signal, true);
   } catch (error) {
+    if (isPreDispatchFailure(error)) throw error;
     mutationError = error;
   }
 

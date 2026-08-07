@@ -17,11 +17,11 @@ The adapter must not change Herdr core or HCP, add dependencies, or claim atomic
 
 ## Decision
 
-1. `herdr_communicate` reads authoritative pane state before sending bytes. `prompt` refuses `working`; `steer` sends the prompt directly for `idle`, `done`, or `blocked`, and sends canonical named `esc`, waits boundedly for `idle`/`done`/`blocked`, then prompts only after the wait acknowledgement succeeds. Unknown or malformed state is a typed no-send failure.
+1. `herdr_communicate` reads authoritative pane state before sending bytes. `prompt` refuses `working`; `steer` sends the prompt directly for `idle`, `done`, or `blocked`, and sends canonical named `esc`, waits boundedly for `idle`/`done`/`blocked`, then prompts only after Herdr returns matching `agent_info` for the exact pane in a settled state. Unknown or malformed state and malformed/mismatched settle acknowledgement are typed no-send failures.
 2. Communication details retain bounded envelope IDs for interrupt/wait/prompt/post-state operations, pre/post state, and the route (`prompt_direct` or `interrupt_then_prompt`).
 3. `herdr_pane`, `herdr_tab`, and `herdr_communicate` are registered with `executionMode: "sequential"`. Read-only inspect, wait, and jobs tools remain unchanged.
 4. Exact explicit pane/tab close is autonomous after fresh topology and protected-caller validation. Ownership and modal confirmation are removed from close policy. The caller pane, containing tab, and containing workspace remain protected. Malformed topology fails closed.
-5. Close runs with completed-mutation preservation and captures the Herdr envelope ID/result. It performs a fresh independent post-topology read after dispatch. If the response is lost or protocol-invalid, one independent readback may reconcile a truthful terminal result only when the target is absent; otherwise it throws typed `MUTATION_UNCERTAIN` with bounded evidence and never retries.
+5. Close runs with completed-mutation preservation and captures the Herdr envelope ID/result. It performs a fresh independent post-topology read after dispatch. If a dispatched response is lost or protocol-invalid, one independent readback may reconcile a truthful terminal result only when the target is absent; otherwise it throws typed `MUTATION_UNCERTAIN` with bounded evidence and never retries. CLI/backend unavailability that proves dispatch never began propagates directly and never reconciles.
 6. Close results return only operation ID, target ID, removed IDs, and a compact sanitized post-topology summary. Full snapshots and environment data are not returned.
 
 ## Alternatives considered

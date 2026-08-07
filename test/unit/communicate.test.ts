@@ -39,9 +39,9 @@ function makeCli(initial: State = "idle", options: { settleFails?: boolean; post
       return response("interrupt-1", { ok: true });
     }
     if (argv[0] === "agent" && argv[1] === "wait") {
-      if (options.settleFails) return response("wait-1", { ok: false, matched: false });
+      if (options.settleFails) return response("wait-1", { type: "agent_info", agent: { ...basePane, pane_id: "wrong", agent_status: "idle" } });
       state = "idle";
-      return response("wait-1", { ok: true, matched: true });
+      return response("wait-1", { type: "agent_info", agent: { ...basePane, agent_status: "idle" } });
     }
     if (argv[0] === "agent" && argv[1] === "prompt") {
       state = "working";
@@ -84,14 +84,17 @@ describe("herdr_communicate", () => {
     expect(result.details).toMatchObject({ route: "interrupt_then_prompt", preState: { agent_status: "working" }, operationIds: { interrupt: "interrupt-1", settleWait: "wait-1", prompt: "prompt-1", postState: "pane-2" } });
   });
 
-  it("accepts a successful settle envelope with a non-object result", async () => {
-    const harness = makeCli("working");
-    const original = harness.cli.runJson.bind(harness.cli);
-    harness.cli.runJson = vi.fn(async (argv: string[], signal: AbortSignal, preserve?: boolean) => {
-      if (argv[0] === "agent" && argv[1] === "wait") return { id: "wait-primitive", result: null };
-      return original(argv, signal, preserve);
-    });
-    await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "new direction" })).resolves.toMatchObject({ details: { operationIds: { settleWait: "wait-primitive" } } });
+  it("rejects malformed settle acknowledgements without prompting", async () => {
+    for (const result of [null, { type: "agent_info", agent: null }, { type: "agent_info", agent: { ...basePane, agent_status: "working" } }]) {
+      const harness = makeCli("working");
+      const original = harness.cli.runJson.bind(harness.cli);
+      harness.cli.runJson = vi.fn(async (argv: string[], signal: AbortSignal, preserve?: boolean) => {
+        if (argv[0] === "agent" && argv[1] === "wait") return { id: "wait-invalid", result };
+        return original(argv, signal, preserve);
+      });
+      await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "new direction" })).rejects.toMatchObject({ code: "SETTLE_FAILED" });
+      expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
+    }
   });
 
   it("refuses prompt against working without mutation", async () => {

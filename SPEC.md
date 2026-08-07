@@ -149,7 +149,7 @@ Rules:
 
 - Every operation reads and classifies the authoritative pre-state before sending bytes. `unknown` or malformed state returns a typed no-send error.
 - `prompt` refuses to interrupt `working` targets and fails with `TARGET_BUSY`; idle, done, and blocked targets receive the bounded prompt command directly.
-- `steer` is state-aware. Idle, done, and blocked targets receive the bounded prompt directly with no Escape. Working targets receive canonical named `esc`, then a bounded `agent wait ... --until idle --until done --until blocked --timeout 5000`; only a successful settle acknowledgement permits the prompt. Unknown/unavailable states are typed no-send failures.
+- `steer` is state-aware. Idle, done, and blocked targets receive the bounded prompt directly with no Escape. Working targets receive canonical named `esc`, then a bounded `agent wait ... --until idle --until done --until blocked --timeout 5000`; only a matching `agent_info` acknowledgement for the exact pane in a settled state permits the prompt. Unknown/unavailable states and malformed or mismatched settle acknowledgements are typed no-send failures.
 - `keys` sends only validated named keys. There is no additional confirmation prompt for keys.
 - For `prompt` and `steer`, the tool briefly verifies that the target enters `working` and returns immediately after that verification. It never waits for completion.
 - Every Herdr envelope ID is retained for interrupt/wait/prompt/post-state calls. Details include bounded pre/post state and route (`prompt_direct` or `interrupt_then_prompt`).
@@ -309,7 +309,7 @@ Rules:
 - Resize requires a finite positive amount and an explicit direction.
 - Close is autonomous after fresh topology validation for an exact non-caller target; it never asks for modal confirmation and never performs automatic cleanup or cascaded cleanup beyond Herdr's own close semantics.
 - Close preserves completed mutation evidence: it captures the Herdr envelope ID/result, invokes the mutation with completed-mutation preservation, and performs an independent fresh post-topology read after dispatch even if the initiating signal aborts.
-- If the close response is lost or invalid, one independent readback reconciles only proven target absence. Otherwise it throws `MUTATION_UNCERTAIN` with bounded original/readback evidence and never retries.
+- If a dispatched close response is lost or invalid, one independent readback reconciles only proven target absence. Failures that prove dispatch never began (`CLI_NOT_FOUND` or `BACKEND_UNAVAILABLE`) propagate directly and never reconcile. Otherwise it throws `MUTATION_UNCERTAIN` with bounded original/readback evidence and never retries.
 - Every successful mutation re-reads affected pane/layout/tab context and returns authoritative post-state. Close returns compact containing topology, operation ID, target ID, and removed IDs.
 
 ### `herdr_tab`
@@ -339,7 +339,7 @@ Rules:
 - Environment overrides have no extension key restrictions and carry the visibility warning described for pane creation.
 - Tab targets are stable tab IDs or `current`; no fuzzy tab-label resolution is added.
 - Close is autonomous after fresh topology validation for an exact non-caller target and does not require UI access. The tool cannot close the tab containing the calling pane or cause the calling workspace to close.
-- Close captures the Herdr envelope ID/result, preserves completed mutations across signal abort, performs a fresh post-topology read, and reconciles one lost/invalid response only when target absence is proven. A present or unreadable target produces `MUTATION_UNCERTAIN`; the tool never retries.
+- Close captures the Herdr envelope ID/result, preserves completed mutations across signal abort, performs a fresh post-topology read, and reconciles one lost/invalid response only when target absence is proven. CLI/backend unavailability before dispatch propagates without reconciliation. A present or unreadable target produces `MUTATION_UNCERTAIN`; the tool never retries.
 - Every successful mutation re-reads authoritative tab and current-context state. A created tab's authoritative child pane metadata is included without inventing a pane ID.
 
 ## Settings

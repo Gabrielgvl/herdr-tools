@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { HerdrCli, type PiExec } from "../../src/cli.js";
+import { CliProtocolError, HerdrCli, type PiExec } from "../../src/cli.js";
 import { boundedEvidence, closeWithReadback, errorEvidence } from "../../src/mutations.js";
 
 const signal = new AbortController().signal;
@@ -67,6 +67,13 @@ describe("completed close mutation preservation and reconciliation", () => {
       cli: new HerdrCli(exec), argv: ["pane", "close", "target"], signal, targetId: "target",
       readback: async () => snapshot(true), targetPresent: (value) => value.present, summarize: (value) => value
     })).rejects.toMatchObject({ code: "MUTATION_UNCERTAIN", details: { targetId: "target", readback: { status: "target_present" } } });
+
+    const primitiveFailure = new HerdrCli(vi.fn<PiExec>());
+    primitiveFailure.runJson = vi.fn().mockRejectedValue("lost response");
+    await expect(closeWithReadback({
+      cli: primitiveFailure, argv: ["pane", "close", "target"], signal, targetId: "target",
+      readback: async () => snapshot(true), targetPresent: (value) => value.present, summarize: (value) => value
+    })).rejects.toMatchObject({ code: "MUTATION_UNCERTAIN", details: { original: { message: "lost response" } } });
   });
 
   it("throws typed uncertainty when readback is unavailable, including bounded evidence", async () => {
@@ -78,7 +85,7 @@ describe("completed close mutation preservation and reconciliation", () => {
     })).rejects.toMatchObject({ code: "MUTATION_UNCERTAIN", details: { targetId: "target", readback: { code: "CLI_TIMEOUT" } } });
   });
 
-  it("does not reconcile a pre-dispatch abort", async () => {
+  it("does not reconcile pre-dispatch aborts or unavailable CLI backends", async () => {
     const controller = new AbortController();
     controller.abort();
     const exec = vi.fn<PiExec>();
@@ -88,6 +95,15 @@ describe("completed close mutation preservation and reconciliation", () => {
       readback, targetPresent: (value: { present: boolean }) => value.present, summarize: (value: { present: boolean }) => value
     })).rejects.toMatchObject({ code: "ABORTED" });
     expect(exec).not.toHaveBeenCalled();
+    expect(readback).not.toHaveBeenCalled();
+
+    for (const failure of [new Error("missing executable"), new CliProtocolError("BACKEND_UNAVAILABLE", "backend unavailable")]) {
+      const unavailable = vi.fn<PiExec>().mockRejectedValue(failure);
+      await expect(closeWithReadback({
+        cli: new HerdrCli(unavailable), argv: ["tab", "close", "target"], signal, targetId: "target",
+        readback, targetPresent: (value: { present: boolean }) => value.present, summarize: (value: { present: boolean }) => value
+      })).rejects.toMatchObject({ code: failure instanceof CliProtocolError ? "BACKEND_UNAVAILABLE" : "CLI_NOT_FOUND" });
+    }
     expect(readback).not.toHaveBeenCalled();
   });
 

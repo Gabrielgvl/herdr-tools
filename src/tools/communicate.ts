@@ -82,12 +82,24 @@ function assertPostState(pane: Record<string, unknown>): CommunicateState {
 }
 
 function assertSettleAcknowledgement(envelope: JsonEnvelope, targetId: string): void {
-  if (typeof envelope.result !== "object" || envelope.result === null || Array.isArray(envelope.result)) return;
+  if (typeof envelope.result !== "object" || envelope.result === null || Array.isArray(envelope.result)) {
+    throw Object.assign(new Error("Herdr returned an invalid settled-state acknowledgement"), {
+      code: "SETTLE_FAILED",
+      details: { target: targetId, operationId: envelope.id }
+    });
+  }
   const result = envelope.result as Record<string, unknown>;
-  if (result.ok === false || result.success === false || result.matched === false) {
+  const agent = result.agent;
+  const acknowledged = result.type === "agent_info"
+    && typeof agent === "object"
+    && agent !== null
+    && !Array.isArray(agent)
+    && (agent as Record<string, unknown>).pane_id === targetId
+    && ["idle", "done", "blocked"].includes(String((agent as Record<string, unknown>).agent_status));
+  if (!acknowledged) {
     throw Object.assign(new Error("Herdr did not acknowledge the requested settled state"), {
       code: "SETTLE_FAILED",
-      details: { target: targetId, operationId: envelope.id, result: result }
+      details: { target: targetId, operationId: envelope.id, result: compactPane(typeof agent === "object" && agent !== null && !Array.isArray(agent) ? agent as Record<string, unknown> : {}) }
     });
   }
 }

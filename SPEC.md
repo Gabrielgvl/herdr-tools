@@ -149,10 +149,10 @@ Rules:
 
 - Every operation reads and classifies the authoritative pre-state before sending bytes. `unknown` or malformed state returns a typed no-send error.
 - `prompt` refuses to interrupt `working` targets and fails with `TARGET_BUSY`; idle, done, and blocked targets receive the bounded prompt command directly.
-- `steer` is state-aware. Idle, done, and blocked targets receive the bounded prompt directly with no Escape. Working targets receive canonical named `esc`, then a bounded `agent wait ... --until idle --until done --until blocked --timeout 5000`; only a matching `agent_info` acknowledgement for the exact pane in a settled state permits the prompt. Unknown/unavailable states and malformed or mismatched settle acknowledgements are typed no-send failures.
+- `steer` never sends Escape or any other interrupt key. For idle, working, done, or blocked targets it submits the text directly through Herdr's `agent prompt` path; when the agent is working, its own TUI receives that submitted prompt as steering input. Unknown or malformed state is a typed no-send failure.
 - `keys` sends only validated named keys. There is no additional confirmation prompt for keys.
 - For `prompt` and `steer`, the tool briefly verifies that the target enters `working` and returns immediately after that verification. It never waits for completion.
-- Every Herdr envelope ID is retained for interrupt/wait/prompt/post-state calls. Details include bounded pre/post state and route (`prompt_direct` or `interrupt_then_prompt`).
+- Every Herdr envelope ID is retained for prompt/key/post-state calls. Details include bounded pre/post state and route (`prompt_direct` or `steer_direct`).
 - After every operation, the tool returns the authoritative target post-state. A verification timeout or contradictory post-state is a structured failure, not a fabricated success.
 
 ### `herdr_wait`
@@ -397,7 +397,6 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `TARGET_BUSY`: normal prompt attempted against a working target.
 - `TARGET_STATE_UNKNOWN`: authoritative target state is explicitly unknown; no prompt or key bytes were sent.
 - `TARGET_STATE_UNAVAILABLE`: authoritative target state is malformed or unavailable; no prompt or key bytes were sent.
-- `SETTLE_FAILED`: a working steer did not receive a successful bounded settled-state acknowledgement; no replacement prompt was sent.
 - `KEY_REJECTED`: key is not a supported named key.
 - `POSTSTATE_UNAVAILABLE`: mutation completed or may have completed, but authoritative post-state could not be read.
 - `LAUNCH_FAILED`: agent start failed; any created resources remain.
@@ -507,7 +506,7 @@ Mock `pi.exec`, CLI stdout/stderr/exit codes, target listings, post-state reads,
 - single-target 100-line inspect cap and collection compactness;
 - health environment and client/server compatibility reporting;
 - normal prompt refusal while working;
-- explicit steer interrupt-before-prompt ordering;
+- explicit steer submission to idle/done/blocked/working targets with zero interrupt-key calls;
 - named-key validation without confirmation;
 - wait state semantics, literal/regex matching, any/all, immediate matches, bounded timeout final snapshots, abort, and internal CLI failures;
 - every long-wait reviewer rule, including concurrent one-per-target calls, bounded deltas, no tools, manager-judgment early exit, and immediate reviewer failure;
@@ -593,7 +592,7 @@ The feature is complete only when all of the following are true:
 1. “Long wait” means a requested timeout longer than the global review cadence. This makes the mandatory reviewer behavior deterministic without adding a per-tool threshold setting.
 2. Pi's typed settings schema has no extension namespace. Extension-owned settings are loaded only from `/home/gabriel/.pi/agent/extensions/herdr-tools/config.json`; tool calls and project-local files cannot override them. An absent file uses the documented defaults, while a malformed or invalid present file fails closed with `INVALID_SETTINGS` without coercion or fallback.
 3. The installed Herdr CLI may add or remove supported agent kinds or adjust output fields. The adapter treats the installed CLI as authoritative and reports compatibility/protocol failures instead of guessing.
-4. `Escape` is the installed CLI's named interrupt mapping for explicit steer. The implementation must validate/use the CLI-supported named-key path, not send raw terminal bytes.
+4. Herdr exposes no dedicated semantic steer command. `agent prompt` writes text plus Enter directly to the agent PTY; a working agent's own TUI determines how that input is handled. The extension must never synthesize steering by sending Escape first.
 5. New tabs may cause Herdr to return an initial child pane. That pane must be labeled from the caller's requested/default launch label before it is used.
 6. Ownership bookkeeping intentionally does not survive extension reload or Pi session changes, even when the Herdr resources remain alive; close authorization is based on the explicit exact target and fresh protected topology, not ownership.
 7. The extension directory is a standalone Git repository with no remote initially. The implementation phase must run `git init`, verify the empty remote list, and create the initial commit containing the reviewed `SPEC.md` before implementation proceeds.

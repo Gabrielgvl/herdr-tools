@@ -18,7 +18,7 @@ const extensionContext = { signal: undefined, hasUI: false } as unknown as Exten
 
 type State = "idle" | "working" | "blocked" | "done" | "unknown" | "malformed";
 
-function makeCli(initial: State = "idle", options: { settleFails?: boolean; postState?: State } = {}) {
+function makeCli(initial: State = "idle", options: { postState?: State } = {}) {
   const calls: string[][] = [];
   const states: State[] = [];
   let state = initial;
@@ -37,11 +37,6 @@ function makeCli(initial: State = "idle", options: { settleFails?: boolean; post
     if (argv[0] === "agent" && argv[1] === "send-keys") {
       state = argv[3] === "esc" ? "idle" : "working";
       return response("interrupt-1", { ok: true });
-    }
-    if (argv[0] === "agent" && argv[1] === "wait") {
-      if (options.settleFails) return response("wait-1", { type: "agent_info", agent: { ...basePane, pane_id: "wrong", agent_status: "idle" } });
-      state = "idle";
-      return response("wait-1", { type: "agent_info", agent: { ...basePane, agent_status: "idle" } });
     }
     if (argv[0] === "agent" && argv[1] === "prompt") {
       state = "working";
@@ -67,34 +62,20 @@ describe("herdr_communicate", () => {
       ["pane", "get", "w1:p2"]
     ]);
     expect(harness.calls.some((call) => call.includes("esc"))).toBe(false);
-    expect(result.details).toMatchObject({ route: "prompt_direct", preState: { agent_status: state }, postState: { agent_status: "working" }, operationIds: { prompt: "prompt-1", postState: "pane-2" } });
+    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: state }, postState: { agent_status: "working" }, operationIds: { prompt: "prompt-1", postState: "pane-2" } });
   });
 
-  it("interrupts working steer, waits for a settled acknowledgement, then prompts", async () => {
+  it("steers a working agent by submitting directly without interrupting", async () => {
     const harness = makeCli("working");
     const result = await execute(harness.cli, { target: "reviewer", operation: "steer", text: "replace direction" });
     expect(harness.calls).toEqual([
       ["api", "snapshot"],
       ["pane", "get", "w1:p2"],
-      ["agent", "send-keys", "w1:p2", "esc"],
-      ["agent", "wait", "w1:p2", "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "5000"],
       ["agent", "prompt", "w1:p2", "replace direction", "--wait", "--until", "working", "--timeout", "5000"],
       ["pane", "get", "w1:p2"]
     ]);
-    expect(result.details).toMatchObject({ route: "interrupt_then_prompt", preState: { agent_status: "working" }, operationIds: { interrupt: "interrupt-1", settleWait: "wait-1", prompt: "prompt-1", postState: "pane-2" } });
-  });
-
-  it("rejects malformed settle acknowledgements without prompting", async () => {
-    for (const result of [null, { type: "agent_info", agent: null }, { type: "agent_info", agent: { ...basePane, agent_status: "working" } }]) {
-      const harness = makeCli("working");
-      const original = harness.cli.runJson.bind(harness.cli);
-      harness.cli.runJson = vi.fn(async (argv: string[], signal: AbortSignal, preserve?: boolean) => {
-        if (argv[0] === "agent" && argv[1] === "wait") return { id: "wait-invalid", result };
-        return original(argv, signal, preserve);
-      });
-      await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "new direction" })).rejects.toMatchObject({ code: "SETTLE_FAILED" });
-      expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
-    }
+    expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "send-keys")).toBe(false);
+    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: "working" }, operationIds: { prompt: "prompt-1", postState: "pane-2" } });
   });
 
   it("refuses prompt against working without mutation", async () => {
@@ -124,12 +105,6 @@ describe("herdr_communicate", () => {
       await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "must not send" })).rejects.toMatchObject({ code: state === "unknown" ? "TARGET_STATE_UNKNOWN" : "TARGET_STATE_UNAVAILABLE" });
       expect(harness.calls.some((call) => call[0] === "agent")).toBe(false);
     }
-  });
-
-  it("does not prompt when interrupt settle fails", async () => {
-    const harness = makeCli("working", { settleFails: true });
-    await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "blocked" })).rejects.toMatchObject({ code: "SETTLE_FAILED" });
-    expect(harness.calls.map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["pane", "get"], ["agent", "send-keys"], ["agent", "wait"]]);
   });
 
   it("fails on contradictory or unknown post-state after prompt", async () => {

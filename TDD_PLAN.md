@@ -101,9 +101,9 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Inspect collections stay compact | `inspect_collection_returns_compact_records_without_transcripts` | Collection metadata is returned for each requested collection. | Collection inspection does not read per-pane transcripts or inflate output to single-target detail. |
 | Health includes version and protocol | `inspect_health_returns_version_and_protocol` | Health details contain both fields from the CLI. | Health does not mutate Herdr or invent a protocol value when absent. |
 | Prompt fails while target is working | `communicate_prompt_rejects_working_agent_without_mutation` | A structured precondition failure is returned. | No prompt, interrupt, focus, or confirmation occurs. |
-| Steer is state-aware and prompts only after a working target settles | `communicate_steer_direct_for_idle_done_blocked`; `communicate_steer_interrupts_working_then_waits`; `communicate_steer_settle_failure_sends_no_prompt` | Idle/done/blocked steer is direct; working steer is named Escape, bounded settle wait, then prompt. | Unknown/malformed state sends zero bytes; prompt never precedes a successful settle acknowledgement. |
-| Prompt/steer verify working but do not wait completion | `communicate_prompt_verifies_working_without_waiting_completion`; `communicate_steer_verifies_working_without_waiting_completion` | The post-read shows `working` and operation IDs correlate each Herdr envelope. | Normal prompt refuses working; steer only waits for interrupt settlement, never completion. |
-| Communicate uses named keys and no confirmation | `communicate_uses_named_keys_only`; `communicate_never_calls_confirmation_ui` | Only validated named keys and canonical `esc` are sent. | No raw escape bytes, arbitrary key bytes, or UI confirmation is sent. |
+| Steer submits directly without interruption | `communicate_steer_direct_for_idle_done_blocked_working`; `communicate_steer_never_sends_escape` | Idle/done/blocked/working steer submits through `agent prompt`; working input is interpreted by the target agent TUI. | Unknown/malformed state sends zero bytes; no steer path sends Escape or waits for settlement. |
+| Prompt/steer verify working but do not wait completion | `communicate_prompt_verifies_working_without_waiting_completion`; `communicate_steer_verifies_working_without_waiting_completion` | The post-read shows `working` and operation IDs correlate each Herdr envelope. | Normal prompt refuses working; steer submits directly and never waits for completion. |
+| Communicate uses named keys and no confirmation | `communicate_uses_named_keys_only`; `communicate_never_calls_confirmation_ui` | Only caller-requested validated named keys are sent. | No synthesized Escape, raw control bytes, arbitrary key bytes, or UI confirmation is sent. |
 | Wait supports single and multi-target any/all | `wait_supports_single_target`; `wait_multi_target_any_returns_first_match`; `wait_multi_target_all_waits_for_every_match` | The matching target set and snapshots are returned. | Any does not wait for unrelated targets; all does not return before every target matches. |
 | Wait supports semantic and raw conditions | `wait_matches_semantic_condition`; `wait_matches_raw_literal`; `wait_matches_raw_regex`; `wait_combines_raw_and_semantic_conditions` | A condition is satisfied only by the requested predicate. | Status is not inferred from text, and literal matching is not accidentally regex matching. |
 | Wait timeout is explicit and capped | `wait_requires_explicit_timeout`; `wait_accepts_timeout_of_3600_seconds`; `wait_rejects_timeout_above_3600_seconds` | Valid timeout starts bounded polling. | Missing, zero/invalid, or over-limit timeout starts no poll or reviewer. |
@@ -468,12 +468,11 @@ uses the validated snapshot captured at its start.
 - `communicate_prompt_rejects_working_agent_without_mutation`
 - `communicate_prompt_sends_text_without_wait_flags`
 - `communicate_prompt_verifies_working_without_waiting_completion`
-- `communicate_steer_direct_for_idle_done_blocked`
-- `communicate_steer_sends_named_interrupt_wait_before_prompt`
-- `communicate_steer_uses_named_keys_only`
+- `communicate_steer_direct_for_idle_done_blocked_working`
+- `communicate_steer_never_sends_escape`
+- `communicate_steer_uses_prompt_submission`
 - `communicate_unknown_state_sends_no_bytes`
 - `communicate_does_not_prompt_after_resolution_failure`
-- `communicate_does_not_prompt_after_interrupt_failure`
 - `communicate_completion_race_returns_verified_working_or_truthful_error`
 
 ### `wait-predicates.test.ts`, `wait-orchestration.test.ts`, and `herdr_wait`
@@ -654,9 +653,9 @@ refactor while all prior tests remain green.
 4. **Inspect.** Implement single-target metadata plus exactly 100
    `recent-unwrapped` lines, compact collections, and health version/protocol.
    Confirm inspect has no mutation or focus path.
-5. **Communicate.** Implement state-aware prompt/steer preconditions, named
-   interrupt plus bounded settle wait for working steer, authoritative working
-   verification, envelope correlation, no completion wait, and no UI confirmation.
+5. **Communicate.** Implement state-aware prompt/steer preconditions, direct
+   prompt submission for steer without synthesized interrupt keys, authoritative
+   working verification, envelope correlation, no completion wait, and no UI confirmation.
 6. **Pane/tab creation.** Implement required labels, right/down direction,
    explicit focus, current cwd/workspace defaults, returned IDs, post-reads, and
    no implicit-close behavior.

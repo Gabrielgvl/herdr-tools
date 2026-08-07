@@ -1,7 +1,9 @@
 # ADR-003: State-aware communication and reconciled autonomous close
 
 ## Status
-Accepted
+Accepted for close reliability; communication/steer decision superseded by ADR-004
+
+> **Supersession:** The steer/interrupt decision and consequences below are historical and must not be implemented. ADR-004 is authoritative for communication. The close-reliability decision remains active.
 
 ## Date
 2026-08-07

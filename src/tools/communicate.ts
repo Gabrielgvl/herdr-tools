@@ -4,7 +4,7 @@ import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../
 import { parseSnapshotResult, resolveTarget, type CurrentContext } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
-export type CommunicateRoute = "prompt_direct" | "interrupt_then_prompt";
+export type CommunicateRoute = "prompt_direct" | "steer_direct";
 export type CommunicateState = "idle" | "working" | "blocked" | "done" | "unknown";
 
 export interface CommunicateDetails {
@@ -17,8 +17,6 @@ export interface CommunicateDetails {
   operationIds: {
     snapshot?: string;
     preState?: string;
-    interrupt?: string;
-    settleWait?: string;
     prompt?: string;
     keys?: string;
     postState?: string;
@@ -81,29 +79,6 @@ function assertPostState(pane: Record<string, unknown>): CommunicateState {
   return state;
 }
 
-function assertSettleAcknowledgement(envelope: JsonEnvelope, targetId: string): void {
-  if (typeof envelope.result !== "object" || envelope.result === null || Array.isArray(envelope.result)) {
-    throw Object.assign(new Error("Herdr returned an invalid settled-state acknowledgement"), {
-      code: "SETTLE_FAILED",
-      details: { target: targetId, operationId: envelope.id }
-    });
-  }
-  const result = envelope.result as Record<string, unknown>;
-  const agent = result.agent;
-  const acknowledged = result.type === "agent_info"
-    && typeof agent === "object"
-    && agent !== null
-    && !Array.isArray(agent)
-    && (agent as Record<string, unknown>).pane_id === targetId
-    && ["idle", "done", "blocked"].includes(String((agent as Record<string, unknown>).agent_status));
-  if (!acknowledged) {
-    throw Object.assign(new Error("Herdr did not acknowledge the requested settled state"), {
-      code: "SETTLE_FAILED",
-      details: { target: targetId, operationId: envelope.id, result: compactPane(typeof agent === "object" && agent !== null && !Array.isArray(agent) ? agent as Record<string, unknown> : {}) }
-    });
-  }
-}
-
 function operationId(envelope: JsonEnvelope | undefined): string | undefined {
   return envelope?.id;
 }
@@ -131,22 +106,13 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: target.paneId, state: beforeState } });
       }
 
-      let interrupt: JsonEnvelope | undefined;
-      let settleWait: JsonEnvelope | undefined;
       let prompt: JsonEnvelope | undefined;
       let keys: JsonEnvelope | undefined;
       let route: CommunicateRoute | undefined;
       if (params.operation === "keys") {
         keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...params.keys], activeSignal);
       } else {
-        if (params.operation === "steer" && beforeState === "working") {
-          route = "interrupt_then_prompt";
-          interrupt = await deps.cli.runJson(["agent", "send-keys", target.paneId!, "esc"], activeSignal);
-          settleWait = await deps.cli.runJson(["agent", "wait", target.paneId!, "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", "5000"], activeSignal);
-          assertSettleAcknowledgement(settleWait, target.paneId!);
-        } else {
-          route = "prompt_direct";
-        }
+        route = params.operation === "steer" ? "steer_direct" : "prompt_direct";
         prompt = await deps.cli.runJson(["agent", "prompt", target.paneId!, params.text, "--wait", "--until", "working", "--timeout", "5000"], activeSignal);
       }
 
@@ -167,8 +133,6 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         operationIds: {
           snapshot: operationId(snapshotEnvelope),
           preState: operationId(preEnvelope),
-          ...(interrupt ? { interrupt: operationId(interrupt) } : {}),
-          ...(settleWait ? { settleWait: operationId(settleWait) } : {}),
           ...(prompt ? { prompt: operationId(prompt) } : {}),
           ...(keys ? { keys: operationId(keys) } : {}),
           postState: operationId(postEnvelope)

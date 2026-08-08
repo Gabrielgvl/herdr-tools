@@ -152,7 +152,7 @@ describe("profile catalog", () => {
     expect((await discoverProfiles({ bundledDir: join(root, "missing-bundled"), userDir: join(root, "missing-user"), projectCwd: fileProject })).effective.size).toBe(1);
     const fileProjectCatalog = await discoverProfiles({ bundledDir: join(root, "missing-bundled"), userDir: join(root, "missing-user"), projectCwd: join(fileProject, ".pi", "herdr-profiles", "nested") });
     expect(fileProjectCatalog.unreadableScopes).toEqual(["project"]);
-    expect(fileProjectCatalog.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "DISCOVERY_ERROR" })]));
+    expect(fileProjectCatalog.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "DISCOVERY_ERROR", path: join(fileProject, ".pi", "herdr-profiles", "nested", ".pi", "herdr-profiles"), source: expect.objectContaining({ scopeRoot: join(fileProject, ".pi", "herdr-profiles", "nested") }) })]));
     const lowerInvalid = join(root, "lower-invalid");
     const higherValid = join(root, "higher-valid");
     await mkdir(lowerInvalid, { recursive: true });
@@ -190,9 +190,16 @@ describe("profile catalog", () => {
     const bounded = await discoverProfiles({ bundledDir: manyInvalid, userDir: join(root, "missing-user") });
     expect(bounded.diagnostics.length).toBe(32);
     expect(await profileCatalog({ bundledDir: join(root, "missing-bundled") })()).toMatchObject({ effective: expect.any(Map) });
-    const permissionCatalog = await discoverProfiles({ bundledDir: lowerScope, userDir: join(root, "missing-user"), projectCwd: nested, projectStat: async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); } });
+    const statPaths: string[] = [];
+    const permissionCatalog = await discoverProfiles({ bundledDir: lowerScope, userDir: join(root, "missing-user"), projectCwd: nested, projectStat: async (path) => {
+      statPaths.push(path);
+      if (path === join(root, "a", "b", ".pi", "herdr-profiles")) throw Object.assign(new Error("not found"), { code: "ENOENT" });
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    } });
+    const failedCandidate = join(root, "a", ".pi", "herdr-profiles");
+    expect(statPaths).toEqual([join(root, "a", "b", ".pi", "herdr-profiles"), failedCandidate]);
     expect(permissionCatalog.unreadableScopes).toEqual(["project"]);
-    expect(permissionCatalog.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "DISCOVERY_ERROR", path: join(root, "a", "b", ".pi", "herdr-profiles") })]));
+    expect(permissionCatalog.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "DISCOVERY_ERROR", path: failedCandidate, source: expect.objectContaining({ scopeRoot: join(root, "a") }) })]));
     expect(() => resolveProfile("worker", permissionCatalog)).toThrow(/unreadable project/);
   });
 
@@ -233,6 +240,7 @@ describe("profile catalog", () => {
     expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, {}, "bad\npath")).toThrow();
     expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { thinking: "invalid" as never })).toThrow();
     expect(() => buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, { effort: "invalid" as never })).toThrow();
+    expect(() => buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, false)).toThrow(/sessionPersistence/);
     expect(() => buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, { permissionMode: "invalid" as never })).toThrow();
     expect(buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, { permissionMode: "bypassPermissions" })).toContain("--allow-dangerously-skip-permissions");
     expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { tools: ["bad\nvalue"] })).toThrow();

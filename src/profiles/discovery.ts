@@ -30,6 +30,14 @@ async function filesIn(directory: string): Promise<string[]> {
   }
 }
 
+class ProjectScopeDiscoveryError extends Error {
+  readonly code = "PROJECT_SCOPE_DISCOVERY_ERROR" as const;
+  constructor(readonly candidatePath: string, readonly scopeRoot: string, cause: unknown) {
+    super(String(cause));
+    this.name = "ProjectScopeDiscoveryError";
+  }
+}
+
 async function existingNearestProjectDir(cwd: string, stat: (path: string) => Promise<{ isDirectory(): boolean }> = fs.stat): Promise<string | undefined> {
   let current = resolve(cwd);
   while (true) {
@@ -38,7 +46,11 @@ async function existingNearestProjectDir(cwd: string, stat: (path: string) => Pr
       const result = await stat(candidate);
       if (result.isDirectory()) return candidate;
     } catch (error) {
-      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        // Continue searching ancestors when this candidate simply does not exist.
+      } else {
+        throw new ProjectScopeDiscoveryError(candidate, resolve(join(candidate, "..", "..")), error);
+      }
     }
     const parent = dirname(current);
     if (parent === current) return undefined;
@@ -101,12 +113,12 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
   const home = options.userHome ?? homedir();
   const userDir = options.userDir ?? join(home, ".pi", "agent", "herdr-profiles");
   let projectDir = options.projectDir;
-  let projectDiscoveryError: unknown;
+  let projectDiscoveryError: ProjectScopeDiscoveryError | undefined;
   if (!projectDir && options.projectCwd) {
     try {
       projectDir = await existingNearestProjectDir(options.projectCwd, options.projectStat);
     } catch (error) {
-      projectDiscoveryError = error;
+      projectDiscoveryError = error as ProjectScopeDiscoveryError;
     }
   }
   const sources: Array<[ProfileSourceKind, string, string]> = [
@@ -114,11 +126,9 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
     ["user", resolve(userDir), resolve(options.userScopeRoot ?? join(home, ".pi", "agent"))],
   ];
   if (projectDir) sources.push(["project", resolve(projectDir), resolve(options.projectRoot ?? join(projectDir, "..", ".."))]);
-  if (projectDiscoveryError !== undefined && options.projectCwd) {
-    const projectPath = join(resolve(options.projectCwd), ".pi", "herdr-profiles");
-    const projectRoot = resolve(options.projectRoot ?? join(resolve(options.projectCwd), "..", ".."));
-    const source = profileSource("project", projectPath, projectRoot);
-    addDiagnostic(diagnostics, { code: "DISCOVERY_ERROR", message: String(projectDiscoveryError), path: projectPath, source });
+  if (projectDiscoveryError) {
+    const source = profileSource("project", projectDiscoveryError.candidatePath, projectDiscoveryError.scopeRoot);
+    addDiagnostic(diagnostics, { code: "DISCOVERY_ERROR", message: projectDiscoveryError.message, path: projectDiscoveryError.candidatePath, source });
     unreadableScopes.push("project");
   }
   for (const [kind, directory, scopeRoot] of sources) {

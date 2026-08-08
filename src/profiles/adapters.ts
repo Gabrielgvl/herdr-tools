@@ -83,6 +83,7 @@ export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>
 }
 
 export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
+  if (!sessionPersistence) throw new ProfileAdapterError("Claude profiles must set sessionPersistence to true for interactive launches");
   rejectIncompatible("claude", overrides as Record<string, unknown>);
   const args = ["--model", model(overrides.model, profile.model), "--effort", effort(overrides.effort, profile.effort), ...permissionArgs(permissionMode(overrides.permissionMode, profile.permissionMode)), ...repeated("--allowed-tools", values(overrides.allowedTools, profile.allowedTools)), ...repeated("--disallowed-tools", values(overrides.disallowedTools, profile.disallowedTools)), ...repeated("--add-dir", scopedValues(overrides.addDirs, profile.addDirs, "overrides.addDirs", scopeRoot)), ...repeated("--plugin-dir", scopedValues(overrides.pluginDirs, profile.pluginDirs, "overrides.pluginDirs", scopeRoot))];
   return [...args, ...promptFileArg("--append-system-prompt-file", promptFilePath)];

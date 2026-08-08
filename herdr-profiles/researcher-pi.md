@@ -1,13 +1,13 @@
 ---
 name: researcher-pi
 description: Research a focused technical question and return bounded cited findings.
+timeoutMinutes: 30
+sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna
   thinking: medium
-  extensions: []
-  skills: []
-fallbacks:
+fallbackProfiles:
   - researcher-claude
 ---
 

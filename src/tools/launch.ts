@@ -42,7 +42,7 @@ export interface LaunchDetails extends LaunchResourceIds {
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
   envelope?: { version: "v1"; kind: "assignment" };
-  profile?: { name: string; source: { kind: string; path: string }; fallbackNames: string[]; reachableNames: string[] };
+  profile?: { name: string; source: { kind: string; path: string }; timeoutMinutes: number; sessionPersistence: boolean; fallbackProfiles: string[]; reachableNames: string[] };
 }
 
 class LaunchError extends Error {
@@ -74,7 +74,7 @@ function validateParams(params: LaunchParams): void {
   if (profileMode && (params.argv !== undefined || params.env !== undefined)) throw new LaunchError("INVALID_INPUT", "profile launches do not accept raw argv or environment overrides");
   if (profileMode && params.overrides !== undefined) {
     if (!record(params.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
-    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "permissionMode"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
+    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
     if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
   }
   if (!profileMode && params.overrides !== undefined) throw new LaunchError("INVALID_INPUT", "overrides are only valid for profile launches");
@@ -330,7 +330,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
             envelope: { version: "v1" as const, kind: "assignment" as const }
           } : {}),
-          ...(profileResolution ? { profile: { name: profileResolution.profile.name, source: { kind: profileResolution.profile.source.kind, path: profileResolution.profile.source.path }, fallbackNames: [...profileResolution.fallbackNames], reachableNames: [...profileResolution.reachableNames] } } : {})
+          ...(profileResolution ? { profile: { name: profileResolution.profile.name, source: { kind: profileResolution.profile.source.kind, path: profileResolution.profile.source.path }, timeoutMinutes: profileResolution.profile.timeoutMinutes, sessionPersistence: profileResolution.profile.sessionPersistence, fallbackProfiles: [...profileResolution.fallbackProfiles], reachableNames: [...profileResolution.reachableNames] } } : {})
         };
         return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId }) }], details };
       } catch (error) {

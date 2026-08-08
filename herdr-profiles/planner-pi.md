@@ -1,13 +1,13 @@
 ---
 name: planner-pi
 description: Plan implementation work from repository evidence and explicit constraints.
+timeoutMinutes: 30
+sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-sol
   thinking: high
-  extensions: []
-  skills: []
-fallbacks:
+fallbackProfiles:
   - planner-claude
 ---
 

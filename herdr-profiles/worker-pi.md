@@ -1,13 +1,13 @@
 ---
 name: worker-pi
 description: Implement a scoped repository change with tests and verification.
+timeoutMinutes: 30
+sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna
   thinking: high
-  extensions: []
-  skills: []
-fallbacks:
+fallbackProfiles:
   - worker-claude
 ---
 

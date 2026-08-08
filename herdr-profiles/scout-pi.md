@@ -1,13 +1,13 @@
 ---
 name: scout-pi
 description: Fast repository reconnaissance with bounded findings for handoff.
+timeoutMinutes: 30
+sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna
   thinking: medium
-  extensions: []
-  skills: []
-fallbacks:
+fallbackProfiles:
   - scout-claude
 ---
 

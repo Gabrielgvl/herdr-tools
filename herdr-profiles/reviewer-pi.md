@@ -1,13 +1,13 @@
 ---
 name: reviewer-pi
 description: Review repository changes for correctness, safety, and contract regressions.
+timeoutMinutes: 30
+sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-sol
   thinking: high
-  extensions: []
-  skills: []
-fallbacks:
+fallbackProfiles:
   - reviewer-claude
 ---
 

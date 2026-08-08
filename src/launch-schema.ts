@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudePermissionMode, type ThinkingLevel } from "./profiles/types.js";
+import { CLAUDE_EFFORTS, THINKING_LEVELS, type ClaudeEffort, type ThinkingLevel } from "./profiles/types.js";
 
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
 const AgentArgument = Type.String({ pattern: "^[^\\u0000]*$" });
@@ -21,7 +21,7 @@ export const LaunchPlacementSchema = Type.Union([
 export const ProfileLaunchOverridesSchema = Type.Object({
   model: Type.Optional(Identifier),
   thinking: Type.Optional(StringEnum(THINKING_LEVELS)),
-  permissionMode: Type.Optional(StringEnum(CLAUDE_PERMISSION_MODES))
+  effort: Type.Optional(StringEnum(CLAUDE_EFFORTS))
 }, { additionalProperties: false });
 
 export const LaunchParamsSchema = Type.Object({
@@ -46,7 +46,7 @@ export type LaunchPlacement =
 export interface ProfileLaunchOverrides {
   model?: string;
   thinking?: ThinkingLevel;
-  permissionMode?: ClaudePermissionMode;
+  effort?: ClaudeEffort;
 }
 
 export interface LaunchParams {

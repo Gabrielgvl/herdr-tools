@@ -66,8 +66,10 @@ function compactProfile(profile: Profile): Record<string, unknown> {
     description: profile.description,
     kind: profile.runtime.kind,
     model: profile.runtime.model,
-    ...(profile.runtime.kind === "pi" ? { thinking: profile.runtime.thinking } : { permissionMode: profile.runtime.permissionMode }),
-    fallbackNames: [...profile.fallbacks],
+    ...(profile.runtime.kind === "pi" ? { thinking: profile.runtime.thinking } : { effort: profile.runtime.effort }),
+    timeoutMinutes: profile.timeoutMinutes,
+    sessionPersistence: profile.sessionPersistence,
+    fallbackProfiles: [...profile.fallbackProfiles],
     source: sourceDetails(profile)
   };
 }
@@ -75,8 +77,8 @@ function compactProfile(profile: Profile): Record<string, unknown> {
 function profileCollection(catalog: ProfileCatalog): Record<string, unknown>[] {
   const entries = new Map<string, Record<string, unknown>>();
   for (const candidate of catalog.candidates) {
-    if (candidate.profile && catalog.effective.get(candidate.name) === candidate.profile) entries.set(candidate.name, compactProfile(candidate.profile));
-    else if (!entries.has(candidate.name)) entries.set(candidate.name, { name: candidate.name, valid: false, source: { kind: candidate.source.kind, path: candidate.source.path }, diagnostic: candidate.diagnostic?.message ?? "invalid profile" });
+    if (candidate.profile && catalog.effective.get(candidate.name) === candidate.profile && !catalog.blocked?.has(candidate.name)) entries.set(candidate.name, compactProfile(candidate.profile));
+    else if (!entries.has(candidate.name)) entries.set(candidate.name, { name: candidate.name, valid: false, source: { kind: candidate.source.kind, path: candidate.source.path }, diagnostic: candidate.diagnostic?.message ?? (catalog.blocked?.has(candidate.name) ? "blocked by invalid higher-precedence profile" : "invalid profile") });
   }
   return [...entries.values()].sort((left, right) => String(left.name).localeCompare(String(right.name))).slice(0, MAX_PROFILE_LIST_ITEMS);
 }
@@ -86,9 +88,9 @@ function exactProfile(catalog: ProfileCatalog, name: string): Record<string, unk
   const profile = resolution.profile;
   return {
     ...compactProfile(profile),
-    runtime: { ...profile.runtime, extensions: [...profile.runtime.extensions], skills: [...profile.runtime.skills] },
+    runtime: { ...profile.runtime },
     body: profile.body.length > MAX_PROFILE_BODY_OUTPUT ? `${profile.body.slice(0, MAX_PROFILE_BODY_OUTPUT)}\n[profile body truncated]` : profile.body,
-    fallbackNames: [...resolution.fallbackNames],
+    fallbackProfiles: [...resolution.fallbackProfiles],
     reachableNames: [...resolution.reachableNames]
   };
 }

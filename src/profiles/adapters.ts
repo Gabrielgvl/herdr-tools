@@ -1,5 +1,4 @@
-import { resolve } from "node:path";
-import { CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudePermissionMode, type PiRuntimeOverrides, type Profile, type RuntimeOverrides, type ThinkingLevel } from "./types.js";
+import { CLAUDE_EFFORTS, THINKING_LEVELS, type ClaudeRuntimeOverrides, type ClaudeEffort, type PiRuntimeOverrides, type Profile, type RuntimeOverrides, type ThinkingLevel } from "./types.js";
 
 export class ProfileAdapterError extends Error {
   readonly code = "INVALID_PROFILE_OVERRIDE" as const;
@@ -21,34 +20,29 @@ function thinking(value: unknown, fallback: ThinkingLevel): ThinkingLevel {
   return result as ThinkingLevel;
 }
 
-function permissionMode(value: unknown, fallback: ClaudePermissionMode): ClaudePermissionMode {
+function effort(value: unknown, fallback: ClaudeEffort): ClaudeEffort {
   const result = value ?? fallback;
-  if (!CLAUDE_PERMISSION_MODES.includes(result as ClaudePermissionMode)) throw new ProfileAdapterError("permissionMode override is invalid");
-  return result as ClaudePermissionMode;
+  if (!CLAUDE_EFFORTS.includes(result as ClaudeEffort)) throw new ProfileAdapterError("effort override is invalid");
+  return result as ClaudeEffort;
 }
 
-function resourceArgs(flag: string, values: readonly string[]): string[] {
-  return values.flatMap((value) => [flag, resolve(value)]);
-}
-
-export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, overrides: PiRuntimeOverrides = {}, systemPrompt?: string): string[] {
-  const args = ["--model", model(overrides.model, profile.model), "--thinking", thinking(overrides.thinking, profile.thinking), ...resourceArgs("--extension", profile.extensions), ...resourceArgs("--skill", profile.skills)];
+export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, sessionPersistence: boolean, overrides: PiRuntimeOverrides = {}, systemPrompt?: string): string[] {
+  const args = ["--model", model(overrides.model, profile.model), "--thinking", thinking(overrides.thinking, profile.thinking)];
+  if (!sessionPersistence) args.push("--no-session");
   return systemPrompt === undefined ? args : [...args, "--append-system-prompt", systemPrompt];
 }
 
-export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, overrides: RuntimeOverrides = {}, systemPrompt?: string): string[] {
-  const selected = permissionMode("permissionMode" in overrides ? overrides.permissionMode : undefined, profile.permissionMode);
-  const args = ["--model", model(overrides.model, profile.model), "--permission-mode", selected];
-  if (selected === "bypassPermissions") args.push("--dangerously-skip-permissions");
-  const resources = [...args, ...resourceArgs("--extension", profile.extensions), ...resourceArgs("--skill", profile.skills)];
-  return systemPrompt === undefined ? resources : [...resources, "--append-system-prompt", systemPrompt];
+export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, systemPrompt?: string): string[] {
+  const args = ["--model", model(overrides.model, profile.model), "--effort", effort(overrides.effort, profile.effort)];
+  if (!sessionPersistence) args.push("--no-session-persistence");
+  return systemPrompt === undefined ? args : [...args, "--append-system-prompt", systemPrompt];
 }
 
 export function buildProfileArgv(profile: Profile, overrides: RuntimeOverrides = {}): string[] {
   if (profile.runtime.kind === "pi") {
-    if ("permissionMode" in overrides && overrides.permissionMode !== undefined) throw new ProfileAdapterError("permissionMode is only valid for Claude profiles");
-    return buildPiArgv(profile.runtime, overrides as PiRuntimeOverrides, profile.body);
+    if ("effort" in overrides && overrides.effort !== undefined) throw new ProfileAdapterError("effort is only valid for Claude profiles");
+    return buildPiArgv(profile.runtime, profile.sessionPersistence, overrides as PiRuntimeOverrides, profile.body);
   }
   if ("thinking" in overrides && overrides.thinking !== undefined) throw new ProfileAdapterError("thinking is only valid for Pi profiles");
-  return buildClaudeArgv(profile.runtime, overrides, profile.body);
+  return buildClaudeArgv(profile.runtime, profile.sessionPersistence, overrides as ClaudeRuntimeOverrides, profile.body);
 }

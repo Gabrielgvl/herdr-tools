@@ -10,7 +10,7 @@ export class ProfileResolutionError extends Error {
 
 function profile(catalog: ProfileCatalog, name: string): Profile {
   const value = catalog.effective.get(name);
-  if (!value) throw new ProfileResolutionError(`Unknown profile ${name}`, { name });
+  if (!value) throw new ProfileResolutionError(catalog.blocked?.has(name) ? `Profile ${name} is blocked by an invalid higher-precedence candidate` : `Unknown profile ${name}`, { name, blocked: catalog.blocked?.has(name) === true });
   return value;
 }
 
@@ -26,9 +26,9 @@ export function resolveProfile(name: string, catalog: ProfileCatalog, maxAttempt
     if (active.includes(currentName)) throw new ProfileResolutionError("Profile fallback graph contains a cycle", { name, cycle: [...active, currentName] });
     if (!reachable.includes(currentName)) reachable.push(currentName);
     active.push(currentName);
-    for (const fallback of current.fallbacks) visit(fallback, depth + 1);
+    for (const fallback of current.fallbackProfiles) visit(fallback, depth + 1);
     active.pop();
   };
   visit(root.name, 1);
-  return { profile: root, fallbackNames: [...root.fallbacks], reachableNames: reachable };
+  return { profile: root, fallbackProfiles: [...root.fallbackProfiles], reachableNames: reachable };
 }

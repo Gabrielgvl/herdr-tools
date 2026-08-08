@@ -133,7 +133,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
     ownership: new RuntimeOwnership(),
     jobs,
     settings: { load: () => loadSettings() },
-    profiles: { load: () => discoverProfiles({ bundledDir: resolve(dirname(fileURLToPath(import.meta.url)), "herdr-profiles"), projectCwd: process.cwd() }) },
+    profiles: { load: () => discoverProfiles({ bundledDir: resolve(dirname(fileURLToPath(import.meta.url)), "herdr-profiles"), bundledScopeRoot: dirname(fileURLToPath(import.meta.url)), projectCwd: process.cwd() }) },
     idsPresent: injected.idsPresent,
     idsValid: injected.idsValid,
   };

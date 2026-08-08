@@ -11,6 +11,9 @@ export class ProfileResolutionError extends Error {
 function profile(catalog: ProfileCatalog, name: string): Profile {
   const value = catalog.effective.get(name);
   if (!value) throw new ProfileResolutionError(catalog.blocked?.has(name) ? `Profile ${name} is blocked by an invalid higher-precedence candidate` : `Unknown profile ${name}`, { name, blocked: catalog.blocked?.has(name) === true });
+  const precedence: Record<Profile["source"]["kind"], number> = { bundled: 0, user: 1, project: 2 };
+  const unreadableHigherScope = catalog.unreadableScopes?.find((scope) => precedence[scope] > value.source.precedence);
+  if (unreadableHigherScope) throw new ProfileResolutionError(`Profile ${name} is blocked by unreadable ${unreadableHigherScope} profile scope`, { name, unreadableScope: unreadableHigherScope });
   return value;
 }
 
@@ -24,7 +27,10 @@ export function resolveProfile(name: string, catalog: ProfileCatalog, maxAttempt
     if (depth > maxAttempts) throw new ProfileResolutionError("Profile fallback graph exceeds the attempt limit", { name, maxAttempts, path: [...active, currentName] });
     const current = profile(catalog, currentName);
     if (active.includes(currentName)) throw new ProfileResolutionError("Profile fallback graph contains a cycle", { name, cycle: [...active, currentName] });
-    if (!reachable.includes(currentName)) reachable.push(currentName);
+    if (!reachable.includes(currentName)) {
+      if (reachable.length >= maxAttempts) throw new ProfileResolutionError("Profile fallback graph exceeds the attempt limit", { name, maxAttempts, path: [...active, currentName] });
+      reachable.push(currentName);
+    }
     active.push(currentName);
     for (const fallback of current.fallbackProfiles) visit(fallback, depth + 1);
     active.pop();

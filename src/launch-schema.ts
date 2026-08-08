@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { CLAUDE_EFFORTS, THINKING_LEVELS, type ClaudeEffort, type ThinkingLevel } from "./profiles/types.js";
+import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type ThinkingLevel } from "./profiles/types.js";
 
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
 const AgentArgument = Type.String({ pattern: "^[^\\u0000]*$" });
@@ -18,10 +18,20 @@ export const LaunchPlacementSchema = Type.Union([
   Type.Object({ mode: Type.Literal("existing_pane"), target: Identifier }, { additionalProperties: false })
 ]);
 
+const ProfileValues = Type.Array(Identifier);
+
 export const ProfileLaunchOverridesSchema = Type.Object({
   model: Type.Optional(Identifier),
   thinking: Type.Optional(StringEnum(THINKING_LEVELS)),
-  effort: Type.Optional(StringEnum(CLAUDE_EFFORTS))
+  effort: Type.Optional(StringEnum(CLAUDE_EFFORTS)),
+  tools: Type.Optional(ProfileValues),
+  extensions: Type.Optional(ProfileValues),
+  skills: Type.Optional(ProfileValues),
+  permissionMode: Type.Optional(StringEnum(CLAUDE_PERMISSION_MODES)),
+  allowedTools: Type.Optional(ProfileValues),
+  disallowedTools: Type.Optional(ProfileValues),
+  addDirs: Type.Optional(ProfileValues),
+  pluginDirs: Type.Optional(ProfileValues)
 }, { additionalProperties: false });
 
 export const LaunchParamsSchema = Type.Object({
@@ -47,6 +57,14 @@ export interface ProfileLaunchOverrides {
   model?: string;
   thinking?: ThinkingLevel;
   effort?: ClaudeEffort;
+  tools?: string[];
+  extensions?: string[];
+  skills?: string[];
+  permissionMode?: ClaudePermissionMode;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  addDirs?: string[];
+  pluginDirs?: string[];
 }
 
 export interface LaunchParams {

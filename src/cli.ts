@@ -108,7 +108,7 @@ export class HerdrCli {
   private async runRaw(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<ExecResult> {
     if (signal.aborted) throw new CliProtocolError("ABORTED", "Operation aborted");
     try {
-      const timeout = argv[0] === "agent" && argv[1] === "start" ? Math.max(this.timeout, 30_000) : this.timeout;
+      const timeout = argv[0] === "agent" && argv[1] === "start" ? Math.max(this.timeout, 120_000) : this.timeout;
       const result = await this.exec("herdr", argv, { signal, timeout });
       if (signal.aborted && !preserveCompletedMutation) throw new CliProtocolError("ABORTED", "Operation aborted");
       return result;

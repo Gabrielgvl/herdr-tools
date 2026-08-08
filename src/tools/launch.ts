@@ -5,7 +5,7 @@ import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.j
 import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { isLaunchAgentKind, LaunchParamsSchema, type LaunchParams, type LaunchPlacement } from "../launch-schema.js";
-import { buildProfileArgv, resolveProfile, type ProfileCatalog, type ProfileResolution } from "../profiles/index.js";
+import { buildProfileArgv, defaultPromptFileFactory, resolveProfile, type ProfileCatalog, type ProfileResolution, type PromptFileFactory } from "../profiles/index.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -21,6 +21,7 @@ export interface LaunchDependencies {
   cwd?: string;
   ownership?: LaunchResourceRegistry;
   profiles?: { load: () => Promise<ProfileCatalog> };
+  promptFiles?: PromptFileFactory;
 }
 
 export interface LaunchResourceIds {
@@ -74,8 +75,12 @@ function validateParams(params: LaunchParams): void {
   if (profileMode && (params.argv !== undefined || params.env !== undefined)) throw new LaunchError("INVALID_INPUT", "profile launches do not accept raw argv or environment overrides");
   if (profileMode && params.overrides !== undefined) {
     if (!record(params.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
-    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
+    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort", "tools", "extensions", "skills", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
     if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
+    for (const key of ["tools", "extensions", "skills", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"] as const) {
+      const value = params.overrides[key];
+      if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0 || /[\0\r\n]/.test(item)))) throw new LaunchError("INVALID_INPUT", `overrides.${key} must be non-empty strings without NUL or newlines`);
+    }
   }
   if (!profileMode && params.overrides !== undefined) throw new LaunchError("INVALID_INPUT", "overrides are only valid for profile launches");
   if (params.argv !== undefined && (!Array.isArray(params.argv) || params.argv.some((arg) => typeof arg !== "string" || /\0/.test(arg)))) {
@@ -239,9 +244,10 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       if (params.profile !== undefined) {
         if (!deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
         profileResolution = resolveProfile(params.profile, await deps.profiles.load());
+        buildProfileArgv(profileResolution.profile, params.overrides);
       }
       const effectiveKind = profileResolution?.profile.runtime.kind ?? params.kind!;
-      const effectiveArgv = profileResolution ? buildProfileArgv(profileResolution.profile, params.overrides) : params.argv;
+      const effectiveArgv = profileResolution ? undefined : params.argv;
       const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
       const sender = params.initialPrompt !== undefined ? resolveSender(snapshot, deps.context.paneId) : undefined;
       assertCurrentContext(snapshot, deps.context);
@@ -288,9 +294,22 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         }
         phase = "agent_start";
         progress(onUpdate, phase, created);
-        const startArgs = ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "30000"];
-        if (effectiveArgv !== undefined && effectiveArgv.length > 0) startArgs.push("--", ...effectiveArgv);
-        const started = await run(deps.cli, startArgs, abortSignal, true);
+        const promptFiles = deps.promptFiles ?? defaultPromptFileFactory;
+        let promptFile: Awaited<ReturnType<PromptFileFactory["create"]>> | undefined;
+        let started: unknown;
+        try {
+          if (profileResolution) {
+            promptFile = await promptFiles.create(profileResolution.profile.body);
+            const argv = buildProfileArgv(profileResolution.profile, params.overrides, promptFile.path);
+            started = await run(deps.cli, ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000", "--", ...argv], abortSignal, true);
+          } else {
+            const startArgs = ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000"];
+            if (effectiveArgv !== undefined && effectiveArgv.length > 0) startArgs.push("--", ...effectiveArgv);
+            started = await run(deps.cli, startArgs, abortSignal, true);
+          }
+        } finally {
+          await promptFile?.cleanup();
+        }
         const startedAgent = agentIdentity(started);
         let agentId = startedAgent.agentId;
         const returnedName = startedAgent.name;

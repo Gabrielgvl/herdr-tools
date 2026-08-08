@@ -55,7 +55,7 @@ describe("herdr_launch", () => {
       ["api", "snapshot"],
       ["pane", "split", "--current", "--direction", "right", "--no-focus", "--cwd", "/repo"],
       ["pane", "rename", "w1:p2", "worker"],
-      ["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "fast mode"],
+      ["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "fast mode"],
       ["pane", "get", "w1:p2"]
     ]);
     expect(result.details).toMatchObject({ outcome: "launched", name: "worker", kind: "pi", paneId: "w1:p2", tabId: "w1:t1", agentId: "agent-7", postState: { agent_status: "working" } });
@@ -136,7 +136,7 @@ describe("herdr_launch", () => {
       ["api", "snapshot"],
       ["tab", "create", "--workspace", "w1", "--cwd", "/repo", "--label", "agents", "--focus"],
       ["pane", "rename", "w1:p3", "worker"],
-      ["agent", "start", "worker", "--kind", "claude", "--pane", "w1:p3", "--timeout", "30000"],
+      ["agent", "start", "worker", "--kind", "claude", "--pane", "w1:p3", "--timeout", "120000"],
       ["pane", "get", "w1:p3"]
     ]);
     expect(calls.some((call) => call[0] === "tab" && call[1] === "get")).toBe(false);
@@ -159,7 +159,7 @@ describe("herdr_launch", () => {
   it("sends an initial prompt only after start and verifies working", async () => {
     const { promise, calls } = launch({ initialPrompt: "begin" });
     const result = await promise;
-    expect(calls[3]).toEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "30000"]);
+    expect(calls[3]).toEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000"]);
     expect(calls[4]).toEqual(["agent", "prompt", "w1:p2", assignmentEnvelope("begin"), "--wait", "--until", "working", "--timeout", "5000"]);
     expect(calls[5]).toEqual(["pane", "get", "w1:p2"]);
     expect(result.details).toMatchObject({ postState: { agent_status: "working" }, initialPromptSent: true, envelope: { version: "v1", kind: "assignment" }, sender: { paneId: "w1:p1", display: "caller" } });

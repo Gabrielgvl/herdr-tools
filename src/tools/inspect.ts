@@ -3,7 +3,8 @@ import type { HerdrCli } from "../cli.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
 import { assertCurrentContext, parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
-import { resolveProfile, type Profile, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS } from "../profiles/index.js";
+import { resolveProfile, type Profile, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
+import { boundedText } from "../job-registry.js";
 
 interface InspectDetails {
   operation: "inspect";
@@ -57,42 +58,150 @@ function compactCollection(snapshot: HerdrSnapshot, collection: "panes" | "agent
 }
 
 function sourceDetails(profile: Profile): Record<string, unknown> {
-  return { kind: profile.source.kind, path: profile.source.path, scopeRoot: profile.source.scopeRoot, precedence: profile.source.precedence };
+  return { kind: boundedText(profile.source.kind, 32), path: boundedText(profile.source.path, 512), scopeRoot: boundedText(profile.source.scopeRoot, 512), precedence: profile.source.precedence };
+}
+
+function boundedValues(values: readonly string[], limit = 16, fieldLimit = 256): string[] {
+  return values.slice(0, limit).map((value) => boundedText(value, fieldLimit));
 }
 
 function compactProfile(profile: Profile): Record<string, unknown> {
+  const runtime = profile.runtime.kind === "pi"
+    ? {
+      thinking: profile.runtime.thinking,
+      tools: boundedValues(profile.runtime.tools, 32, 128),
+      extensions: boundedValues(profile.runtime.extensions, 16, 512),
+      skills: boundedValues(profile.runtime.skills, 16, 512)
+    }
+    : {
+      effort: profile.runtime.effort,
+      permissionMode: profile.runtime.permissionMode,
+      allowedTools: boundedValues(profile.runtime.allowedTools, 32, 128),
+      disallowedTools: boundedValues(profile.runtime.disallowedTools, 16, 128),
+      addDirs: boundedValues(profile.runtime.addDirs, 16, 512),
+      pluginDirs: boundedValues(profile.runtime.pluginDirs, 16, 512)
+    };
   return {
-    name: profile.name,
-    description: profile.description,
+    name: boundedText(profile.name, 128),
+    description: boundedText(profile.description, 512),
     kind: profile.runtime.kind,
-    model: profile.runtime.model,
-    ...(profile.runtime.kind === "pi" ? { thinking: profile.runtime.thinking } : { effort: profile.runtime.effort }),
+    model: boundedText(profile.runtime.model, 256),
+    ...runtime,
     timeoutMinutes: profile.timeoutMinutes,
     sessionPersistence: profile.sessionPersistence,
-    fallbackProfiles: [...profile.fallbackProfiles],
+    fallbackProfiles: boundedValues(profile.fallbackProfiles, 16, 128),
     source: sourceDetails(profile)
   };
+}
+
+function profileBlockedByUnreadableScope(profile: Profile, catalog: ProfileCatalog): boolean {
+  const precedence = { bundled: 0, user: 1, project: 2 } as const;
+  return catalog.unreadableScopes?.some((scope) => precedence[scope] > profile.source.precedence) === true;
 }
 
 function profileCollection(catalog: ProfileCatalog): Record<string, unknown>[] {
   const entries = new Map<string, Record<string, unknown>>();
   for (const candidate of catalog.candidates) {
-    if (candidate.profile && catalog.effective.get(candidate.name) === candidate.profile && !catalog.blocked?.has(candidate.name)) entries.set(candidate.name, compactProfile(candidate.profile));
-    else if (!entries.has(candidate.name)) entries.set(candidate.name, { name: candidate.name, valid: false, source: { kind: candidate.source.kind, path: candidate.source.path }, diagnostic: candidate.diagnostic?.message ?? (catalog.blocked?.has(candidate.name) ? "blocked by invalid higher-precedence profile" : "invalid profile") });
+    if (candidate.profile && catalog.effective.get(candidate.name) === candidate.profile && !catalog.blocked?.has(candidate.name) && !profileBlockedByUnreadableScope(candidate.profile, catalog)) entries.set(candidate.name, compactProfile(candidate.profile));
+    else if (!entries.has(candidate.name)) {
+      const diagnostic = candidate.diagnostic?.message
+        ?? (catalog.blocked?.has(candidate.name)
+          ? "blocked by invalid higher-precedence profile"
+          : candidate.profile && profileBlockedByUnreadableScope(candidate.profile, catalog)
+            ? "blocked by unreadable higher-precedence profile scope"
+            : "invalid profile");
+      entries.set(candidate.name, {
+        name: boundedText(candidate.name, 128),
+        valid: false,
+        source: { kind: boundedText(candidate.source.kind, 32), path: boundedText(candidate.source.path, 512) },
+        diagnostic: boundedText(diagnostic, 512)
+      });
+    }
   }
-  return [...entries.values()].sort((left, right) => String(left.name).localeCompare(String(right.name))).slice(0, MAX_PROFILE_LIST_ITEMS);
+  const result: Record<string, unknown>[] = [];
+  for (const entry of [...entries.values()].sort((left, right) => String(left.name).localeCompare(String(right.name))).slice(0, MAX_PROFILE_LIST_ITEMS)) {
+    const candidate = [...result, entry];
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > MAX_PROFILE_RESULT_BYTES - 8_000) break;
+    result.push(entry);
+  }
+  return result;
+}
+
+function boundedBody(body: string): string {
+  if (Buffer.byteLength(body, "utf8") <= MAX_PROFILE_BODY_OUTPUT) return body;
+  return `${boundedText(body, MAX_PROFILE_BODY_OUTPUT - 64)}\n[profile body truncated]`;
 }
 
 function exactProfile(catalog: ProfileCatalog, name: string): Record<string, unknown> {
   const resolution = resolveProfile(name, catalog);
   const profile = resolution.profile;
+  const runtime = profile.runtime.kind === "pi"
+    ? {
+      kind: "pi",
+      model: boundedText(profile.runtime.model, 256),
+      thinking: profile.runtime.thinking,
+      tools: boundedValues(profile.runtime.tools, 32, 128),
+      extensions: boundedValues(profile.runtime.extensions, 16, 512),
+      skills: boundedValues(profile.runtime.skills, 16, 512)
+    }
+    : {
+      kind: "claude",
+      model: boundedText(profile.runtime.model, 256),
+      effort: profile.runtime.effort,
+      permissionMode: profile.runtime.permissionMode,
+      allowedTools: boundedValues(profile.runtime.allowedTools, 32, 128),
+      disallowedTools: boundedValues(profile.runtime.disallowedTools, 16, 128),
+      addDirs: boundedValues(profile.runtime.addDirs, 16, 512),
+      pluginDirs: boundedValues(profile.runtime.pluginDirs, 16, 512)
+    };
   return {
     ...compactProfile(profile),
-    runtime: { ...profile.runtime },
-    body: profile.body.length > MAX_PROFILE_BODY_OUTPUT ? `${profile.body.slice(0, MAX_PROFILE_BODY_OUTPUT)}\n[profile body truncated]` : profile.body,
-    fallbackProfiles: [...resolution.fallbackProfiles],
-    reachableNames: [...resolution.reachableNames]
+    runtime,
+    body: boundedBody(profile.body),
+    fallbackProfiles: boundedValues(resolution.fallbackProfiles, 16, 128),
+    reachableNames: boundedValues(resolution.reachableNames, 16, 128)
   };
+}
+
+function modelVisibleProfile(profile: Record<string, unknown>): Record<string, unknown> {
+  const runtime = profile.runtime as Record<string, unknown> | undefined;
+  const source = profile.source as Record<string, unknown> | undefined;
+  return {
+    name: boundedText(String(profile.name), 128),
+    description: boundedText(String(profile.description), 512),
+    kind: boundedText(String(profile.kind), 32),
+    ...(runtime?.model !== undefined ? { model: boundedText(String(runtime.model), 256) } : { model: boundedText(String(profile.model), 256) }),
+    ...(runtime?.thinking !== undefined ? { thinking: boundedText(String(runtime.thinking), 32) } : profile.thinking !== undefined ? { thinking: boundedText(String(profile.thinking), 32) } : {}),
+    ...(runtime?.effort !== undefined ? { effort: boundedText(String(runtime.effort), 32) } : profile.effort !== undefined ? { effort: boundedText(String(profile.effort), 32) } : {}),
+    tools: boundedValues((profile.tools as string[] | undefined) || [], 32, 128),
+    extensions: boundedValues((profile.extensions as string[] | undefined) || [], 16, 512),
+    skills: boundedValues((profile.skills as string[] | undefined) || [], 16, 512),
+    permissionMode: profile.permissionMode ?? runtime?.permissionMode,
+    allowedTools: boundedValues((profile.allowedTools as string[] | undefined) || [], 32, 128),
+    disallowedTools: boundedValues((profile.disallowedTools as string[] | undefined) || [], 32, 128),
+    addDirs: boundedValues((profile.addDirs as string[] | undefined) || [], 16, 512),
+    pluginDirs: boundedValues((profile.pluginDirs as string[] | undefined) || [], 16, 512),
+    timeoutMinutes: profile.timeoutMinutes,
+    sessionPersistence: profile.sessionPersistence,
+    fallbackProfiles: (profile.fallbackProfiles as string[]).slice(0, 16).map((item) => boundedText(String(item), 128)),
+    source: { kind: boundedText(String(source?.kind), 32), path: boundedText(String(source?.path), 512) }
+  };
+}
+
+function modelVisibleDiagnostics(diagnostics: readonly unknown[]): unknown[] {
+  return diagnostics.slice(0, 16).map((diagnostic) => {
+    const value = diagnostic as Record<string, unknown>;
+    return {
+      code: boundedText(String(value.code), 64),
+      ...(value.name !== undefined ? { name: boundedText(String(value.name), 128) } : {}),
+      message: boundedText(String(value.message), 512),
+      path: boundedText(String(value.path), 512)
+    };
+  });
+}
+
+function modelVisibleContent(value: Record<string, unknown>): string {
+  return boundedText(JSON.stringify(value), 16_000);
 }
 
 function parseHealth(text: string): Pick<InspectDetails, "client" | "server" | "socketReachable" | "compatible"> {
@@ -120,8 +229,21 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         if (mode === "collection" && (input.profile !== undefined || input.target !== undefined)) throw Object.assign(new Error("profile collection rejects profile/target"), { code: "INVALID_INPUT" });
         if (!deps.profiles) throw Object.assign(new Error("Profile catalog is unavailable"), { code: "PROFILE_CATALOG_UNAVAILABLE" });
         const catalog = await deps.profiles.load();
-        if (mode === "collection") return { content: [{ type: "text", text: "Inspected profiles" }], details: { operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items: profileCollection(catalog), diagnostics: catalog.diagnostics.slice(0, 16) } };
-        return { content: [{ type: "text", text: `Inspected profile ${input.profile}` }], details: { operation: "inspect", kind: "profile", outcome: "success", profile: exactProfile(catalog, input.profile!), diagnostics: catalog.diagnostics.filter((item) => item.name === input.profile).slice(0, 8) } };
+        if (mode === "collection") {
+          const items = profileCollection(catalog);
+          const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.slice(0, 16));
+          return { content: [{ type: "text", text: modelVisibleContent({ collection: "profiles", items: items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), diagnostics }) }], details: { operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items, diagnostics } };
+        }
+        const profile = exactProfile(catalog, input.profile!);
+        const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.filter((item) => item.name === input.profile).slice(0, 8));
+        const visibleProfile = {
+          ...modelVisibleProfile(profile),
+          body: boundedText(String(profile.body), MAX_PROFILE_BODY_OUTPUT),
+          fallbackProfiles: (profile.fallbackProfiles as string[]).slice(0, 16).map((item) => boundedText(String(item), 128)),
+          reachableNames: (profile.reachableNames as string[]).slice(0, 16).map((item) => boundedText(String(item), 128))
+        };
+        const content = modelVisibleContent({ profile: visibleProfile, diagnostics });
+        return { content: [{ type: "text", text: content }], details: { operation: "inspect", kind: "profile", outcome: "success", profile, diagnostics } };
       }
       if (mode === "health") {
         if (input.target !== undefined || input.collection !== undefined || input.profile !== undefined) throw Object.assign(new Error("health does not accept target, profile, or collection"), { code: "INVALID_INPUT" });

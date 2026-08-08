@@ -19,11 +19,11 @@ describe("HerdrCli", () => {
     expect(exec).toHaveBeenCalledWith("herdr", ["pane", "get", "w1:p1"], { signal, timeout: 4321 });
   });
 
-  it("gives agent startup its full thirty-second readiness window", async () => {
+  it("gives agent startup its full two-minute readiness window", async () => {
     const exec = vi.fn<PiExec>().mockResolvedValue(response('{"id":"start","result":{"agent":{"name":"worker"}}}'));
     const cli = new HerdrCli(exec);
-    await cli.runJson(["agent", "start", "worker", "--timeout", "30000"], signal);
-    expect(exec).toHaveBeenCalledWith("herdr", ["agent", "start", "worker", "--timeout", "30000"], { signal, timeout: 30_000 });
+    await cli.runJson(["agent", "start", "worker", "--timeout", "120000"], signal);
+    expect(exec).toHaveBeenCalledWith("herdr", ["agent", "start", "worker", "--timeout", "120000"], { signal, timeout: 120_000 });
   });
 
   it("preserves a completed mutation response when abort arrives after execution", async () => {

@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseProfile, profileSource } from "./parser.js";
-import { MAX_PROFILE_DIAGNOSTICS, type Profile, type ProfileCandidate, type ProfileCatalog, type ProfileDiagnostic, type ProfileSourceKind } from "./types.js";
+import { MAX_PROFILE_BYTES, MAX_PROFILE_DIAGNOSTICS, type Profile, type ProfileCandidate, type ProfileCatalog, type ProfileDiagnostic, type ProfileSourceKind } from "./types.js";
 
 export interface ProfileDiscoveryOptions {
   bundledDir: string;
@@ -45,11 +45,29 @@ async function existingNearestProjectDir(cwd: string): Promise<string | undefine
   }
 }
 
+async function readProfileText(path: string): Promise<string> {
+  const stat = await fs.stat(path);
+  if (stat.size > MAX_PROFILE_BYTES) throw new Error(`profile exceeds the ${MAX_PROFILE_BYTES}-byte limit`);
+  const file = await fs.open(path, "r");
+  try {
+    const buffer = Buffer.alloc(MAX_PROFILE_BYTES + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const result = await file.read(buffer, offset, buffer.length - offset, offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    return buffer.subarray(0, Math.min(offset, MAX_PROFILE_BYTES)).toString("utf8");
+  } finally {
+    await file.close();
+  }
+}
+
 async function readSource(kind: ProfileSourceKind, directory: string, scopeRoot: string, candidates: ProfileCandidate[], diagnostics: ProfileDiagnostic[]): Promise<void> {
   for (const path of await filesIn(directory)) {
     const source = profileSource(kind, path, scopeRoot);
     try {
-      const profile = parseProfile(await fs.readFile(path, "utf8"), source);
+      const profile = parseProfile(await readProfileText(path), source);
       candidates.push({ name: profile.name, profile, source });
     } catch (error) {
       const message = String(error);
@@ -64,6 +82,7 @@ async function readSource(kind: ProfileSourceKind, directory: string, scopeRoot:
 export async function discoverProfiles(options: ProfileDiscoveryOptions): Promise<ProfileCatalog> {
   const candidates: ProfileCandidate[] = [];
   const diagnostics: ProfileDiagnostic[] = [];
+  const unreadableScopes: ProfileSourceKind[] = [];
   const home = options.userHome ?? homedir();
   const userDir = options.userDir ?? join(home, ".pi", "agent", "herdr-profiles");
   const projectDir = options.projectDir ?? (options.projectCwd ? await existingNearestProjectDir(options.projectCwd) : undefined);
@@ -78,6 +97,7 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
     } catch (error) {
       const source = profileSource(kind, directory, scopeRoot);
       addDiagnostic(diagnostics, { code: "DISCOVERY_ERROR", message: String(error), path: directory, source });
+      unreadableScopes.push(kind);
     }
   }
 
@@ -102,7 +122,7 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
       addDiagnostic(diagnostics, { code: "BLOCKED_PROFILE", message: `${candidate.source.path} blocks lower-precedence profile ${selected.source.path}`, path: candidate.source.path, name: candidate.name, source: candidate.source, relatedPath: selected.source.path });
     }
   }
-  return { effective, candidates, diagnostics, blocked };
+  return { effective, candidates, diagnostics, blocked, unreadableScopes };
 }
 
 export function profileCatalog(options: ProfileDiscoveryOptions): () => Promise<ProfileCatalog> {

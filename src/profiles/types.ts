@@ -4,6 +4,9 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export const CLAUDE_EFFORTS = ["low", "medium", "high", "max"] as const;
 export type ClaudeEffort = (typeof CLAUDE_EFFORTS)[number];
 
+export const CLAUDE_PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"] as const;
+export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODES)[number];
+
 export const PROFILE_KINDS = ["pi", "claude"] as const;
 export type ProfileKind = (typeof PROFILE_KINDS)[number];
 export type ProfileSourceKind = "bundled" | "user" | "project";
@@ -19,12 +22,20 @@ export interface PiRuntimeProfile {
   kind: "pi";
   model: string;
   thinking: ThinkingLevel;
+  tools: string[];
+  extensions: string[];
+  skills: string[];
 }
 
 export interface ClaudeRuntimeProfile {
   kind: "claude";
   model: string;
   effort: ClaudeEffort;
+  permissionMode: ClaudePermissionMode;
+  allowedTools: string[];
+  disallowedTools: string[];
+  addDirs: string[];
+  pluginDirs: string[];
 }
 
 export type RuntimeProfile = PiRuntimeProfile | ClaudeRuntimeProfile;
@@ -61,6 +72,7 @@ export interface ProfileCatalog {
   candidates: readonly ProfileCandidate[];
   diagnostics: readonly ProfileDiagnostic[];
   blocked?: ReadonlySet<string>;
+  unreadableScopes?: readonly ProfileSourceKind[];
 }
 
 export interface ProfileResolution {
@@ -72,11 +84,19 @@ export interface ProfileResolution {
 export interface PiRuntimeOverrides {
   model?: string;
   thinking?: ThinkingLevel;
+  tools?: string[];
+  extensions?: string[];
+  skills?: string[];
 }
 
 export interface ClaudeRuntimeOverrides {
   model?: string;
   effort?: ClaudeEffort;
+  permissionMode?: ClaudePermissionMode;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  addDirs?: string[];
+  pluginDirs?: string[];
 }
 
 export type RuntimeOverrides = PiRuntimeOverrides | ClaudeRuntimeOverrides;
@@ -86,3 +106,4 @@ export const MAX_PROFILE_BODY_BYTES = 32 * 1024;
 export const MAX_PROFILE_DIAGNOSTICS = 32;
 export const MAX_PROFILE_LIST_ITEMS = 100;
 export const MAX_PROFILE_BODY_OUTPUT = 8 * 1024;
+export const MAX_PROFILE_RESULT_BYTES = 50 * 1024;

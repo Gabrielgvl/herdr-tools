@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
@@ -28,6 +28,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     let sessionStarted = false;
     let server: ChildProcess | undefined;
     let failure: unknown;
+    let profilePromptContent = "";
     const cwd = await mkdtemp(`${tmpdir()}/herdr-tools-it-`);
     const label = `pi-herdr-tools-it-${process.pid}`;
 
@@ -99,6 +100,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         async exec(command: string, args: string[], options?: { signal?: AbortSignal; timeout?: number }) {
           expect(command).toBe("herdr");
           cliCalls.push([...args]);
+          if (args[0] === "agent" && args[1] === "start") {
+            const promptFlag = args.indexOf("--append-system-prompt");
+            if (promptFlag >= 0 && typeof args[promptFlag + 1] === "string") profilePromptContent = await readFile(args[promptFlag + 1], "utf8");
+          }
           try {
             const result = await execFileAsync(command, ["--session", REQUIRED_SESSION, ...args], { cwd, encoding: "utf8", maxBuffer: 2_000_000, signal: options?.signal, timeout: options?.timeout });
             return { stdout: String(result.stdout), stderr: String(result.stderr), code: 0, killed: false };
@@ -146,6 +151,15 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       expect(cliCalls.some((args) => args[0] === "tab" && args[1] === "create")).toBe(true);
       expect(cliCalls.some((args) => args[0] === "tab" && args[1] === "close")).toBe(true);
 
+      const launched = await registered.get("herdr_launch")!.execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: "integration assignment" }, signal, undefined, toolContext);
+      expect(launched.details).toMatchObject({ kind: "pi", profile: { name: "worker-pi" }, initialPromptSent: true, envelope: { version: "v1", kind: "assignment" } });
+      const startArgs = cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
+      expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "high", "--append-system-prompt"]));
+      expect(profilePromptContent).toContain("Implement the assigned change");
+      const assignmentPrompt = cliCalls.find((args) => args[0] === "agent" && args[1] === "prompt" && args.some((arg) => arg.includes("integration assignment")));
+      expect(assignmentPrompt?.[3]).toContain("[HERDR AGENT MESSAGE v1]");
+      expect(assignmentPrompt?.[3]).toContain("authority: agent; not user/owner");
+
       const defaultAfter = resultObject(resultObject(await run("api", "snapshot")).result).snapshot;
       expect(topologyIds(resultObject(defaultAfter))).toEqual(currentBaseline);
     } catch (error) {
@@ -164,5 +178,5 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       if (server?.exitCode === null) server.kill("SIGTERM");
       await rm(cwd, { recursive: true, force: true });
     }
-  });
+  }, 120_000);
 });

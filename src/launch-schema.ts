@@ -1,5 +1,5 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type ThinkingLevel } from "./profiles/types.js";
 
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
@@ -34,19 +34,29 @@ export const ProfileLaunchOverridesSchema = Type.Object({
   pluginDirs: Type.Optional(ProfileValues)
 }, { additionalProperties: false });
 
-export const LaunchParamsSchema = Type.Object({
+const LaunchCommonProperties = {
   name: Identifier,
-  kind: Type.Optional(StringEnum(LAUNCH_AGENT_KINDS)),
-  profile: Type.Optional(Identifier),
-  argv: Type.Optional(Type.Array(AgentArgument)),
-  overrides: Type.Optional(ProfileLaunchOverridesSchema),
   placement: Type.Optional(LaunchPlacementSchema),
   label: Type.Optional(Identifier),
   cwd: Type.Optional(Identifier),
-  env: Type.Optional(Type.Record(Identifier, EnvValue)),
   focus: Type.Optional(Type.Boolean()),
   initialPrompt: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" }))
+};
+
+const RawLaunchParamsSchema = Type.Object({
+  ...LaunchCommonProperties,
+  kind: StringEnum(LAUNCH_AGENT_KINDS),
+  argv: Type.Optional(Type.Array(AgentArgument)),
+  env: Type.Optional(Type.Record(Identifier, EnvValue))
 }, { additionalProperties: false });
+
+const ProfileLaunchParamsSchema = Type.Object({
+  ...LaunchCommonProperties,
+  profile: Identifier,
+  overrides: Type.Optional(ProfileLaunchOverridesSchema)
+}, { additionalProperties: false });
+
+export const LaunchParamsSchema = Type.Union([RawLaunchParamsSchema, ProfileLaunchParamsSchema]);
 
 export type LaunchPlacement =
   | { mode: "same_tab" }
@@ -67,7 +77,9 @@ export interface ProfileLaunchOverrides {
   pluginDirs?: string[];
 }
 
-export interface LaunchParams {
+export type LaunchParams = Static<typeof LaunchParamsSchema>;
+
+export interface LaunchRequest {
   name: string;
   kind?: LaunchAgentKind;
   profile?: string;

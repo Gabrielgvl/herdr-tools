@@ -2,7 +2,7 @@
 name: researcher-claude
 description: Research a focused technical question with a visible Claude worker.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: claude
   model: claude-sonnet-5

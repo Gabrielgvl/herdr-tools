@@ -13,6 +13,7 @@ export interface ProfileDiscoveryOptions {
   userScopeRoot?: string;
   projectDir?: string;
   projectRoot?: string;
+  projectStat?: (path: string) => Promise<{ isDirectory(): boolean }>;
 }
 
 function addDiagnostic(list: ProfileDiagnostic[], item: ProfileDiagnostic): void {
@@ -29,13 +30,13 @@ async function filesIn(directory: string): Promise<string[]> {
   }
 }
 
-async function existingNearestProjectDir(cwd: string): Promise<string | undefined> {
+async function existingNearestProjectDir(cwd: string, stat: (path: string) => Promise<{ isDirectory(): boolean }> = fs.stat): Promise<string | undefined> {
   let current = resolve(cwd);
   while (true) {
     const candidate = join(current, ".pi", "herdr-profiles");
     try {
-      const stat = await fs.stat(candidate);
-      if (stat.isDirectory()) return candidate;
+      const result = await stat(candidate);
+      if (result.isDirectory()) return candidate;
     } catch (error) {
       if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
     }
@@ -45,10 +46,21 @@ async function existingNearestProjectDir(cwd: string): Promise<string | undefine
   }
 }
 
-async function readProfileText(path: string): Promise<string> {
-  const stat = await fs.stat(path);
+export interface ProfileReadHandle {
+  read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }>;
+  stat(): Promise<{ size: number }>;
+  close(): Promise<void>;
+}
+
+export interface ProfileReadIo {
+  stat(path: string): Promise<{ size: number }>;
+  open(path: string, flags: string): Promise<ProfileReadHandle>;
+}
+
+export async function readProfileText(path: string, io: ProfileReadIo = fs): Promise<string> {
+  const stat = await io.stat(path);
   if (stat.size > MAX_PROFILE_BYTES) throw new Error(`profile exceeds the ${MAX_PROFILE_BYTES}-byte limit`);
-  const file = await fs.open(path, "r");
+  const file = await io.open(path, "r");
   try {
     const buffer = Buffer.alloc(MAX_PROFILE_BYTES + 1);
     let offset = 0;
@@ -57,7 +69,10 @@ async function readProfileText(path: string): Promise<string> {
       if (result.bytesRead === 0) break;
       offset += result.bytesRead;
     }
-    return buffer.subarray(0, Math.min(offset, MAX_PROFILE_BYTES)).toString("utf8");
+    if (offset > MAX_PROFILE_BYTES) throw new Error(`profile exceeds the ${MAX_PROFILE_BYTES}-byte limit`);
+    const finalStat = await file.stat();
+    if (finalStat.size > MAX_PROFILE_BYTES) throw new Error(`profile exceeds the ${MAX_PROFILE_BYTES}-byte limit`);
+    return buffer.subarray(0, offset).toString("utf8");
   } finally {
     await file.close();
   }
@@ -85,12 +100,27 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
   const unreadableScopes: ProfileSourceKind[] = [];
   const home = options.userHome ?? homedir();
   const userDir = options.userDir ?? join(home, ".pi", "agent", "herdr-profiles");
-  const projectDir = options.projectDir ?? (options.projectCwd ? await existingNearestProjectDir(options.projectCwd) : undefined);
+  let projectDir = options.projectDir;
+  let projectDiscoveryError: unknown;
+  if (!projectDir && options.projectCwd) {
+    try {
+      projectDir = await existingNearestProjectDir(options.projectCwd, options.projectStat);
+    } catch (error) {
+      projectDiscoveryError = error;
+    }
+  }
   const sources: Array<[ProfileSourceKind, string, string]> = [
     ["bundled", resolve(options.bundledDir), resolve(options.bundledScopeRoot ?? dirname(options.bundledDir))],
     ["user", resolve(userDir), resolve(options.userScopeRoot ?? join(home, ".pi", "agent"))],
   ];
   if (projectDir) sources.push(["project", resolve(projectDir), resolve(options.projectRoot ?? join(projectDir, "..", ".."))]);
+  if (projectDiscoveryError !== undefined && options.projectCwd) {
+    const projectPath = join(resolve(options.projectCwd), ".pi", "herdr-profiles");
+    const projectRoot = resolve(options.projectRoot ?? join(resolve(options.projectCwd), "..", ".."));
+    const source = profileSource("project", projectPath, projectRoot);
+    addDiagnostic(diagnostics, { code: "DISCOVERY_ERROR", message: String(projectDiscoveryError), path: projectPath, source });
+    unreadableScopes.push("project");
+  }
   for (const [kind, directory, scopeRoot] of sources) {
     try {
       await readSource(kind, directory, scopeRoot, candidates, diagnostics);

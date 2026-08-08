@@ -2,7 +2,7 @@
 name: worker-claude
 description: Implement a scoped repository change with a visible Claude worker.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: claude
   model: claude-opus-5

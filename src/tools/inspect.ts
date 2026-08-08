@@ -121,7 +121,7 @@ function profileCollection(catalog: ProfileCatalog): Record<string, unknown>[] {
   const result: Record<string, unknown>[] = [];
   for (const entry of [...entries.values()].sort((left, right) => String(left.name).localeCompare(String(right.name))).slice(0, MAX_PROFILE_LIST_ITEMS)) {
     const candidate = [...result, entry];
-    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > MAX_PROFILE_RESULT_BYTES - 8_000) break;
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > MAX_PROFILE_RESULT_BYTES) break;
     result.push(entry);
   }
   return result;
@@ -200,8 +200,73 @@ function modelVisibleDiagnostics(diagnostics: readonly unknown[]): unknown[] {
   });
 }
 
+function jsonBytes(value: unknown): number {
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? 0 : Buffer.byteLength(encoded, "utf8");
+}
+
+interface MutableValueRef {
+  owner: Record<string, unknown> | unknown[];
+  key: string | number;
+  value: unknown;
+}
+
+function collectValueRefs(value: unknown, strings: MutableValueRef[], arrays: MutableValueRef[], objects: MutableValueRef[], owner?: Record<string, unknown> | unknown[], key?: string | number, seen = new WeakSet<object>()): void {
+  if (typeof value === "string") {
+    if (owner !== undefined && key !== undefined) strings.push({ owner, key, value });
+    return;
+  }
+  if (typeof value !== "object" || value === null) return;
+  if (seen.has(value)) return;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    if (owner !== undefined && key !== undefined) arrays.push({ owner, key, value });
+    value.forEach((item, index) => collectValueRefs(item, strings, arrays, objects, value, index, seen));
+    return;
+  }
+  if (owner !== undefined && key !== undefined) objects.push({ owner, key, value });
+  for (const [childKey, child] of Object.entries(value)) collectValueRefs(child, strings, arrays, objects, value as Record<string, unknown>, childKey, seen);
+}
+
+export function fitInspectionValue(value: unknown, maxBytes: number): unknown {
+  let candidate: unknown;
+  try { candidate = structuredClone(value); } catch { return { truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED", message: "inspection value could not be cloned" }] }; }
+  if (jsonBytes(candidate) <= maxBytes) return candidate;
+  for (let attempt = 0; attempt < 2_000; attempt += 1) {
+    if (jsonBytes(candidate) <= maxBytes) return candidate;
+    const strings: MutableValueRef[] = [];
+    const arrays: MutableValueRef[] = [];
+    const objects: MutableValueRef[] = [];
+    collectValueRefs(candidate, strings, arrays, objects);
+    const longest = strings.sort((left, right) => Buffer.byteLength(String(right.value), "utf8") - Buffer.byteLength(String(left.value), "utf8"))[0];
+    if (longest) {
+      const current = String(longest.value);
+      const next = boundedText(current, Math.max(2, Math.ceil(Buffer.byteLength(current, "utf8") / 2)));
+      const replacement = next === current ? "" : next;
+      (longest.owner as Record<string | number, unknown>)[longest.key] = replacement;
+      continue;
+    }
+    const largestArray = arrays.filter((item) => Array.isArray(item.value) && item.key !== "diagnostics").sort((left, right) => (right.value as unknown[]).length - (left.value as unknown[]).length)[0];
+    if (largestArray && Array.isArray(largestArray.value) && largestArray.value.length > 0) {
+      largestArray.value.splice(Math.ceil(largestArray.value.length / 2));
+      continue;
+    }
+    const removable = objects.flatMap((item) => Object.keys(item.value as Record<string, unknown>).filter((objectKey) => !["profile", "diagnostics", "source", "name", "kind"].includes(objectKey)).map((objectKey) => ({ owner: item.value as Record<string, unknown>, key: objectKey })))[0];
+    if (removable) {
+      delete removable.owner[removable.key];
+      continue;
+    }
+    break;
+  }
+  return { truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED", message: "inspection value exceeded the output limit" }] };
+}
+
+function boundedInspectionDetails<T extends InspectDetails>(details: T): T {
+  return fitInspectionValue(details, MAX_PROFILE_RESULT_BYTES) as T;
+}
+
 function modelVisibleContent(value: Record<string, unknown>): string {
-  return boundedText(JSON.stringify(value), 16_000);
+  return JSON.stringify(fitInspectionValue(value, MAX_PROFILE_RESULT_BYTES)) as string;
 }
 
 function parseHealth(text: string): Pick<InspectDetails, "client" | "server" | "socketReachable" | "compatible"> {
@@ -232,7 +297,8 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         if (mode === "collection") {
           const items = profileCollection(catalog);
           const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.slice(0, 16));
-          return { content: [{ type: "text", text: modelVisibleContent({ collection: "profiles", items: items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), diagnostics }) }], details: { operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items, diagnostics } };
+          const details = boundedInspectionDetails({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items, diagnostics });
+          return { content: [{ type: "text", text: modelVisibleContent({ collection: "profiles", items: items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), diagnostics }) }], details };
         }
         const profile = exactProfile(catalog, input.profile!);
         const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.filter((item) => item.name === input.profile).slice(0, 8));
@@ -243,7 +309,8 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
           reachableNames: (profile.reachableNames as string[]).slice(0, 16).map((item) => boundedText(String(item), 128))
         };
         const content = modelVisibleContent({ profile: visibleProfile, diagnostics });
-        return { content: [{ type: "text", text: content }], details: { operation: "inspect", kind: "profile", outcome: "success", profile, diagnostics } };
+        const details = boundedInspectionDetails({ operation: "inspect", kind: "profile", outcome: "success", profile, diagnostics });
+        return { content: [{ type: "text", text: content }], details };
       }
       if (mode === "health") {
         if (input.target !== undefined || input.collection !== undefined || input.profile !== undefined) throw Object.assign(new Error("health does not accept target, profile, or collection"), { code: "INVALID_INPUT" });

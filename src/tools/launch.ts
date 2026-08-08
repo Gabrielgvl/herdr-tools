@@ -4,7 +4,7 @@ import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
-import { isLaunchAgentKind, LaunchParamsSchema, type LaunchParams, type LaunchPlacement } from "../launch-schema.js";
+import { isLaunchAgentKind, LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildProfileArgv, defaultPromptFileFactory, resolveProfile, type ProfileCatalog, type ProfileResolution, type PromptFileFactory } from "../profiles/index.js";
 
 export interface LaunchCli {
@@ -63,7 +63,7 @@ function identifier(value: unknown, field: string): asserts value is string {
   }
 }
 
-function validateParams(params: LaunchParams): void {
+function validateParams(params: LaunchRequest): void {
   if (!record(params)) throw new LaunchError("INVALID_INPUT", "launch parameters must be an object");
   if (typeof params.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
     throw new LaunchError("INVALID_INPUT", "name must start with a lowercase letter and contain only lowercase letters, digits, - or _ (1-32 characters)");
@@ -233,7 +233,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
     label: "Herdr Launch",
     description: "Launch a supported Herdr agent in an explicitly selected pane placement.",
     parameters: LaunchParamsSchema,
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, rawParams, signal, onUpdate, ctx) {
+      const params = rawParams as unknown as LaunchRequest;
       validateParams(params);
       const abortSignal = signal!;
       const cwd = params.cwd ?? deps.cwd ?? ctx.cwd;
@@ -357,7 +358,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       }
     },
     renderCall(args, theme) {
-      return textComponent(formatCall("herdr_launch", args.kind ?? "profile", args.name), theme, "accent");
+      return textComponent(formatCall("herdr_launch", "kind" in args ? args.kind : "profile", args.name), theme, "accent");
     },
     renderResult(result, options, theme) {
       return renderResultComponent("launch", result, options, theme, result.details?.paneId);

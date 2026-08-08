@@ -17,6 +17,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Files use strict YAML 1.2 frontmatter and a required literal Markdown body. No interpolation, includes, inheritance, environment expansion, or raw argv.
 - Filename stem must equal a required lowercase kebab-case `name`; `description`, exact `model`, `kind`, and kind-specific reasoning are required.
 - Each profile pins exactly one kind (`pi` or `claude`) through a discriminated runtime block. The body is appended to the runtime's default system prompt.
+- Claude profiles must set `sessionPersistence: true` because Herdr starts interactive Claude agents; Pi profiles may set it false and receive `--no-session`.
 - Relative runtime-resource paths resolve from the profile scope root. Arbitrary environment overrides are not supported by profile delegation.
 - Typed call overrides may replace typed defaults, including capability-expanding Claude permission modes. Project profiles have no trust gate. These are deliberate trust choices.
 - Fallbacks are ordered references to named profiles, validated as a graph. A logical run has at most three attempts. Invalid profiles are isolated; only the selected reachable graph blocks launch.

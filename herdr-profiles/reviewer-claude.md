@@ -2,7 +2,7 @@
 name: reviewer-claude
 description: Review repository changes for correctness using a visible Claude worker.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: claude
   model: claude-opus-5

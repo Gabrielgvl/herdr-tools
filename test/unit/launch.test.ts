@@ -43,7 +43,18 @@ function launch(overrides: Partial<LaunchParams> = {}, deps: { cli?: LaunchCli; 
 describe("herdr_launch schema", () => {
   it("exposes the complete installed supported kind set and a strict required shape", () => {
     expect(LAUNCH_AGENT_KINDS).toEqual(["pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode", "opencode", "copilot", "kimi", "kiro", "droid", "amp", "grok", "hermes", "kilo", "qodercli", "maki"]);
-    expect(LaunchParamsSchema).toMatchObject({ type: "object", additionalProperties: false });
+    expect(LaunchParamsSchema).toMatchObject({ anyOf: expect.any(Array) });
+    const variants = (LaunchParamsSchema as { anyOf: Array<{ required?: string[]; properties?: Record<string, unknown> }> }).anyOf;
+    expect(variants).toHaveLength(2);
+    const raw = variants.find((variant) => variant.required?.includes("kind"));
+    const profile = variants.find((variant) => variant.required?.includes("profile"));
+    expect(raw?.properties).toEqual(expect.objectContaining({ kind: expect.any(Object) }));
+    expect(raw?.properties).not.toHaveProperty("profile");
+    expect(raw?.properties).not.toHaveProperty("overrides");
+    expect(profile?.properties).toEqual(expect.objectContaining({ profile: expect.any(Object) }));
+    expect(profile?.properties).not.toHaveProperty("kind");
+    expect(profile?.properties).not.toHaveProperty("argv");
+    expect(profile?.properties).not.toHaveProperty("env");
   });
 });
 

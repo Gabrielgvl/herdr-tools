@@ -18,7 +18,7 @@ A direct feature-parity rewrite would mix profile parsing, agent-specific config
 
 Build the replacement in layers.
 
-`herdr-tools` owns separate bundled/user/project profile files and strict resolution. Profiles pin Pi or Claude, use typed runtime blocks, append a required Markdown body to the default system prompt, and never expose raw argv or arbitrary environment overrides.
+`herdr-tools` owns separate bundled/user/project profile files and strict resolution. Profiles pin Pi or Claude, use typed runtime blocks, append a required Markdown body to the default system prompt, and never expose raw argv or arbitrary environment overrides. Interactive Claude profiles must keep session persistence enabled; Pi profiles may disable it.
 
 The first slice adds the profile catalog, inspection, adapters, and profile-backed launch using existing Herdr primitives. It exposes fallback metadata but does not automate fallback or scrape terminal output as a result.
 

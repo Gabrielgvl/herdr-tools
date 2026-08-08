@@ -1,5 +1,5 @@
-import { parseDocument, type Node } from "yaml";
-import { basename, resolve } from "node:path";
+import { isAlias, isMap, isScalar, isSeq, parseDocument, type Node } from "yaml";
+import { basename, isAbsolute, relative, resolve, sep, win32 } from "node:path";
 import {
   CLAUDE_EFFORTS,
   CLAUDE_PERMISSION_MODES,
@@ -51,8 +51,22 @@ function stringArray(value: unknown, field: string): string[] {
   return value === undefined ? [] : arrayOfStrings(value, field);
 }
 
+export function normalizeScopedResourcePath(value: string, field: string, scopeRoot: string): string {
+  if (value.length === 0 || /[\0\r\n]/.test(value)) fail(`${field} must be a non-empty single-line relative path`, { field });
+  if (isAbsolute(value) || win32.isAbsolute(value) || /^[A-Za-z]:/.test(value)) fail(`${field} must be relative to the profile scope root`, { field });
+  const segments = value.split(/[\\/]/);
+  if (segments.some((segment) => segment.length === 0)) fail(`${field} contains an unsafe empty path segment`, { field });
+  const root = resolve(scopeRoot);
+  const resolved = resolve(root, value.replace(/[\\/]/g, sep));
+  const fromRoot = relative(root, resolved);
+  if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot) || win32.isAbsolute(fromRoot)) {
+    fail(`${field} escapes the profile scope root`, { field, scopeRoot: root });
+  }
+  return resolved;
+}
+
 function resourcePaths(value: unknown, field: string, scopeRoot: string): string[] {
-  return stringArray(value, field).map((item) => resolve(scopeRoot, item));
+  return stringArray(value, field).map((item) => normalizeScopedResourcePath(item, field, scopeRoot));
 }
 
 function parseRuntime(value: unknown, scopeRoot: string): RuntimeProfile {
@@ -70,21 +84,48 @@ function parseRuntime(value: unknown, scopeRoot: string): RuntimeProfile {
   return { kind: "claude", model: stringField(value.model, "runtime.model"), effort: value.effort as ClaudeEffort, permissionMode: mode as ClaudePermissionMode, allowedTools: stringArray(value.allowedTools, "runtime.allowedTools"), disallowedTools: stringArray(value.disallowedTools, "runtime.disallowedTools"), addDirs: resourcePaths(value.addDirs, "runtime.addDirs", scopeRoot), pluginDirs: resourcePaths(value.pluginDirs, "runtime.pluginDirs", scopeRoot) };
 }
 
+function rejectYamlAliases(node: Node): void {
+  if (isAlias(node)) fail("YAML anchors, aliases, and tags are not supported");
+  if (isMap(node)) {
+    for (const item of node.items) {
+      rejectYamlAliases(item.key as Node);
+      rejectYamlAliases(item.value as Node);
+    }
+  } else if (isSeq(node)) {
+    for (const item of node.items) rejectYamlAliases(item as Node);
+  }
+}
+
+function validateYamlNode(node: Node): void {
+  if ("anchor" in node && node.anchor !== undefined) fail("YAML anchors, aliases, and tags are not supported");
+  if (node.tag !== undefined) fail("YAML anchors, aliases, and tags are not supported");
+  if (isMap(node)) {
+    for (const item of node.items) {
+      validateYamlNode(item.key as Node);
+      validateYamlNode(item.value as Node);
+    }
+  } else if (isSeq(node)) {
+    for (const item of node.items) validateYamlNode(item as Node);
+  } else {
+    isScalar(node);
+  }
+}
+
 function yamlValue(node: Node): unknown {
-  if ("items" in node && Array.isArray(node.items)) for (const item of node.items) yamlValue(item as Node);
-  if ("value" in node && typeof node.value === "object" && node.value !== null) yamlValue(node.value as Node);
-  return (node as { toJSON?: () => unknown }).toJSON?.();
+  rejectYamlAliases(node);
+  validateYamlNode(node);
+  return node.toJSON();
 }
 
 function frontmatter(text: string): { values: Record<string, unknown>; body: string } {
   if (!text.startsWith("---\n") && !text.startsWith("---\r\n")) fail("profile must start with YAML frontmatter");
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
   if (!match) fail("profile frontmatter must have a closing delimiter and Markdown body");
-  if (/(^|[\s,:{}-]|\[)(?:&[^\s,}\]]+|\*[^\s,}\]]+|!{1,2}[A-Za-z0-9_-]*)/.test(match[1])) fail("YAML anchors, aliases, and tags are not supported");
   const document = parseDocument(match[1], { version: "1.2", schema: "core", strict: true, uniqueKeys: true, prettyErrors: false });
   if (document.errors.length > 0) fail("invalid YAML frontmatter");
-  if (document.contents?.constructor.name !== "YAMLMap") fail("YAML frontmatter must be a mapping");
-  return { values: yamlValue(document.contents) as Record<string, unknown>, body: match[2] };
+  if (document.contents === null || !isMap(document.contents)) fail("YAML frontmatter must be a mapping");
+  const values = yamlValue(document.contents) as Record<string, unknown>;
+  return { values, body: match[2] };
 }
 
 export function parseProfile(text: string, source: ProfileSource): Profile {
@@ -100,7 +141,9 @@ export function parseProfile(text: string, source: ProfileSource): Profile {
   const fallbackProfiles = values.fallbackProfiles === undefined ? [] : arrayOfStrings(values.fallbackProfiles, "fallbackProfiles");
   for (const fallback of fallbackProfiles) if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(fallback)) fail("fallbackProfiles must contain lowercase kebab-case names", { fallback });
   if (new Set(fallbackProfiles).size !== fallbackProfiles.length) fail("fallbackProfiles must not contain duplicates");
-  return { name, description: stringField(values.description, "description"), timeoutMinutes: values.timeoutMinutes as number, sessionPersistence: values.sessionPersistence, runtime: parseRuntime(values.runtime, source.scopeRoot), fallbackProfiles, body, source };
+  const runtime = parseRuntime(values.runtime, source.scopeRoot);
+  if (runtime.kind === "claude" && values.sessionPersistence === false) fail("Claude profiles must set sessionPersistence to true for interactive launches");
+  return { name, description: stringField(values.description, "description"), timeoutMinutes: values.timeoutMinutes as number, sessionPersistence: values.sessionPersistence, runtime, fallbackProfiles, body, source };
 }
 
 export function profileSource(kind: ProfileSource["kind"], path: string, scopeRoot: string): ProfileSource {

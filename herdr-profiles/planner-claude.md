@@ -2,7 +2,7 @@
 name: planner-claude
 description: Plan implementation work with a visible Claude reasoning worker.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: claude
   model: claude-fable-5

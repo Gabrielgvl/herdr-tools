@@ -2,8 +2,8 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { buildClaudeArgv, buildPiArgv, buildProfileArgv, discoverProfiles, parseProfile, profileCatalog, profileSource, resolveProfile, ProfileParseError, ProfileResolutionError } from "../../src/profiles/index.js";
-import { createInspectTool } from "../../src/tools/inspect.js";
+import { buildClaudeArgv, buildPiArgv, buildProfileArgv, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileSource, readProfileText, resolveProfile, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
+import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
 import { createLaunchTool, validateLaunchParams } from "../../src/tools/launch.js";
 import { createRuntime } from "../../index.js";
 import type { HerdrCli } from "../../src/cli.js";
@@ -13,12 +13,31 @@ function profileText(name: string, runtime = "pi", extra = "", fallbackProfiles 
   const block = runtime === "pi"
     ? "  kind: pi\n  model: test/model\n  thinking: low"
     : "  kind: claude\n  model: claude-test\n  effort: medium";
-  return `---\nname: ${name}\ndescription: Test ${name}\ntimeoutMinutes: 30\nsessionPersistence: false\nruntime:\n${block}\nfallbackProfiles: ${fallbackProfiles}\n${extra}---\n\nBody for ${name}.\n`;
+  const sessionPersistence = runtime === "claude" ? "true" : "false";
+  return `---\nname: ${name}\ndescription: Test ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${sessionPersistence}\nruntime:\n${block}\nfallbackProfiles: ${fallbackProfiles}\n${extra}---\n\nBody for ${name}.\n`;
 }
 
 const noCli = { runJson: async () => { throw new Error("CLI must not be called"); }, runText: async () => { throw new Error("CLI must not be called"); } } as unknown as HerdrCli;
 
 describe("profile catalog", () => {
+  it("fits inspection values without invalid JSON or losing protected evidence", () => {
+    const shared = { repeated: true };
+    expect(fitInspectionValue(undefined, 128)).toBeUndefined();
+    expect(fitInspectionValue("x".repeat(2_000), 128)).toMatchObject({ truncated: true });
+    expect(fitInspectionValue(Array.from({ length: 256 }, (_, index) => index), 128)).toBeDefined();
+    const stringFit = fitInspectionValue({ message: "x".repeat(2_000) }, 128);
+    expect(Buffer.byteLength(JSON.stringify(stringFit), "utf8")).toBeLessThanOrEqual(128);
+    const arrayStringFit = fitInspectionValue({ items: ["x".repeat(2_000)] }, 128);
+    expect(fitInspectionValue({ empty: "", items: Array.from({ length: 256 }, (_, index) => index) }, 128)).toBeDefined();
+    expect(Buffer.byteLength(JSON.stringify(arrayStringFit), "utf8")).toBeLessThanOrEqual(128);
+    const arrayFit = fitInspectionValue({ items: Array.from({ length: 256 }, (_, index) => index), otherItems: [1, 2], sharedA: shared, sharedB: shared }, 128);
+    expect(Buffer.byteLength(JSON.stringify(arrayFit), "utf8")).toBeLessThanOrEqual(128);
+    const objectFit = fitInspectionValue({ nested: Object.fromEntries(Array.from({ length: 64 }, (_, index) => [`key-${index}`, index])) }, 128);
+    expect(Buffer.byteLength(JSON.stringify(objectFit), "utf8")).toBeLessThanOrEqual(128);
+    const fallback = fitInspectionValue({ profile: {}, diagnostics: Array.from({ length: 256 }, (_, index) => index) }, 1);
+    expect(fallback).toMatchObject({ truncated: true, diagnostics: expect.any(Array) });
+    expect(fitInspectionValue({ cannotClone: () => undefined }, 128)).toMatchObject({ truncated: true });
+  });
   it("parses strict YAML, typed runtime defaults, and profile metadata", () => {
     const root = "/tmp/profile-scope";
     const parsed = parseProfile(profileText("worker"), source(root, "worker"));
@@ -26,11 +45,20 @@ describe("profile catalog", () => {
     expect(parsed.body).toContain("Body for worker");
     const claude = parseProfile(profileText("reviewer", "claude"), source(root, "reviewer"));
     expect(claude.runtime).toMatchObject({ kind: "claude", effort: "medium", permissionMode: "default" });
+    expect(claude.sessionPersistence).toBe(true);
+    expect(() => parseProfile(profileText("claude-disabled", "claude").replace("sessionPersistence: true", "sessionPersistence: false"), source(root, "claude-disabled"))).toThrow(ProfileParseError);
     const resources = parseProfile(profileText("worker").replace("thinking: low", "thinking: low\n  tools: [read]\n  extensions: [./ext.ts]\n  skills: [./skills]"), source(root, "worker"));
     expect(resources.runtime).toMatchObject({ tools: ["read"], extensions: [join(root, "ext.ts")], skills: [join(root, "skills")] });
+    expect(buildProfileArgv(resources, { extensions: ["./override.ts"], skills: ["./override-skills"] })).toContain(join(root, "override.ts"));
+    expect(buildProfileArgv(resources, { extensions: ["./override.ts"], skills: ["./override-skills"] })).toContain(join(root, "override-skills"));
+    expect(() => normalizeScopedResourcePath("", "resource", root)).toThrow(ProfileParseError);
+    for (const path of ["/tmp/absolute.ts", "../outside.ts", "./nested//unsafe.ts", "C:\\outside.ts"]) {
+      expect(() => parseProfile(profileText("worker").replace("thinking: low", `thinking: low\n  extensions: [${JSON.stringify(path)}]`), source(root, "worker"))).toThrow(ProfileParseError);
+      expect(() => buildProfileArgv(resources, { extensions: [path] })).toThrow();
+    }
     expect(buildProfileArgv(resources, {}, "/tmp/prompt")).toEqual(["--model", "test/model", "--thinking", "low", "--tools", "read", "--extension", join(root, "ext.ts"), "--skill", join(root, "skills"), "--no-session", "--append-system-prompt", "/tmp/prompt"]);
     const claudeResources = parseProfile(profileText("claude-resource", "claude").replace("effort: medium", "effort: medium\n  permissionMode: acceptEdits\n  allowedTools: [Read]\n  disallowedTools: [Bash]\n  addDirs: [./docs]\n  pluginDirs: [./plugin]"), source(root, "claude-resource"));
-    expect(buildProfileArgv(claudeResources, {}, "/tmp/prompt")).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "acceptEdits", "--allowed-tools", "Read", "--disallowed-tools", "Bash", "--add-dir", join(root, "docs"), "--plugin-dir", join(root, "plugin"), "--no-session-persistence", "--append-system-prompt-file", "/tmp/prompt"]);
+    expect(buildProfileArgv(claudeResources, {}, "/tmp/prompt")).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "acceptEdits", "--allowed-tools", "Read", "--disallowed-tools", "Bash", "--add-dir", join(root, "docs"), "--plugin-dir", join(root, "plugin"), "--append-system-prompt-file", "/tmp/prompt"]);
   });
 
   it("rejects malformed frontmatter and unknown or invalid fields", () => {
@@ -41,6 +69,7 @@ describe("profile catalog", () => {
       "---\n- x\n---\n\nbody\n",
       "---\nname: [\n---\n\nbody\n",
       profileText("worker").replace(/runtime:\n {2}kind: pi\n {2}model: test\/model\n {2}thinking: low\n/, "runtime: null\n"),
+      profileText("worker").replace(/runtime:\n {2}kind: pi\n {2}model: test\/model\n {2}thinking: low\n/, "runtime:\n"),
       profileText("worker").replace("kind: pi", "kind: other"),
       profileText("worker").replace("thinking: low", "thinking: invalid"),
       profileText("worker").replace("model: test/model", "model:"),
@@ -59,11 +88,16 @@ describe("profile catalog", () => {
       profileText("worker").replace("description: Test worker", "description: !!str Test worker"),
       profileText("worker").replace("description: Test worker", "description: &1 Test worker"),
       profileText("worker").replace("description: Test worker", "description: *1 Test worker"),
+      profileText("worker").replace("description: Test worker", "description: !1 Test worker"),
+      profileText("worker").replace("description: Test worker", "description: !!int Test worker"),
+      profileText("worker").replace("description: Test worker", "description: !<tag:yaml.org,2002:str> Test worker"),
       profileText("worker").replace("description: Test worker", "description: &desc Test worker\nextraDescription: *desc"),
+      profileText("worker").replace("thinking: low", "thinking: low\n  extensions: &paths [./ext]\n  skills: *paths"),
       profileText("worker").replace("runtime:\n", "runtime:\n  extra: true\n"),
       profileText("Worker"),
     ];
     for (const [index, text] of cases.entries()) expect(() => parseProfile(text, source(root, "worker")), `case ${index}`).toThrow(ProfileParseError);
+    expect(parseProfile(profileText("worker").replace("description: Test worker", 'description: "ordinary ! & * text"'), source(root, "worker")).description).toBe("ordinary ! & * text");
     expect(parseProfile(profileText("worker").replace("fallbackProfiles: []\n", ""), source(root, "worker")).fallbackProfiles).toEqual([]);
     expect(() => parseProfile(profileText("worker"), source(root, "other"))).toThrow(ProfileParseError);
     expect(() => parseProfile(profileText("worker").replace("\nBody for worker.\n", "\n   \n"), source(root, "worker"))).toThrow(ProfileParseError);
@@ -116,7 +150,9 @@ describe("profile catalog", () => {
     await mkdir(join(fileProject, ".pi"), { recursive: true });
     await writeFile(join(fileProject, ".pi", "herdr-profiles"), "not-a-directory");
     expect((await discoverProfiles({ bundledDir: join(root, "missing-bundled"), userDir: join(root, "missing-user"), projectCwd: fileProject })).effective.size).toBe(1);
-    await expect(discoverProfiles({ bundledDir: join(root, "missing-bundled"), userDir: join(root, "missing-user"), projectCwd: join(fileProject, ".pi", "herdr-profiles", "nested") })).rejects.toThrow();
+    const fileProjectCatalog = await discoverProfiles({ bundledDir: join(root, "missing-bundled"), userDir: join(root, "missing-user"), projectCwd: join(fileProject, ".pi", "herdr-profiles", "nested") });
+    expect(fileProjectCatalog.unreadableScopes).toEqual(["project"]);
+    expect(fileProjectCatalog.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "DISCOVERY_ERROR" })]));
     const lowerInvalid = join(root, "lower-invalid");
     const higherValid = join(root, "higher-valid");
     await mkdir(lowerInvalid, { recursive: true });
@@ -130,12 +166,34 @@ describe("profile catalog", () => {
     await writeFile(join(oversized, "too-large.md"), "x".repeat(70_000));
     const oversizedCatalog = await discoverProfiles({ bundledDir: oversized, userDir: join(root, "missing-user") });
     expect(oversizedCatalog.candidates[0]?.diagnostic?.message).toContain("exceeds");
+    const growingReader: ProfileReadIo = {
+      stat: vi.fn(async () => ({ size: MAX_PROFILE_BYTES - 1 })),
+      open: vi.fn(async () => ({
+        read: async (buffer: Buffer, offset: number, length: number) => { buffer.fill(120, offset, offset + length); return { bytesRead: length }; },
+        stat: async () => ({ size: MAX_PROFILE_BYTES + 1 }),
+        close: vi.fn(async () => undefined)
+      }))
+    };
+    await expect(readProfileText("growing.md", growingReader)).rejects.toThrow(/exceeds/);
+    const postReadGrowing: ProfileReadIo = {
+      stat: vi.fn(async () => ({ size: MAX_PROFILE_BYTES })),
+      open: vi.fn(async () => ({
+        read: async (buffer: Buffer, offset: number, length: number) => { buffer.fill(120, offset, offset + Math.min(length, MAX_PROFILE_BYTES - offset)); return { bytesRead: Math.min(length, MAX_PROFILE_BYTES - offset) }; },
+        stat: async () => ({ size: MAX_PROFILE_BYTES + 1 }),
+        close: vi.fn(async () => undefined)
+      }))
+    };
+    await expect(readProfileText("post-read-growing.md", postReadGrowing)).rejects.toThrow(/exceeds/);
     const manyInvalid = join(root, "many-invalid");
     await mkdir(manyInvalid, { recursive: true });
     await Promise.all(Array.from({ length: 33 }, (_, index) => writeFile(join(manyInvalid, `bad-${index}.md`), "bad")));
     const bounded = await discoverProfiles({ bundledDir: manyInvalid, userDir: join(root, "missing-user") });
     expect(bounded.diagnostics.length).toBe(32);
     expect(await profileCatalog({ bundledDir: join(root, "missing-bundled") })()).toMatchObject({ effective: expect.any(Map) });
+    const permissionCatalog = await discoverProfiles({ bundledDir: lowerScope, userDir: join(root, "missing-user"), projectCwd: nested, projectStat: async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); } });
+    expect(permissionCatalog.unreadableScopes).toEqual(["project"]);
+    expect(permissionCatalog.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "DISCOVERY_ERROR", path: join(root, "a", "b", ".pi", "herdr-profiles") })]));
+    expect(() => resolveProfile("worker", permissionCatalog)).toThrow(/unreadable project/);
   });
 
   it("validates reachable fallback graphs and max attempts", () => {
@@ -165,9 +223,9 @@ describe("profile catalog", () => {
     const pi = parseProfile(profileText("worker"), source("/tmp/profile-scope", "worker"));
     const claude = parseProfile(profileText("reviewer", "claude"), source("/tmp/profile-scope", "reviewer"));
     expect(buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { model: "override/model", thinking: "high" }, "system prompt")).toEqual(["--model", "override/model", "--thinking", "high", "--no-session", "--append-system-prompt", "system prompt"]);
-    expect(buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, {}, "system prompt")).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "default", "--no-session-persistence", "--append-system-prompt-file", "system prompt"]);
+    expect(buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, {}, "system prompt")).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "default", "--append-system-prompt-file", "system prompt"]);
     expect(buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, true)).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "default"]);
-    expect(buildProfileArgv(claude)).toContain("--no-session-persistence");
+    expect(buildProfileArgv(claude)).not.toContain("--no-session-persistence");
     expect(buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence)).toEqual(["--model", "test/model", "--thinking", "low", "--no-session"]);
     const persisted = { ...pi, sessionPersistence: true };
     expect(buildProfileArgv(persisted)).not.toContain("--no-session");
@@ -178,8 +236,10 @@ describe("profile catalog", () => {
     expect(() => buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, { permissionMode: "invalid" as never })).toThrow();
     expect(buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, { permissionMode: "bypassPermissions" })).toContain("--allow-dangerously-skip-permissions");
     expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { tools: ["bad\nvalue"] })).toThrow();
-    expect(() => buildProfileArgv(pi, { effort: "low" })).toThrow();
-    expect(() => buildProfileArgv(claude, { thinking: "low" })).toThrow();
+    expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { extensions: ["./extension"] })).toThrow(/scope root/);
+    expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { extensions: ["../outside"] }, undefined, "/tmp/profile-scope")).toThrow();
+    for (const key of ["effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"] as const) expect(() => buildProfileArgv(pi, { [key]: key === "permissionMode" ? "plan" : key === "effort" ? "low" : ["value"] } as never)).toThrow();
+    for (const key of ["thinking", "tools", "extensions", "skills"] as const) expect(() => buildProfileArgv(claude, { [key]: key === "thinking" ? "low" : ["value"] } as never)).toThrow();
   });
 
   it("validates profile launch input before placement", () => {
@@ -244,9 +304,17 @@ describe("profile catalog", () => {
     const huge = await tool.execute("id", { mode: "profile", profile: "huge" } as never, new AbortController().signal, undefined, {} as never);
     expect(Buffer.byteLength(JSON.stringify(huge.details), "utf8")).toBeLessThanOrEqual(50 * 1024);
     expect(Buffer.byteLength(contentText(huge), "utf8")).toBeLessThanOrEqual(50 * 1024);
+    expect(() => JSON.parse(contentText(huge))).not.toThrow();
     expect(Buffer.byteLength(contentText(collection), "utf8")).toBeLessThanOrEqual(50 * 1024);
-    const manyProfiles = Array.from({ length: 100 }, (_, index) => ({ ...worker, name: `profile-${index}`, description: "d".repeat(512), source: profileSource("bundled", `/tmp/profile-${index}.md`, "/tmp") }));
-    const boundedTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map(manyProfiles.map((item) => [item.name, item])), candidates: manyProfiles.map((item) => ({ name: item.name, profile: item, source: item.source })), diagnostics: [] }) } });
+    expect(() => JSON.parse(contentText(collection))).not.toThrow();
+    const manyProfiles = Array.from({ length: 100 }, (_, index) => ({
+      ...worker,
+      name: `profile-${index}`,
+      description: "d".repeat(512),
+      fallbackProfiles: Array.from({ length: 16 }, (_, fallback) => `fallback-${fallback}-${"x".repeat(100)}`),
+      source: profileSource("bundled", "p".repeat(512), "s".repeat(512))
+    }));
+    const boundedTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map(manyProfiles.map((item) => [item.name, item])), candidates: manyProfiles.map((item) => ({ name: item.name, profile: item, source: item.source })), diagnostics: Array.from({ length: 16 }, (_, index) => ({ code: "DISCOVERY_ERROR" as const, name: `diagnostic-${index}`, message: "m".repeat(512), path: "p".repeat(512) })) }) } });
     const boundedCollection = await boundedTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
     expect(Buffer.byteLength(contentText(boundedCollection), "utf8")).toBeLessThanOrEqual(50 * 1024);
     const blockedProfile = { ...worker, name: "blocked-low", source: profileSource("bundled", "/tmp/blocked-low.md", "/tmp") };

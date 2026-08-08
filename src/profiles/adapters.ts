@@ -1,4 +1,5 @@
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeRuntimeOverrides, type ClaudeEffort, type ClaudePermissionMode, type PiRuntimeOverrides, type Profile, type RuntimeOverrides, type ThinkingLevel } from "./types.js";
+import { normalizeScopedResourcePath } from "./parser.js";
 
 export class ProfileAdapterError extends Error {
   readonly code = "INVALID_PROFILE_OVERRIDE" as const;
@@ -38,6 +39,24 @@ function values(value: string[] | undefined, fallback: string[]): string[] {
   return result;
 }
 
+function scopedValues(value: string[] | undefined, fallback: string[], field: string, scopeRoot: string | undefined): string[] {
+  const result = values(value, fallback);
+  if (value === undefined) return result;
+  if (scopeRoot === undefined) throw new ProfileAdapterError(`${field} overrides require a profile scope root`);
+  try {
+    return result.map((item) => normalizeScopedResourcePath(item, field, scopeRoot));
+  } catch (error) {
+    throw new ProfileAdapterError((error as Error).message);
+  }
+}
+
+function rejectIncompatible(kind: "pi" | "claude", overrides: Record<string, unknown>): void {
+  const invalid = kind === "pi"
+    ? ["effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"]
+    : ["thinking", "tools", "extensions", "skills"];
+  for (const key of invalid) if (Object.prototype.hasOwnProperty.call(overrides, key)) throw new ProfileAdapterError(`${key} is only valid for ${kind === "pi" ? "Claude" : "Pi"} profiles`);
+}
+
 function repeated(flag: string, items: string[]): string[] {
   return items.flatMap((item) => [flag, item]);
 }
@@ -56,23 +75,20 @@ function promptFileArg(flag: string, path: string | undefined): string[] {
   return [flag, path];
 }
 
-export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, sessionPersistence: boolean, overrides: PiRuntimeOverrides = {}, promptFilePath?: string): string[] {
-  const args = ["--model", model(overrides.model, profile.model), "--thinking", thinking(overrides.thinking, profile.thinking), ...commaSeparated("--tools", values(overrides.tools, profile.tools)), ...repeated("--extension", values(overrides.extensions, profile.extensions)), ...repeated("--skill", values(overrides.skills, profile.skills))];
+export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, sessionPersistence: boolean, overrides: PiRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
+  rejectIncompatible("pi", overrides as Record<string, unknown>);
+  const args = ["--model", model(overrides.model, profile.model), "--thinking", thinking(overrides.thinking, profile.thinking), ...commaSeparated("--tools", values(overrides.tools, profile.tools)), ...repeated("--extension", scopedValues(overrides.extensions, profile.extensions, "overrides.extensions", scopeRoot)), ...repeated("--skill", scopedValues(overrides.skills, profile.skills, "overrides.skills", scopeRoot))];
   if (!sessionPersistence) args.push("--no-session");
   return [...args, ...promptFileArg("--append-system-prompt", promptFilePath)];
 }
 
-export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string): string[] {
-  const args = ["--model", model(overrides.model, profile.model), "--effort", effort(overrides.effort, profile.effort), ...permissionArgs(permissionMode(overrides.permissionMode, profile.permissionMode)), ...repeated("--allowed-tools", values(overrides.allowedTools, profile.allowedTools)), ...repeated("--disallowed-tools", values(overrides.disallowedTools, profile.disallowedTools)), ...repeated("--add-dir", values(overrides.addDirs, profile.addDirs)), ...repeated("--plugin-dir", values(overrides.pluginDirs, profile.pluginDirs))];
-  if (!sessionPersistence) args.push("--no-session-persistence");
+export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
+  rejectIncompatible("claude", overrides as Record<string, unknown>);
+  const args = ["--model", model(overrides.model, profile.model), "--effort", effort(overrides.effort, profile.effort), ...permissionArgs(permissionMode(overrides.permissionMode, profile.permissionMode)), ...repeated("--allowed-tools", values(overrides.allowedTools, profile.allowedTools)), ...repeated("--disallowed-tools", values(overrides.disallowedTools, profile.disallowedTools)), ...repeated("--add-dir", scopedValues(overrides.addDirs, profile.addDirs, "overrides.addDirs", scopeRoot)), ...repeated("--plugin-dir", scopedValues(overrides.pluginDirs, profile.pluginDirs, "overrides.pluginDirs", scopeRoot))];
   return [...args, ...promptFileArg("--append-system-prompt-file", promptFilePath)];
 }
 
 export function buildProfileArgv(profile: Profile, overrides: RuntimeOverrides = {}, promptFilePath?: string): string[] {
-  if (profile.runtime.kind === "pi") {
-    if ("effort" in overrides && overrides.effort !== undefined) throw new ProfileAdapterError("effort is only valid for Claude profiles");
-    return buildPiArgv(profile.runtime, profile.sessionPersistence, overrides as PiRuntimeOverrides, promptFilePath);
-  }
-  if ("thinking" in overrides && overrides.thinking !== undefined) throw new ProfileAdapterError("thinking is only valid for Pi profiles");
-  return buildClaudeArgv(profile.runtime, profile.sessionPersistence, overrides as ClaudeRuntimeOverrides, promptFilePath);
+  if (profile.runtime.kind === "pi") return buildPiArgv(profile.runtime, profile.sessionPersistence, overrides as PiRuntimeOverrides, promptFilePath, profile.source.scopeRoot);
+  return buildClaudeArgv(profile.runtime, profile.sessionPersistence, overrides as ClaudeRuntimeOverrides, promptFilePath, profile.source.scopeRoot);
 }

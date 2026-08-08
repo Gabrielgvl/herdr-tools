@@ -2,7 +2,7 @@
 name: scout-claude
 description: Fast repository reconnaissance using a visible Claude worker.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: claude
   model: claude-sonnet-5

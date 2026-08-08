@@ -3,7 +3,7 @@ import type { HerdrCli } from "../cli.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
 import { assertCurrentContext, parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
-import { resolveProfile, type Profile, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
+import { resolveProfile, type Profile, type ProfileCandidate, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
 import { boundedText } from "../job-registry.js";
 
 interface InspectDetails {
@@ -15,6 +15,8 @@ interface InspectDetails {
   items?: unknown[];
   profile?: unknown;
   diagnostics?: unknown[];
+  truncated?: boolean;
+  omittedCount?: number;
   metadata?: unknown;
   recentUnwrappedLines?: string[];
   client?: { version: string; protocol: number };
@@ -94,37 +96,73 @@ function compactProfile(profile: Profile): Record<string, unknown> {
   };
 }
 
-function profileBlockedByUnreadableScope(profile: Profile, catalog: ProfileCatalog): boolean {
-  const precedence = { bundled: 0, user: 1, project: 2 } as const;
-  return catalog.unreadableScopes?.some((scope) => precedence[scope] > profile.source.precedence) === true;
+const PROFILE_SCOPE_PRECEDENCE = { bundled: 0, user: 1, project: 2 } as const;
+
+function highestUnreadableScope(catalog: ProfileCatalog, lowerThan?: number): Profile["source"]["kind"] | undefined {
+  return [...(catalog.unreadableScopes ?? [])]
+    .filter((scope) => lowerThan === undefined || PROFILE_SCOPE_PRECEDENCE[scope] > lowerThan)
+    .sort((left, right) => PROFILE_SCOPE_PRECEDENCE[right] - PROFILE_SCOPE_PRECEDENCE[left])[0];
 }
 
-function profileCollection(catalog: ProfileCatalog): Record<string, unknown>[] {
+function profileBlockedByUnreadableScope(profile: Profile, catalog: ProfileCatalog): Profile["source"]["kind"] | undefined {
+  return highestUnreadableScope(catalog, profile.source.precedence);
+}
+
+function invalidCandidate(candidates: readonly ProfileCandidate[]): ProfileCandidate | undefined {
+  return [...candidates]
+    .filter((candidate) => candidate.diagnostic !== undefined)
+    .sort((left, right) => right.source.precedence - left.source.precedence)[0];
+}
+
+interface ProfileCollectionResult {
+  items: Record<string, unknown>[];
+  omittedCount: number;
+}
+
+function profileCollection(catalog: ProfileCatalog): ProfileCollectionResult {
+  const grouped = new Map<string, ProfileCandidate[]>();
+  for (const candidate of catalog.candidates) grouped.set(candidate.name, [...(grouped.get(candidate.name) ?? []), candidate]);
   const entries = new Map<string, Record<string, unknown>>();
-  for (const candidate of catalog.candidates) {
-    if (candidate.profile && catalog.effective.get(candidate.name) === candidate.profile && !catalog.blocked?.has(candidate.name) && !profileBlockedByUnreadableScope(candidate.profile, catalog)) entries.set(candidate.name, compactProfile(candidate.profile));
-    else if (!entries.has(candidate.name)) {
-      const diagnostic = candidate.diagnostic?.message
-        ?? (catalog.blocked?.has(candidate.name)
-          ? "blocked by invalid higher-precedence profile"
-          : candidate.profile && profileBlockedByUnreadableScope(candidate.profile, catalog)
-            ? "blocked by unreadable higher-precedence profile scope"
-            : "invalid profile");
-      entries.set(candidate.name, {
-        name: boundedText(candidate.name, 128),
+  for (const [name, candidates] of grouped) {
+    const effective = catalog.effective.get(name);
+    const unreadableScope = effective ? profileBlockedByUnreadableScope(effective, catalog) : highestUnreadableScope(catalog);
+    const unreadableDiagnostic = unreadableScope
+      ? catalog.diagnostics.find((item) => item.code === "DISCOVERY_ERROR" && item.source?.kind === unreadableScope)
+      : undefined;
+    if (unreadableScope) {
+      entries.set(name, {
+        name: boundedText(name, 128),
         valid: false,
-        source: { kind: boundedText(candidate.source.kind, 32), path: boundedText(candidate.source.path, 512) },
-        diagnostic: boundedText(diagnostic, 512)
+        source: unreadableDiagnostic?.source
+          ? { kind: boundedText(unreadableDiagnostic.source.kind, 32), path: boundedText(unreadableDiagnostic.source.path, 512) }
+          : { kind: boundedText(unreadableScope, 32), path: "<unreadable scope>" },
+        diagnostic: boundedText(unreadableDiagnostic?.message ?? `blocked by unreadable ${unreadableScope} profile scope`, 512)
+      });
+      continue;
+    }
+    if (effective && !catalog.blocked?.has(name)) {
+      entries.set(name, compactProfile(effective));
+      continue;
+    }
+    const invalid = invalidCandidate(candidates);
+    if (invalid) {
+      entries.set(name, {
+        name: boundedText(name, 128),
+        valid: false,
+        source: { kind: boundedText(invalid.source.kind, 32), path: boundedText(invalid.source.path, 512) },
+        diagnostic: boundedText(invalid.diagnostic?.message ?? "invalid profile", 512)
       });
     }
   }
-  const result: Record<string, unknown>[] = [];
-  for (const entry of [...entries.values()].sort((left, right) => String(left.name).localeCompare(String(right.name))).slice(0, MAX_PROFILE_LIST_ITEMS)) {
-    const candidate = [...result, entry];
+  const allEntries = [...entries.values()].sort((left, right) => String(left.name).localeCompare(String(right.name)));
+  const items: Record<string, unknown>[] = [];
+  for (const entry of allEntries) {
+    if (items.length >= MAX_PROFILE_LIST_ITEMS) break;
+    const candidate = [...items, entry];
     if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > MAX_PROFILE_RESULT_BYTES) break;
-    result.push(entry);
+    items.push(entry);
   }
-  return result;
+  return { items, omittedCount: allEntries.length - items.length };
 }
 
 function boundedBody(body: string): string {
@@ -308,10 +346,14 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         if (!deps.profiles) throw Object.assign(new Error("Profile catalog is unavailable"), { code: "PROFILE_CATALOG_UNAVAILABLE" });
         const catalog = await deps.profiles.load();
         if (mode === "collection") {
-          const items = profileCollection(catalog);
-          const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.slice(0, 16));
-          const details = boundedInspectionDetails({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items, diagnostics });
-          return { content: [{ type: "text", text: modelVisibleContent({ collection: "profiles", items: items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), diagnostics }) }], details };
+          const collection = profileCollection(catalog);
+          const omitted = collection.omittedCount > 0;
+          const diagnostics = omitted
+            ? [...modelVisibleDiagnostics(catalog.diagnostics.slice(0, 15)), OUTPUT_TRUNCATED_DIAGNOSTIC]
+            : modelVisibleDiagnostics(catalog.diagnostics.slice(0, 16));
+          const omission = omitted ? { truncated: true, omittedCount: collection.omittedCount } : {};
+          const details = boundedInspectionDetails({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items: collection.items, ...omission, diagnostics });
+          return { content: [{ type: "text", text: modelVisibleContent({ collection: "profiles", items: collection.items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), ...omission, diagnostics }) }], details };
         }
         const profile = exactProfile(catalog, input.profile!);
         const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.filter((item) => item.name === input.profile).slice(0, 8));

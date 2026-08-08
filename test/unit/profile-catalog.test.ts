@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { buildClaudeArgv, buildPiArgv, buildProfileArgv, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileSource, readProfileText, resolveProfile, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
+import { buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
 import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
 import { createLaunchTool, validateLaunchParams } from "../../src/tools/launch.js";
 import { createRuntime } from "../../index.js";
@@ -114,6 +114,8 @@ describe("profile catalog", () => {
   });
 
   it("discovers scoped precedence, reports shadows, and blocks invalid overrides", async () => {
+    expect(profileNameFromPath("/tmp/herdr-profiles/worker.md")).toBe("worker");
+    expect(profileNameFromPath("C:\\\\Users\\\\owner\\\\herdr-profiles\\\\worker.md")).toBe("worker");
     const root = await mkdtemp(join(tmpdir(), "herdr-profile-"));
     const bundled = join(root, "package", "herdr-profiles");
     const user = join(root, "home", ".pi", "agent", "herdr-profiles");
@@ -226,6 +228,10 @@ describe("profile catalog", () => {
     const tooDeep = new Map([make("root", ["next"]), make("next", ["last"]), make("last", ["end"]), make("end", [])].map((item) => [item.name, item] as const));
     expect(() => resolveProfile("root", { effective: tooDeep, candidates: [], diagnostics: [] }, 3)).toThrow(ProfileResolutionError);
     expect(() => resolveProfile("missing", { effective, candidates: [], diagnostics: [] })).toThrow(ProfileResolutionError);
+    for (const unreadableScope of ["bundled", "user", "project"] as const) {
+      expect(() => resolveProfile("missing", { effective: new Map(), candidates: [], diagnostics: [], unreadableScopes: [unreadableScope] })).toThrow(new RegExp(`${unreadableScope}.*unreadable`));
+    }
+    expect(() => resolveProfile("missing", { effective: new Map(), candidates: [], diagnostics: [], unreadableScopes: ["bundled", "user", "project"] })).toThrow(/project/);
     const shared = new Map([make("root", ["next", "last"]), make("next", ["last"]), make("last", [])].map((item) => [item.name, item] as const));
     expect(resolveProfile("root", { effective: shared, candidates: [], diagnostics: [] }).reachableNames).toEqual(["root", "next", "last"]);
     const fanout = new Map([make("root", ["next", "last", "end"]), make("next", []), make("last", []), make("end", [])].map((item) => [item.name, item] as const));
@@ -273,8 +279,7 @@ describe("profile catalog", () => {
     const worker = parseProfile(profileText("worker"), source(root, "worker"));
     const calls: string[][] = [];
     const snapshot = { type: "session_snapshot", snapshot: { version: "0.8", protocol: 1, workspaces: [{ workspace_id: "w", label: "workspace" }], tabs: [{ tab_id: "w:t", workspace_id: "w", label: "main" }], panes: [{ pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "caller", agent_status: "idle" }], agents: [] } };
-    const cleanup = vi.fn(async () => undefined);
-    const promptFiles = { create: vi.fn(async (body: string) => ({ path: "/tmp/profile-prompt", cleanup, body })) };
+    const promptSources = { create: vi.fn(async (body: string) => ({ path: `/tmp/profile-${Buffer.byteLength(body, "utf8")}.md` })) };
     const cli = { runJson: async (argv: string[]) => {
       calls.push(argv);
       if (argv[0] === "api") return { id: "snapshot", result: snapshot };
@@ -284,11 +289,22 @@ describe("profile catalog", () => {
       if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "w:p2", tab_id: "w:t", agent_name: "worker", agent_status: "idle" } } };
       throw new Error(`unexpected ${argv.join(" ")}`);
     } } as unknown as HerdrCli;
-    const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptFiles, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
-    expect(promptFiles.create).toHaveBeenCalledWith("\nBody for worker.\n");
-    expect(cleanup).toHaveBeenCalledOnce();
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--no-session", "--append-system-prompt", "/tmp/profile-prompt"]);
+    const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
+    expect(promptSources.create).toHaveBeenCalledWith("\nBody for worker.\n");
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
     expect(result.details).toMatchObject({ profile: { name: "worker", fallbackProfiles: [], timeoutMinutes: 30 }, kind: "pi" });
+    const defaultCreate = vi.spyOn(defaultPromptSourceStore, "create").mockResolvedValue({ path: "/tmp/default-profile.md" });
+    try {
+      await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-default", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
+      expect(defaultCreate).toHaveBeenCalledWith("\nBody for worker.\n");
+    } finally {
+      defaultCreate.mockRestore();
+    }
+
+    const storeFailure = new Error("prompt cache unavailable");
+    const callsBeforeFailure = calls.length;
+    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toBe(storeFailure);
+    expect(calls).toHaveLength(callsBeforeFailure);
   });
 
   it("inspects bounded profile collections and exact profiles without Herdr reads", async () => {
@@ -299,7 +315,7 @@ describe("profile catalog", () => {
     const longBody = { ...worker, name: "long", source: source(root, "long"), body: "x".repeat(9_000) };
     const hugeMetadata = { ...worker, name: "huge", source: source(root, "huge"), description: "d".repeat(100_000) };
     const fallbackRoot = { ...worker, name: "fallback-root", source: source(root, "fallback-root"), fallbackProfiles: [worker.name] };
-    const catalog = { effective: new Map([[worker.name, worker], [longBody.name, longBody], [hugeMetadata.name, hugeMetadata], [fallbackRoot.name, fallbackRoot], [claude.name, claude]]), blocked: new Set(["blocked-no-diagnostic"]), candidates: [{ name: worker.name, profile: worker, source: worker.source }, { name: hugeMetadata.name, profile: hugeMetadata, source: hugeMetadata.source }, { name: fallbackRoot.name, profile: fallbackRoot, source: fallbackRoot.source }, { name: claude.name, profile: claude, source: claude.source }, { name: "invalid", source: source(root, "invalid"), diagnostic: { code: "INVALID_PROFILE" as const, message: "bad" } }, { name: "invalid", source: source(root, "invalid-2"), diagnostic: { code: "INVALID_PROFILE" as const, message: "bad again" } }, { name: "blocked-no-diagnostic", source: source(root, "blocked-no-diagnostic") }, { name: "no-diagnostic", source: source(root, "no-diagnostic") }], diagnostics: [{ code: "SHADOWED_PROFILE" as const, message: "test", name: "worker", path: "/tmp/shadowed" }, { code: "DISCOVERY_ERROR" as const, message: "scope read failed", path: "/tmp/unreadable" }] };
+    const catalog = { effective: new Map([[worker.name, worker], [longBody.name, longBody], [hugeMetadata.name, hugeMetadata], [fallbackRoot.name, fallbackRoot], [claude.name, claude]]), blocked: new Set(["blocked-no-diagnostic"]), candidates: [{ name: worker.name, profile: worker, source: worker.source }, { name: hugeMetadata.name, profile: hugeMetadata, source: hugeMetadata.source }, { name: fallbackRoot.name, profile: fallbackRoot, source: fallbackRoot.source }, { name: claude.name, profile: claude, source: claude.source }, { name: "invalid", source: source(root, "invalid"), diagnostic: { code: "INVALID_PROFILE" as const, message: "bad" } }, { name: "invalid", source: source(root, "invalid-2"), diagnostic: { code: "INVALID_PROFILE" as const, message: "bad again" } }, { name: "invalid-no-message", source: source(root, "invalid-no-message"), diagnostic: { code: "INVALID_PROFILE" as const } as never }, { name: "blocked-no-diagnostic", source: source(root, "blocked-no-diagnostic") }, { name: "no-diagnostic", source: source(root, "no-diagnostic") }], diagnostics: [{ code: "SHADOWED_PROFILE" as const, message: "test", name: "worker", path: "/tmp/shadowed" }, { code: "DISCOVERY_ERROR" as const, message: "scope read failed", path: "/tmp/unreadable" }] };
     const tool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => catalog } });
     const contentText = (result: { content: Array<unknown> }) => (result.content[0] as { text: string }).text;
     const collection = await tool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
@@ -307,6 +323,28 @@ describe("profile catalog", () => {
     expect(contentText(collection)).toContain('"description":"Test worker"');
     expect(contentText(collection)).toContain('"thinking":"low"');
     expect(contentText(collection)).toContain('"source"');
+    const blockedWorker = { ...worker, source: profileSource("bundled", "/bundled/worker.md", "/bundled") };
+    const blockedInspection = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({
+      effective: new Map(),
+      blocked: new Set(["worker"]),
+      candidates: [
+        { name: "worker", profile: blockedWorker, source: blockedWorker.source },
+        { name: "worker", source: profileSource("user", "/user/worker.md", "/user"), diagnostic: { code: "INVALID_PROFILE" as const, message: "user invalid" } },
+        { name: "worker", source: profileSource("project", "/project/worker.md", "/project"), diagnostic: { code: "INVALID_PROFILE" as const, message: "project invalid" } }
+      ], diagnostics: []
+    }) } });
+    const blockedResult = await blockedInspection.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    expect(blockedResult.details).toMatchObject({ items: [expect.objectContaining({ name: "worker", valid: false, source: expect.objectContaining({ path: "/project/worker.md" }), diagnostic: "project invalid" })] });
+    const unreadableInspection = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({
+      effective: new Map([[blockedWorker.name, blockedWorker]]),
+      candidates: [{ name: "worker", profile: blockedWorker, source: blockedWorker.source }],
+      diagnostics: [
+        { code: "DISCOVERY_ERROR" as const, message: "user scope unreadable", source: profileSource("user", "/user", "/home") },
+        { code: "DISCOVERY_ERROR" as const, message: "project scope unreadable", source: profileSource("project", "/project", "/project") }
+      ], unreadableScopes: ["bundled", "user", "project"] as const
+    }) } });
+    const unreadableResult = await unreadableInspection.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    expect(unreadableResult.details).toMatchObject({ items: [expect.objectContaining({ name: "worker", valid: false, source: expect.objectContaining({ kind: "project" }), diagnostic: "project scope unreadable" })] });
     const exact = await tool.execute("id", { mode: "profile", profile: "worker" } as never, new AbortController().signal, undefined, {} as never);
     expect(exact.details).toMatchObject({ kind: "profile", profile: { name: "worker", body: expect.stringContaining("Body") } });
     expect(contentText(exact)).toContain('"body":"\\nBody for worker.\\n"');
@@ -335,11 +373,17 @@ describe("profile catalog", () => {
     expect(Buffer.byteLength(contentText(boundedCollection), "utf8")).toBeLessThanOrEqual(16_000);
     expect(boundedCollectionContent.truncated).toBe(true);
     expect(boundedCollectionContent.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "OUTPUT_TRUNCATED" })]));
+    expect(boundedCollection.details).toMatchObject({ truncated: true, omittedCount: expect.any(Number), diagnostics: expect.arrayContaining([expect.objectContaining({ code: "OUTPUT_TRUNCATED" })]) });
+    expect(boundedCollectionContent.omittedCount).toBeGreaterThan(0);
+    const capProfiles = Array.from({ length: 101 }, (_, index) => ({ ...worker, name: `cap-${index}`, description: "d", source: profileSource("bundled", `/p/${index}`, "/p") }));
+    const capTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map(capProfiles.map((item) => [item.name, item])), candidates: capProfiles.map((item) => ({ name: item.name, profile: item, source: item.source })), diagnostics: [] }) } });
+    const capResult = await capTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    expect(capResult.details).toMatchObject({ truncated: true, omittedCount: 1 });
     const blockedProfile = { ...worker, name: "blocked-low", source: profileSource("bundled", "/tmp/blocked-low.md", "/tmp") };
     const blockedCatalog = { ...catalog, effective: new Map([[blockedProfile.name, blockedProfile]]), candidates: [{ name: blockedProfile.name, profile: blockedProfile, source: blockedProfile.source }], unreadableScopes: ["project"] as const };
     const blockedTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => blockedCatalog } });
     const blockedCollection = await blockedTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
-    expect(JSON.stringify(blockedCollection.details)).toContain("unreadable higher-precedence");
+    expect(JSON.stringify(blockedCollection.details)).toContain("blocked by unreadable project profile scope");
     await expect(tool.execute("id", { mode: "collection", collection: "profiles", profile: "worker" } as never, new AbortController().signal, undefined, {} as never)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(tool.execute("id", { mode: "profile", profile: "worker", target: "current" } as never, new AbortController().signal, undefined, {} as never)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(tool.execute("id", { mode: "profile", profile: "missing" } as never, new AbortController().signal, undefined, {} as never)).rejects.toMatchObject({ code: "PROFILE_RESOLUTION_INVALID" });

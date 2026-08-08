@@ -5,7 +5,7 @@ import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.j
 import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { isLaunchAgentKind, LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
-import { buildProfileArgv, defaultPromptFileFactory, resolveProfile, type ProfileCatalog, type ProfileResolution, type PromptFileFactory } from "../profiles/index.js";
+import { buildProfileArgv, defaultPromptSourceStore, resolveProfile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -21,7 +21,7 @@ export interface LaunchDependencies {
   cwd?: string;
   ownership?: LaunchResourceRegistry;
   profiles?: { load: () => Promise<ProfileCatalog> };
-  promptFiles?: PromptFileFactory;
+  promptSources?: PromptSourceStore;
 }
 
 export interface LaunchResourceIds {
@@ -249,6 +249,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       }
       const effectiveKind = profileResolution?.profile.runtime.kind ?? params.kind!;
       const effectiveArgv = profileResolution ? undefined : params.argv;
+      const promptSource = profileResolution
+        ? await (deps.promptSources ?? defaultPromptSourceStore).create(profileResolution.profile.body)
+        : undefined;
       const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
       const sender = params.initialPrompt !== undefined ? resolveSender(snapshot, deps.context.paneId) : undefined;
       assertCurrentContext(snapshot, deps.context);
@@ -295,21 +298,14 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         }
         phase = "agent_start";
         progress(onUpdate, phase, created);
-        const promptFiles = deps.promptFiles ?? defaultPromptFileFactory;
-        let promptFile: Awaited<ReturnType<PromptFileFactory["create"]>> | undefined;
         let started: unknown;
-        try {
-          if (profileResolution) {
-            promptFile = await promptFiles.create(profileResolution.profile.body);
-            const argv = buildProfileArgv(profileResolution.profile, params.overrides, promptFile.path);
-            started = await run(deps.cli, ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000", "--", ...argv], abortSignal, true);
-          } else {
-            const startArgs = ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000"];
-            if (effectiveArgv !== undefined && effectiveArgv.length > 0) startArgs.push("--", ...effectiveArgv);
-            started = await run(deps.cli, startArgs, abortSignal, true);
-          }
-        } finally {
-          await promptFile?.cleanup();
+        if (profileResolution) {
+          const argv = buildProfileArgv(profileResolution.profile, params.overrides, promptSource!.path);
+          started = await run(deps.cli, ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000", "--", ...argv], abortSignal, true);
+        } else {
+          const startArgs = ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000"];
+          if (effectiveArgv !== undefined && effectiveArgv.length > 0) startArgs.push("--", ...effectiveArgv);
+          started = await run(deps.cli, startArgs, abortSignal, true);
         }
         const startedAgent = agentIdentity(started);
         let agentId = startedAgent.agentId;

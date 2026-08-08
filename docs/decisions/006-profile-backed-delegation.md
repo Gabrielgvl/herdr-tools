@@ -20,7 +20,7 @@ Build the replacement in layers.
 
 `herdr-tools` owns separate bundled/user/project profile files and strict resolution. Profiles pin Pi or Claude, use typed runtime blocks, append a required Markdown body to the default system prompt, and never expose raw argv or arbitrary environment overrides. Interactive Claude profiles must keep session persistence enabled; Pi profiles may disable it.
 
-The first slice adds the profile catalog, inspection, adapters, and profile-backed launch using existing Herdr primitives. It exposes fallback metadata but does not automate fallback or scrape terminal output as a result.
+The first slice adds the profile catalog, inspection, adapters, and profile-backed launch using existing Herdr primitives. It exposes fallback metadata but does not automate fallback or scrape terminal output as a result. Before any pane/tab mutation, a profile body is written to a durable owner-only SHA-256 content-addressed prompt source under the Herdr-tools cache (`0700` directory, `0600` file). The exact source is reused across launches and reloads and is never removed on successful launch or another launch's failure.
 
 Herdr core subsequently gains stdin prompt transport, structured turn results, cancellation, same-pane replacement, durable lineage, and result/transcript references. Only then does `herdr-tools` add the blocking `herdr_delegate` state machine.
 
@@ -54,5 +54,6 @@ Rejected because provider text changes and classification errors can hide authen
 - The public surface remains honest: Slice 1 launches profile-backed agents but does not promise structured results or automatic fallback.
 - The complete feature spans this TypeScript extension and the Rust Herdr runtime/integrations.
 - Profile configuration is deliberately powerful: typed call overrides may expand capabilities, Claude bypass modes are allowed, and project profiles have no trust gate.
+- Prompt-source storage is a launch prerequisite rather than launch cleanup: a store failure occurs before topology mutation, and startup errors are not masked by cleanup of a successful shared source.
 - The runtime requires durable evidence and lineage for indefinitely suspended runs; active/suspended evidence is not constrained by the terminal 100 MiB retention cap.
 - Architectural complexity is introduced only when its prerequisite layer works and is tested.

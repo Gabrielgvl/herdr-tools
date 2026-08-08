@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, win32 } from "node:path";
 import { parseProfile, profileSource } from "./parser.js";
 import { MAX_PROFILE_BYTES, MAX_PROFILE_DIAGNOSTICS, type Profile, type ProfileCandidate, type ProfileCatalog, type ProfileDiagnostic, type ProfileSourceKind } from "./types.js";
 
@@ -90,6 +90,12 @@ export async function readProfileText(path: string, io: ProfileReadIo = fs): Pro
   }
 }
 
+export function profileNameFromPath(path: string): string {
+  const hostBasename = basename(path);
+  const fileName = hostBasename === path ? win32.basename(path) : hostBasename;
+  return fileName.replace(/\.md$/, "");
+}
+
 async function readSource(kind: ProfileSourceKind, directory: string, scopeRoot: string, candidates: ProfileCandidate[], diagnostics: ProfileDiagnostic[]): Promise<void> {
   for (const path of await filesIn(directory)) {
     const source = profileSource(kind, path, scopeRoot);
@@ -98,7 +104,7 @@ async function readSource(kind: ProfileSourceKind, directory: string, scopeRoot:
       candidates.push({ name: profile.name, profile, source });
     } catch (error) {
       const message = String(error);
-      const name = path.slice(path.lastIndexOf("/") + 1).replace(/\.md$/, "");
+      const name = profileNameFromPath(path);
       const item: ProfileDiagnostic = { code: "INVALID_PROFILE", message, path, name, source };
       candidates.push({ name, source, diagnostic: item });
       addDiagnostic(diagnostics, item);

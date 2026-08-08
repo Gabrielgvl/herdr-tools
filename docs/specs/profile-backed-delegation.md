@@ -19,6 +19,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Each profile pins exactly one kind (`pi` or `claude`) through a discriminated runtime block. The body is appended to the runtime's default system prompt.
 - Claude profiles must set `sessionPersistence: true` because Herdr starts interactive Claude agents; Pi profiles may set it false and receive `--no-session`.
 - Relative runtime-resource paths resolve from the profile scope root. Arbitrary environment overrides are not supported by profile delegation.
+- Profile bodies are stored as durable owner-only prompt sources before topology mutation. The source is a UTF-8 exact-body SHA-256 content-addressed file under the Herdr-tools cache directory (`0700` directory, `0600` file), reused across launches and restarts; successful sources are never deleted.
 - Typed call overrides may replace typed defaults, including capability-expanding Claude permission modes. Project profiles have no trust gate. These are deliberate trust choices.
 - Fallbacks are ordered references to named profiles, validated as a graph. A logical run has at most three attempts. Invalid profiles are isolated; only the selected reachable graph blocks launch.
 - Fallback targets use their own defaults. The logical cwd, task, placement, and provenance carry across attempts.
@@ -38,7 +39,7 @@ Deliver now:
 
 - strict schema/parser and scoped discovery;
 - deterministic whole-profile precedence and graph validation;
-- bounded `herdr_inspect` profile collection/exact-profile modes;
+- bounded `herdr_inspect` profile collection/exact-profile modes; collection omissions expose `truncated`, `omittedCount`, and an `OUTPUT_TRUNCATED` diagnostic in both details and model-visible JSON;
 - typed Pi and Claude argv adapters;
 - profile-backed launch through the existing launch implementation while preserving mandatory assignment provenance;
 - starter bundled profiles and unit tests;

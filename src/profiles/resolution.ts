@@ -8,11 +8,20 @@ export class ProfileResolutionError extends Error {
   }
 }
 
+const PROFILE_SCOPE_PRECEDENCE: Record<Profile["source"]["kind"], number> = { bundled: 0, user: 1, project: 2 };
+
+function highestUnreadableScope(catalog: ProfileCatalog): Profile["source"]["kind"] | undefined {
+  return [...(catalog.unreadableScopes ?? [])].sort((left, right) => PROFILE_SCOPE_PRECEDENCE[right] - PROFILE_SCOPE_PRECEDENCE[left])[0];
+}
+
 function profile(catalog: ProfileCatalog, name: string): Profile {
   const value = catalog.effective.get(name);
-  if (!value) throw new ProfileResolutionError(catalog.blocked?.has(name) ? `Profile ${name} is blocked by an invalid higher-precedence candidate` : `Unknown profile ${name}`, { name, blocked: catalog.blocked?.has(name) === true });
-  const precedence: Record<Profile["source"]["kind"], number> = { bundled: 0, user: 1, project: 2 };
-  const unreadableHigherScope = catalog.unreadableScopes?.find((scope) => precedence[scope] > value.source.precedence);
+  if (!value) {
+    const unreadableScope = highestUnreadableScope(catalog);
+    if (unreadableScope) throw new ProfileResolutionError(`Profile ${name} cannot be resolved because the ${unreadableScope} profile scope is unreadable`, { name, unreadableScope, blocked: true });
+    throw new ProfileResolutionError(catalog.blocked?.has(name) ? `Profile ${name} is blocked by an invalid higher-precedence candidate` : `Unknown profile ${name}`, { name, blocked: catalog.blocked?.has(name) === true });
+  }
+  const unreadableHigherScope = catalog.unreadableScopes?.find((scope) => PROFILE_SCOPE_PRECEDENCE[scope] > value.source.precedence);
   if (unreadableHigherScope) throw new ProfileResolutionError(`Profile ${name} is blocked by unreadable ${unreadableHigherScope} profile scope`, { name, unreadableScope: unreadableHigherScope });
   return value;
 }

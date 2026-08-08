@@ -1,5 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudePermissionMode, type ThinkingLevel } from "./profiles/types.js";
 
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
 const AgentArgument = Type.String({ pattern: "^[^\\u0000]*$" });
@@ -9,7 +10,6 @@ export const LAUNCH_AGENT_KINDS = [
   "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode", "opencode",
   "copilot", "kimi", "kiro", "droid", "amp", "grok", "hermes", "kilo", "qodercli", "maki"
 ] as const;
-
 export type LaunchAgentKind = (typeof LAUNCH_AGENT_KINDS)[number];
 
 export const LaunchPlacementSchema = Type.Union([
@@ -18,10 +18,18 @@ export const LaunchPlacementSchema = Type.Union([
   Type.Object({ mode: Type.Literal("existing_pane"), target: Identifier }, { additionalProperties: false })
 ]);
 
+export const ProfileLaunchOverridesSchema = Type.Object({
+  model: Type.Optional(Identifier),
+  thinking: Type.Optional(StringEnum(THINKING_LEVELS)),
+  permissionMode: Type.Optional(StringEnum(CLAUDE_PERMISSION_MODES))
+}, { additionalProperties: false });
+
 export const LaunchParamsSchema = Type.Object({
   name: Identifier,
-  kind: StringEnum(LAUNCH_AGENT_KINDS),
+  kind: Type.Optional(StringEnum(LAUNCH_AGENT_KINDS)),
+  profile: Type.Optional(Identifier),
   argv: Type.Optional(Type.Array(AgentArgument)),
+  overrides: Type.Optional(ProfileLaunchOverridesSchema),
   placement: Type.Optional(LaunchPlacementSchema),
   label: Type.Optional(Identifier),
   cwd: Type.Optional(Identifier),
@@ -35,10 +43,18 @@ export type LaunchPlacement =
   | { mode: "new_tab"; tabLabel: string }
   | { mode: "existing_pane"; target: string };
 
+export interface ProfileLaunchOverrides {
+  model?: string;
+  thinking?: ThinkingLevel;
+  permissionMode?: ClaudePermissionMode;
+}
+
 export interface LaunchParams {
   name: string;
-  kind: LaunchAgentKind;
+  kind?: LaunchAgentKind;
+  profile?: string;
   argv?: string[];
+  overrides?: ProfileLaunchOverrides;
   placement?: LaunchPlacement;
   label?: string;
   cwd?: string;

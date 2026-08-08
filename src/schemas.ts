@@ -7,7 +7,8 @@ export const InspectParamsSchema = Type.Union([
   Type.Object({}, { additionalProperties: false }),
   Type.Object({ mode: StringEnum(["context"] as const) }, { additionalProperties: false }),
   Type.Object({ mode: StringEnum(["target"] as const), target: Identifier }, { additionalProperties: false }),
-  Type.Object({ mode: StringEnum(["collection"] as const), collection: StringEnum(["panes", "agents", "tabs"] as const) }, { additionalProperties: false }),
+  Type.Object({ mode: StringEnum(["collection"] as const), collection: StringEnum(["panes", "agents", "tabs", "profiles"] as const) }, { additionalProperties: false }),
+  Type.Object({ mode: StringEnum(["profile"] as const), profile: Identifier }, { additionalProperties: false }),
   Type.Object({ mode: StringEnum(["health"] as const) }, { additionalProperties: false })
 ]);
 
@@ -20,7 +21,7 @@ export const CommunicateParamsSchema = Type.Union([
   Type.Object({ target: Identifier, operation: Type.Literal("keys"), keys: Type.Array(NamedKey, { minItems: 1 }) }, { additionalProperties: false })
 ]);
 
-export type InspectParams = { mode?: "context" | "target" | "collection" | "health"; target?: string; collection?: "panes" | "agents" | "tabs" };
+export type InspectParams = { mode?: "context" | "target" | "collection" | "profile" | "health"; target?: string; collection?: "panes" | "agents" | "tabs" | "profiles"; profile?: string };
 export type CommunicateParams =
   | { target: string; operation: "prompt"; text: string }
   | { target: string; operation: "steer"; text: string }

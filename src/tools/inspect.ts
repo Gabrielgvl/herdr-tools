@@ -328,27 +328,32 @@ function boundedInspectionDetails<T extends InspectDetails>(details: T): T {
   return fitInspectionValue(details, MAX_PROFILE_RESULT_BYTES) as T;
 }
 
-function hasOutputTruncationDiagnostic(diagnostics: readonly unknown[]): boolean {
-  return diagnostics.some((diagnostic) => typeof diagnostic === "object" && diagnostic !== null && (diagnostic as Record<string, unknown>).code === "OUTPUT_TRUNCATED");
-}
-
 function fitProfileCollection(value: Record<string, unknown>, totalCount: number, maxBytes: number): Record<string, unknown> {
-  const initialItems = value.items as unknown[];
-  if (jsonBytes(value) <= maxBytes && initialItems.length >= totalCount) return value;
-  const reserve = jsonBytes({ truncated: true, omittedCount: totalCount, diagnostics: [OUTPUT_TRUNCATED_DIAGNOSTIC] }) + 32;
-  const fitted = fitInspectionValue(value, Math.max(0, maxBytes - reserve));
-  const objectValue = fitted as Record<string, unknown>;
-  const items = Array.isArray(objectValue.items) ? objectValue.items : [];
-  const omittedCount = Math.max(0, totalCount - items.length);
-  const truncated = objectValue.truncated === true || omittedCount > 0;
-  const diagnostics = objectValue.diagnostics as unknown[];
-  const next: Record<string, unknown> = { ...objectValue, items };
-  if (truncated) {
-    next.truncated = true;
-    next.omittedCount = omittedCount;
-    next.diagnostics = hasOutputTruncationDiagnostic(diagnostics) ? diagnostics : [...diagnostics, OUTPUT_TRUNCATED_DIAGNOSTIC];
-  }
-  return next;
+  const items = value.items as unknown[];
+  const diagnostics = value.diagnostics as unknown[];
+  if (jsonBytes(value) <= maxBytes && items.length === totalCount && value.truncated !== true) return value;
+  const fixed = { ...value };
+  delete fixed.items;
+  delete fixed.diagnostics;
+  delete fixed.truncated;
+  delete fixed.omittedCount;
+  const retainedDiagnostics = diagnostics.filter((diagnostic) => !(typeof diagnostic === "object" && diagnostic !== null && (diagnostic as Record<string, unknown>).code === "OUTPUT_TRUNCATED"));
+  const selectItems = (diagnosticSubset: unknown[]): Record<string, unknown> | undefined => {
+    for (let count = items.length; count >= 0; count -= 1) {
+      const candidate = {
+        ...fixed,
+        items: items.slice(0, count),
+        truncated: true,
+        omittedCount: totalCount - count,
+        diagnostics: [...diagnosticSubset, OUTPUT_TRUNCATED_DIAGNOSTIC]
+      };
+      if (jsonBytes(candidate) <= maxBytes) return candidate;
+    }
+    return undefined;
+  };
+  let candidate = selectItems(retainedDiagnostics);
+  for (let count = retainedDiagnostics.length - 1; !candidate && count >= 0; count -= 1) candidate = selectItems(retainedDiagnostics.slice(0, count));
+  return candidate!;
 }
 
 function modelVisibleContent(value: Record<string, unknown>): string {

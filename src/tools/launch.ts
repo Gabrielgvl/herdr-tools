@@ -242,6 +242,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       const placement = params.placement ?? { mode: "same_tab" as const };
       const label = params.label ?? params.name;
       let profileResolution: ProfileResolution | undefined;
+      let profileArgv: string[] | undefined;
       if (params.profile !== undefined) {
         if (!deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
         profileResolution = resolveProfile(params.profile, await deps.profiles.load());
@@ -252,6 +253,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       const promptSource = profileResolution
         ? await (deps.promptSources ?? defaultPromptSourceStore).create(profileResolution.profile.body)
         : undefined;
+      if (profileResolution) profileArgv = buildProfileArgv(profileResolution.profile, params.overrides, promptSource!.path);
       const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
       const sender = params.initialPrompt !== undefined ? resolveSender(snapshot, deps.context.paneId) : undefined;
       assertCurrentContext(snapshot, deps.context);
@@ -300,8 +302,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         progress(onUpdate, phase, created);
         let started: unknown;
         if (profileResolution) {
-          const argv = buildProfileArgv(profileResolution.profile, params.overrides, promptSource!.path);
-          started = await run(deps.cli, ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000", "--", ...argv], abortSignal, true);
+          started = await run(deps.cli, ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000", "--", ...profileArgv!], abortSignal, true);
         } else {
           const startArgs = ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000"];
           if (effectiveArgv !== undefined && effectiveArgv.length > 0) startArgs.push("--", ...effectiveArgv);

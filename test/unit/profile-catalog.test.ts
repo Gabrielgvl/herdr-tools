@@ -311,6 +311,9 @@ describe("profile catalog", () => {
     const callsBeforeFailure = calls.length;
     await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toBe(storeFailure);
     expect(calls).toHaveLength(callsBeforeFailure);
+    const invalidPathCalls = calls.length;
+    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => ({ path: "/tmp/invalid\nprofile.md" }) }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-3", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toThrow(/prompt file path/);
+    expect(calls).toHaveLength(invalidPathCalls);
   });
 
   it("inspects bounded profile collections and exact profiles without Herdr reads", async () => {
@@ -407,11 +410,22 @@ describe("profile catalog", () => {
     const modelProfiles = Array.from({ length: 30 }, (_, index) => ({ ...worker, name: `model-${index}`, description: "d".repeat(512), source: profileSource("bundled", `/model/${index}`, "/model") }));
     const modelTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map(modelProfiles.map((item) => [item.name, item])), candidates: modelProfiles.map((item) => ({ name: item.name, profile: item, source: item.source })), diagnostics: [] }) } });
     const modelCollection = await modelTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
-    const modelContent = JSON.parse(contentText(modelCollection)) as { items: unknown[]; omittedCount: number; truncated: boolean; diagnostics: unknown[] };
+    const modelContent = JSON.parse(contentText(modelCollection)) as { collection: string; items: Array<Record<string, unknown>>; omittedCount: number; truncated: boolean; diagnostics: unknown[] };
     expect(Buffer.byteLength(JSON.stringify(modelCollection.details), "utf8")).toBeLessThanOrEqual(50 * 1024);
+    expect(modelCollection.details).toMatchObject({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success" });
+    const expectedModelNames = modelProfiles.map((item) => item.name).sort();
+    for (const [index, item] of (modelCollection.details.items as Array<Record<string, unknown>>).entries()) {
+      expect(item.name).toBe(expectedModelNames[index]);
+      expect((item.source as Record<string, unknown>).path).toBe(`/model/${Number(String(item.name).slice("model-".length))}`);
+    }
     expect(Buffer.byteLength(contentText(modelCollection), "utf8")).toBeLessThanOrEqual(16_000);
+    expect(modelContent.collection).toBe("profiles");
     expect(modelContent.truncated).toBe(true);
     expect(modelContent.items.length + modelContent.omittedCount).toBe(modelProfiles.length);
+    for (const [index, item] of modelContent.items.entries()) {
+      expect(item.name).toBe(expectedModelNames[index]);
+      expect((item.source as Record<string, unknown>).path).toBe(`/model/${Number(String(item.name).slice("model-".length))}`);
+    }
     expect(modelContent.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "OUTPUT_TRUNCATED" })]));
     const blockedProfile = { ...worker, name: "blocked-low", source: profileSource("bundled", "/tmp/blocked-low.md", "/tmp") };
     const blockedCatalog = { ...catalog, effective: new Map([[blockedProfile.name, blockedProfile]]), candidates: [{ name: blockedProfile.name, profile: blockedProfile, source: blockedProfile.source }], unreadableScopes: ["project"] as const };

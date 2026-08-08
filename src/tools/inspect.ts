@@ -98,14 +98,8 @@ function compactProfile(profile: Profile): Record<string, unknown> {
 
 const PROFILE_SCOPE_PRECEDENCE = { bundled: 0, user: 1, project: 2 } as const;
 
-function highestUnreadableScope(catalog: ProfileCatalog, lowerThan?: number): Profile["source"]["kind"] | undefined {
-  return [...(catalog.unreadableScopes ?? [])]
-    .filter((scope) => lowerThan === undefined || PROFILE_SCOPE_PRECEDENCE[scope] > lowerThan)
-    .sort((left, right) => PROFILE_SCOPE_PRECEDENCE[right] - PROFILE_SCOPE_PRECEDENCE[left])[0];
-}
-
-function profileBlockedByUnreadableScope(profile: Profile, catalog: ProfileCatalog): Profile["source"]["kind"] | undefined {
-  return highestUnreadableScope(catalog, profile.source.precedence);
+function highestUnreadableScope(catalog: ProfileCatalog): Profile["source"]["kind"] | undefined {
+  return [...(catalog.unreadableScopes ?? [])].sort((left, right) => PROFILE_SCOPE_PRECEDENCE[right] - PROFILE_SCOPE_PRECEDENCE[left])[0];
 }
 
 function invalidCandidate(candidates: readonly ProfileCandidate[]): ProfileCandidate | undefined {
@@ -116,7 +110,28 @@ function invalidCandidate(candidates: readonly ProfileCandidate[]): ProfileCandi
 
 interface ProfileCollectionResult {
   items: Record<string, unknown>[];
-  omittedCount: number;
+  totalCount: number;
+}
+
+type CollectionBlocker =
+  | { kind: "effective"; precedence: number; profile: Profile }
+  | { kind: "invalid"; precedence: number; candidate: ProfileCandidate }
+  | { kind: "unreadable"; precedence: number; scope: Profile["source"]["kind"] };
+
+function compareCollectionBlockers(left: CollectionBlocker, right: CollectionBlocker): number {
+  const precedence = right.precedence - left.precedence;
+  return precedence !== 0 ? precedence : Number(right.kind !== "unreadable") - Number(left.kind !== "unreadable");
+}
+
+function highestCollectionBlocker(catalog: ProfileCatalog, name: string, value: Profile | undefined, candidates: readonly ProfileCandidate[]): CollectionBlocker | undefined {
+  const blockers: CollectionBlocker[] = [];
+  if (value) blockers.push({ kind: "effective", precedence: value.source.precedence, profile: value });
+  const invalid = invalidCandidate(candidates);
+  if (invalid) blockers.push({ kind: "invalid", precedence: invalid.source.precedence, candidate: invalid });
+  const unreadable = highestUnreadableScope(catalog);
+  if (unreadable) blockers.push({ kind: "unreadable", precedence: PROFILE_SCOPE_PRECEDENCE[unreadable], scope: unreadable });
+  blockers.sort(compareCollectionBlockers);
+  return blockers[0];
 }
 
 function profileCollection(catalog: ProfileCatalog): ProfileCollectionResult {
@@ -125,32 +140,29 @@ function profileCollection(catalog: ProfileCatalog): ProfileCollectionResult {
   const entries = new Map<string, Record<string, unknown>>();
   for (const [name, candidates] of grouped) {
     const effective = catalog.effective.get(name);
-    const unreadableScope = effective ? profileBlockedByUnreadableScope(effective, catalog) : highestUnreadableScope(catalog);
-    const unreadableDiagnostic = unreadableScope
-      ? catalog.diagnostics.find((item) => item.code === "DISCOVERY_ERROR" && item.source?.kind === unreadableScope)
-      : undefined;
-    if (unreadableScope) {
+    const blocker = highestCollectionBlocker(catalog, name, effective, candidates);
+    if (blocker?.kind === "effective") {
+      entries.set(name, compactProfile(blocker.profile));
+      continue;
+    }
+    if (blocker?.kind === "invalid") {
+      entries.set(name, {
+        name: boundedText(name, 128),
+        valid: false,
+        source: { kind: boundedText(blocker.candidate.source.kind, 32), path: boundedText(blocker.candidate.source.path, 512) },
+        diagnostic: boundedText(blocker.candidate.diagnostic?.message ?? "invalid profile", 512)
+      });
+      continue;
+    }
+    if (blocker?.kind === "unreadable") {
+      const unreadableDiagnostic = catalog.diagnostics.find((item) => item.code === "DISCOVERY_ERROR" && item.source?.kind === blocker.scope);
       entries.set(name, {
         name: boundedText(name, 128),
         valid: false,
         source: unreadableDiagnostic?.source
           ? { kind: boundedText(unreadableDiagnostic.source.kind, 32), path: boundedText(unreadableDiagnostic.source.path, 512) }
-          : { kind: boundedText(unreadableScope, 32), path: "<unreadable scope>" },
-        diagnostic: boundedText(unreadableDiagnostic?.message ?? `blocked by unreadable ${unreadableScope} profile scope`, 512)
-      });
-      continue;
-    }
-    if (effective && !catalog.blocked?.has(name)) {
-      entries.set(name, compactProfile(effective));
-      continue;
-    }
-    const invalid = invalidCandidate(candidates);
-    if (invalid) {
-      entries.set(name, {
-        name: boundedText(name, 128),
-        valid: false,
-        source: { kind: boundedText(invalid.source.kind, 32), path: boundedText(invalid.source.path, 512) },
-        diagnostic: boundedText(invalid.diagnostic?.message ?? "invalid profile", 512)
+          : { kind: boundedText(blocker.scope, 32), path: "<unreadable scope>" },
+        diagnostic: boundedText(unreadableDiagnostic?.message ?? `blocked by unreadable ${blocker.scope} profile scope`, 512)
       });
     }
   }
@@ -162,7 +174,7 @@ function profileCollection(catalog: ProfileCatalog): ProfileCollectionResult {
     if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > MAX_PROFILE_RESULT_BYTES) break;
     items.push(entry);
   }
-  return { items, omittedCount: allEntries.length - items.length };
+  return { items, totalCount: allEntries.length };
 }
 
 function boundedBody(body: string): string {
@@ -316,6 +328,29 @@ function boundedInspectionDetails<T extends InspectDetails>(details: T): T {
   return fitInspectionValue(details, MAX_PROFILE_RESULT_BYTES) as T;
 }
 
+function hasOutputTruncationDiagnostic(diagnostics: readonly unknown[]): boolean {
+  return diagnostics.some((diagnostic) => typeof diagnostic === "object" && diagnostic !== null && (diagnostic as Record<string, unknown>).code === "OUTPUT_TRUNCATED");
+}
+
+function fitProfileCollection(value: Record<string, unknown>, totalCount: number, maxBytes: number): Record<string, unknown> {
+  const initialItems = value.items as unknown[];
+  if (jsonBytes(value) <= maxBytes && initialItems.length >= totalCount) return value;
+  const reserve = jsonBytes({ truncated: true, omittedCount: totalCount, diagnostics: [OUTPUT_TRUNCATED_DIAGNOSTIC] }) + 32;
+  const fitted = fitInspectionValue(value, Math.max(0, maxBytes - reserve));
+  const objectValue = fitted as Record<string, unknown>;
+  const items = Array.isArray(objectValue.items) ? objectValue.items : [];
+  const omittedCount = Math.max(0, totalCount - items.length);
+  const truncated = objectValue.truncated === true || omittedCount > 0;
+  const diagnostics = objectValue.diagnostics as unknown[];
+  const next: Record<string, unknown> = { ...objectValue, items };
+  if (truncated) {
+    next.truncated = true;
+    next.omittedCount = omittedCount;
+    next.diagnostics = hasOutputTruncationDiagnostic(diagnostics) ? diagnostics : [...diagnostics, OUTPUT_TRUNCATED_DIAGNOSTIC];
+  }
+  return next;
+}
+
 function modelVisibleContent(value: Record<string, unknown>): string {
   return JSON.stringify(fitInspectionValue(value, MAX_PROFILE_CONTENT_BYTES)) as string;
 }
@@ -347,13 +382,10 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         const catalog = await deps.profiles.load();
         if (mode === "collection") {
           const collection = profileCollection(catalog);
-          const omitted = collection.omittedCount > 0;
-          const diagnostics = omitted
-            ? [...modelVisibleDiagnostics(catalog.diagnostics.slice(0, 15)), OUTPUT_TRUNCATED_DIAGNOSTIC]
-            : modelVisibleDiagnostics(catalog.diagnostics.slice(0, 16));
-          const omission = omitted ? { truncated: true, omittedCount: collection.omittedCount } : {};
-          const details = boundedInspectionDetails({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items: collection.items, ...omission, diagnostics });
-          return { content: [{ type: "text", text: modelVisibleContent({ collection: "profiles", items: collection.items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), ...omission, diagnostics }) }], details };
+          const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.slice(0, 16));
+          const details = fitProfileCollection({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items: collection.items, diagnostics }, collection.totalCount, MAX_PROFILE_RESULT_BYTES) as unknown as InspectDetails;
+          const content = fitProfileCollection({ collection: "profiles", items: collection.items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), diagnostics }, collection.totalCount, MAX_PROFILE_CONTENT_BYTES);
+          return { content: [{ type: "text", text: JSON.stringify(content) }], details };
         }
         const profile = exactProfile(catalog, input.profile!);
         const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.filter((item) => item.name === input.profile).slice(0, 8));

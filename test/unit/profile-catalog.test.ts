@@ -232,6 +232,12 @@ describe("profile catalog", () => {
       expect(() => resolveProfile("missing", { effective: new Map(), candidates: [], diagnostics: [], unreadableScopes: [unreadableScope] })).toThrow(new RegExp(`${unreadableScope}.*unreadable`));
     }
     expect(() => resolveProfile("missing", { effective: new Map(), candidates: [], diagnostics: [], unreadableScopes: ["bundled", "user", "project"] })).toThrow(/project/);
+    const bundledWorker = { ...make("worker", []), source: profileSource("bundled", "/bundled/worker.md", "/bundled") };
+    const invalidProject = { name: "worker", source: profileSource("project", "/project/worker.md", "/project"), diagnostic: { code: "INVALID_PROFILE" as const, message: "project invalid" } };
+    expect(() => resolveProfile("worker", { effective: new Map(), blocked: new Set(["worker"]), candidates: [{ name: "worker", profile: bundledWorker, source: bundledWorker.source }, { name: "worker", source: profileSource("user", "/user/worker.md", "/user"), diagnostic: { code: "INVALID_PROFILE" as const, message: "user invalid" } }, invalidProject], diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "user unreadable", source: profileSource("user", "/user", "/home") }], unreadableScopes: ["user"] })).toThrow(/invalid higher-precedence/);
+    const invalidUser = { name: "worker", source: profileSource("user", "/user/worker.md", "/user"), diagnostic: { code: "INVALID_PROFILE" as const, message: "user invalid" } };
+    expect(() => resolveProfile("worker", { effective: new Map([[bundledWorker.name, bundledWorker]]), candidates: [{ name: "worker", profile: bundledWorker, source: bundledWorker.source }, invalidUser], diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "project unreadable", source: profileSource("project", "/project", "/project") }], unreadableScopes: ["project"] })).toThrow(/unreadable project/);
+    expect(() => resolveProfile("worker", { effective: new Map(), candidates: [invalidUser], diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "user unreadable", source: profileSource("user", "/user", "/home") }], unreadableScopes: ["user"] })).toThrow(/invalid higher-precedence/);
     const shared = new Map([make("root", ["next", "last"]), make("next", ["last"]), make("last", [])].map((item) => [item.name, item] as const));
     expect(resolveProfile("root", { effective: shared, candidates: [], diagnostics: [] }).reachableNames).toEqual(["root", "next", "last"]);
     const fanout = new Map([make("root", ["next", "last", "end"]), make("next", []), make("last", []), make("end", [])].map((item) => [item.name, item] as const));
@@ -331,10 +337,23 @@ describe("profile catalog", () => {
         { name: "worker", profile: blockedWorker, source: blockedWorker.source },
         { name: "worker", source: profileSource("user", "/user/worker.md", "/user"), diagnostic: { code: "INVALID_PROFILE" as const, message: "user invalid" } },
         { name: "worker", source: profileSource("project", "/project/worker.md", "/project"), diagnostic: { code: "INVALID_PROFILE" as const, message: "project invalid" } }
-      ], diagnostics: []
+      ],
+      diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "user scope unreadable", source: profileSource("user", "/user", "/home") }],
+      unreadableScopes: ["user"] as const
     }) } });
     const blockedResult = await blockedInspection.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
     expect(blockedResult.details).toMatchObject({ items: [expect.objectContaining({ name: "worker", valid: false, source: expect.objectContaining({ path: "/project/worker.md" }), diagnostic: "project invalid" })] });
+    const inverseBlockedInspection = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({
+      effective: new Map([[blockedWorker.name, blockedWorker]]),
+      candidates: [
+        { name: "worker", profile: blockedWorker, source: blockedWorker.source },
+        { name: "worker", source: profileSource("user", "/user/worker.md", "/user"), diagnostic: { code: "INVALID_PROFILE" as const, message: "user invalid" } }
+      ],
+      diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "project scope unreadable", source: profileSource("project", "/project", "/project") }],
+      unreadableScopes: ["project"] as const
+    }) } });
+    const inverseBlockedResult = await inverseBlockedInspection.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    expect(inverseBlockedResult.details).toMatchObject({ items: [expect.objectContaining({ name: "worker", valid: false, source: expect.objectContaining({ kind: "project" }), diagnostic: "project scope unreadable" })] });
     const unreadableInspection = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({
       effective: new Map([[blockedWorker.name, blockedWorker]]),
       candidates: [{ name: "worker", profile: blockedWorker, source: blockedWorker.source }],
@@ -345,6 +364,12 @@ describe("profile catalog", () => {
     }) } });
     const unreadableResult = await unreadableInspection.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
     expect(unreadableResult.details).toMatchObject({ items: [expect.objectContaining({ name: "worker", valid: false, source: expect.objectContaining({ kind: "project" }), diagnostic: "project scope unreadable" })] });
+    const tieInspection = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({
+      effective: new Map(), candidates: [{ name: "worker", source: profileSource("user", "/user/worker.md", "/user"), diagnostic: { code: "INVALID_PROFILE" as const, message: "user invalid" } }],
+      diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "user unreadable", source: profileSource("user", "/user", "/home") }], unreadableScopes: ["user"] as const
+    }) } });
+    const tieResult = await tieInspection.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    expect(tieResult.details).toMatchObject({ items: [expect.objectContaining({ source: expect.objectContaining({ kind: "user" }), diagnostic: "user invalid" })] });
     const exact = await tool.execute("id", { mode: "profile", profile: "worker" } as never, new AbortController().signal, undefined, {} as never);
     expect(exact.details).toMatchObject({ kind: "profile", profile: { name: "worker", body: expect.stringContaining("Body") } });
     expect(contentText(exact)).toContain('"body":"\\nBody for worker.\\n"');
@@ -379,6 +404,15 @@ describe("profile catalog", () => {
     const capTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map(capProfiles.map((item) => [item.name, item])), candidates: capProfiles.map((item) => ({ name: item.name, profile: item, source: item.source })), diagnostics: [] }) } });
     const capResult = await capTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
     expect(capResult.details).toMatchObject({ truncated: true, omittedCount: 1 });
+    const modelProfiles = Array.from({ length: 30 }, (_, index) => ({ ...worker, name: `model-${index}`, description: "d".repeat(512), source: profileSource("bundled", `/model/${index}`, "/model") }));
+    const modelTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map(modelProfiles.map((item) => [item.name, item])), candidates: modelProfiles.map((item) => ({ name: item.name, profile: item, source: item.source })), diagnostics: [] }) } });
+    const modelCollection = await modelTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    const modelContent = JSON.parse(contentText(modelCollection)) as { items: unknown[]; omittedCount: number; truncated: boolean; diagnostics: unknown[] };
+    expect(Buffer.byteLength(JSON.stringify(modelCollection.details), "utf8")).toBeLessThanOrEqual(50 * 1024);
+    expect(Buffer.byteLength(contentText(modelCollection), "utf8")).toBeLessThanOrEqual(16_000);
+    expect(modelContent.truncated).toBe(true);
+    expect(modelContent.items.length + modelContent.omittedCount).toBe(modelProfiles.length);
+    expect(modelContent.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "OUTPUT_TRUNCATED" })]));
     const blockedProfile = { ...worker, name: "blocked-low", source: profileSource("bundled", "/tmp/blocked-low.md", "/tmp") };
     const blockedCatalog = { ...catalog, effective: new Map([[blockedProfile.name, blockedProfile]]), candidates: [{ name: blockedProfile.name, profile: blockedProfile, source: blockedProfile.source }], unreadableScopes: ["project"] as const };
     const blockedTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => blockedCatalog } });

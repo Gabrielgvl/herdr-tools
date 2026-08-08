@@ -1,4 +1,4 @@
-import type { Profile, ProfileCatalog, ProfileResolution } from "./types.js";
+import type { Profile, ProfileCandidate, ProfileCatalog, ProfileResolution, ProfileSourceKind } from "./types.js";
 
 export class ProfileResolutionError extends Error {
   readonly code = "PROFILE_RESOLUTION_INVALID" as const;
@@ -8,21 +8,48 @@ export class ProfileResolutionError extends Error {
   }
 }
 
-const PROFILE_SCOPE_PRECEDENCE: Record<Profile["source"]["kind"], number> = { bundled: 0, user: 1, project: 2 };
+const PROFILE_SCOPE_PRECEDENCE: Record<ProfileSourceKind, number> = { bundled: 0, user: 1, project: 2 };
 
-function highestUnreadableScope(catalog: ProfileCatalog): Profile["source"]["kind"] | undefined {
+type ProfileBlocker =
+  | { kind: "effective"; precedence: number; profile: Profile }
+  | { kind: "invalid"; precedence: number; candidate: ProfileCandidate }
+  | { kind: "unreadable"; precedence: number; scope: ProfileSourceKind };
+
+function highestUnreadableScope(catalog: ProfileCatalog): ProfileSourceKind | undefined {
   return [...(catalog.unreadableScopes ?? [])].sort((left, right) => PROFILE_SCOPE_PRECEDENCE[right] - PROFILE_SCOPE_PRECEDENCE[left])[0];
+}
+
+function highestInvalidCandidate(catalog: ProfileCatalog, name: string): ProfileCandidate | undefined {
+  return catalog.candidates
+    .filter((candidate) => candidate.name === name && candidate.diagnostic !== undefined)
+    .sort((left, right) => right.source.precedence - left.source.precedence)[0];
+}
+
+function compareBlockers(left: ProfileBlocker, right: ProfileBlocker): number {
+  const precedence = right.precedence - left.precedence;
+  return precedence !== 0 ? precedence : Number(right.kind !== "unreadable") - Number(left.kind !== "unreadable");
+}
+
+function highestBlocker(catalog: ProfileCatalog, name: string, value: Profile | undefined): ProfileBlocker | undefined {
+  const blockers: ProfileBlocker[] = [];
+  if (value) blockers.push({ kind: "effective", precedence: value.source.precedence, profile: value });
+  const invalid = highestInvalidCandidate(catalog, name);
+  if (invalid) blockers.push({ kind: "invalid", precedence: invalid.source.precedence, candidate: invalid });
+  const unreadable = highestUnreadableScope(catalog);
+  if (unreadable) blockers.push({ kind: "unreadable", precedence: PROFILE_SCOPE_PRECEDENCE[unreadable], scope: unreadable });
+  blockers.sort(compareBlockers);
+  return blockers[0];
 }
 
 function profile(catalog: ProfileCatalog, name: string): Profile {
   const value = catalog.effective.get(name);
-  if (!value) {
-    const unreadableScope = highestUnreadableScope(catalog);
-    if (unreadableScope) throw new ProfileResolutionError(`Profile ${name} cannot be resolved because the ${unreadableScope} profile scope is unreadable`, { name, unreadableScope, blocked: true });
-    throw new ProfileResolutionError(catalog.blocked?.has(name) ? `Profile ${name} is blocked by an invalid higher-precedence candidate` : `Unknown profile ${name}`, { name, blocked: catalog.blocked?.has(name) === true });
+  const blocker = highestBlocker(catalog, name, value);
+  if (blocker?.kind === "invalid") throw new ProfileResolutionError(`Profile ${name} is blocked by an invalid higher-precedence candidate`, { name, blocked: true, candidatePath: blocker.candidate.source.path });
+  if (blocker?.kind === "unreadable") {
+    const message = value ? `Profile ${name} is blocked by unreadable ${blocker.scope} profile scope` : `Profile ${name} cannot be resolved because the ${blocker.scope} profile scope is unreadable`;
+    throw new ProfileResolutionError(message, { name, unreadableScope: blocker.scope, blocked: true });
   }
-  const unreadableHigherScope = catalog.unreadableScopes?.find((scope) => PROFILE_SCOPE_PRECEDENCE[scope] > value.source.precedence);
-  if (unreadableHigherScope) throw new ProfileResolutionError(`Profile ${name} is blocked by unreadable ${unreadableHigherScope} profile scope`, { name, unreadableScope: unreadableHigherScope });
+  if (!value) throw new ProfileResolutionError(catalog.blocked?.has(name) ? `Profile ${name} is blocked by an invalid higher-precedence candidate` : `Unknown profile ${name}`, { name, blocked: catalog.blocked?.has(name) === true });
   return value;
 }
 

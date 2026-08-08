@@ -23,19 +23,25 @@ describe("profile catalog", () => {
   it("fits inspection values without invalid JSON or losing protected evidence", () => {
     const shared = { repeated: true };
     expect(fitInspectionValue(undefined, 128)).toBeUndefined();
-    expect(fitInspectionValue("x".repeat(2_000), 128)).toMatchObject({ truncated: true });
-    expect(fitInspectionValue(Array.from({ length: 256 }, (_, index) => index), 128)).toBeDefined();
-    const stringFit = fitInspectionValue({ message: "x".repeat(2_000) }, 128);
+    expect(fitInspectionValue("x".repeat(2_000), 128)).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
+    expect(fitInspectionValue(Array.from({ length: 256 }, (_, index) => index), 128)).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
+    const stringFit = fitInspectionValue({ message: "x".repeat(2_000) }, 128) as Record<string, unknown>;
+    expect(stringFit).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
     expect(Buffer.byteLength(JSON.stringify(stringFit), "utf8")).toBeLessThanOrEqual(128);
-    const arrayStringFit = fitInspectionValue({ items: ["x".repeat(2_000)] }, 128);
-    expect(fitInspectionValue({ empty: "", items: Array.from({ length: 256 }, (_, index) => index) }, 128)).toBeDefined();
+    const arrayStringFit = fitInspectionValue({ items: ["x".repeat(2_000)] }, 128) as Record<string, unknown>;
+    expect(arrayStringFit).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
+    expect(fitInspectionValue({ empty: "", items: Array.from({ length: 256 }, (_, index) => index) }, 128)).toMatchObject({ truncated: true });
     expect(Buffer.byteLength(JSON.stringify(arrayStringFit), "utf8")).toBeLessThanOrEqual(128);
-    const arrayFit = fitInspectionValue({ items: Array.from({ length: 256 }, (_, index) => index), otherItems: [1, 2], sharedA: shared, sharedB: shared }, 128);
+    const arrayFit = fitInspectionValue({ items: Array.from({ length: 256 }, (_, index) => index), otherItems: [1, 2], sharedA: shared, sharedB: shared }, 128) as Record<string, unknown>;
+    expect(arrayFit).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
     expect(Buffer.byteLength(JSON.stringify(arrayFit), "utf8")).toBeLessThanOrEqual(128);
     const objectFit = fitInspectionValue({ nested: Object.fromEntries(Array.from({ length: 64 }, (_, index) => [`key-${index}`, index])) }, 128);
     expect(Buffer.byteLength(JSON.stringify(objectFit), "utf8")).toBeLessThanOrEqual(128);
-    const fallback = fitInspectionValue({ profile: {}, diagnostics: Array.from({ length: 256 }, (_, index) => index) }, 1);
-    expect(fallback).toMatchObject({ truncated: true, diagnostics: expect.any(Array) });
+    const fallback = fitInspectionValue({ profile: {}, diagnostics: Array.from({ length: 256 }, (_, index) => index) }, 128);
+    expect(fallback).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
+    const exactLossy = fitInspectionValue({ operation: "inspect", kind: "profile", profile: { name: "exact-profile", body: "x".repeat(2_000) }, diagnostics: [] }, 512) as Record<string, unknown>;
+    expect(exactLossy).toMatchObject({ operation: "inspect", kind: "profile", truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
+    expect(Buffer.byteLength(JSON.stringify(exactLossy), "utf8")).toBeLessThanOrEqual(512);
     expect(fitInspectionValue({ cannotClone: () => undefined }, 128)).toMatchObject({ truncated: true });
   });
   it("parses strict YAML, typed runtime defaults, and profile metadata", () => {
@@ -70,6 +76,7 @@ describe("profile catalog", () => {
       "---\nname: [\n---\n\nbody\n",
       profileText("worker").replace(/runtime:\n {2}kind: pi\n {2}model: test\/model\n {2}thinking: low\n/, "runtime: null\n"),
       profileText("worker").replace(/runtime:\n {2}kind: pi\n {2}model: test\/model\n {2}thinking: low\n/, "runtime:\n"),
+      profileText("worker").replace(/runtime:\n {2}kind: pi\n {2}model: test\/model\n {2}thinking: low\n/, "runtime: { model }\n"),
       profileText("worker").replace("kind: pi", "kind: other"),
       profileText("worker").replace("thinking: low", "thinking: invalid"),
       profileText("worker").replace("model: test/model", "model:"),
@@ -311,9 +318,9 @@ describe("profile catalog", () => {
     expect(long.details).toMatchObject({ profile: { body: expect.stringContaining("profile body truncated") } });
     const huge = await tool.execute("id", { mode: "profile", profile: "huge" } as never, new AbortController().signal, undefined, {} as never);
     expect(Buffer.byteLength(JSON.stringify(huge.details), "utf8")).toBeLessThanOrEqual(50 * 1024);
-    expect(Buffer.byteLength(contentText(huge), "utf8")).toBeLessThanOrEqual(50 * 1024);
+    expect(Buffer.byteLength(contentText(huge), "utf8")).toBeLessThanOrEqual(16_000);
     expect(() => JSON.parse(contentText(huge))).not.toThrow();
-    expect(Buffer.byteLength(contentText(collection), "utf8")).toBeLessThanOrEqual(50 * 1024);
+    expect(Buffer.byteLength(contentText(collection), "utf8")).toBeLessThanOrEqual(16_000);
     expect(() => JSON.parse(contentText(collection))).not.toThrow();
     const manyProfiles = Array.from({ length: 100 }, (_, index) => ({
       ...worker,
@@ -324,7 +331,10 @@ describe("profile catalog", () => {
     }));
     const boundedTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map(manyProfiles.map((item) => [item.name, item])), candidates: manyProfiles.map((item) => ({ name: item.name, profile: item, source: item.source })), diagnostics: Array.from({ length: 16 }, (_, index) => ({ code: "DISCOVERY_ERROR" as const, name: `diagnostic-${index}`, message: "m".repeat(512), path: "p".repeat(512) })) }) } });
     const boundedCollection = await boundedTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
-    expect(Buffer.byteLength(contentText(boundedCollection), "utf8")).toBeLessThanOrEqual(50 * 1024);
+    const boundedCollectionContent = JSON.parse(contentText(boundedCollection)) as Record<string, unknown>;
+    expect(Buffer.byteLength(contentText(boundedCollection), "utf8")).toBeLessThanOrEqual(16_000);
+    expect(boundedCollectionContent.truncated).toBe(true);
+    expect(boundedCollectionContent.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "OUTPUT_TRUNCATED" })]));
     const blockedProfile = { ...worker, name: "blocked-low", source: profileSource("bundled", "/tmp/blocked-low.md", "/tmp") };
     const blockedCatalog = { ...catalog, effective: new Map([[blockedProfile.name, blockedProfile]]), candidates: [{ name: blockedProfile.name, profile: blockedProfile, source: blockedProfile.source }], unreadableScopes: ["project"] as const };
     const blockedTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => blockedCatalog } });

@@ -84,36 +84,42 @@ function parseRuntime(value: unknown, scopeRoot: string): RuntimeProfile {
   return { kind: "claude", model: stringField(value.model, "runtime.model"), effort: value.effort as ClaudeEffort, permissionMode: mode as ClaudePermissionMode, allowedTools: stringArray(value.allowedTools, "runtime.allowedTools"), disallowedTools: stringArray(value.disallowedTools, "runtime.disallowedTools"), addDirs: resourcePaths(value.addDirs, "runtime.addDirs", scopeRoot), pluginDirs: resourcePaths(value.pluginDirs, "runtime.pluginDirs", scopeRoot) };
 }
 
-function rejectYamlAliases(node: Node): void {
+function rejectYamlAliases(node: Node | null): void {
+  if (node === null) return;
   if (isAlias(node)) fail("YAML anchors, aliases, and tags are not supported");
   if (isMap(node)) {
     for (const item of node.items) {
-      rejectYamlAliases(item.key as Node);
-      rejectYamlAliases(item.value as Node);
+      rejectYamlAliases(item.key as Node | null);
+      rejectYamlAliases(item.value as Node | null);
     }
   } else if (isSeq(node)) {
-    for (const item of node.items) rejectYamlAliases(item as Node);
+    for (const item of node.items) rejectYamlAliases(item as Node | null);
   }
 }
 
-function validateYamlNode(node: Node): void {
+function validateYamlNode(node: Node | null): void {
+  if (node === null) return;
   if ("anchor" in node && node.anchor !== undefined) fail("YAML anchors, aliases, and tags are not supported");
   if (node.tag !== undefined) fail("YAML anchors, aliases, and tags are not supported");
   if (isMap(node)) {
     for (const item of node.items) {
-      validateYamlNode(item.key as Node);
-      validateYamlNode(item.value as Node);
+      validateYamlNode(item.key as Node | null);
+      validateYamlNode(item.value as Node | null);
     }
   } else if (isSeq(node)) {
-    for (const item of node.items) validateYamlNode(item as Node);
+    for (const item of node.items) validateYamlNode(item as Node | null);
   } else {
     isScalar(node);
   }
 }
 
-function yamlValue(node: Node): unknown {
+function validateProfileYamlNode(node: Node | null): void {
   rejectYamlAliases(node);
   validateYamlNode(node);
+}
+
+function yamlValue(node: Node): unknown {
+  validateProfileYamlNode(node);
   return node.toJSON();
 }
 

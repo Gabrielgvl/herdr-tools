@@ -200,9 +200,21 @@ function modelVisibleDiagnostics(diagnostics: readonly unknown[]): unknown[] {
   });
 }
 
+const MAX_PROFILE_CONTENT_BYTES = 16_000;
+const OUTPUT_TRUNCATED_DIAGNOSTIC = Object.freeze({ code: "OUTPUT_TRUNCATED", message: "inspection output was truncated to fit the byte limit" });
+
 function jsonBytes(value: unknown): number {
   const encoded = JSON.stringify(value);
   return encoded === undefined ? 0 : Buffer.byteLength(encoded, "utf8");
+}
+
+function truncationEvidence(value: unknown, maxBytes: number): unknown {
+  const objectValue = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  const existingDiagnostics = objectValue && Array.isArray(objectValue.diagnostics) ? objectValue.diagnostics : [];
+  const marked = objectValue
+    ? { ...objectValue, truncated: true, diagnostics: [...existingDiagnostics, OUTPUT_TRUNCATED_DIAGNOSTIC] }
+    : { value, truncated: true, diagnostics: [OUTPUT_TRUNCATED_DIAGNOSTIC] };
+  return jsonBytes(marked) <= maxBytes ? marked : { truncated: true, diagnostics: [OUTPUT_TRUNCATED_DIAGNOSTIC] };
 }
 
 interface MutableValueRef {
@@ -230,10 +242,11 @@ function collectValueRefs(value: unknown, strings: MutableValueRef[], arrays: Mu
 
 export function fitInspectionValue(value: unknown, maxBytes: number): unknown {
   let candidate: unknown;
-  try { candidate = structuredClone(value); } catch { return { truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED", message: "inspection value could not be cloned" }] }; }
+  try { candidate = structuredClone(value); } catch { return truncationEvidence({ value: "inspection value could not be cloned" }, maxBytes); }
   if (jsonBytes(candidate) <= maxBytes) return candidate;
+  const fittingLimit = Math.max(0, maxBytes - jsonBytes({ truncated: true, diagnostics: [OUTPUT_TRUNCATED_DIAGNOSTIC] }) - 16);
   for (let attempt = 0; attempt < 2_000; attempt += 1) {
-    if (jsonBytes(candidate) <= maxBytes) return candidate;
+    if (jsonBytes(candidate) <= fittingLimit) return truncationEvidence(candidate, maxBytes);
     const strings: MutableValueRef[] = [];
     const arrays: MutableValueRef[] = [];
     const objects: MutableValueRef[] = [];
@@ -258,7 +271,7 @@ export function fitInspectionValue(value: unknown, maxBytes: number): unknown {
     }
     break;
   }
-  return { truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED", message: "inspection value exceeded the output limit" }] };
+  return truncationEvidence(candidate, maxBytes);
 }
 
 function boundedInspectionDetails<T extends InspectDetails>(details: T): T {
@@ -266,7 +279,7 @@ function boundedInspectionDetails<T extends InspectDetails>(details: T): T {
 }
 
 function modelVisibleContent(value: Record<string, unknown>): string {
-  return JSON.stringify(fitInspectionValue(value, MAX_PROFILE_RESULT_BYTES)) as string;
+  return JSON.stringify(fitInspectionValue(value, MAX_PROFILE_CONTENT_BYTES)) as string;
 }
 
 function parseHealth(text: string): Pick<InspectDetails, "client" | "server" | "socketReachable" | "compatible"> {

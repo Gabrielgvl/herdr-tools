@@ -44,6 +44,68 @@ describe("profile prompt source transport", () => {
     expect(calls.at(-1)).toEqual({ operation: "rm", path: "/cache/.tmp-test", options: { force: true, recursive: true } });
   });
 
+  it("treats an EEXIST racing writer with identical bytes as a successful publication", async () => {
+    let reads = 0;
+    const raceIo: PromptSourceIo = {
+      mkdir: async () => undefined,
+      mkdtemp: async () => "/cache/.tmp-race",
+      readFile: async () => {
+        reads += 1;
+        if (reads === 1) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        return Buffer.from("race body");
+      },
+      writeFile: async () => undefined,
+      chmod: async () => undefined,
+      rename: async () => { throw Object.assign(new Error("destination exists"), { code: "EEXIST" }); },
+      rm: vi.fn(async () => undefined)
+    };
+    const result = await createPromptSource("race body", raceIo, "/cache");
+    expect(result.path).toMatch(/^\/cache\/[a-f0-9]{64}\.md$/);
+    expect(raceIo.rm).toHaveBeenCalledWith("/cache/.tmp-race", { force: true, recursive: true });
+
+    for (const destination of [Buffer.from("different"), Object.assign(new Error("unreadable"), { code: "EACCES" })]) {
+      let destinationReads = 0;
+      const failureIo: PromptSourceIo = {
+        mkdir: async () => undefined,
+        mkdtemp: async () => "/cache/.tmp-race-failure",
+        readFile: async () => {
+          destinationReads += 1;
+          if (destinationReads === 1) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+          if (destination instanceof Error) throw destination;
+          return destination;
+        },
+        writeFile: async () => undefined,
+        chmod: async () => undefined,
+        rename: async () => { throw Object.assign(new Error("destination exists"), { code: "EEXIST" }); },
+        rm: vi.fn(async () => undefined)
+      };
+      await expect(createPromptSource("race body", failureIo, "/cache")).rejects.toMatchObject({ code: "EEXIST" });
+      expect(failureIo.rm).toHaveBeenCalledWith("/cache/.tmp-race-failure", { force: true, recursive: true });
+    }
+
+    const publicationFailureIo: PromptSourceIo = {
+      mkdir: async () => undefined,
+      mkdtemp: async () => "/cache/.tmp-publication-failure",
+      readFile: async () => { throw "not an object error"; },
+      writeFile: async () => undefined,
+      chmod: async () => undefined,
+      rename: async () => { throw new Error("rename failed"); },
+      rm: vi.fn(async () => undefined)
+    };
+    await expect(createPromptSource("publication", publicationFailureIo, "/cache")).rejects.toBe("not an object error");
+
+    const nonRaceRenameIo: PromptSourceIo = {
+      mkdir: async () => undefined,
+      mkdtemp: async () => "/cache/.tmp-non-race",
+      readFile: async () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+      writeFile: async () => undefined,
+      chmod: async () => undefined,
+      rename: async () => { throw Object.assign(new Error("rename failed"), { code: "EPERM" }); },
+      rm: vi.fn(async () => undefined)
+    };
+    await expect(createPromptSource("non-race", nonRaceRenameIo, "/cache")).rejects.toMatchObject({ code: "EPERM" });
+  });
+
   it("does not remove an existing shared source and preserves store failures", async () => {
     const io: PromptSourceIo = {
       mkdir: async () => undefined,

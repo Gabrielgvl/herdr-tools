@@ -29,8 +29,16 @@ const nodePromptSourceIo: PromptSourceIo = {
 
 export const DEFAULT_PROMPT_SOURCE_CACHE = join(homedir(), ".cache", "herdr-tools", "profile-prompts");
 
+function errorCode(error: unknown): unknown {
+  return error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
+}
+
 function isMissing(error: unknown): boolean {
-  return error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT";
+  return errorCode(error) === "ENOENT";
+}
+
+function isAlreadyPublishedRace(error: unknown): boolean {
+  return errorCode(error) === "EEXIST";
 }
 
 async function removeTemp(io: PromptSourceIo, path: string | undefined): Promise<void> {
@@ -60,7 +68,21 @@ export async function createPromptSource(body: string, io: PromptSourceIo = node
     const temporaryPath = join(temporaryDirectory, "prompt.md");
     await io.writeFile(temporaryPath, data, { mode: 0o600 });
     await io.chmod(temporaryPath, 0o600);
-    await io.rename(temporaryPath, path);
+    try {
+      await io.rename(temporaryPath, path);
+    } catch (error) {
+      if (isAlreadyPublishedRace(error)) {
+        try {
+          if (Buffer.from(await io.readFile(path)).equals(data)) {
+            await removeTemp(io, temporaryDirectory);
+            return { path };
+          }
+        } catch {
+          // Preserve the original publication error when the racing destination is unavailable.
+        }
+      }
+      throw error;
+    }
   } catch (error) {
     await removeTemp(io, temporaryDirectory);
     throw error;

@@ -11,6 +11,10 @@ import { boundedText, JobRegistry, type JobDetail } from "./src/job-registry.js"
 import { RuntimeOwnership, resetOwnership, type OwnedResource } from "./src/ownership.js";
 import { loadSettings, type Settings } from "./src/settings.js";
 import type { CurrentContext } from "./src/targets.js";
+import type { ProfileCatalog } from "./src/profiles/types.js";
+import { discoverProfiles } from "./src/profiles/discovery.js";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const CORE_TOOL_NAMES = [
   "herdr_inspect",
@@ -38,6 +42,7 @@ export interface ExtensionRuntime {
   ownership: RuntimeOwnership;
   jobs: JobRegistry;
   settings: { load: () => Promise<Settings> };
+  profiles: { load: () => Promise<ProfileCatalog> };
   idsPresent: boolean;
   idsValid: boolean;
 }
@@ -128,6 +133,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
     ownership: new RuntimeOwnership(),
     jobs,
     settings: { load: () => loadSettings() },
+    profiles: { load: () => discoverProfiles({ bundledDir: resolve(dirname(fileURLToPath(import.meta.url)), "herdr-profiles"), bundledScopeRoot: dirname(fileURLToPath(import.meta.url)), projectCwd: process.cwd() }) },
     idsPresent: injected.idsPresent,
     idsValid: injected.idsValid,
   };
@@ -152,7 +158,7 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     resetOwnership(runtime.ownership);
   });
 
-  pi.registerTool(createInspectTool({ cli: runtime.cli, context: runtime.context, environment }));
+  pi.registerTool(createInspectTool({ cli: runtime.cli, context: runtime.context, environment, profiles: runtime.profiles }));
   pi.registerTool(createCommunicateTool({ cli: runtime.cli, context: runtime.context }));
   pi.registerTool(createWaitTool({
     cli: runtime.cli,
@@ -166,6 +172,7 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     context: runtime.context,
     cwd: process.cwd(),
     ownership: runtime.ownership,
+    profiles: runtime.profiles,
   }));
   pi.registerTool(createPaneTool({
     cli: runtime.cli,

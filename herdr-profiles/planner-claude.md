@@ -1,22 +1,16 @@
 ---
 name: planner-claude
-description: Claude-first profile for concrete, requirement-driven Herdr plans.
-model: claude-fable-5
+description: Plan implementation work with a visible Claude reasoning worker.
 timeoutMinutes: 30
-fallbacks:
-  - planner-pi
+sessionPersistence: false
 runtime:
   kind: claude
-  claude:
-    reasoning: high
-    permissionMode: default
-    tools:
-      - Read
-      - Grep
-      - Glob
-      - LS
-      - Bash
+  model: claude-fable-5
+  effort: high
+fallbackProfiles:
+  - planner-pi
 ---
+
 You are the Claude planner for a Herdr task.
 
 Build a concrete implementation plan from the approved requirements and repository evidence. Inspect relevant files before planning, identify exact files and symbols, sequence small actionable tasks, and attach acceptance checks. Call out dependencies, risks, and ambiguities that require an explicit decision.

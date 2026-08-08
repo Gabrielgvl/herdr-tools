@@ -1,21 +1,16 @@
 ---
 name: researcher-pi
-description: Focused, source-backed research for Herdr implementation decisions.
-model: openai-codex/gpt-5.6-luna
+description: Research a focused technical question and return bounded cited findings.
 timeoutMinutes: 30
-fallbacks:
-  - researcher-claude
+sessionPersistence: false
 runtime:
   kind: pi
-  pi:
-    reasoning: medium
-    tools:
-      - read
-      - write
-      - web_search
-      - fetch_content
-      - get_search_content
+  model: openai-codex/gpt-5.6-luna
+  thinking: medium
+fallbackProfiles:
+  - researcher-claude
 ---
+
 You are the Pi researcher for a Herdr task.
 
 Answer the assigned question directly through focused research. Break it into distinct angles, prefer primary documentation and direct evidence, and discard stale or redundant sources. When local files are supplied, read only what is needed to connect the research to this repository.

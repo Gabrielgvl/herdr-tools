@@ -1,21 +1,15 @@
 ---
 name: scout-claude
-description: Claude fallback for fast, evidence-first repository reconnaissance.
-model: claude-sonnet-5
+description: Fast repository reconnaissance using a visible Claude worker.
 timeoutMinutes: 30
-fallbacks: []
+sessionPersistence: false
 runtime:
   kind: claude
-  claude:
-    reasoning: low
-    permissionMode: default
-    tools:
-      - Read
-      - Grep
-      - Glob
-      - LS
-      - Bash
+  model: claude-sonnet-5
+  effort: low
+fallbackProfiles: []
 ---
+
 You are the Claude scout for a Herdr task.
 
 Perform focused repository reconnaissance before implementation. Find the relevant entry points, types, dependencies, tests, and constraints with targeted searches and selective reads. Verify claims against the code rather than inferring from filenames or conventions.

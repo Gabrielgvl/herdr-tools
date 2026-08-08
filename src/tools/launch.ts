@@ -5,6 +5,7 @@ import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.j
 import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { isLaunchAgentKind, LaunchParamsSchema, type LaunchParams, type LaunchPlacement } from "../launch-schema.js";
+import { buildProfileArgv, resolveProfile, type ProfileCatalog, type ProfileResolution } from "../profiles/index.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -19,6 +20,7 @@ export interface LaunchDependencies {
   context: CurrentContext;
   cwd?: string;
   ownership?: LaunchResourceRegistry;
+  profiles?: { load: () => Promise<ProfileCatalog> };
 }
 
 export interface LaunchResourceIds {
@@ -40,6 +42,7 @@ export interface LaunchDetails extends LaunchResourceIds {
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
   envelope?: { version: "v1"; kind: "assignment" };
+  profile?: { name: string; source: { kind: string; path: string }; timeoutMinutes: number; sessionPersistence: boolean; fallbackProfiles: string[]; reachableNames: string[] };
 }
 
 class LaunchError extends Error {
@@ -64,7 +67,17 @@ function validateParams(params: LaunchParams): void {
   if (typeof params.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
     throw new LaunchError("INVALID_INPUT", "name must start with a lowercase letter and contain only lowercase letters, digits, - or _ (1-32 characters)");
   }
-  if (!isLaunchAgentKind(params.kind)) throw new LaunchError("INVALID_INPUT", `Unsupported Herdr agent kind: ${String(params.kind)}`);
+  const profileMode = params.profile !== undefined;
+  if (profileMode) identifier(params.profile, "profile");
+  if (profileMode === (params.kind !== undefined)) throw new LaunchError("INVALID_INPUT", "launch requires exactly one of kind or profile");
+  if (!profileMode && !isLaunchAgentKind(params.kind)) throw new LaunchError("INVALID_INPUT", `Unsupported Herdr agent kind: ${String(params.kind)}`);
+  if (profileMode && (params.argv !== undefined || params.env !== undefined)) throw new LaunchError("INVALID_INPUT", "profile launches do not accept raw argv or environment overrides");
+  if (profileMode && params.overrides !== undefined) {
+    if (!record(params.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
+    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
+    if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
+  }
+  if (!profileMode && params.overrides !== undefined) throw new LaunchError("INVALID_INPUT", "overrides are only valid for profile launches");
   if (params.argv !== undefined && (!Array.isArray(params.argv) || params.argv.some((arg) => typeof arg !== "string" || /\0/.test(arg)))) {
     throw new LaunchError("INVALID_INPUT", "argv must contain only strings representable by the CLI transport");
   }
@@ -222,6 +235,13 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       identifier(cwd, "cwd");
       const placement = params.placement ?? { mode: "same_tab" as const };
       const label = params.label ?? params.name;
+      let profileResolution: ProfileResolution | undefined;
+      if (params.profile !== undefined) {
+        if (!deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
+        profileResolution = resolveProfile(params.profile, await deps.profiles.load());
+      }
+      const effectiveKind = profileResolution?.profile.runtime.kind ?? params.kind!;
+      const effectiveArgv = profileResolution ? buildProfileArgv(profileResolution.profile, params.overrides) : params.argv;
       const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
       const sender = params.initialPrompt !== undefined ? resolveSender(snapshot, deps.context.paneId) : undefined;
       assertCurrentContext(snapshot, deps.context);
@@ -268,8 +288,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         }
         phase = "agent_start";
         progress(onUpdate, phase, created);
-        const startArgs = ["agent", "start", params.name, "--kind", params.kind, "--pane", resolvedPaneId, "--timeout", "30000"];
-        if (params.argv !== undefined && params.argv.length > 0) startArgs.push("--", ...params.argv);
+        const startArgs = ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "30000"];
+        if (effectiveArgv !== undefined && effectiveArgv.length > 0) startArgs.push("--", ...effectiveArgv);
         const started = await run(deps.cli, startArgs, abortSignal, true);
         const startedAgent = agentIdentity(started);
         let agentId = startedAgent.agentId;
@@ -299,7 +319,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           operation: "launch",
           outcome: "launched",
           name: authoritativeName,
-          kind: params.kind,
+          kind: effectiveKind,
           placement,
           tabId,
           paneId: resolvedPaneId,
@@ -309,7 +329,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           ...(sender ? {
             sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
             envelope: { version: "v1" as const, kind: "assignment" as const }
-          } : {})
+          } : {}),
+          ...(profileResolution ? { profile: { name: profileResolution.profile.name, source: { kind: profileResolution.profile.source.kind, path: profileResolution.profile.source.path }, timeoutMinutes: profileResolution.profile.timeoutMinutes, sessionPersistence: profileResolution.profile.sessionPersistence, fallbackProfiles: [...profileResolution.fallbackProfiles], reachableNames: [...profileResolution.reachableNames] } } : {})
         };
         return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId }) }], details };
       } catch (error) {
@@ -317,7 +338,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       }
     },
     renderCall(args, theme) {
-      return textComponent(formatCall("herdr_launch", args.kind, args.name), theme, "accent");
+      return textComponent(formatCall("herdr_launch", args.kind ?? "profile", args.name), theme, "accent");
     },
     renderResult(result, options, theme) {
       return renderResultComponent("launch", result, options, theme, result.details?.paneId);

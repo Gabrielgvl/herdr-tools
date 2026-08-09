@@ -39,7 +39,7 @@ Deliver now:
 
 - strict schema/parser and scoped discovery;
 - deterministic whole-profile precedence and graph validation;
-- bounded `herdr_inspect` profile collection/exact-profile modes; collection omissions expose `truncated`, exact whole-item `omittedCount`, exact diagnostic `diagnosticOmittedCount`, and an `OUTPUT_TRUNCATED` diagnostic in both details and model-visible JSON;
+- bounded `herdr_inspect` profile collection/exact-profile modes; collection omissions expose `truncated`, exact whole-item `omittedCount`, exact diagnostic `diagnosticOmittedCount`, and an `OUTPUT_TRUNCATED` diagnostic in both details and model-visible JSON. Catalogs also retain the total generated diagnostic count even when retained diagnostics are capped;
 - typed Pi and Claude argv adapters;
 - profile-backed launch through the existing launch implementation while preserving mandatory assignment provenance;
 - starter bundled profiles and unit tests;

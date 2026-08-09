@@ -71,6 +71,8 @@ export interface ProfileCatalog {
   effective: ReadonlyMap<string, Profile>;
   candidates: readonly ProfileCandidate[];
   diagnostics: readonly ProfileDiagnostic[];
+  /** Total diagnostics generated before the retained diagnostics cap. */
+  diagnosticCount?: number;
   blocked?: ReadonlySet<string>;
   unreadableScopes?: readonly ProfileSourceKind[];
 }

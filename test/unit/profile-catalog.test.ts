@@ -28,10 +28,13 @@ describe("profile catalog", () => {
     const stringFit = fitInspectionValue({ message: "x".repeat(2_000) }, 128) as Record<string, unknown>;
     expect(stringFit).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
     expect(Buffer.byteLength(JSON.stringify(stringFit), "utf8")).toBeLessThanOrEqual(128);
+    const successfulObjectFit = fitInspectionValue({ name: "stable-name", message: "x".repeat(2_000) }, 256) as Record<string, unknown>;
+    expect(successfulObjectFit).toMatchObject({ name: "stable-name", truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
     const arrayStringFit = fitInspectionValue({ items: ["x".repeat(2_000)] }, 128) as Record<string, unknown>;
     expect(arrayStringFit).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
-    expect(fitInspectionValue({ empty: "", items: Array.from({ length: 256 }, (_, index) => index) }, 128)).toMatchObject({ truncated: true });
     expect(Buffer.byteLength(JSON.stringify(arrayStringFit), "utf8")).toBeLessThanOrEqual(128);
+    expect(fitInspectionValue({ name: "stable-array", items: Array.from({ length: 256 }, (_, index) => index) }, 256)).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
+    expect(fitInspectionValue({ empty: "", items: Array.from({ length: 256 }, (_, index) => index) }, 128)).toMatchObject({ truncated: true });
     const arrayFit = fitInspectionValue({ items: Array.from({ length: 256 }, (_, index) => index), otherItems: [1, 2], sharedA: shared, sharedB: shared }, 128) as Record<string, unknown>;
     expect(arrayFit).toMatchObject({ truncated: true, diagnostics: [{ code: "OUTPUT_TRUNCATED" }] });
     expect(Buffer.byteLength(JSON.stringify(arrayFit), "utf8")).toBeLessThanOrEqual(128);
@@ -198,6 +201,13 @@ describe("profile catalog", () => {
     await Promise.all(Array.from({ length: 33 }, (_, index) => writeFile(join(manyInvalid, `bad-${index}.md`), "bad")));
     const bounded = await discoverProfiles({ bundledDir: manyInvalid, userDir: join(root, "missing-user") });
     expect(bounded.diagnostics.length).toBe(32);
+    expect(bounded.diagnosticCount).toBe(33);
+    const boundedInspect = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => bounded } });
+    const boundedInspection = await boundedInspect.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    const boundedInspectionContent = JSON.parse((boundedInspection.content[0] as { text: string }).text) as { diagnosticOmittedCount: number; truncated: boolean; diagnostics: unknown[] };
+    expect(boundedInspection.details).toMatchObject({ diagnosticOmittedCount: 17, truncated: true });
+    expect(boundedInspectionContent).toMatchObject({ diagnosticOmittedCount: 17, truncated: true });
+    expect(boundedInspectionContent.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "OUTPUT_TRUNCATED" })]));
     expect(await profileCatalog({ bundledDir: join(root, "missing-bundled") })()).toMatchObject({ effective: expect.any(Map) });
     const statPaths: string[] = [];
     const permissionCatalog = await discoverProfiles({ bundledDir: lowerScope, userDir: join(root, "missing-user"), projectCwd: nested, projectStat: async (path) => {

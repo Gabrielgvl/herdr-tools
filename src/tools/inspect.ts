@@ -391,7 +391,7 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         if (mode === "collection") {
           const collection = profileCollection(catalog);
           const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.slice(0, 16));
-          const totalDiagnostics = catalog.diagnostics.length;
+          const totalDiagnostics = catalog.diagnosticCount ?? catalog.diagnostics.length;
           const details = fitProfileCollection({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items: collection.items, diagnostics }, collection.totalCount, MAX_PROFILE_RESULT_BYTES, totalDiagnostics) as unknown as InspectDetails;
           const content = fitProfileCollection({ collection: "profiles", items: collection.items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), diagnostics }, collection.totalCount, MAX_PROFILE_CONTENT_BYTES, totalDiagnostics);
           return { content: [{ type: "text", text: JSON.stringify(content) }], details };

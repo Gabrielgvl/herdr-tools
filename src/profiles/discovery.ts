@@ -16,7 +16,12 @@ export interface ProfileDiscoveryOptions {
   projectStat?: (path: string) => Promise<{ isDirectory(): boolean }>;
 }
 
-function addDiagnostic(list: ProfileDiagnostic[], item: ProfileDiagnostic): void {
+interface DiagnosticCounter {
+  value: number;
+}
+
+function addDiagnostic(list: ProfileDiagnostic[], item: ProfileDiagnostic, counter: DiagnosticCounter): void {
+  counter.value += 1;
   if (list.length < MAX_PROFILE_DIAGNOSTICS) list.push(item);
 }
 
@@ -96,7 +101,7 @@ export function profileNameFromPath(path: string): string {
   return fileName.replace(/\.md$/, "");
 }
 
-async function readSource(kind: ProfileSourceKind, directory: string, scopeRoot: string, candidates: ProfileCandidate[], diagnostics: ProfileDiagnostic[]): Promise<void> {
+async function readSource(kind: ProfileSourceKind, directory: string, scopeRoot: string, candidates: ProfileCandidate[], diagnostics: ProfileDiagnostic[], diagnosticCount: DiagnosticCounter): Promise<void> {
   for (const path of await filesIn(directory)) {
     const source = profileSource(kind, path, scopeRoot);
     try {
@@ -107,7 +112,7 @@ async function readSource(kind: ProfileSourceKind, directory: string, scopeRoot:
       const name = profileNameFromPath(path);
       const item: ProfileDiagnostic = { code: "INVALID_PROFILE", message, path, name, source };
       candidates.push({ name, source, diagnostic: item });
-      addDiagnostic(diagnostics, item);
+      addDiagnostic(diagnostics, item, diagnosticCount);
     }
   }
 }
@@ -115,6 +120,7 @@ async function readSource(kind: ProfileSourceKind, directory: string, scopeRoot:
 export async function discoverProfiles(options: ProfileDiscoveryOptions): Promise<ProfileCatalog> {
   const candidates: ProfileCandidate[] = [];
   const diagnostics: ProfileDiagnostic[] = [];
+  const diagnosticCount: DiagnosticCounter = { value: 0 };
   const unreadableScopes: ProfileSourceKind[] = [];
   const home = options.userHome ?? homedir();
   const userDir = options.userDir ?? join(home, ".pi", "agent", "herdr-profiles");
@@ -134,15 +140,15 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
   if (projectDir) sources.push(["project", resolve(projectDir), resolve(options.projectRoot ?? join(projectDir, "..", ".."))]);
   if (projectDiscoveryError) {
     const source = profileSource("project", projectDiscoveryError.candidatePath, projectDiscoveryError.scopeRoot);
-    addDiagnostic(diagnostics, { code: "DISCOVERY_ERROR", message: projectDiscoveryError.message, path: projectDiscoveryError.candidatePath, source });
+    addDiagnostic(diagnostics, { code: "DISCOVERY_ERROR", message: projectDiscoveryError.message, path: projectDiscoveryError.candidatePath, source }, diagnosticCount);
     unreadableScopes.push("project");
   }
   for (const [kind, directory, scopeRoot] of sources) {
     try {
-      await readSource(kind, directory, scopeRoot, candidates, diagnostics);
+      await readSource(kind, directory, scopeRoot, candidates, diagnostics, diagnosticCount);
     } catch (error) {
       const source = profileSource(kind, directory, scopeRoot);
-      addDiagnostic(diagnostics, { code: "DISCOVERY_ERROR", message: String(error), path: directory, source });
+      addDiagnostic(diagnostics, { code: "DISCOVERY_ERROR", message: String(error), path: directory, source }, diagnosticCount);
       unreadableScopes.push(kind);
     }
   }
@@ -153,7 +159,7 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
     const prior = effective.get(candidate.name);
     if (!prior) effective.set(candidate.name, candidate.profile);
     else {
-      addDiagnostic(diagnostics, { code: "SHADOWED_PROFILE", message: `${prior.source.path} is shadowed by ${candidate.source.path}`, path: prior.source.path, name: candidate.name, source: prior.source, relatedPath: candidate.source.path });
+      addDiagnostic(diagnostics, { code: "SHADOWED_PROFILE", message: `${prior.source.path} is shadowed by ${candidate.source.path}`, path: prior.source.path, name: candidate.name, source: prior.source, relatedPath: candidate.source.path }, diagnosticCount);
       effective.set(candidate.name, candidate.profile);
     }
   }
@@ -165,10 +171,10 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
     if (selected && candidate.source.precedence >= selected.source.precedence) {
       effective.delete(candidate.name);
       blocked.add(candidate.name);
-      addDiagnostic(diagnostics, { code: "BLOCKED_PROFILE", message: `${candidate.source.path} blocks lower-precedence profile ${selected.source.path}`, path: candidate.source.path, name: candidate.name, source: candidate.source, relatedPath: selected.source.path });
+      addDiagnostic(diagnostics, { code: "BLOCKED_PROFILE", message: `${candidate.source.path} blocks lower-precedence profile ${selected.source.path}`, path: candidate.source.path, name: candidate.name, source: candidate.source, relatedPath: selected.source.path }, diagnosticCount);
     }
   }
-  return { effective, candidates, diagnostics, blocked, unreadableScopes };
+  return { effective, candidates, diagnostics, diagnosticCount: diagnosticCount.value, blocked, unreadableScopes };
 }
 
 export function profileCatalog(options: ProfileDiscoveryOptions): () => Promise<ProfileCatalog> {

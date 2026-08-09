@@ -17,6 +17,7 @@ interface InspectDetails {
   diagnostics?: unknown[];
   truncated?: boolean;
   omittedCount?: number;
+  diagnosticOmittedCount?: number;
   metadata?: unknown;
   recentUnwrappedLines?: string[];
   client?: { version: string; protocol: number };
@@ -328,15 +329,16 @@ function boundedInspectionDetails<T extends InspectDetails>(details: T): T {
   return fitInspectionValue(details, MAX_PROFILE_RESULT_BYTES) as T;
 }
 
-function fitProfileCollection(value: Record<string, unknown>, totalCount: number, maxBytes: number): Record<string, unknown> {
+function fitProfileCollection(value: Record<string, unknown>, totalCount: number, maxBytes: number, totalDiagnostics: number): Record<string, unknown> {
   const items = value.items as unknown[];
   const diagnostics = value.diagnostics as unknown[];
-  if (jsonBytes(value) <= maxBytes && items.length === totalCount && value.truncated !== true) return value;
+  if (jsonBytes(value) <= maxBytes && items.length === totalCount && diagnostics.length === totalDiagnostics && value.truncated !== true) return value;
   const fixed = { ...value };
   delete fixed.items;
   delete fixed.diagnostics;
   delete fixed.truncated;
   delete fixed.omittedCount;
+  delete fixed.diagnosticOmittedCount;
   const retainedDiagnostics = diagnostics.filter((diagnostic) => !(typeof diagnostic === "object" && diagnostic !== null && (diagnostic as Record<string, unknown>).code === "OUTPUT_TRUNCATED"));
   const selectItems = (diagnosticSubset: unknown[]): Record<string, unknown> | undefined => {
     for (let count = items.length; count >= 0; count -= 1) {
@@ -345,6 +347,7 @@ function fitProfileCollection(value: Record<string, unknown>, totalCount: number
         items: items.slice(0, count),
         truncated: true,
         omittedCount: totalCount - count,
+        diagnosticOmittedCount: totalDiagnostics - diagnosticSubset.length,
         diagnostics: [...diagnosticSubset, OUTPUT_TRUNCATED_DIAGNOSTIC]
       };
       if (jsonBytes(candidate) <= maxBytes) return candidate;
@@ -388,8 +391,9 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         if (mode === "collection") {
           const collection = profileCollection(catalog);
           const diagnostics = modelVisibleDiagnostics(catalog.diagnostics.slice(0, 16));
-          const details = fitProfileCollection({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items: collection.items, diagnostics }, collection.totalCount, MAX_PROFILE_RESULT_BYTES) as unknown as InspectDetails;
-          const content = fitProfileCollection({ collection: "profiles", items: collection.items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), diagnostics }, collection.totalCount, MAX_PROFILE_CONTENT_BYTES);
+          const totalDiagnostics = catalog.diagnostics.length;
+          const details = fitProfileCollection({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success", items: collection.items, diagnostics }, collection.totalCount, MAX_PROFILE_RESULT_BYTES, totalDiagnostics) as unknown as InspectDetails;
+          const content = fitProfileCollection({ collection: "profiles", items: collection.items.map((item) => item.valid === false ? { name: item.name, valid: false, source: item.source, diagnostic: item.diagnostic } : modelVisibleProfile(item)), diagnostics }, collection.totalCount, MAX_PROFILE_CONTENT_BYTES, totalDiagnostics);
           return { content: [{ type: "text", text: JSON.stringify(content) }], details };
         }
         const profile = exactProfile(catalog, input.profile!);

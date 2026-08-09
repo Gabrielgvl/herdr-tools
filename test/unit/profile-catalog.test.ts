@@ -427,6 +427,24 @@ describe("profile catalog", () => {
       expect((item.source as Record<string, unknown>).path).toBe(`/model/${Number(String(item.name).slice("model-".length))}`);
     }
     expect(modelContent.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "OUTPUT_TRUNCATED" })]));
+    const diagnosticOnlyDiagnostics = Array.from({ length: 20 }, (_, index) => ({ code: "DISCOVERY_ERROR" as const, name: `diagnostic-${index}`, message: `message-${index}`, path: `/diagnostic/${index}` }));
+    const diagnosticOnlyTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [{ name: worker.name, profile: worker, source: worker.source }], diagnostics: diagnosticOnlyDiagnostics }) } });
+    const diagnosticOnly = await diagnosticOnlyTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    const diagnosticOnlyContent = JSON.parse(contentText(diagnosticOnly)) as { diagnosticOmittedCount: number; diagnostics: Array<Record<string, unknown>>; truncated: boolean };
+    expect(diagnosticOnly.details).toMatchObject({ truncated: true, omittedCount: 0, diagnosticOmittedCount: 4 });
+    expect((diagnosticOnly.details.diagnostics as Array<Record<string, unknown>>).find((item) => item.name === "diagnostic-15")).toMatchObject({ message: "message-15", path: "/diagnostic/15" });
+    expect(diagnosticOnlyContent).toMatchObject({ truncated: true, diagnosticOmittedCount: 4 });
+    expect(diagnosticOnlyContent.diagnostics.find((item) => item.name === "diagnostic-15")).toMatchObject({ message: "message-15", path: "/diagnostic/15" });
+    const byteDiagnostics = Array.from({ length: 16 }, (_, index) => ({ code: "DISCOVERY_ERROR" as const, name: `diagnostic-${index}-${"n".repeat(120)}`, message: "m".repeat(512), path: `/diagnostic/${"p".repeat(512)}` }));
+    const byteDiagnosticTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [{ name: worker.name, profile: worker, source: worker.source }], diagnostics: byteDiagnostics }) } });
+    const byteDiagnosticResult = await byteDiagnosticTool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    const byteDiagnosticContent = JSON.parse(contentText(byteDiagnosticResult)) as { items: unknown[]; omittedCount: number; diagnosticOmittedCount: number; truncated: boolean; diagnostics: unknown[] };
+    expect(Buffer.byteLength(JSON.stringify(byteDiagnosticResult.details), "utf8")).toBeLessThanOrEqual(50 * 1024);
+    expect(Buffer.byteLength(contentText(byteDiagnosticResult), "utf8")).toBeLessThanOrEqual(16_000);
+    expect(byteDiagnosticContent.truncated).toBe(true);
+    expect(byteDiagnosticContent.items.length + byteDiagnosticContent.omittedCount).toBe(1);
+    expect(byteDiagnosticContent.diagnosticOmittedCount).toBeGreaterThan(0);
+    expect(byteDiagnosticContent.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: "OUTPUT_TRUNCATED" })]));
     const blockedProfile = { ...worker, name: "blocked-low", source: profileSource("bundled", "/tmp/blocked-low.md", "/tmp") };
     const blockedCatalog = { ...catalog, effective: new Map([[blockedProfile.name, blockedProfile]]), candidates: [{ name: blockedProfile.name, profile: blockedProfile, source: blockedProfile.source }], unreadableScopes: ["project"] as const };
     const blockedTool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => blockedCatalog } });

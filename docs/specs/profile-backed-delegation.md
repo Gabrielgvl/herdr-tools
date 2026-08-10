@@ -4,11 +4,12 @@
 
 Replace the normal `pi-subagents` delegation path with visible, pane-backed Pi and Claude agents launched from reusable profiles. Build it in working layers rather than coupling the first release to every lifecycle feature.
 
-The first implementation slice delivers a strict profile catalog and profile-backed launch that can be dogfooded immediately. Later slices add Herdr-native turn results, same-pane replacement, durable run state, and the blocking `herdr_delegate` lifecycle tool. `pi-subagents` remains installed only until the acceptance gates for the complete replacement pass.
+The first implementation slice delivers a strict profile catalog and profile-backed launch that can be dogfooded immediately. It also gives each bundled role an explicit capability policy and one shared role skill across Pi and Claude, with `manager-pi` as the visible orchestration-only entry point. Later slices add Herdr-native turn results, same-pane replacement, durable run state, and the blocking `herdr_delegate` lifecycle tool. `pi-subagents` remains installed only until the acceptance gates for the complete replacement pass.
 
 ## Validated product decisions
 
 - Profiles are owned and resolved by `herdr-tools`, not the Herdr runtime.
+- Bundled profiles use deliberate role-scoped capabilities. `manager-pi` orchestrates visible workers but cannot edit; scout, planner, reviewer, and researcher are read-only; worker is the only bundled role with direct edit/write and background-job tools.
 - Profiles are separate Markdown files discovered from:
   1. bundled `herdr-profiles/*.md`;
   2. user `~/.pi/agent/herdr-profiles/*.md`;
@@ -23,12 +24,13 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Typed call overrides may replace typed defaults, including capability-expanding Claude permission modes. Project profiles have no trust gate. These are deliberate trust choices.
 - Fallbacks are ordered references to named profiles, validated as a graph. A logical run has at most three attempts. Invalid profiles are isolated; only the selected reachable graph blocks launch.
 - Fallback targets use their own defaults. The logical cwd, task, placement, and provenance carry across attempts.
-- Bundled roles are `scout`, `planner`, `worker`, `reviewer`, and `researcher`, with Pi and Claude variants. Bundled direction/model policy:
+- Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager` has only a Pi profile using `openai-codex/gpt-5.6-sol` with high thinking and no fallback. The other roles have Pi and Claude variants with the existing direction/model policy:
   - scout: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - researcher: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - worker: `openai-codex/gpt-5.6-luna` -> `claude-opus-5`;
   - reviewer: `openai-codex/gpt-5.6-sol` -> `claude-opus-5`;
   - planner: `claude-fable-5` -> `openai-codex/gpt-5.6-sol`.
+- Every bundled profile has one role-scoped skill. Claude profiles load the corresponding scope-local plugin directory; Pi profiles load the same skill path directly. Normal installed extension discovery remains enabled, while profile allowlists omit hidden delegation, durable-memory mutation, and unapproved lifecycle capabilities.
 - Bundled role bodies are rewritten for Herdr; they do not preserve chain, artifact, fork, or `pi-subagents` implementation assumptions.
 
 ## Layered delivery
@@ -42,7 +44,7 @@ Deliver now:
 - bounded `herdr_inspect` profile collection/exact-profile modes; collection omissions expose `truncated`, exact whole-item `omittedCount`, exact diagnostic `diagnosticOmittedCount`, and an `OUTPUT_TRUNCATED` diagnostic in both details and model-visible JSON. Catalogs also retain the total generated diagnostic count even when retained diagnostics are capped;
 - typed Pi and Claude argv adapters;
 - profile-backed launch through the existing launch implementation while preserving mandatory assignment provenance;
-- starter bundled profiles and unit tests;
+- starter bundled profiles, shared role plugins/skills, explicit Pi/Claude capability matrices, and unit tests;
 - no automatic fallback yet: return the validated ordered fallback names as launch evidence.
 
 This slice must not pretend terminal transcript scraping is a structured result.
@@ -106,6 +108,7 @@ test/unit/profiles/         parser/discovery/graph/adapter tests
 src/tools/inspect.ts        profile catalog inspection modes
 src/tools/launch.ts         low-level profile-backed launch integration
 src/tools/delegate.ts       later blocking lifecycle tool
+herdr-profiles/role-plugins/ shared role skills and Claude plugin manifests
 docs/specs/                 living implementation specifications
 docs/decisions/             architecture decisions
 ```
@@ -131,6 +134,7 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 ## Testing strategy
 
 - Unit-test parsing, schema rejection, precedence, shadow reporting, graph cycles/missing targets/max attempts, path resolution, argument generation, bounds, and redaction.
+- Assert the 11 bundled profiles, exact role capability matrices, shared resource paths, no hidden delegation tools, read-only mutation exclusions, and representative Pi/Claude launch flags.
 - Unit-test launch ordering: resolve -> create pane/tab -> start exact kind/argv -> readiness -> provenance assignment.
 - Integration-test in a disposable Herdr session; never mutate or close the active user workspace.
 - Runtime work requires Pi and Claude contract tests for result correlation, cancellation, replacement, restart reconciliation, and capacity/storage failures.
@@ -163,7 +167,9 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 
 ## Slice 1 success criteria
 
-- [ ] A valid bundled/user/project profile resolves deterministically with source and shadow evidence.
+- [ ] Eleven bundled profiles resolve deterministically with source and shadow evidence; `manager-pi` is the only manager profile and has no fallback.
+- [ ] Every bundled role has one shared role skill, with matching Pi skill and Claude plugin resources.
+- [ ] Pi and Claude capability matrices exclude hidden delegation and keep direct mutation tools limited to workers.
 - [ ] Invalid unrelated profiles do not block valid profiles; invalid reachable fallback graphs fail before launch.
 - [ ] Exact profile inspection is bounded and redacts sensitive runtime values.
 - [ ] Pi and Claude adapters produce typed, shell-free argv with appended-system-prompt semantics.

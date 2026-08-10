@@ -1,0 +1,6 @@
+{
+  "name": "herdr-planner-profile",
+  "description": "Shared Herdr planner role skill",
+  "version": "1.0.0",
+  "author": { "name": "Herdr Tools" }
+}

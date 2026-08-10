@@ -7,11 +7,23 @@ runtime:
   kind: claude
   model: claude-sonnet-5
   effort: low
+  permissionMode: dontAsk
+  allowedTools:
+    - Read
+    - Glob
+    - Grep
+    - Bash
+  disallowedTools:
+    - Edit
+    - Write
+    - NotebookEdit
+    - Task
+  addDirs: []
+  pluginDirs:
+    - herdr-profiles/role-plugins/scout
 fallbackProfiles: []
 ---
 
 You are the Claude scout for a Herdr task.
 
-Perform focused repository reconnaissance before implementation. Find the relevant entry points, types, dependencies, tests, and constraints with targeted searches and selective reads. Verify claims against the code rather than inferring from filenames or conventions.
-
-Remain read-only. Report exact paths and useful line ranges, separate confirmed facts from risks, and give the next agent a concise starting point. Do not edit files, invent fallback behavior, or expand the investigation beyond the assigned question.
+Use the scout role skill for focused, bounded, read-only repository reconnaissance. Return exact evidence and do not mutate state.

@@ -17,6 +17,15 @@ const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
 const assignmentEnvelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const extensionContext = { cwd: "/repo", hasUI: false } as ExtensionContext;
 const ok = (id: string, result: unknown) => ({ id, result });
+const promptStalled = (id = "cli:agent:prompt") => Object.assign(new Error("Herdr CLI did not return a usable response"), {
+  code: "CLI_PROTOCOL_ERROR",
+  details: {
+    exitCode: 1,
+    killed: false,
+    stdout: "",
+    stderr: `${JSON.stringify({ error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained 7" }, id })}\n`
+  }
+});
 
 function makeCli(overrides: Partial<LaunchCli> = {}) {
   const calls: string[][] = [];
@@ -171,9 +180,92 @@ describe("herdr_launch", () => {
     const { promise, calls } = launch({ initialPrompt: "begin" });
     const result = await promise;
     expect(calls[3]).toEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000"]);
-    expect(calls[4]).toEqual(["agent", "prompt", "w1:p2", assignmentEnvelope("begin"), "--wait", "--until", "working", "--timeout", "5000"]);
+    expect(calls[4]).toEqual(["agent", "prompt", "w1:p2", assignmentEnvelope("begin"), "--wait", "--until", "working", "--timeout", "10000"]);
     expect(calls[5]).toEqual(["pane", "get", "w1:p2"]);
     expect(result.details).toMatchObject({ postState: { agent_status: "working" }, initialPromptSent: true, envelope: { version: "v1", kind: "assignment" }, sender: { paneId: "w1:p1", display: "caller" } });
+  });
+
+  it("submits one enter and re-verifies a newly created pane after exact stalled-prompt evidence", async () => {
+    const { cli, calls } = makeCli();
+    const base = cli.runJson;
+    cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserveCompletedMutation) => {
+      if (argv[0] === "agent" && argv[1] === "prompt") {
+        calls.push(argv);
+        throw promptStalled();
+      }
+      if (argv[0] === "agent" && argv[1] === "send-keys") {
+        calls.push(argv);
+        return ok("keys", { ok: true });
+      }
+      if (argv[0] === "agent" && argv[1] === "wait") {
+        calls.push(argv);
+        return ok("wait", { agent: { pane_id: "w1:p2", status: "working" } });
+      }
+      return base(argv, signal, preserveCompletedMutation);
+    });
+
+    const result = await createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "begin" }, new AbortController().signal, undefined, extensionContext);
+
+    expect(calls.slice(4, 8)).toEqual([
+      ["agent", "prompt", "w1:p2", assignmentEnvelope("begin"), "--wait", "--until", "working", "--timeout", "10000"],
+      ["agent", "send-keys", "w1:p2", "enter"],
+      ["agent", "wait", "w1:p2", "--until", "working", "--timeout", "5000"],
+      ["pane", "get", "w1:p2"]
+    ]);
+    expect(result.details).toMatchObject({ initialPromptSent: true, postState: { agent_status: "working" } });
+  });
+
+  it("does not send enter when prompt failure evidence is not the exact stalled-prompt envelope", async () => {
+    const { cli, calls } = makeCli();
+    const base = cli.runJson;
+    cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserveCompletedMutation) => {
+      if (argv[0] === "agent" && argv[1] === "prompt") {
+        calls.push(argv);
+        throw promptStalled("cli:agent:wait");
+      }
+      return base(argv, signal, preserveCompletedMutation);
+    });
+
+    await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "begin" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR", created: { paneId: "w1:p2", tabId: "w1:t1" } } });
+    expect(calls.some((argv) => argv[0] === "agent" && argv[1] === "send-keys")).toBe(false);
+  });
+
+  it("does not retry malformed or non-timeout prompt failures", async () => {
+    const failures = [
+      Object.assign(new Error("missing details"), { code: "CLI_PROTOCOL_ERROR" }),
+      Object.assign(new Error("wrong exit"), { code: "CLI_PROTOCOL_ERROR", details: { exitCode: 2, killed: false, stderr: "{}" } }),
+      Object.assign(new Error("malformed stderr"), { code: "CLI_PROTOCOL_ERROR", details: { exitCode: 1, killed: false, stderr: "{" } })
+    ];
+
+    for (const failure of failures) {
+      const { cli, calls } = makeCli();
+      const base = cli.runJson;
+      cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserveCompletedMutation) => {
+        if (argv[0] === "agent" && argv[1] === "prompt") {
+          calls.push(argv);
+          throw failure;
+        }
+        return base(argv, signal, preserveCompletedMutation);
+      });
+
+      await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "begin" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
+      expect(calls.some((argv) => argv[0] === "agent" && argv[1] === "send-keys")).toBe(false);
+    }
+  });
+
+  it("does not retry an exact prompt timeout in a pre-existing pane", async () => {
+    const calls: string[][] = [];
+    const existingSnapshot = { ...snapshot, panes: [...snapshot.panes, { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "target", agent_status: "idle" }] };
+    const cli: LaunchCli = { runJson: vi.fn<LaunchCli["runJson"]>(async (argv) => {
+      calls.push(argv);
+      if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: existingSnapshot });
+      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker", pane_id: "w1:p2" } });
+      if (argv[0] === "agent" && argv[1] === "prompt") throw promptStalled();
+      throw new Error(`unexpected argv: ${argv.join(" ")}`);
+    }) };
+
+    await expect(createLaunchTool({ cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", placement: { mode: "existing_pane", target: "target" }, initialPrompt: "begin" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR", created: {} } });
+    expect(calls.some((argv) => argv[0] === "agent" && argv[1] === "send-keys")).toBe(false);
   });
 
   it("fails before placement when an initial-prompt caller pane is absent", async () => {

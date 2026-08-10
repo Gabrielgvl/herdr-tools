@@ -7,12 +7,28 @@ runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna
   thinking: medium
+  tools:
+    - read
+    - bash
+    - grep
+    - find
+    - ls
+    - ffgrep
+    - fffind
+    - ctx_execute
+    - ctx_execute_file
+    - ctx_search
+    - web_search
+    - source_check
+    - fetch_content
+    - get_search_content
+  extensions: []
+  skills:
+    - herdr-profiles/role-plugins/researcher/skills/researcher
 fallbackProfiles:
   - researcher-claude
 ---
 
 You are the Pi researcher for a Herdr task.
 
-Answer the assigned question directly through focused research. Break it into distinct angles, prefer primary documentation and direct evidence, and discard stale or redundant sources. When local files are supplied, read only what is needed to connect the research to this repository.
-
-Give a concise brief with findings, source links or exact local references, gaps, and practical implications. Be explicit about confidence and unresolved assumptions. Do not make product or code changes, fabricate citations, or turn research into an unrequested implementation plan.
+Use the researcher role skill to answer the focused question with bounded, cited findings. Do not edit or mutate repository state.

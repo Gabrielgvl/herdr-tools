@@ -197,6 +197,22 @@ function focusArgs(focus: boolean): string[] {
   return [focus ? "--focus" : "--no-focus"];
 }
 
+function isPromptStalled(error: unknown): boolean {
+  if (!record(error) || error.code !== "CLI_PROTOCOL_ERROR" || !record(error.details)) return false;
+  const { exitCode, killed, stderr } = error.details;
+  if (exitCode !== 1 || killed !== false || typeof stderr !== "string") return false;
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(stderr.trim());
+  } catch {
+    return false;
+  }
+  if (!record(envelope) || envelope.id !== "cli:agent:prompt" || !record(envelope.error)) return false;
+  return envelope.error.code === "agent_prompt_stalled"
+    && typeof envelope.error.message === "string"
+    && /^agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained \d+$/.test(envelope.error.message);
+}
+
 function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"]): LaunchError {
   const causeCode = error instanceof LaunchError ? error.code : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
   const message = error instanceof Error ? error.message : String(error);
@@ -321,7 +337,13 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (params.initialPrompt !== undefined) {
           phase = "prompt_verification";
           const envelope = buildEnvelope(sender!, "assignment", params.initialPrompt);
-          await run(deps.cli, ["agent", "prompt", resolvedPaneId, envelope, "--wait", "--until", "working", "--timeout", "5000"], abortSignal);
+          try {
+            await run(deps.cli, ["agent", "prompt", resolvedPaneId, envelope, "--wait", "--until", "working", "--timeout", "10000"], abortSignal);
+          } catch (error) {
+            if (placement.mode === "existing_pane" || !isPromptStalled(error)) throw error;
+            await run(deps.cli, ["agent", "send-keys", resolvedPaneId, "enter"], abortSignal);
+            await run(deps.cli, ["agent", "wait", resolvedPaneId, "--until", "working", "--timeout", "5000"], abortSignal);
+          }
           initialPromptSent = true;
           progress(onUpdate, phase, created);
         }

@@ -7,11 +7,27 @@ runtime:
   kind: pi
   model: openai-codex/gpt-5.6-sol
   thinking: high
+  tools:
+    - read
+    - bash
+    - grep
+    - find
+    - ls
+    - ffgrep
+    - fffind
+    - ctx_execute
+    - ctx_execute_file
+    - ctx_search
+    - web_search
+    - source_check
+    - fetch_content
+    - get_search_content
+  extensions: []
+  skills:
+    - herdr-profiles/role-plugins/planner/skills/planner
 fallbackProfiles: []
 ---
 
 You are the Pi planner for a Herdr task.
 
-Turn the stated requirements and repository evidence into a concrete implementation plan. Read the relevant code first, name exact files and symbols, order small actionable steps, and define acceptance checks for each step. Surface dependencies, risks, and unresolved ambiguity instead of hiding it behind generic advice.
-
-Do not edit code or invent new product behavior. Present the plan directly in your response, keeping it bounded to the approved scope so another worker can execute it without guessing.
+Use the planner role skill to turn requirements and repository evidence into a concrete bounded plan. Do not edit or mutate state.

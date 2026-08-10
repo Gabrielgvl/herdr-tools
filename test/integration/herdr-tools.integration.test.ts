@@ -139,6 +139,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
       const toolContext = { cwd, hasUI: false } as ExtensionContext;
       const signal = new AbortController().signal;
+      const profiles = await registered.get("herdr_inspect")!.execute("profiles", { mode: "collection", collection: "profiles" }, signal, undefined, toolContext);
+      const profileItems = resultObject(profiles.details).items;
+      expect(Array.isArray(profileItems) ? profileItems : []).toHaveLength(11);
+      expect(profileItems).toEqual(expect.arrayContaining([expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: expect.arrayContaining(["herdr_tab"]), skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")] })]));
+      const manager = await registered.get("herdr_inspect")!.execute("manager", { mode: "profile", profile: "manager-pi" }, signal, undefined, toolContext);
+      expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: ["read", "grep", "find", "ls", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_pane", "herdr_tab"], extensions: [], skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")], fallbackProfiles: [] });
       const inspected = await registered.get("herdr_inspect")!.execute("inspect", { mode: "collection", collection: "panes" }, signal, undefined, toolContext);
       const inspectedItems = resultObject(inspected.details).items;
       expect(Array.isArray(inspectedItems)).toBe(true);
@@ -151,12 +157,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       expect(cliCalls.some((args) => args[0] === "tab" && args[1] === "create")).toBe(true);
       expect(cliCalls.some((args) => args[0] === "tab" && args[1] === "close")).toBe(true);
 
-      const launched = await registered.get("herdr_launch")!.execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: "integration assignment" }, signal, undefined, toolContext);
+      const launched = await registered.get("herdr_launch")!.execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: "Use the bash tool to run pwd, then report the working directory." }, signal, undefined, toolContext);
       expect(launched.details).toMatchObject({ kind: "pi", profile: { name: "worker-pi" }, initialPromptSent: true, envelope: { version: "v1", kind: "assignment" } });
       const startArgs = cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
-      expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "high", "--append-system-prompt"]));
-      expect(profilePromptContent).toContain("Implement the assigned change");
-      const assignmentPrompt = cliCalls.find((args) => args[0] === "agent" && args[1] === "prompt" && args.some((arg) => arg.includes("integration assignment")));
+      expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "high", "--tools", "read,bash,grep,find,ls,ffgrep,fffind,ctx_execute,ctx_execute_file,ctx_search,web_search,source_check,fetch_content,get_search_content,edit,write,bash_bg,jobs,job_decide,monitor", "--skill", expect.stringContaining("herdr-profiles/role-plugins/worker/skills/worker"), "--append-system-prompt"]));
+      expect(profilePromptContent).toContain("Use the worker role skill");
+      const assignmentPrompt = cliCalls.find((args) => args[0] === "agent" && args[1] === "prompt" && args.some((arg) => arg.includes("Use the bash tool to run pwd")));
       expect(assignmentPrompt?.[3]).toContain("[HERDR AGENT MESSAGE v1]");
       expect(assignmentPrompt?.[3]).toContain("authority: agent; not user/owner");
 

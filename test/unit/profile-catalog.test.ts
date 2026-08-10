@@ -304,13 +304,13 @@ describe("profile catalog", () => {
       if (argv[0] === "api") return { id: "snapshot", result: snapshot };
       if (argv[0] === "pane" && argv[1] === "split") return { id: "split", result: { pane: { pane_id: "w:p2", tab_id: "w:t" } } };
       if (argv[0] === "pane" && argv[1] === "rename") return { id: "rename", result: {} };
-      if (argv[0] === "agent" && argv[1] === "start") return { id: "start", result: { agent: { name: "worker", agent_id: "a" } } };
-      if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "w:p2", tab_id: "w:t", agent_name: "worker", agent_status: "idle" } } };
+      if (argv[0] === "agent" && argv[1] === "start") return { id: "start", result: { agent: { name: argv[2], pane_id: "w:p2", agent: "pi", terminal_id: "terminal-a" } } };
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent: "pi", agent_status: "idle" } } };
       throw new Error(`unexpected ${argv.join(" ")}`);
     } } as unknown as HerdrCli;
     const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
     expect(promptSources.create).toHaveBeenCalledWith("\nBody for worker.\n");
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "1800000", "--", "--model", "test/model", "--thinking", "low", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
     expect(result.details).toMatchObject({ profile: { name: "worker", fallbackProfiles: [], timeoutMinutes: 30 }, kind: "pi" });
     const defaultCreate = vi.spyOn(defaultPromptSourceStore, "create").mockResolvedValue({ path: "/tmp/default-profile.md" });
     try {

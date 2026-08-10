@@ -262,8 +262,8 @@ Rules:
 - `name` is required and must be unique according to an authoritative agent listing. The extension never generates a name or silently renames a collision.
 - Default placement splits the current pane to the right in the current tab, with no focus change, current Pi cwd, and a pane label equal to `name` unless `label` is supplied. `new_tab` and `existing_pane` retain their existing explicit semantics.
 - Profile body sources are created before topology mutation. Initial prompts are sent only after the selected agent starts, wrapped in the mandatory v1 assignment envelope, and verified as `working`.
-- Overrides apply only to the requested primary profile. Every fallback uses its own untouched defaults, including runtime, model, source, timeout, and permissions.
-- Automatic fallback is permitted only for the exact machine-typed Herdr error `agent_start_failed` with message `process exited before becoming interactive`, followed by an authoritative pane read proving that no agent remains. Timeout, malformed/protocol, identity/kind, prompt, and uncertain-state failures stop without fallback.
+- Overrides apply only to the requested primary profile. Every fallback uses its own untouched defaults, including runtime, model, source, timeout, and permissions. Profile `timeoutMinutes` is task policy; Herdr startup uses a separate valid 120000 ms readiness timeout, while the CLI subprocess receives a small execution margin.
+- Automatic fallback is permitted only for the installed CLI failure envelope `{id:"cli:agent:start",error:{code:"agent_start_failed",message:"agent process exited before becoming interactive"}}` with non-killed exit 1 and untruncated stderr, followed by an authoritative pane read with `agent_status:"unknown"` and no agent identity/session fields. Timeout, malformed/protocol, identity/kind, prompt, and uncertain-state failures stop without fallback.
 - Fallback attempts reuse the resolved pane; the ordered reachable profile chain is deterministic and capped at three. An exhausted chain stops and reports bounded attempt evidence; no profile is improvised.
 - Launch details report requested and selected profiles, effective runtime/model/source/timeout/permissions, bounded attempt evidence, authoritative IDs/post-state, and any visible provenance. Failed launches retain created resources and never auto-clean them.
 
@@ -435,7 +435,7 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - The extension is global code with full Pi permissions; it is trusted code and must remain narrowly scoped.
 - Registration is gated by `HERDR_ENV=1`.
 - All process execution uses `pi.exec` with explicit executable and argument arrays. No shell interpolation, command concatenation, arbitrary executable input, or direct socket protocol implementation is allowed.
-- `herdr_launch` accepts a Herdr-supported `kind` and arguments only, never an executable string.
+- `herdr_launch` accepts only a validated named Pi/Claude profile and typed overrides; raw kind, argv, and env launch fields are rejected.
 - Target resolution is exact and fail-closed. The extension never relies on UI focus or guesses an ID.
 - Named keys are validated symbols, never raw escape/control strings. Key delivery does not add a second confirmation dialog.
 - Destructive close operations are autonomous only after exact target and protected-topology validation. No UI is required, but malformed topology fails closed.
@@ -528,7 +528,7 @@ Mock `pi.exec`, CLI stdout/stderr/exit codes, target listings, post-state reads,
 - named-key validation without confirmation;
 - wait state semantics, literal/regex matching, any/all, immediate matches, bounded timeout final snapshots, abort, and internal CLI failures;
 - every long-wait reviewer rule, including concurrent one-per-target calls, bounded deltas, no tools, manager-judgment early exit, and immediate reviewer failure;
-- unique launch names, supported kinds, placement defaults, argv separation, initial prompt readiness, post-state reads, and failed-launch retention;
+- unique launch names, strict profile schemas, typed overrides, startup-timeout margins, real failure-envelope fallback, AgentInfo correlation, initial prompt readiness, post-state reads, and failed-launch retention;
 - all pane/tab topology operations and default direction/focus behavior;
 - environment overrides without an extension key allowlist and without value echoing;
 - autonomous exact pane/tab close, lost-response reconciliation, mutation uncertainty, compact post-topology evidence, malformed topology, and caller ancestor protection;

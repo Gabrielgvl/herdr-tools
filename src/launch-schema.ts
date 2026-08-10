@@ -2,6 +2,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type ThinkingLevel } from "./profiles/types.js";
 
+const AgentName = Type.String({ minLength: 1, maxLength: 32, pattern: "^[a-z][a-z0-9_-]{0,31}$" });
+const ProfileName = Type.String({ minLength: 1, pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" });
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
 
 export const LaunchPlacementSchema = Type.Union([
@@ -27,7 +29,7 @@ export const ProfileLaunchOverridesSchema = Type.Object({
 }, { additionalProperties: false });
 
 const LaunchCommonProperties = {
-  name: Identifier,
+  name: AgentName,
   placement: Type.Optional(LaunchPlacementSchema),
   label: Type.Optional(Identifier),
   cwd: Type.Optional(Identifier),
@@ -37,7 +39,7 @@ const LaunchCommonProperties = {
 
 const ProfileLaunchParamsSchema = Type.Object({
   ...LaunchCommonProperties,
-  profile: Identifier,
+  profile: ProfileName,
   overrides: Type.Optional(ProfileLaunchOverridesSchema)
 }, { additionalProperties: false });
 

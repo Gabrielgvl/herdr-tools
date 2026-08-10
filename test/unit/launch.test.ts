@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CliProtocolError } from "../../src/cli.js";
 import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, type LaunchCli, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
-import { parseProfile, profileSource, type ProfileCatalog } from "../../src/profiles/index.js"
+import { parseProfile, profileSource, type ProfileCatalog } from "../../src/profiles/index.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
 const testPreflight = async () => undefined;
@@ -19,6 +20,12 @@ const snapshot: HerdrSnapshot = {
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
 const extensionContext = { cwd: "/repo", hasUI: false } as ExtensionContext;
 const ok = (id: string, result: unknown) => ({ id, result });
+const startFailure = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", {
+  exitCode: 1,
+  killed: false,
+  stderrTruncated: false,
+  stderr: JSON.stringify({ id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } })
+});
 const envelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 
 function profile(name: string, kind: "pi" | "claude" = "pi", fallbackProfiles: string[] = []) {
@@ -36,6 +43,7 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
   const calls = options.calls ?? [];
   let paneReads = 0;
   let starts = 0;
+  let lastKind = "pi";
   const cli: LaunchCli = {
     runJson: vi.fn<LaunchCli["runJson"]>(async (argv) => {
       calls.push(argv);
@@ -45,15 +53,17 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
       if (argv[0] === "tab" && argv[1] === "create") return ok("tab", { tab: { tab_id: "w1:t2", workspace_id: "w1" }, root_pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1" } });
       if (argv[0] === "agent" && argv[1] === "start") {
         const attempt = starts++;
+        lastKind = String(argv[4]);
         if (options.start) return options.start(argv, attempt) as Awaited<ReturnType<LaunchCli["runJson"]>>;
-        return ok("start", { agent: { name: "worker", agent_id: `agent-${attempt}` } });
+        const paneId = calls.some((call) => call[0] === "tab" && call[1] === "create") ? "w1:p3" : "w1:p2";
+        return ok("start", { agent: { name: "worker", pane_id: paneId, agent: argv[4], terminal_id: `terminal-${attempt}` } });
       }
       if (argv[0] === "agent" && argv[1] === "prompt") return ok("prompt", { ok: true });
       if (argv[0] === "agent" && argv[1] === "focus") return ok("focus", {});
       if (argv[0] === "pane" && argv[1] === "get") {
         const configured = options.paneStates?.[paneReads++];
         const paneId = calls.some((call) => call[0] === "tab" && call[1] === "create") ? "w1:p3" : "w1:p2";
-        return ok("get", { pane: configured ?? { pane_id: paneId, tab_id: paneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent_name: "worker", agent_status: "working" } });
+        return ok("get", { pane: configured ?? { pane_id: paneId, tab_id: paneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent: lastKind, agent_status: "working" } });
       }
       if (argv[0] === "tab" && argv[1] === "get") return ok("tab-get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1:t2" } });
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
@@ -86,6 +96,7 @@ describe("herdr_launch profile-only contract", () => {
       null, {}, { ...valid, name: "" }, { ...valid, name: "Bad" }, { ...valid, name: "x".repeat(33) },
       { ...valid, unknown: true }, { ...valid, profile: "" }, { ...valid, profile: "bad\nprofile" },
       { ...valid, overrides: null }, { ...valid, overrides: { unknown: true } }, { ...valid, overrides: { model: "" } },
+      { ...valid, overrides: { thinking: "invalid" } }, { ...valid, overrides: { effort: "invalid" } }, { ...valid, overrides: { permissionMode: "invalid" } },
       ...["tools", "extensions", "skills", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"].map((key) => ({ ...valid, overrides: { [key]: ["bad\nvalue"] } })),
       ...["tools", "extensions", "skills", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"].map((key) => ({ ...valid, overrides: { [key]: 1 } })),
       { ...valid, label: "" }, { ...valid, cwd: "" }, { ...valid, initialPrompt: "" }, { ...valid, initialPrompt: 1 }, { ...valid, focus: 1 },
@@ -106,6 +117,20 @@ describe("herdr_launch profile-only contract", () => {
       harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "agent" && argv[1] === "start" ? ok("start", startResult) : base(argv, signal, preserve));
       await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
     }
+    for (const agent of [
+      { name: "other", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-wrong-name" },
+      { name: "worker", pane_id: "w1:p9", agent: "pi", terminal_id: "terminal-wrong-pane" },
+      { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-wrong-kind" }
+    ]) {
+      const harness = makeCli();
+      const base = harness.cli.runJson;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "agent" && argv[1] === "start" ? ok("start", { agent }) : base(argv, signal, preserve));
+      await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      expect(harness.calls.some((call) => call[0] === "pane" && call[1] === "get")).toBe(false);
+    }
+
+    const noTerminalId = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
+    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), noTerminalId.cli)).resolves.toMatchObject({ details: { name: "worker" } });
 
     const paneVariants = [{ pane: { pane_id: "w1:p2", tab_id: "w1:t1" } }, { root_pane: { pane_id: "w1:p2", tab_id: "w1:t1" } }, { new_pane: { pane_id: "w1:p2" } }, { child_pane: { pane_id: "w1:p2" } }, { created_pane: { pane_id: "w1:p2" } }, { pane_id: "w1:p2", tab_id: "w1:t1" }];
     for (const placement of paneVariants) {
@@ -132,10 +157,10 @@ describe("herdr_launch profile-only contract", () => {
     });
     await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), stalled.cli)).resolves.toMatchObject({ details: { initialPromptSent: true } });
 
-    const safeEvidence = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "none", agent_id: 1, status: {} }] });
+    const safeEvidence = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown", agent_id: 1, status: {} }] });
     const safeBase = safeEvidence.cli.runJson;
     safeEvidence.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-      if (argv[0] === "agent" && argv[1] === "start") throw Object.assign(new Error("process exited before becoming interactive"), { code: "agent_start_failed", details: { stderr: "{" } });
+      if (argv[0] === "agent" && argv[1] === "start") throw startFailure();
       return safeBase(argv, signal, preserve);
     });
     await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), safeEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
@@ -166,7 +191,8 @@ describe("herdr_launch profile-only contract", () => {
     tabLookup.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
       if (argv[0] === "tab" && argv[1] === "create") return ok("tab", { tab: { tab_id: "w1:t2" } });
       if (argv[0] === "tab" && argv[1] === "get") return ok("tab", { rootPane: { pane_id: "w1:p3", tab_id: "w1:t2" } });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1", agent_name: "worker", agent_status: "idle" } });
+      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker", pane_id: "w1:p3", agent: "pi", terminal_id: "terminal-tab" } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1", agent: "pi", agent_status: "idle" } });
       return tabLookupBase(argv, signal, preserve);
     });
     await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(worker), tabLookup.cli)).resolves.toMatchObject({ details: { paneId: "w1:p3" } });
@@ -196,11 +222,11 @@ describe("herdr_launch profile-only contract", () => {
     const primary = profile("primary", "pi", ["fallback"]);
     const fallback = profile("fallback");
 
-    const readFailure = makeCli({ start: () => { throw Object.assign(new Error("process exited before becoming interactive"), { code: "agent_start_failed" }); } });
+    const readFailure = makeCli({ start: () => { throw startFailure(); } });
     const readBase = readFailure.cli.runJson;
     readFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? Promise.reject(new Error("read failed")) : readBase(argv, signal, preserve));
     await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), readFailure.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE", details: { causeCode: "POSTSTATE_UNAVAILABLE", startFailureCode: "agent_start_failed" } });
-    const readStringFailure = makeCli({ start: () => { throw Object.assign(new Error("process exited before becoming interactive"), { code: "agent_start_failed" }); } });
+    const readStringFailure = makeCli({ start: () => { throw startFailure(); } });
     const readStringBase = readStringFailure.cli.runJson;
     readStringFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? Promise.reject("read failed") : readStringBase(argv, signal, preserve));
     await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), readStringFailure.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
@@ -214,18 +240,27 @@ describe("herdr_launch profile-only contract", () => {
     });
     await expect(createLaunchTool({ cli: abortHarness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) } }).execute("id", { name: "worker", profile: "worker" }, aborted.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
 
-    const exhausted = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "none" }, { pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "none" }], start: () => { throw Object.assign(new Error("process exited before becoming interactive"), { code: "agent_start_failed" }); } });
+    const exhausted = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" }, { pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" }], start: () => { throw startFailure(); } });
     await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), exhausted.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_start_failed", attempts: expect.arrayContaining([expect.objectContaining({ profile: "fallback" })]) } });
 
     const focused = makeCli();
     const focusedBase = focused.cli.runJson;
-    focused.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent_status: "idle" } }) : focusedBase(argv, signal, preserve));
+    focused.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", terminal_id: "terminal-focused" } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "idle" } });
+      return focusedBase(argv, signal, preserve);
+    });
     await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focused.cli)).resolves.toMatchObject({ details: { paneId: "w1:p1" } });
     expect(focused.calls).toContainEqual(["agent", "focus", "w1:p1"]);
     for (const focusError of ["CLI_TIMEOUT", "READY_TIMEOUT"]) {
       const focusFailure = makeCli();
       const focusBase = focusFailure.cli.runJson;
-      focusFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "agent" && argv[1] === "focus" ? Promise.reject(Object.assign(new Error(focusError), { code: focusError })) : focusBase(argv, signal, preserve));
+      focusFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", terminal_id: "terminal-focus-failure" } });
+        if (argv[0] === "agent" && argv[1] === "focus") throw Object.assign(new Error(focusError), { code: focusError });
+        if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "idle" } });
+        return focusBase(argv, signal, preserve);
+      });
       await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focusFailure.cli)).rejects.toMatchObject({ code: "READY_TIMEOUT" });
     }
 
@@ -255,10 +290,10 @@ describe("herdr_launch profile-only contract", () => {
     const stringFailure = makeCli({ start: () => { throw "string failure"; } });
     await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), stringFailure.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
 
-    const nestedEvidence = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "none" }] });
+    const nestedEvidence = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" }] });
     const nestedBase = nestedEvidence.cli.runJson;
     nestedEvidence.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-      if (argv[0] === "agent" && argv[1] === "start") throw Object.assign(new Error("outer"), { code: "CLI_PROTOCOL_ERROR", details: { error: { code: "agent_start_failed", message: "process exited before becoming interactive" } } });
+      if (argv[0] === "agent" && argv[1] === "start") throw startFailure();
       return nestedBase(argv, signal, preserve);
     });
     await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), nestedEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
@@ -282,8 +317,20 @@ describe("herdr_launch profile-only contract", () => {
     const calls: string[][] = [];
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/custom.md" })) };
     const result = await launch({ name: "worker", profile: "custom-profile", overrides: { model: "override/model", thinking: "high" } }, catalog(worker), makeCli({ calls }).cli, promptSources);
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "1800000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read", "--no-session", "--append-system-prompt", "/cache/custom.md"]);
-    expect(result.details).toMatchObject({ profile: { name: "custom-profile", requested: "custom-profile", selected: "custom-profile", source: { path: "/profiles/custom-profile.md" }, timeoutMinutes: 30, runtime: { kind: "pi", model: "test/model", thinking: "low" }, permissions: { sessionPersistence: false }, attempts: [{ profile: "custom-profile", outcome: "selected" }] } });
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read", "--no-session", "--append-system-prompt", "/cache/custom.md"]);
+    expect(result.details).toMatchObject({ profile: { name: "custom-profile", requested: "custom-profile", selected: "custom-profile", source: { path: "/profiles/custom-profile.md" }, timeoutMinutes: 30, runtime: { kind: "pi", model: "override/model", thinking: "high" }, permissions: { sessionPersistence: false, tools: ["read"], extensions: [], skills: [] }, attempts: [{ profile: "custom-profile", outcome: "selected" }] } });
+  });
+
+  it("reports normalized primary capability overrides instead of profile defaults", async () => {
+    const base = profile("resource-profile");
+    const resourceProfile = {
+      ...base,
+      runtime: { kind: "pi" as const, model: "test/model", thinking: "low" as const, tools: ["read"], extensions: ["/profiles/base-extension"], skills: ["/profiles/base-skill"] }
+    };
+    const calls: string[][] = [];
+    const result = await launch({ name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "grep"], extensions: ["./override-extension"], skills: ["./override-skill"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,grep", "--extension", "/profiles/override-extension", "--skill", "/profiles/override-skill", "--no-session", "--append-system-prompt", "/cache/body.md"]);
+    expect(result.details).toMatchObject({ profile: { runtime: { model: "override/model", thinking: "high" }, permissions: { tools: ["read", "grep"], extensions: ["/profiles/override-extension"], skills: ["/profiles/override-skill"] } } });
   });
 
   it("stops before mutation when the catalog is unavailable and preserves abort evidence", async () => {
@@ -324,11 +371,11 @@ describe("herdr_launch profile-only contract", () => {
     const first = profile("primary", "pi", ["fallback"]);
     const second = profile("fallback", "claude");
     const calls: string[][] = [];
-    const result = await launch({ name: "worker", profile: "primary", overrides: { model: "override/model", thinking: "high" } }, catalog(first, second), makeCli({ calls, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "none" }] , start: (argv, attempt) => {
-      if (attempt === 0) throw Object.assign(new Error("process exited before becoming interactive"), { code: "agent_start_failed" });
-      return ok("start", { agent: { name: "worker", agent_id: "agent-fallback" } });
+    const result = await launch({ name: "worker", profile: "primary", overrides: { model: "override/model", thinking: "high" } }, catalog(first, second), makeCli({ calls, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }] , start: (argv, attempt) => {
+      if (attempt === 0) throw startFailure();
+      return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback" } });
     }}).cli);
-    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "claude")).toEqual(["agent", "start", "worker", "--kind", "claude", "--pane", "w1:p2", "--timeout", "1800000", "--", "--model", "claude/test", "--effort", "medium", "--permission-mode", "dontAsk", "--allowed-tools", "Read", "--disallowed-tools", "Edit", "--append-system-prompt-file", "/cache/body.md"]);
+    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "claude")).toEqual(["agent", "start", "worker", "--kind", "claude", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "claude/test", "--effort", "medium", "--permission-mode", "dontAsk", "--allowed-tools", "Read", "--disallowed-tools", "Edit", "--append-system-prompt-file", "/cache/body.md"]);
     expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
     expect(result.details).toMatchObject({ kind: "claude", profile: { requested: "primary", selected: "fallback", attempts: [{ profile: "primary", outcome: "agent_start_failed", errorCode: "agent_start_failed" }, { profile: "fallback", outcome: "selected" }] } });
   });
@@ -336,13 +383,25 @@ describe("herdr_launch profile-only contract", () => {
   it("refuses fallback for mismatched errors, uncertain post-state, or an occupied pane", async () => {
     const primary = profile("primary", "pi", ["fallback"]);
     const fallback = profile("fallback", "pi");
-    const mismatched = makeCli({ start: () => { throw Object.assign(new Error("process exited before becoming interactive"), { code: "agent_start_failed" }); }, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_id: "still-running", agent_status: "working" }] });
+    const mismatched = makeCli({ start: () => { throw startFailure(); }, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_session: { source: "pi", agent: "pi", kind: "managed", value: "session" }, agent_status: "working" }] });
     await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), mismatched.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_start_failed" } });
     expect(mismatched.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
 
     const wrongMessage = makeCli({ start: () => { throw Object.assign(new Error("other failure"), { code: "agent_start_failed" }); } });
     await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), wrongMessage.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
     expect(wrongMessage.calls.some((call) => call[0] === "pane" && call[1] === "get")).toBe(false);
+    const malformedEnvelope = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "failure", { exitCode: 1, killed: false, stderrTruncated: false, stderr: "{" }); } });
+    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), malformedEnvelope.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+
+    for (const errorEnvelope of [
+      { id: "cli:agent:other", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } },
+      { id: "cli:agent:start", error: { code: "agent_start_transport_failed", message: "agent process exited before becoming interactive" } },
+      { id: "cli:agent:start", error: { code: "agent_start_failed", message: "process exited before becoming interactive" } }
+    ]) {
+      const invalid = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "failure", { exitCode: 1, killed: false, stderrTruncated: false, stderr: JSON.stringify(errorEnvelope) }); } });
+      await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), invalid.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      expect(invalid.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    }
   });
 
   it("preserves all placement modes without exposing raw environment launch", async () => {
@@ -354,8 +413,8 @@ describe("herdr_launch profile-only contract", () => {
     const existing = { ...snapshot, panes: [{ ...snapshot.panes[0], label: "target" }] };
     const existingCli: LaunchCli = { runJson: vi.fn(async (argv) => {
       if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: existing });
-      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker" } });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent_status: "idle" } });
+      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", terminal_id: "terminal-existing" } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "idle" } });
       throw new Error(`unexpected ${argv.join(" ")}`);
     }) };
     await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "target" } }, catalog(worker), existingCli)).resolves.toMatchObject({ details: { paneId: "w1:p1" } });

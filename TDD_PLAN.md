@@ -124,12 +124,12 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Reviewer input is bounded and delta-based | `reviewer_receives_bounded_metadata_and_transcript_delta`; `reviewer_delta_excludes_prior_transcript`; `reviewer_input_contains_no_tools_or_actions` | Only the specified bounded current metadata and new transcript delta are passed. | Full scrollback, unrelated panes, tool definitions, UI handles, and action methods are absent. |
 | Reviewer terminal findings end a wait | `reviewer_stalled_ends_wait_early`; `reviewer_blocked_ends_wait_early`; `reviewer_risk_ends_wait_early`; `reviewer_unknown_ends_wait_early`; `reviewer_failure_ends_wait_early` | Wait ends with the finding/failure and latest snapshots. | No further poll, prompt, pane, focus, or automatic remediation follows. |
 | Reviewer healthy result continues normally | `healthy_reviewer_does_not_fake_completion` | Ordinary polling continues until match or timeout. | A healthy review is not returned as a target match and does not create a pane. |
-| Launch accepts known kind and argv | `launch_accepts_each_known_agent_kind`; `launch_rejects_unknown_kind_before_mutation`; `launch_passes_argv_as_separate_tokens` | Known kind starts in the selected Herdr pane. | Unknown kind, shell reinterpretation, or argv concatenation cannot execute. |
+| Launch is profile-only | `launch_rejects_raw_kind_argv_and_env_schema`; `launch_accepts_arbitrary_valid_named_profile`; `launch_validates_agent_and_profile_name_patterns` | A valid named Pi/Claude profile starts in the selected Herdr pane. | Raw kind, argv, and env launch fields cannot bypass the profile contract. |
 | Launch requires a unique name | `launch_requires_nonempty_name`; `launch_rejects_duplicate_exact_name_before_creation`; `launch_rejects_ambiguous_name_before_creation` | A unique named launch is allowed. | Duplicate/ambiguous names do not create a tab, pane, process, or focus change. |
 | Launch defaults label/name and placement safely | `launch_defaults_label_to_name`; `launch_defaults_right_no_focus_and_current_cwd` | Defaults are included in creation argv. | Default launch never focuses, changes cwd, or selects a different direction. |
 | Launch supports tab/pane placement | `launch_can_create_new_tab`; `launch_can_use_existing_exact_pane`; `launch_rejects_conflicting_tab_and_pane_targets` | Only the requested returned tab/pane receives the agent. | No inferred tab/pane, focused-pane fallback, or unrelated resource mutation occurs. |
 | Launch prompts only after readiness and verifies working | `launch_optional_prompt_waits_for_ready_then_verifies_working`; `launch_prompt_does_not_wait_for_completion` | Prompt is sent to the returned pane after readiness; post-read observes working. | Prompt is not sent early and launch does not wait for done/idle completion. |
-| Launch accepts arbitrary environment overrides | `launch_passes_arbitrary_env_overrides_unchanged`; `launch_env_overrides_do_not_mutate_process_env` | Each provided key/value reaches Herdr. | No allowlist rejection, environment global mutation, or shell interpolation occurs. |
+| Launch fallback is bounded and schema-real | `launch_requires_real_start_failure_envelope_for_fallback`; `launch_requires_unknown_status_and_empty_agent_fields_for_fallback`; `launch_correlates_returned_name_pane_and_agent_kind` | Only the real `cli:agent:start` failure envelope plus an `agent_status: unknown` no-agent pane proof permits fallback. | Timeouts, malformed envelopes, identity/kind mismatches, contradictory panes, and prompt failures never retry. |
 | Launch never auto-cleans resources | `launch_success_never_closes_resources`; `launch_partial_failure_preserves_created_resources`; `session_shutdown_does_not_auto_cleanup` | Created resources remain available for explicit user/admin handling. | No implicit close/delete on success, failure, cancellation, reload, or shutdown. |
 | Pane creation requires a label and safe defaults | `pane_create_requires_label`; `pane_create_defaults_right_and_no_focus`; `pane_create_honors_explicit_down_and_focus` | Labeled pane is created with requested direction/focus. | Missing label fails before CLI mutation; defaults never focus. |
 | Tab creation requires label and honors focus | `tab_create_requires_label`; `tab_create_defaults_no_focus`; `tab_create_honors_explicit_focus` | Labeled tab is created and post-read. | Missing label and omitted focus never mutate/focus. |
@@ -542,32 +542,33 @@ UI or implementation batch limit and verifies one request per target.
 
 ### `launch.test.ts` / `herdr_launch`
 
-- `launch_accepts_each_known_agent_kind`
-- `launch_rejects_unknown_kind_before_mutation`
-- `launch_requires_nonempty_name`
-- `launch_rejects_duplicate_exact_name_before_creation`
-- `launch_rejects_ambiguous_name_before_creation`
-- `launch_passes_argv_as_separate_tokens`
+- `launch_rejects_raw_kind_argv_and_env_schema`
+- `launch_accepts_arbitrary_valid_named_profile`
+- `launch_validates_agent_and_profile_name_patterns`
+- `launch_validates_typed_override_enums`
+- `launch_reports_effective_primary_overrides_and_normalized_paths`
+- `launch_uses_120_second_startup_timeout_with_cli_margin`
+- `launch_requires_real_start_failure_envelope_for_fallback`
+- `launch_requires_unknown_status_and_empty_agent_fields_for_fallback`
+- `launch_correlates_returned_name_pane_and_agent_kind`
+- `launch_applies_overrides_only_to_requested_primary`
 - `launch_defaults_label_to_name`
 - `launch_defaults_right_no_focus_and_current_cwd`
 - `launch_can_create_new_tab`
 - `launch_can_use_existing_exact_pane`
-- `launch_rejects_conflicting_tab_and_pane_targets`
 - `launch_uses_returned_pane_id_for_agent_start`
 - `launch_wraps_initial_prompt_as_assignment`
 - `launch_missing_caller_fails_before_mutation`
 - `launch_optional_prompt_waits_for_ready_then_verifies_working`
 - `launch_prompt_does_not_wait_for_completion`
-- `launch_accepts_arbitrary_env_overrides_unchanged`
-- `launch_env_overrides_do_not_mutate_process_env`
 - `launch_success_never_closes_resources`
 - `launch_partial_failure_preserves_created_resources`
 - `launch_cancellation_preserves_truthful_partial_state`
 
-Known kinds are the explicitly supported interactive agent kinds from the Herdr
-boundary (`pi`, `codex`, `claude`, `opencode`, and `omp`, subject to the installed
-CLI's authoritative help). The test must fail closed for any other kind; it must
-not turn an arbitrary string into a shell command.
+`herdr_launch` accepts only a validated named Pi/Claude profile and typed
+runtime overrides. Raw kind, argv, and env launch fields are rejected. Fallback
+uses the real `cli:agent:start` error envelope and a schema-real pane proof; it
+must never turn arbitrary strings into a shell command or retry an uncertain state.
 
 ### `pane.test.ts` / `herdr_pane`
 

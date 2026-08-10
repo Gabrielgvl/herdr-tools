@@ -28,6 +28,8 @@ export interface CliTextResult {
 }
 
 const MAX_EVIDENCE_BYTES = 50_000;
+export const HERDR_AGENT_START_TIMEOUT_MS = 120_000;
+export const HERDR_AGENT_START_EXEC_MARGIN_MS = 5_000;
 
 function bounded(value: string, limit = MAX_EVIDENCE_BYTES): { value: string; content: string; truncated: boolean } {
   const result = truncateTail(value, { maxBytes: limit, maxLines: 2_000 });
@@ -69,6 +71,15 @@ function parseEnvelope(stdout: string, evidenceLimit = MAX_EVIDENCE_BYTES): Json
   return { id: candidate.id, result: candidate.result };
 }
 
+function requestedAgentStartTimeout(argv: string[]): number {
+  const timeoutIndex = argv.indexOf("--timeout");
+  if (timeoutIndex >= 0) {
+    const value = Number(argv[timeoutIndex + 1]);
+    if (Number.isSafeInteger(value) && value > 0) return value;
+  }
+  return HERDR_AGENT_START_TIMEOUT_MS;
+}
+
 export class HerdrCli {
   constructor(
     private readonly exec: PiExec,
@@ -108,7 +119,9 @@ export class HerdrCli {
   private async runRaw(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<ExecResult> {
     if (signal.aborted) throw new CliProtocolError("ABORTED", "Operation aborted");
     try {
-      const timeout = argv[0] === "agent" && argv[1] === "start" ? Math.max(this.timeout, 120_000) : this.timeout;
+      const timeout = argv[0] === "agent" && argv[1] === "start"
+        ? Math.max(this.timeout, requestedAgentStartTimeout(argv) + HERDR_AGENT_START_EXEC_MARGIN_MS)
+        : this.timeout;
       const result = await this.exec("herdr", argv, { signal, timeout });
       if (signal.aborted && !preserveCompletedMutation) throw new CliProtocolError("ABORTED", "Operation aborted");
       return result;

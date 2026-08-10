@@ -235,41 +235,37 @@ All model-visible content, list summaries, completion notifications, and rendere
 
 ### `herdr_launch`
 
-**Purpose:** Launch a caller-named Herdr-supported agent in a pane, optionally deliver its first prompt, and return authoritative launch state.
+**Purpose:** Launch a named Pi or Claude agent from a strict profile, optionally deliver its first prompt, and return authoritative launch state. **No profile, no launch.**
 
 **Input:**
 
 ```text
 {
   name: string,                              // required, caller-chosen and unique
-  kind: SupportedHerdrAgentKind,             // required
-  argv?: string[],                           // optional agent arguments only
+  profile: string,                           // required named profile
+  overrides?: TypedProfileOverrides,         // optional typed overrides for the requested profile only
   placement?:
     { mode: "same_tab" }                    // default
     | { mode: "new_tab", tabLabel: string }
     | { mode: "existing_pane", target: TargetRef },
   label?: string,                            // pane label; default: name
   cwd?: string,                              // default: current Pi cwd
-  env?: EnvMap,                              // optional child environment overrides
   focus?: boolean,                           // default: false
   initialPrompt?: string                     // optional prompt after readiness
 }
 ```
 
-`SupportedHerdrAgentKind` is the set reported by the installed CLI. At the current CLI version it includes `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, and `maki`. The CLI remains authoritative; unsupported kinds fail closed.
+Raw `kind`, `argv`, and `env` launch fields are rejected. Profiles are resolved from the manager session cwd using bundled, user, then nearest-project discovery; arbitrary valid named profiles are allowed. Each profile pins exactly `pi` or `claude` and supplies typed runtime flags, prompt source, timeout, permissions, and an ordered fallback graph of at most three reachable profiles.
 
 Rules:
 
 - `name` is required and must be unique according to an authoritative agent listing. The extension never generates a name or silently renames a collision.
-- `argv` contains arguments for the selected agent kind only. There is no executable/path field and arbitrary executable strings are rejected. Arguments are passed after the CLI's argument delimiter.
-- Default placement splits the current pane to the right in the current tab, with no focus change, current Pi cwd, and a pane label equal to `name` unless `label` is supplied.
-- `new_tab` explicitly creates a labeled tab in the current workspace, with no focus by default. Any pane returned/created for the new tab is labeled before the agent is started.
-- `existing_pane` explicitly starts in the resolved existing pane and does not create a replacement pane.
-- `focus: true` is the only way this tool changes focus.
-- If `initialPrompt` is provided, the tool resolves the caller sender from the pre-mutation snapshot, wraps the payload in the mandatory v1 envelope with `kind: assignment`, waits only for the new agent to be ready, sends the wrapped prompt, and briefly verifies `working`; it does not wait for completion.
-- Progress is streamed for placement, agent start, readiness, and prompt verification.
-- A failed launch is never automatically cleaned up. Any pane or tab already created remains visible and is returned in failure details for manual handling.
-- Launch returns the authoritative agent name, agent ID if supplied by Herdr, pane ID, tab ID, placement, and post-state. IDs are always read from Herdr responses.
+- Default placement splits the current pane to the right in the current tab, with no focus change, current Pi cwd, and a pane label equal to `name` unless `label` is supplied. `new_tab` and `existing_pane` retain their existing explicit semantics.
+- Profile body sources are created before topology mutation. Initial prompts are sent only after the selected agent starts, wrapped in the mandatory v1 assignment envelope, and verified as `working`.
+- Overrides apply only to the requested primary profile. Every fallback uses its own untouched defaults, including runtime, model, source, timeout, and permissions.
+- Automatic fallback is permitted only for the exact machine-typed Herdr error `agent_start_failed` with message `process exited before becoming interactive`, followed by an authoritative pane read proving that no agent remains. Timeout, malformed/protocol, identity/kind, prompt, and uncertain-state failures stop without fallback.
+- Fallback attempts reuse the resolved pane; the ordered reachable profile chain is deterministic and capped at three. An exhausted chain stops and reports bounded attempt evidence; no profile is improvised.
+- Launch details report requested and selected profiles, effective runtime/model/source/timeout/permissions, bounded attempt evidence, authoritative IDs/post-state, and any visible provenance. Failed launches retain created resources and never auto-clean them.
 
 ### `herdr_pane`
 

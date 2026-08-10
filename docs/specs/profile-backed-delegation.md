@@ -22,8 +22,9 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Relative runtime-resource paths resolve from the profile scope root. Arbitrary environment overrides are not supported by profile delegation.
 - Profile bodies are stored as durable owner-only prompt sources before topology mutation. The source is a UTF-8 exact-body SHA-256 content-addressed file under the Herdr-tools cache directory (`0700` directory, `0600` file), reused across launches and restarts; successful sources are never deleted.
 - Typed call overrides may replace typed defaults, including capability-expanding Claude permission modes. Project profiles have no trust gate. These are deliberate trust choices.
-- Fallbacks are ordered references to named profiles, validated as a graph. A logical run has at most three attempts. Invalid profiles are isolated; only the selected reachable graph blocks launch.
-- Fallback targets use their own defaults. The logical cwd, task, placement, and provenance carry across attempts.
+- Fallbacks are ordered references to named profiles, validated as a graph. A launch has at most three attempts. Invalid profiles are isolated; only the selected reachable graph blocks launch.
+- Automatic fallback is allowed only after the exact machine-typed Herdr `agent_start_failed` error with message `process exited before becoming interactive` and an authoritative post-read proving the pane has no agent. Timeout, malformed/protocol, identity/kind, prompt, and uncertain-state failures stop.
+- Fallback targets use their own untouched defaults. Typed overrides apply only to the requested primary. The logical cwd, task, placement, and provenance carry across attempts.
 - Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager` has only a Pi profile using `openai-codex/gpt-5.6-sol` with high thinking and no fallback. The other roles have Pi and Claude variants with the existing direction/model policy:
   - scout: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - researcher: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
@@ -45,9 +46,17 @@ Deliver now:
 - typed Pi and Claude argv adapters;
 - profile-backed launch through the existing launch implementation while preserving mandatory assignment provenance;
 - starter bundled profiles, shared role plugins/skills, explicit Pi/Claude capability matrices, and unit tests;
-- no automatic fallback yet: return the validated ordered fallback names as launch evidence.
+- bounded automatic fallback for the exact pre-interactive process-exit error and authoritative no-agent proof; all other failures stop and return bounded attempt evidence.
 
 This slice must not pretend terminal transcript scraping is a structured result.
+
+### Locked profile-only launch contract
+
+`herdr_launch` has one public mode: `{name, profile, overrides?, placement?, label?, cwd?, focus?, initialPrompt?}`. Raw `kind`, `argv`, and `env` fields are rejected. Profile discovery remains rooted at the manager session cwd and accepts arbitrary valid named profiles.
+
+The advisory role defaults are: manager-pi for management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-pi for research, and reviewer-pi for review. These defaults do not restrict arbitrary valid profile selection. Primary-only typed overrides never leak into fallback profiles.
+
+Launch details include requested and selected profile names, effective runtime/model/source/timeout/permissions, and bounded per-attempt evidence. Fallback uses the deterministic reachable order, up to three attempts, and only the exact `agent_start_failed` / `process exited before becoming interactive` error followed by a pane read proving no agent remains. Every timeout, protocol, identity/kind, prompt, or uncertain-state failure stops without fallback. Exhaustion stops and reports; it never invents another profile.
 
 ### Slice 2: Herdr runtime prerequisites
 

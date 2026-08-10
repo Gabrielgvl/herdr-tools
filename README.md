@@ -38,7 +38,7 @@ herdr_communicate({"target":"worker-id","operation":"prompt","text":"Continue th
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000})
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000,"runInBackground":true})
 herdr_jobs({"operation":"list","status":"running"})
-herdr_launch({"name":"reviewer","kind":"pi","initialPrompt":"Inspect the current changes"})
+herdr_launch({"name":"reviewer","profile":"reviewer-pi","initialPrompt":"Inspect the current changes"})
 herdr_pane({"operation":"split","label":"worker","direction":"right"})
 herdr_tab({"operation":"create","label":"review"})
 ```
@@ -64,7 +64,7 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `index.ts` gates registration, builds the `pi.exec` CLI adapter, shares runtime ownership, and clears only in-memory ownership on session shutdown and session start.
 - `src/cli.ts` bounds and validates CLI responses.
 - `src/targets.ts` resolves exact targets and injected current context.
-- `src/tools/` contains the seven public tools.
+- `src/tools/` contains the seven public tools. Profile discovery and typed Pi/Claude adapters live under `src/profiles/`; `herdr_launch` is strict profile-only: no profile, no launch.
 - `src/reviewer.ts` contains the tool-less in-process model reviewer used by long waits.
 - `src/tui.ts` uses Pi `Text` components with bounded semantic rows.
 

@@ -16,6 +16,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 - The manager orchestrates only. It may inspect evidence, launch workers, communicate, wait, arrange or clean up owned panes, and synthesize results. It must not edit or implement.
 - Use role-scoped tool allowlists while retaining installed extension discovery.
 - Configure role-specific skills.
+- Advisory defaults are manager-pi for management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-pi for research, and reviewer-pi for review. Planner order is intentional and must not be inverted.
 
 ## Assumptions
 

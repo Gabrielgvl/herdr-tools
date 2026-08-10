@@ -129,8 +129,12 @@ describe("herdr_launch profile-only contract", () => {
       expect(harness.calls.some((call) => call[0] === "pane" && call[1] === "get")).toBe(false);
     }
 
-    const noTerminalId = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), noTerminalId.cli)).resolves.toMatchObject({ details: { name: "worker" } });
+    const terminalOnly = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-worker" } }) });
+    const terminalOnlyResult = await launch({ name: "worker", profile: "worker" }, catalog(worker), terminalOnly.cli);
+    expect(terminalOnlyResult.details).toMatchObject({ name: "worker" });
+    expect(terminalOnlyResult.details).not.toHaveProperty("agentId");
+    const explicitAgentId = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", agent_id: "agent-worker", terminal_id: "terminal-worker" } }) });
+    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), explicitAgentId.cli)).resolves.toMatchObject({ details: { agentId: "agent-worker" } });
 
     const paneVariants = [{ pane: { pane_id: "w1:p2", tab_id: "w1:t1" } }, { root_pane: { pane_id: "w1:p2", tab_id: "w1:t1" } }, { new_pane: { pane_id: "w1:p2" } }, { child_pane: { pane_id: "w1:p2" } }, { created_pane: { pane_id: "w1:p2" } }, { pane_id: "w1:p2", tab_id: "w1:t1" }];
     for (const placement of paneVariants) {

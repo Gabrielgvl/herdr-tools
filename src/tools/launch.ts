@@ -158,7 +158,7 @@ function agentIdentity(value: unknown, expectedName: string, expectedPaneId: str
   const name = stringFrom(agent, "name");
   const paneId = stringFrom(agent, "pane_id");
   const kind = stringFrom(agent, "agent");
-  const agentId = idFrom(agent, "terminal_id") ?? idFrom(agent, "agent_id") ?? idFrom(agent, "id");
+  const agentId = idFrom(agent, "agent_id") ?? idFrom(agent, "id");
   if (!name || !paneId || !kind) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr agent-start response omitted authoritative name, pane, or kind");
   if (name !== expectedName || paneId !== expectedPaneId || kind !== expectedKind) {
     throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr agent-start response does not match the requested identity", { expectedName, actualName: name, expectedPaneId, actualPaneId: paneId, expectedKind, actualKind: kind });

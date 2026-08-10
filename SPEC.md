@@ -176,7 +176,7 @@ Rules:
 
 ### `herdr_wait`
 
-**Purpose:** Wait for one or many exact agent/pane targets to satisfy a state or output condition.
+**Purpose:** The MCP `herdr_wait` tool waits for one or many exact agent/pane targets to satisfy a state or output condition. It is distinct from the CLI `herdr agent wait` readiness command; output conditions use authoritative pane reads, not a CLI `herdr wait` command.
 
 **Input:**
 
@@ -404,10 +404,10 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 
 - `HERDR_ENV_REQUIRED`: extension operation attempted without the required Herdr environment. Normally unreachable because tools are not registered when disabled.
 - `CONTEXT_UNAVAILABLE`: required injected ID or current context is absent.
-- `CLI_NOT_FOUND`: installed `herdr` executable is unavailable.
-- `BACKEND_UNAVAILABLE`: CLI cannot reach the Herdr server/socket.
-- `CLI_PROTOCOL_ERROR`: malformed or contradictory CLI output.
-- `CLIENT_SERVER_INCOMPATIBLE`: health detects incompatible client/server versions or schemas.
+- `CLI_NOT_FOUND`: installed `herdr` executable is unavailable outside a compatibility preflight.
+- `BACKEND_UNAVAILABLE`: CLI cannot reach the Herdr server/socket, including a failed compatibility preflight.
+- `CLI_INCOMPATIBLE`: compatibility health is malformed or reports incompatible client/server versions; mutations stop before dispatch.
+- `CLI_PROTOCOL_ERROR`: malformed or contradictory CLI output after compatibility preflight.
 - `INVALID_INPUT`: schema or cross-field validation failure.
 - `INVALID_SETTINGS`: invalid extension-owned setting.
 - `TARGET_NOT_FOUND`: no exact target match.

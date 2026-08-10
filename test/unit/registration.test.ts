@@ -4,7 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const readFileMock = vi.hoisted(() => vi.fn());
 vi.mock("node:fs/promises", () => ({ readFile: readFileMock }));
 
-import extension, { CORE_TOOL_NAMES, createRuntime, notificationForJob, readInjectedContext } from "../../index.js";
+import extension, { CORE_TOOL_NAMES, createPreflight, createRuntime, notificationForJob, readInjectedContext } from "../../index.js";
+import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
 
 const original = {
@@ -100,6 +101,12 @@ describe("global extension registration", () => {
     await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "low" });
   });
 
+  it("creates a compatibility preflight for the registered CLI", async () => {
+    const exec = vi.fn<PiExec>().mockResolvedValue({ stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "0.8.0", protocol: 19, compatible: true } }), stderr: "", code: 0, killed: false });
+    await expect(createPreflight(new HerdrCli(exec))(new AbortController().signal)).resolves.toBeUndefined();
+    expect(exec).toHaveBeenCalledWith("herdr", ["status", "--json"], expect.anything());
+  });
+
   it("pushes bounded terminal notifications with queue and priority semantics", async () => {
     const detail = {
       jobId: "job_notify",
@@ -114,7 +121,8 @@ describe("global extension registration", () => {
     const notification = notificationForJob(detail);
     expect(notification.content).toContain("HIGH PRIORITY: MANAGER JUDGMENT REQUIRED");
     expect(notification.content).not.toContain("review\nsummary");
-    expect(notification.details).toMatchObject({ priority: "high", jobId: "job_notify", matchedTargets: [] });
+    expect(notification.details).toMatchObject({ action: "wait", priority: "high", jobId: "job_notify", matchedTargets: [] });
+    expect(notification.content).toContain("target lifecycle unchanged");
     const successAny = notificationForJob({
       ...detail,
       outcome: "success",
@@ -129,7 +137,7 @@ describe("global extension registration", () => {
     });
     expect(successAny.content).toContain("matchedTargets=second (p2)");
     expect(successAny.content).not.toContain("matchedTargets=first");
-    expect(successAny.details).toMatchObject({ matchedTargets: ["p2"], matchedTargetCount: 1 });
+    expect(successAny.details).toMatchObject({ action: "wait", matchedTargets: ["p2"], matchedTargetCount: 1 });
     const successBeyondEvidence = notificationForJob({
       ...detail,
       outcome: "success",

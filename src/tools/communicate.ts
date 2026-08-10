@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli, JsonEnvelope } from "../cli.js";
+import type { CompatibilityPreflight } from "../health.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext } from "../targets.js";
@@ -29,6 +30,7 @@ export interface CommunicateDetails {
 export interface CommunicateDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  preflight: CompatibilityPreflight;
 }
 
 const VALID_STATES = new Set<CommunicateState>(["idle", "working", "blocked", "done", "unknown"]);
@@ -99,6 +101,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         throw Object.assign(new Error("Unsupported named key"), { code: "KEY_REJECTED" });
       }
 
+      await deps.preflight(activeSignal);
       const snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], activeSignal);
       const snapshot = parseSnapshotResult(snapshotEnvelope.result);
       const sender = params.operation === "keys" ? undefined : resolveSender(snapshot, deps.context.paneId);

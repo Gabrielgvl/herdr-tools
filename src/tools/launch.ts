@@ -5,8 +5,8 @@ import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
-import { isLaunchAgentKind, LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
-import { buildProfileArgv, defaultPromptSourceStore, resolveProfile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
+import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
+import { buildProfileArgv, defaultPromptSourceStore, resolveProfile, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -32,6 +32,26 @@ export interface LaunchResourceIds {
   agentId?: string;
 }
 
+export interface LaunchAttemptEvidence {
+  profile: string;
+  outcome: "selected" | "agent_start_failed" | "fallback_refused";
+  errorCode?: string;
+  message?: string;
+  postState?: Record<string, unknown>;
+}
+
+export interface LaunchEffectiveProfile {
+  requested: string;
+  selected: string;
+  source: { kind: string; path: string };
+  timeoutMinutes: number;
+  runtime: Record<string, unknown>;
+  permissions: Record<string, unknown>;
+  attempts: LaunchAttemptEvidence[];
+  fallbackProfiles: string[];
+  reachableNames: string[];
+}
+
 export interface LaunchDetails extends LaunchResourceIds {
   operation: "launch";
   outcome: "launched" | "partial";
@@ -45,7 +65,7 @@ export interface LaunchDetails extends LaunchResourceIds {
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
   envelope?: { version: "v1"; kind: "assignment" };
-  profile?: { name: string; source: { kind: string; path: string }; timeoutMinutes: number; sessionPersistence: boolean; fallbackProfiles: string[]; reachableNames: string[] };
+  profile?: LaunchEffectiveProfile & { name: string; sessionPersistence: boolean };
 }
 
 class LaunchError extends Error {
@@ -70,12 +90,10 @@ function validateParams(params: LaunchRequest): void {
   if (typeof params.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
     throw new LaunchError("INVALID_INPUT", "name must start with a lowercase letter and contain only lowercase letters, digits, - or _ (1-32 characters)");
   }
-  const profileMode = params.profile !== undefined;
-  if (profileMode) identifier(params.profile, "profile");
-  if (profileMode === (params.kind !== undefined)) throw new LaunchError("INVALID_INPUT", "launch requires exactly one of kind or profile");
-  if (!profileMode && !isLaunchAgentKind(params.kind)) throw new LaunchError("INVALID_INPUT", `Unsupported Herdr agent kind: ${String(params.kind)}`);
-  if (profileMode && (params.argv !== undefined || params.env !== undefined)) throw new LaunchError("INVALID_INPUT", "profile launches do not accept raw argv or environment overrides");
-  if (profileMode && params.overrides !== undefined) {
+  const allowedKeys = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "initialPrompt"]);
+  for (const key of Object.keys(params)) if (!allowedKeys.has(key)) throw new LaunchError("INVALID_INPUT", `Unknown launch field: ${key}`);
+  identifier(params.profile, "profile");
+  if (params.overrides !== undefined) {
     if (!record(params.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
     for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort", "tools", "extensions", "skills", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
     if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
@@ -84,24 +102,12 @@ function validateParams(params: LaunchRequest): void {
       if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0 || /[\0\r\n]/.test(item)))) throw new LaunchError("INVALID_INPUT", `overrides.${key} must be non-empty strings without NUL or newlines`);
     }
   }
-  if (!profileMode && params.overrides !== undefined) throw new LaunchError("INVALID_INPUT", "overrides are only valid for profile launches");
-  if (params.argv !== undefined && (!Array.isArray(params.argv) || params.argv.some((arg) => typeof arg !== "string" || /\0/.test(arg)))) {
-    throw new LaunchError("INVALID_INPUT", "argv must contain only strings representable by the CLI transport");
-  }
   if (params.label !== undefined) identifier(params.label, "label");
   if (params.cwd !== undefined) identifier(params.cwd, "cwd");
   if (params.initialPrompt !== undefined && (typeof params.initialPrompt !== "string" || params.initialPrompt.length === 0 || /\0/.test(params.initialPrompt))) {
     throw new LaunchError("INVALID_INPUT", "initialPrompt must be a non-empty string without NUL");
   }
   if (params.focus !== undefined && typeof params.focus !== "boolean") throw new LaunchError("INVALID_INPUT", "focus must be a boolean");
-  if (params.env !== undefined) {
-    if (!record(params.env)) throw new LaunchError("INVALID_INPUT", "env must be a string map");
-    for (const [key, value] of Object.entries(params.env)) {
-      identifier(key, "environment variable name");
-      if (key.includes("=")) throw new LaunchError("INVALID_INPUT", "environment variable names must not contain =");
-      if (typeof value !== "string" || /\0/.test(value)) throw new LaunchError("INVALID_INPUT", "environment values must be strings without NUL");
-    }
-  }
   const placement = params.placement;
   if (placement === undefined) return;
   if (!record(placement) || typeof placement.mode !== "string") throw new LaunchError("INVALID_INPUT", "placement is invalid");
@@ -173,6 +179,50 @@ function stateFrom(pane: Record<string, unknown>): string {
   return typeof pane.agent_status === "string" ? pane.agent_status : "unknown";
 }
 
+function noAgentFromPane(pane: Record<string, unknown>): boolean {
+  return ["agent_id", "agent_name", "agent"].every((field) => pane[field] === undefined || pane[field] === null || pane[field] === "");
+}
+
+function compactAttemptState(pane: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(["pane_id", "tab_id", "workspace_id", "agent_id", "agent_name", "agent_status", "status"].flatMap((field): Array<[string, unknown]> => {
+    const value = pane[field];
+    if (value === undefined) return [];
+    if (typeof value === "string") return [[field, value.slice(0, 256)]];
+    if (typeof value === "number" || typeof value === "boolean" || value === null) return [[field, value]];
+    return [];
+  }));
+}
+
+function startFailureEvidence(error: unknown): { code: string; message: string } | undefined {
+  const candidates: unknown[] = [error];
+  if (record(error) && record(error.details)) {
+    candidates.push(error.details, error.details.error);
+    if (typeof error.details.stderr === "string") {
+      try { candidates.push(JSON.parse(error.details.stderr.trim())); } catch { /* malformed evidence is not eligible */ }
+    }
+  }
+  for (const candidate of candidates) {
+    if (!record(candidate)) continue;
+    const nested = record(candidate.error) ? candidate.error : candidate;
+    if (record(nested) && nested.code === "agent_start_failed" && nested.message === "process exited before becoming interactive") {
+      return { code: nested.code, message: nested.message };
+    }
+  }
+  return undefined;
+}
+
+function effectiveRuntime(profile: Profile): Record<string, unknown> {
+  return profile.runtime.kind === "pi"
+    ? { kind: "pi", model: profile.runtime.model, thinking: profile.runtime.thinking }
+    : { kind: "claude", model: profile.runtime.model, effort: profile.runtime.effort };
+}
+
+function effectivePermissions(profile: Profile): Record<string, unknown> {
+  return profile.runtime.kind === "pi"
+    ? { sessionPersistence: profile.sessionPersistence, tools: [...profile.runtime.tools], extensions: [...profile.runtime.extensions], skills: [...profile.runtime.skills] }
+    : { sessionPersistence: profile.sessionPersistence, permissionMode: profile.runtime.permissionMode, allowedTools: [...profile.runtime.allowedTools], disallowedTools: [...profile.runtime.disallowedTools], addDirs: [...profile.runtime.addDirs], pluginDirs: [...profile.runtime.pluginDirs] };
+}
+
 function snapshotOf(result: unknown): HerdrSnapshot {
   return parseSnapshotResult(result);
 }
@@ -188,11 +238,6 @@ function existingAgentNames(snapshot: HerdrSnapshot): string[] {
 
 function paneForPlacement(snapshot: HerdrSnapshot, target: string, context: CurrentContext): ResolvedTarget {
   return resolveTarget(snapshot, target, "pane", context);
-}
-
-function envArgs(env: Record<string, string> | undefined): string[] {
-  if (!env) return [];
-  return Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
 }
 
 function focusArgs(focus: boolean): string[] {
@@ -216,7 +261,10 @@ function isPromptStalled(error: unknown): boolean {
 }
 
 function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"]): LaunchError {
-  const causeCode = error instanceof LaunchError ? error.code : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
+  const causeCode = error instanceof LaunchError && typeof error.details.causeCode === "string"
+    ? error.details.causeCode
+    : error instanceof LaunchError ? error.code
+      : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
   const message = error instanceof Error ? error.message : String(error);
   const code = causeCode === "ABORTED" ? "ABORTED" : causeCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : causeCode === "READY_TIMEOUT" || (causeCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
   return new LaunchError(code, `Launch did not complete: ${message}`, {
@@ -249,7 +297,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
   return {
     name: "herdr_launch",
     label: "Herdr Launch",
-    description: "Launch a supported Herdr agent in an explicitly selected pane placement.",
+    description: "Launch a named Pi or Claude Herdr agent from a strict profile in an explicitly selected pane placement.",
     parameters: LaunchParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, ctx) {
       const params = rawParams as unknown as LaunchRequest;
@@ -260,27 +308,26 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       identifier(cwd, "cwd");
       const placement = params.placement ?? { mode: "same_tab" as const };
       const label = params.label ?? params.name;
-      let profileResolution: ProfileResolution | undefined;
-      let profileArgv: string[] | undefined;
-      if (params.profile !== undefined) {
-        if (!deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
-        profileResolution = resolveProfile(params.profile, await deps.profiles.load());
-        buildProfileArgv(profileResolution.profile, params.overrides);
+      if (!deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
+      const catalog = await deps.profiles.load();
+      const profileResolution: ProfileResolution = resolveProfile(params.profile, catalog);
+      const profiles = profileResolution.reachableNames.map((name) => {
+        const profile = catalog.effective.get(name);
+        if (!profile) throw new LaunchError("PROFILE_RESOLUTION_INVALID", `Resolved profile ${name} is unavailable`);
+        return profile;
+      });
+      const promptStore = deps.promptSources ?? defaultPromptSourceStore;
+      const promptPaths = new Map<string, string>();
+      for (const profile of profiles) {
+        const promptSource = await promptStore.create(profile.body);
+        promptPaths.set(profile.name, promptSource.path);
+        buildProfileArgv(profile, profile.name === params.profile ? params.overrides : {}, promptSource.path);
       }
-      const effectiveKind = profileResolution?.profile.runtime.kind ?? params.kind!;
-      const effectiveArgv = profileResolution ? undefined : params.argv;
-      const promptSource = profileResolution
-        ? await (deps.promptSources ?? defaultPromptSourceStore).create(profileResolution.profile.body)
-        : undefined;
-      if (profileResolution) profileArgv = buildProfileArgv(profileResolution.profile, params.overrides, promptSource!.path);
       const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
       const sender = params.initialPrompt !== undefined ? resolveSender(snapshot, deps.context.paneId) : undefined;
       assertCurrentContext(snapshot, deps.context);
       if (existingAgentNames(snapshot).filter((name) => name === params.name).length > 0) {
         throw new LaunchError("INVALID_INPUT", `Agent name is already in use: ${params.name}`);
-      }
-      if (placement.mode === "existing_pane" && params.env !== undefined) {
-        throw new LaunchError("INVALID_INPUT", "Environment overrides are supported only when Herdr creates the child pane or tab");
       }
       const existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, deps.context) : undefined;
       const workspaceId = placement.mode === "new_tab" ? deps.context.workspaceId! : undefined;
@@ -288,13 +335,14 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let tabId: string | undefined;
       let phase: LaunchDetails["phase"] = "placement";
       const created: LaunchResourceIds = {};
+      const attempts: LaunchAttemptEvidence[] = [];
       try {
         progress(onUpdate, phase, created);
         if (placement.mode === "existing_pane") {
           paneId = existingTarget!.paneId!;
           tabId = existingTarget!.tabId;
         } else if (placement.mode === "new_tab") {
-          const result = tabRefFrom(await run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...focusArgs(params.focus === true), ...envArgs(params.env)], abortSignal, true));
+          const result = tabRefFrom(await run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...focusArgs(params.focus === true)], abortSignal, true));
           tabId = result.tabId;
           paneId = result.paneId;
           created.tabId = tabId;
@@ -306,7 +354,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           created.paneId = paneId;
           deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
         } else {
-          const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...focusArgs(params.focus === true), "--cwd", cwd, ...envArgs(params.env)], abortSignal, true));
+          const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...focusArgs(params.focus === true), "--cwd", cwd], abortSignal, true));
           paneId = result.paneId;
           tabId = result.tabId ?? deps.context.tabId!;
           created.paneId = paneId;
@@ -314,25 +362,42 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId! });
         }
         const resolvedPaneId = paneId!;
-        if (placement.mode !== "existing_pane") {
-          await run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal);
-        }
+        if (placement.mode !== "existing_pane") await run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal);
         phase = "agent_start";
         progress(onUpdate, phase, created);
         let started: unknown;
-        if (profileResolution) {
-          started = await run(deps.cli, ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000", "--", ...profileArgv!], abortSignal, true);
-        } else {
-          const startArgs = ["agent", "start", params.name, "--kind", effectiveKind, "--pane", resolvedPaneId, "--timeout", "120000"];
-          if (effectiveArgv !== undefined && effectiveArgv.length > 0) startArgs.push("--", ...effectiveArgv);
-          started = await run(deps.cli, startArgs, abortSignal, true);
+        let selectedProfile: Profile | undefined;
+        let startedAgent: { name?: string; agentId?: string } | undefined;
+        for (const profile of profiles) {
+          const startArgs = ["agent", "start", params.name, "--kind", profile.runtime.kind, "--pane", resolvedPaneId, "--timeout", String(profile.timeoutMinutes * 60_000), "--", ...buildProfileArgv(profile, profile.name === params.profile ? params.overrides : {}, promptPaths.get(profile.name))];
+          try {
+            started = await run(deps.cli, startArgs, abortSignal, true);
+            startedAgent = agentIdentity(started);
+            selectedProfile = profile;
+            attempts.push({ profile: profile.name, outcome: "selected" });
+            break;
+          } catch (error) {
+            const eligible = startFailureEvidence(error);
+            if (!eligible) throw error;
+            let failedPane: Record<string, unknown>;
+            try {
+              failedPane = paneRecord(await run(deps.cli, ["pane", "get", resolvedPaneId], abortSignal), resolvedPaneId);
+            } catch (readError) {
+              throw new LaunchError("POSTSTATE_UNAVAILABLE", "Fallback eligibility could not be proven from authoritative pane state", { causeCode: eligible.code, readError: readError instanceof Error ? readError.message : String(readError), attempts });
+            }
+            const evidence: LaunchAttemptEvidence = { profile: profile.name, outcome: "agent_start_failed", errorCode: eligible.code, message: eligible.message, postState: compactAttemptState(failedPane) };
+            attempts.push(evidence);
+            if (!noAgentFromPane(failedPane)) {
+              throw new LaunchError("LAUNCH_FAILED", "Automatic fallback refused because the failed pane still has an agent", { causeCode: eligible.code, attempts });
+            }
+            if (profile === profiles.at(-1)) throw new LaunchError("LAUNCH_FAILED", "Profile fallback chain exhausted after agent start failure", { causeCode: eligible.code, attempts });
+          }
         }
-        const startedAgent = agentIdentity(started);
-        let agentId = startedAgent.agentId;
-        const returnedName = startedAgent.name;
-        if (agentId) {
-          created.agentId = agentId;
-        }
+        const chosenProfile = selectedProfile!;
+        const chosenAgent = startedAgent!;
+        let agentId = chosenAgent.agentId;
+        const returnedName = chosenAgent.name;
+        if (agentId) created.agentId = agentId;
         phase = "ready";
         progress(onUpdate, phase, created);
         if (placement.mode === "existing_pane" && params.focus === true) await run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal);
@@ -351,36 +416,29 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           progress(onUpdate, phase, created);
         }
         const postState = paneRecord(await run(deps.cli, ["pane", "get", resolvedPaneId], abortSignal), resolvedPaneId);
-        if (params.initialPrompt !== undefined && stateFrom(postState) !== "working") {
-          throw new LaunchError("POSTSTATE_UNAVAILABLE", "Initial prompt did not produce a verified working state");
-        }
+        if (params.initialPrompt !== undefined && stateFrom(postState) !== "working") throw new LaunchError("POSTSTATE_UNAVAILABLE", "Initial prompt did not produce a verified working state");
         agentId ??= idFrom(postState, "agent_id");
         const authoritativeName = returnedName ?? stringFrom(postState, "agent_name") ?? stringFrom(postState, "name");
         if (!authoritativeName) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr launch post-state omitted authoritative agent name");
         const details: LaunchDetails = {
-          operation: "launch",
-          outcome: "launched",
-          name: authoritativeName,
-          kind: effectiveKind,
-          placement,
-          tabId,
-          paneId: resolvedPaneId,
-          ...(agentId ? { agentId } : {}),
-          postState,
-          initialPromptSent,
-          ...(sender ? {
-            sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
-            envelope: { version: "v1" as const, kind: "assignment" as const }
-          } : {}),
-          ...(profileResolution ? { profile: { name: profileResolution.profile.name, source: { kind: profileResolution.profile.source.kind, path: profileResolution.profile.source.path }, timeoutMinutes: profileResolution.profile.timeoutMinutes, sessionPersistence: profileResolution.profile.sessionPersistence, fallbackProfiles: [...profileResolution.fallbackProfiles], reachableNames: [...profileResolution.reachableNames] } } : {})
+          operation: "launch", outcome: "launched", name: authoritativeName, kind: chosenProfile.runtime.kind, placement, tabId, paneId: resolvedPaneId,
+          ...(agentId ? { agentId } : {}), postState, initialPromptSent,
+          ...(sender ? { sender: { paneId: sender.paneId, display: sender.display, source: sender.source }, envelope: { version: "v1" as const, kind: "assignment" as const } } : {}),
+          profile: {
+            name: chosenProfile.name, requested: params.profile, selected: chosenProfile.name,
+            source: { kind: chosenProfile.source.kind, path: chosenProfile.source.path }, timeoutMinutes: chosenProfile.timeoutMinutes,
+            runtime: effectiveRuntime(chosenProfile), permissions: effectivePermissions(chosenProfile), attempts,
+            fallbackProfiles: [...profileResolution.fallbackProfiles], reachableNames: [...profileResolution.reachableNames], sessionPersistence: chosenProfile.sessionPersistence
+          }
         };
         return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId }) }], details };
       } catch (error) {
+        if (error instanceof LaunchError && attempts.length > 0 && error.details.attempts === undefined) error.details.attempts = attempts;
         throw partialError(error, created, phase);
       }
     },
     renderCall(args, theme) {
-      return textComponent(formatCall("herdr_launch", "kind" in args ? args.kind : "profile", args.name), theme, "accent");
+      return textComponent(formatCall("herdr_launch", args.profile, args.name), theme, "accent");
     },
     renderResult(result, options, theme) {
       return renderResultComponent("launch", result, options, theme, result.details?.paneId);

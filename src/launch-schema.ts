@@ -3,14 +3,6 @@ import { Type, type Static } from "typebox";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type ThinkingLevel } from "./profiles/types.js";
 
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
-const AgentArgument = Type.String({ pattern: "^[^\\u0000]*$" });
-const EnvValue = Type.String({ pattern: "^[^\\u0000]*$" });
-
-export const LAUNCH_AGENT_KINDS = [
-  "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode", "opencode",
-  "copilot", "kimi", "kiro", "droid", "amp", "grok", "hermes", "kilo", "qodercli", "maki"
-] as const;
-export type LaunchAgentKind = (typeof LAUNCH_AGENT_KINDS)[number];
 
 export const LaunchPlacementSchema = Type.Union([
   Type.Object({ mode: Type.Literal("same_tab") }, { additionalProperties: false }),
@@ -43,20 +35,13 @@ const LaunchCommonProperties = {
   initialPrompt: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" }))
 };
 
-const RawLaunchParamsSchema = Type.Object({
-  ...LaunchCommonProperties,
-  kind: StringEnum(LAUNCH_AGENT_KINDS),
-  argv: Type.Optional(Type.Array(AgentArgument)),
-  env: Type.Optional(Type.Record(Identifier, EnvValue))
-}, { additionalProperties: false });
-
 const ProfileLaunchParamsSchema = Type.Object({
   ...LaunchCommonProperties,
   profile: Identifier,
   overrides: Type.Optional(ProfileLaunchOverridesSchema)
 }, { additionalProperties: false });
 
-export const LaunchParamsSchema = Type.Union([RawLaunchParamsSchema, ProfileLaunchParamsSchema]);
+export const LaunchParamsSchema = ProfileLaunchParamsSchema;
 
 export type LaunchPlacement =
   | { mode: "same_tab" }
@@ -81,18 +66,11 @@ export type LaunchParams = Static<typeof LaunchParamsSchema>;
 
 export interface LaunchRequest {
   name: string;
-  kind?: LaunchAgentKind;
-  profile?: string;
-  argv?: string[];
+  profile: string;
   overrides?: ProfileLaunchOverrides;
   placement?: LaunchPlacement;
   label?: string;
   cwd?: string;
-  env?: Record<string, string>;
   focus?: boolean;
   initialPrompt?: string;
-}
-
-export function isLaunchAgentKind(value: unknown): value is LaunchAgentKind {
-  return typeof value === "string" && (LAUNCH_AGENT_KINDS as readonly string[]).includes(value);
 }

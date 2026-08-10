@@ -289,7 +289,7 @@ describe("profile catalog", () => {
       { name: "worker", profile: "worker", overrides: null }, { name: "worker", profile: "worker", overrides: { unknown: "x" } },
       { name: "worker", profile: "worker", overrides: { model: "" } }, { name: "worker", profile: "worker", overrides: { tools: ["bad\nvalue"] } }, { name: "worker", kind: "pi", overrides: {} }
     ];
-    for (const value of invalid) expect(() => validateLaunchParams(value as never)).toThrow();
+    for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams(value as never), `invalid case ${index}`).toThrow();
     expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { thinking: "low", tools: ["read"], extensions: ["./ext"], skills: ["./skill"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."], pluginDirs: ["./plugin"] } } as never)).not.toThrow();
   });
 
@@ -310,7 +310,7 @@ describe("profile catalog", () => {
     } } as unknown as HerdrCli;
     const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
     expect(promptSources.create).toHaveBeenCalledWith("\nBody for worker.\n");
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "1800000", "--", "--model", "test/model", "--thinking", "low", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
     expect(result.details).toMatchObject({ profile: { name: "worker", fallbackProfiles: [], timeoutMinutes: 30 }, kind: "pi" });
     const defaultCreate = vi.spyOn(defaultPromptSourceStore, "create").mockResolvedValue({ path: "/tmp/default-profile.md" });
     try {
@@ -533,7 +533,7 @@ describe("profile catalog", () => {
     const launchTool = createLaunchTool({ cli: noCli as never, context: {}, profiles: undefined });
     await expect(launchTool.execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
     const rendered = launchTool.renderCall?.({ name: "worker", profile: "worker" } as never, {} as never, {} as never);
-    expect(rendered?.render(80)).toEqual(["herdr_launch · profile · worker"]);
+    expect(rendered?.render(80)).toEqual(["herdr_launch · worker · worker"]);
     rendered?.invalidate();
   });
 

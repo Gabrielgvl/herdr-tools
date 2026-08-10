@@ -417,7 +417,7 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
   return {
     name: "herdr_wait",
     label: "Herdr Wait",
-    description: "Wait for exact Herdr targets to satisfy an authoritative state or output condition.",
+    description: "MCP wait for exact Herdr agent targets to satisfy an authoritative state or pane-output condition; distinct from the CLI agent wait readiness command.",
     parameters: WaitParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, context) {
       const activeSignal = signal ?? new AbortController().signal;

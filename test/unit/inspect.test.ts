@@ -164,7 +164,7 @@ describe("herdr_inspect", () => {
       if (stdout.includes('"compatible":false')) {
         await expect(execute(new HerdrCli(exec), { mode: "health" })).resolves.toMatchObject({ details: { socketReachable: false, compatible: false } });
       } else {
-        await expect(execute(new HerdrCli(exec), { mode: "health" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+        await expect(execute(new HerdrCli(exec), { mode: "health" })).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
       }
     }
   });

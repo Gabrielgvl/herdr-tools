@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
+import { parseHealth } from "../health.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
 import { assertCurrentContext, parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
@@ -361,16 +362,6 @@ function fitProfileCollection(value: Record<string, unknown>, totalCount: number
 
 function modelVisibleContent(value: Record<string, unknown>): string {
   return JSON.stringify(fitInspectionValue(value, MAX_PROFILE_CONTENT_BYTES)) as string;
-}
-
-function parseHealth(text: string): Pick<InspectDetails, "client" | "server" | "socketReachable" | "compatible"> {
-  let parsed: unknown;
-  try { parsed = JSON.parse(text); } catch { throw Object.assign(new Error("Health output is incompatible"), { code: "CLI_PROTOCOL_ERROR" }); }
-  if (typeof parsed !== "object" || parsed === null || typeof (parsed as { client?: unknown }).client !== "object" || (parsed as { client?: unknown }).client === null || typeof (parsed as { server?: unknown }).server !== "object" || (parsed as { server?: unknown }).server === null) throw Object.assign(new Error("Health output is incompatible"), { code: "CLI_PROTOCOL_ERROR" });
-  const client = (parsed as Record<string, unknown>).client as Record<string, unknown>;
-  const server = (parsed as Record<string, unknown>).server as Record<string, unknown>;
-  if (typeof client.version !== "string" || typeof client.protocol !== "number" || typeof server.status !== "string" || typeof server.version !== "string" || typeof server.protocol !== "number" || typeof server.compatible !== "boolean") throw Object.assign(new Error("Health output is incompatible"), { code: "CLI_PROTOCOL_ERROR" });
-  return { client: { version: client.version, protocol: client.protocol }, server: { status: server.status, version: server.version, protocol: server.protocol }, socketReachable: server.status === "running", compatible: server.compatible };
 }
 
 export function createInspectTool(deps: InspectDependencies): ToolDefinition<typeof InspectParamsSchema, InspectDetails> {

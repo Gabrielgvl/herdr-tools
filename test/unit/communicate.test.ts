@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
-import { compactPane, createCommunicateTool, paneFrom } from "../../src/tools/communicate.js";
+import { compactPane, createCommunicateTool as createCommunicateToolImplementation, paneFrom, type CommunicateDependencies } from "../../src/tools/communicate.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
@@ -15,6 +15,9 @@ const baseSnapshot: HerdrSnapshot = {
   panes: [callerPane, basePane],
   agents: [{ pane_id: "w1:p1", agent_id: "agent-caller", name: "caller", agent_status: "idle" }, { pane_id: "w1:p2", agent_id: "agent-7", name: "reviewer", agent_status: "idle" }]
 };
+const testPreflight = async () => undefined;
+const createCommunicateTool = (deps: Omit<CommunicateDependencies, "preflight"> & Partial<Pick<CommunicateDependencies, "preflight">>) => createCommunicateToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
+
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
 const senderEnvelope = (kind: "prompt" | "steer", payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: ${kind}\nauthority: agent; not user/owner\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const extensionContext = { signal: undefined, hasUI: false } as unknown as ExtensionContext;

@@ -1,5 +1,6 @@
 import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { JsonEnvelope } from "../cli.js";
+import type { CompatibilityPreflight } from "../health.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
@@ -18,6 +19,7 @@ export interface LaunchResourceRegistry {
 export interface LaunchDependencies {
   cli: LaunchCli;
   context: CurrentContext;
+  preflight: CompatibilityPreflight;
   cwd?: string;
   ownership?: LaunchResourceRegistry;
   profiles?: { load: () => Promise<ProfileCatalog> };
@@ -237,6 +239,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       const params = rawParams as unknown as LaunchRequest;
       validateParams(params);
       const abortSignal = signal!;
+      await deps.preflight(abortSignal);
       const cwd = params.cwd ?? deps.cwd ?? ctx.cwd;
       identifier(cwd, "cwd");
       const placement = params.placement ?? { mode: "same_tab" as const };

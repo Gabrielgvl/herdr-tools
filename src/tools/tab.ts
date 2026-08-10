@@ -1,5 +1,6 @@
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
+import type { CompatibilityPreflight } from "../health.js";
 import { runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { tabCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
@@ -23,6 +24,7 @@ export interface TabDetails {
 export interface TabDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  preflight: CompatibilityPreflight;
   cwd?: string;
   ownership?: RuntimeOwnership;
 }
@@ -176,6 +178,7 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
       const params = rawParams as unknown as TabParams;
       if (params.operation === "create") {
+        await deps.preflight(activeSignal);
         assertSafeIdentifier(params.label, "label");
         assertSafeEnvironment(params.env);
         const current = await snapshot(deps.cli, activeSignal);
@@ -196,6 +199,7 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
         ledger.record({ kind: "pane", id: authoritative.rootPaneId, parentId: authoritative.tab.tab_id });
         return tabResult({ operation: "create", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, rootPaneId: authoritative.rootPaneId, postState: withoutEnvironment(postState) }, "create", postState.tab_id);
       }
+      await deps.preflight(activeSignal);
       const current = await snapshot(deps.cli, activeSignal);
       const target = tabTarget(current, params.target, deps.context);
       if (params.operation === "rename") {

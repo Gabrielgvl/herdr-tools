@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
 import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
-import { createLaunchTool, validateLaunchParams } from "../../src/tools/launch.js";
+import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, type LaunchDependencies } from "../../src/tools/launch.js";
 import { createRuntime } from "../../index.js";
 import type { HerdrCli } from "../../src/cli.js";
 
@@ -16,6 +16,9 @@ function profileText(name: string, runtime = "pi", extra = "", fallbackProfiles 
   const sessionPersistence = runtime === "claude" ? "true" : "false";
   return `---\nname: ${name}\ndescription: Test ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${sessionPersistence}\nruntime:\n${block}\nfallbackProfiles: ${fallbackProfiles}\n${extra}---\n\nBody for ${name}.\n`;
 }
+
+const testPreflight = async () => undefined;
+const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight"> & Partial<Pick<LaunchDependencies, "preflight">>) => createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
 
 const noCli = { runJson: async () => { throw new Error("CLI must not be called"); }, runText: async () => { throw new Error("CLI must not be called"); } } as unknown as HerdrCli;
 

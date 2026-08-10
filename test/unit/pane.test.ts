@@ -2,8 +2,11 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { resetOwnership, runtimeOwnership } from "../../src/ownership.js";
-import { createPaneTool } from "../../src/tools/pane.js";
+import { createPaneTool as createPaneToolImplementation, type PaneDependencies } from "../../src/tools/pane.js";
 import type { HerdrSnapshot, PaneRecord } from "../../src/targets.js";
+
+const testPreflight = async () => undefined;
+const createPaneTool = (deps: Omit<PaneDependencies, "preflight"> & Partial<Pick<PaneDependencies, "preflight">>) => createPaneToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
 
 const context = { workspaceId: "w1", tabId: "t1", paneId: "p1" };
 const basePane = (id: string, tabId = "t1", label = id): PaneRecord => ({ pane_id: id, tab_id: tabId, workspace_id: "w1", label, agent_status: "idle" });

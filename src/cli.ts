@@ -3,7 +3,7 @@ import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
 
 export type PiExec = (command: string, args: string[], options: ExecOptions) => Promise<ExecResult>;
 
-export type CliFailureCode = "ABORTED" | "CLI_NOT_FOUND" | "BACKEND_UNAVAILABLE" | "CLI_PROTOCOL_ERROR" | "CLI_TIMEOUT";
+export type CliFailureCode = "ABORTED" | "CLI_NOT_FOUND" | "BACKEND_UNAVAILABLE" | "CLI_INCOMPATIBLE" | "CLI_PROTOCOL_ERROR" | "CLI_TIMEOUT";
 
 export class CliProtocolError extends Error {
   readonly code: CliFailureCode;

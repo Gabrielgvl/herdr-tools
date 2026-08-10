@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HerdrCli } from "./src/cli.js";
+import { preflightCompatibility } from "./src/health.js";
 import { createCommunicateTool } from "./src/tools/communicate.js";
 import { createInspectTool } from "./src/tools/inspect.js";
 import { createJobsTool } from "./src/tools/jobs.js";
@@ -80,6 +81,10 @@ function safeNotificationPart(value: unknown, limit = 500): string {
   return boundedText(safe, limit);
 }
 
+export function createPreflight(cli: HerdrCli): (signal: AbortSignal) => Promise<void> {
+  return (signal) => preflightCompatibility(cli, signal).then(() => undefined);
+}
+
 export function notificationForJob(detail: JobDetail): { content: string; details: Record<string, unknown> } {
   const manager = detail.outcome === "manager_judgment_required";
   const success = detail.status === "completed" && detail.outcome === "success";
@@ -94,13 +99,14 @@ export function notificationForJob(detail: JobDetail): { content: string; detail
   const reviewer = detail.result?.reviewerSummaries?.map((summary) => `${safeNotificationPart(summary.targetId)}: ${safeNotificationPart(summary.summary)}`).join("; ");
   const error = detail.error ? `${safeNotificationPart(detail.error.code ?? "error")}: ${safeNotificationPart(detail.error.message)}` : undefined;
   const prefix = manager ? "HIGH PRIORITY: MANAGER JUDGMENT REQUIRED\n" : "";
-  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} finished: outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)}, matchedTargets=${safeNotificationPart(matchedTargets || "none", 2_000)}${matchedSuffix}, requestedTargets=${safeNotificationPart(requestedTargets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
+  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} reported: action=wait, outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)} (wait condition only; target lifecycle unchanged), matchedTargets=${safeNotificationPart(matchedTargets || "none", 2_000)}${matchedSuffix}, requestedTargets=${safeNotificationPart(requestedTargets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
   const requestedIds = detail.request.targetIds.slice(0, 16).map((targetId) => safeNotificationPart(targetId, 256));
   const requestedOmitted = Math.max(detail.truncation?.requestTargetIds ?? 0, detail.request.targetIds.length - requestedIds.length);
   return {
     content: boundedText(content, 8_000),
     details: {
       jobId: safeNotificationPart(detail.jobId, 256),
+      action: "wait",
       outcome: status,
       reason: safeNotificationPart(reason),
       targets: matchedRefs.slice(0, 16).map((target) => safeNotificationPart(target.targetId, 256)),
@@ -158,8 +164,9 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     resetOwnership(runtime.ownership);
   });
 
+  const preflight = createPreflight(runtime.cli);
   pi.registerTool(createInspectTool({ cli: runtime.cli, context: runtime.context, environment, profiles: runtime.profiles }));
-  pi.registerTool(createCommunicateTool({ cli: runtime.cli, context: runtime.context }));
+  pi.registerTool(createCommunicateTool({ cli: runtime.cli, context: runtime.context, preflight }));
   pi.registerTool(createWaitTool({
     cli: runtime.cli,
     context: runtime.context,
@@ -173,17 +180,20 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     cwd: process.cwd(),
     ownership: runtime.ownership,
     profiles: runtime.profiles,
+    preflight,
   }));
   pi.registerTool(createPaneTool({
     cli: runtime.cli,
     context: runtime.context,
     cwd: process.cwd(),
     ownership: runtime.ownership,
+    preflight,
   }));
   pi.registerTool(createTabTool({
     cli: runtime.cli,
     context: runtime.context,
     cwd: process.cwd(),
     ownership: runtime.ownership,
+    preflight,
   }));
 }

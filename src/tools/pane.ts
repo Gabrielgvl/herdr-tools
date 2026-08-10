@@ -1,5 +1,6 @@
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
+import type { CompatibilityPreflight } from "../health.js";
 import { recordCreatedResource, runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { paneCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
@@ -24,6 +25,7 @@ export interface PaneDetails {
 export interface PaneDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  preflight: CompatibilityPreflight;
   cwd?: string;
   ownership?: RuntimeOwnership;
 }
@@ -200,6 +202,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
       const params = rawParams as unknown as PaneParams;
       if (params.operation === "split") {
+        await deps.preflight(activeSignal);
         assertSafeIdentifier(params.label, "label");
         assertSafeEnvironment(params.env);
         const snapshot = await readSnapshot(deps.cli, activeSignal);
@@ -217,6 +220,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         return result({ operation: "split", outcome: "success", paneId, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "split", paneId);
       }
       if (params.operation === "move") {
+        await deps.preflight(activeSignal);
         const snapshot = await readSnapshot(deps.cli, activeSignal);
         const source = stateTarget(snapshot, params.target, deps.context);
         const destination = params.destination;
@@ -242,6 +246,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
       }
       if (params.operation === "rename") {
         assertSafeIdentifier(params.label, "label");
+        await deps.preflight(activeSignal);
         const snapshot = await readSnapshot(deps.cli, activeSignal);
         const target = stateTarget(snapshot, params.target, deps.context);
         await deps.cli.runJson(["pane", "rename", target.id, params.label], activeSignal);
@@ -249,6 +254,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         return result({ operation: "rename", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "rename", postState.pane_id);
       }
       if (params.operation === "focus") {
+        await deps.preflight(activeSignal);
         const snapshot = await readSnapshot(deps.cli, activeSignal);
         const target = stateTarget(snapshot, params.target, deps.context);
         await focusExactPane(deps.cli, target, activeSignal);
@@ -257,6 +263,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
       }
       if (params.operation === "resize") {
         if (typeof params.amount !== "number" || !Number.isFinite(params.amount) || params.amount <= 0) throw Object.assign(new Error("resize amount must be finite and positive"), { code: "INVALID_INPUT" });
+        await deps.preflight(activeSignal);
         const snapshot = await readSnapshot(deps.cli, activeSignal);
         const target = stateTarget(snapshot, params.target, deps.context);
         await deps.cli.runJson(["pane", "resize", "--direction", params.direction, "--amount", String(params.amount), "--pane", target.id], activeSignal);
@@ -264,6 +271,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         return result({ operation: "resize", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "resize", postState.pane_id);
       }
       if (params.operation === "swap") {
+        await deps.preflight(activeSignal);
         const snapshot = await readSnapshot(deps.cli, activeSignal);
         const source = stateTarget(snapshot, params.source, deps.context);
         const withTarget = params.with;
@@ -273,6 +281,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         return result({ operation: "swap", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "swap", postState.pane_id);
       }
       if (params.operation === "zoom") {
+        await deps.preflight(activeSignal);
         const snapshot = await readSnapshot(deps.cli, activeSignal);
         const target = stateTarget(snapshot, params.target, deps.context);
         const mode = params.mode ?? "toggle";
@@ -280,6 +289,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         const postState = await readPane(deps.cli, target.id, activeSignal);
         return result({ operation: "zoom", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "zoom", postState.pane_id);
       }
+      await deps.preflight(activeSignal);
       const details = await closePane(deps, params, activeSignal);
       return { content: [{ type: "text", text: formatResult({ operation: "pane", outcome: details.outcome, targetId: details.paneId }) }], details };
     },

@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
-import { createLaunchTool, validateLaunchParams, type LaunchCli } from "../../src/tools/launch.js";
+import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, type LaunchCli, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LAUNCH_AGENT_KINDS, LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
+
+const testPreflight = async () => undefined;
+const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight"> & Partial<Pick<LaunchDependencies, "preflight">>) => createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
 
 const snapshot: HerdrSnapshot = {
   version: "0.8.0",

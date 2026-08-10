@@ -2,8 +2,11 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { resetOwnership, runtimeOwnership } from "../../src/ownership.js";
-import { createTabTool } from "../../src/tools/tab.js";
+import { createTabTool as createTabToolImplementation, type TabDependencies } from "../../src/tools/tab.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
+
+const testPreflight = async () => undefined;
+const createTabTool = (deps: Omit<TabDependencies, "preflight"> & Partial<Pick<TabDependencies, "preflight">>) => createTabToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
 
 const context = { workspaceId: "w1", tabId: "t1", paneId: "p1" };
 

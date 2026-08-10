@@ -199,11 +199,11 @@ describe("herdr_launch profile-only contract", () => {
     const readFailure = makeCli({ start: () => { throw Object.assign(new Error("process exited before becoming interactive"), { code: "agent_start_failed" }); } });
     const readBase = readFailure.cli.runJson;
     readFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? Promise.reject(new Error("read failed")) : readBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), readFailure.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_start_failed" } });
+    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), readFailure.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE", details: { causeCode: "POSTSTATE_UNAVAILABLE", startFailureCode: "agent_start_failed" } });
     const readStringFailure = makeCli({ start: () => { throw Object.assign(new Error("process exited before becoming interactive"), { code: "agent_start_failed" }); } });
     const readStringBase = readStringFailure.cli.runJson;
     readStringFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? Promise.reject("read failed") : readStringBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), readStringFailure.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), readStringFailure.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
 
     const aborted = new AbortController();
     const abortHarness = makeCli();

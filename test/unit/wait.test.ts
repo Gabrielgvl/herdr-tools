@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { ReviewerFailure, type WaitReviewer } from "../../src/reviewer.js";
-import { WaitError, boundedBackgroundDetails, createWaitTool, deltaLines, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
+import { WaitError, boundedBackgroundDetails, createWaitTool, deltaLines, deriveWaitLabel, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
 import { JobRegistry } from "../../src/job-registry.js";
 
 const snapshot = {
@@ -277,20 +277,23 @@ describe("herdr_wait", () => {
     const defaultCall = tool.renderCall?.({} as never, {} as never, {} as never);
     expect(defaultCall?.render(80)).toEqual(["herdr_wait · wait"]);
     defaultCall?.invalidate();
+    const labeledCall = tool.renderCall?.({ targets: ["p1"], label: "release gate" } as never, {} as never, {} as never);
+    expect(labeledCall?.render(80)).toEqual(["herdr_wait · wait · release gate · p1"]);
+    labeledCall?.invalidate();
     const rendered = tool.renderResult?.({ content: [], details: result.details, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(rendered?.render(80)).toEqual(["wait"]);
+    expect(rendered?.render(80)).toEqual(['wait · one → contains "matched"']);
     rendered?.invalidate();
     const partialRendered = tool.renderResult?.({ content: [], details: { ...result.details, outcome: "progress", matched: false }, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(partialRendered?.render(80)).toEqual(["partial"]);
+    expect(partialRendered?.render(80)).toEqual(['partial · one → contains "matched"']);
     partialRendered?.invalidate();
     const emptyRendered = tool.renderResult?.({ content: [], isError: true } as never, {} as never, {} as never, {} as never);
     expect(emptyRendered?.render(80)).toEqual(["error UNKNOWN"]);
     emptyRendered?.invalidate();
     const timeoutRendered = tool.renderResult?.({ content: [], details: { ...result.details, outcome: "timeout", matched: false, reason: "timeout" }, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(timeoutRendered?.render(80)).toEqual(["timeout"]);
+    expect(timeoutRendered?.render(80)).toEqual(['timeout · one → contains "matched"']);
     timeoutRendered?.invalidate();
     const managerRendered = tool.renderResult?.({ content: [], details: { ...result.details, outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" }, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(managerRendered?.render(80)).toEqual(["error MANAGER_JUDGMENT_REQUIRED"]);
+    expect(managerRendered?.render(80)).toEqual(['error MANAGER_JUDGMENT_REQUIRED · one → contains "matched"']);
     managerRendered?.invalidate();
   });
 
@@ -460,6 +463,20 @@ describe("herdr_wait", () => {
     await expect(tool.execute("id", { targets: ["p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 } as never, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
   });
 
+  it("derives bounded effective labels from resolved targets and conditions", async () => {
+    const state = await prepareWait({ cli: fakeCli(), context, settingsLoader: async () => settings }, { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "completed" }, timeoutMs: 1 }, new AbortController().signal);
+    expect(state.label).toBe("one +1 → completed");
+    expect(deriveWaitLabel({ ...state.params, label: undefined, condition: { kind: "output", match: { kind: "literal", value: "done\nnow" } } }, state.resolved)).toBe('one +1 → contains "done now"');
+    expect(deriveWaitLabel({ ...state.params, label: undefined, condition: { kind: "output", match: { kind: "regex", value: "done.*" } } }, state.resolved)).toBe("one +1 → matches /done.*/");
+    expect(deriveWaitLabel({ ...state.params, label: "release gate" }, state.resolved)).toBe("release gate");
+    const paneLabelOnly = [{ ...state.resolved[0]!, target: { ...state.resolved[0]!.target, agentName: undefined, label: "pane one" } }];
+    expect(deriveWaitLabel({ ...state.params, label: undefined }, paneLabelOnly)).toBe("pane one → completed");
+    const refOnly = [{ ...state.resolved[0]!, target: { ...state.resolved[0]!.target, agentName: undefined, label: undefined } }];
+    expect(deriveWaitLabel({ ...state.params, label: undefined }, refOnly)).toBe("p1 → completed");
+    expect(() => deriveWaitLabel({ ...state.params, label: undefined }, [])).toThrowError(/resolved target/);
+    expect(deriveWaitLabel({ ...state.params, label: undefined, condition: { kind: "output", match: { kind: "literal", value: "x".repeat(1_000) } } }, state.resolved).length).toBeLessThanOrEqual(120);
+  });
+
   it("uses the default settings loader during direct preflight", async () => {
     const prepared = await prepareWait({ cli: fakeCli(), context }, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, new AbortController().signal);
     expect(prepared.params.targets).toEqual(["p1"]);
@@ -503,9 +520,9 @@ describe("herdr_wait", () => {
     const updates = vi.fn(() => { throw new Error("initiating update used"); });
     const tool = createWaitTool({ cli, context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
     const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 100, runInBackground: true } as never, initiating.signal, updates, extensionContext);
-    expect(started).toMatchObject({ content: [{ type: "text", text: "background wait started · job_background" }], details: { operation: "wait", outcome: "background", jobId: "job_background", targets: ["p1"], targetIds: ["p1"] } });
+    expect(started).toMatchObject({ content: [{ type: "text", text: "background wait started · one → contains \"done\" · job_background" }], details: { operation: "wait", outcome: "background", jobId: "job_background", label: "one → contains \"done\"", targets: ["p1"], targetIds: ["p1"] } });
     const backgroundRendered = tool.renderResult?.(started as never, { expanded: false, isPartial: false }, {} as never, {} as never);
-    expect(backgroundRendered?.render(80)).toEqual(["background · job_background"]);
+    expect(backgroundRendered?.render(80)).toEqual(["background · job_background · one → contains \"done\""]);
     backgroundRendered?.invalidate();
     initiating.abort();
     release();
@@ -543,13 +560,21 @@ describe("herdr_wait", () => {
     expect(registry.get("job_runner_failure")).toMatchObject({ status: "failed", error: { code: "CLI_PROTOCOL_ERROR" } });
   });
 
+  it("preserves a maximum-length multibyte label in background details", () => {
+    const label = "界".repeat(120);
+    const params = { targets: ["p1"], match: "any" as const, condition: { kind: "state" as const, state: "done" as const }, timeoutMs: 1 };
+    const details = boundedBackgroundDetails("job_unicode", label, params, ["p1"]);
+    expect(details.label).toBe(label);
+    expect(details.truncation.labelClipped).toBeUndefined();
+  });
+
   it("reports clipped and omitted values in a background acknowledgement", () => {
     const params = { targets: Array.from({ length: 17 }, (_, index) => `target-${index}-${"t".repeat(2_000)}`), match: "any" as const, condition: { kind: "state" as const, state: "done" as const }, timeoutMs: 1 };
     const targetIds = params.targets.map((_, index) => `pane-${index}-${"p".repeat(2_000)}`);
-    const details = boundedBackgroundDetails(`job_${"j".repeat(2_000)}`, params, targetIds);
+    const details = boundedBackgroundDetails(`job_${"j".repeat(2_000)}`, "label".repeat(100), params, targetIds);
     expect(details.targets).toHaveLength(16);
     expect(details.targetIds).toHaveLength(16);
-    expect(details.truncation).toMatchObject({ targets: 1, targetIds: 1, jobIdClipped: true, targetsClipped: 16, targetIdsClipped: 16 });
+    expect(details.truncation).toMatchObject({ targets: 1, targetIds: 1, jobIdClipped: true, labelClipped: true, targetsClipped: 16, targetIdsClipped: 16 });
     expect(JSON.stringify(details).length).toBeLessThan(50_000);
   });
 

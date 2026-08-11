@@ -8,7 +8,12 @@ describe("herdr_wait schema and runtime validation", () => {
     expect(Value.Check(WaitParamsSchema, { targets: ["w1:p1"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 3_600_000 })).toBe(true);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "done" } }, timeoutMs: 1, reviewerModel: "bad" })).toBe(false);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "bad" }, timeoutMs: 1 })).toBe(false);
-    expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true })).toBe(true);
+    expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, label: "review worker", runInBackground: true })).toBe(true);
+    expect(validateWaitParams({ targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, label: "review worker" }).params.label).toBe("review worker");
+    const emojiLabel = "😀".repeat(120);
+    const emojiInput = { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, label: emojiLabel };
+    expect(Value.Check(WaitParamsSchema, emojiInput)).toBe(true);
+    expect(validateWaitParams(emojiInput).params.label).toBe(emojiLabel);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, run_in_background: true })).toBe(false);
   });
 
@@ -39,6 +44,12 @@ describe("herdr_wait schema and runtime validation", () => {
       { ...valid, extra: true },
       { ...valid, run_in_background: true },
       { ...valid, runInBackground: "yes" },
+      { ...valid, label: "" },
+      { ...valid, label: "   " },
+      { ...valid, label: "bad\tlabel" },
+      { ...valid, label: "bad\nlabel" },
+      { ...valid, label: `bad${String.fromCharCode(127)}label` },
+      { ...valid, label: "x".repeat(121) },
       { ...valid, targets: [] },
       { ...valid, targets: ["\0"] },
       { ...valid, match: "sometimes" },

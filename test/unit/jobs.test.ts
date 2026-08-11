@@ -3,6 +3,7 @@ import { JobRegistry, type JobRequestSnapshot } from "../../src/job-registry.js"
 import { createJobsTool, boundedContent, detailContent } from "../../src/tools/jobs.js";
 
 const request: JobRequestSnapshot = {
+  label: "wait for worker",
   targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10,
   settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }
 };
@@ -19,9 +20,9 @@ describe("herdr_jobs", () => {
     const pending = new Promise<never>(() => undefined);
     const handle = jobs.register(request, async () => pending);
     const listed = await tool.execute("id", { operation: "list" } as never, new AbortController().signal, undefined, {} as never);
-    expect(listed.details).toMatchObject({ operation: "jobs", kind: "list", total: 1, jobs: [{ jobId: handle.jobId, status: "running" }] });
+    expect(listed.details).toMatchObject({ operation: "jobs", kind: "list", total: 1, jobs: [{ jobId: handle.jobId, label: "wait for worker", status: "running" }] });
     const got = await tool.execute("id", { operation: "get", jobId: handle.jobId } as never, undefined, undefined, {} as never);
-    expect(got.details).toMatchObject({ operation: "jobs", kind: "job", jobId: handle.jobId, status: "running" });
+    expect(got.details).toMatchObject({ operation: "jobs", kind: "job", jobId: handle.jobId, status: "running", request: { label: "wait for worker" } });
     const cancelled = await tool.execute("id", { operation: "cancel", jobId: handle.jobId } as never, undefined, undefined, {} as never);
     expect(cancelled.details).toMatchObject({ jobId: handle.jobId, status: "cancelled" });
     await expect(tool.execute("id", { operation: "get", jobId: "job_unknown" } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "JOB_NOT_FOUND" });

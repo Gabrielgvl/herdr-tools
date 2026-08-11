@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { boundedList, fitsPublic, JobRegistry, jobDetailContent, publicDetail, type JobDetail, type JobListResult, type JobRequestSnapshot, type JobRunResult } from "../../src/job-registry.js";
 
 const request: JobRequestSnapshot = {
+  label: "wait for one",
   targets: ["one"],
   targetIds: ["p1"],
   match: "any",
@@ -147,6 +148,16 @@ describe("JobRegistry", () => {
     truncatedRegistry.cancel(large.jobId);
   });
 
+  it("preserves valid maximum-length multibyte labels across job views", () => {
+    const label = "😀".repeat(120);
+    const registry = new JobRegistry({ idFactory: () => "job_unicode_label" });
+    const handle = registry.register({ ...request, label }, async () => new Promise<never>(() => undefined));
+    expect(registry.get(handle.jobId)?.request.label).toBe(label);
+    expect(registry.list().jobs[0]?.label).toBe(label);
+    expect(registry.runningOverview().jobs[0]?.label).toBe(label);
+    registry.cancel(handle.jobId);
+  });
+
   it("copies optional result fields and keeps small public details untruncated", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_optional" });
     const handle = registry.register(request, async () => ({
@@ -203,6 +214,7 @@ describe("JobRegistry", () => {
     const long = "\u0000\u0001\u000b\u001f".repeat(100_000);
     const handle = registry.register({
       ...request,
+      label: "label-" + "a".repeat(2_000),
       targets: ["request-" + "t".repeat(2_000)],
       targetIds: ["request-id-" + "i".repeat(2_000)],
       settings: { ...request.settings, reviewerModel: "model-" + "m".repeat(2_000) }
@@ -222,6 +234,7 @@ describe("JobRegistry", () => {
       truncation: {
         requestTargetsClipped: 1,
         requestTargetIdsClipped: 1,
+        requestLabelClipped: true,
         requestReviewerModelClipped: true,
         resultTargetValuesClipped: 1,
         resultTargetIdsClipped: 1,
@@ -231,6 +244,7 @@ describe("JobRegistry", () => {
       },
       result: { targets: [{ metadata: { truncated: true } }] }
     });
+    expect(registry.list().jobs[0]).toMatchObject({ truncation: { labelClipped: true } });
   });
 
   it("degrades oversized public detail and list projections without invalid JSON", () => {
@@ -318,6 +332,7 @@ describe("JobRegistry", () => {
 
     const jobs = Array.from({ length: 100 }, (_, index) => ({
       jobId: index === 0 ? "job_" + "z".repeat(1_000) : `job_${index}`,
+      label: index === 0 ? "label-" + "q".repeat(1_000) : `wait ${index}`,
       status: "running" as const,
       sequence: index,
       createdAtMs: index,
@@ -332,6 +347,7 @@ describe("JobRegistry", () => {
     const listed = boundedList({ jobs, total: 100, offset: 0, limit: 100, nextOffset: null, truncation: { jobs: 1, padding: "x".repeat(100_000) } as unknown as JobListResult["truncation"] });
     expect(listed.jobs).toHaveLength(100);
     expect(listed.truncation).toMatchObject({ jobs: 1, jobIdsClipped: 100 });
+    expect(listed.jobs[0]).toMatchObject({ truncation: { jobIdClipped: true, labelClipped: true } });
     expect(Buffer.byteLength(JSON.stringify(listed, null, 2), "utf8")).toBeLessThan(50_000);
 
     const largeJobs = jobs.map((job) => ({ ...job, targetIds: ["x".repeat(10_000)], targets: ["y".repeat(10_000)] }));
@@ -346,7 +362,15 @@ describe("JobRegistry", () => {
     longIdRegistry.cancel(longIdHandle.jobId);
   });
 
-  it("does not let notification failures escape", async () => {
+  it("does not let notification or change-listener failures escape", async () => {
+    const syncChange = new JobRegistry({ idFactory: () => "job_change_sync", onChange: () => { throw new Error("ui down"); } });
+    const syncChangeHandle = syncChange.register(request, async () => success);
+    await expect(syncChangeHandle.promise).resolves.toBeUndefined();
+    const asyncChange = new JobRegistry({ idFactory: () => "job_change_async", onChange: async () => { throw new Error("async ui down"); } });
+    const asyncChangeHandle = asyncChange.register(request, async () => success);
+    await expect(asyncChangeHandle.promise).resolves.toBeUndefined();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
     const registry = new JobRegistry({ idFactory: () => "job_notify", onTerminal: () => { throw new Error("ui down"); } });
     const handle = registry.register(request, async () => success);
     await expect(handle.promise).resolves.toBeUndefined();

@@ -5,6 +5,8 @@ import type { Static } from "typebox";
 
 export const WAIT_RAW_STATES = ["idle", "working", "blocked", "done", "unknown"] as const;
 export const WAIT_SEMANTIC_STATES = ["started", "completed", "needs_input"] as const;
+export const WAIT_LABEL_MAX_LENGTH = 120;
+export const WAIT_LABEL_MAX_BYTES = WAIT_LABEL_MAX_LENGTH * 4 + 2;
 
 /** A target selector is deliberately an opaque, single-line identifier. */
 export const WaitTargetSchema = Type.String({
@@ -33,6 +35,7 @@ export const WaitParamsSchema = Type.Object({
   match: StringEnum(["any", "all"] as const),
   condition: Type.Union([WaitStateConditionSchema, WaitOutputConditionSchema]),
   timeoutMs: Type.Integer({ minimum: 1, maximum: 3_600_000 }),
+  label: Type.Optional(Type.String({ minLength: 1, maxLength: WAIT_LABEL_MAX_LENGTH, pattern: "^[^\\u0000-\\u001f\\u007f]+$" })),
   runInBackground: Type.Optional(Type.Boolean())
 }, { additionalProperties: false });
 
@@ -67,8 +70,9 @@ export function validateWaitParams(value: unknown): WaitValidation {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalid("INVALID_INPUT: wait input must be an object");
   const params = value as Partial<WaitParams>;
   const topLevelKeys = Object.keys(value as object);
-  if (topLevelKeys.some((key) => !["targets", "match", "condition", "timeoutMs", "runInBackground"].includes(key))) invalid("INVALID_INPUT: unknown wait fields are not allowed");
+  if (topLevelKeys.some((key) => !["targets", "match", "condition", "timeoutMs", "label", "runInBackground"].includes(key))) invalid("INVALID_INPUT: unknown wait fields are not allowed");
   if (!Array.isArray(params.targets) || params.targets.length === 0) invalid("INVALID_INPUT: targets must contain at least one target");
+  if (params.label !== undefined && (typeof params.label !== "string" || params.label.trim().length === 0 || [...params.label].length > WAIT_LABEL_MAX_LENGTH || [...params.label].some((character) => { const code = character.charCodeAt(0); return code <= 31 || code === 127; }))) invalid(`INVALID_INPUT: label must be a non-empty printable single-line string of at most ${WAIT_LABEL_MAX_LENGTH} characters`);
   if (params.runInBackground !== undefined && typeof params.runInBackground !== "boolean") invalid("INVALID_INPUT: runInBackground must be a boolean");
   if (params.targets.some((target) => typeof target !== "string" || target.length === 0 || target.includes(String.fromCharCode(0)) || target.includes("\r") || target.includes("\n"))) invalid("INVALID_INPUT: targets must be non-empty single-line identifiers");
   if (new Set(params.targets).size !== params.targets.length) invalid("INVALID_INPUT: duplicate target references are not allowed");

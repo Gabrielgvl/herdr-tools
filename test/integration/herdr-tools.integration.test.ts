@@ -94,6 +94,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       if (!rootPane || typeof rootPane.pane_id !== "string" || typeof rootPane.tab_id !== "string") throw new Error("fixture snapshot omitted its root pane context");
 
       const registered = new Map<string, ExecutableTool>();
+      const commands: string[] = [];
       const handlers: Array<{ event: string; handler: () => unknown }> = [];
       const cliCalls: string[][] = [];
       const pi = {
@@ -116,6 +117,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
           const executable = tool as ExecutableTool;
           registered.set(executable.name, executable);
         },
+        registerCommand(name: string) {
+          commands.push(name);
+        },
         on(event: string, handler: () => unknown) {
           handlers.push({ event, handler });
         },
@@ -135,6 +139,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       }
       expect([...registered.keys()]).toEqual([...CORE_TOOL_NAMES]);
       expect([...registered.values()].every((tool) => typeof tool.execute === "function")).toBe(true);
+      expect(commands).toEqual(["herdr-waits"]);
       expect(handlers.map((entry) => entry.event)).toEqual(["session_shutdown", "session_start"]);
 
       const toolContext = { cwd, hasUI: false } as ExtensionContext;

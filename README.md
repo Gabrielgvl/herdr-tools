@@ -36,7 +36,7 @@ herdr_inspect({"mode":"context"})
 herdr_inspect({"mode":"target","target":"worker-id"})
 herdr_communicate({"target":"worker-id","operation":"prompt","text":"Continue the implementation"})
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000})
-herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000,"runInBackground":true})
+herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000,"label":"worker review","runInBackground":true})
 herdr_jobs({"operation":"list","status":"running"})
 herdr_launch({"name":"reviewer","kind":"pi","initialPrompt":"Inspect the current changes"})
 herdr_pane({"operation":"split","label":"worker","direction":"right"})
@@ -46,6 +46,8 @@ herdr_tab({"operation":"create","label":"review"})
 Targets are exact opaque IDs, `current`, exact pane labels, or unique exact agent names where the operation permits. No focused-pane, prefix, display-number, or fuzzy fallback exists. Launch and topology mutations return authoritative post-state, and failed launches retain any resources already created for manual handling.
 
 Communication prompts and launch initial prompts always include the visible `[HERDR AGENT MESSAGE v1]` sender envelope; the caller payload remains unchanged after the envelope blank line. Named-key delivery is not wrapped, and there is no provenance opt-out.
+
+Detached waits show a live Pi footer status with active count and oldest elapsed time. Run `/herdr-waits` to toggle the read-only active-wait widget; each row shows its label, elapsed time, and exact job ID for `herdr_jobs` inspection or cancellation. Labels are optional and are derived from targets plus condition when omitted.
 
 ## Commands
 
@@ -66,6 +68,7 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `src/targets.ts` resolves exact targets and injected current context.
 - `src/tools/` contains the seven public tools.
 - `src/reviewer.ts` contains the tool-less in-process model reviewer used by long waits.
+- `src/wait-jobs-ui.ts` owns session-scoped footer/widget rendering for active detached waits.
 - `src/tui.ts` uses Pi `Text` components with bounded semantic rows.
 
 See [ADR-001](docs/decisions/001-extension-runtime-boundary.md) for the runtime boundary and ownership decisions.

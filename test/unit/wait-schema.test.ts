@@ -49,6 +49,11 @@ describe("herdr_wait schema and runtime validation", () => {
       { ...valid, label: "bad\tlabel" },
       { ...valid, label: "bad\nlabel" },
       { ...valid, label: `bad${String.fromCharCode(127)}label` },
+      { ...valid, label: "bad\u0085label" },
+      { ...valid, label: "bad\u202elabel" },
+      { ...valid, label: "bad\u2028label" },
+      { ...valid, label: "bad\u2029label" },
+      { ...valid, label: "bad\u2066label" },
       { ...valid, label: "x".repeat(121) },
       { ...valid, targets: [] },
       { ...valid, targets: ["\0"] },
@@ -68,6 +73,9 @@ describe("herdr_wait schema and runtime validation", () => {
       { ...valid, condition: { kind: "unknown" } }
     ];
     for (const value of invalid) expect(() => validateWaitParams(value)).toThrowError(/INVALID_INPUT/);
+    for (const label of ["bad\u0085label", "bad\u202elabel", "bad\u2028label", "bad\u2029label", "bad\u2066label"]) {
+      expect(Value.Check(WaitParamsSchema, { ...valid, label })).toBe(false);
+    }
     expect(validateWaitParams({ ...valid, runInBackground: false }).params.runInBackground).toBe(false);
   });
 

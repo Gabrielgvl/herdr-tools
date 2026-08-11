@@ -350,6 +350,11 @@ describe("JobRegistry", () => {
     expect(listed.jobs[0]).toMatchObject({ truncation: { jobIdClipped: true, labelClipped: true } });
     expect(Buffer.byteLength(JSON.stringify(listed, null, 2), "utf8")).toBeLessThan(50_000);
 
+    const compactLabel = "a".repeat(64);
+    const compactOnly = boundedList({ jobs: [{ ...jobs[2]!, label: compactLabel, targets: ["y".repeat(50_000)] }], total: 1, offset: 0, limit: 1, nextOffset: null });
+    expect(compactOnly.jobs[0]?.label).not.toBe(compactLabel);
+    expect(compactOnly.jobs[0]?.truncation).toMatchObject({ labelClipped: true });
+
     const largeJobs = jobs.map((job) => ({ ...job, targetIds: ["x".repeat(10_000)], targets: ["y".repeat(10_000)] }));
     const compactList = boundedList({ jobs: largeJobs, total: 100, offset: 0, limit: 100, nextOffset: null });
     expect(compactList.jobs).toHaveLength(100);

@@ -515,12 +515,14 @@ function summary(detail: JobDetail): JobSummary {
 }
 
 function compactSummaryForList(value: JobSummary): JobSummary {
-  const jobIdClipped = value.jobId.length > 32 || value.truncation?.jobIdClipped === true;
-  const labelClipped = value.label.length > 64 || value.truncation?.labelClipped === true;
+  const jobId = boundedText(value.jobId, 32);
+  const label = boundedText(value.label, 64);
+  const jobIdClipped = jobId !== value.jobId || value.truncation?.jobIdClipped === true;
+  const labelClipped = label !== value.label || value.truncation?.labelClipped === true;
   const truncation = { ...value.truncation, ...(jobIdClipped ? { jobIdClipped: true } : {}), ...(labelClipped ? { labelClipped: true } : {}) };
   return {
-    jobId: boundedText(value.jobId, 32),
-    label: boundedText(value.label, 64),
+    jobId,
+    label,
     status: value.status,
     sequence: value.sequence,
     createdAtMs: value.createdAtMs,
@@ -540,19 +542,23 @@ export function boundedList(result: JobListResult): JobListResult {
   if (fitsPublic(result)) return clone(result);
   const compact = { ...result, jobs: result.jobs.map(compactSummaryForList) };
   if (fitsPublic(compact)) return clone(compact);
-  const minimalJobs = result.jobs.map((job) => ({
-    jobId: boundedText(job.jobId, 16),
-    label: boundedText(job.label, 32),
-    status: job.status,
-    sequence: job.sequence,
-    createdAtMs: job.createdAtMs,
-    ...(job.startedAtMs === undefined ? {} : { startedAtMs: job.startedAtMs }),
-    ...(job.finishedAtMs === undefined ? {} : { finishedAtMs: job.finishedAtMs }),
-    ...(job.outcome ? { outcome: job.outcome } : {}),
-    targetIds: [],
-    targets: [],
-    truncation: { ...(job.truncation ?? {}), jobIdClipped: true, ...(job.label.length > 32 || job.truncation?.labelClipped === true ? { labelClipped: true } : {}) }
-  }));
+  const minimalJobs = result.jobs.map((job) => {
+    const jobId = boundedText(job.jobId, 16);
+    const label = boundedText(job.label, 32);
+    return {
+      jobId,
+      label,
+      status: job.status,
+      sequence: job.sequence,
+      createdAtMs: job.createdAtMs,
+      ...(job.startedAtMs === undefined ? {} : { startedAtMs: job.startedAtMs }),
+      ...(job.finishedAtMs === undefined ? {} : { finishedAtMs: job.finishedAtMs }),
+      ...(job.outcome ? { outcome: job.outcome } : {}),
+      targetIds: [],
+      targets: [],
+      truncation: { ...(job.truncation ?? {}), jobIdClipped: true, ...(label !== job.label || job.truncation?.labelClipped === true ? { labelClipped: true } : {}) }
+    };
+  });
   const truncation = {
     ...(result.truncation?.jobs === undefined ? {} : { jobs: result.truncation.jobs }),
     jobIdsClipped: result.jobs.length

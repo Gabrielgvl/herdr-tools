@@ -867,11 +867,12 @@ blocker if unavailable; no test may weaken the 100% repository threshold.
 
 ## Approved active wait-visibility amendment
 
-Add red/green schema tests for optional bounded single-line labels and derivation
-tests covering state, literal-output, regex-output, resolved display names, and
-multiple targets. Foreground and background renderer tests must show the effective
-label, and registry/tool projections must preserve it through bounded detail/list
-forms.
+Add red/green schema tests for optional bounded printable single-line labels and
+derivation tests covering state, literal-output, regex-output, resolved display
+names, and multiple targets. Foreground call rows must show supplied labels;
+foreground results and background rows must show the effective post-preflight
+label. Registry/tool projections preserve it or explicitly mark aggregate
+compaction through bounded detail/list forms.
 
 Add a deterministic UI-controller suite with fake clock/timers and fake Pi UI.
 Cover zero-to-one and one-to-zero timer transitions, one-second spinner/elapsed

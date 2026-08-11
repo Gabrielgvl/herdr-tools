@@ -863,3 +863,21 @@ registrations, active-branch completion pushes and their `deliverAs`/`triggerTur
 options, manager-judgment priority, normal queue behavior, and cancellation or
 shutdown suppression. Integration remains opt-in and must record the exact
 blocker if unavailable; no test may weaken the 100% repository threshold.
+
+## Approved active wait-visibility amendment
+
+Add red/green schema tests for optional bounded single-line labels and derivation
+tests covering state, literal-output, regex-output, resolved display names, and
+multiple targets. Foreground and background renderer tests must show the effective
+label, and registry/tool projections must preserve it through bounded detail/list
+forms.
+
+Add a deterministic UI-controller suite with fake clock/timers and fake Pi UI.
+Cover zero-to-one and one-to-zero timer transitions, one-second spinner/elapsed
+refresh, exact active count and oldest elapsed calculation, bounded 20-row active
+widget output with omission reporting, label/time/ID rows, toggle-on/toggle-off,
+session-scoped toggle memory across an empty active set, and full session cleanup.
+Rendering failures must not affect job state. Registration tests must verify the
+`/herdr-waits` read-only command, unchanged seven-tool registration, no factory
+background timer, and non-UI behavior. Existing terminal notification and
+`herdr_jobs` cancellation coverage remains authoritative.

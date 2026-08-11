@@ -187,7 +187,9 @@ Rules:
   condition:
     { kind: "state", state: AgentState | SemanticState }
     | { kind: "output", match: { kind: "literal" | "regex", value: string } },
-  timeoutMs: integer // required, 1 through 3,600,000 inclusive
+  timeoutMs: integer,          // required, 1 through 3,600,000 inclusive
+  label?: string,              // optional single-line display label
+  runInBackground?: boolean    // optional; default false
 }
 ```
 
@@ -232,6 +234,14 @@ The in-memory, session-wide registry has no concurrency cap and retains terminal
 On session shutdown, notification delivery is disabled first, running jobs are marked/aborted, cleanup is allowed to settle safely, and registry ownership/generation is reset. `/tree` does not cancel jobs. Completion notifications target the current active branch and are best-effort. Background success, timeout, failure, and manager judgment send one compact visible custom Pi message with `deliverAs: "steer"` and `triggerTurn: true`; explicit cancel and shutdown cancellation never notify. Manager judgment messages start with `HIGH PRIORITY: MANAGER JUDGMENT REQUIRED` and use details priority `high`; other outcomes use normal priority. Messages include the job ID, outcome/reason, matched targets, and bounded error/reviewer summary, treating pane/output text as untrusted data. Pi's normal queue is used without custom debounce.
 
 All model-visible content, list summaries, completion notifications, and renderers enforce Pi's 50KB/2,000-line bounds with explicit truncation and no full transcripts. No background resource starts in the extension factory; only tool execution registers jobs.
+
+#### Active wait visibility
+
+`label` is valid for both foreground and detached waits. A supplied label is a bounded non-empty single-line value. When omitted, preflight derives one bounded effective label from resolved target names plus the requested state/output condition (for example, `worker-pi +2 → completed`). Foreground call/result rows show the effective label. Detached jobs store it in request details and list summaries, so `herdr_jobs` and the TUI always expose the same identity; duplicate labels are allowed because exact actions continue to use `jobId`.
+
+While detached jobs are running, the extension owns one session-scoped Pi footer status. It renders an animated spinner, the exact active count, the elapsed time of the oldest active job, and the `/herdr-waits` hint, refreshing once per second. The timer starts only when an active job exists and stops immediately when none remain. Status/UI failures never alter registry state.
+
+`/herdr-waits` is a read-only toggle for an above-editor active-job widget. Each visible row contains the effective label, current elapsed time, and exact job ID. The widget is bounded to 20 rows and reports additional active jobs as omitted. It clears while the active set is empty but remembers the enabled preference for the current session, so a later wait restores it automatically. A session transition clears footer/widget state, stops the timer, and resets the toggle. Inspect and cancel remain `herdr_jobs` operations; existing terminal steer notifications remain unchanged.
 
 ### `herdr_launch`
 

@@ -241,7 +241,7 @@ All model-visible content, list summaries, completion notifications, and rendere
 
 While detached jobs are running, the extension owns one session-scoped Pi footer status. It renders an animated spinner, the exact active count, the elapsed time of the oldest active job, and the `/herdr-waits` hint, refreshing once per second. The timer starts only when an active job exists and stops immediately when none remain. Status/UI failures never alter registry state.
 
-`/herdr-waits` is a read-only toggle for an above-editor active-job widget. Each visible row contains the effective label, current elapsed time, and exact job ID. The widget is bounded to 20 rows and reports additional active jobs as omitted. It clears while the active set is empty but remembers the enabled preference for the current session, so a later wait restores it automatically. A session transition clears footer/widget state, stops the timer, and resets the toggle. Inspect and cancel remain `herdr_jobs` operations; existing terminal steer notifications remain unchanged.
+`/herdr-waits` is a read-only toggle for an above-editor active-job widget. Each visible row contains the effective label, current elapsed time, and exact job ID. Pi bounds string-array widgets to 10 lines, so the extension uses at most 10 total lines and reserves the final line for an omission count when more jobs are active. It clears while the active set is empty but remembers the enabled preference for the current session, so a later wait restores it automatically. A session transition clears footer/widget state, stops the timer, and resets the toggle. Inspect and cancel remain `herdr_jobs` operations; existing terminal steer notifications remain unchanged.
 
 ### `herdr_launch`
 

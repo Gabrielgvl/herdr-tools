@@ -875,8 +875,8 @@ forms.
 
 Add a deterministic UI-controller suite with fake clock/timers and fake Pi UI.
 Cover zero-to-one and one-to-zero timer transitions, one-second spinner/elapsed
-refresh, exact active count and oldest elapsed calculation, bounded 20-row active
-widget output with omission reporting, label/time/ID rows, toggle-on/toggle-off,
+refresh, exact active count and oldest elapsed calculation, Pi-compatible 10-line
+active widget output with a reserved omission row, label/time/ID rows, toggle-on/toggle-off,
 session-scoped toggle memory across an empty active set, and full session cleanup.
 Rendering failures must not affect job state. Registration tests must verify the
 `/herdr-waits` read-only command, unchanged seven-tool registration, no factory

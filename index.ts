@@ -9,6 +9,8 @@ import { createPaneTool } from "./src/tools/pane.js";
 import { createTabTool } from "./src/tools/tab.js";
 import { createWaitTool } from "./src/tools/wait.js";
 import { boundedText, JobRegistry, type JobDetail } from "./src/job-registry.js";
+import { WaitJobsUi } from "./src/wait-jobs-ui.js";
+import { WAIT_LABEL_MAX_BYTES } from "./src/wait-schema.js";
 import { RuntimeOwnership, resetOwnership, type OwnedResource } from "./src/ownership.js";
 import { loadSettings, type Settings } from "./src/settings.js";
 import type { CurrentContext } from "./src/targets.js";
@@ -42,6 +44,7 @@ export interface ExtensionRuntime {
   context: CurrentContext;
   ownership: RuntimeOwnership;
   jobs: JobRegistry;
+  waitJobsUi: WaitJobsUi;
   settings: { load: () => Promise<Settings> };
   profiles: { load: () => Promise<ProfileCatalog> };
   idsPresent: boolean;
@@ -99,13 +102,14 @@ export function notificationForJob(detail: JobDetail): { content: string; detail
   const reviewer = detail.result?.reviewerSummaries?.map((summary) => `${safeNotificationPart(summary.targetId)}: ${safeNotificationPart(summary.summary)}`).join("; ");
   const error = detail.error ? `${safeNotificationPart(detail.error.code ?? "error")}: ${safeNotificationPart(detail.error.message)}` : undefined;
   const prefix = manager ? "HIGH PRIORITY: MANAGER JUDGMENT REQUIRED\n" : "";
-  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} reported: action=wait, outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)} (wait condition only; target lifecycle unchanged), matchedTargets=${safeNotificationPart(matchedTargets || "none", 2_000)}${matchedSuffix}, requestedTargets=${safeNotificationPart(requestedTargets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
+  const content = `${prefix}Herdr wait job ${safeNotificationPart(detail.jobId)} (${safeNotificationPart(detail.request.label, WAIT_LABEL_MAX_BYTES)}) reported: action=wait, outcome=${safeNotificationPart(status)}, reason=${safeNotificationPart(reason)} (wait condition only; target lifecycle unchanged), matchedTargets=${safeNotificationPart(matchedTargets || "none", 2_000)}${matchedSuffix}, requestedTargets=${safeNotificationPart(requestedTargets, 2_000)}${error ? `, error=${safeNotificationPart(error)}` : ""}${reviewer ? `, reviewer=${safeNotificationPart(reviewer, 2_000)}` : ""}`;
   const requestedIds = detail.request.targetIds.slice(0, 16).map((targetId) => safeNotificationPart(targetId, 256));
   const requestedOmitted = Math.max(detail.truncation?.requestTargetIds ?? 0, detail.request.targetIds.length - requestedIds.length);
   return {
     content: boundedText(content, 8_000),
     details: {
       jobId: safeNotificationPart(detail.jobId, 256),
+      label: safeNotificationPart(detail.request.label, WAIT_LABEL_MAX_BYTES),
       action: "wait",
       outcome: status,
       reason: safeNotificationPart(reason),
@@ -122,7 +126,9 @@ export function notificationForJob(detail: JobDetail): { content: string; detail
 
 export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<ExtensionAPI, "sendMessage">>, env: NodeJS.ProcessEnv = process.env): ExtensionRuntime {
   const injected = readInjectedContext(env);
+  const uiRef: { current?: WaitJobsUi } = {};
   const jobs = new JobRegistry({
+    onChange: () => uiRef.current?.refresh(),
     onTerminal: (detail) => {
       if (!pi.sendMessage) return;
       const notification = notificationForJob(detail);
@@ -133,11 +139,14 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
       }
     }
   });
+  const waitJobsUi = new WaitJobsUi(jobs);
+  uiRef.current = waitJobsUi;
   return {
     cli: new HerdrCli(pi.exec.bind(pi)),
     context: injected.context,
     ownership: new RuntimeOwnership(),
     jobs,
+    waitJobsUi,
     settings: { load: () => loadSettings() },
     profiles: { load: () => discoverProfiles({ bundledDir: resolve(dirname(fileURLToPath(import.meta.url)), "herdr-profiles"), bundledScopeRoot: dirname(fileURLToPath(import.meta.url)), projectCwd: process.cwd() }) },
     idsPresent: injected.idsPresent,
@@ -156,12 +165,22 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
   };
 
   pi.on("session_shutdown", async () => {
+    runtime.waitJobsUi.endSession();
     runtime.jobs.shutdown();
     resetOwnership(runtime.ownership);
   });
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, context) => {
     runtime.jobs.beginSession();
+    runtime.waitJobsUi.beginSession(context);
     resetOwnership(runtime.ownership);
+  });
+
+  pi.registerCommand("herdr-waits", {
+    description: "Toggle the active Herdr wait-job list",
+    handler: async (_args, context) => {
+      const visible = runtime.waitJobsUi.toggle(context);
+      context.ui.notify(`Herdr active waits ${visible ? "shown" : "hidden"}`, "info");
+    }
   });
 
   const preflight = createPreflight(runtime.cli);

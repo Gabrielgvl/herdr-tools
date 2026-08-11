@@ -28,7 +28,8 @@ interactive job manager or consuming editor space by default.
   second and clear the status immediately when the active count reaches zero.
 - Register `/herdr-waits` as a read-only toggle for an above-editor widget. The
   widget contains active jobs only, one compact row per job with effective label,
-  elapsed time, and exact job ID. Bound the visible rows and report omissions.
+  elapsed time, and exact job ID. Stay within Pi's 10-line string-widget limit,
+  reserving the final line for an omission count when needed.
 - Remember the widget toggle for the current Pi session. Clear the widget when no
   jobs are active, but restore it automatically when a later wait starts if the
   toggle remains enabled. Reset the preference at the next session boundary.

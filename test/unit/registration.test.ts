@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const readFileMock = vi.hoisted(() => vi.fn());
@@ -27,14 +27,16 @@ afterEach(() => {
 
 function fakePi() {
   const tools: unknown[] = [];
+  const commands: Array<{ name: string; definition: { handler: (...args: never[]) => unknown } }> = [];
   const handlers: Array<{ event: string; handler: (...args: never[]) => unknown }> = [];
   const pi = {
     exec: vi.fn(),
     sendMessage: vi.fn(),
     registerTool: vi.fn((tool: unknown) => tools.push(tool)),
+    registerCommand: vi.fn((name: string, definition: { handler: (...args: never[]) => unknown }) => commands.push({ name, definition })),
     on: vi.fn((event: string, handler: (...args: never[]) => unknown) => handlers.push({ event, handler })),
   } as unknown as ExtensionAPI;
-  return { pi, tools, handlers };
+  return { pi, tools, commands, handlers };
 }
 
 function enable(ids = true): void {
@@ -53,16 +55,17 @@ function enable(ids = true): void {
 describe("global extension registration", () => {
   it("is completely inert when HERDR_ENV is not 1", () => {
     delete process.env.HERDR_ENV;
-    const { pi, tools, handlers } = fakePi();
+    const { pi, tools, commands, handlers } = fakePi();
     extension(pi);
     expect(tools).toEqual([]);
+    expect(commands).toEqual([]);
     expect(handlers).toEqual([]);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 
   it("registers exactly the seven core tools and no deferred aliases", () => {
     enable();
-    const { pi, tools, handlers } = fakePi();
+    const { pi, tools, commands, handlers } = fakePi();
     extension(pi);
     expect(tools.map((tool) => (tool as { name: string }).name)).toEqual([...CORE_TOOL_NAMES]);
     expect(tools).toHaveLength(7);
@@ -71,7 +74,22 @@ describe("global extension registration", () => {
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_command");
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_workspace");
     expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_admin");
+    expect(commands.map((command) => command.name)).toEqual(["herdr-waits"]);
     expect(handlers.map((entry) => entry.event)).toEqual(["session_shutdown", "session_start"]);
+    expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+  });
+
+  it("registers a read-only active-waits toggle command", async () => {
+    enable();
+    const { pi, commands } = fakePi();
+    extension(pi);
+    const notify = vi.fn();
+    const context = { hasUI: true, ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
+    const handler = commands[0]?.definition.handler as unknown as (args: string, context: ExtensionContext) => Promise<void>;
+    await handler("", context);
+    expect(notify).toHaveBeenLastCalledWith("Herdr active waits shown", "info");
+    await handler("", context);
+    expect(notify).toHaveBeenLastCalledWith("Herdr active waits hidden", "info");
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 
@@ -114,15 +132,20 @@ describe("global extension registration", () => {
       sequence: 1,
       createdAtMs: 0,
       finishedAtMs: 1,
-      request: { targets: ["worker\\n<untrusted>"], targetIds: ["p1"], match: "any" as const, condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const } },
+      request: { label: "wait for worker", targets: ["worker\\n<untrusted>"], targetIds: ["p1"], match: "any" as const, condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const } },
       outcome: "manager_judgment_required" as const,
       result: { outcome: "manager_judgment_required" as const, matched: false, reason: "manager_judgment_required", reviewerSummaries: [{ target: "worker", targetId: "p1", classification: "blocked", summary: "review\nsummary" }] }
     };
     const notification = notificationForJob(detail);
     expect(notification.content).toContain("HIGH PRIORITY: MANAGER JUDGMENT REQUIRED");
     expect(notification.content).not.toContain("review\nsummary");
-    expect(notification.details).toMatchObject({ action: "wait", priority: "high", jobId: "job_notify", matchedTargets: [] });
+    expect(notification.details).toMatchObject({ action: "wait", priority: "high", jobId: "job_notify", label: "wait for worker", matchedTargets: [] });
+    expect(notification.content).toContain("job_notify (wait for worker)");
     expect(notification.content).toContain("target lifecycle unchanged");
+    const unicodeLabel = "😀".repeat(120);
+    const unicodeNotification = notificationForJob({ ...detail, request: { ...detail.request, label: unicodeLabel } });
+    expect(unicodeNotification.details.label).toBe(unicodeLabel);
+    expect(unicodeNotification.content).toContain(unicodeLabel);
     const successAny = notificationForJob({
       ...detail,
       outcome: "success",
@@ -211,11 +234,11 @@ describe("global extension registration", () => {
     const { pi } = fakePi();
     const runtime = createRuntime(pi, process.env);
     const pending = new Promise<never>(() => undefined);
-    const handle = runtime.jobs.register({ targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } }, async () => pending);
+    const handle = runtime.jobs.register({ label: "wait for worker", targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } }, async () => pending);
     runtime.jobs.cancel(handle.jobId);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect((pi.sendMessage as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
-    const second = runtime.jobs.register({ targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } }, async () => pending);
+    const second = runtime.jobs.register({ label: "wait for worker", targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } }, async () => pending);
     runtime.jobs.shutdown();
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(runtime.jobs.get(second.jobId)).toBeUndefined();

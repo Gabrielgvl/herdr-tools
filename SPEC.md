@@ -437,6 +437,7 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `REVIEWER_FAILED`: any required in-process reviewer/model call failed.
 - `MANAGER_JUDGMENT_REQUIRED`: reviewer ended the wait early because the result requires manager judgment.
 - `CLI_TIMEOUT`: an individual CLI call exceeded its bounded internal timeout.
+- `CLI_OUTPUT_OVERFLOW`: a CLI call produced more output than the host collects while streaming. The child is killed and the call fails with bounded evidence; output is never silently truncated into a partial envelope.
 
 `herdr_wait` timeout is a normal structured result with `matched: false`, not `CLI_TIMEOUT`. No error path may substitute a guessed ID, focused pane, fallback model, generic success, or automatic cleanup.
 
@@ -450,6 +451,8 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - Named keys are validated symbols, never raw escape/control strings. Key delivery does not add a second confirmation dialog.
 - Destructive close operations are autonomous only after exact target and protected-topology validation. No UI is required, but malformed topology fails closed.
 - Environment overrides accept arbitrary variable names by product decision. They can expose secrets or control process behavior to the launched child and may be visible through Herdr process/session inspection; normal tool output must not echo their values. Callers remain responsible for not supplying sensitive values in a shared session.
+- That rule is enforced structurally, not per tool: every authoritative record a tool retains as evidence — inspect target metadata, wait target snapshots, launch post-state, and pane/tab post-state — passes through the one shared redaction in `src/redaction.ts`, and any host that projects `details` into model-visible content applies it again at that boundary, so a record added later cannot leak by omission. The redaction drops an environment-shaped key at any nesting depth, including inside arrays, whenever its value carries a string at any depth. Environment values are strings by contract, so that rule is fail-closed on anything that could hold one while typed diagnostics that legitimately use the name, such as the health `environment` presence booleans, survive.
+- Every host bounds captured process output while it is still streaming, not only after a call settles. Crossing the documented ceiling kills the child and fails the call with `CLI_OUTPUT_OVERFLOW` and bounded evidence.
 - Long-wait reviewers receive only bounded metadata/transcript deltas, have no tools, cannot mutate or communicate, and are not visible as Herdr panes. Reviewer failures fail closed.
 - Every CLI and model call observes `AbortSignal`; close post-readback uses a fresh independent signal so completed destructive mutations cannot lose terminal evidence.
 - The extension does not read, write, replace, or report state through `herdr-agent-state.ts`; Herdr's managed state integration remains the authority for the calling Pi pane's lifecycle state.

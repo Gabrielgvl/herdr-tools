@@ -16,6 +16,7 @@ import type { CurrentContext } from "../targets.js";
 import { createPreflight, createToolSurface, type HerdrToolSurface } from "../tool-surface.js";
 import { callTool, describeTools } from "./adapter.js";
 import { createNodeExec, resolveStartup, StartupRefusal, type DirectoryStat } from "./host.js";
+import { SequentialToolQueue } from "./queue.js";
 
 export const MCP_SERVER_NAME = "herdr-tools";
 export const MCP_SERVER_VERSION = "1.0.0";
@@ -142,6 +143,9 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   }
 
   const server = new Server({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }, { capabilities: { tools: {} } });
+  // One queue per server, so the sequential tools are serialized across every
+  // concurrent `tools/call` this session issues.
+  const queue = new SequentialToolQueue();
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: descriptors }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const outcome = await callTool({
@@ -149,7 +153,8 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
       name: request.params.name,
       args: request.params.arguments,
       host: { cwd: startup.projectDir, signal: extra.signal },
-      callId: String(extra.requestId)
+      callId: String(extra.requestId),
+      queue
     });
     return {
       content: outcome.content.map((block) => ({ type: block.type, text: block.text })),
@@ -161,6 +166,9 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   const shutdown = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
+    // Closed before the registry and the transport, so a call still waiting for
+    // its turn is refused instead of mutating during teardown.
+    queue.close();
     jobs.shutdown();
     resetOwnership(ownership);
     await server.close();

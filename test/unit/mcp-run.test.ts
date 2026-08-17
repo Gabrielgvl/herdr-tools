@@ -59,9 +59,11 @@ const snapshot = {
     protocol: 1,
     workspaces: [{ workspace_id: "w", label: "w" }],
     tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
+    // Pane records carry owner-supplied environment values; no model-visible
+    // block this host publishes may echo one.
     panes: [
-      { pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "manager", agent_name: "manager", agent_status: "idle" },
-      { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent_status: "working" }
+      { pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "manager", agent_name: "manager", agent_status: "idle", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] },
+      { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent_status: "working", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] }
     ],
     agents: [{ pane_id: "w:p", name: "manager", agent_status: "idle" }, { pane_id: "w:p2", name: "worker", agent_status: "working" }]
   }
@@ -83,7 +85,7 @@ function fakeExec(): { exec: PiExec; calls: string[][] } {
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: "worker output", stderr: "", code: 0, killed: false };
     if (argv[0] === "tab" && argv[1] === "create") {
       live.snapshot.tabs.push({ tab_id: "w:t2", workspace_id: "w", label: argv[argv.indexOf("--label") + 1]! });
-      live.snapshot.panes.push({ pane_id: "w:p9", tab_id: "w:t2", workspace_id: "w", label: "root", agent_name: "root", agent_status: "idle" });
+      live.snapshot.panes.push({ pane_id: "w:p9", tab_id: "w:t2", workspace_id: "w", label: "root", agent_name: "root", agent_status: "idle", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] });
       return envelope("create", { tab: { tab_id: "w:t2" }, root_pane: { pane_id: "w:p9" } });
     }
     if (argv[0] === "tab" && argv[1] === "get") return envelope("get", { tab: live.snapshot.tabs.find((tab) => tab.tab_id === argv[2]) });
@@ -301,6 +303,48 @@ describe("MCP tool serving", () => {
     const selfTarget = await harness.client.callTool({ name: "herdr_communicate", arguments: { target: "current", operation: "prompt", text: "hello" } });
     expect(selfTarget.isError).toBe(true);
     expect(textOf(selfTarget)).toContain("SELF_TARGET_REJECTED");
+    await harness.handle.shutdown();
+  });
+
+  it("never publishes an environment value in any model-visible block", async () => {
+    const harness = await start();
+    const results = [
+      await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "target", target: "w:p2" } }),
+      await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "panes" } }),
+      await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } })
+    ];
+    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000, runInBackground: true } });
+    const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.status).toBe("completed"));
+    results.push(detached, await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "get", jobId } }));
+    for (const result of results) {
+      expect(result.isError, textOf(result)).toBeUndefined();
+      expect(textOf(result)).not.toContain("run-secret");
+    }
+    // The pane evidence itself still reaches the model.
+    expect(textOf(results[0]!)).toContain("agent_status");
+    await harness.handle.shutdown();
+  });
+
+  it("serializes overlapping sequential tool calls", async () => {
+    const base = fakeExec();
+    const calls = base.calls;
+    // Every CLI step yields to the event loop, so two unserialized herdr_pane
+    // calls would interleave their read/mutate/read sequences here.
+    const exec: PiExec = async (command, argv, options) => {
+      await new Promise((settle) => setTimeout(settle, 2));
+      return base.exec(command, argv, options);
+    };
+    const harness = await start({ exec });
+    const outcomes = await Promise.all([
+      harness.client.callTool({ name: "herdr_pane", arguments: { operation: "rename", target: "w:p2", label: "rename-first" } }),
+      harness.client.callTool({ name: "herdr_pane", arguments: { operation: "rename", target: "w:p2", label: "rename-second" } })
+    ]);
+    expect(outcomes.every((outcome) => outcome.isError === undefined)).toBe(true);
+    const sequence = calls.filter((call) => call[0] === "pane" && (call[1] === "rename" || call[1] === "get")).map((call) => call.slice(1).join(" "));
+    const first = ["rename w:p2 rename-first", "get w:p2", "rename w:p2 rename-second", "get w:p2"];
+    const second = ["rename w:p2 rename-second", "get w:p2", "rename w:p2 rename-first", "get w:p2"];
+    expect([first, second]).toContainEqual(sequence);
     await harness.handle.shutdown();
   });
 

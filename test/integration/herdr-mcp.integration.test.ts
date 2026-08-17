@@ -27,6 +27,8 @@ const serverEntry = join(repoRoot, "dist/src/mcp-server.js");
  * no assertion: the launch must still succeed and prove its evidence.
  */
 const PANE_SETTLE_MS = 3_000;
+/** Planted as a pane environment override; it must never appear in a tool result. */
+const ENVIRONMENT_SENTINEL = "integration-environment-sentinel";
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
 
@@ -155,7 +157,13 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       await client.connect(transport);
       let serverStderr = "";
       transport.stderr?.on("data", (chunk: Buffer) => { serverStderr += chunk.toString(); });
-      const call = (name: string, args: Record<string, unknown>) => client!.callTool({ name, arguments: args }) as Promise<ToolResult>;
+      // Every tool result is swept for the environment value planted below, so
+      // no block this server publishes can echo an owner-supplied secret.
+      const call = async (name: string, args: Record<string, unknown>): Promise<ToolResult> => {
+        const result = await (client!.callTool({ name, arguments: args }) as Promise<ToolResult>);
+        expect(text(result), name).not.toContain(ENVIRONMENT_SENTINEL);
+        return result;
+      };
 
       const listed = await client.listTools();
       expect(listed.tools.map((tool) => tool.name)).toEqual([...CORE_TOOL_NAMES]);
@@ -186,7 +194,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
 
       // Owned resources come first so the launch target has settled by the time
       // it is used, and so cleanup only ever touches this run's own fixtures.
-      const split = await call("herdr_pane", { operation: "split", target: rootPane.pane_id, label: "mcp-worker", direction: "right", focus: false });
+      const split = await call("herdr_pane", { operation: "split", target: rootPane.pane_id, label: "mcp-worker", direction: "right", focus: false, env: { HERDR_TOOLS_IT_SECRET: ENVIRONMENT_SENTINEL } });
       const workerPaneId = evidence(split).paneId as string;
       expect(typeof workerPaneId).toBe("string");
 

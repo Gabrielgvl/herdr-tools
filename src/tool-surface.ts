@@ -1,4 +1,4 @@
-import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext, ToolExecutionMode } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import type { HerdrCli } from "./cli.js";
 import { preflightCompatibility, type CompatibilityPreflight, type HealthCli } from "./health.js";
@@ -79,6 +79,12 @@ export interface HerdrToolDefinition {
   readonly label: string;
   readonly description: string;
   readonly parameters: TSchema;
+  /**
+   * The Pi scheduling contract the mutating tools declare. Both hosts must
+   * honor it, so it is part of the host-agnostic projection rather than a
+   * Pi-registration detail.
+   */
+  readonly executionMode?: ToolExecutionMode;
   execute(
     toolCallId: string,
     params: unknown,

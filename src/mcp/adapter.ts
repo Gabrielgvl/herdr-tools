@@ -1,7 +1,9 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { Value } from "typebox/value";
+import { modelSafeJson } from "../redaction.js";
 import type { HerdrToolDefinition, HerdrToolSurface } from "../tool-surface.js";
 import { hostContext, type HerdrToolHost } from "./host.js";
+import type { QueueRefusal, SequentialToolQueue } from "./queue.js";
 
 /** Total response bound for one MCP tool result. */
 export const MCP_RESULT_MAX_BYTES = 60_000;
@@ -14,6 +16,7 @@ const MARKER_BYTES = Buffer.byteLength(OUTPUT_TRUNCATION_MARKER, "utf8");
 const DETAILS_PREFIX = `${HERDR_DETAILS_LABEL}\n`;
 const DETAILS_PREFIX_BYTES = Buffer.byteLength(DETAILS_PREFIX, "utf8");
 const MIN_DETAILS_BYTES = 256;
+const DETAILS_FIELD_BYTES = Buffer.byteLength(",\"details\":", "utf8");
 const MAX_ERROR_MESSAGE_CHARS = 2_000;
 const MAX_CODE_CHARS = 120;
 const MAX_TOOL_NAME_CHARS = 120;
@@ -54,6 +57,12 @@ export interface McpCallRequest {
   readonly args: unknown;
   readonly host: HerdrToolHost;
   readonly callId: string;
+  /**
+   * The session-scoped queue that reproduces the Pi host's sequential
+   * scheduling. It is required, so a sequential tool cannot be served
+   * unserialized by forgetting to pass one.
+   */
+  readonly queue: SequentialToolQueue;
 }
 
 function bytes(value: string): number {
@@ -99,12 +108,12 @@ export function describeTools(surface: McpToolSurface): McpToolDescriptor[] {
 }
 
 /**
- * Bound a payload to `budget` bytes, keeping the head and never splitting a code
- * point. The head is authoritative here: a truncated tail would drop the typed
- * code, the operation, and the outcome the model needs.
+ * Bound one oversized shared text block to `budget` bytes, keeping the head and
+ * never splitting a code point. The head is authoritative here: a truncated tail
+ * would drop the operation and the outcome the model needs. The caller has
+ * already established that `value` does not fit, so the marker is always true.
  */
 function boundedHead(value: string, budget: number): string {
-  if (bytes(value) <= budget) return value;
   const room = Math.max(0, budget - MARKER_BYTES);
   let kept = "";
   let size = 0;
@@ -117,8 +126,51 @@ function boundedHead(value: string, budget: number): string {
   return `${kept}${OUTPUT_TRUNCATION_MARKER}`;
 }
 
+/** What one code point costs inside a JSON string literal. */
+function escapedBytes(character: string): number {
+  return bytes(JSON.stringify(character)) - 2;
+}
+
+/**
+ * A bounded structured block stays valid JSON. Cutting a serialized object at a
+ * byte boundary would publish malformed syntax, so an oversized value is
+ * replaced by this envelope instead: the head of the serialized evidence is
+ * carried as a JSON string, and the original size is stated so the truncation is
+ * explicit rather than inferred from a trailing marker.
+ */
+interface TruncationEnvelope {
+  readonly truncated: true;
+  readonly originalBytes: number;
+  readonly preview: string;
+}
+
+function truncationEnvelope(serialized: string, budget: number): TruncationEnvelope {
+  const empty: TruncationEnvelope = { truncated: true, originalBytes: bytes(serialized), preview: "" };
+  const room = budget - bytes(JSON.stringify(empty));
+  let preview = "";
+  let size = 0;
+  for (const character of serialized) {
+    const cost = escapedBytes(character);
+    if (size + cost > room) break;
+    preview += character;
+    size += cost;
+  }
+  return { ...empty, preview };
+}
+
+/**
+ * Bound one structured value to `budget` serialized bytes, as a value rather
+ * than as text, so every block this adapter publishes is parseable JSON. The
+ * caller must pass a budget with room for the empty envelope; both call sites
+ * hold at least `MIN_DETAILS_BYTES`.
+ */
+function boundedJsonValue(value: unknown, budget: number): unknown {
+  const serialized = JSON.stringify(value) ?? "null";
+  return bytes(serialized) <= budget ? value : truncationEnvelope(serialized, budget);
+}
+
 function boundedJsonText(value: unknown, budget: number): string {
-  return boundedHead(JSON.stringify(value) ?? "null", budget);
+  return JSON.stringify(boundedJsonValue(value, budget)) ?? "null";
 }
 
 function detailsBlock(details: unknown, budget: number): McpTextBlock | undefined {
@@ -171,9 +223,10 @@ function alreadyPublished(details: unknown, texts: readonly string[]): boolean {
 export function successOutcome(result: { content: ReadonlyArray<{ type: string; text?: string }>; details?: unknown }): McpCallOutcome {
   const texts = result.content.filter((block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string").map((block) => block.text);
   const sharedBytes = texts.reduce((total, text) => total + bytes(text), 0);
-  const details = result.details === undefined || alreadyPublished(result.details, texts)
+  const safeDetails = modelSafeJson(result.details);
+  const details = result.details === undefined || alreadyPublished(safeDetails, texts)
     ? undefined
-    : detailsBlock(result.details, MCP_RESULT_MAX_BYTES - sharedBytes);
+    : detailsBlock(safeDetails, MCP_RESULT_MAX_BYTES - sharedBytes);
   const sharedBudget = MCP_RESULT_MAX_BYTES - (details ? bytes(details.text) : 0);
   return { content: [...boundedSharedBlocks(texts, sharedBudget), ...(details ? [details] : [])] };
 }
@@ -189,14 +242,22 @@ function errorDetails(error: unknown): unknown {
   return typeof details === "object" && details !== null ? details : undefined;
 }
 
-/** Typed tool failures are model-visible tool results, never protocol errors. */
+/**
+ * Typed tool failures are model-visible tool results, never protocol errors.
+ *
+ * The typed code and the bounded message are never truncated away: they are
+ * serialized first and only the evidence is bounded against what is left. The
+ * head is small by construction — `MAX_CODE_CHARS` plus `MAX_ERROR_MESSAGE_CHARS`
+ * printable characters cannot exceed roughly 9 KiB even fully escaped — so the
+ * evidence always keeps more than `MIN_DETAILS_BYTES` of room.
+ */
 export function errorOutcome(code: string, message: string, details?: unknown): McpCallOutcome {
-  const payload = {
-    code,
-    message: singleLine(message, MAX_ERROR_MESSAGE_CHARS),
-    ...(details === undefined ? {} : { details })
-  };
-  return { content: [{ type: "text", text: boundedJsonText(payload, MCP_RESULT_MAX_BYTES) }], isError: true };
+  const head = { code, message: singleLine(message, MAX_ERROR_MESSAGE_CHARS) };
+  const safeDetails = modelSafeJson(details);
+  const payload = safeDetails === undefined
+    ? head
+    : { ...head, details: boundedJsonValue(safeDetails, MCP_RESULT_MAX_BYTES - bytes(JSON.stringify(head)) - DETAILS_FIELD_BYTES) };
+  return { content: [{ type: "text", text: JSON.stringify(payload) }], isError: true };
 }
 
 function validationOutcome(definition: HerdrToolDefinition, args: unknown): McpCallOutcome | undefined {
@@ -210,9 +271,20 @@ function validationOutcome(definition: HerdrToolDefinition, args: unknown): McpC
   return errorOutcome("INVALID_INPUT", `INVALID_INPUT: arguments do not match the ${definition.name} schema`, { errors });
 }
 
+const QUEUE_REFUSAL_MESSAGE: Record<QueueRefusal, string> = {
+  aborted: "ABORTED: the queued Herdr tool call was cancelled before it started",
+  closed: "ABORTED: the Herdr tools MCP host shut down before the queued call started"
+};
+
 /**
  * Validate against the shared schema, execute the shared tool with the request's
  * cancellation signal, and map the outcome to bounded MCP content.
+ *
+ * A tool that declares `executionMode: "sequential"` runs through the
+ * session-scoped queue, so the MCP host reproduces the Pi host's one-at-a-time
+ * scheduling for the mutating tools. Every other tool stays concurrent.
+ * Validation happens before the queue: a rejected argument object touches no
+ * state and must not wait behind an unrelated mutation.
  */
 export async function callTool(request: McpCallRequest): Promise<McpCallOutcome> {
   const definition = request.surface.definitions.find((candidate) => candidate.name === request.name);
@@ -222,10 +294,14 @@ export async function callTool(request: McpCallRequest): Promise<McpCallOutcome>
   const args = request.args === undefined || request.args === null ? {} : request.args;
   const invalid = validationOutcome(definition, args);
   if (invalid) return invalid;
-  try {
-    const result = await definition.execute(request.callId, args, request.host.signal, undefined, hostContext(request.host));
-    return successOutcome(result);
-  } catch (error) {
-    return errorOutcome(errorCode(error), error instanceof Error ? error.message : String(error), errorDetails(error));
-  }
+  const invoke = async (): Promise<McpCallOutcome> => {
+    try {
+      const result = await definition.execute(request.callId, args, request.host.signal, undefined, hostContext(request.host));
+      return successOutcome(result);
+    } catch (error) {
+      return errorOutcome(errorCode(error), error instanceof Error ? error.message : String(error), errorDetails(error));
+    }
+  };
+  if (definition.executionMode !== "sequential") return invoke();
+  return request.queue.serialize(request.host.signal, invoke, (reason) => errorOutcome("ABORTED", QUEUE_REFUSAL_MESSAGE[reason], { tool: definition.name, executionMode: "sequential", reason }));
 }

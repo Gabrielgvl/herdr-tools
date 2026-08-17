@@ -9,6 +9,7 @@ import { RuntimeOwnership } from "../../src/ownership.js";
 import { createPreflight, createToolSurface, CORE_TOOL_NAMES, type HerdrToolDefinition } from "../../src/tool-surface.js";
 import { AdapterContractError, HERDR_DETAILS_LABEL, MCP_RESULT_MAX_BYTES, callTool, describeTools, publishedInputSchema, type McpCallOutcome } from "../../src/mcp/adapter.js";
 import { HostCapabilityError } from "../../src/mcp/host.js";
+import { SequentialToolQueue } from "../../src/mcp/queue.js";
 
 const health = { client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "0.8.0", protocol: 19, compatible: true } };
 const snapshot = {
@@ -60,7 +61,7 @@ function stub(definition: Partial<HerdrToolDefinition> & Pick<HerdrToolDefinitio
 const host = { cwd: "/project", signal: new AbortController().signal };
 
 function call(surface: { definitions: HerdrToolDefinition[] }, args: unknown = {}, name = "herdr_inspect"): Promise<McpCallOutcome> {
-  return callTool({ surface, name, args, host, callId: "call-1" });
+  return callTool({ surface, name, args, host, callId: "call-1", queue: new SequentialToolQueue() });
 }
 
 function outcomeBytes(outcome: McpCallOutcome): number {
@@ -69,6 +70,13 @@ function outcomeBytes(outcome: McpCallOutcome): number {
 
 function payload(outcome: McpCallOutcome): Record<string, unknown> {
   return JSON.parse(outcome.content[0]!.text) as Record<string, unknown>;
+}
+
+/** The appended structured block, parsed. Every block must be valid JSON. */
+function detailsOf(outcome: McpCallOutcome): unknown {
+  const block = outcome.content.find((entry) => entry.text.startsWith(`${HERDR_DETAILS_LABEL}\n`));
+  if (!block) throw new Error("outcome carried no herdr-details block");
+  return JSON.parse(block.text.slice(HERDR_DETAILS_LABEL.length + 1));
 }
 
 describe("MCP input schema publication", () => {
@@ -160,7 +168,7 @@ describe("MCP published schema parity", () => {
       expect(Value.Check(published, args), `published: ${label}`).toBe(accepted);
       expect(Value.Check(definition.parameters, args), `validation: ${label}`).toBe(accepted);
       if (accepted) continue;
-      const outcome = await callTool({ surface, name, args, host, callId: "c" });
+      const outcome = await callTool({ surface, name, args, host, callId: "c", queue: new SequentialToolQueue() });
       expect(outcome.isError, label).toBe(true);
       expect(payload(outcome).code, label).toBe("INVALID_INPUT");
     }
@@ -171,12 +179,12 @@ describe("MCP argument validation", () => {
   it("accepts the no-argument form and rejects unknown fields with bounded schema errors", async () => {
     const surface = realSurface();
     const definitions = { definitions: [...surface.definitions] };
-    const absent = await callTool({ surface: definitions, name: "herdr_inspect", args: undefined, host, callId: "c" });
-    const nulled = await callTool({ surface: definitions, name: "herdr_inspect", args: null, host, callId: "c" });
+    const absent = await callTool({ surface: definitions, name: "herdr_inspect", args: undefined, host, callId: "c", queue: new SequentialToolQueue() });
+    const nulled = await callTool({ surface: definitions, name: "herdr_inspect", args: null, host, callId: "c", queue: new SequentialToolQueue() });
     expect(absent.isError).toBeUndefined();
     expect(nulled.isError).toBeUndefined();
     expect(absent.content[0]!.text).toContain("inspect");
-    const invalid = await callTool({ surface: definitions, name: "herdr_inspect", args: { mode: "health", extra: true }, host, callId: "c" });
+    const invalid = await callTool({ surface: definitions, name: "herdr_inspect", args: { mode: "health", extra: true }, host, callId: "c", queue: new SequentialToolQueue() });
     expect(invalid.isError).toBe(true);
     const body = payload(invalid);
     expect(body.code).toBe("INVALID_INPUT");
@@ -196,17 +204,17 @@ describe("MCP argument validation", () => {
       ["herdr_tab", { operation: "create" }]
     ];
     for (const [name, args] of rejected) {
-      const outcome = await callTool({ surface, name, args, host, callId: "c" });
+      const outcome = await callTool({ surface, name, args, host, callId: "c", queue: new SequentialToolQueue() });
       expect(outcome.isError).toBe(true);
       expect(payload(outcome).code).toBe("INVALID_INPUT");
     }
-    const accepted = await callTool({ surface, name: "herdr_jobs", args: { operation: "list" }, host, callId: "c" });
+    const accepted = await callTool({ surface, name: "herdr_jobs", args: { operation: "list" }, host, callId: "c", queue: new SequentialToolQueue() });
     expect(accepted.isError).toBeUndefined();
   });
 
   it("raises MethodNotFound for an unknown tool name", async () => {
     const surface = realSurface();
-    const failure = await callTool({ surface, name: "herdr_admin\nnope", args: {}, host, callId: "c" }).catch((error: unknown) => error);
+    const failure = await callTool({ surface, name: "herdr_admin\nnope", args: {}, host, callId: "c", queue: new SequentialToolQueue() }).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(McpError);
     expect(failure).toMatchObject({ code: ErrorCode.MethodNotFound });
     expect((failure as McpError).message).toContain("herdr_admin nope");
@@ -252,26 +260,63 @@ describe("MCP result mapping", () => {
 
   it("publishes herdr_jobs evidence exactly once", async () => {
     const surface = realSurface();
-    const outcome = await callTool({ surface, name: "herdr_jobs", args: { operation: "list" }, host, callId: "c" });
+    const outcome = await callTool({ surface, name: "herdr_jobs", args: { operation: "list" }, host, callId: "c", queue: new SequentialToolQueue() });
     expect(outcome.content).toHaveLength(1);
     expect(outcome.content[0]!.text).not.toContain(HERDR_DETAILS_LABEL);
     expect(JSON.parse(outcome.content[0]!.text)).toMatchObject({ operation: "jobs", kind: "list" });
   });
 
-  it("truncates oversized details before the shared blocks and stays within the response bound", async () => {
+  it("bounds oversized details to a parseable truncation envelope inside the response bound", async () => {
     const outcome = await call(stub({
       execute: async () => ({ content: [{ type: "text", text: "shared" }], details: { blob: "d".repeat(200_000) } })
     }));
     expect(outcome.content[0]!.text).toBe("shared");
-    expect(outcome.content[1]!.text.startsWith(`${HERDR_DETAILS_LABEL}\n{"blob":"ddd`)).toBe(true);
-    expect(outcome.content[1]!.text.endsWith("[output truncated]")).toBe(true);
+    const envelope = detailsOf(outcome) as { truncated: boolean; originalBytes: number; preview: string };
+    expect(envelope.truncated).toBe(true);
+    expect(envelope.originalBytes).toBe(Buffer.byteLength(JSON.stringify({ blob: "d".repeat(200_000) }), "utf8"));
+    expect(envelope.preview.startsWith('{"blob":"ddd')).toBe(true);
     expect(outcomeBytes(outcome)).toBeLessThanOrEqual(MCP_RESULT_MAX_BYTES);
-    const multibyte = await call(stub({
-      execute: async () => ({ content: [], details: { blob: "🐑".repeat(40_000) } })
-    }));
-    expect(multibyte.content[0]!.text.endsWith("[output truncated]")).toBe(true);
+
+    // A multi-byte payload keeps the same guarantee: parseable JSON, no split
+    // code point, and no replacement character anywhere in the block.
+    const multibyte = await call(stub({ execute: async () => ({ content: [], details: { blob: "🐑".repeat(40_000) } }) }));
+    const multibyteEnvelope = detailsOf(multibyte) as { truncated: boolean; preview: string };
+    expect(multibyteEnvelope.truncated).toBe(true);
+    expect(multibyteEnvelope.preview.startsWith('{"blob":"🐑')).toBe(true);
     expect(multibyte.content[0]!.text).not.toContain("�");
     expect(outcomeBytes(multibyte)).toBeLessThanOrEqual(MCP_RESULT_MAX_BYTES);
+  });
+
+  it("keeps every details block parseable at and around the block boundary", async () => {
+    // The details budget is the response bound minus the shared blocks and the
+    // block prefix, so these cases straddle the exact byte where the adapter
+    // switches from the full value to the envelope.
+    for (const size of [MCP_RESULT_MAX_BYTES - 200, MCP_RESULT_MAX_BYTES - 30, MCP_RESULT_MAX_BYTES - 14, MCP_RESULT_MAX_BYTES - 13, MCP_RESULT_MAX_BYTES, MCP_RESULT_MAX_BYTES + 1]) {
+      const details = { blob: "x".repeat(size) };
+      const outcome = await call(stub({ execute: async () => ({ content: [], details }) }));
+      const parsed = detailsOf(outcome) as Record<string, unknown>;
+      expect(typeof parsed, String(size)).toBe("object");
+      expect(parsed.blob === details.blob || parsed.truncated === true, String(size)).toBe(true);
+      expect(outcomeBytes(outcome), String(size)).toBeLessThanOrEqual(MCP_RESULT_MAX_BYTES);
+    }
+  });
+
+  it("publishes a cyclic, hostile, or unserializable details object as parseable JSON", async () => {
+    const cyclic: Record<string, unknown> = { operation: "inspect", nested: { deep: [] as unknown[] } };
+    cyclic.self = cyclic;
+    (cyclic.nested as { deep: unknown[] }).deep.push(cyclic);
+    const outcome = await call(stub({ execute: async () => ({ content: [], details: cyclic }) }));
+    expect(detailsOf(outcome)).toEqual({ operation: "inspect", nested: { deep: ["[cyclic]"] }, self: "[cyclic]" });
+
+    const hostile = await call(stub({
+      execute: async () => ({ content: [], details: { count: 10n, broken: Number.POSITIVE_INFINITY, hidden: () => undefined, list: [undefined, () => undefined], when: new Date("2026-08-17T00:00:00.000Z") } })
+    }));
+    expect(detailsOf(hostile)).toEqual({ count: "10", broken: null, list: [null, null], when: "2026-08-17T00:00:00.000Z" });
+
+    let deep: Record<string, unknown> = { end: true };
+    for (let level = 0; level < 200; level += 1) deep = { level, deep };
+    const nested = await call(stub({ execute: async () => ({ content: [], details: deep }) }));
+    expect(JSON.stringify(detailsOf(nested))).toContain("[depth limit]");
   });
 
   it("drops the details block and truncates shared blocks when the shared content fills the bound", async () => {
@@ -330,17 +375,51 @@ describe("MCP error mapping", () => {
     expect(payload(thrownString)).toEqual({ code: "INTERNAL_ERROR", message: "no error object" });
   });
 
-  it("bounds a hostile failure message, code, and details", async () => {
+  it("bounds a hostile failure message, code, and details without dropping the typed head", async () => {
     const outcome = await call(stub({
       execute: async () => { throw Object.assign(new Error(`line\none${"m".repeat(5_000)}`), { code: `WEIRD\nCODE${"x".repeat(500)}`, details: { blob: "d".repeat(200_000) } }); }
     }));
     const text = outcome.content[0]!.text;
-    const [, code, message] = /^\{"code":"([^"]+)","message":"([^"]+)"/.exec(text) ?? [];
-    expect(code).toBe(`WEIRD CODE${"x".repeat(110)}`);
-    expect(message).toBe(`line one${"m".repeat(1_992)}`);
-    expect(text.slice(0, -"\n[output truncated]".length)).not.toContain("\n");
-    expect(text.endsWith("[output truncated]")).toBe(true);
+    const body = payload(outcome) as { code: string; message: string; details: { truncated: boolean; originalBytes: number; preview: string } };
+    expect(body.code).toBe(`WEIRD CODE${"x".repeat(110)}`);
+    expect(body.message).toBe(`line one${"m".repeat(1_992)}`);
+    // The evidence is bounded as a value, so the whole block stays parseable and
+    // the truncation is stated instead of implied by a cut string.
+    expect(body.details.truncated).toBe(true);
+    expect(body.details.originalBytes).toBe(Buffer.byteLength(JSON.stringify({ blob: "d".repeat(200_000) }), "utf8"));
+    expect(body.details.preview.startsWith('{"blob":"ddd')).toBe(true);
+    expect(text).not.toContain("\n");
     expect(outcomeBytes(outcome)).toBeLessThanOrEqual(MCP_RESULT_MAX_BYTES);
+
+    const multibyte = await call(stub({
+      execute: async () => { throw Object.assign(new Error("CLI_TIMEOUT: read failed"), { code: "CLI_TIMEOUT", details: { stdout: "🐑".repeat(40_000) } }); }
+    }));
+    const multibyteBody = payload(multibyte) as { code: string; details: { preview: string } };
+    expect(multibyteBody.code).toBe("CLI_TIMEOUT");
+    expect(multibyteBody.details.preview).not.toContain("�");
+    expect(outcomeBytes(multibyte)).toBeLessThanOrEqual(MCP_RESULT_MAX_BYTES);
+
+    const cyclic: Record<string, unknown> = { target: "w:p2" };
+    cyclic.self = cyclic;
+    const cyclicOutcome = await call(stub({ execute: async () => { throw Object.assign(new Error("CLI_PROTOCOL_ERROR: bad"), { code: "CLI_PROTOCOL_ERROR", details: cyclic }); } }));
+    expect(payload(cyclicOutcome)).toEqual({ code: "CLI_PROTOCOL_ERROR", message: "CLI_PROTOCOL_ERROR: bad", details: { target: "w:p2", self: "[cyclic]" } });
+  });
+
+  it("redacts environment values carried by a thrown error at every depth", async () => {
+    const outcome = await call(stub({
+      execute: async () => {
+        throw Object.assign(new Error("CLI_PROTOCOL_ERROR: pane read failed"), {
+          code: "CLI_PROTOCOL_ERROR",
+          details: { target: "w:p2", pane: { pane_id: "w:p2", environment: { SECRET: "error-secret" } }, history: [{ env_vars: { VAR: "error-secret" } }] }
+        });
+      }
+    }));
+    expect(payload(outcome)).toEqual({
+      code: "CLI_PROTOCOL_ERROR",
+      message: "CLI_PROTOCOL_ERROR: pane read failed",
+      details: { target: "w:p2", pane: { pane_id: "w:p2" }, history: [{}] }
+    });
+    expect(outcome.content[0]!.text).not.toContain("error-secret");
   });
 
   it("hands the request cancellation signal to the shared tool", async () => {
@@ -349,7 +428,222 @@ describe("MCP error mapping", () => {
       expect(signal).toBe(controller.signal);
       return { content: [{ type: "text" as const, text: "ok" }], details: undefined };
     });
-    await callTool({ surface: stub({ execute }), name: "herdr_inspect", args: {}, host: { cwd: "/project", signal: controller.signal }, callId: "c" });
+    await callTool({ surface: stub({ execute }), name: "herdr_inspect", args: {}, host: { cwd: "/project", signal: controller.signal }, callId: "c", queue: new SequentialToolQueue() });
     expect(execute).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Pane records may carry environment values the owner supplied for a child
+ * process. They are authoritative evidence for the owner, never model-visible
+ * content, so every projection this adapter publishes must strip them at every
+ * nesting depth while keeping the typed evidence a manager needs.
+ */
+const SENTINELS = ["pane-secret", "upper-secret", "env-secret", "vars-secret", "variables-secret", "overrides-secret", "array-secret", "deep-secret"];
+
+function leakyPane(paneId: string, label: string, status = "idle"): Record<string, unknown> {
+  return {
+    pane_id: paneId,
+    tab_id: "w:t",
+    workspace_id: "w",
+    label,
+    agent_name: label,
+    agent_status: status,
+    environment: { SECRET: "pane-secret" },
+    ENVIRONMENT: { SECRET: "upper-secret" },
+    env: { SECRET: "env-secret" },
+    env_vars: { SECRET: "vars-secret" },
+    environment_variables: { SECRET: "variables-secret" },
+    environment_overrides: { SECRET: "overrides-secret" },
+    history: [{ env: { SECRET: "array-secret" } }, { child: { grandchild: { environment: { SECRET: "deep-secret" } } } }]
+  };
+}
+
+function leakySurface() {
+  const panes = [leakyPane("w:p", "caller"), leakyPane("w:p2", "worker")];
+  const live = {
+    type: "session_snapshot",
+    snapshot: {
+      version: "1",
+      protocol: 1,
+      workspaces: [{ workspace_id: "w", label: "w" }],
+      tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
+      panes,
+      agents: [{ pane_id: "w:p", name: "caller", agent_status: "idle" }, { pane_id: "w:p2", name: "worker", agent_status: "idle" }]
+    }
+  };
+  const envelope = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
+  const exec: PiExec = async (_command, argv) => {
+    if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
+    if (argv[0] === "api") return envelope("snapshot", live);
+    if (argv[0] === "pane" && argv[1] === "get") return envelope("pane", { pane: panes.find((pane) => pane.pane_id === argv[2]) ?? leakyPane(argv[2]!, "created") });
+    if (argv[0] === "pane" && argv[1] === "read") return { stdout: "worker output", stderr: "", code: 0, killed: false };
+    if (argv[0] === "pane" && argv[1] === "split") return envelope("split", { pane: leakyPane("w:p3", "created") });
+    return envelope("other", { ok: true });
+  };
+  const cli = new HerdrCli(exec);
+  return createToolSurface({
+    cli,
+    context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" },
+    environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
+    preflight: createPreflight(cli),
+    settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "low" }),
+    jobs: new JobRegistry(),
+    profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
+    ownership: new RuntimeOwnership(),
+    cwd: "/project"
+  });
+}
+
+describe("MCP model-boundary redaction", () => {
+  it("strips environment values from inspect, wait, and pane evidence while keeping typed fields", async () => {
+    const surface = leakySurface();
+    const queue = new SequentialToolQueue();
+    const calls: Array<[string, unknown]> = [
+      ["herdr_inspect", { mode: "target", target: "w:p2" }],
+      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1_000 }],
+      ["herdr_pane", { operation: "split", target: "w:p2", label: "worker-split", direction: "right", focus: false }]
+    ];
+    for (const [name, args] of calls) {
+      const outcome = await callTool({ surface, name, args, host, callId: "c", queue });
+      expect(outcome.isError, name).toBeUndefined();
+      const text = outcome.content.map((block) => block.text).join("\n");
+      for (const sentinel of SENTINELS) expect(text, `${name} ${sentinel}`).not.toContain(sentinel);
+      // The environment keys themselves are gone, not just their values.
+      expect(text, name).not.toContain("environment_overrides");
+      // The typed evidence a manager needs survives the redaction.
+      expect(text, name).toContain("agent_status");
+      expect(text, name).toMatch(/w:p[23]/);
+    }
+  });
+
+  it("strips environment values from a raw record nested in an arbitrary details projection", async () => {
+    const outcome = await call(stub({
+      execute: async () => ({
+        content: [{ type: "text", text: "inspected" }],
+        details: { operation: "inspect", metadata: leakyPane("w:p2", "worker"), snapshots: [{ metadata: leakyPane("w:p3", "other") }], postState: { pane: leakyPane("w:p4", "launched") } }
+      })
+    }));
+    const text = outcome.content.map((block) => block.text).join("\n");
+    for (const sentinel of SENTINELS) expect(text, sentinel).not.toContain(sentinel);
+    expect(detailsOf(outcome)).toEqual({
+      operation: "inspect",
+      metadata: { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent_status: "idle", history: [{}, { child: { grandchild: {} } }] },
+      snapshots: [{ metadata: { pane_id: "w:p3", tab_id: "w:t", workspace_id: "w", label: "other", agent_name: "other", agent_status: "idle", history: [{}, { child: { grandchild: {} } }] } }],
+      postState: { pane: { pane_id: "w:p4", tab_id: "w:t", workspace_id: "w", label: "launched", agent_name: "launched", agent_status: "idle", history: [{}, { child: { grandchild: {} } }] } }
+    });
+  });
+});
+
+describe("MCP sequential execution", () => {
+  function overlapping(name: string, executionMode?: "sequential"): { definitions: HerdrToolDefinition[]; active: () => number; started: () => number; peak: () => number; release: () => void } {
+    let active = 0;
+    let started = 0;
+    let peak = 0;
+    const waiting: Array<() => void> = [];
+    return {
+      active: () => active,
+      started: () => started,
+      peak: () => peak,
+      release: () => { for (const resume of waiting.splice(0)) resume(); },
+      definitions: [{
+        name,
+        label: name,
+        description: "stub",
+        parameters: Type.Object({}, { additionalProperties: false }),
+        ...(executionMode ? { executionMode } : {}),
+        async execute() {
+          active += 1;
+          started += 1;
+          peak = Math.max(peak, active);
+          await new Promise<void>((resume) => waiting.push(resume));
+          active -= 1;
+          return { content: [{ type: "text" as const, text: "done" }], details: undefined };
+        }
+      }]
+    };
+  }
+
+  it("never runs two sequential calls concurrently and keeps other tools concurrent", async () => {
+    const sequential = overlapping("herdr_pane", "sequential");
+    const queue = new SequentialToolQueue();
+    const both = [
+      callTool({ surface: sequential, name: "herdr_pane", args: {}, host, callId: "first", queue }),
+      callTool({ surface: sequential, name: "herdr_pane", args: {}, host, callId: "second", queue })
+    ];
+    await vi.waitFor(() => expect(sequential.started()).toBe(1));
+    // The second call is queued behind the first, so it cannot have started.
+    expect(sequential.peak()).toBe(1);
+    sequential.release();
+    await vi.waitFor(() => expect(sequential.started()).toBe(2));
+    sequential.release();
+    expect((await Promise.all(both)).every((outcome) => outcome.isError === undefined)).toBe(true);
+    expect(sequential.peak()).toBe(1);
+
+    const parallel = overlapping("herdr_inspect");
+    const concurrent = [
+      callTool({ surface: parallel, name: "herdr_inspect", args: {}, host, callId: "first", queue }),
+      callTool({ surface: parallel, name: "herdr_inspect", args: {}, host, callId: "second", queue })
+    ];
+    await vi.waitFor(() => expect(parallel.peak()).toBe(2));
+    parallel.release();
+    await Promise.all(concurrent);
+  });
+
+  it("does not poison the queue when a sequential call fails or is invalid", async () => {
+    const order: string[] = [];
+    const definitions: HerdrToolDefinition[] = [{
+      name: "herdr_pane",
+      label: "Herdr Pane",
+      description: "stub",
+      executionMode: "sequential",
+      parameters: Type.Object({ fail: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
+      async execute(_id, args) {
+        order.push((args as { fail?: boolean }).fail ? "failed" : "ok");
+        if ((args as { fail?: boolean }).fail) throw Object.assign(new Error("CLI_PROTOCOL_ERROR: refused"), { code: "CLI_PROTOCOL_ERROR" });
+        return { content: [{ type: "text" as const, text: "done" }], details: undefined };
+      }
+    }];
+    const surface = { definitions };
+    const queue = new SequentialToolQueue();
+    const [failed, invalid, recovered] = await Promise.all([
+      callTool({ surface, name: "herdr_pane", args: { fail: true }, host, callId: "a", queue }),
+      callTool({ surface, name: "herdr_pane", args: { unknown: true }, host, callId: "b", queue }),
+      callTool({ surface, name: "herdr_pane", args: {}, host, callId: "c", queue })
+    ]);
+    expect(payload(failed!).code).toBe("CLI_PROTOCOL_ERROR");
+    expect(payload(invalid!).code).toBe("INVALID_INPUT");
+    expect(recovered!.isError).toBeUndefined();
+    expect(order).toEqual(["failed", "ok"]);
+  });
+
+  it("refuses queued calls that outlive the host instead of mutating during teardown", async () => {
+    const blocked = overlapping("herdr_pane", "sequential");
+    const queue = new SequentialToolQueue();
+    const holding = callTool({ surface: blocked, name: "herdr_pane", args: {}, host, callId: "holding", queue });
+    await vi.waitFor(() => expect(blocked.started()).toBe(1));
+    const waiting = callTool({ surface: blocked, name: "herdr_pane", args: {}, host, callId: "waiting", queue });
+    queue.close();
+    const afterClose = callTool({ surface: blocked, name: "herdr_pane", args: {}, host, callId: "after", queue });
+    blocked.release();
+    expect((await holding).isError).toBeUndefined();
+    expect(payload(await waiting)).toMatchObject({ code: "ABORTED", details: { tool: "herdr_pane", executionMode: "sequential", reason: "closed" } });
+    expect(payload(await afterClose)).toMatchObject({ code: "ABORTED", details: { reason: "closed" } });
+    // Only the call that had already started ever executed.
+    expect(blocked.peak()).toBe(1);
+  });
+
+  it("refuses a queued call whose request was cancelled before its turn", async () => {
+    const blocked = overlapping("herdr_pane", "sequential");
+    const queue = new SequentialToolQueue();
+    const holding = callTool({ surface: blocked, name: "herdr_pane", args: {}, host, callId: "holding", queue });
+    await vi.waitFor(() => expect(blocked.started()).toBe(1));
+    const controller = new AbortController();
+    const cancelled = callTool({ surface: blocked, name: "herdr_pane", args: {}, host: { cwd: "/project", signal: controller.signal }, callId: "cancelled", queue });
+    controller.abort();
+    blocked.release();
+    await holding;
+    expect(payload(await cancelled)).toMatchObject({ code: "ABORTED", details: { reason: "aborted" } });
+    expect(blocked.peak()).toBe(1);
   });
 });

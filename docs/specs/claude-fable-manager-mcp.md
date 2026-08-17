@@ -63,6 +63,8 @@ index.ts                              src/mcp-server.ts -> src/mcp/run.ts
 
 `src/tool-surface.ts` becomes the one place that constructs the seven tools from typed dependencies. `index.ts` keeps its Pi-only concerns (command registration, session events, wait-job UI, terminal notifications) and consumes the same surface. `CORE_TOOL_NAMES` moves to `src/tool-surface.ts` and is re-exported from `index.ts` so existing imports and tests keep working.
 
+`readInjectedContext` and `createPreflight` move with it, because both hosts need the injected Herdr identity and the per-call compatibility preflight, and `src/mcp/` must not import the Pi extension entry to reach them. Both are re-exported from `index.ts` as well.
+
 ### Typed adapter boundary
 
 The shared tools read exactly three fields from the host context: `cwd` (launch, pane, tab), `signal` (communicate, pane, tab fallback), and `modelRegistry` (wait reviewer only). The MCP host provides only `cwd` and `signal` and denies everything else at runtime, `modelRegistry` included: the host injects a throwing `reviewerFactory`, so nothing may reach `createPiModelReviewer`. A `modelRegistry` read is proof that the reviewer seam was bypassed and must fail loudly rather than resolve to `undefined`.
@@ -313,22 +315,33 @@ Only in the disposable named session `herdr-tools-integration`, extending the ex
 
 ### Phase 1: contract verification, no product code
 
-- [ ] Verify the four external contracts before writing the adapter.
+- [~] Verify the four external contracts before writing the adapter. Recorded below; the packaging probe stays with Phase 4.
   - Acceptance: recorded evidence for the plugin manifest and top-level server-map form, how `CLAUDE_PROJECT_DIR` reaches the MCP subprocess, headless importability of the shared modules in plain Node, and the installed SDK's list/call handler and `signal` shape.
   - Verify: throwaway probe in the scratch directory plus `/mcp` output from a disposable manager session, which must list the server and the `mcp__plugin_herdr-tools_herdr__*` tool names; results appended to this spec.
   - Files: this spec only.
   - Checkpoint: if the shared modules cannot be imported headlessly, add an injected renderer seam in `src/tools/` rather than duplicating any tool logic.
 
+#### Phase 1 evidence
+
+Probes ran in the scratch directory against the installed dependencies and the emitted `dist/`; no product file was written for them.
+
+- **Headless importability.** Compiling the repository with `rootDir: "."` and importing the emitted `dist/index.js` and `dist/src/tools/*.js` under plain `node` v25.9 constructs all seven tools with their renderers. `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `@earendil-works/pi-ai/compat` all load outside Pi, so no renderer seam is needed.
+- **SDK contract (`@modelcontextprotocol/sdk` 1.30.0).** The low-level `Server` with `ListToolsRequestSchema` and `CallToolRequestSchema` publishes `inputSchema` verbatim, including a `type: "object"` plus `anyOf` root, and carries `title`. `extra.signal` is an `AbortSignal` that aborts when the client cancels. A thrown `McpError(ErrorCode.MethodNotFound)` surfaces as JSON-RPC `-32601`; an `isError: true` result passes through as a normal result. `arguments` may arrive `undefined`. No Zod layer and no schema duplication is required. The `Server` class carries an `@deprecated` JSDoc tag pointing at `McpServer`; it is not deprecated behaviour and no lint or typecheck gate objects.
+- **TypeBox publication and validation.** `JSON.parse(JSON.stringify(schema))` yields `anyOf` roots with no root `additionalProperties` and per-variant `additionalProperties: false` for `herdr_inspect`, `herdr_communicate`, `herdr_jobs`, `herdr_pane`, and `herdr_tab`, and `type: "object"` roots for `herdr_wait` and `herdr_launch`. `Value.Check` and `Value.Errors` accept union roots. TypeBox 1.3 `ValueError` entries carry `keyword`, `schemaPath`, `instancePath`, `params`, and `message`, and no `path`; the adapter reports the first three as `keyword`, `instancePath`, `schemaPath`, and `message`.
+- **Truncation direction.** `truncateTail` from `@earendil-works/pi-coding-agent` keeps the tail and cannot bound a single-line JSON payload without dropping the head, and `truncateHead` returns empty content for a single line over the byte limit. The adapter therefore bounds its own payloads by bytes from the head, never splitting a code point, and keeps the existing `\n[output truncated]` marker. Per-tool bounds are unchanged.
+- **`CLAUDE_PROJECT_DIR`.** It is not present in the ambient Claude Code process environment in this installation, so the server map most likely needs the explicit `"env": { "CLAUDE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}" }` entry that assumption 4 anticipates. The startup check is an injectable env read with no fallback, so both forms are safe: the server refuses rather than guessing. Confirming which form the client actually delivers needs a loaded package and belongs to Phase 4's `/mcp` verification. The live Honcho plugin confirms the top-level server-map shape with `${CLAUDE_PLUGIN_ROOT}` expansion.
+- **Emission and startup.** `tsconfig.build.json` emits `dist/src/mcp-server.js` and `dist/index.js`; the entry stays inside `src/`, so typecheck, lint, and emit all cover it and no root shim is needed. `node dist/src/mcp-server.js` refuses with one bounded stderr line and exit 1 for a missing `HERDR_ENV`, missing or malformed injected identifiers, and a missing, relative, or nonexistent `CLAUDE_PROJECT_DIR`; with valid gating it lists the seven tools in order with object schemas, and `herdr_inspect` `collection: "profiles"` returns the same 11 bundled profiles with no diagnostics that the Pi host loads. The bundled catalog is anchored on the package manifest, so the source and emitted layouts resolve to the same repository root.
+
 ### Phase 2: shared tool surface extraction
 
-- [ ] Extract `src/tool-surface.ts` with typed dependencies and move `CORE_TOOL_NAMES`, re-exporting it from `index.ts`.
+- [x] Extract `src/tool-surface.ts` with typed dependencies and move `CORE_TOOL_NAMES`, re-exporting it from `index.ts`.
   - Acceptance: no behavior change in the Pi host; registration, ordering, descriptions, and schemas are identical; coverage stays 100%.
   - Verify: `npm run test:unit`, `npm run typecheck`, `npm run lint`.
   - Files: `src/tool-surface.ts`, `index.ts`, `test/unit/tool-surface.test.ts`, `test/unit/registration.test.ts`.
 
 ### Phase 3: MCP host and adapter
 
-- [ ] Add `@modelcontextprotocol/sdk`, the three `src/mcp/` modules, the compiled entry, `tsconfig.build.json`, and the `build:mcp` script.
+- [x] Add `@modelcontextprotocol/sdk`, the three `src/mcp/` modules, the compiled entry, `tsconfig.build.json`, and the `build:mcp` script.
   - Acceptance: gating, cwd resolution, capability proxy, schema publication, validation, bounded result/error mapping, cancellation, and shutdown all behave as specified; `@modelcontextprotocol/sdk` is the only added runtime dependency; `src/mcp-server.ts` is typechecked, linted, and emitted; `dist/src/mcp-server.js` starts and lists seven tools.
   - Verify: `npm run test:unit`, `npm run typecheck`, `npm run lint`, `npm run build`, `npm run build:mcp`.
   - Files: `package.json`, `tsconfig.build.json`, `vitest.config.ts`, `src/mcp/host.ts`, `src/mcp/adapter.ts`, `src/mcp/run.ts`, `src/mcp-server.ts`, `test/unit/mcp-host.test.ts`, `test/unit/mcp-adapter.test.ts`, `test/unit/mcp-run.test.ts`.

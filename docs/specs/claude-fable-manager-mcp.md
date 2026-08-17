@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved contract; implementation not started.
+Implemented through Phase 5. Phase 6 (optional shared wording alignment) is not started, and owner dogfooding of a live Fable manager session is outstanding.
 
 ## Objective
 
@@ -225,6 +225,7 @@ npm run typecheck
 npm run lint
 npm run build
 npm run build:mcp
+npm run validate:plugin
 HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration
 ```
 
@@ -253,7 +254,8 @@ test/unit/tool-surface.test.ts                        shared surface identity an
 test/unit/mcp-host.test.ts                            gating, cwd rules, capability proxy
 test/unit/mcp-adapter.test.ts                         schema, validation, result/error mapping, bounds
 test/unit/mcp-run.test.ts                             startup order, lifecycle, shutdown
-test/integration/herdr-tools.integration.test.ts      disposable-session MCP evidence
+test/unit/claude-plugin.test.ts                       package inventory, manifest, server map, skill conduct
+test/integration/herdr-mcp.integration.test.ts        disposable-session MCP evidence
 docs/specs/claude-fable-manager-mcp.md
 docs/decisions/009-shared-claude-mcp-adapter.md
 docs/decisions/010-claude-manager-plugin-conduct.md
@@ -366,6 +368,7 @@ Probes ran in the scratch directory against the installed dependencies and the e
 
 #### Phase 4 evidence
 
+- **Live load.** `claude --plugin-dir ./claude-manager-plugin mcp list` reports `plugin:herdr-tools:herdr: node /home/gabriel/workspace/herdr-tools-claude-mcp/claude-manager-plugin/../dist/src/mcp-server.js - ✔ Connected`, so `${CLAUDE_PLUGIN_ROOT}` expands as specified and the built entry passes its startup gating under a real Claude Code load. `claude --plugin-dir ./claude-manager-plugin plugin details herdr-tools` reports skills 1 (`herdr-manager`), agents 0, hooks 0. That inventory prints "MCP servers (0)" because it counts inline manifest entries and this manifest points at the sibling `mcp-servers.json`; `mcp list` is the authority and shows the server registered and connected. The published tool names were not read from a live session's tool list: they follow from the `plugin:herdr-tools:herdr` server id by the same rule the installed Honcho plugin demonstrates (`plugin:honcho:honcho` publishing `mcp__plugin_honcho_honcho__*`). Confirming the exact names in a Fable manager session is left to owner dogfooding.
 - **Package contents.** Exactly three files: `.claude-plugin/plugin.json`, `mcp-servers.json`, and `skills/herdr-manager/SKILL.md`. No `.claude/agents`, no hooks, no settings, no `allowedTools`/`disallowedTools`, no permission-mode field. `claude plugin validate ./claude-manager-plugin` passes on Claude Code 2.1.233, and `test/unit/claude-plugin.test.ts` pins the manifest shape, the single `herdr` server key, the resolved entry path, the derived `mcp__plugin_herdr-tools_herdr__*` names, and the required skill conduct.
 - **`CLAUDE_PROJECT_DIR` delivery.** Default delivery is authoritative; no `env` mapping is carried. Two sources agree.
   - Official documentation (Claude Code plugins reference): `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, and `${CLAUDE_PROJECT_DIR}` "are exported as environment variables to hook processes and to MCP and LSP server subprocesses", with `${CLAUDE_PROJECT_DIR}` resolving to the project root.
@@ -374,10 +377,17 @@ Probes ran in the scratch directory against the installed dependencies and the e
 
 ### Phase 5: integration evidence and documentation
 
-- [ ] Extend the disposable-session integration suite and document installation in the existing README structure.
+- [x] Extend the disposable-session integration suite and document installation in the existing README structure.
   - Acceptance: every integration assertion in the testing strategy passes; the live workspace is untouched; README documents installation, the manager launch command, and the `herdr_jobs` polling model.
   - Verify: `HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration`, then the full command list in order.
-  - Files: `test/integration/herdr-tools.integration.test.ts`, `README.md`.
+  - Files: `test/integration/herdr-mcp.integration.test.ts`, `README.md`.
+
+#### Phase 5 evidence
+
+- The MCP evidence lives in a second suite, `test/integration/herdr-mcp.integration.test.ts`, beside the existing extension suite. Vitest runs integration files sequentially (`fileParallelism: false`, `maxWorkers: 1`), and each suite owns a complete session lifecycle, so neither depends on the other's state.
+- The server is bound to the disposable session through `HERDR_SOCKET_PATH`, which the spawned `herdr` client processes inherit. The default session's workspace, tab, and pane IDs are captured before the run and asserted unchanged after it.
+- **Herdr runtime constraint.** Herdr 0.8.0 attaches a shell to a newly created pane asynchronously and exposes no readiness field on the pane record, so `agent start` immediately after `tab create` intermittently returns `agent_pane_busy` (observed in 1 of 3 back-to-back attempts). This affects the Pi host identically and is not introduced by this slice. The suite therefore launches into a pane created earlier in the same run and adds one bounded settle; the launch assertion itself is unchanged and a failure is still a failure. A readiness signal on the pane record would remove the settle.
+- `herdr_communicate` is exercised with `steer`, because the worker is still working on its assignment prompt and `prompt` correctly refuses to interrupt a working target with `TARGET_BUSY`. Both carry the same mandatory v1 envelope, which is then observed in authoritative pane output.
 
 ### Phase 6: optional shared wording alignment
 
@@ -419,16 +429,16 @@ Probes ran in the scratch directory against the installed dependencies and the e
 
 ## Success criteria
 
-- [ ] A Claude Fable manager session in a Herdr pane lists and calls exactly the seven tools through the local stdio adapter.
-- [ ] Pi and Claude hosts run the same tool implementation and profile catalog, with no duplicated schema or policy.
-- [ ] `@modelcontextprotocol/sdk` is the only added runtime dependency.
-- [ ] Startup refuses to serve without `HERDR_ENV=1`, valid injected IDs, and a valid absolute existing `CLAUDE_PROJECT_DIR`, and never falls back to subprocess or module paths.
-- [ ] Profile discovery, prompt sources, bounded fallback, ownership, and v1 provenance behave identically across hosts.
-- [ ] Detached waits are created and polled through `herdr_jobs`, with no self-communication and no automatic turn injection.
-- [ ] Waits beyond the effective review cadence fail closed with a typed reviewer error in both foreground and detached form.
-- [ ] The package adds only packaging and a conduct skill; model selection remains launch/user configuration and mismatch is reported, not enforced.
-- [ ] The package loads from this repository with `--plugin-dir` and its tools resolve as `mcp__plugin_herdr-tools_herdr__*`; marketplace publication is documented as blocked rather than half-supported.
-- [ ] Unit coverage stays at 100% for included sources with `src/mcp-server.ts` the only exclusion; the entry is typechecked, linted, built, and exercised by integration.
+- [~] A Claude Fable manager session in a Herdr pane lists and calls exactly the seven tools through the local stdio adapter. The adapter lists and calls all seven over real stdio in the disposable-session integration run, and the packaged server connects under a real `--plugin-dir` load. Doing it from inside a live Fable session is owner dogfooding.
+- [x] Pi and Claude hosts run the same tool implementation and profile catalog, with no duplicated schema or policy.
+- [x] `@modelcontextprotocol/sdk` is the only added runtime dependency.
+- [x] Startup refuses to serve without `HERDR_ENV=1`, valid injected IDs, and a valid absolute existing `CLAUDE_PROJECT_DIR`, and never falls back to subprocess or module paths.
+- [x] Profile discovery, prompt sources, bounded fallback, ownership, and v1 provenance behave identically across hosts.
+- [x] Detached waits are created and polled through `herdr_jobs`, with no self-communication and no automatic turn injection.
+- [x] Waits beyond the effective review cadence fail closed with a typed reviewer error in both foreground and detached form.
+- [x] The package adds only packaging and a conduct skill; model selection remains launch/user configuration and mismatch is reported, not enforced.
+- [~] The package loads from this repository with `--plugin-dir` and its tools resolve as `mcp__plugin_herdr-tools_herdr__*`; marketplace publication is documented as blocked rather than half-supported. Loading and the blocked-publication statement are done; the tool-name form is derived from the observed `plugin:herdr-tools:herdr` server id rather than read from a live tool list.
+- [x] Unit coverage stays at 100% for included sources with `src/mcp-server.ts` the only exclusion; the entry is typechecked, linted, built, and exercised by integration.
 
 ## Stop conditions
 

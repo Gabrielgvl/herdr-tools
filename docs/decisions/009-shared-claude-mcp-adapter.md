@@ -26,7 +26,7 @@ Expose the existing seven tools to Claude through a local stdio MCP adapter that
 
 The adapter uses the SDK's low-level `Server` with `tools/list` and `tools/call` handlers over `StdioServerTransport`. Published `inputSchema` values are structural clones of the shared TypeBox schemas; a union root is published as `{ "type": "object", "anyOf": [...] }` with per-variant `additionalProperties: false`, and any other root shape is a startup failure. Arguments are validated with `typebox/value` against the same schema before `execute`, which reproduces the guarantee the Pi host gives today. Results return the shared content blocks verbatim plus one bounded `herdr-details` JSON block; failures return `isError: true` with the error's own typed code; an unknown tool name is a JSON-RPC `MethodNotFound`. `structuredContent` and `outputSchema` are not published.
 
-The Pi `ExtensionContext` type is crossed at exactly one seam. The adapter builds a narrow host object with `cwd` and `signal`, wraps it in a Proxy that returns `undefined` for symbol keys and throws `HOST_CAPABILITY_UNAVAILABLE` for any string key outside `cwd`, `signal`, and `modelRegistry`, and casts that Proxy once. A unit test exercises all seven tools against a recording proxy, so an upstream tool that starts reading a new host field fails closed instead of silently reading `undefined`.
+The Pi `ExtensionContext` type is crossed at exactly one seam. The adapter builds a narrow host object with `cwd` and `signal`, wraps it in a Proxy that returns `undefined` for symbol keys and throws `HOST_CAPABILITY_UNAVAILABLE` for every other key, and casts that Proxy once. `modelRegistry` is denied along with everything else: the host injects a throwing `reviewerFactory`, so a `modelRegistry` read can only mean the reviewer seam was bypassed, and that must fail loudly rather than resolve to `undefined`. A unit test exercises all seven tools against a recording proxy to prove the read set is exactly `cwd` and `signal`.
 
 Startup is fail-closed and ordered: `HERDR_ENV=1`; injected `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID` present and valid; `CLAUDE_PROJECT_DIR` present, absolute, and an existing directory. That directory is both the profile-discovery `projectCwd` and the operational `cwd`. There is no fallback to `process.cwd()`, the plugin root, or a module-relative path. Any failure exits non-zero before the transport connects, with no tool registered and no CLI call made. Herdr CLI compatibility stays a per-call preflight, unchanged from the Pi host.
 
@@ -34,7 +34,9 @@ Detached waits keep the in-memory job registry and are polled through `herdr_job
 
 Model-backed wait review remains a Pi capability. The MCP host injects a `reviewerFactory` that throws, so a wait whose timeout exceeds the configured review cadence fails closed with `REVIEWER_FAILED` in both foreground and detached form. The existing 1..30 minute `wait.reviewCadenceMinutes` setting is the only supervision knob; no unsupervised long wait is allowed.
 
-`@modelcontextprotocol/sdk` is the only new runtime dependency. The stdio entry is compiled to `dist/` because it runs under plain `node` without Pi's TypeScript loader.
+`@modelcontextprotocol/sdk` is the only new runtime dependency. The stdio entry lives at `src/mcp-server.ts` so typecheck, lint, and emit all cover it, and is compiled by `tsconfig.build.json` to `dist/src/mcp-server.js` because it runs under plain `node` without Pi's TypeScript loader. It carries no logic beyond an argument-free call into the run module, so it is the single `coverage.exclude` entry and is verified by the disposable-session integration run instead. No untyped root shim is introduced.
+
+Because the server command resolves through `${CLAUDE_PLUGIN_ROOT}/..` into the installed repository, this slice supports local `--plugin-dir` loading only and marketplace publication is blocked.
 
 ## Alternatives considered
 
@@ -70,6 +72,18 @@ Rejected because the subprocess working directory is chosen by the client, not t
 
 Rejected because self-communication and automatic turn injection would make the adapter an actor in the manager's turn loop. Polling through `herdr_jobs` keeps the manager in control and keeps the evidence path authoritative.
 
+### Allow `modelRegistry` to read as `undefined` on the MCP host
+
+Rejected because the throwing `reviewerFactory` already covers the supported path. A tolerated `undefined` read would let a future code path construct a reviewer with no registry and fail deep inside a wait loop instead of at the boundary.
+
+### Ship an untyped root shim as the executable entry
+
+Rejected because a root file outside the existing `tsconfig.json` include and `eslint` inputs would be the one part of the server that no gate checks. Keeping the entry in `src/` costs one explicit coverage exclusion and buys typecheck, lint, and emit coverage.
+
+### Make the package self-contained for marketplace installation now
+
+Rejected for this slice. A cached marketplace install keeps only the package directory, so the server would need its own bundled build and dependency copy, which is a packaging redesign. Constraining the slice to local `--plugin-dir` loading and stating that publication is blocked is the smaller honest contract.
+
 ### Allow long waits without a reviewer on the MCP host
 
 Rejected because it would silently drop the supervision the Pi host applies. Failing closed keeps the missing capability visible and leaves the cadence decision with the owner.
@@ -80,6 +94,7 @@ Rejected because it would silently drop the supervision the Pi host applies. Fai
 - Every future tool or policy change lands once and reaches both hosts.
 - The MCP host is deliberately weaker in two visible ways: no model-backed review beyond the configured cadence, and no push notification when a detached wait completes.
 - Ownership and job state are per host process, so a server restart loses the ledger and leaves Herdr resources visible for explicit manual handling, exactly as ADR-001 specifies for the Pi runtime.
-- An extra build step exists: the stdio entry must be compiled before the manager session can load it.
+- An extra build step exists: the stdio entry must be compiled to `dist/src/mcp-server.js` before the manager session can load it.
+- The package is usable only from its place in this repository via `--plugin-dir`; marketplace distribution stays blocked until a self-contained package is authorized.
 - Any upstream change that makes a tool read a new host field breaks loudly in tests and at runtime instead of degrading quietly.
 - ADR-007's rejection of Herdr lifecycle tools for delegated Claude workers is unchanged; parity is granted only to the owner-started interactive manager session.

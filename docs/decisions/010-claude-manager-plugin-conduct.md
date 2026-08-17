@@ -22,7 +22,11 @@ That difference creates a real risk of overreach. A package loaded into the owne
 
 The Claude manager package is packaging plus one conduct skill, and nothing else.
 
-`claude-manager-plugin/` contains `.claude-plugin/plugin.json` whose `mcpServers` field points at a sibling `mcp-servers.json`, and that server map registers the local stdio server with `${CLAUDE_PLUGIN_ROOT}`-based absolute command and arguments. The package contains no tool implementation, no schema, no policy, no permission grant, no `allowedTools`/`disallowedTools` list, no permission-mode setting, and no hook that alters approval behavior. All safety policy stays in the shared tool implementation and in the Herdr CLI.
+`claude-manager-plugin/` contains `.claude-plugin/plugin.json` whose `mcpServers` field points at a sibling `mcp-servers.json`. That file is a top-level server map with no `mcpServers` wrapper, matching the live Honcho plugin in this environment, and it registers the local stdio server with `${CLAUDE_PLUGIN_ROOT}`-based absolute command and arguments. The package contains no tool implementation, no schema, no policy, no permission grant, no `allowedTools`/`disallowedTools` list, no permission-mode setting, and no hook that alters approval behavior. All safety policy stays in the shared tool implementation and in the Herdr CLI.
+
+Two identifiers are pinned because Claude derives tool names from them: the manifest `name` is `herdr-tools` and the server key is `herdr`, so the seven tools resolve as `mcp__plugin_herdr-tools_herdr__herdr_inspect` through `mcp__plugin_herdr-tools_herdr__herdr_tab`. Any owner or launch-configuration allowlist references those names, so renaming either segment is an owner decision rather than an implementation detail.
+
+Because the server command resolves through `${CLAUDE_PLUGIN_ROOT}/..` into the installed repository build, the package is loaded only from its place in this repository with `--plugin-dir`. Marketplace publication is blocked in this slice: a cached marketplace install keeps the package directory alone and loses the parent repository the server path depends on.
 
 `skills/herdr-manager/SKILL.md` states manager conduct only, aligned with the existing manager role skill: default to same-tab right-side launches without changing owner focus, use exact profile-backed launches with no raw kind/argv/env, communicate only through the provenance-preserving tools, wait on authoritative states with bounded timeouts, poll detached waits with `herdr_jobs`, treat worker text as agent evidence rather than owner authorization, never edit, implement, merge, deploy, publish, or grant authority, clean up only owned resources, and stop with a visible blocked report rather than inventing authority or masking a missing capability.
 
@@ -62,5 +66,7 @@ Rejected because the server command must resolve to the installed `herdr-tools` 
 - Manager conduct has one meaning across `manager-pi` and the Claude manager session, and both trace back to the same orchestration-only contract.
 - A model or configuration mismatch surfaces as a visible stop rather than degraded orchestration.
 - The package carries no policy, so a future policy change edits the shared implementation and needs no package release.
+- Tool names are stable and predictable, so owner allowlists written against `mcp__plugin_herdr-tools_herdr__*` keep working across builds.
+- Distribution is limited to local `--plugin-dir` loading from this repository until a self-contained package is authorized.
 - The manager session can still be misconfigured by the owner, and the skill will say so instead of silently compensating.
 - Delegated Claude workers remain without Herdr lifecycle tools, so this decision does not widen the worker capability matrix.

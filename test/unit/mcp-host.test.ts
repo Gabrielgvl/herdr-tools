@@ -8,7 +8,7 @@ import { RuntimeOwnership } from "../../src/ownership.js";
 import { createPreflight, createToolSurface } from "../../src/tool-surface.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import { createLaunchTool } from "../../src/tools/launch.js";
-import { EXEC_FORCE_KILL_MS, EXEC_IDLE_GRACE_MS, HOST_FIELDS, HostCapabilityError, StartupRefusal, createNodeExec, hostContext, resolveStartup, type ChildProcessLike, type SpawnLike } from "../../src/mcp/host.js";
+import { EXEC_FORCE_KILL_MS, EXEC_IDLE_GRACE_MS, EXEC_MAX_OUTPUT_BYTES, HOST_FIELDS, HostCapabilityError, StartupRefusal, createNodeExec, hostContext, resolveStartup, type ChildProcessLike, type SpawnLike } from "../../src/mcp/host.js";
 
 const snapshot = {
   type: "session_snapshot",
@@ -339,6 +339,76 @@ describe("MCP node exec adapter", () => {
     second.fire("close", 1);
     second.fire("close", 1);
     await expect(pendingSecond).resolves.toMatchObject({ code: 1, killed: true });
+  });
+
+  it("rejects a stream that crosses the documented output ceiling and kills the child", async () => {
+    vi.useFakeTimers();
+    expect(EXEC_MAX_OUTPUT_BYTES).toBe(1_048_576);
+    const child = new FakeChild();
+    const pending = createNodeExec({ cwd: "/project", spawn: spawnFake(child).spawn })("herdr", ["pane", "read"], { timeout: 10_000 });
+    // A protocol envelope that keeps growing: the first chunks are collected and
+    // the chunk that crosses the ceiling ends the call.
+    child.stdout?.listener?.(`{"id":"read","result":"${"a".repeat(EXEC_MAX_OUTPUT_BYTES - 100)}`);
+    expect(child.signals).toEqual([]);
+    child.stdout?.listener?.("b".repeat(200));
+    const failure = await pending.catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      name: "CliProtocolError",
+      code: "CLI_OUTPUT_OVERFLOW",
+      details: { stream: "stdout", limitBytes: EXEC_MAX_OUTPUT_BYTES, killed: true }
+    });
+    // Bounded evidence, not the megabyte that was collected.
+    const details = (failure as { details: { stdout: string; stderr: string } }).details;
+    expect(Buffer.byteLength(details.stdout, "utf8")).toBeLessThanOrEqual(50_100);
+    expect(details.stdout.endsWith("[output truncated]")).toBe(true);
+    expect(details.stderr).toBe("");
+    expect(child.stdout?.destroyed).toBe(true);
+    expect(child.stderr?.destroyed).toBe(true);
+    // Deterministic teardown: SIGTERM now, and the same SIGKILL escalation a
+    // timeout uses, because the child is still producing output.
+    expect(child.signals).toEqual(["SIGTERM"]);
+    await vi.advanceTimersByTimeAsync(EXEC_FORCE_KILL_MS);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  it("applies the ceiling to stderr and to a multibyte stream without splitting a code point", async () => {
+    const noisy = new FakeChild();
+    const stderrOverflow = createNodeExec({ cwd: "/project", spawn: spawnFake(noisy).spawn })("herdr", ["status"], {});
+    noisy.stderr?.listener?.("e".repeat(EXEC_MAX_OUTPUT_BYTES + 1));
+    await expect(stderrOverflow).rejects.toMatchObject({ code: "CLI_OUTPUT_OVERFLOW", details: { stream: "stderr" } });
+    expect(noisy.signals).toEqual(["SIGTERM"]);
+
+    // Byte accounting is on decoded UTF-8: a sheep is four bytes, so the
+    // ceiling is crossed by bytes and never mid code point.
+    const multibyte = new FakeChild();
+    const sheepOverflow = createNodeExec({ cwd: "/project", spawn: spawnFake(multibyte).spawn })("herdr", ["pane", "read"], {});
+    const sheep = Buffer.from("🐑".repeat(EXEC_MAX_OUTPUT_BYTES / 4), "utf8");
+    multibyte.stdout?.listener?.(sheep.subarray(0, sheep.length - 2));
+    expect(multibyte.signals).toEqual([]);
+    multibyte.stdout?.listener?.(sheep.subarray(sheep.length - 2));
+    multibyte.stdout?.listener?.(Buffer.from("🐑", "utf8"));
+    const failure = await sheepOverflow.catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "CLI_OUTPUT_OVERFLOW", details: { stream: "stdout" } });
+    expect((failure as { details: { stdout: string } }).details.stdout).not.toContain("�");
+  });
+
+  it("collects nothing after the call settles, so a runaway child cannot grow it", async () => {
+    const child = new FakeChild();
+    const pending = createNodeExec({ cwd: "/project", spawn: spawnFake(child).spawn })("herdr", ["status"], {});
+    child.stdout?.listener?.("done");
+    child.fire("close", 0);
+    await expect(pending).resolves.toEqual({ stdout: "done", stderr: "", code: 0, killed: false });
+    child.stdout?.listener?.("x".repeat(EXEC_MAX_OUTPUT_BYTES + 1));
+    child.stderr?.listener?.("y".repeat(EXEC_MAX_OUTPUT_BYTES + 1));
+    // Post-settle chunks are not collected and cannot trigger an overflow kill.
+    expect(child.signals).toEqual([]);
+    await expect(pending).resolves.toEqual({ stdout: "done", stderr: "", code: 0, killed: false });
+  });
+
+  it("bounds a real child that floods stdout", async () => {
+    const exec = createNodeExec({ cwd: tmpdir() });
+    const flood = exec(process.execPath, ["-e", `const line = "z".repeat(64 * 1024) + "\\n"; for (let index = 0; index < 64; index += 1) process.stdout.write(line);`], { timeout: 20_000 });
+    await expect(flood).rejects.toMatchObject({ code: "CLI_OUTPUT_OVERFLOW", details: { stream: "stdout" } });
   });
 
   it("executes a real process with the default spawn", async () => {

@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import { isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { ExecOptions, ExecResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { PiExec } from "../cli.js";
+import { boundedEvidence, CliProtocolError, type PiExec } from "../cli.js";
 import type { CurrentContext } from "../targets.js";
 import { readInjectedContext, type EnvironmentState } from "../tool-surface.js";
 
@@ -126,6 +126,21 @@ export const EXEC_FORCE_KILL_MS = 5_000;
  * already-written pipe buffer.
  */
 export const EXEC_IDLE_GRACE_MS = 100;
+/**
+ * Hard ceiling on the decoded bytes this host collects from one child stream.
+ *
+ * `HerdrCli` bounds evidence only after a call settles, so the ceiling has to be
+ * enforced while the pipes are still streaming: without it a runaway `herdr`
+ * response would be accumulated in full inside the MCP server first. The
+ * configured timeout bounds duration, not volume.
+ *
+ * 1 MiB is twenty times the 50 KiB evidence bound `HerdrCli` keeps, so every
+ * legitimate snapshot, pane read, or protocol envelope fits well below it. A
+ * stream that crosses the ceiling is a failure, not a truncation: silently
+ * cutting a JSON envelope would turn overflow into a parse error or, worse, into
+ * a plausible-looking success.
+ */
+export const EXEC_MAX_OUTPUT_BYTES = 1_048_576;
 
 interface ChildStream {
   on(event: "data", listener: (chunk: unknown) => void): unknown;
@@ -154,6 +169,18 @@ function decodeChunk(decoder: StringDecoder, chunk: unknown): string {
   return decoder.write(Buffer.from(String(chunk), "utf8"));
 }
 
+/** One child stream, decoded as UTF-8 and measured against the host ceiling. */
+interface Collected {
+  readonly stream: "stdout" | "stderr";
+  readonly decoder: StringDecoder;
+  text: string;
+  bytes: number;
+}
+
+function collector(stream: "stdout" | "stderr"): Collected {
+  return { stream, decoder: new StringDecoder("utf8"), text: "", bytes: 0 };
+}
+
 /**
  * The MCP host's process-execution capability, matching the Pi host contract:
  * no shell, bounded by the caller's timeout and signal, and the host owns the
@@ -167,16 +194,17 @@ function decodeChunk(decoder: StringDecoder, chunk: unknown): string {
  * evidence and report `CLI_PROTOCOL_ERROR` instead.
  *
  * Both pipes are decoded through a streaming UTF-8 decoder, so a code point
- * split across two chunks cannot corrupt evidence.
+ * split across two chunks cannot corrupt evidence, and each pipe is measured
+ * against `EXEC_MAX_OUTPUT_BYTES` while it streams: crossing the ceiling kills
+ * the child and rejects with `CLI_OUTPUT_OVERFLOW` instead of accumulating an
+ * unbounded string. Nothing is collected after the call settles.
  */
 export function createNodeExec(options: NodeExecOptions): PiExec {
   const spawnProcess = options.spawn ?? (spawn as unknown as SpawnLike);
   return (command: string, args: string[], execOptions: ExecOptions) => new Promise<ExecResult>((resolve, reject) => {
     const child = spawnProcess(command, args, { cwd: options.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
-    const stdoutDecoder = new StringDecoder("utf8");
-    const stderrDecoder = new StringDecoder("utf8");
-    let stdout = "";
-    let stderr = "";
+    const out = collector("stdout");
+    const err = collector("stderr");
     let killed = false;
     let settled = false;
     let exited = false;
@@ -193,9 +221,9 @@ export function createNodeExec(options: NodeExecOptions): PiExec {
       child.kill("SIGTERM");
       forceTimer = setTimeout(() => child.kill("SIGKILL"), EXEC_FORCE_KILL_MS);
     };
-    const release = (): void => {
+    const release = (keepEscalation = false): void => {
       settled = true;
-      for (const timer of [idleTimer, forceTimer, timeoutTimer]) {
+      for (const timer of keepEscalation ? [idleTimer, timeoutTimer] : [idleTimer, forceTimer, timeoutTimer]) {
         if (timer) clearTimeout(timer);
       }
       execOptions.signal?.removeEventListener("abort", kill);
@@ -205,7 +233,42 @@ export function createNodeExec(options: NodeExecOptions): PiExec {
     const settle = (code: number | null): void => {
       if (settled) return;
       release();
-      resolve({ stdout: stdout + stdoutDecoder.end(), stderr: stderr + stderrDecoder.end(), code: code ?? 0, killed });
+      resolve({ stdout: out.text + out.decoder.end(), stderr: err.text + err.decoder.end(), code: code ?? 0, killed });
+    };
+    const armIdle = (code: number | null): void => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => settle(code), EXEC_IDLE_GRACE_MS);
+    };
+    /**
+     * Overflow is a rejected call, not a truncated success. The child is torn
+     * down with the same `SIGTERM` then `SIGKILL` escalation a timeout uses — the
+     * escalation timer deliberately survives `release` here, because the process
+     * is still producing output — and `HerdrCli` re-throws this typed failure
+     * unchanged, so the model sees `CLI_OUTPUT_OVERFLOW` with bounded evidence.
+     */
+    const overflow = (target: Collected): void => {
+      release(true);
+      kill();
+      reject(new CliProtocolError("CLI_OUTPUT_OVERFLOW", "Herdr CLI produced more output than the MCP host collects", {
+        stream: target.stream,
+        limitBytes: EXEC_MAX_OUTPUT_BYTES,
+        killed: true,
+        stdout: boundedEvidence(out.text).value,
+        stderr: boundedEvidence(err.text).value
+      }));
+    };
+    /** Collect one chunk under the ceiling; nothing is collected after settling. */
+    const collect = (target: Collected, chunk: unknown): void => {
+      if (settled) return;
+      observed = true;
+      const decoded = decodeChunk(target.decoder, chunk);
+      target.text += decoded;
+      target.bytes += Buffer.byteLength(decoded, "utf8");
+      if (target.bytes > EXEC_MAX_OUTPUT_BYTES) {
+        overflow(target);
+        return;
+      }
+      if (exited) armIdle(exitCode);
     };
     const fail = (error: Error): void => {
       if (settled) return;
@@ -218,21 +281,9 @@ export function createNodeExec(options: NodeExecOptions): PiExec {
       release();
       reject(error);
     };
-    const armIdle = (code: number | null): void => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => settle(code), EXEC_IDLE_GRACE_MS);
-    };
 
-    child.stdout?.on("data", (chunk) => {
-      observed = true;
-      stdout += decodeChunk(stdoutDecoder, chunk);
-      if (exited) armIdle(exitCode);
-    });
-    child.stderr?.on("data", (chunk) => {
-      observed = true;
-      stderr += decodeChunk(stderrDecoder, chunk);
-      if (exited) armIdle(exitCode);
-    });
+    child.stdout?.on("data", (chunk) => collect(out, chunk));
+    child.stderr?.on("data", (chunk) => collect(err, chunk));
     child.once("exit", (code) => {
       exited = true;
       observed = true;

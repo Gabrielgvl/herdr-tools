@@ -1,5 +1,7 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { Type } from "typebox";
+import type { TSchema } from "typebox";
+import { Value } from "typebox/value";
 import { describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { JobRegistry } from "../../src/job-registry.js";
@@ -100,6 +102,68 @@ describe("MCP input schema publication", () => {
     expect(descriptors.every((descriptor) => descriptor.inputSchema.type === "object")).toBe(true);
     expect(descriptors[0]!.inputSchema).not.toBe(surface.definitions[0]!.parameters);
     expect(descriptors[0]!.inputSchema).toMatchObject({ anyOf: expect.any(Array) as unknown as unknown[] });
+  });
+});
+
+describe("MCP published schema parity", () => {
+  it("publishes each shared schema unchanged except for the object root MCP requires", () => {
+    for (const definition of realSurface().definitions) {
+      const source = JSON.parse(JSON.stringify(definition.parameters)) as Record<string, unknown>;
+      // Publication may only add the root `type`; it can never drop or loosen a
+      // keyword, so the published document cannot accept more than validation.
+      expect(publishedInputSchema(definition.parameters)).toEqual({ ...source, type: "object" });
+    }
+  });
+
+  it("accepts and rejects exactly the same arguments as server-side validation", async () => {
+    const surface = realSurface();
+    // The mixed and extra-field shapes are the ones a manager session actually
+    // tried; every union variant is strict, so a field from another mode is an
+    // additional property in the mode it was mixed into.
+    const cases: Array<[string, unknown, boolean]> = [
+      ["herdr_inspect", {}, true],
+      ["herdr_inspect", { mode: "context" }, true],
+      ["herdr_inspect", { mode: "health" }, true],
+      ["herdr_inspect", { mode: "target", target: "w:p2" }, true],
+      ["herdr_inspect", { mode: "collection", collection: "panes" }, true],
+      ["herdr_inspect", { mode: "collection", collection: "profiles" }, true],
+      ["herdr_inspect", { mode: "profile", profile: "worker-pi" }, true],
+      ["herdr_inspect", { mode: "context", collection: "panes" }, false],
+      ["herdr_inspect", { mode: "context", profile: "worker-pi" }, false],
+      ["herdr_inspect", { mode: "context", target: "w:p2" }, false],
+      ["herdr_inspect", { mode: "health", target: "w:p2" }, false],
+      ["herdr_inspect", { mode: "collection", collection: "panes", profile: "worker-pi" }, false],
+      ["herdr_inspect", { mode: "target" }, false],
+      ["herdr_inspect", { mode: "profile" }, false],
+      ["herdr_inspect", { mode: "bogus" }, false],
+      ["herdr_inspect", { collection: "panes" }, false],
+      ["herdr_inspect", { mode: "context", extra: true }, false],
+      ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi" }, true],
+      ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi", keys: ["enter"] }, false],
+      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["enter"], text: "hi" }, false],
+      ["herdr_jobs", { operation: "list" }, true],
+      ["herdr_jobs", { operation: "list", jobId: "job_1" }, false],
+      ["herdr_jobs", { operation: "get", jobId: "job_1", status: "running" }, false],
+      ["herdr_pane", { operation: "focus", target: "w:p2" }, true],
+      ["herdr_pane", { operation: "focus", target: "w:p2", label: "worker" }, false],
+      ["herdr_tab", { operation: "focus", target: "w:t" }, true],
+      ["herdr_tab", { operation: "focus", target: "w:t", label: "review" }, false],
+      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5 }, true],
+      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi" }, true],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", extra: true }, false]
+    ];
+    for (const [name, args, accepted] of cases) {
+      const definition = surface.definitions.find((candidate) => candidate.name === name)!;
+      const published = publishedInputSchema(definition.parameters) as unknown as TSchema;
+      const label = `${name} ${JSON.stringify(args)}`;
+      expect(Value.Check(published, args), `published: ${label}`).toBe(accepted);
+      expect(Value.Check(definition.parameters, args), `validation: ${label}`).toBe(accepted);
+      if (accepted) continue;
+      const outcome = await callTool({ surface, name, args, host, callId: "c" });
+      expect(outcome.isError, label).toBe(true);
+      expect(payload(outcome).code, label).toBe("INVALID_INPUT");
+    }
   });
 });
 

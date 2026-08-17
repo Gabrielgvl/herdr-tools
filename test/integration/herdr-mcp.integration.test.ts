@@ -7,7 +7,11 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { describe, expect, it } from "vitest";
-import { CORE_TOOL_NAMES } from "../../src/tool-surface.js";
+import { HerdrCli } from "../../src/cli.js";
+import { JobRegistry } from "../../src/job-registry.js";
+import { RuntimeOwnership } from "../../src/ownership.js";
+import { publishedInputSchema } from "../../src/mcp/adapter.js";
+import { createPreflight, createToolSurface, CORE_TOOL_NAMES } from "../../src/tool-surface.js";
 
 const execFileAsync = promisify(execFile);
 const REQUIRED_SESSION = "herdr-tools-integration";
@@ -42,6 +46,26 @@ function evidence(result: ToolResult): Record<string, unknown> {
 
 function text(result: ToolResult): string {
   return result.content.map((block) => block.text).join("\n");
+}
+
+/**
+ * A surface built purely to read the shared TypeBox `parameters`, so the wire
+ * schema can be compared against the schema the server validates with. No CLI
+ * call is made: `tools/list` needs none.
+ */
+function schemaReferenceSurface() {
+  const cli = new HerdrCli(async () => ({ stdout: "{}", stderr: "", code: 0, killed: false }));
+  return createToolSurface({
+    cli,
+    context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" },
+    environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
+    preflight: createPreflight(cli),
+    settingsLoader: async () => ({ reviewCadenceMinutes: 5, reviewerModel: "reference", reviewerThinking: "low" }),
+    jobs: new JobRegistry(),
+    profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
+    ownership: new RuntimeOwnership(),
+    cwd: "/reference"
+  });
 }
 
 describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
@@ -136,6 +160,18 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const listed = await client.listTools();
       expect(listed.tools.map((tool) => tool.name)).toEqual([...CORE_TOOL_NAMES]);
       expect(listed.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
+
+      // The schema the client receives must be the schema the server validates
+      // with, so the model can never be shown a looser contract than the one
+      // enforced.
+      for (const definition of schemaReferenceSurface().definitions) {
+        const wire = listed.tools.find((tool) => tool.name === definition.name)?.inputSchema;
+        expect(wire, definition.name).toEqual(publishedInputSchema(definition.parameters));
+      }
+      const mixedShape = await call("herdr_inspect", { mode: "context", collection: "panes" });
+      expect(mixedShape.isError).toBe(true);
+      expect(text(mixedShape)).toContain("INVALID_INPUT");
+      expect(text(mixedShape)).toContain("additionalProperties");
 
       const health = await call("herdr_inspect", { mode: "health" });
       expect(health.isError).toBeUndefined();

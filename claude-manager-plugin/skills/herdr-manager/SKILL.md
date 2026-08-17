@@ -27,6 +27,8 @@ Use exactly the seven typed Herdr tools this plugin's `herdr` MCP server publish
 - Never delegate Herdr work to a native subagent or the `Task` tool. Delegation happens through `herdr_launch` into a visible Herdr pane with a profile, so the work has an authoritative identity, a pane, and provenance.
 - If the server is not listed by `/mcp`, or a tool call fails at startup gating, stop and report. Do not substitute another mechanism.
 
+Every tool takes one exclusive argument shape, and each shape accepts only its own fields. `herdr_inspect` is the one to read carefully: `{}` or `{"mode":"context"}`, `{"mode":"health"}`, `{"mode":"target","target":"..."}`, `{"mode":"collection","collection":"panes|agents|tabs|profiles"}`, `{"mode":"profile","profile":"..."}`. Mixing fields across modes, such as `{"mode":"context","collection":"panes"}`, is rejected as `INVALID_INPUT`; the published schema and the server enforce the same rule, so a rejection means the argument was wrong, not that the server is stricter than advertised.
+
 ## Conduct
 
 - Inspect authoritative state before acting. Targets are exact opaque IDs, `current`, exact pane labels, or unique exact agent names. There is no fuzzy, prefix, or focused-pane fallback.

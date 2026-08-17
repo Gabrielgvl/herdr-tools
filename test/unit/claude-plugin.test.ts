@@ -96,7 +96,9 @@ describe("Herdr manager conduct skill", () => {
       ["detached polling", /poll it with `herdr_jobs`/],
       ["owned cleanup only", /Close only panes and tabs this session created and still owns/],
       ["external model selection", /--model claude-fable-5/],
-      ["model mismatch stops", /report the mismatch and stop/]
+      ["model mismatch stops", /report the mismatch and stop/],
+      ["exclusive inspect shapes", /Mixing fields across modes.*is rejected as `INVALID_INPUT`/],
+      ["schema is not stricter than published", /the published schema and the server enforce the same rule/]
     ];
     for (const [label, pattern] of required) {
       expect(pattern.test(skill), label).toBe(true);

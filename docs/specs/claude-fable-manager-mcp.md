@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented through Phase 5. Phase 6 (optional shared wording alignment) is not started, and owner dogfooding of a live Fable manager session is outstanding.
+Implemented and accepted through Phase 5, including owner dogfooding of a live Fable manager session. Phase 6 (optional shared wording alignment) is not started.
 
 ## Objective
 
@@ -226,8 +226,10 @@ npm run lint
 npm run build
 npm run build:mcp
 npm run validate:plugin
-HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration
+HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration -- --session herdr-tools-integration
 ```
+
+`scripts/test-integration.ts` is authoritative for the last command: the session argument is optional and defaults to `herdr-tools-integration`, and any other value is refused before Vitest starts. It is written out here and in the README so the disposable session is visible at the call site; omitting it changes nothing.
 
 Manager session startup, from the manager's project directory inside a Herdr pane:
 
@@ -379,7 +381,7 @@ Probes ran in the scratch directory against the installed dependencies and the e
 
 - [x] Extend the disposable-session integration suite and document installation in the existing README structure.
   - Acceptance: every integration assertion in the testing strategy passes; the live workspace is untouched; README documents installation, the manager launch command, and the `herdr_jobs` polling model.
-  - Verify: `HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration`, then the full command list in order.
+  - Verify: `HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration -- --session herdr-tools-integration`, then the full command list in order.
   - Files: `test/integration/herdr-mcp.integration.test.ts`, `README.md`.
 
 #### Phase 5 evidence
@@ -388,6 +390,29 @@ Probes ran in the scratch directory against the installed dependencies and the e
 - The server is bound to the disposable session through `HERDR_SOCKET_PATH`, which the spawned `herdr` client processes inherit. The default session's workspace, tab, and pane IDs are captured before the run and asserted unchanged after it.
 - **Herdr runtime constraint.** Herdr 0.8.0 attaches a shell to a newly created pane asynchronously and exposes no readiness field on the pane record, so `agent start` immediately after `tab create` intermittently returns `agent_pane_busy` (observed in 1 of 3 back-to-back attempts). This affects the Pi host identically and is not introduced by this slice. The suite therefore launches into a pane created earlier in the same run and adds one bounded settle; the launch assertion itself is unchanged and a failure is still a failure. A readiness signal on the pane record would remove the settle.
 - `herdr_communicate` is exercised with `steer`, because the worker is still working on its assignment prompt and `prompt` correctly refuses to interrupt a working target with `TARGET_BUSY`. Both carry the same mandatory v1 envelope, which is then observed in authoritative pane output.
+
+#### Published schema parity
+
+A dogfood session reported that the published `herdr_inspect` schema looked looser than server validation after invalid mixed shapes such as `{mode:"context", collection:...}` were tried. It is not: publication and validation accept exactly the same inputs.
+
+- The published document is the shared TypeBox document plus the root `type: "object"` MCP requires. Nothing is dropped, rewritten, or relaxed, and a unit test asserts that exact relationship for all seven tools. Adding a root `type` can only narrow.
+- `herdr_inspect` publishes six `anyOf` variants, each with `additionalProperties: false`. A field belonging to another mode is therefore an additional property in the mode it was mixed into, which is why `{mode:"context", collection:"panes"}` and `{mode:"context", profile:"..."}` are rejected. Validation rejects them for the identical reason, reporting `keyword: "additionalProperties"`.
+- A semantic regression test evaluates a table of valid variants and the reported invalid mixed, missing-field, unknown-mode, and extra-field shapes against **both** the published document and the shared schema, and requires the same verdict from each; every rejected case is also driven through `callTool` and must return `INVALID_INPUT`. Equivalent cases cover the other six tools.
+- The integration suite compares the exact `tools/list` schema emitted by the built server over stdio with `publishedInputSchema(definition.parameters)` for all seven tools and requires deep equality, then calls a mixed shape over the wire and requires `INVALID_INPUT` with `additionalProperties`.
+
+The contract is unchanged. What the client does not do is validate arguments locally before sending, so an invalid call reaches the server and is refused there; from inside the session that looks like a stricter server, but the same schema was published. The manager skill now states the exclusive `herdr_inspect` shapes and says explicitly that a rejection means the argument was wrong, not that the server is stricter than advertised.
+
+#### Dogfood acceptance evidence
+
+Reported by the owner-side dogfood run of a primary `claude-fable-5` session loaded with local `--plugin-dir`:
+
+- All seven published tool names were called successfully from the Fable manager session.
+- `scout-pi` launched as Luna low with no fallback taken.
+- A detached wait job was created and observed to completion through `herdr_jobs`.
+- The assignment and prompt envelopes both showed `[HERDR AGENT MESSAGE v1]` with `authority: agent; not user/owner`.
+- The pane and tab IDs created during the run were closed, and topology returned to the pre-dogfood count.
+
+Independently re-verified here: no global installation and no configuration write occurred. `~/.claude/plugins/installed_plugins.json` contains no `herdr` entry, `~/.claude/plugins/cache/` holds no `herdr-tools` package, and no MCP server was written into user or project configuration. The only `~/.claude.json` traces are usage counters Claude Code maintains automatically — `pluginUsage["herdr-tools@inline"]`, whose `@inline` suffix marks a `--plugin-dir` load rather than an install, and `skillUsage["herdr-tools:herdr-manager"]`.
 
 ### Phase 6: optional shared wording alignment
 
@@ -429,7 +454,7 @@ Probes ran in the scratch directory against the installed dependencies and the e
 
 ## Success criteria
 
-- [~] A Claude Fable manager session in a Herdr pane lists and calls exactly the seven tools through the local stdio adapter. The adapter lists and calls all seven over real stdio in the disposable-session integration run, and the packaged server connects under a real `--plugin-dir` load. Doing it from inside a live Fable session is owner dogfooding.
+- [x] A Claude Fable manager session in a Herdr pane lists and calls exactly the seven tools through the local stdio adapter. Proven twice: the disposable-session integration run lists and calls all seven over real stdio, and the dogfood run called all seven from a primary `claude-fable-5` session loaded with local `--plugin-dir`.
 - [x] Pi and Claude hosts run the same tool implementation and profile catalog, with no duplicated schema or policy.
 - [x] `@modelcontextprotocol/sdk` is the only added runtime dependency.
 - [x] Startup refuses to serve without `HERDR_ENV=1`, valid injected IDs, and a valid absolute existing `CLAUDE_PROJECT_DIR`, and never falls back to subprocess or module paths.
@@ -437,7 +462,7 @@ Probes ran in the scratch directory against the installed dependencies and the e
 - [x] Detached waits are created and polled through `herdr_jobs`, with no self-communication and no automatic turn injection.
 - [x] Waits beyond the effective review cadence fail closed with a typed reviewer error in both foreground and detached form.
 - [x] The package adds only packaging and a conduct skill; model selection remains launch/user configuration and mismatch is reported, not enforced.
-- [~] The package loads from this repository with `--plugin-dir` and its tools resolve as `mcp__plugin_herdr-tools_herdr__*`; marketplace publication is documented as blocked rather than half-supported. Loading and the blocked-publication statement are done; the tool-name form is derived from the observed `plugin:herdr-tools:herdr` server id rather than read from a live tool list.
+- [x] The package loads from this repository with `--plugin-dir` and its tools resolve as `mcp__plugin_herdr-tools_herdr__*`; marketplace publication is documented as blocked rather than half-supported. The dogfood run called all seven published names from a live session, confirming the naming derived from the `plugin:herdr-tools:herdr` server id.
 - [x] Unit coverage stays at 100% for included sources with `src/mcp-server.ts` the only exclusion; the entry is typechecked, linted, built, and exercised by integration.
 
 ## Stop conditions

@@ -131,6 +131,7 @@ export function callTool(request: {
 ### Result and error mapping
 
 - Success: the shared `content` text blocks are returned verbatim, followed by one `herdr-details` text block containing bounded JSON `details` when `details` is present. `structuredContent` and `outputSchema` are not published in this slice.
+- Duplicate suppression: the `herdr-details` block is omitted when a shared text block is already the complete serialization of the same `details` value, which is exactly what `herdr_jobs` returns. Equality is a JSON round trip, so a projection, a truncated rendering, or any non-JSON text still gets its own block. The rule can only remove a byte-for-byte redundant copy; it can never hide evidence that is absent, partial, or differently shaped.
 - Bounds: total response bytes are capped by `MCP_RESULT_MAX_BYTES` (60000) with the existing `\n[output truncated]` marker. The details block is truncated first, then the shared blocks. Existing per-tool bounds (`MAX_PROFILE_RESULT_BYTES`, `JOB_OUTPUT_LIMITS`, CLI evidence limits) are unchanged and applied first.
 - Tool failures: returned as a tool result with `isError: true` and a single bounded JSON text block `{ "code", "message", "details" }`, using the error's own `code` when present and `INTERNAL_ERROR` otherwise. `ABORTED` is reported with its own code, never as success.
 - Protocol failures: an unknown tool name is a JSON-RPC `MethodNotFound`. Argument validation and execution failures are tool results with `isError: true` so the model can see and correct them.
@@ -148,6 +149,16 @@ export function callTool(request: {
 The resolved `CLAUDE_PROJECT_DIR` is used as both the profile-discovery `projectCwd` and the operational `cwd`. `process.cwd()` is never read, and no path is derived from `import.meta.url` except the bundled profile directory, which keeps its current module-relative resolution.
 
 Herdr CLI compatibility is not probed at startup. It stays per-call through the existing `preflightCompatibility` seam, so the health contract, error codes, and fail-closed behavior are identical to the Pi host.
+
+Any failure that escapes startup entirely is written by `src/mcp-server.ts` through the same sanitizing, bounded single-line helper the refusals use, so the entry never emits raw multi-line error text into the client's log.
+
+### Process execution on the MCP host
+
+`createNodeExec` is the MCP host's equivalent of Pi's `exec`, and it must produce the same typed failures:
+
+- A process that could never be spawned rejects with its own error, so `HerdrCli` maps a missing `herdr` binary to `CLI_NOT_FOUND` with the spawn failure as `cause`, exactly as it does under Pi. Resolving a spawn failure as an ordinary non-zero exit would discard the evidence and mislabel it `CLI_PROTOCOL_ERROR`. A child that already emitted output or exited is not a spawn failure and still settles with its evidence.
+- Both pipes are decoded through a streaming UTF-8 decoder, so a code point split across two chunks cannot corrupt evidence.
+- Settling after `exit` waits one `EXEC_IDLE_GRACE_MS` (100ms) window, re-armed by each late chunk. This is a documented tradeoff: `close` cannot be relied on because a detached Herdr descendant can hold the inherited pipe open indefinitely, while settling on `exit` alone would drop queued output. A well-behaved child that emits `close` settles immediately and pays nothing; a child with an inherited pipe pays exactly one grace period; output arriving more than one grace period after the last chunk is lost rather than held forever.
 
 ### Runtime lifetime
 

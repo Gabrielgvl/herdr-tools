@@ -49,7 +49,7 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
   }
 }));
 
-const { runHerdrMcpServer, packageRoot, refusalLine, MCP_SERVER_NAME } = await import("../../src/mcp/run.js");
+const { runHerdrMcpServer, packageRoot, refusalLine, fatalLine, MCP_SERVER_NAME } = await import("../../src/mcp/run.js");
 
 const health = { client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "0.8.0", protocol: 19, compatible: true } };
 const snapshot = {
@@ -231,6 +231,15 @@ describe("MCP server startup", () => {
     const long = refusalLine(new Error(`${"x".repeat(2_000)}`));
     expect(long.endsWith("\n")).toBe(true);
     expect(long.split(": ")[1]).toHaveLength(501);
+  });
+
+  it("bounds and sanitizes the fatal entry line with the same conventions", () => {
+    expect(fatalLine(new Error("transport exploded"))).toBe(`${MCP_SERVER_NAME} mcp server failed: transport exploded\n`);
+    const hostile = fatalLine(new Error(`forged\nCLAUDE_PROJECT_DIR=/etc\r ${"y".repeat(2_000)}`));
+    expect(hostile.split("\n")).toHaveLength(2);
+    expect(hostile.endsWith("\n")).toBe(true);
+    expect(hostile.slice(`${MCP_SERVER_NAME} mcp server failed: `.length, -1)).toHaveLength(500);
+    expect(fatalLine("not an error object")).toBe(`${MCP_SERVER_NAME} mcp server failed: not an error object\n`);
   });
 
   it("anchors the bundled profile catalog on the package root", async () => {

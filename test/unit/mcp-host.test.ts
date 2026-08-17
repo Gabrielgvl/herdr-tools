@@ -8,7 +8,7 @@ import { RuntimeOwnership } from "../../src/ownership.js";
 import { createPreflight, createToolSurface } from "../../src/tool-surface.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import { createLaunchTool } from "../../src/tools/launch.js";
-import { HOST_FIELDS, HostCapabilityError, StartupRefusal, createNodeExec, hostContext, resolveStartup, type ChildProcessLike, type SpawnLike } from "../../src/mcp/host.js";
+import { EXEC_FORCE_KILL_MS, EXEC_IDLE_GRACE_MS, HOST_FIELDS, HostCapabilityError, StartupRefusal, createNodeExec, hostContext, resolveStartup, type ChildProcessLike, type SpawnLike } from "../../src/mcp/host.js";
 
 const snapshot = {
   type: "session_snapshot",
@@ -224,30 +224,85 @@ describe("MCP node exec adapter", () => {
     expect(child.stderr?.destroyed).toBe(true);
   });
 
-  it("settles after exit when close never fires and keeps reading late output", async () => {
+  it("settles one idle grace period after exit when close never fires, re-arming on late output", async () => {
     vi.useFakeTimers();
+    // The grace window is a documented tradeoff, not an incidental delay: a
+    // detached Herdr descendant can hold the inherited pipe open so `close`
+    // never fires, and each late chunk re-arms the window.
+    expect(EXEC_IDLE_GRACE_MS).toBe(100);
+    expect(EXEC_FORCE_KILL_MS).toBe(5_000);
     const child = new FakeChild();
     const { spawn } = spawnFake(child);
-    const pending = createNodeExec({ cwd: "/project", spawn })("herdr", ["api", "snapshot"], {});
+    const settled = vi.fn();
+    const pending = createNodeExec({ cwd: "/project", spawn })("herdr", ["api", "snapshot"], {}).then((result) => {
+      settled();
+      return result;
+    });
     child.fire("exit", 0);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(EXEC_IDLE_GRACE_MS - 1);
+    expect(settled).not.toHaveBeenCalled();
     child.stdout?.listener?.("late");
     child.stderr?.listener?.("also late");
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(EXEC_IDLE_GRACE_MS - 1);
+    expect(settled).not.toHaveBeenCalled();
     child.stdout?.listener?.("later still");
-    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(EXEC_IDLE_GRACE_MS);
     await expect(pending).resolves.toEqual({ stdout: "latelater still", stderr: "also late", code: 0, killed: false });
+    // Output arriving more than one grace period after the last chunk is lost
+    // rather than held forever; that is the accepted side of the tradeoff.
+    child.stdout?.listener?.("far too late");
+    await expect(pending).resolves.toMatchObject({ stdout: "latelater still" });
   });
 
-  it("treats a spawn error and a missing exit code as a failed process", async () => {
+  it("rejects a spawn failure with its own evidence so the CLI reports CLI_NOT_FOUND", async () => {
     const failing = new FakeChild(false);
-    const errored = createNodeExec({ cwd: "/project", spawn: spawnFake(failing).spawn })("herdr", ["status"], {});
-    failing.fire("error", new Error("spawn herdr ENOENT"));
-    await expect(errored).resolves.toEqual({ stdout: "", stderr: "", code: 1, killed: false });
+    const exec = createNodeExec({ cwd: "/project", spawn: spawnFake(failing).spawn });
+    const errored = exec("herdr", ["status"], {});
+    failing.fire("error", Object.assign(new Error("spawn herdr ENOENT"), { code: "ENOENT" }));
+    await expect(errored).rejects.toMatchObject({ message: "spawn herdr ENOENT", code: "ENOENT" });
+
+    const neverSpawned = new FakeChild(false);
+    const cli = new HerdrCli(createNodeExec({ cwd: "/project", spawn: spawnFake(neverSpawned).spawn }));
+    const failure = cli.runJson(["status", "--json"], new AbortController().signal).catch((error: unknown) => error);
+    neverSpawned.fire("error", new Error("spawn herdr ENOENT"));
+    expect(await failure).toMatchObject({ code: "CLI_NOT_FOUND", details: { cause: "spawn herdr ENOENT" } });
+  });
+
+  it("keeps the evidence of a child that already ran when a late error arrives", async () => {
+    const child = new FakeChild();
+    const pending = createNodeExec({ cwd: "/project", spawn: spawnFake(child).spawn })("herdr", ["status"], {});
+    child.stdout?.listener?.("partial");
+    child.fire("error", new Error("kill EPERM"));
+    await expect(pending).resolves.toEqual({ stdout: "partial", stderr: "", code: 1, killed: false });
+  });
+
+  it("treats a missing exit code as a clean exit and ignores an error after settling", async () => {
     const child = new FakeChild();
     const pending = createNodeExec({ cwd: "/project", spawn: spawnFake(child).spawn })("herdr", ["status"], {});
     child.fire("close", null);
+    child.fire("error", new Error("teardown noise"));
     await expect(pending).resolves.toMatchObject({ code: 0, killed: false });
+  });
+
+  it("decodes both pipes as a UTF-8 stream so a split code point cannot corrupt evidence", async () => {
+    const child = new FakeChild();
+    const pending = createNodeExec({ cwd: "/project", spawn: spawnFake(child).spawn })("herdr", ["pane", "read"], {});
+    const sheep = Buffer.from("🐑", "utf8");
+    child.stdout?.listener?.(sheep.subarray(0, 2));
+    child.stdout?.listener?.(sheep.subarray(2));
+    const accented = Buffer.from("é", "utf8");
+    child.stderr?.listener?.(accented.subarray(0, 1));
+    child.stderr?.listener?.(accented.subarray(1));
+    child.fire("close", 0);
+    await expect(pending).resolves.toMatchObject({ stdout: "🐑", stderr: "é" });
+
+    const truncated = new FakeChild();
+    const dangling = createNodeExec({ cwd: "/project", spawn: spawnFake(truncated).spawn })("herdr", ["pane", "read"], {});
+    truncated.stdout?.listener?.(Buffer.from("🐑", "utf8").subarray(0, 2));
+    truncated.fire("close", 0);
+    const result = await dangling;
+    expect(result.stdout).not.toBe("");
+    expect(result.stdout).toContain("�");
   });
 
   it("kills on timeout and escalates to SIGKILL once", async () => {
@@ -289,5 +344,6 @@ describe("MCP node exec adapter", () => {
   it("executes a real process with the default spawn", async () => {
     const exec = createNodeExec({ cwd: tmpdir() });
     await expect(exec(process.execPath, ["-e", "process.stdout.write(process.cwd())"], { timeout: 10_000 })).resolves.toMatchObject({ code: 0, killed: false, stdout: expect.stringContaining(tmpdir()) as unknown as string });
+    await expect(exec(join(tmpdir(), "herdr-binary-that-does-not-exist"), ["status"], { timeout: 10_000 })).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

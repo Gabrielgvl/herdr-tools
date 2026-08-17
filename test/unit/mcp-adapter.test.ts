@@ -168,6 +168,32 @@ describe("MCP result mapping", () => {
     expect(outcome.content).toEqual([{ type: "text", text: "only" }]);
   });
 
+  it("omits a details block that a shared block already publishes in full", async () => {
+    const details = { operation: "jobs", outcome: "success", jobs: [{ jobId: "job_1", status: "running" }] };
+    const identical = await call(stub({ execute: async () => ({ content: [{ type: "text", text: JSON.stringify(details) }], details }) }));
+    expect(identical.content).toEqual([{ type: "text", text: JSON.stringify(details) }]);
+    const prettyPrinted = await call(stub({ execute: async () => ({ content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details }) }));
+    expect(prettyPrinted.content).toEqual([{ type: "text", text: JSON.stringify(details, null, 2) }]);
+    const prose = await call(stub({ execute: async () => ({ content: [{ type: "text", text: "Inspected panes" }], details }) }));
+    expect(prose.content).toHaveLength(2);
+
+    // Anything short of an exact, complete serialization keeps its block, so no
+    // structured evidence is ever hidden behind a near-duplicate rendering.
+    const truncatedRendering = await call(stub({ execute: async () => ({ content: [{ type: "text", text: `${JSON.stringify(details)}\n[output truncated]` }], details }) }));
+    expect(truncatedRendering.content).toHaveLength(2);
+    expect(truncatedRendering.content[1]!.text).toBe(`${HERDR_DETAILS_LABEL}\n${JSON.stringify(details)}`);
+    const projection = await call(stub({ execute: async () => ({ content: [{ type: "text", text: JSON.stringify({ jobs: details.jobs }) }], details }) }));
+    expect(projection.content).toHaveLength(2);
+  });
+
+  it("publishes herdr_jobs evidence exactly once", async () => {
+    const surface = realSurface();
+    const outcome = await callTool({ surface, name: "herdr_jobs", args: { operation: "list" }, host, callId: "c" });
+    expect(outcome.content).toHaveLength(1);
+    expect(outcome.content[0]!.text).not.toContain(HERDR_DETAILS_LABEL);
+    expect(JSON.parse(outcome.content[0]!.text)).toMatchObject({ operation: "jobs", kind: "list" });
+  });
+
   it("truncates oversized details before the shared blocks and stays within the response bound", async () => {
     const outcome = await call(stub({
       execute: async () => ({ content: [{ type: "text", text: "shared" }], details: { blob: "d".repeat(200_000) } })

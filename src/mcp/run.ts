@@ -45,11 +45,12 @@ export interface HerdrMcpServer {
   shutdown(): Promise<void>;
 }
 
-/** The single bounded stderr line a refusal is allowed to write. */
-export function refusalLine(error: unknown): string {
-  const message = error instanceof StartupRefusal
-    ? `${error.reason}: ${error.message}`
-    : error instanceof Error ? error.message : String(error);
+/**
+ * The one sanitized, bounded stderr line this server is allowed to write.
+ * Control characters become spaces so a hostile message cannot forge extra
+ * lines, and the payload is capped so it cannot flood the client's log.
+ */
+function stderrLine(prefix: string, message: string): string {
   const printable = [...message]
     .map((character) => {
       const code = character.charCodeAt(0);
@@ -57,7 +58,23 @@ export function refusalLine(error: unknown): string {
     })
     .join("")
     .slice(0, MAX_STDERR_LINE_CHARS);
-  return `${MCP_SERVER_NAME} mcp server refused to start: ${printable}\n`;
+  return `${MCP_SERVER_NAME} mcp server ${prefix}: ${printable}\n`;
+}
+
+/** The single bounded stderr line a refusal is allowed to write. */
+export function refusalLine(error: unknown): string {
+  const message = error instanceof StartupRefusal
+    ? `${error.reason}: ${error.message}`
+    : error instanceof Error ? error.message : String(error);
+  return stderrLine("refused to start", message);
+}
+
+/**
+ * The same fail-closed line for a failure that escapes startup entirely, so the
+ * executable entry never writes raw, unbounded error text to the client.
+ */
+export function fatalLine(error: unknown): string {
+  return stderrLine("failed", error instanceof Error ? error.message : String(error));
 }
 
 /**

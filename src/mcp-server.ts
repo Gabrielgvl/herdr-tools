@@ -1,6 +1,6 @@
-import { runHerdrMcpServer } from "./mcp/run.js";
+import { fatalLine, runHerdrMcpServer } from "./mcp/run.js";
 
 runHerdrMcpServer().catch((error: unknown) => {
-  process.stderr.write(`herdr-tools mcp server failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.stderr.write(fatalLine(error));
   process.exitCode = 1;
 });

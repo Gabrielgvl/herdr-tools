@@ -145,6 +145,25 @@ function boundedSharedBlocks(texts: readonly string[], budget: number): McpTextB
 }
 
 /**
+ * A shared tool whose content block already is its own `details` serialized
+ * (`herdr_jobs`, pretty-printed) needs no appended copy: the structured evidence
+ * is present, complete, and untruncated. The comparison is a JSON round trip, so
+ * only an exact same-value block qualifies. A projection, a truncated rendering,
+ * or any non-JSON text is not the same evidence and still gets its block.
+ */
+function alreadyPublished(details: unknown, texts: readonly string[]): boolean {
+  const serialized = JSON.stringify(details);
+  if (serialized === undefined) return false;
+  return texts.some((text) => {
+    try {
+      return JSON.stringify(JSON.parse(text)) === serialized;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
  * Shared text blocks pass through verbatim, followed by one bounded
  * `herdr-details` block. The details block is bounded first, then the shared
  * blocks, so the total response stays within `MCP_RESULT_MAX_BYTES`.
@@ -152,7 +171,9 @@ function boundedSharedBlocks(texts: readonly string[], budget: number): McpTextB
 export function successOutcome(result: { content: ReadonlyArray<{ type: string; text?: string }>; details?: unknown }): McpCallOutcome {
   const texts = result.content.filter((block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string").map((block) => block.text);
   const sharedBytes = texts.reduce((total, text) => total + bytes(text), 0);
-  const details = result.details === undefined ? undefined : detailsBlock(result.details, MCP_RESULT_MAX_BYTES - sharedBytes);
+  const details = result.details === undefined || alreadyPublished(result.details, texts)
+    ? undefined
+    : detailsBlock(result.details, MCP_RESULT_MAX_BYTES - sharedBytes);
   const sharedBudget = MCP_RESULT_MAX_BYTES - (details ? bytes(details.text) : 0);
   return { content: [...boundedSharedBlocks(texts, sharedBudget), ...(details ? [details] : [])] };
 }

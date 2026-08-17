@@ -4,6 +4,7 @@ import type { CompatibilityPreflight } from "../health.js";
 import { recordCreatedResource, runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { paneCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
+import { withoutEnvironment } from "../redaction.js";
 import { assertSafeEnvironment, assertSafeIdentifier, PaneParamsSchema, type PaneParams } from "../topology-schema.js";
 import { parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot, type PaneRecord, type ResolvedTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
@@ -55,14 +56,6 @@ function resourceId(value: unknown): string {
     if (typeof object?.pane_id === "string" && object.pane_id.length > 0) return object.pane_id;
   }
   throw Object.assign(new Error("Herdr mutation response is missing pane_id"), { code: "CLI_PROTOCOL_ERROR" });
-}
-
-function withoutEnvironment(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(withoutEnvironment);
-  if (typeof value !== "object" || value === null) return value;
-  return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !/^(env|environment|env_vars|environment_variables|environment_overrides|environmentoverrides)$/i.test(key))
-    .map(([key, item]) => [key, withoutEnvironment(item)]));
 }
 
 function paneFrom(value: unknown): PaneRecord {

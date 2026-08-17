@@ -136,6 +136,22 @@ describe("herdr_inspect", () => {
     await expect(execute(cli, { mode: "collection", collection: "tabs" })).resolves.toMatchObject({ details: { kind: "collection", collection: "tabs" } });
   });
 
+  it("strips environment values from retained target metadata at every depth", async () => {
+    const leaky: HerdrSnapshot = {
+      ...snapshot,
+      panes: [{
+        ...snapshot.panes[0]!,
+        environment: { SECRET: "pane-secret" },
+        environment_overrides: { SECRET: "overrides-secret" },
+        history: [{ env: { SECRET: "array-secret" } }, { child: { env_vars: { SECRET: "deep-secret" } } }]
+      }]
+    };
+    const { cli } = makeCli(undefined, leaky);
+    const result = await execute(cli, { mode: "target", target: "caller" });
+    expect(result.details.metadata).toEqual({ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle", agent_name: "caller", history: [{}, { child: {} }] });
+    expect(JSON.stringify(result)).not.toContain("secret");
+  });
+
   it("keeps invalid mode combinations before the CLI", async () => {
     const { cli, calls } = makeCli();
     await expect(execute(cli, { mode: "target" })).rejects.toMatchObject({ code: "INVALID_INPUT" });

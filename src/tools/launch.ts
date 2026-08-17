@@ -9,6 +9,7 @@ import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "..
 import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type RuntimeProfile } from "../profiles/types.js";
 import { HERDR_AGENT_START_TIMEOUT_MS } from "../cli.js";
+import { withoutEnvironment } from "../redaction.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -446,7 +447,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         const details = effectiveDetails(chosenProfile, chosenRuntime);
         const launchDetails: LaunchDetails = {
           operation: "launch", outcome: "launched", name: authoritativeName, kind: chosenRuntime.kind, placement, tabId, paneId: resolvedPaneId,
-          ...(agentId ? { agentId } : {}), postState, initialPromptSent,
+          ...(agentId ? { agentId } : {}), postState: withoutEnvironment(postState), initialPromptSent,
           ...(sender ? { sender: { paneId: sender.paneId, display: sender.display, source: sender.source }, envelope: { version: "v1" as const, kind: "assignment" as const } } : {}),
           profile: {
             name: chosenProfile.name, requested: params.profile, selected: chosenProfile.name,

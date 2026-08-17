@@ -50,6 +50,31 @@ function execute(cli: WaitCli, params: unknown, extra: Partial<Parameters<typeof
 }
 
 describe("herdr_wait", () => {
+  it("strips environment values from every retained target snapshot at every depth", async () => {
+    const leaky: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        return {
+          id: "pane",
+          result: {
+            pane: {
+              ...snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]),
+              environment: { SECRET: "pane-secret" },
+              environment_variables: { SECRET: "variables-secret" },
+              history: [{ env: { SECRET: "array-secret" } }, { child: { environment_overrides: { SECRET: "deep-secret" } } }]
+            }
+          }
+        };
+      },
+      async runText() { return "still working"; }
+    };
+    const result = await execute(leaky, { targets: ["p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1 }, { clock: clock() });
+    expect(result.details).toMatchObject({ outcome: "success", matched: true });
+    const targets = (result.details as { targets: Array<{ metadata: Record<string, unknown> }> }).targets;
+    expect(targets[0]!.metadata).toEqual({ pane_id: "p2", tab_id: "w:t", workspace_id: "w", label: "two", agent_name: "two", agent_status: "working", history: [{}, { child: {} }] });
+    expect(JSON.stringify(result)).not.toContain("secret");
+  });
+
   it("matches existing literal output immediately and does not treat literal as regex", async () => {
     const cli = fakeCli({ p1: "already done", p2: "x" });
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: ".*" } }, timeoutMs: 1 }, { clock: clock() });

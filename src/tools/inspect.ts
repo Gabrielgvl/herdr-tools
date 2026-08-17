@@ -6,6 +6,7 @@ import { assertCurrentContext, parseSnapshotResult, resolvePaneOrAgentTarget, ty
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { resolveProfile, type Profile, type ProfileCandidate, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
 import { boundedText } from "../job-registry.js";
+import { withoutEnvironment } from "../redaction.js";
 
 interface InspectDetails {
   operation: "inspect";
@@ -418,7 +419,7 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], signal!)).result);
       const raw = await deps.cli.runText(["pane", "read", target.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal!);
       const recentUnwrappedLines = raw.length === 0 ? [] : raw.split(/\r?\n/).slice(-100);
-      const details: InspectDetails = { operation: "inspect", kind: "target", outcome: "success", target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName }, metadata: pane, recentUnwrappedLines };
+      const details: InspectDetails = { operation: "inspect", kind: "target", outcome: "success", target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName }, metadata: withoutEnvironment(pane), recentUnwrappedLines };
       return { content: [{ type: "text", text: formatResult({ operation: "inspect", outcome: "success", targetId: target.id }) }], details };
     },
     renderCall(rawArgs, theme) {

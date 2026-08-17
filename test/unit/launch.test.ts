@@ -77,6 +77,25 @@ function launch(params: LaunchParams, profiles: ProfileCatalog, cli = makeCli().
   return tool.execute("id", params, new AbortController().signal, undefined, extensionContext);
 }
 
+describe("herdr_launch evidence redaction", () => {
+  it("strips environment values from the authoritative post-state at every depth", async () => {
+    const leaky = {
+      pane_id: "w1:p2",
+      tab_id: "w1:t1",
+      workspace_id: "w1",
+      agent: "pi",
+      agent_status: "working",
+      environment: { SECRET: "pane-secret" },
+      env_vars: { SECRET: "vars-secret" },
+      history: [{ env: { SECRET: "array-secret" } }, { child: { environment_overrides: { SECRET: "deep-secret" } } }]
+    };
+    const result = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli({ paneStates: [leaky, leaky] }).cli);
+    expect(result.details).toMatchObject({ operation: "launch", outcome: "launched", paneId: "w1:p2" });
+    expect(result.details?.postState).toEqual({ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "working", history: [{}, { child: {} }] });
+    expect(JSON.stringify(result)).not.toContain("secret");
+  });
+});
+
 describe("herdr_launch profile-only contract", () => {
   it("rejects raw kind, argv, and env schemas", () => {
     expect(LaunchParamsSchema).toMatchObject({ type: "object", additionalProperties: false, required: expect.arrayContaining(["name", "profile"]) });

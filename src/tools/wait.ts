@@ -6,6 +6,7 @@ import { parseSnapshotResult, resolveTarget, type CurrentContext, type ResolvedT
 import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
 import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams } from "../wait-schema.js";
 import { boundedText, type JobRegistry, type JobRequestSnapshot, type JobRunResult } from "../job-registry.js";
+import { withoutEnvironment } from "../redaction.js";
 import { formatCall, formatResult, resultForRender, textComponent } from "../tui.js";
 
 export interface WaitClock {
@@ -227,7 +228,7 @@ async function readTarget(cli: WaitCli, resolved: ResolvedTarget, ref: string, c
     const readArgs = ["pane", "read", resolved.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"];
     const output = cli.runTextResult ? await cli.runTextResult(readArgs, signal) : { value: await cli.runText(readArgs, signal), truncated: false };
     checkAbort(signal);
-    return { target: ref, targetId: resolved.paneId!, metadata: pane, recentUnwrappedLines: boundedLines(output.value), outputTruncated: output.truncated, observedAtMs: clock.now(), matched: false };
+    return { target: ref, targetId: resolved.paneId!, metadata: withoutEnvironment(pane), recentUnwrappedLines: boundedLines(output.value), outputTruncated: output.truncated, observedAtMs: clock.now(), matched: false };
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;

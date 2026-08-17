@@ -4,6 +4,7 @@ import type { CompatibilityPreflight } from "../health.js";
 import { runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { tabCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
+import { withoutEnvironment } from "../redaction.js";
 import { assertSafeEnvironment, assertSafeIdentifier, TabParamsSchema, type TabParams } from "../topology-schema.js";
 import { parseSnapshotResult, type CurrentContext, type HerdrSnapshot, type TabRecord } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
@@ -32,14 +33,6 @@ export interface TabDependencies {
 function object(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw Object.assign(new Error("Herdr returned an incompatible tab response"), { code: "CLI_PROTOCOL_ERROR" });
   return value as Record<string, unknown>;
-}
-
-function withoutEnvironment(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(withoutEnvironment);
-  if (typeof value !== "object" || value === null) return value;
-  return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !/^(env|environment|env_vars|environment_variables|environmentoverrides)$/i.test(key))
-    .map(([key, item]) => [key, withoutEnvironment(item)]));
 }
 
 function tabFrom(value: unknown): TabRecord {

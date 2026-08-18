@@ -218,7 +218,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         paneId: workerPaneId,
         initialPromptSent: true,
         envelope: { version: "v1", kind: "assignment" },
-        profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "high" } }
+        profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max" } }
       });
       expect(record(launchEvidence.sender).paneId).toBe(rootPane.pane_id);
       expect(record(record(launchEvidence.profile).source).kind).toBe("bundled");

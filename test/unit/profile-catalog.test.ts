@@ -502,7 +502,7 @@ describe("profile catalog", () => {
     }
     expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: [...piTools.manager], extensions: [], skills: [join(rolePluginRoot, "manager", "skills", "manager")] });
     expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual([]);
-    expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "high" });
+    expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
     expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-claude"]);
 
     const claudeTools = {
@@ -523,7 +523,7 @@ describe("profile catalog", () => {
     const reviewer = catalog.effective.get("reviewer-pi")!;
     const claudeWorker = catalog.effective.get("worker-claude")!;
     expect(buildProfileArgv(manager)).toEqual(["--model", "openai-codex/gpt-5.6-sol", "--thinking", "high", "--tools", piTools.manager.join(","), "--skill", join(rolePluginRoot, "manager", "skills", "manager"), "--no-session"]);
-    expect(buildProfileArgv(worker)).toEqual(["--model", "openai-codex/gpt-5.6-luna", "--thinking", "high", "--tools", piTools.worker.join(","), "--skill", join(rolePluginRoot, "worker", "skills", "worker"), "--no-session"]);
+    expect(buildProfileArgv(worker)).toEqual(["--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", piTools.worker.join(","), "--skill", join(rolePluginRoot, "worker", "skills", "worker"), "--no-session"]);
     expect(buildProfileArgv(reviewer)).not.toContain("edit");
     expect(buildProfileArgv(reviewer)).not.toContain("write");
     expect(buildProfileArgv(claudeWorker)).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "acceptEdits", ...claudeTools.worker.allowedTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "worker")]);

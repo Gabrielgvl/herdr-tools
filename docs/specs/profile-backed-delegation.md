@@ -28,7 +28,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager` has only a Pi profile using `openai-codex/gpt-5.6-sol` with high thinking and no fallback. The other roles have Pi and Claude variants with the existing direction/model policy:
   - scout: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - researcher: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
-  - worker: `openai-codex/gpt-5.6-luna` -> `claude-opus-5`;
+  - worker: `openai-codex/gpt-5.6-luna` with max thinking -> `claude-opus-5`;
   - reviewer: `openai-codex/gpt-5.6-sol` -> `claude-opus-5`;
   - planner: `claude-fable-5` -> `openai-codex/gpt-5.6-sol`.
 - Every bundled profile has one role-scoped skill. Claude profiles load the corresponding scope-local plugin directory; Pi profiles load the same skill path directly. Normal installed extension discovery remains enabled, while profile allowlists omit hidden delegation, durable-memory mutation, and unapproved lifecycle capabilities.

@@ -473,7 +473,7 @@ describe("profile catalog", () => {
   it("enforces the bundled capability matrix and shared role resources", async () => {
     const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
     const catalog = await runtime.profiles.load();
-    expect(catalog.effective.size).toBe(11);
+    expect(catalog.effective.size).toBe(12);
     expect(catalog.diagnostics).toEqual([]);
     const bundledRoot = catalog.effective.get("manager-pi")!.source.scopeRoot;
     const rolePluginRoot = join(bundledRoot, "herdr-profiles", "role-plugins");
@@ -483,7 +483,7 @@ describe("profile catalog", () => {
       const skillPath = join(rolePluginRoot, role, "skills", role, "SKILL.md");
       await expect(access(manifestPath)).resolves.toBeUndefined();
       await expect(access(skillPath)).resolves.toBeUndefined();
-      expect(JSON.parse(await readFile(manifestPath, "utf8"))).toMatchObject({ name: `herdr-${role}-profile` });
+      expect(JSON.parse(await readFile(manifestPath, "utf8"))).toMatchObject({ name: role === "manager" ? "herdr-tools" : `herdr-${role}-profile` });
       expect((await readFile(skillPath, "utf8")).trim().length).toBeGreaterThan(0);
     }
 
@@ -502,6 +502,15 @@ describe("profile catalog", () => {
     }
     expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: [...piTools.manager], extensions: [], skills: [join(rolePluginRoot, "manager", "skills", "manager")] });
     expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual([]);
+    const managerClaude = catalog.effective.get("manager-claude")!;
+    const managerClaudeTools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "mcp__plugin_herdr-tools_herdr"];
+    expect(managerClaude.runtime).toEqual({ kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: managerClaudeTools, disallowedTools: ["Task"], addDirs: [], pluginDirs: [join(rolePluginRoot, "manager")] });
+    expect(managerClaude.sessionPersistence).toBe(true);
+    expect(managerClaude.timeoutMinutes).toBe(30);
+    expect(managerClaude.fallbackProfiles).toEqual([]);
+    expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.allowedTools).not.toEqual(expect.arrayContaining(["Bash", "Edit", "Write", "NotebookEdit"]));
+    expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.disallowedTools).toEqual(["Task"]);
+    expect(buildProfileArgv(managerClaude)).toEqual(["--model", "claude-fable-5", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "manager")]);
     expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
     expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-claude"]);
 
@@ -540,7 +549,7 @@ describe("profile catalog", () => {
   it("loads bundled profiles from the package scope", async () => {
     const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
     const catalog = await runtime.profiles.load();
-    expect(catalog.effective.size).toBe(11);
+    expect(catalog.effective.size).toBe(12);
     expect(catalog.effective.get("worker-pi")?.source.scopeRoot).toBe(process.cwd());
   });
 });

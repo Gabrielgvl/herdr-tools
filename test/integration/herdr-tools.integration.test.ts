@@ -146,10 +146,15 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       const signal = new AbortController().signal;
       const profiles = await registered.get("herdr_inspect")!.execute("profiles", { mode: "collection", collection: "profiles" }, signal, undefined, toolContext);
       const profileItems = resultObject(profiles.details).items;
-      expect(Array.isArray(profileItems) ? profileItems : []).toHaveLength(11);
-      expect(profileItems).toEqual(expect.arrayContaining([expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: expect.arrayContaining(["herdr_tab"]), skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")] })]));
+      expect(Array.isArray(profileItems) ? profileItems : []).toHaveLength(12);
+      expect(profileItems).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: expect.arrayContaining(["herdr_tab"]), skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")] }),
+        expect.objectContaining({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", fallbackProfiles: [] })
+      ]));
       const manager = await registered.get("herdr_inspect")!.execute("manager", { mode: "profile", profile: "manager-pi" }, signal, undefined, toolContext);
       expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: ["read", "grep", "find", "ls", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_pane", "herdr_tab"], extensions: [], skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")], fallbackProfiles: [] });
+      const managerClaude = await registered.get("herdr_inspect")!.execute("manager-claude", { mode: "profile", profile: "manager-claude" }, signal, undefined, toolContext);
+      expect(resultObject(managerClaude.details).profile).toMatchObject({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "mcp__plugin_herdr-tools_herdr"], disallowedTools: ["Task"], pluginDirs: [expect.stringContaining("herdr-profiles/role-plugins/manager")] });
       const inspected = await registered.get("herdr_inspect")!.execute("inspect", { mode: "collection", collection: "panes" }, signal, undefined, toolContext);
       const inspectedItems = resultObject(inspected.details).items;
       expect(Array.isArray(inspectedItems)).toBe(true);

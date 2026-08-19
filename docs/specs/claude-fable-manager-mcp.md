@@ -12,25 +12,25 @@ The manager is a normal interactive Claude session in a Herdr pane, not a native
 
 ## Validated owner decisions
 
-- Claude Fable is the primary interactive manager session. No `manager-claude` launch profile and no native subagent profile are added.
+- Claude Fable is the primary interactive manager session, and the bundled `manager-claude` profile is the explicit profile-backed entry for owner-requested Claude/Fable management or Claude-to-Claude succession. No native subagent profile is added.
 - The adapter exposes exactly `herdr_inspect`, `herdr_communicate`, `herdr_wait`, `herdr_jobs`, `herdr_launch`, `herdr_pane`, and `herdr_tab`, in that order, and no other tool.
 - Pi and Claude hosts execute one shared tool implementation and one shared profile resolver/catalog. Policy, schemas, bounds, and provenance exist once.
 - `@modelcontextprotocol/sdk` is the only planned new runtime dependency.
 - Fail-closed health/context gating, in-memory ownership, exact targeting, bounded results, durable prompt sources, and mandatory v1 sender provenance are preserved unchanged.
 - Claude detached waits are polled through `herdr_jobs`. The adapter performs no self-communication and no automatic turn injection.
-- Profile discovery behavior is unchanged for this slice. The MCP runtime uses the manager session's authoritative project directory, never a plugin installation directory and never a directory derived from the module path.
-- The Claude package is packaging plus a manager-conduct skill. The skill cannot claim owner authority and cannot silently grant permissions.
+- Profile discovery behavior is unchanged for this slice. The MCP runtime uses the manager session's authoritative project directory, never a plugin installation directory and never a directory derived from the module path. The `manager-claude` profile and the interactive plugin use the same manager plugin and shared skill.
+- The manager plugin is self-contained under `herdr-profiles/role-plugins/manager/`: stable `herdr-tools` manifest and `herdr` server identity, the local MCP registration, and the shared manager skill. The `manager-claude` profile keeps `default` permission mode, pre-approves only its core/research/Herdr namespace, disallows only `Task`, and leaves Bash/Edit/Write owner-gated.
 - Primary model selection stays a launch/user configuration concern: the manager is started with `--model claude-fable-5` or switched with `/model fable`. The skill reports a mismatch and stops; it never claims enforcement.
 - Unit coverage stays at 100% for the coverage-included sources. Integration uses only the disposable named session `herdr-tools-integration` and never the live workspace.
 
-This slice is the Claude-to-Herdr control bridge that `docs/specs/manager-profile-capabilities.md` lists under "Ask first". The owner has authorized it for the primary interactive manager session only; the ask-first gate remains in force for any Claude worker profile with Herdr lifecycle tools.
+This slice is the Claude-to-Herdr control bridge and the manager plugin consolidation authorized for the primary interactive manager session and the explicit `manager-claude` profile. The ask-first gate remains in force for any Claude worker profile with Herdr lifecycle tools.
 
 ## Reconciliation with existing decisions
 
 - ADR-001 stays authoritative: `HERDR_ENV=1` gating, installed-CLI-only Herdr access, memory-only ownership, per-runtime session scope, and fail-closed compatibility. The MCP process is a second *host* for the same narrow runtime, not a second authority.
 - ADR-006 and ADR-008 stay authoritative for profiles: `herdr-tools` owns the catalog, launch is profile-only with typed overrides and bounded fallback, and prompt sources are prepared before topology mutation. The adapter adds no launch input and removes none.
 - ADR-005 stays authoritative: every prompt, steer, and assignment keeps the mandatory `[HERDR AGENT MESSAGE v1]` envelope with a sender resolved from the authoritative snapshot.
-- ADR-007 (role-scoped capabilities) rejected a `manager-claude` profile because no Claude profile had Herdr tool parity. That reasoning is unchanged for *launch profiles*: parity is granted here to the owner-started interactive session, not to a delegated Claude worker.
+- ADR-007 (role-scoped capabilities) and ADR-010 retain their historical rationale for the original release. ADR-011 supersedes only their narrow rejection of a `manager-claude` profile and separate manager package: parity is now provided by the shared manager plugin, while delegated Claude workers still do not receive Herdr lifecycle tools.
 - ADR-002 stays authoritative for detached waits. The MCP host keeps the in-memory job registry and drops only the Pi-specific notification and TUI surfaces.
 
 ## Assumptions
@@ -175,10 +175,10 @@ Any failure that escapes startup entirely is written by `src/mcp-server.ts` thro
 
 ### Claude package
 
-`claude-manager-plugin/` is packaging plus one conduct skill. It contains no tool logic, no policy, and no permission grants.
+`herdr-profiles/role-plugins/manager/` is the self-contained manager Claude plugin. It contains the stable manifest, the local MCP server registration, and the shared manager conduct skill; it contains no duplicate tool logic or permission grants.
 
 ```json
-// claude-manager-plugin/.claude-plugin/plugin.json
+// herdr-profiles/role-plugins/manager/.claude-plugin/plugin.json
 {
   "name": "herdr-tools",
   "description": "Herdr manager conduct skill and the local Herdr tools MCP server",
@@ -189,11 +189,11 @@ Any failure that escapes startup entirely is written by `src/mcp-server.ts` thro
 ```
 
 ```json
-// claude-manager-plugin/mcp-servers.json
+// herdr-profiles/role-plugins/manager/mcp-servers.json
 {
   "herdr": {
     "command": "node",
-    "args": ["${CLAUDE_PLUGIN_ROOT}/../dist/src/mcp-server.js"]
+    "args": ["${CLAUDE_PLUGIN_ROOT}/../../../dist/src/mcp-server.js"]
   }
 }
 ```
@@ -202,11 +202,11 @@ Any failure that escapes startup entirely is written by `src/mcp-server.ts` thro
 
 The manifest `name` and the server key are pinned, because Claude derives tool names from both: the seven tools appear as `mcp__plugin_herdr-tools_herdr__herdr_inspect` through `mcp__plugin_herdr-tools_herdr__herdr_tab`. Renaming either segment rewrites every allowlist entry an owner or launch configuration may reference, so a rename is an owner decision, not an implementation detail.
 
-The package lives inside this repository beside `herdr-profiles/role-plugins/`, so `${CLAUDE_PLUGIN_ROOT}/..` is the installed `herdr-tools` root and the built entry is the same code the Pi host runs. The server map carries no `env` mapping: Claude Code exports `CLAUDE_PROJECT_DIR` to MCP server subprocesses itself, confirmed by the official plugin reference and by the running Honcho plugin's subprocesses in this installation (Phase 4 evidence). The server still refuses to guess if it is ever absent.
+The plugin lives at `herdr-profiles/role-plugins/manager/`, so `${CLAUDE_PLUGIN_ROOT}/../../../` is the installed `herdr-tools` root and the built entry is the same code the Pi host runs. The server map carries no `env` mapping: Claude Code exports `CLAUDE_PROJECT_DIR` to MCP server subprocesses itself, confirmed by the official plugin reference and by the running Honcho plugin's subprocesses in this installation (Phase 4 evidence). The server still refuses to guess if it is ever absent.
 
 ### Local plugin loading only
 
-The `${CLAUDE_PLUGIN_ROOT}/..` path is valid only while the package is loaded from its place in this repository with `--plugin-dir`. Marketplace installation caches the package directory alone, so the parent repository, its `dist/`, and its `node_modules/` are gone and the server command cannot resolve.
+The `${CLAUDE_PLUGIN_ROOT}/../../../` path is valid only while the plugin is loaded from `herdr-profiles/role-plugins/manager/` in this repository with `--plugin-dir`. Marketplace installation caches the package directory alone, so the parent repository, its `dist/`, and its `node_modules/` are gone and the server command cannot resolve.
 
 This slice is therefore constrained to local `--plugin-dir` loading, and marketplace publication is blocked. A self-contained package would need its own bundled server build and its own dependency copy, which is a packaging redesign this slice does not authorize. The constraint is stated in the boundaries and stop conditions; the follow-up option is recorded as an unresolved question rather than half-built now.
 
@@ -235,7 +235,7 @@ Manager session startup, from the manager's project directory inside a Herdr pan
 
 ```bash
 claude --model claude-fable-5 \
-  --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/claude-manager-plugin
+  --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/role-plugins/manager
 ```
 
 Inside a running session the owner switches with `/model fable`. Server registration is verified with `/mcp`, which must list `herdr-tools` with the seven tools.
@@ -249,9 +249,9 @@ src/mcp/adapter.ts                                    descriptors, input validat
 src/mcp/run.ts                                        stdio server wiring and lifecycle
 src/mcp-server.ts                                     argument-free executable entry
 tsconfig.build.json                                   emit configuration for dist/
-claude-manager-plugin/.claude-plugin/plugin.json      package manifest
-claude-manager-plugin/mcp-servers.json                stdio server map
-claude-manager-plugin/skills/herdr-manager/SKILL.md   manager conduct skill
+herdr-profiles/role-plugins/manager/.claude-plugin/plugin.json  package manifest
+herdr-profiles/role-plugins/manager/mcp-servers.json            stdio server map
+herdr-profiles/role-plugins/manager/skills/manager/SKILL.md     shared manager conduct skill
 test/unit/tool-surface.test.ts                        shared surface identity and wiring
 test/unit/mcp-host.test.ts                            gating, cwd rules, capability proxy
 test/unit/mcp-adapter.test.ts                         schema, validation, result/error mapping, bounds
@@ -261,6 +261,7 @@ test/integration/herdr-mcp.integration.test.ts        disposable-session MCP evi
 docs/specs/claude-fable-manager-mcp.md
 docs/decisions/009-shared-claude-mcp-adapter.md
 docs/decisions/010-claude-manager-plugin-conduct.md
+docs/decisions/011-manager-claude-profile-and-plugin-consolidation.md
 ```
 
 `dist/` is already ignored by `.gitignore`.
@@ -323,10 +324,10 @@ Only in the disposable named session `herdr-tools-integration`, extending the ex
 
 ### Phase 0: specification and decisions
 
-- [x] Add this spec plus ADR-009 and ADR-010.
-  - Acceptance: product scope, adapter boundary, gating, testing strategy, boundaries, and stop conditions are durable and consistent with ADR-001, ADR-005, ADR-006, ADR-007, and ADR-008.
+- [x] Add this spec plus ADR-009, ADR-010, and ADR-011.
+  - Acceptance: product scope, adapter boundary, manager profile/plugin consolidation, gating, testing strategy, boundaries, and stop conditions are durable and consistent with ADR-001, ADR-005, ADR-006, ADR-007, and ADR-008.
   - Verify: documentation review, `git diff` inspection, no secrets, documentation-only commit.
-  - Files: `docs/specs/claude-fable-manager-mcp.md`, `docs/decisions/009-shared-claude-mcp-adapter.md`, `docs/decisions/010-claude-manager-plugin-conduct.md`.
+  - Files: `docs/specs/claude-fable-manager-mcp.md`, `docs/decisions/009-shared-claude-mcp-adapter.md`, `docs/decisions/010-claude-manager-plugin-conduct.md`, `docs/decisions/011-manager-claude-profile-and-plugin-consolidation.md`.
 
 ### Phase 1: contract verification, no product code
 
@@ -345,7 +346,7 @@ Probes ran in the scratch directory against the installed dependencies and the e
 - **TypeBox publication and validation.** `JSON.parse(JSON.stringify(schema))` yields `anyOf` roots with no root `additionalProperties` and per-variant `additionalProperties: false` for `herdr_inspect`, `herdr_communicate`, `herdr_jobs`, `herdr_pane`, and `herdr_tab`, and `type: "object"` roots for `herdr_wait` and `herdr_launch`. `Value.Check` and `Value.Errors` accept union roots. TypeBox 1.3 `ValueError` entries carry `keyword`, `schemaPath`, `instancePath`, `params`, and `message`, and no `path`; the adapter reports the first three as `keyword`, `instancePath`, `schemaPath`, and `message`.
 - **Truncation direction.** `truncateTail` from `@earendil-works/pi-coding-agent` keeps the tail and cannot bound a single-line JSON payload without dropping the head, and `truncateHead` returns empty content for a single line over the byte limit. The adapter therefore bounds its own payloads by bytes from the head, never splitting a code point, and keeps the existing `\n[output truncated]` marker. Per-tool bounds are unchanged.
 - **`CLAUDE_PROJECT_DIR`.** It is not present in the ambient Claude Code process environment in this installation, so Phase 1 could not tell from the parent process whether the client delivers it to an MCP subprocess. Phase 4 settled it: default delivery is authoritative and no `env` mapping is needed. See the Phase 4 evidence below. The live Honcho plugin confirms the top-level server-map shape with `${CLAUDE_PLUGIN_ROOT}` expansion.
-- **Emission and startup.** `tsconfig.build.json` emits `dist/src/mcp-server.js` and `dist/index.js`; the entry stays inside `src/`, so typecheck, lint, and emit all cover it and no root shim is needed. `node dist/src/mcp-server.js` refuses with one bounded stderr line and exit 1 for a missing `HERDR_ENV`, missing or malformed injected identifiers, and a missing, relative, or nonexistent `CLAUDE_PROJECT_DIR`; with valid gating it lists the seven tools in order with object schemas, and `herdr_inspect` `collection: "profiles"` returns the same 11 bundled profiles with no diagnostics that the Pi host loads. The bundled catalog is anchored on the package manifest, so the source and emitted layouts resolve to the same repository root.
+- **Emission and startup.** `tsconfig.build.json` emits `dist/src/mcp-server.js` and `dist/index.js`; the entry stays inside `src/`, so typecheck, lint, and emit all cover it and no root shim is needed. `node dist/src/mcp-server.js` refuses with one bounded stderr line and exit 1 for a missing `HERDR_ENV`, missing or malformed injected identifiers, and a missing, relative, or nonexistent `CLAUDE_PROJECT_DIR`; with valid gating it lists the seven tools in order with object schemas, and `herdr_inspect` `collection: "profiles"` returns the same 12 bundled profiles with no diagnostics that the Pi host loads. The bundled catalog is anchored on the package manifest, so the source and emitted layouts resolve to the same repository root.
 
 ### Phase 2: shared tool surface extraction
 
@@ -363,15 +364,15 @@ Probes ran in the scratch directory against the installed dependencies and the e
 
 ### Phase 4: Claude package and conduct skill
 
-- [x] Add `claude-manager-plugin/` with the manifest, top-level server map, and `herdr-manager` skill.
+- [x] Consolidate the manager plugin under `herdr-profiles/role-plugins/manager/` with the stable manifest, top-level server map, and shared `manager` skill; add the bundled `manager-claude` profile.
   - Acceptance: the package contains no tool logic and no permission grants; the manifest `name` is `herdr-tools` and the server key is `herdr`, so tools resolve as `mcp__plugin_herdr-tools_herdr__*`; the skill states manager conduct, evidence handling, job polling, the model expectation with report-and-stop on mismatch, and explicit non-authority language.
   - Verify: `npm run validate:plugin`, `test/unit/claude-plugin.test.ts`; then load the package with `--plugin-dir` in a disposable manager session and confirm `/mcp` lists the `herdr` server with seven tools under the expected prefix.
-  - Files: `claude-manager-plugin/**`, `test/unit/claude-plugin.test.ts`, `package.json`.
+  - Files: `herdr-profiles/manager-claude.md`, `herdr-profiles/role-plugins/manager/**`, `test/unit/claude-plugin.test.ts`, `test/unit/profile-catalog.test.ts`, `package.json`.
 
 #### Phase 4 evidence
 
-- **Live load.** `claude --plugin-dir ./claude-manager-plugin mcp list` reports `plugin:herdr-tools:herdr: node /home/gabriel/workspace/herdr-tools-claude-mcp/claude-manager-plugin/../dist/src/mcp-server.js - ✔ Connected`, so `${CLAUDE_PLUGIN_ROOT}` expands as specified and the built entry passes its startup gating under a real Claude Code load. `claude --plugin-dir ./claude-manager-plugin plugin details herdr-tools` reports skills 1 (`herdr-manager`), agents 0, hooks 0. That inventory prints "MCP servers (0)" because it counts inline manifest entries and this manifest points at the sibling `mcp-servers.json`; `mcp list` is the authority and shows the server registered and connected. The published tool names were not read from a live session's tool list: they follow from the `plugin:herdr-tools:herdr` server id by the same rule the installed Honcho plugin demonstrates (`plugin:honcho:honcho` publishing `mcp__plugin_honcho_honcho__*`). Confirming the exact names in a Fable manager session is left to owner dogfooding.
-- **Package contents.** Exactly three files: `.claude-plugin/plugin.json`, `mcp-servers.json`, and `skills/herdr-manager/SKILL.md`. No `.claude/agents`, no hooks, no settings, no `allowedTools`/`disallowedTools`, no permission-mode field. `claude plugin validate ./claude-manager-plugin` passes on Claude Code 2.1.233, and `test/unit/claude-plugin.test.ts` pins the manifest shape, the single `herdr` server key, the resolved entry path, the derived `mcp__plugin_herdr-tools_herdr__*` names, and the required skill conduct.
+- **Live load.** `claude --plugin-dir ./herdr-profiles/role-plugins/manager mcp list` reports the `plugin:herdr-tools:herdr` server connected through `${CLAUDE_PLUGIN_ROOT}/../../../dist/src/mcp-server.js`, so the consolidated plugin path and built entry pass startup gating under a real Claude Code load. `claude --plugin-dir ./herdr-profiles/role-plugins/manager plugin details herdr-tools` reports the shared manager skill, no native agents, and no hooks. The published tool names are pinned by the `plugin:herdr-tools:herdr` server identity and the unit/integration suites verify the exact `mcp__plugin_herdr-tools_herdr__*` names.
+- **Package contents.** Exactly three files: `.claude-plugin/plugin.json`, `mcp-servers.json`, and `skills/manager/SKILL.md`. No `.claude/agents`, no hooks, no settings, no permission lists in the plugin package. `claude plugin validate ./herdr-profiles/role-plugins/manager` passes on Claude Code 2.1.233, and `test/unit/claude-plugin.test.ts` pins the stable manifest/server identity, resolved entry path, derived `mcp__plugin_herdr-tools_herdr__*` names, and shared manager conduct.
 - **`CLAUDE_PROJECT_DIR` delivery.** Default delivery is authoritative; no `env` mapping is carried. Two sources agree.
   - Official documentation (Claude Code plugins reference): `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, and `${CLAUDE_PROJECT_DIR}` "are exported as environment variables to hook processes and to MCP and LSP server subprocesses", with `${CLAUDE_PROJECT_DIR}` resolving to the project root.
   - Live local example: the installed Honcho plugin registers its stdio server through the same top-level `mcp-servers.json` shape and carries no `env` mapping. Its running MCP subprocesses inherit `CLAUDE_PROJECT_DIR` set to each session's own project directory, alongside `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, and the injected `HERDR_ENV`/`HERDR_WORKSPACE_ID`/`HERDR_TAB_ID`/`HERDR_PANE_ID` identity this server also gates on. Two concurrent sessions in different project directories each delivered their own value, so the variable tracks the session rather than the client installation.
@@ -379,7 +380,7 @@ Probes ran in the scratch directory against the installed dependencies and the e
 
 ### Phase 5: integration evidence and documentation
 
-- [x] Extend the disposable-session integration suite and document installation in the existing README structure.
+- [x] Extend the disposable-session integration suite, validate the consolidated plugin, and document installation in the existing README structure.
   - Acceptance: every integration assertion in the testing strategy passes; the live workspace is untouched; README documents installation, the manager launch command, and the `herdr_jobs` polling model.
   - Verify: `HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration -- --session herdr-tools-integration`, then the full command list in order.
   - Files: `test/integration/herdr-mcp.integration.test.ts`, `README.md`.
@@ -437,7 +438,7 @@ Independently re-verified here: no global installation and no configuration writ
 - Publishing `outputSchema`/`structuredContent`, MCP progress notifications, or MCP resources and prompts.
 - Making the package self-contained for marketplace publication, which needs its own bundled server build and dependency copy.
 - Renaming the manifest or the server key, which rewrites every `mcp__plugin_herdr-tools_herdr__*` allowlist entry.
-- Adding a Claude worker profile with Herdr lifecycle tools, or a `manager-claude` launch profile.
+- Adding Herdr lifecycle tools to a Claude worker profile, or changing the manager-claude permission/tool policy.
 - Adding a headless wait reviewer for the MCP host, or changing the review cadence policy.
 - Raising the adapter response bounds or the existing per-tool bounds.
 - Exposing the adapter over anything other than local stdio.
@@ -447,7 +448,7 @@ Independently re-verified here: no global installation and no configuration writ
 - Add a raw-shell Herdr MCP tool, a native subagent profile, or an eighth tool.
 - Duplicate schemas, policy, bounds, or provenance in a host adapter.
 - Trust subprocess `cwd`, plugin installation paths, or module-relative paths for the project directory.
-- Publish the package to a marketplace or any cached install path while the server command depends on `${CLAUDE_PLUGIN_ROOT}/..`.
+- Publish the package to a marketplace or any cached install path while the server command depends on `${CLAUDE_PLUGIN_ROOT}/../../../`.
 - Inject turns, steer the manager, or let the adapter communicate with its own session.
 - Let the skill or package claim owner authority, grant permissions, or claim model enforcement.
 - Add compatibility parsing, profile-format redesign, monorepo conversion, or unrelated cleanup in this slice.
@@ -461,7 +462,7 @@ Independently re-verified here: no global installation and no configuration writ
 - [x] Profile discovery, prompt sources, bounded fallback, ownership, and v1 provenance behave identically across hosts.
 - [x] Detached waits are created and polled through `herdr_jobs`, with no self-communication and no automatic turn injection.
 - [x] Waits beyond the effective review cadence fail closed with a typed reviewer error in both foreground and detached form.
-- [x] The package adds only packaging and a conduct skill; model selection remains launch/user configuration and mismatch is reported, not enforced.
+- [x] The manager plugin adds only packaging, the shared manager skill, and the MCP registration; the `manager-claude` profile owns explicit runtime policy, model selection remains launch/user configuration, and mismatch is reported rather than enforced.
 - [x] The package loads from this repository with `--plugin-dir` and its tools resolve as `mcp__plugin_herdr-tools_herdr__*`; marketplace publication is documented as blocked rather than half-supported. The dogfood run called all seven published names from a live session, confirming the naming derived from the `plugin:herdr-tools:herdr` server id.
 - [x] Unit coverage stays at 100% for included sources with `src/mcp-server.ts` the only exclusion; the entry is typechecked, linted, built, and exercised by integration.
 

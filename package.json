@@ -18,7 +18,7 @@
     "lint": "eslint .",
     "build": "tsc",
     "build:mcp": "tsc -p tsconfig.build.json",
-    "validate:plugin": "claude plugin validate ./claude-manager-plugin"
+    "validate:plugin": "claude plugin validate ./herdr-profiles/role-plugins/manager"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.83.0",

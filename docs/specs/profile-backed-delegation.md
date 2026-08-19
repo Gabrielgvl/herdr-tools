@@ -4,12 +4,12 @@
 
 Replace the normal `pi-subagents` delegation path with visible, pane-backed Pi and Claude agents launched from reusable profiles. Build it in working layers rather than coupling the first release to every lifecycle feature.
 
-The first implementation slice delivers a strict profile catalog and profile-backed launch that can be dogfooded immediately. It also gives each bundled role an explicit capability policy and one shared role skill across Pi and Claude, with `manager-pi` as the visible orchestration-only entry point. Later slices add Herdr-native turn results, same-pane replacement, durable run state, and the blocking `herdr_delegate` lifecycle tool. `pi-subagents` remains installed only until the acceptance gates for the complete replacement pass.
+The first implementation slice delivers a strict profile catalog and profile-backed launch that can be dogfooded immediately. It also gives each bundled role an explicit capability policy and one shared role skill across Pi and Claude, with `manager-pi` as the generic advisory manager and `manager-claude` as the explicit Claude/Fable manager and succession profile. Later slices add Herdr-native turn results, same-pane replacement, durable run state, and the blocking `herdr_delegate` lifecycle tool. `pi-subagents` remains installed only until the acceptance gates for the complete replacement pass.
 
 ## Validated product decisions
 
 - Profiles are owned and resolved by `herdr-tools`, not the Herdr runtime.
-- Bundled profiles use deliberate role-scoped capabilities. `manager-pi` orchestrates visible workers but cannot edit; scout, planner, reviewer, and researcher are read-only; worker is the only bundled role with direct edit/write and background-job tools.
+- Bundled profiles use deliberate role-scoped capabilities. `manager-pi` orchestrates visible workers without direct mutation tools; `manager-claude` uses Claude `default` permission mode with only its core/research/Herdr namespace pre-approved and only `Task` hard-denied, so Bash/Edit/Write remain owner-gated; scout, planner, reviewer, and researcher are read-only; worker is the only bundled role with pre-approved direct edit/write and background-job tools.
 - Profiles are separate Markdown files discovered from:
   1. bundled `herdr-profiles/*.md`;
   2. user `~/.pi/agent/herdr-profiles/*.md`;
@@ -25,7 +25,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Fallbacks are ordered references to named profiles, validated as a graph. A launch has at most three attempts. Invalid profiles are isolated; only the selected reachable graph blocks launch.
 - Automatic fallback is allowed only after the installed CLI failure envelope `{id:"cli:agent:start",error:{code:"agent_start_failed",message:"agent process exited before becoming interactive"}}` with non-killed exit 1 and untruncated stderr, followed by an authoritative pane read with `agent_status:"unknown"` and no agent identity/session fields. Timeout, malformed/protocol, identity/kind, prompt, and uncertain-state failures stop.
 - Fallback targets use their own untouched defaults. Typed overrides apply only to the requested primary. The logical cwd, task, placement, and provenance carry across attempts.
-- Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager` has only a Pi profile using `openai-codex/gpt-5.6-sol` with high thinking and no fallback. The other roles have Pi and Claude variants with the existing direction/model policy:
+- Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager-pi` uses `openai-codex/gpt-5.6-sol` with high thinking as the generic advisory profile; `manager-claude` uses `claude-fable-5` with high effort, default permission mode, persistent session state, the manager plugin, and no fallback because manager identity must not silently change. The other roles have Pi and Claude variants with the existing direction/model policy:
   - scout: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - researcher: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - worker: `openai-codex/gpt-5.6-luna` with max thinking -> `claude-opus-5`;
@@ -54,7 +54,7 @@ This slice must not pretend terminal transcript scraping is a structured result.
 
 `herdr_launch` has one public mode: `{name, profile, overrides?, placement?, label?, cwd?, focus?, initialPrompt?}`. Raw `kind`, `argv`, and `env` fields are rejected. Profile discovery remains rooted at the manager session cwd and accepts arbitrary valid named profiles.
 
-The advisory role defaults are: manager-pi for management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-pi for research, and reviewer-pi for review. These defaults do not restrict arbitrary valid profile selection. Primary-only typed overrides never leak into fallback profiles. Profile `timeoutMinutes` is task policy; Herdr startup uses a separate valid 120000 ms readiness timeout and a small CLI execution margin.
+The advisory role defaults are: manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-pi for research, and reviewer-pi for review. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. These defaults do not restrict arbitrary valid profile selection. Primary-only typed overrides never leak into fallback profiles. Profile `timeoutMinutes` is task policy; Herdr startup uses a separate valid 120000 ms readiness timeout and a small CLI execution margin.
 
 Launch details include requested and selected profile names, effective runtime/model/source/timeout/permissions, and bounded per-attempt evidence. Fallback uses the deterministic reachable order, up to three attempts, and only the exact installed CLI error envelope plus the schema-real `agent_status:"unknown"` no-agent proof. Every timeout, protocol, identity/kind, prompt, or uncertain-state failure stops without fallback. Exhaustion stops and reports; it never invents another profile.
 
@@ -143,7 +143,7 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 ## Testing strategy
 
 - Unit-test parsing, schema rejection, precedence, shadow reporting, graph cycles/missing targets/max attempts, path resolution, argument generation, bounds, and redaction.
-- Assert the 11 bundled profiles, exact role capability matrices, shared resource paths, no hidden delegation tools, read-only mutation exclusions, and representative Pi/Claude launch flags.
+- Assert the 12 bundled profiles, exact manager-claude and role capability matrices, shared resource paths, no hidden delegation tools, read-only mutation exclusions, and representative Pi/Claude launch flags.
 - Unit-test launch ordering: resolve -> create pane/tab -> start exact kind/argv -> readiness -> provenance assignment.
 - Integration-test in a disposable Herdr session; never mutate or close the active user workspace.
 - Runtime work requires Pi and Claude contract tests for result correlation, cancellation, replacement, restart reconciliation, and capacity/storage failures.
@@ -176,7 +176,7 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 
 ## Slice 1 success criteria
 
-- [ ] Eleven bundled profiles resolve deterministically with source and shadow evidence; `manager-pi` is the only manager profile and has no fallback.
+- [ ] Twelve bundled profiles resolve deterministically with source and shadow evidence; `manager-pi` remains the generic advisory manager and `manager-claude` is selected for explicit Claude/Fable management or Claude-to-Claude succession; both have no fallback.
 - [ ] Every bundled role has one shared role skill, with matching Pi skill and Claude plugin resources.
 - [ ] Pi and Claude capability matrices exclude hidden delegation and keep direct mutation tools limited to workers.
 - [ ] Invalid unrelated profiles do not block valid profiles; invalid reachable fallback graphs fail before launch.

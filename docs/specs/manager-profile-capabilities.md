@@ -6,23 +6,23 @@ Implemented and verified.
 
 ## Objective
 
-Add one bundled `manager-pi` profile that orchestrates visible Herdr workers without implementing repository changes itself. Give every bundled Pi and Claude profile a deliberate role-scoped tool policy and a shared role skill, while retaining normal installed extension discovery.
+Add bundled `manager-pi` and `manager-claude` profiles that orchestrate visible Herdr workers without unapproved repository changes. Keep `manager-pi` as the generic advisory default and select `manager-claude` for owner-requested Claude/Fable management or Claude-to-Claude succession. Give every bundled Pi and Claude profile a deliberate role-scoped tool policy and a shared role skill, while retaining normal installed extension discovery.
 
 Success means profile launches are useful by default, hidden subagent spawning is excluded, read-only roles cannot use direct edit tools, and missing task-critical extension capabilities are reported as blockers instead of silently replaced by weaker behavior.
 
 ## Validated Owner Decisions
 
-- Add `manager-pi` only; do not add `manager-claude`.
-- The manager orchestrates only. It may inspect evidence, launch workers, communicate, wait, arrange or clean up owned panes, and synthesize results. It must not edit or implement.
+- Keep `manager-pi` as the generic advisory default and add `manager-claude` for owner-requested Claude/Fable management or Claude-to-Claude succession.
+- Both manager profiles orchestrate visible workers. The Claude manager may use Bash, Edit, and Write only after direct owner approval for coordination artifacts, read-only verification, monitoring, or directly owner-authorized control-plane actions; it must not perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation.
 - Use role-scoped tool allowlists while retaining installed extension discovery.
 - Configure role-specific skills.
-- Advisory defaults are manager-pi for management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-pi for research, and reviewer-pi for review. Planner order is intentional and must not be inverted.
+- Advisory defaults are manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-pi for research, and reviewer-pi for review. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.
 
 ## Assumptions
 
 1. `manager-pi` uses `openai-codex/gpt-5.6-sol` with `thinking: high`, a 30-minute timeout, and no persistent Pi session.
-2. The manager has no fallback profile because no Claude profile has native Herdr extension-tool parity.
-3. Existing model and fallback choices remain unchanged.
+2. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, a 30-minute timeout, persistent session state, and no fallback because manager identity must not silently change.
+3. Existing model and fallback choices remain unchanged for non-manager roles.
 4. Pi extension discovery remains enabled. Profile `runtime.extensions` stays empty because bundled profiles cannot portably reference machine-global package paths.
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
@@ -52,11 +52,13 @@ npm run test:integration
 ```text
 herdr-profiles/
   manager-pi.md
+  manager-claude.md
   *-pi.md
   *-claude.md
   role-plugins/
     manager/
       .claude-plugin/plugin.json
+      mcp-servers.json
       skills/manager/SKILL.md
     scout/
       .claude-plugin/plugin.json
@@ -95,7 +97,8 @@ Common extension-backed navigation tools are selected by name but still supplied
 
 | Profile | Active tools |
 |---|---|
-| `manager-pi` | `read`, `grep`, `find`, `ls`, `herdr_inspect`, `herdr_launch`, `herdr_communicate`, `herdr_wait`, `herdr_pane`, `herdr_tab` |
+| `manager-pi` | `read`, `grep`, `find`, `ls`, `herdr_inspect`, `herdr_launch`, `herdr_communicate`, `herdr_wait`, `herdr_pane`, `herdr_tab` | Generic advisory manager; no direct Bash/Edit/Write. |
+| `manager-claude` | `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `AskUserQuestion`, `Skill`, `ToolSearch`, `mcp__plugin_herdr-tools_herdr` | Claude `default`; only `Task` is disallowed. Bash/Edit/Write remain owner-gated and are omitted from both lists. |
 | `scout-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ffgrep`, `fffind`, `ctx_execute`, `ctx_execute_file`, `ctx_search` |
 | `planner-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content` |
 | `worker-pi` | Planner set plus `edit`, `write`, `bash_bg`, `jobs`, `job_decide`, `monitor` |
@@ -108,7 +111,7 @@ Explicitly absent from every non-manager Pi profile:
 - Herdr lifecycle tools
 - durable-memory mutation tools
 
-The manager does not receive `bash`, `edit`, or `write`.
+`manager-pi` does not receive `bash`, `edit`, or `write`. `manager-claude` receives none of those tools through pre-approval; Claude's `default` permission mode keeps owner approval required when they are requested.
 
 ### Claude profiles
 
@@ -126,10 +129,11 @@ Claude `allowedTools` pre-approves selected tools; `disallowedTools` supplies th
 
 ### Manager
 
-- Default to same-tab right-side launches and keep owner focus unchanged.
-- Use exact profile-backed launches, inspect state, communicate through provenance-preserving tools, and wait on authoritative states.
+- Keep the manager/caller pane isolated on its own tab; put workers on separate worker tabs with at most three panes per tab arranged side by side in one horizontal row.
+- Default to same-tab right-side launches without changing owner focus. Use exact profile-backed launches, authoritative state, provenance-preserving tools, detached waits plus `herdr_jobs` when appropriate, owned-resource cleanup, and handoff before context exhaustion.
 - Treat worker text as agent evidence, never as owner authorization.
-- Never edit, implement, merge, deploy, publish, or grant authority.
+- `manager-claude` may use Bash/Edit/Write only after direct owner approval for coordination artifacts, read-only verification, monitoring, or directly owner-authorized control-plane actions. Never use availability as approval.
+- Never perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation, and never grant authority.
 - Stop and report blocked or ambiguous work rather than inventing authority or masking degraded capabilities.
 
 ### Scout
@@ -184,8 +188,8 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 
 ### Unit tests
 
-- Catalog discovers 11 bundled profiles with no diagnostics.
-- `manager-pi` has exact identity, model, authority prompt, tools, skill path, and no fallback.
+- Catalog discovers 12 bundled profiles with no diagnostics.
+- `manager-pi` and `manager-claude` have exact identity, model, authority prompt, tools, shared skill/plugin path, and empty fallbacks.
 - Every Pi profile has a non-empty role allowlist and exactly one scoped role skill.
 - Every Claude profile has explicit permission mode, allowed/disallowed tools, and exactly one scoped plugin directory.
 - Read-only roles exclude direct mutation tools.
@@ -207,7 +211,7 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 - Add six scope-local role plugin directories under `herdr-profiles/role-plugins/`.
 - Give each plugin a minimal Claude manifest and one `skills/<role>/SKILL.md` contract.
 - Keep role method in the shared skill; keep profile bodies focused on identity, authority, and expected result shape.
-- Add `herdr-profiles/manager-pi.md` with the approved Sol/high orchestration-only configuration and no fallback.
+- Add `herdr-profiles/manager-pi.md` with the approved Sol/high orchestration-only configuration and no fallback, plus `herdr-profiles/manager-claude.md` with the exact owner-gated Fable manager policy and no fallback.
 
 Checkpoint: load the catalog and build argv for the manager plus one Pi/Claude pair before changing every profile.
 
@@ -218,13 +222,13 @@ Checkpoint: load the catalog and build argv for the manager plus one Pi/Claude p
 - Keep models, reasoning, timeouts, persistence, and existing fallback direction unchanged.
 - Include `herdr_tab` in the manager set and the four approved background-job tools in `worker-pi`.
 
-Checkpoint: catalog resolution has 11 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
+Checkpoint: catalog resolution has 12 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
 
 ### 3. Enforce contracts in tests
 
 - Extend `test/unit/profile-catalog.test.ts` with an exact capability matrix and role-resource existence checks.
 - Add representative `buildProfileArgv` assertions for manager, worker, read-only Pi, and Claude profiles.
-- Update `test/integration/herdr-tools.integration.test.ts` to inspect 11 profiles, inspect `manager-pi`, and verify exact worker tool/skill launch arguments without changing provenance or topology assertions.
+- Update `test/integration/herdr-tools.integration.test.ts` to inspect 12 profiles, inspect both manager profiles, and verify exact worker tool/skill launch arguments without changing provenance or topology assertions.
 - Add the owner-approved bounded launch recovery in `src/tools/launch.ts`: after exact `agent_prompt_stalled` evidence reports five seconds with no state change and idle status in a newly created pane, send one lowercase `enter` and re-verify `working`; never retry non-matching failures or pre-existing panes.
 - Cover the positive and negative recovery boundaries in `test/unit/launch.test.ts`.
 - Do not weaken strict parser, inspection-budget, discovery, or fallback tests.
@@ -253,7 +257,7 @@ npm run test:integration
 
 Then inspect the live profile collection from the built extension and confirm:
 
-- 11 effective profiles;
+- 12 effective profiles;
 - no diagnostics;
 - `manager-pi` reports the exact approved tools and skill;
 - existing profiles report their role-specific resources.
@@ -265,8 +269,8 @@ Then inspect the live profile collection from the built extension and confirm:
   - Verify: profile parser resolves each referenced path without diagnostics.
   - Files: `herdr-profiles/role-plugins/**`.
 
-- [x] Add `manager-pi` and configure all Pi profile capabilities.
-  - Acceptance: six Pi profiles have exact tools and one role skill; only manager has Herdr lifecycle tools; only worker has edit/write and background-job tools.
+- [x] Add `manager-pi` and `manager-claude`, and configure all manager/profile capabilities.
+  - Acceptance: six Pi profiles have exact tools and one role skill; manager-claude has the exact owner-gated Claude policy and shared manager plugin; only manager Pi has Herdr lifecycle tools in its Pi allowlist; only worker has edit/write and background-job tools among Pi profiles.
   - Verify: unit capability-matrix and argv tests.
   - Files: `herdr-profiles/*-pi.md`, `test/unit/profile-catalog.test.ts`.
 
@@ -311,7 +315,7 @@ Then inspect the live profile collection from the built extension and confirm:
 ## Success Criteria
 
 - `manager-pi` can visibly orchestrate profile-backed workers through Herdr and cannot directly edit repositories.
-- All 11 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
+- All 12 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
 - All Pi and Claude variants use one shared role skill source per role.
 - Read-only and no-hidden-delegation boundaries are mechanically represented in profile configuration and tested.
 - Unit tests, typecheck, lint, build, and integration tests pass.

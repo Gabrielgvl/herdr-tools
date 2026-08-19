@@ -18,15 +18,15 @@ Pi discovers the directory through its root `index.ts` when it is installed at `
 
 ## Claude Fable manager
 
-A Claude Fable session running in a Herdr pane can act as the manager through the local stdio MCP server in `claude-manager-plugin/`. Build the server first, then start the session from the manager's own project directory:
+A Claude Fable session running in a Herdr pane can act as the manager through the local stdio MCP server in `herdr-profiles/role-plugins/manager/`. Build the server first, then start the session from the manager's own project directory:
 
 ```bash
 npm run build:mcp
 claude --model claude-fable-5 \
-  --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/claude-manager-plugin
+  --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/role-plugins/manager
 ```
 
-`/mcp` must list the `herdr` server with the seven tools as `mcp__plugin_herdr-tools_herdr__herdr_inspect` through `mcp__plugin_herdr-tools_herdr__herdr_tab`. Inside a running session the owner switches models with `/model fable`; the packaged skill reports a mismatch and stops rather than claiming enforcement.
+`/mcp` must list the `herdr` server with the seven tools as `mcp__plugin_herdr-tools_herdr__herdr_inspect` through `mcp__plugin_herdr-tools_herdr__herdr_tab`. The bundled `manager-claude` profile uses this same plugin and is selected for owner-requested Claude/Fable management or Claude-to-Claude succession; `manager-pi` remains the generic advisory default. Inside a running session the owner switches models with `/model fable`; the packaged skill reports a mismatch and stops rather than claiming enforcement.
 
 Startup is fail-closed. The server refuses to serve unless `HERDR_ENV=1`, the injected `HERDR_WORKSPACE_ID`/`HERDR_TAB_ID`/`HERDR_PANE_ID` identity is present and valid, and `CLAUDE_PROJECT_DIR` is an absolute path to an existing directory. Claude Code exports `CLAUDE_PROJECT_DIR` to MCP server subprocesses, so no environment mapping is configured; the subprocess working directory, the plugin directory, and module-relative paths are never used as a substitute.
 
@@ -37,7 +37,7 @@ Two host differences are deliberate:
 - **Waits are polled, not pushed.** Nothing notifies the manager session when a detached wait finishes. Start long waits with `runInBackground: true` and read them with `herdr_jobs` `list` and `get`.
 - **No model-backed wait review.** The MCP host has no model registry, so a wait whose timeout exceeds `wait.reviewCadenceMinutes` fails closed with `REVIEWER_FAILED` in both foreground and detached form. Use repeated bounded waits, or raise the cadence (maximum 30) in `config.json`.
 
-The package loads only from its place in this repository with `--plugin-dir`, because its server command resolves through `${CLAUDE_PLUGIN_ROOT}/..` into this build. Marketplace publication is blocked: a cached install keeps the package directory alone and loses the build it points at.
+The package loads only from its place in this repository with `--plugin-dir`, because its server command resolves through `${CLAUDE_PLUGIN_ROOT}/../../../dist/src/mcp-server.js` into this build. Marketplace publication is blocked: a cached install keeps the package directory alone and loses the build it points at.
 
 ## Configuration
 
@@ -84,7 +84,7 @@ Detached waits show a live Pi footer status with active count and oldest elapsed
 | `npm run build` | TypeScript build check |
 | `npm run build:mcp` | Emit `dist/`, including the `dist/src/mcp-server.js` entry the plugin runs |
 | `npm run lint` | ESLint |
-| `npm run validate:plugin` | `claude plugin validate` on `claude-manager-plugin/` |
+| `npm run validate:plugin` | `claude plugin validate` on `herdr-profiles/role-plugins/manager/` |
 | `HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration -- --session herdr-tools-integration` | Opt-in disposable-session smoke tests for both hosts |
 
 The integration harness refuses any session name other than `herdr-tools-integration`, rejects reuse of an existing fixture, records failures before teardown, and tears down only IDs returned by that fixture. The MCP suite additionally binds the server to that session's socket and asserts the default session's topology is unchanged. Do not run it against the active Courier session.
@@ -95,7 +95,7 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `index.ts` gates registration, builds the `pi.exec` CLI adapter, shares runtime ownership, and clears only in-memory ownership on session shutdown and session start.
 - `src/mcp/` holds the MCP host only: startup gating, the `cwd`/`signal` capability proxy, and the bounded process-execution adapter (`host.ts`), schema publication with redacted, parseable, bounded result/error mapping (`adapter.ts`), sequential scheduling for the mutating tools (`queue.ts`), and stdio wiring and lifecycle (`run.ts`). `src/mcp-server.ts` is the argument-free entry emitted to `dist/src/mcp-server.js`.
 - `src/redaction.ts` holds the one environment redaction both hosts apply to retained evidence, plus the model-boundary projection the MCP adapter applies again before publishing.
-- `claude-manager-plugin/` is packaging plus one conduct skill: a manifest, the `herdr` stdio server map, and `skills/herdr-manager/SKILL.md`. It carries no tool logic, no policy, and no permission grants.
+- `herdr-profiles/role-plugins/manager/` is the self-contained Claude manager plugin: a stable `herdr-tools` manifest, the `herdr` stdio server map, and the shared `skills/manager/SKILL.md`. It carries the local MCP registration and manager conduct, while the profile keeps permissions explicit and owner-gated.
 - `src/cli.ts` bounds and validates CLI responses.
 - `src/targets.ts` resolves exact targets and injected current context.
 - `src/tools/` contains the seven public tools. Profile discovery and typed Pi/Claude adapters live under `src/profiles/`; `herdr_launch` is strict profile-only: no profile, no launch.
@@ -103,4 +103,4 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `src/wait-jobs-ui.ts` owns session-scoped footer/widget rendering for active detached waits.
 - `src/tui.ts` uses Pi `Text` components with bounded semantic rows.
 
-See [ADR-001](docs/decisions/001-extension-runtime-boundary.md) for the runtime boundary and ownership decisions, [ADR-009](docs/decisions/009-shared-claude-mcp-adapter.md) for the shared-implementation MCP adapter, and [ADR-010](docs/decisions/010-claude-manager-plugin-conduct.md) for the Claude manager package boundary.
+See [ADR-001](docs/decisions/001-extension-runtime-boundary.md) for the runtime boundary and ownership decisions, [ADR-009](docs/decisions/009-shared-claude-mcp-adapter.md) for the shared-implementation MCP adapter, [ADR-010](docs/decisions/010-claude-manager-plugin-conduct.md) for the historical Claude package boundary, and [ADR-011](docs/decisions/011-manager-claude-profile-and-plugin-consolidation.md) for the current manager profile and plugin layout.

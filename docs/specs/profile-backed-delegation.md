@@ -74,7 +74,7 @@ Add to Herdr core and managed Pi/Claude integrations:
 
 Add `herdr_delegate` as a blocking high-level tool:
 
-- creates only owned no-focus panes (same-tab right split or new tab);
+- creates only owned no-focus worker panes on worker tabs separate from the manager/caller tab; a right-side split is permitted only when adding another worker pane to an existing worker tab with fewer than three panes; the manager/caller tab is never used;
 - one logical 1-60 minute deadline, profile default 30 minutes;
 - eligible fallback on structured quota/rate-limit/overload/model-provider capacity failures;
 - continuation after prior activity uses a low-thinking direct model summary (default exact Luna) plus a Herdr `transcriptRef`;

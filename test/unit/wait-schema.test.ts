@@ -5,6 +5,7 @@ import { WaitParamsSchema, isRawState, isSemanticState, validateWaitParams } fro
 describe("herdr_wait schema and runtime validation", () => {
   it("is strict and accepts the documented state and output forms", () => {
     expect(Value.Check(WaitParamsSchema, { targets: ["w1:p1"], match: "any", condition: { kind: "state", state: "completed" }, timeoutMs: 1 })).toBe(true);
+    expect(Value.Check(WaitParamsSchema, { targets: ["w1:p1"], match: "any", condition: { kind: "state", state: "terminal" }, timeoutMs: 1 })).toBe(true);
     expect(Value.Check(WaitParamsSchema, { targets: ["w1:p1"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 3_600_000 })).toBe(true);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "done" } }, timeoutMs: 1, reviewerModel: "bad" })).toBe(false);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "bad" }, timeoutMs: 1 })).toBe(false);

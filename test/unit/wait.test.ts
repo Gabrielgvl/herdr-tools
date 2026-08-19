@@ -94,6 +94,22 @@ describe("herdr_wait", () => {
     expect(all.details.targets).toHaveLength(2);
   });
 
+  it("matches terminal to idle, blocked, and done only", () => {
+    const expected = new Map([
+      ["idle", true],
+      ["working", false],
+      ["blocked", true],
+      ["done", true],
+      ["unknown", false]
+    ]);
+    for (const [state, matches] of expected) expect(matchesState(state, "terminal")).toBe(matches);
+  });
+
+  it("describes the terminal semantic state", () => {
+    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings });
+    expect(tool.description).toContain("terminal");
+  });
+
   it("rejects target aliases that resolve to one resource and preserves timeout snapshots", async () => {
     await expect(execute(fakeCli(), { targets: ["p1", "one"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     const controller = new AbortController(); controller.abort();

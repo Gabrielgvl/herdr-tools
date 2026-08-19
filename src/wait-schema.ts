@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import type { Static } from "typebox";
 
 export const WAIT_RAW_STATES = ["idle", "working", "blocked", "done", "unknown"] as const;
-export const WAIT_SEMANTIC_STATES = ["started", "completed", "needs_input"] as const;
+export const WAIT_SEMANTIC_STATES = ["started", "completed", "needs_input", "terminal"] as const;
 export const WAIT_LABEL_MAX_LENGTH = 120;
 export const WAIT_LABEL_MAX_BYTES = WAIT_LABEL_MAX_LENGTH * 4 + 2;
 const WAIT_LABEL_PATTERN = "^[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u0600-\\u0605\\u061c\\u06dd\\u070f\\u0890-\\u0891\\u08e2\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\u2066-\\u206f\\ufeff\\ufff9-\\ufffb]+$";

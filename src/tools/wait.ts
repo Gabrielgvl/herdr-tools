@@ -153,6 +153,7 @@ export function matchesState(state: string, requested: string): boolean {
   if (["idle", "working", "blocked", "done", "unknown"].includes(requested)) return state === requested;
   if (requested === "started") return state === "working";
   if (requested === "completed") return state === "idle" || state === "done";
+  if (requested === "terminal") return state === "idle" || state === "blocked" || state === "done";
   return requested === "needs_input" && state === "blocked";
 }
 
@@ -450,7 +451,7 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
   return {
     name: "herdr_wait",
     label: "Herdr Wait",
-    description: "MCP wait for exact Herdr agent targets to satisfy an authoritative state or pane-output condition; distinct from the CLI agent wait readiness command.",
+    description: "MCP wait for exact Herdr agent targets to satisfy an authoritative raw state (idle, working, blocked, done, unknown), semantic state (started, completed, needs_input, terminal), or pane-output condition; distinct from the CLI agent wait readiness command.",
     parameters: WaitParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, context) {
       const activeSignal = signal ?? new AbortController().signal;

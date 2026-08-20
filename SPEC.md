@@ -189,7 +189,7 @@ Rules:
     | { kind: "output", match: { kind: "literal" | "regex", value: string } },
   timeoutMs: integer,          // required, 1 through 3,600,000 inclusive
   label?: string,              // optional single-line display label
-  runInBackground?: boolean    // optional; default false
+  runInBackground?: boolean    // optional; omitted auto-detaches long waits
 }
 ```
 
@@ -221,9 +221,9 @@ Long waits use mandatory in-process, tool-less reviewer calls:
 
 ### Detached wait jobs and `herdr_jobs`
 
-`herdr_wait` accepts an optional camelCase `runInBackground` boolean. Its schema is strict: omitted or `false` retains the blocking behavior, while snake_case and unknown fields are rejected. Background mode performs parameter validation, extension-owned settings loading, one authoritative snapshot read, exact target resolution, and duplicate resolved-resource rejection before registering anything. These preflight steps use the initiating tool signal and throw directly on failure without creating a job.
+`herdr_wait` accepts an optional camelCase `runInBackground` boolean. Its schema is strict: `true` explicitly detaches, `false` explicitly retains blocking behavior, and an omitted value automatically detaches waits whose timeout exceeds the configured review cadence. Snake_case and unknown fields are rejected. Background mode performs parameter validation, extension-owned settings loading, one authoritative snapshot read, exact target resolution, and duplicate resolved-resource rejection before registering anything. These preflight steps use the initiating tool signal and throw directly on failure without creating a job.
 
-After preflight, the extension registers a stable opaque `job_${randomUUID()}` identifier and runs the same prepared wait engine used by foreground waits under a fresh per-job `AbortController`. The prepared params, settings, and resolved IDs are copied at registration. Timeout starts after preflight. The initiating signal and call-scoped update callback are never used by post-registration work. A session generation/token check prevents stale preflight from registering into a replacement session.
+After preflight, the extension registers a stable opaque `job_${randomUUID()}` identifier and runs the same prepared wait engine used by foreground waits under a fresh per-job `AbortController`. Automatically detached long waits retain the mandatory in-process watcher model, and its terminal notification wakes the initiating Pi agent through the normal steer queue. The prepared params, settings, and resolved IDs are copied at registration. Timeout starts after preflight. The initiating signal and call-scoped update callback are never used by post-registration work. A session generation/token check prevents stale preflight from registering into a replacement session.
 
 The in-memory, session-wide registry has no concurrency cap and retains terminal jobs until shutdown. Generic job status is `running`, `completed`, `failed`, or `cancelled`; wait outcome is separately `success`, `timeout`, or `manager_judgment_required`. Only latest bounded progress is stored. Terminal transitions are first-wins. `herdr_jobs` is the sole public registry view and is strict:
 

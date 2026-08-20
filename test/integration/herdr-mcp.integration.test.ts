@@ -195,8 +195,8 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       ]));
       expect(catalog.diagnostics ?? []).toEqual([]);
 
-      // Owned resources come first so the launch target has settled by the time
-      // it is used, and so cleanup only ever touches this run's own fixtures.
+      // Create the launch target through this same runtime so existing-pane
+      // recovery can prove ownership instead of treating the pane as external.
       const split = await call("herdr_pane", { operation: "split", target: rootPane.pane_id, label: "mcp-worker", direction: "right", focus: false, env: { HERDR_TOOLS_IT_SECRET: ENVIRONMENT_SENTINEL } });
       const workerPaneId = evidence(split).paneId as string;
       expect(typeof workerPaneId).toBe("string");
@@ -211,6 +211,12 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(evidence(panes).items).toEqual(expect.arrayContaining([expect.objectContaining({ workspace_id: workspaceId })]));
 
       await new Promise((settle) => setTimeout(settle, PANE_SETTLE_MS));
+      const prelaunch = await call("herdr_inspect", { mode: "target", target: workerPaneId });
+      const prelaunchMetadata = record(evidence(prelaunch).metadata);
+      expect(prelaunchMetadata).toMatchObject({ pane_id: workerPaneId, agent_status: "unknown" });
+      expect(prelaunchMetadata).not.toHaveProperty("agent_name");
+      expect(prelaunchMetadata).not.toHaveProperty("agent_id");
+      expect(prelaunchMetadata).not.toHaveProperty("agent");
       const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", placement: { mode: "existing_pane", target: workerPaneId }, initialPrompt: "Use the bash tool to run pwd, then report the working directory." });
       expect(launched.isError, text(launched)).toBeUndefined();
       const launchEvidence = evidence(launched);
@@ -238,7 +244,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(evidence(communicated)).toMatchObject({ operation: "steer", envelope: { version: "v1", kind: "steer" }, sender: { paneId: rootPane.pane_id } });
       const transcript = await call("herdr_inspect", { mode: "target", target: workerPaneId });
       expect(JSON.stringify(evidence(transcript).recentUnwrappedLines)).toContain("[HERDR AGENT MESSAGE v1]");
-      const unsupervised = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 31 * 60_000 });
+      const unsupervised = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 31 * 60_000, runInBackground: false });
       expect(unsupervised.isError).toBe(true);
       expect(text(unsupervised)).toContain("REVIEWER_FAILED");
 

@@ -17,6 +17,7 @@ export interface LaunchCli {
 
 export interface LaunchResourceRegistry {
   record(resource: { kind: "pane" | "tab"; id: string; parentId?: string }): void;
+  has?(resource: { kind: "pane" | "tab"; id: string }): boolean;
 }
 
 export interface LaunchDependencies {
@@ -208,8 +209,31 @@ function noAgentFromPane(pane: Record<string, unknown>): boolean {
   return pane.agent_status === "unknown" && agentFields.every((field) => pane[field] === undefined || pane[field] === null);
 }
 
+function prelaunchPaneIsAgentFree(snapshot: HerdrSnapshot, pane: Record<string, unknown>): boolean {
+  return noAgentFromPane(pane) && !snapshot.agents.some((agent) => agent.pane_id === pane.pane_id);
+}
+
+function agentRecord(result: unknown): Record<string, unknown> {
+  if (!record(result)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr agent post-state is incompatible");
+  const agent = record(result.agent) ? result.agent : result;
+  return agent;
+}
+
+function exactPromptRecoveryAgent(agent: Record<string, unknown>, started: StartedAgent, stateChangeSeq: number): boolean {
+  const actualSequence = agent.state_change_seq;
+  const actualAgentId = idFrom(agent, "agent_id") ?? idFrom(agent, "id");
+  return stringFrom(agent, "name") === started.name
+    && idFrom(agent, "pane_id") === started.paneId
+    && stringFrom(agent, "agent") === started.kind
+    && stateFrom(agent) === "idle"
+    && typeof actualSequence === "number"
+    && Number.isSafeInteger(actualSequence)
+    && actualSequence === stateChangeSeq
+    && (started.agentId === undefined || actualAgentId === started.agentId);
+}
+
 function compactAttemptState(pane: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(["pane_id", "tab_id", "workspace_id", "agent_id", "agent_name", "agent_status", "status"].flatMap((field): Array<[string, unknown]> => {
+  return Object.fromEntries(["pane_id", "tab_id", "workspace_id", "agent_id", "agent_name", "name", "agent_kind", "agent", "kind", "agent_status", "state_change_seq", "agent_session", "status"].flatMap((field): Array<[string, unknown]> => {
     const value = pane[field];
     if (value === undefined) return [];
     if (typeof value === "string") return [[field, value.slice(0, 256)]];
@@ -262,20 +286,25 @@ function focusArgs(focus: boolean): string[] {
   return [focus ? "--focus" : "--no-focus"];
 }
 
-function isPromptStalled(error: unknown): boolean {
-  if (!record(error) || error.code !== "CLI_PROTOCOL_ERROR" || !record(error.details)) return false;
+interface PromptStallEvidence {
+  stateChangeSeq: number;
+}
+
+function promptStallEvidence(error: unknown): PromptStallEvidence | undefined {
+  if (!record(error) || error.code !== "CLI_PROTOCOL_ERROR" || !record(error.details)) return undefined;
   const { exitCode, killed, stderr } = error.details;
-  if (exitCode !== 1 || killed !== false || typeof stderr !== "string") return false;
+  if (exitCode !== 1 || killed !== false || typeof stderr !== "string") return undefined;
   let envelope: unknown;
   try {
     envelope = JSON.parse(stderr.trim());
   } catch {
-    return false;
+    return undefined;
   }
-  if (!record(envelope) || envelope.id !== "cli:agent:prompt" || !record(envelope.error)) return false;
-  return envelope.error.code === "agent_prompt_stalled"
-    && typeof envelope.error.message === "string"
-    && /^agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained \d+$/.test(envelope.error.message);
+  if (!record(envelope) || envelope.id !== "cli:agent:prompt" || !record(envelope.error) || envelope.error.code !== "agent_prompt_stalled" || typeof envelope.error.message !== "string") return undefined;
+  const match = /^agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained (\d+)$/.exec(envelope.error.message);
+  if (!match) return undefined;
+  const stateChangeSeq = Number(match[1]);
+  return Number.isSafeInteger(stateChangeSeq) ? { stateChangeSeq } : undefined;
 }
 
 function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"]): LaunchError {
@@ -284,7 +313,9 @@ function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchD
     : error instanceof LaunchError ? error.code
       : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
   const message = error instanceof Error ? error.message : String(error);
-  const code = causeCode === "ABORTED" ? "ABORTED" : causeCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : causeCode === "READY_TIMEOUT" || (causeCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
+  const code = error instanceof LaunchError && error.code === "POSTSTATE_UNAVAILABLE"
+    ? "POSTSTATE_UNAVAILABLE"
+    : causeCode === "ABORTED" ? "ABORTED" : causeCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : causeCode === "READY_TIMEOUT" || (causeCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
   return new LaunchError(code, `Launch did not complete: ${message}`, {
     ...(error instanceof LaunchError ? error.details : {}),
     created: { ...created },
@@ -351,6 +382,12 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         throw new LaunchError("INVALID_INPUT", `Agent name is already in use: ${params.name}`);
       }
       const existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, deps.context) : undefined;
+      const existingPaneOwned = placement.mode === "existing_pane"
+        && existingTarget !== undefined
+        && deps.ownership?.has?.({ kind: "pane", id: existingTarget.id }) === true;
+      const existingPaneAgentFree = placement.mode === "existing_pane"
+        && existingTarget !== undefined
+        && prelaunchPaneIsAgentFree(snapshot, existingTarget.record);
       const workspaceId = placement.mode === "new_tab" ? deps.context.workspaceId! : undefined;
       let paneId: string | undefined;
       let tabId: string | undefined;
@@ -433,7 +470,25 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           try {
             await run(deps.cli, ["agent", "prompt", resolvedPaneId, envelope, "--wait", "--until", "working", "--timeout", "10000"], abortSignal);
           } catch (error) {
-            if (placement.mode === "existing_pane" || !isPromptStalled(error)) throw error;
+            const stalled = promptStallEvidence(error);
+            if (!stalled) throw error;
+            if (placement.mode === "existing_pane") {
+              if (!existingPaneOwned) {
+                throw new LaunchError("LAUNCH_FAILED", "Initial prompt stalled; existing-pane recovery requires runtime ownership", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_not_owned" });
+              }
+              if (!existingPaneAgentFree) {
+                throw new LaunchError("LAUNCH_FAILED", "Initial prompt stalled; existing-pane recovery requires an agent-free pre-launch pane", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_preexisting_agent" });
+              }
+              let stalledAgent: Record<string, unknown>;
+              try {
+                stalledAgent = agentRecord(await run(deps.cli, ["agent", "get", resolvedPaneId], abortSignal));
+              } catch {
+                throw new LaunchError("POSTSTATE_UNAVAILABLE", "Initial prompt stalled; authoritative agent post-state was unavailable for bounded recovery", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_post_state_unavailable" });
+              }
+              if (!exactPromptRecoveryAgent(stalledAgent, chosenAgent, stalled.stateChangeSeq)) {
+                throw new LaunchError("POSTSTATE_UNAVAILABLE", "Initial prompt stalled; authoritative agent post-state did not prove the exact idle agent", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_post_state_unproven", postState: compactAttemptState(stalledAgent), expectedStateChangeSeq: stalled.stateChangeSeq });
+              }
+            }
             await run(deps.cli, ["agent", "send-keys", resolvedPaneId, "enter"], abortSignal);
             await run(deps.cli, ["agent", "wait", resolvedPaneId, "--until", "working", "--timeout", "5000"], abortSignal);
           }

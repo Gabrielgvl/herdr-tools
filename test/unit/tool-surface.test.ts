@@ -124,7 +124,7 @@ describe("shared tool surface", () => {
 
   it("forwards an injected reviewer factory and otherwise keeps the Pi model reviewer", async () => {
     const reviewerFactory = vi.fn(() => { throw Object.assign(new Error("no reviewer"), { code: "REVIEWER_FAILED" }); });
-    const longWait = { targets: ["w:p2"], match: "any" as const, condition: { kind: "state" as const, state: "blocked" as const }, timeoutMs: 120_000 };
+    const longWait = { targets: ["w:p2"], match: "any" as const, condition: { kind: "state" as const, state: "blocked" as const }, timeoutMs: 120_000, runInBackground: false };
     const injected = surfaceFor({ reviewerFactory });
     await expect(injected.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
     expect(reviewerFactory).toHaveBeenCalledTimes(1);

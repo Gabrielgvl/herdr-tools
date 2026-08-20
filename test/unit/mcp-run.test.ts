@@ -254,7 +254,7 @@ describe("MCP server startup", () => {
     const profiles = await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "profiles" } });
     expect(profiles.isError).toBeUndefined();
     expect(textOf(profiles)).toContain("manager-pi");
-    const beyondDefaultCadence = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 600_000 } });
+    const beyondDefaultCadence = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 600_000, runInBackground: false } });
     expect(beyondDefaultCadence.isError).toBe(true);
     expect(textOf(beyondDefaultCadence)).toContain("REVIEWER_FAILED");
     expect(readFileMock).toHaveBeenCalled();
@@ -385,7 +385,7 @@ describe("MCP tool serving", () => {
 describe("MCP wait and job semantics", () => {
   it("fails closed for a foreground wait beyond the review cadence", async () => {
     const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
-    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
+    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000, runInBackground: false } });
     expect(outcome.isError).toBe(true);
     expect(textOf(outcome)).toContain("REVIEWER_FAILED");
     expect(textOf(outcome)).toContain("model-backed wait review is unavailable on the MCP host");

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { CliProtocolError, HerdrCli, type PiExec } from "../../src/cli.js";
-import { mapPreflightFailure, parseHealth, preflightCompatibility } from "../../src/health.js";
+import { mapPreflightFailure, MAX_HEALTH_STATUS_LENGTH, MAX_HEALTH_VERSION_LENGTH, parseHealth, preflightCompatibility } from "../../src/health.js";
 import { createPaneTool } from "../../src/tools/pane.js";
 
 const healthy = JSON.stringify({
@@ -42,6 +42,28 @@ describe("Herdr compatibility preflight", () => {
     await expect(preflightCompatibility({ runText: vi.fn(async () => healthy) }, new AbortController().signal)).resolves.toMatchObject({ compatible: true, socketReachable: true });
   });
 
+  it("accepts health fields at their explicit size boundaries", () => {
+    const version = "v".repeat(MAX_HEALTH_VERSION_LENGTH);
+    const status = "s".repeat(MAX_HEALTH_STATUS_LENGTH);
+    expect(parseHealth(JSON.stringify({
+      client: { version, protocol: 19 },
+      server: { status, version, protocol: 19, compatible: true }
+    }))).toEqual({
+      client: { version, protocol: 19 },
+      server: { status, version, protocol: 19 },
+      socketReachable: false,
+      compatible: true
+    });
+  });
+
+  it.each([
+    ["client version", { client: { version: "v".repeat(MAX_HEALTH_VERSION_LENGTH + 1), protocol: 19 }, server: { status: "running", version: "0.8.0", protocol: 19, compatible: true } }],
+    ["server version", { client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "v".repeat(MAX_HEALTH_VERSION_LENGTH + 1), protocol: 19, compatible: true } }],
+    ["server status", { client: { version: "0.8.0", protocol: 19 }, server: { status: "s".repeat(MAX_HEALTH_STATUS_LENGTH + 1), version: "0.8.0", protocol: 19, compatible: true } }]
+  ] as const)("rejects oversized %s health fields before mutation preflight", (_name, output) => {
+    expect(() => parseHealth(JSON.stringify(output))).toThrowError(expect.objectContaining({ code: "CLI_INCOMPATIBLE" }));
+  });
+
   it("accepts degraded stopped health without server metadata and reports it as unavailable", async () => {
     const degraded = JSON.stringify({ client: { version: "0.8.0", protocol: 19 }, server: { status: "stopped" } });
     expect(parseHealth(degraded)).toEqual({
@@ -63,6 +85,33 @@ describe("Herdr compatibility preflight", () => {
     });
     const { promise, calls } = productionRename(degraded);
     await expect(promise).rejects.toMatchObject({ code: "BACKEND_UNAVAILABLE" });
+    expect(calls).toEqual([["status", "--json"]]);
+  });
+
+  it("keeps stopped and incompatible preflight errors bounded to typed health", async () => {
+    const version = "v".repeat(MAX_HEALTH_VERSION_LENGTH);
+    const status = "s".repeat(MAX_HEALTH_STATUS_LENGTH);
+    const stopped = productionRename(JSON.stringify({ client: { version, protocol: 19 }, server: { status } }));
+    const stoppedError = await stopped.promise.catch((error: unknown) => error);
+    expect(stoppedError).toMatchObject({ code: "BACKEND_UNAVAILABLE", details: { health: { client: { version }, server: { status }, socketReachable: false } } });
+    expect(Object.keys((stoppedError as { details: Record<string, unknown> }).details)).toEqual(["health"]);
+    expect(JSON.stringify(stoppedError)).not.toContain("[truncated]");
+    expect(stopped.calls).toEqual([["status", "--json"]]);
+
+    const incompatible = productionRename(JSON.stringify({ client: { version, protocol: 19 }, server: { status: "running", version, protocol: 18, compatible: false } }));
+    const incompatibleError = await incompatible.promise.catch((error: unknown) => error);
+    expect(incompatibleError).toMatchObject({ code: "CLI_INCOMPATIBLE", details: { health: { client: { version }, server: { status: "running", version, protocol: 18 }, socketReachable: true, compatible: false } } });
+    expect(Object.keys((incompatibleError as { details: Record<string, unknown> }).details)).toEqual(["health"]);
+    expect(JSON.stringify(incompatibleError)).not.toContain("[truncated]");
+    expect(incompatible.calls).toEqual([["status", "--json"]]);
+  });
+
+  it.each([
+    ["stopped status", { client: { version: "0.8.0", protocol: 19 }, server: { status: "s".repeat(MAX_HEALTH_STATUS_LENGTH + 1) } }],
+    ["incompatible server version", { client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "v".repeat(MAX_HEALTH_VERSION_LENGTH + 1), protocol: 18, compatible: false } }]
+  ] as const)("rejects oversized %s through production preflight without mutation", async (_name, output) => {
+    const { promise, calls } = productionRename(JSON.stringify(output));
+    await expect(promise).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
     expect(calls).toEqual([["status", "--json"]]);
   });
 
@@ -106,6 +155,7 @@ describe("Herdr compatibility preflight", () => {
     ["bad server null", healthDetails(validHealthClient, null)],
     ["bad server array", healthDetails(validHealthClient, [])],
     ["empty client version", healthDetails({ version: "", protocol: 19 })],
+    ["oversized client version", healthDetails({ version: "v".repeat(MAX_HEALTH_VERSION_LENGTH + 1), protocol: 19 })],
     ["non-string client version", healthDetails({ version: 19, protocol: 19 })],
     ["invalid client protocol type", healthDetails({ version: "0.8.0", protocol: "19" })],
     ["non-finite client protocol", healthDetails({ version: "0.8.0", protocol: Infinity })],
@@ -113,13 +163,15 @@ describe("Herdr compatibility preflight", () => {
     ["non-positive client protocol", healthDetails({ version: "0.8.0", protocol: 0 })],
     ["malformed status", healthDetails(validHealthClient, { status: 123, version: "0.8.0", protocol: 19, compatible: true })],
     ["empty status", healthDetails(validHealthClient, { status: "", version: "0.8.0", protocol: 19, compatible: true })],
+    ["oversized status", healthDetails(validHealthClient, { status: "s".repeat(MAX_HEALTH_STATUS_LENGTH + 1), version: "0.8.0", protocol: 19, compatible: true })],
     ["empty server version", healthDetails(validHealthClient, { status: "running", version: "", protocol: 19, compatible: true })],
+    ["oversized server version", healthDetails(validHealthClient, { status: "running", version: "v".repeat(MAX_HEALTH_VERSION_LENGTH + 1), protocol: 19, compatible: true })],
     ["non-string server version", healthDetails(validHealthClient, { status: "running", version: 19, protocol: 19, compatible: true })],
     ["invalid server protocol type", healthDetails(validHealthClient, { status: "running", version: "0.8.0", protocol: "19", compatible: true })],
     ["non-finite server protocol", healthDetails(validHealthClient, { status: "running", version: "0.8.0", protocol: Infinity, compatible: true })],
     ["non-integer server protocol", healthDetails(validHealthClient, { status: "running", version: "0.8.0", protocol: 19.5, compatible: true })],
     ["non-positive server protocol", healthDetails(validHealthClient, { status: "running", version: "0.8.0", protocol: 0, compatible: true })],
-    ["malformed compatible", healthDetails(validHealthClient, { status: "running", version: "0.8.0", protocol: 19, compatible: "true" })],
+    ["malformed compatible", healthDetails(validHealthClient, { status: "running", version: "0.8.0", protocol: 19, compatible: "true" }, { compatible: "true" })],
     ["missing socket reachability", { client: validHealthClient, server: validHealthServer, compatible: true }]
   ] as const;
   const mappedMalformedHealthCases = malformedHealthCases.flatMap(([name, health]) => (["CLI_INCOMPATIBLE", "BACKEND_UNAVAILABLE"] as const).map((code) => [name, code, health] as const));
@@ -140,6 +192,20 @@ describe("Herdr compatibility preflight", () => {
   it.each(retainedHealthCases.flatMap(([name, health, expected]) => (["CLI_INCOMPATIBLE", "BACKEND_UNAVAILABLE"] as const).map((code) => [name, code, health, expected] as const)))("retains %s safe typed health details for %s preflight errors", (_name, code, health, expected) => {
     const mapped = mapPreflightFailure(new CliProtocolError(code, "preflight failed", { health }));
     expect(mapped.details.health).toEqual(expected);
+  });
+
+  it("fails closed for contradictory running protocol metadata before dispatching a mutation", async () => {
+    const output = JSON.stringify({ client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "0.8.0", protocol: 18, compatible: true } });
+    const { promise, calls } = productionRename(output);
+    const error = await promise.catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ code: "CLI_INCOMPATIBLE", details: { health: { client: { protocol: 19 }, server: { protocol: 18 }, compatible: true } } });
+    expect(calls).toEqual([["status", "--json"]]);
+  });
+
+  it("keeps equal protocols compatible and mismatch with false unchanged", async () => {
+    await expect(preflightCompatibility({ runText: vi.fn(async () => healthy) }, new AbortController().signal)).resolves.toMatchObject({ client: { protocol: 19 }, server: { protocol: 19 } });
+    const mismatch = JSON.stringify({ client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "0.7.0", protocol: 18, compatible: false } });
+    await expect(preflightCompatibility({ runText: vi.fn(async () => mismatch) }, new AbortController().signal)).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
   });
 
   it("preserves an abort that happens before compatibility preflight without dispatching a mutation", async () => {

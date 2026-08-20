@@ -3,6 +3,8 @@ import type { TSchema } from "typebox";
 import type { HerdrCli } from "./cli.js";
 import { preflightCompatibility, type CompatibilityPreflight, type HealthCli } from "./health.js";
 import type { JobRegistry } from "./job-registry.js";
+import type { RecipientRegistry } from "./messages/recipients.js";
+import type { AttachmentStore } from "./messages/store.js";
 import type { RuntimeOwnership } from "./ownership.js";
 import type { ProfileCatalog } from "./profiles/types.js";
 import type { WaitReviewer } from "./reviewer.js";
@@ -105,6 +107,13 @@ export interface HerdrToolSurfaceDependencies {
   ownership: RuntimeOwnership;
   cwd: string;
   reviewerFactory?: (settings: Settings, context: ExtensionContext) => WaitReviewer;
+  /**
+   * Large-message delivery is owned by the tools, so a host that cannot own an
+   * attachment cache simply omits these and every attachment delivery is
+   * refused as unverified rather than degraded to an inline send.
+   */
+  attachments?: AttachmentStore;
+  recipients?: RecipientRegistry;
 }
 
 export interface HerdrToolSurface {
@@ -122,7 +131,13 @@ export interface HerdrToolSurface {
 /** Construct the seven Herdr tools once for every host. */
 export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrToolSurface {
   const inspect = createInspectTool({ cli: deps.cli, context: deps.context, environment: deps.environment, profiles: deps.profiles });
-  const communicate = createCommunicateTool({ cli: deps.cli, context: deps.context, preflight: deps.preflight });
+  const communicate = createCommunicateTool({
+    cli: deps.cli,
+    context: deps.context,
+    preflight: deps.preflight,
+    ...(deps.attachments ? { attachments: deps.attachments } : {}),
+    ...(deps.recipients ? { recipients: deps.recipients } : {}),
+  });
   const wait = createWaitTool({
     cli: deps.cli,
     context: deps.context,
@@ -138,6 +153,8 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     ownership: deps.ownership,
     profiles: deps.profiles,
     preflight: deps.preflight,
+    ...(deps.attachments ? { attachments: deps.attachments } : {}),
+    ...(deps.recipients ? { recipients: deps.recipients } : {}),
   });
   const pane = createPaneTool({
     cli: deps.cli,

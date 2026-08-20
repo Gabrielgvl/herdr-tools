@@ -7,6 +7,7 @@ describe("compact tool rows", () => {
     expect(formatCall("herdr_inspect", "target", "w1:p2")).toBe("herdr_inspect · target · w1:p2");
     expect(formatResult({ operation: "inspect", outcome: "success", targetId: "w1:p2" })).toBe("inspected · w1:p2");
     expect(formatResult({ operation: "communicate", outcome: "error", code: "TARGET_BUSY", targetId: "w1:p2" })).toBe("error TARGET_BUSY · w1:p2");
+    expect(formatResult({ operation: "communicate", outcome: "error", code: "CLI_INCOMPATIBLE", delivery: "attachment", targetId: "w1:p2" })).toBe("error CLI_INCOMPATIBLE · attachment · w1:p2");
     expect(formatResult({ operation: "communicate", outcome: "success", targetId: "w1:p2", postState: { agent_status: "working" } })).toBe("sent · w1:p2 · working");
   });
 
@@ -25,6 +26,9 @@ describe("compact tool rows", () => {
     expect(resultForRender("wait", { details: { outcome: "progress" } }, { isPartial: true })).toEqual({ text: "partial · wait", tone: "warning" });
     expect(resultForRender("wait", {}, {})).toEqual({ text: "error UNKNOWN", tone: "error" });
     expect(resultForRender("wait", { isError: true, details: { code: "REVIEWER_FAILED" } })).toEqual({ text: "error REVIEWER_FAILED", tone: "error" });
+    expect(resultForRender("communicate", { details: { outcome: "success", delivery: "attachment" } })).toEqual({ text: "sent · attachment", tone: "success" });
+    expect(resultForRender("communicate", { isError: true, details: { code: "CLI_TIMEOUT", delivery: "attachment" } }, {}, "p2")).toEqual({ text: "error CLI_TIMEOUT · attachment · p2", tone: "error" });
+    expect(resultForRender("launch", { isError: true, details: { code: "LAUNCH_FAILED", delivery: "inline" } })).toEqual({ text: "error LAUNCH_FAILED · inline", tone: "error" });
     expect(resultForRender("wait", { isError: true })).toEqual({ text: "error UNKNOWN", tone: "error" });
     const theme = { fg: (name: string, value: string) => `${name}:${value}` };
     expect(textComponent("status", theme, "success").render(20)[0]).toBe("success:status");

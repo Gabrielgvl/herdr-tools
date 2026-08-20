@@ -1,6 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HerdrCli } from "./src/cli.js";
 import { createPreflight, createToolSurface, readInjectedContext } from "./src/tool-surface.js";
+import type { StdinExec } from "./src/exec-stdin.js";
+import { defaultAttachmentStore, type AttachmentStore } from "./src/messages/store.js";
+import { RecipientRegistry } from "./src/messages/recipients.js";
 import { boundedText, JobRegistry, type JobDetail } from "./src/job-registry.js";
 import { WaitJobsUi } from "./src/wait-jobs-ui.js";
 import { WAIT_LABEL_MAX_BYTES } from "./src/wait-schema.js";
@@ -24,6 +27,8 @@ export interface ExtensionRuntime {
   ownership: RuntimeOwnership;
   jobs: JobRegistry;
   waitJobsUi: WaitJobsUi;
+  attachments: AttachmentStore;
+  recipients: RecipientRegistry;
   settings: { load: () => Promise<Settings> };
   profiles: { load: () => Promise<ProfileCatalog> };
   idsPresent: boolean;
@@ -75,7 +80,13 @@ export function notificationForJob(detail: JobDetail): { content: string; detail
   };
 }
 
-export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<ExtensionAPI, "sendMessage">>, env: NodeJS.ProcessEnv = process.env): ExtensionRuntime {
+export interface RuntimeOptions {
+  stdinExecutor?: StdinExec;
+  attachments?: AttachmentStore;
+  recipients?: RecipientRegistry;
+}
+
+export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<ExtensionAPI, "sendMessage">> & { execStdin?: StdinExec }, env: NodeJS.ProcessEnv = process.env, options: RuntimeOptions = {}): ExtensionRuntime {
   const injected = readInjectedContext(env);
   const uiRef: { current?: WaitJobsUi } = {};
   const jobs = new JobRegistry({
@@ -93,11 +104,13 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   const waitJobsUi = new WaitJobsUi(jobs);
   uiRef.current = waitJobsUi;
   return {
-    cli: new HerdrCli(pi.exec.bind(pi)),
+    cli: new HerdrCli(pi.exec.bind(pi), 10_000, 50_000, options.stdinExecutor ?? pi.execStdin),
     context: injected.context,
     ownership: new RuntimeOwnership(),
     jobs,
     waitJobsUi,
+    attachments: options.attachments ?? defaultAttachmentStore,
+    recipients: options.recipients ?? new RecipientRegistry(),
     settings: { load: () => loadSettings() },
     profiles: { load: () => discoverProfiles({ bundledDir: resolve(dirname(fileURLToPath(import.meta.url)), "herdr-profiles"), bundledScopeRoot: dirname(fileURLToPath(import.meta.url)), projectCwd: process.cwd() }) },
     idsPresent: injected.idsPresent,
@@ -118,11 +131,13 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     runtime.waitJobsUi.endSession();
     runtime.jobs.shutdown();
+    runtime.recipients.reset();
     resetOwnership(runtime.ownership);
   });
   pi.on("session_start", async (_event, context) => {
     runtime.jobs.beginSession();
     runtime.waitJobsUi.beginSession(context);
+    runtime.recipients.reset();
     resetOwnership(runtime.ownership);
   });
 
@@ -144,6 +159,8 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     profiles: runtime.profiles,
     ownership: runtime.ownership,
     cwd: process.cwd(),
+    attachments: runtime.attachments,
+    recipients: runtime.recipients,
   });
   pi.registerTool(surface.inspect);
   pi.registerTool(surface.communicate);

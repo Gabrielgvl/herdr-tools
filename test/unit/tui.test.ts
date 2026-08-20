@@ -27,6 +27,8 @@ describe("compact tool rows", () => {
     expect(resultForRender("wait", {}, {})).toEqual({ text: "error UNKNOWN", tone: "error" });
     expect(resultForRender("wait", { isError: true, details: { code: "REVIEWER_FAILED" } })).toEqual({ text: "error REVIEWER_FAILED", tone: "error" });
     expect(resultForRender("communicate", { details: { outcome: "success", delivery: "attachment" } })).toEqual({ text: "sent · attachment", tone: "success" });
+    expect(resultForRender("communicate", { isError: true, details: { code: "CLI_TIMEOUT", delivery: "attachment" } }, {}, "p2")).toEqual({ text: "error CLI_TIMEOUT · attachment · p2", tone: "error" });
+    expect(resultForRender("launch", { isError: true, details: { code: "LAUNCH_FAILED", delivery: "inline" } })).toEqual({ text: "error LAUNCH_FAILED · inline", tone: "error" });
     expect(resultForRender("wait", { isError: true })).toEqual({ text: "error UNKNOWN", tone: "error" });
     const theme = { fg: (name: string, value: string) => `${name}:${value}` };
     expect(textComponent("status", theme, "success").render(20)[0]).toBe("success:status");

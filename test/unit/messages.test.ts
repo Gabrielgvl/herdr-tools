@@ -1,11 +1,14 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
+import { mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ATTACHMENT_MAX_BYTES, ATTACHMENT_RETENTION_HOURS, ATTACHMENT_STORE_MAX_RECORDS, ATTACHMENT_STORE_QUOTA_BYTES, MESSAGE_INLINE_MAX_BYTES, assertDeliverySize, assertMessageText } from "../../src/messages/limits.js";
 import { RecipientRegistry, mintRecipientKey, recipientIdentity, verifyRecipient } from "../../src/messages/recipients.js";
+import { withDeliveryFailureEvidence } from "../../src/messages/failure.js";
 import { attachmentCapability } from "../../src/profiles/capability.js";
-import { attachmentMetadataBytes, createAttachmentStore, type AttachmentDirEntry, type AttachmentStoreIo } from "../../src/messages/store.js";
+import { ATTACHMENT_LOCK_NAME, EMPTY_RECIPIENT_GRACE_MS, attachmentMetadataBytes, createAttachmentStore, type AttachmentDirEntry, type AttachmentStoreIo } from "../../src/messages/store.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import type { Profile } from "../../src/profiles/types.js";
 
@@ -18,6 +21,8 @@ const snapshot: HerdrSnapshot = {
   agents: [{ pane_id: "w:p1", name: "worker", agent_id: "agent-1" }]
 };
 
+const KEY = "recipient-key";
+
 function profile(kind: "pi" | "claude", overrides: Partial<Profile["runtime"]> = {}): Profile {
   const runtime = kind === "pi"
     ? { kind: "pi" as const, model: "test", thinking: "low" as const, tools: [], extensions: [], skills: [], ...overrides }
@@ -27,23 +32,50 @@ function profile(kind: "pi" | "claude", overrides: Partial<Profile["runtime"]> =
   };
 }
 
-function ioWith(overrides: Partial<AttachmentStoreIo> = {}): AttachmentStoreIo {
+/** Real filesystem IO so store sequencing is exercised, with targeted failure injection. */
+function io(overrides: Partial<AttachmentStoreIo> = {}): AttachmentStoreIo {
   return {
-    mkdir: vi.fn(async () => undefined),
-    mkdtemp: vi.fn(async (prefix: string) => `${prefix}stage`),
-    readFile: vi.fn(async () => Buffer.from("{}")),
-    writeFile: vi.fn(async () => undefined),
-    chmod: vi.fn(async () => undefined),
-    rename: vi.fn(async () => undefined),
-    rm: vi.fn(async () => undefined),
-    readdir: vi.fn(async () => [] as readonly AttachmentDirEntry[]),
+    mkdir: async (path, options) => { await fs.mkdir(path, options); },
+    mkdtemp: (prefix) => fs.mkdtemp(prefix),
+    readFile: async (path) => fs.readFile(path),
+    writeFile: async (path, data, options) => { await fs.writeFile(path, data, options); },
+    chmod: (path, mode) => fs.chmod(path, mode),
+    rename: (source, destination) => fs.rename(source, destination),
+    rm: (path, options) => fs.rm(path, options),
+    readdir: async (path) => fs.readdir(path, { withFileTypes: true }) as Promise<readonly AttachmentDirEntry[]>,
+    stat: async (path) => ({ mtimeMs: (await fs.stat(path)).mtimeMs }),
     ...overrides
   };
 }
 
-function entry(name: string, directory = true): AttachmentDirEntry {
-  return { name, isDirectory: () => directory };
+async function root(name: string): Promise<string> {
+  return mkdtemp(join(tmpdir(), `herdr-attachments-${name}-`));
 }
+
+function metadata(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    attachmentId: "00000000-0000-4000-8000-000000000000",
+    bytes: 1,
+    sha256: "0".repeat(64),
+    encoding: "utf-8",
+    createdAt: "2026-08-20T00:00:00.000Z",
+    expiresAt: "2999-08-20T00:00:00.000Z",
+    senderPaneId: "w:p0",
+    senderDisplay: "caller",
+    operation: "prompt",
+    ...overrides
+  });
+}
+
+async function seedRecord(storeRoot: string, key: string, id: string, overrides: Record<string, unknown> = {}, body = "x"): Promise<string> {
+  const path = join(storeRoot, key, id);
+  await fs.mkdir(path, { recursive: true, mode: 0o700 });
+  await fs.writeFile(join(path, "body.txt"), body, { mode: 0o600 });
+  await fs.writeFile(join(path, "meta.json"), metadata({ attachmentId: id, bytes: Buffer.byteLength(body), ...overrides }), { mode: 0o600 });
+  return path;
+}
+
+const input = { recipientKey: KEY, senderPaneId: "w:p0", senderDisplay: "caller", operation: "prompt" as const };
 
 describe("large message limits and recipient capabilities", () => {
   it("enforces text and route bounds", () => {
@@ -56,7 +88,7 @@ describe("large message limits and recipient capabilities", () => {
     expect(() => assertDeliverySize("ok", "attachment")).not.toThrow();
   });
 
-  it("derives Pi and Claude read capabilities without inferring from kind", () => {
+  it("derives Pi and Claude read capabilities from the effective post-override runtime", () => {
     expect(attachmentCapability(profile("pi"))).toMatchObject({ kind: "pi", capable: true });
     expect(attachmentCapability(profile("pi", { tools: ["bash"] }))).toMatchObject({ capable: false });
     expect(attachmentCapability(profile("pi", { tools: ["read", "bash"] }))).toMatchObject({ capable: true });
@@ -64,6 +96,12 @@ describe("large message limits and recipient capabilities", () => {
     expect(attachmentCapability(profile("claude", { disallowedTools: ["Read"] }))).toMatchObject({ capable: false });
     expect(attachmentCapability(profile("claude", { allowedTools: ["Bash"] }))).toMatchObject({ capable: false });
     expect(attachmentCapability(profile("claude", { allowedTools: ["Read"] }))).toMatchObject({ capable: true });
+
+    expect(attachmentCapability(profile("pi"), { tools: ["bash"] })).toMatchObject({ capable: false, reason: "Pi profile excludes the local read tool" });
+    expect(attachmentCapability(profile("pi", { tools: ["bash"] }), { tools: ["read"] })).toMatchObject({ capable: true });
+    expect(attachmentCapability(profile("claude"), { disallowedTools: ["Read"] })).toMatchObject({ capable: false, reason: "Claude profile disallows Read" });
+    expect(attachmentCapability(profile("claude"), { allowedTools: ["Bash"] })).toMatchObject({ capable: false, reason: "Claude profile allowlist excludes Read" });
+    expect(attachmentCapability(profile("claude", { disallowedTools: ["Read"] }), { disallowedTools: [] })).toMatchObject({ capable: true });
   });
 
   it("tracks runtime-only recipient identities and resets them", () => {
@@ -83,138 +121,343 @@ describe("large message limits and recipient capabilities", () => {
     registry.reset();
     expect(registry.size).toBe(0);
   });
+
+  it("adds body-free delivery evidence only to object failures", () => {
+    expect(withDeliveryFailureEvidence("string failure", { delivery: "attachment" })).toBe("string failure");
+    const typed = Object.assign(new Error("send failed"), { code: "CLI_TIMEOUT", details: { target: "w:p1" } });
+    const augmented = withDeliveryFailureEvidence(typed, { delivery: "attachment", route: "prompt_direct", phase: "send", published: { attachmentId: "a", path: "/store/a/body.txt", bytes: 4, sha256: "0".repeat(64), expiresAt: "2999-01-01T00:00:00.000Z" } }) as typeof typed;
+    expect(augmented.code).toBe("CLI_TIMEOUT");
+    expect(augmented.details).toMatchObject({ target: "w:p1", delivery: "attachment", route: "prompt_direct", phase: "send", attachmentRetained: true, attachment: { path: "/store/a/body.txt" } });
+    const untyped = Object.assign(new Error("no details"), { details: "not-a-record" });
+    expect((withDeliveryFailureEvidence(untyped, { phase: "publish" }) as typeof untyped).details).toEqual({ phase: "publish" });
+    const arrayDetails = Object.assign(new Error("array details"), { details: ["ignored"] });
+    expect((withDeliveryFailureEvidence(arrayDetails, { delivery: "inline" }) as typeof arrayDetails).details).toEqual({ delivery: "inline" });
+  });
 });
 
 describe("attachment store", () => {
   it("atomically publishes exact owner-only UTF-8 content and metadata", async () => {
-    const root = await mkdtemp(join(tmpdir(), "herdr-attachments-"));
+    const storeRoot = await root("publish");
     try {
       let now = new Date("2026-08-20T12:00:00.000Z");
-      const store = createAttachmentStore(undefined, root, () => now);
-      const key = "recipient-key";
-      const directory = await store.ensureRecipient(key);
+      const store = createAttachmentStore(undefined, storeRoot, () => now);
+      const directory = await store.ensureRecipient(KEY);
       const body = "large\n☃";
-      const published = await store.publish({ body, recipientKey: key, recipientPaneId: "w:p1", recipientAgentName: "worker", senderPaneId: "w:p0", senderDisplay: "caller", operation: "prompt" });
+      const published = await store.publish({ ...input, body, recipientPaneId: "w:p1", recipientAgentName: "worker" });
       expect(published).toMatchObject({ bytes: Buffer.byteLength(body), recipientPaneId: "w:p1", path: join(directory, published.attachmentId, "body.txt") });
       expect(await readFile(published.path, "utf8")).toBe(body);
-      const metadata = JSON.parse(await readFile(join(directory, published.attachmentId, "meta.json"), "utf8")) as Record<string, unknown>;
-      expect(metadata).toMatchObject({ attachmentId: published.attachmentId, bytes: published.bytes, sha256: published.sha256, encoding: "utf-8", senderPaneId: "w:p0", recipientPaneId: "w:p1", operation: "prompt" });
-      expect(JSON.stringify(metadata)).not.toContain(body);
-      expect((await stat(root)).mode & 0o777).toBe(0o700);
+      const record = JSON.parse(await readFile(join(directory, published.attachmentId, "meta.json"), "utf8")) as Record<string, unknown>;
+      expect(record).toMatchObject({ attachmentId: published.attachmentId, bytes: published.bytes, sha256: published.sha256, encoding: "utf-8", senderPaneId: "w:p0", recipientPaneId: "w:p1", operation: "prompt" });
+      expect(JSON.stringify(record)).not.toContain(body);
+      expect((await stat(storeRoot)).mode & 0o777).toBe(0o700);
       expect((await stat(directory)).mode & 0o777).toBe(0o700);
       expect((await stat(published.path)).mode & 0o777).toBe(0o600);
       expect((await stat(join(directory, published.attachmentId, "meta.json"))).mode & 0o777).toBe(0o600);
+      await expect(stat(join(storeRoot, ATTACHMENT_LOCK_NAME))).rejects.toMatchObject({ code: "ENOENT" });
+
       now = new Date(now.getTime() + ATTACHMENT_RETENTION_HOURS * 60 * 60 * 1_000 + 1);
-      const fresh = await store.publish({ body: "fresh", recipientKey: key, senderPaneId: "w:p0", senderDisplay: "caller", operation: "assignment" });
+      const fresh = await store.publish({ ...input, body: "fresh", operation: "assignment" });
       await expect(stat(published.path)).rejects.toMatchObject({ code: "ENOENT" });
       expect(fresh.expiresAt).toBe("2026-08-22T12:00:00.001Z");
+      expect(await readFile(fresh.path, "utf8")).toBe("fresh");
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
     }
   });
 
-  it("rejects invalid keys, bodies, and quota without deleting live records", async () => {
-    const root = await mkdtemp(join(tmpdir(), "herdr-attachments-invalid-"));
+  it("purges abandoned staging and metadata-less records before any quota decision", async () => {
+    const storeRoot = await root("purge");
     try {
-      const store = createAttachmentStore(undefined, root);
-      await expect(store.ensureRecipient("bad/key")).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED" });
-      await expect(store.publish({ body: "", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "INVALID_INPUT" });
-      await expect(store.publish({ body: "bad\0body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "INVALID_INPUT" });
-      await expect(store.publish({ body: "x".repeat(ATTACHMENT_MAX_BYTES + 1), recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
-      const fake = ioWith({ readdir: vi.fn(async () => { throw Object.assign(new Error("unavailable"), { code: "EACCES" }); }) });
-      const quota = createAttachmentStore(fake, "/cache");
-      await expect(quota.publish({ body: "x", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED" });
-      const entries = Array.from({ length: ATTACHMENT_STORE_MAX_RECORDS }, (_, index) => entry(`record-${index}`));
-      const metadata = JSON.stringify({ attachmentId: "record-00000000", bytes: 1, sha256: "0".repeat(64), encoding: "utf-8", createdAt: "2026-08-20T00:00:00.000Z", expiresAt: "2999-08-20T00:00:00.000Z", senderPaneId: "p", senderDisplay: "s", operation: "prompt" });
-      const recordIo = ioWith({
-        readdir: vi.fn(async (path: string) => path === "/cache" ? [entry("recipient-key")] : entries),
-        readFile: vi.fn(async () => Buffer.from(metadata))
-      });
-      const recordStore = createAttachmentStore(recordIo, "/cache");
-      await expect(recordStore.publish({ body: "x", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "ATTACHMENT_QUOTA_EXCEEDED" });
+      const store = createAttachmentStore(io(), storeRoot);
+      await fs.mkdir(join(storeRoot, KEY, ".tmp-abandoned"), { recursive: true });
+      await fs.writeFile(join(storeRoot, KEY, ".tmp-abandoned", "body.txt"), "x".repeat(2_048));
+      await fs.mkdir(join(storeRoot, ".tmp-orphan"), { recursive: true });
+      await fs.writeFile(join(storeRoot, ".tmp-orphan", "body.txt"), "x".repeat(2_048));
+      const incomplete = join(storeRoot, KEY, "11111111-1111-4111-8111-111111111111");
+      await fs.mkdir(incomplete, { recursive: true });
+      await fs.writeFile(join(incomplete, "body.txt"), "x".repeat(2_048));
+      await fs.writeFile(join(storeRoot, KEY, "stray.txt"), "not an attachment");
+
+      const published = await store.publish({ ...input, body: "kept" });
+      await expect(stat(join(storeRoot, KEY, ".tmp-abandoned"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(join(storeRoot, ".tmp-orphan"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(incomplete)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(published.path, "utf8")).toBe("kept");
+      expect(await readFile(join(storeRoot, KEY, "stray.txt"), "utf8")).toBe("not an attachment");
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
     }
   });
 
-  it("reports sweep and publication failures without exposing body text", async () => {
-    const failingRead = ioWith({ readdir: vi.fn(async () => [entry("recipient-key")]), readFile: vi.fn(async () => { throw new Error("metadata unavailable"); }) });
-    const store = createAttachmentStore(failingRead, "/cache");
-    await expect(store.publish({ body: "secret body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "read_metadata" } });
-
-    const failingWrite = ioWith({ readdir: vi.fn(async () => []), writeFile: vi.fn(async () => { throw new Error("write failed"); }) });
-    const writeStore = createAttachmentStore(failingWrite, "/cache");
-    await expect(writeStore.publish({ body: "secret body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "publish" } });
-    expect(JSON.stringify((failingWrite.writeFile as ReturnType<typeof vi.fn>).mock.calls)).not.toContain("secret body");
-
-    const failingSweep = ioWith({ readdir: vi.fn(async () => [entry("recipient-key")]), readFile: vi.fn(async () => Buffer.from(JSON.stringify({ attachmentId: "record-00000000", bytes: 1, sha256: "0".repeat(64), encoding: "utf-8", createdAt: "bad", expiresAt: "bad", senderPaneId: "p", senderDisplay: "s", operation: "prompt" }))) });
-    const sweepStore = createAttachmentStore(failingSweep, "/cache");
-    await expect(sweepStore.publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED" });
-
-    expect(ATTACHMENT_STORE_QUOTA_BYTES).toBe(64 * 1024 * 1024);
-    expect(attachmentMetadataBytes({ attachmentId: "record-00000000", bytes: 1, sha256: "0".repeat(64), encoding: "utf-8", createdAt: "2026-08-20T00:00:00.000Z", expiresAt: "2999-08-20T00:00:00.000Z", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).toBeGreaterThan(0);
+  it("removes only aged empty recipient directories so launch grants survive", async () => {
+    const storeRoot = await root("empty");
+    try {
+      const now = new Date("2026-08-20T12:00:00.000Z");
+      const store = createAttachmentStore(io(), storeRoot, () => now);
+      const fresh = await store.ensureRecipient("fresh-recipient-key");
+      await utimes(fresh, now, now);
+      const aged = await store.ensureRecipient("aged-recipient-key");
+      const agedTime = new Date(now.getTime() - EMPTY_RECIPIENT_GRACE_MS - 1_000);
+      await utimes(aged, agedTime, agedTime);
+      await store.publish({ ...input, body: "body" });
+      expect((await stat(fresh)).isDirectory()).toBe(true);
+      await expect(stat(aged)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
   });
 
-  it("fails closed for malformed metadata and every storage boundary", async () => {
-    const validMetadata = {
-      attachmentId: "record-00000000",
-      bytes: 1,
-      sha256: "0".repeat(64),
-      encoding: "utf-8",
-      createdAt: "2026-08-20T00:00:00.000Z",
-      expiresAt: "2999-08-20T00:00:00.000Z",
-      senderPaneId: "p",
-      senderDisplay: "s",
-      operation: "prompt"
-    };
-    const metadataCases: Uint8Array[] = [
-      Buffer.from("not json"),
-      Buffer.from("[]"),
-      Buffer.from(JSON.stringify({ ...validMetadata, bytes: 0 })),
-      Buffer.from(JSON.stringify({ ...validMetadata, recipientPaneId: 4 })),
-      Buffer.from(JSON.stringify({ ...validMetadata, recipientAgentName: 4 }))
-    ];
-    for (const metadata of metadataCases) {
-      const io = ioWith({
-        readdir: vi.fn(async (path: string) => path === "/cache" ? [entry("recipient-key")] : [entry("attachment-1")]),
-        readFile: vi.fn(async () => metadata)
-      });
-      await expect(createAttachmentStore(io, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED" });
+  it("rejects invalid keys, bodies, recipients, and quota without deleting live records", async () => {
+    const storeRoot = await root("invalid");
+    try {
+      const store = createAttachmentStore(io(), storeRoot);
+      await expect(store.ensureRecipient("bad/key")).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "validate_recipient" } });
+      await expect(store.publish({ ...input, body: "" })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+      await expect(store.publish({ ...input, body: "bad\0body" })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+      await expect(store.publish({ ...input, body: 4 as unknown as string })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+      await expect(store.publish({ ...input, body: "x".repeat(ATTACHMENT_MAX_BYTES + 1) })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+      await expect(store.publish({ ...input, body: "body", recipientKey: "short" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED" });
+      await expect(store.publish({ ...input, body: "body", recipientPaneId: "bad\n" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "validate_recipient" } });
+
+      const kept = await seedRecord(storeRoot, KEY, "22222222-2222-4222-8222-222222222222", { bytes: ATTACHMENT_STORE_QUOTA_BYTES }, "x");
+      await expect(store.publish({ ...input, body: "over" })).rejects.toMatchObject({ code: "ATTACHMENT_QUOTA_EXCEEDED", details: { operation: "quota", limitBytes: ATTACHMENT_STORE_QUOTA_BYTES } });
+      expect(await readFile(join(kept, "body.txt"), "utf8")).toBe("x");
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
     }
-    const longName = "r".repeat(600);
-    const longPathIo = ioWith({ readdir: vi.fn(async (path: string) => path === "/cache" ? [entry(longName)] : [entry("attachment-1")]), readFile: vi.fn(async () => Buffer.from("not json")) });
-    await expect(createAttachmentStore(longPathIo, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ details: { path: "[path omitted]" } });
+  });
 
-    const rootFailure = ioWith({ mkdir: vi.fn(async () => { throw Object.assign(new Error("root"), { code: "EACCES" }); }) });
-    await expect(createAttachmentStore(rootFailure, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ details: { operation: "ensure_root", causeCode: "EACCES" } });
+  it("fails closed on the record cap and on malformed metadata", async () => {
+    const capRoot = await root("cap");
+    try {
+      const store = createAttachmentStore(io(), capRoot);
+      for (let index = 0; index < ATTACHMENT_STORE_MAX_RECORDS; index += 1) {
+        await seedRecord(capRoot, KEY, `3${String(index).padStart(7, "0")}-3333-4333-8333-333333333333`);
+      }
+      await expect(store.publish({ ...input, body: "over" })).rejects.toMatchObject({ code: "ATTACHMENT_QUOTA_EXCEEDED", details: { limitRecords: ATTACHMENT_STORE_MAX_RECORDS } });
+    } finally {
+      await rm(capRoot, { recursive: true, force: true });
+    }
 
-    const recipientFailure = ioWith({ mkdir: vi.fn(async (path: string) => { if (path === "/cache/recipient-key") throw new Error("recipient"); }) });
-    await expect(createAttachmentStore(recipientFailure, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ details: { operation: "ensure_recipient" } });
+    const cases = ["not json", "[]", metadata({ bytes: 0 }), metadata({ recipientPaneId: 4 }), metadata({ recipientAgentName: 4 }), metadata({ sha256: "z" })];
+    for (const value of cases) {
+      const caseRoot = await root("metadata");
+      try {
+        const record = join(caseRoot, KEY, "44444444-4444-4444-8444-444444444444");
+        await fs.mkdir(record, { recursive: true });
+        await fs.writeFile(join(record, "meta.json"), value);
+        await expect(createAttachmentStore(io(), caseRoot).publish({ ...input, body: "body" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "read_metadata" } });
+      } finally {
+        await rm(caseRoot, { recursive: true, force: true });
+      }
+    }
 
-    const listFailure = ioWith({ readdir: vi.fn(async (path: string) => path === "/cache" ? [entry("recipient-key")] : (() => { throw new Error("list"); })()) });
-    await expect(createAttachmentStore(listFailure, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ details: { operation: "list_attachments" } });
+    const deepRoot = await root("longpath");
+    try {
+      const longRoot = join(deepRoot, "d".repeat(200), "e".repeat(200), "f".repeat(120));
+      const record = join(longRoot, KEY, "55555555-5555-4555-8555-555555555555");
+      await fs.mkdir(record, { recursive: true });
+      await fs.writeFile(join(record, "meta.json"), "not json");
+      expect(join(record, "meta.json").length).toBeGreaterThan(512);
+      await expect(createAttachmentStore(io(), longRoot).publish({ ...input, body: "body" })).rejects.toMatchObject({ details: { path: "[path omitted]" } });
+    } finally {
+      await rm(deepRoot, { recursive: true, force: true });
+    }
+  });
 
-    const skipIo = ioWith({ readdir: vi.fn(async (path: string) => path === "/cache" ? [entry("file", false), entry(".tmp-old"), entry("recipient-key")] : [entry("body.txt", false), entry(".tmp-stage")]) });
-    await expect(createAttachmentStore(skipIo, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).resolves.toMatchObject({ bytes: 4 });
-
-    const expired = { ...validMetadata, expiresAt: "2000-01-01T00:00:00.000Z" };
-    const sweepFailure = ioWith({
-      readdir: vi.fn(async (path: string) => path === "/cache" ? [entry("recipient-key")] : [entry("attachment-1")]),
-      readFile: vi.fn(async () => Buffer.from(JSON.stringify(expired))),
-      rm: vi.fn(async () => { throw new Error("remove"); })
+  it("reports every storage boundary without exposing body text", async () => {
+    const storeRoot = await root("failures");
+    /** Lock contention is not the subject here, so leftover locks are treated as stale. */
+    const fast = { lockRetryMs: 1, lockAttempts: 5, lockStaleMs: 0 };
+    /** Fail only the targeted removal so the lock can still be released. */
+    const failRemovalOf = (needle: string, message: string) => vi.fn(async (path: string, options: { force: boolean; recursive: boolean }) => {
+      if (path.includes(needle)) throw new Error(message);
+      await fs.rm(path, options);
     });
-    await expect(createAttachmentStore(sweepFailure, "/cache", () => new Date("2026-08-20T00:00:00.000Z")).publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ details: { operation: "sweep" } });
+    try {
+      const secret = "secret body";
+      const rootFailure = createAttachmentStore(io({ mkdir: vi.fn(async () => { throw Object.assign(new Error("root"), { code: "EACCES" }); }) }), storeRoot, undefined, fast);
+      await expect(rootFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "ensure_root", causeCode: "EACCES" } });
 
-    const rootAfterSweepFailure = ioWith({ readdir: vi.fn().mockResolvedValueOnce([entry("recipient-key")]).mockResolvedValueOnce([]).mockRejectedValueOnce(new Error("root after sweep")) });
-    await expect(createAttachmentStore(rootAfterSweepFailure, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ details: { operation: "list_recipients" } });
+      const recipientFailure = createAttachmentStore(io({
+        mkdir: vi.fn(async (path: string, options: { recursive: boolean; mode: number }) => {
+          if (path.endsWith(KEY)) throw new Error("recipient");
+          await fs.mkdir(path, options);
+        })
+      }), storeRoot, undefined, fast);
+      await expect(recipientFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "ensure_recipient" } });
 
-    const recipientAfterSweepFailure = ioWith({ readdir: vi.fn().mockResolvedValueOnce([entry("recipient-key")]).mockResolvedValueOnce([]).mockResolvedValueOnce([entry("recipient-key")]).mockRejectedValueOnce(new Error("recipient after sweep")) });
-    await expect(createAttachmentStore(recipientAfterSweepFailure, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ details: { operation: "list_attachments" } });
+      const listRootFailure = createAttachmentStore(io({ readdir: vi.fn(async () => { throw new Error("list root"); }) }), storeRoot, undefined, fast);
+      await expect(listRootFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "list_recipients" } });
 
-    const removeEmptyFailure = ioWith({ readdir: vi.fn().mockResolvedValueOnce([entry("recipient-key")]).mockResolvedValueOnce([]).mockResolvedValueOnce([entry("recipient-key")]).mockResolvedValueOnce([]), rm: vi.fn(async () => { throw new Error("empty"); }) });
-    await expect(createAttachmentStore(removeEmptyFailure, "/cache").publish({ body: "body", recipientKey: "recipient-key", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ details: { operation: "sweep" } });
+      await fs.mkdir(join(storeRoot, KEY), { recursive: true });
+      const listRecipientFailure = createAttachmentStore(io({
+        readdir: vi.fn(async (path: string) => path === storeRoot ? fs.readdir(path, { withFileTypes: true }) as unknown as readonly AttachmentDirEntry[] : (() => { throw new Error("list attachments"); })())
+      }), storeRoot, undefined, fast);
+      await expect(listRecipientFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "list_attachments" } });
 
-    const invalidPane = createAttachmentStore(ioWith(), "/cache");
-    await expect(invalidPane.publish({ body: "body", recipientKey: "recipient-key", recipientPaneId: "bad\n", senderPaneId: "p", senderDisplay: "s", operation: "prompt" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED" });
+      const unreadable = createAttachmentStore(io({ readFile: vi.fn(async () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); }) }), storeRoot, undefined, fast);
+      await seedRecord(storeRoot, KEY, "66666666-6666-4666-8666-666666666666");
+      await expect(unreadable.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "read_metadata", causeCode: "EACCES" } });
+      await rm(join(storeRoot, KEY, "66666666-6666-4666-8666-666666666666"), { recursive: true, force: true });
+
+      const stagingRmFailure = createAttachmentStore(io({ rm: failRemovalOf(".tmp-stuck", "remove staging") }), storeRoot, undefined, fast);
+      await fs.mkdir(join(storeRoot, KEY, ".tmp-stuck"), { recursive: true });
+      await expect(stagingRmFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "purge_staging" } });
+      await rm(join(storeRoot, KEY, ".tmp-stuck"), { recursive: true, force: true });
+
+      const incompleteRmFailure = createAttachmentStore(io({ rm: failRemovalOf("77777777", "remove incomplete") }), storeRoot, undefined, fast);
+      await fs.mkdir(join(storeRoot, KEY, "77777777-7777-4777-8777-777777777777"), { recursive: true });
+      await expect(incompleteRmFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "purge_incomplete" } });
+      await rm(join(storeRoot, KEY, "77777777-7777-4777-8777-777777777777"), { recursive: true, force: true });
+
+      const invalidExpiry = createAttachmentStore(io(), storeRoot, undefined, fast);
+      await seedRecord(storeRoot, KEY, "88888888-8888-4888-8888-888888888888", { expiresAt: "not a date" });
+      await expect(invalidExpiry.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "sweep" } });
+      await rm(join(storeRoot, KEY, "88888888-8888-4888-8888-888888888888"), { recursive: true, force: true });
+
+      await seedRecord(storeRoot, KEY, "99999999-9999-4999-8999-999999999999", { expiresAt: "2000-01-01T00:00:00.000Z" });
+      const sweepRmFailure = createAttachmentStore(io({ rm: failRemovalOf("99999999", "remove expired") }), storeRoot, () => new Date("2026-08-20T00:00:00.000Z"), fast);
+      await expect(sweepRmFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "sweep" } });
+      await rm(join(storeRoot, KEY, "99999999-9999-4999-8999-999999999999"), { recursive: true, force: true });
+
+      await fs.mkdir(join(storeRoot, "aged-recipient-key"), { recursive: true });
+      const emptyStatFailure = createAttachmentStore(io({
+        stat: vi.fn(async (path: string) => {
+          if (path.endsWith("aged-recipient-key")) throw Object.assign(new Error("stat"), { code: "EACCES" });
+          return { mtimeMs: (await fs.stat(path)).mtimeMs };
+        })
+      }), storeRoot, undefined, fast);
+      await expect(emptyStatFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "sweep" } });
+
+      const vanishing = createAttachmentStore(io({ stat: vi.fn(async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); }) }), storeRoot, undefined, fast);
+      await expect(vanishing.publish({ ...input, body: "kept" })).resolves.toMatchObject({ bytes: 4 });
+      await rm(join(storeRoot, "aged-recipient-key"), { recursive: true, force: true });
+
+      const writeFailure = vi.fn(async () => { throw new Error("write failed"); });
+      const writeStore = createAttachmentStore(io({ writeFile: writeFailure }), storeRoot, undefined, fast);
+      await expect(writeStore.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "publish" } });
+      expect(JSON.stringify(writeFailure.mock.calls)).not.toContain(secret);
+
+      const renameFailure = createAttachmentStore(io({ rename: vi.fn(async () => { throw new Error("rename failed"); }), rm: failRemovalOf(".tmp-", "cleanup failed") }), storeRoot, undefined, fast);
+      await expect(renameFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "publish" } });
+
+      expect(ATTACHMENT_STORE_QUOTA_BYTES).toBe(64 * 1024 * 1024);
+      expect(attachmentMetadataBytes(JSON.parse(metadata()) as never)).toBeGreaterThan(0);
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
   });
+
+  it("serializes publication behind a filesystem lock and reclaims stale locks", async () => {
+    const storeRoot = await root("lock");
+    try {
+      const heldStore = createAttachmentStore(io(), storeRoot, () => new Date("2026-08-20T12:00:00.000Z"), { lockAttempts: 3, lockRetryMs: 1, lockStaleMs: 30_000 });
+      await fs.mkdir(storeRoot, { recursive: true });
+      await fs.mkdir(join(storeRoot, ATTACHMENT_LOCK_NAME));
+      const now = new Date("2026-08-20T12:00:00.000Z");
+      await utimes(join(storeRoot, ATTACHMENT_LOCK_NAME), now, now);
+      await expect(heldStore.publish({ ...input, body: "blocked" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "lock", attempts: 3 } });
+      expect(await fs.readdir(join(storeRoot, KEY)).catch(() => [])).toEqual([]);
+
+      const staleStore = createAttachmentStore(io(), storeRoot, () => now, { lockAttempts: 3, lockRetryMs: 1, lockStaleMs: 1_000 });
+      const stale = new Date(now.getTime() - 60_000);
+      await utimes(join(storeRoot, ATTACHMENT_LOCK_NAME), stale, stale);
+      await expect(staleStore.publish({ ...input, body: "reclaimed" })).resolves.toMatchObject({ bytes: 9 });
+      await expect(stat(join(storeRoot, ATTACHMENT_LOCK_NAME))).rejects.toMatchObject({ code: "ENOENT" });
+
+      const releasedDuringWait = createAttachmentStore(io({
+        stat: vi.fn(async (path: string) => {
+          if (path.endsWith(ATTACHMENT_LOCK_NAME)) {
+            await fs.rm(path, { recursive: true, force: true });
+            throw Object.assign(new Error("released"), { code: "ENOENT" });
+          }
+          return { mtimeMs: (await fs.stat(path)).mtimeMs };
+        })
+      }), storeRoot, () => now, { lockAttempts: 5, lockRetryMs: 1 });
+      await fs.mkdir(join(storeRoot, ATTACHMENT_LOCK_NAME));
+      await expect(releasedDuringWait.publish({ ...input, body: "waited" })).resolves.toMatchObject({ bytes: 6 });
+
+      const lockMkdirFailure = createAttachmentStore(io({
+        mkdir: vi.fn(async (path: string, options: { recursive: boolean; mode: number }) => {
+          if (path.endsWith(ATTACHMENT_LOCK_NAME)) throw Object.assign(new Error("denied"), { code: "EACCES" });
+          await fs.mkdir(path, options);
+        })
+      }), storeRoot);
+      await expect(lockMkdirFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock", causeCode: "EACCES" } });
+
+      const staleStatFailure = createAttachmentStore(io({ stat: vi.fn(async () => { throw Object.assign(new Error("stat"), { code: "EACCES" }); }) }), storeRoot, () => now, { lockAttempts: 2, lockRetryMs: 1 });
+      await fs.mkdir(join(storeRoot, ATTACHMENT_LOCK_NAME));
+      await expect(staleStatFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock" } });
+
+      const staleRemoveFailure = createAttachmentStore(io({ rm: vi.fn(async () => { throw new Error("stuck lock"); }) }), storeRoot, () => now, { lockAttempts: 2, lockRetryMs: 1, lockStaleMs: 1_000 });
+      await utimes(join(storeRoot, ATTACHMENT_LOCK_NAME), stale, stale);
+      await expect(staleRemoveFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock" } });
+
+      await rm(join(storeRoot, ATTACHMENT_LOCK_NAME), { recursive: true, force: true });
+      const releaseFailure = createAttachmentStore(io({ rm: vi.fn(async (path: string, options: { force: boolean; recursive: boolean }) => { if (path.endsWith(ATTACHMENT_LOCK_NAME)) throw new Error("release failed"); await fs.rm(path, options); }) }), storeRoot, () => now, { lockStaleMs: 1_000 });
+      await expect(releaseFailure.publish({ ...input, body: "kept" })).resolves.toMatchObject({ bytes: 4 });
+      expect((await stat(join(storeRoot, ATTACHMENT_LOCK_NAME))).isDirectory()).toBe(true);
+      await rm(join(storeRoot, ATTACHMENT_LOCK_NAME), { recursive: true, force: true });
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("admits exactly one concurrent publication at the record cap in one process", async () => {
+    const storeRoot = await root("race");
+    try {
+      for (let index = 0; index < ATTACHMENT_STORE_MAX_RECORDS - 1; index += 1) {
+        await seedRecord(storeRoot, KEY, `a${String(index).padStart(7, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`);
+      }
+      const first = createAttachmentStore(io(), storeRoot, () => new Date("2026-08-20T12:00:00.000Z"), { lockRetryMs: 1 });
+      const second = createAttachmentStore(io(), storeRoot, () => new Date("2026-08-20T12:00:00.000Z"), { lockRetryMs: 1 });
+      const outcomes = await Promise.allSettled([
+        first.publish({ ...input, body: "first" }),
+        second.publish({ ...input, body: "second" })
+      ]);
+      const fulfilled = outcomes.filter((outcome) => outcome.status === "fulfilled");
+      const rejected = outcomes.filter((outcome) => outcome.status === "rejected");
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({ code: "ATTACHMENT_QUOTA_EXCEEDED" });
+      const records = await fs.readdir(join(storeRoot, KEY));
+      expect(records.filter((name) => !name.startsWith(".tmp-"))).toHaveLength(ATTACHMENT_STORE_MAX_RECORDS);
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("admits exactly one concurrent publication at the record cap across processes", async () => {
+    const storeRoot = await root("cross-process");
+    try {
+      for (let index = 0; index < ATTACHMENT_STORE_MAX_RECORDS - 1; index += 1) {
+        await seedRecord(storeRoot, KEY, `b${String(index).padStart(7, "0")}-bbbb-4bbb-8bbb-bbbbbbbbbbbb`);
+      }
+      const storeModule = join(dirname(new URL(import.meta.url).pathname), "..", "..", "src", "messages", "store.ts");
+      const script = `
+        import { createAttachmentStore } from ${JSON.stringify(storeModule)};
+        const store = createAttachmentStore(undefined, ${JSON.stringify(storeRoot)}, () => new Date(), { lockRetryMs: 1 });
+        store.publish({ body: "child", recipientKey: ${JSON.stringify(KEY)}, senderPaneId: "w:p0", senderDisplay: "caller", operation: "prompt" })
+          .then(() => process.stdout.write("PUBLISHED"))
+          .catch((error) => process.stdout.write(String(error.code)));
+      `;
+      const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+      let childOutput = "";
+      let childError = "";
+      child.stdout.on("data", (chunk: Buffer) => { childOutput += chunk.toString(); });
+      child.stderr?.on("data", (chunk: Buffer) => { childError += chunk.toString(); });
+      const local = createAttachmentStore(io(), storeRoot, () => new Date(), { lockRetryMs: 1, lockAttempts: 2_000 });
+      const localOutcome = await local.publish({ ...input, body: "local" }).then(() => "PUBLISHED").catch((error: { code?: string }) => String(error.code));
+      await new Promise<void>((resolve) => child.on("close", () => resolve()));
+
+      expect(childError, `child publish failed: ${childError}`).toBe("");
+      expect([localOutcome, childOutput].filter((value) => value === "PUBLISHED")).toHaveLength(1);
+      expect([localOutcome, childOutput].filter((value) => value === "ATTACHMENT_QUOTA_EXCEEDED")).toHaveLength(1);
+      const records = await fs.readdir(join(storeRoot, KEY));
+      expect(records.filter((name) => !name.startsWith(".tmp-") && name !== ATTACHMENT_LOCK_NAME)).toHaveLength(ATTACHMENT_STORE_MAX_RECORDS);
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

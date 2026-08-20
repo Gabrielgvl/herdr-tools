@@ -25,4 +25,11 @@ describe("stdin prompt executor", () => {
 
     await expect(spawnWithStdin("/definitely/missing/herdr", [], "input", {})).rejects.toBeInstanceOf(Error);
   });
+
+  it("kills a real child that ignores SIGTERM", async () => {
+    const ignoresTerm = "process.on('SIGTERM', () => {}); process.stdin.resume(); setInterval(() => {}, 1000);";
+    const result = await spawnWithStdin(process.execPath, ["-e", ignoresTerm], "input", { timeout: 25, killGraceMs: 50 });
+    expect(result.killed).toBe(true);
+    expect(result.code).toBe(137);
+  }, 15_000);
 });

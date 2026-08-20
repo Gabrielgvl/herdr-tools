@@ -1,14 +1,17 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import type { ExecResult } from "@earendil-works/pi-coding-agent";
 
 export interface StdinExecOptions {
   signal?: AbortSignal;
   timeout?: number;
+  /** Bounded grace period between SIGTERM and SIGKILL for a child that ignores termination. */
+  killGraceMs?: number;
 }
 
 export type StdinExec = (command: string, args: string[], input: string, options: StdinExecOptions) => Promise<ExecResult>;
 
 const MAX_CAPTURE_BYTES = 256 * 1024;
+export const DEFAULT_KILL_GRACE_MS = 5_000;
 
 function appendBounded(current: string, chunk: Buffer): string {
   const next = current + chunk.toString("utf8");
@@ -18,9 +21,9 @@ function appendBounded(current: string, chunk: Buffer): string {
 
 export function spawnWithStdin(command: string, args: string[], input: string, options: StdinExecOptions = {}): Promise<ExecResult> {
   return new Promise<ExecResult>((resolve, reject) => {
-    let child;
+    let spawned: ChildProcess;
     try {
-      child = spawn(command, args, {
+      spawned = spawn(command, args, {
         shell: false,
         stdio: ["pipe", "pipe", "pipe"]
       });
@@ -28,28 +31,45 @@ export function spawnWithStdin(command: string, args: string[], input: string, o
       reject(error);
       return;
     }
+    const child = spawned;
 
     let stdout = "";
     let stderr = "";
     let killed = false;
     let settled = false;
-    let timer: NodeJS.Timeout | undefined;
-
-    const finish = (result: ExecResult): void => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      resolve(result);
-    };
-
-    const terminate = (): void => {
-      if (settled) return;
-      killed = true;
-      child.kill();
-    };
-
+    let timeoutTimer: NodeJS.Timeout | undefined;
+    let killTimer: NodeJS.Timeout | undefined;
     const signal = options.signal;
     const onAbort = (): void => terminate();
+
+    const cleanup = (): void => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      timeoutTimer = undefined;
+      killTimer = undefined;
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const settle = (outcome: () => void): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      outcome();
+    };
+
+    const escalate = (): void => {
+      try { child.kill("SIGKILL"); } catch { /* the child is already gone */ }
+    };
+
+    function terminate(): void {
+      if (settled) return;
+      killed = true;
+      try { child.kill("SIGTERM"); } catch { /* the child is already gone */ }
+      if (killTimer) return;
+      const grace = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+      killTimer = setTimeout(escalate, Math.max(0, grace));
+    }
+
     if (signal?.aborted) {
       terminate();
     } else {
@@ -63,15 +83,14 @@ export function spawnWithStdin(command: string, args: string[], input: string, o
       terminate();
     });
     child.on("error", (error: Error) => {
-      if (!settled) reject(error);
+      settle(() => reject(error));
     });
     child.on("close", (code: number | null) => {
-      signal?.removeEventListener("abort", onAbort);
-      finish({ stdout, stderr, code: code ?? (killed ? 137 : 1), killed });
+      settle(() => resolve({ stdout, stderr, code: code ?? (killed ? 137 : 1), killed }));
     });
 
     if (options.timeout !== undefined && Number.isFinite(options.timeout) && options.timeout > 0) {
-      timer = setTimeout(terminate, options.timeout);
+      timeoutTimer = setTimeout(terminate, options.timeout);
     }
 
     if (!signal?.aborted) {

@@ -21,6 +21,7 @@ export interface AttachmentStoreIo {
   rename(source: string, destination: string): Promise<void>;
   rm(path: string, options: { force: boolean; recursive: boolean }): Promise<void>;
   readdir(path: string): Promise<readonly AttachmentDirEntry[]>;
+  stat(path: string): Promise<{ mtimeMs: number }>;
 }
 
 export interface AttachmentDirEntry {
@@ -36,8 +37,24 @@ const nodeAttachmentStoreIo: AttachmentStoreIo = {
   chmod: (path, mode) => fs.chmod(path, mode),
   rename: (source, destination) => fs.rename(source, destination),
   rm: (path, options) => fs.rm(path, options),
-  readdir: async (path) => fs.readdir(path, { withFileTypes: true })
+  readdir: async (path) => fs.readdir(path, { withFileTypes: true }),
+  stat: async (path) => ({ mtimeMs: (await fs.stat(path)).mtimeMs })
 };
+
+/** Serializing lock directory; every mutating store phase runs while it is held. */
+export const ATTACHMENT_LOCK_NAME = ".lock";
+export const DEFAULT_LOCK_RETRY_MS = 25;
+export const DEFAULT_LOCK_ATTEMPTS = 200;
+export const DEFAULT_LOCK_STALE_MS = 30_000;
+/** An empty recipient directory is a live launch grant until it is this old. */
+export const EMPTY_RECIPIENT_GRACE_MS = 60_000;
+
+export interface AttachmentStoreOptions {
+  sleep?: (ms: number) => Promise<void>;
+  lockRetryMs?: number;
+  lockAttempts?: number;
+  lockStaleMs?: number;
+}
 
 export interface AttachmentMetadata {
   attachmentId: string;
@@ -96,6 +113,13 @@ export interface AttachmentStore {
 interface LiveRecord {
   path: string;
   metadata: AttachmentMetadata;
+}
+
+interface StoreScan {
+  records: LiveRecord[];
+  staging: string[];
+  incomplete: string[];
+  recipients: Array<{ path: string; entries: number }>;
 }
 
 function errorCode(error: unknown): unknown {
@@ -176,6 +200,10 @@ function isTemporaryDirectory(name: string): boolean {
   return name.startsWith(".tmp-");
 }
 
+function isReserved(name: string): boolean {
+  return name === ATTACHMENT_LOCK_NAME;
+}
+
 function storeFailure(operation: string, path: string, error: unknown): AttachmentStoreError {
   if (error instanceof AttachmentStoreError) return error;
   const causeCode = errorCode(error);
@@ -186,8 +214,13 @@ function storeFailure(operation: string, path: string, error: unknown): Attachme
   });
 }
 
-export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStoreIo, rootDirectory = DEFAULT_ATTACHMENT_STORE_ROOT, now: () => Date = () => new Date()): AttachmentStore {
+export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStoreIo, rootDirectory = DEFAULT_ATTACHMENT_STORE_ROOT, now: () => Date = () => new Date(), options: AttachmentStoreOptions = {}): AttachmentStore {
   const root = resolve(rootDirectory);
+  const lockPath = join(root, ATTACHMENT_LOCK_NAME);
+  const lockRetryMs = options.lockRetryMs ?? DEFAULT_LOCK_RETRY_MS;
+  const lockAttempts = options.lockAttempts ?? DEFAULT_LOCK_ATTEMPTS;
+  const lockStaleMs = options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }));
 
   const recipientDirectory = (recipientKey: string): string => {
     validateKey(recipientKey);
@@ -215,67 +248,116 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
     }
   };
 
-  const readLiveRecords = async (): Promise<LiveRecord[]> => {
-    let recipients: readonly AttachmentDirEntry[];
+  const list = async (path: string, operation: string): Promise<readonly AttachmentDirEntry[]> => {
     try {
-      recipients = await io.readdir(root);
+      return await io.readdir(path);
     } catch (error) {
-      throw storeFailure("list_recipients", root, error);
+      throw storeFailure(operation, path, error);
     }
-    const records: LiveRecord[] = [];
-    for (const recipient of recipients) {
-      if (!recipient.isDirectory() || isTemporaryDirectory(recipient.name)) continue;
-      const recipientPath = join(root, recipient.name);
-      let attachments: readonly AttachmentDirEntry[];
-      try {
-        attachments = await io.readdir(recipientPath);
-      } catch (error) {
-        throw storeFailure("list_attachments", recipientPath, error);
-      }
-      for (const attachment of attachments) {
-        if (!attachment.isDirectory() || isTemporaryDirectory(attachment.name)) continue;
-        const attachmentPath = join(recipientPath, attachment.name);
-        const metadataPath = join(attachmentPath, "meta.json");
-        try {
-          const metadata = parsedMetadata(await io.readFile(metadataPath), metadataPath);
-          records.push({ path: attachmentPath, metadata });
-        } catch (error) {
-          throw storeFailure("read_metadata", metadataPath, error);
-        }
-      }
-    }
-    return records;
   };
 
-  const sweep = async (): Promise<void> => {
+  const remove = async (path: string, operation: string): Promise<void> => {
+    try {
+      await io.rm(path, { force: true, recursive: true });
+    } catch (error) {
+      throw storeFailure(operation, path, error);
+    }
+  };
+
+  /**
+   * One traversal of the store. Staging directories and attachment directories without
+   * readable metadata are reported separately so the caller can purge them before any
+   * quota decision uses their bytes.
+   */
+  const scan = async (): Promise<StoreScan> => {
+    const result: StoreScan = { records: [], staging: [], incomplete: [], recipients: [] };
+    for (const recipient of await list(root, "list_recipients")) {
+      if (!recipient.isDirectory() || isReserved(recipient.name)) continue;
+      const recipientPath = join(root, recipient.name);
+      if (isTemporaryDirectory(recipient.name)) {
+        result.staging.push(recipientPath);
+        continue;
+      }
+      const attachments = await list(recipientPath, "list_attachments");
+      result.recipients.push({ path: recipientPath, entries: attachments.length });
+      for (const attachment of attachments) {
+        if (!attachment.isDirectory()) continue;
+        const attachmentPath = join(recipientPath, attachment.name);
+        if (isTemporaryDirectory(attachment.name)) {
+          result.staging.push(attachmentPath);
+          continue;
+        }
+        const metadataPath = join(attachmentPath, "meta.json");
+        let raw: Uint8Array;
+        try {
+          raw = await io.readFile(metadataPath);
+        } catch (error) {
+          if (errorCode(error) === "ENOENT") {
+            result.incomplete.push(attachmentPath);
+            continue;
+          }
+          throw storeFailure("read_metadata", metadataPath, error);
+        }
+        result.records.push({ path: attachmentPath, metadata: parsedMetadata(raw, metadataPath) });
+      }
+    }
+    return result;
+  };
+
+  const acquireLock = async (): Promise<void> => {
+    for (let attempt = 0; attempt < lockAttempts; attempt += 1) {
+      try {
+        await io.mkdir(lockPath, { recursive: false, mode: 0o700 });
+        return;
+      } catch (error) {
+        if (errorCode(error) !== "EEXIST") throw storeFailure("lock", lockPath, error);
+      }
+      let heldSinceMs: number | undefined;
+      try {
+        heldSinceMs = (await io.stat(lockPath)).mtimeMs;
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw storeFailure("lock", lockPath, error);
+      }
+      if (heldSinceMs !== undefined && now().getTime() - heldSinceMs >= lockStaleMs) {
+        await remove(lockPath, "lock");
+        continue;
+      }
+      await sleep(lockRetryMs);
+    }
+    throw new AttachmentStoreError("ATTACHMENT_STORE_FAILED", "Attachment store lock is unavailable", { operation: "lock", path: safePath(lockPath), attempts: lockAttempts });
+  };
+
+  const releaseLock = async (): Promise<void> => {
+    try {
+      await io.rm(lockPath, { force: true, recursive: true });
+    } catch {
+      // Preserve the publication outcome; a retained lock is reclaimed as stale.
+    }
+  };
+
+  /** Purge abandoned staging and metadata-less records, then delete expired records. */
+  const reclaim = async (): Promise<StoreScan> => {
+    const initial = await scan();
+    for (const path of initial.staging) await remove(path, "purge_staging");
+    for (const path of initial.incomplete) await remove(path, "purge_incomplete");
     const current = now().getTime();
-    const records = await readLiveRecords();
-    const touchedRecipients = new Set<string>();
-    for (const record of records) {
+    for (const record of initial.records) {
       const expiry = Date.parse(record.metadata.expiresAt);
       if (!Number.isFinite(expiry)) throw new AttachmentStoreError("ATTACHMENT_STORE_FAILED", "Attachment expiry is invalid", { operation: "sweep", path: safePath(record.path) });
-      if (expiry <= current) {
-        touchedRecipients.add(resolve(record.path, ".."));
-        try {
-          await io.rm(record.path, { force: true, recursive: true });
-        } catch (error) {
-          throw storeFailure("sweep", record.path, error);
-        }
-      }
+      if (expiry <= current) await remove(record.path, "sweep");
     }
-    const recipients = await io.readdir(root).catch((error: unknown) => { throw storeFailure("list_recipients", root, error); });
-    for (const recipient of recipients) {
-      if (!recipient.isDirectory() || isTemporaryDirectory(recipient.name)) continue;
-      const recipientPath = join(root, recipient.name);
-      const entries = await io.readdir(recipientPath).catch((error: unknown) => { throw storeFailure("list_attachments", recipientPath, error); });
-      if (entries.length === 0 || touchedRecipients.has(recipientPath) && entries.every((entry) => isTemporaryDirectory(entry.name))) {
-        try {
-          await io.rm(recipientPath, { force: true, recursive: true });
-        } catch (error) {
-          throw storeFailure("sweep", recipientPath, error);
-        }
+    const remaining = await scan();
+    for (const recipient of remaining.recipients) {
+      if (recipient.entries > 0) continue;
+      let mtimeMs: number | undefined;
+      try {
+        mtimeMs = (await io.stat(recipient.path)).mtimeMs;
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw storeFailure("sweep", recipient.path, error);
       }
+      if (mtimeMs !== undefined && now().getTime() - mtimeMs >= EMPTY_RECIPIENT_GRACE_MS) await remove(recipient.path, "sweep");
     }
+    return remaining;
   };
 
   const publish = async (input: AttachmentPublishInput): Promise<PublishedAttachment> => {
@@ -287,15 +369,15 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
     const attachmentId = randomUUID();
     const digest = createHash("sha256").update(data).digest("hex");
     await ensureRoot();
+    await acquireLock();
     try {
-      await sweep();
-      const live = await readLiveRecords();
-      const liveBytes = live.reduce((total, item) => total + item.metadata.bytes, 0);
-      if (live.length >= ATTACHMENT_STORE_MAX_RECORDS || liveBytes + data.byteLength > ATTACHMENT_STORE_QUOTA_BYTES) {
+      const live = await reclaim();
+      const liveBytes = live.records.reduce((total, item) => total + item.metadata.bytes, 0);
+      if (live.records.length >= ATTACHMENT_STORE_MAX_RECORDS || liveBytes + data.byteLength > ATTACHMENT_STORE_QUOTA_BYTES) {
         throw new AttachmentStoreError("ATTACHMENT_QUOTA_EXCEEDED", "Attachment store quota is exhausted", {
           operation: "quota",
           bytes: liveBytes,
-          records: live.length,
+          records: live.records.length,
           requestedBytes: data.byteLength,
           limitBytes: ATTACHMENT_STORE_QUOTA_BYTES,
           limitRecords: ATTACHMENT_STORE_MAX_RECORDS
@@ -333,6 +415,8 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
       return { attachmentId, path: join(finalPath, "body.txt"), bytes: data.byteLength, sha256: digest, expiresAt: expires.toISOString(), ...(input.recipientPaneId === undefined ? {} : { recipientPaneId: input.recipientPaneId }) };
     } catch (error) {
       throw storeFailure("publish", root, error);
+    } finally {
+      await releaseLock();
     }
   };
 

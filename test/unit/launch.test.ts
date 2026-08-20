@@ -524,8 +524,144 @@ describe("herdr_launch", () => {
     await expect(createLaunchTool({ cli: aborted.cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "body" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
   });
 
+  it("derives attachment capability from the effective post-override runtime", async () => {
+    const piProfile = {
+      name: "worker-pi",
+      description: "worker",
+      timeoutMinutes: 1,
+      sessionPersistence: false,
+      runtime: { kind: "pi" as const, model: "test/model", thinking: "low" as const, tools: [], extensions: [], skills: [] },
+      fallbackProfiles: [], body: "body", source: { kind: "bundled" as const, path: "/profiles/worker-pi.md", scopeRoot: "/profiles", precedence: 0 }
+    };
+    const claudeProfile = {
+      name: "worker-claude",
+      description: "worker",
+      timeoutMinutes: 1,
+      sessionPersistence: true,
+      runtime: { kind: "claude" as const, model: "test/model", effort: "high" as const, permissionMode: "default" as const, allowedTools: [], disallowedTools: [], addDirs: [], pluginDirs: [] },
+      fallbackProfiles: [], body: "body", source: { kind: "bundled" as const, path: "/profiles/worker-claude.md", scopeRoot: "/profiles", precedence: 0 }
+    };
+    const catalog = (profile: typeof piProfile | typeof claudeProfile) => ({ load: async () => ({ effective: new Map([[profile.name, profile]]), candidates: [], diagnostics: [] }) });
+    const store = (): AttachmentStore => ({
+      root: "/cache",
+      recipientDirectory: (key) => `/cache/${key}`,
+      ensureRecipient: vi.fn(async (key: string) => `/cache/${key}`),
+      publish: vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/key/attachment-1/body.txt", bytes: 4, sha256: "b".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" }))
+    });
+
+    const piOverride = makeCli();
+    await expect(createLaunchTool({ cli: piOverride.cli, context, cwd: "/repo", attachments: store(), recipients: new RecipientRegistry(), promptSources: { create: async () => ({ path: "/tmp/profile.md" }) }, profiles: catalog(piProfile) })
+      .execute("id", { name: "worker", profile: "worker-pi", overrides: { tools: ["bash"] }, initialPrompt: "body", initialPromptDelivery: "attachment" } as never, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "Pi profile excludes the local read tool" } });
+    expect(piOverride.calls).toHaveLength(0);
+
+    const claudeOverride = makeCli();
+    await expect(createLaunchTool({ cli: claudeOverride.cli, context, cwd: "/repo", attachments: store(), recipients: new RecipientRegistry(), promptSources: { create: async () => ({ path: "/tmp/profile.md" }) }, profiles: catalog(claudeProfile) })
+      .execute("id", { name: "worker", profile: "worker-claude", overrides: { disallowedTools: ["Read"] }, initialPrompt: "body", initialPromptDelivery: "attachment" } as never, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "Claude profile disallows Read" } });
+    expect(claudeOverride.calls).toHaveLength(0);
+
+    const capablePi = makeCli();
+    const capableResult = await createLaunchTool({ cli: capablePi.cli, context, cwd: "/repo", attachments: store(), recipients: new RecipientRegistry(), promptSources: { create: async () => ({ path: "/tmp/profile.md" }) }, profiles: catalog(piProfile) })
+      .execute("id", { name: "worker", profile: "worker-pi", overrides: { tools: ["read", "bash"] }, initialPrompt: "body", initialPromptDelivery: "attachment" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(capableResult.details).toMatchObject({ initialPromptDelivery: "attachment", recipient: { capable: true } });
+
+    const recipients = new RecipientRegistry();
+    await createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo", attachments: store(), recipients, promptSources: { create: async () => ({ path: "/tmp/profile.md" }) }, profiles: catalog(piProfile) })
+      .execute("id", { name: "worker", profile: "worker-pi", overrides: { tools: ["bash"] } } as never, new AbortController().signal, undefined, extensionContext);
+    expect(recipients.get("w1:p2")).toMatchObject({ capable: false, reason: "Pi profile excludes the local read tool" });
+  });
+
+  it("rejects raw-kind attachment prompts and reports retained attachments on later failures", async () => {
+    expect(() => validateLaunchParams({ name: "worker", kind: "pi", initialPrompt: "body", initialPromptDelivery: "attachment" })).toThrowError(expect.objectContaining({ code: "ATTACHMENT_TARGET_UNVERIFIED" }));
+
+    const profile = {
+      name: "worker-pi",
+      description: "worker",
+      timeoutMinutes: 1,
+      sessionPersistence: false,
+      runtime: { kind: "pi" as const, model: "test/model", thinking: "low" as const, tools: [], extensions: [], skills: [] },
+      fallbackProfiles: [], body: "body", source: { kind: "bundled" as const, path: "/profiles/worker-pi.md", scopeRoot: "/profiles", precedence: 0 }
+    };
+    const profiles = { load: async () => ({ effective: new Map([[profile.name, profile]]), candidates: [], diagnostics: [] }) };
+    const promptSources = { create: async () => ({ path: "/tmp/profile.md" }) };
+    const published = { attachmentId: "attachment-1", path: "/cache/key/attachment-1/body.txt", bytes: 4, sha256: "b".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" };
+    const attachments: AttachmentStore = {
+      root: "/cache",
+      recipientDirectory: (key) => `/cache/${key}`,
+      ensureRecipient: async (key) => `/cache/${key}`,
+      publish: async () => published
+    };
+
+    const sendFailure = makeCli();
+    sendFailure.cli.runJsonWithStdin = vi.fn(async () => { throw Object.assign(new Error("submission failed"), { code: "CLI_TIMEOUT" }); });
+    await expect(createLaunchTool({ cli: sendFailure.cli, context, cwd: "/repo", attachments, recipients: new RecipientRegistry(), promptSources, profiles })
+      .execute("id", { name: "worker", profile: "worker-pi", initialPrompt: "body", initialPromptDelivery: "attachment" } as never, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: { causeCode: "CLI_TIMEOUT", phase: "prompt_verification", delivery: "attachment", initialPromptDelivery: "attachment", attachmentRetained: true, attachment: { attachmentId: "attachment-1", path: published.path } }
+      });
+
+    const publishFailure: AttachmentStore = {
+      root: "/cache",
+      recipientDirectory: (key) => `/cache/${key}`,
+      ensureRecipient: async (key) => `/cache/${key}`,
+      publish: async () => { throw Object.assign(new Error("quota"), { code: "ATTACHMENT_QUOTA_EXCEEDED", details: { operation: "quota" } }); }
+    };
+    const publishCli = makeCli();
+    await expect(createLaunchTool({ cli: publishCli.cli, context, cwd: "/repo", attachments: publishFailure, recipients: new RecipientRegistry(), promptSources, profiles })
+      .execute("id", { name: "worker", profile: "worker-pi", initialPrompt: "body", initialPromptDelivery: "attachment" } as never, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_QUOTA_EXCEEDED", details: { operation: "quota", delivery: "attachment", phase: "attachment_publish" } });
+    expect(publishCli.calls.some((argv) => argv[0] === "pane" && argv[1] === "split")).toBe(false);
+
+    const existingPane = makeCli({
+      runJson: vi.fn(async (argv: string[]) => {
+        if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot });
+        if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker", pane_id: "w1:p1" } });
+        if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent_status: "working" } });
+        throw new Error(`unexpected argv: ${argv.join(" ")}`);
+      })
+    });
+    const recipientPaneRecords: string[] = [];
+    const paneScoped: AttachmentStore = {
+      root: "/cache",
+      recipientDirectory: (key) => `/cache/${key}`,
+      ensureRecipient: async (key) => `/cache/${key}`,
+      publish: async (request) => { recipientPaneRecords.push(String(request.recipientPaneId)); return published; }
+    };
+    const existingResult = await createLaunchTool({ cli: existingPane.cli, context, cwd: "/repo", attachments: paneScoped, recipients: new RecipientRegistry(), promptSources, profiles })
+      .execute("id", { name: "worker", profile: "worker-pi", placement: { mode: "existing_pane", target: "w1:p1" }, initialPrompt: "body", initialPromptDelivery: "attachment" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(recipientPaneRecords).toEqual(["w1:p1"]);
+    expect(existingResult.details).toMatchObject({ paneId: "w1:p1", initialPromptDelivery: "attachment" });
+  });
+
+  it("falls back to the context signal and then to a fresh signal", async () => {
+    const withContextSignal = makeCli();
+    const contextSignal = new AbortController().signal;
+    await expect(createLaunchTool({ cli: withContextSignal.cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, undefined, undefined, { ...extensionContext, signal: contextSignal } as ExtensionContext))
+      .resolves.toMatchObject({ details: { outcome: "launched" } });
+
+    const withoutSignal = makeCli();
+    await expect(createLaunchTool({ cli: withoutSignal.cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi" }, undefined, undefined, { cwd: "/repo", hasUI: false } as ExtensionContext))
+      .resolves.toMatchObject({ details: { outcome: "launched" } });
+  });
+
+  it("maps an aborted stdin prompt failure to ABORTED", async () => {
+    const controller = new AbortController();
+    const aborted = makeCli();
+    aborted.cli.runJsonWithStdin = vi.fn(async () => {
+      controller.abort();
+      throw new Error("transport closed");
+    });
+    await expect(createLaunchTool({ cli: aborted.cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "body" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+  });
+
   it("renders compact calls and results", () => {
     const tool = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo" });
+    const delivery = tool.renderCall?.({ name: "worker", profile: "worker-pi", initialPrompt: "body", initialPromptDelivery: "attachment" } as never, {} as never, {} as never);
+    expect(delivery?.render(80)).toEqual(["herdr_launch · profile · attachment · worker"]);
+    const inlineDelivery = tool.renderCall?.({ name: "worker", kind: "pi", initialPrompt: "body" } as never, {} as never, {} as never);
+    expect(inlineDelivery?.render(80)).toEqual(["herdr_launch · pi · inline · worker"]);
     const call = tool.renderCall?.({ name: "worker", kind: "pi" } as never, {} as never, {} as never);
     expect(call?.render(80)).toEqual(["herdr_launch · pi · worker"]);
     call?.invalidate();

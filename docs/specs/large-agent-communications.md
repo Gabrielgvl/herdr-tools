@@ -85,8 +85,16 @@ already `working` omits the wait flags; every other wrapped delivery keeps them.
 Pi's `pi.exec` helper spawns children with `stdio: ["ignore", "pipe", "pipe"]` and
 has no input option, so the extension adds one narrow stdin-capable executor of its
 own. It keeps every existing guarantee: explicit `herdr` executable, argv array,
-`shell: false`, the same bounded timeout, the same `AbortSignal` handling, and
-bounded stdout/stderr evidence. Payload text is never included in error details.
+`shell: false`, the same bounded timeout, and the same `AbortSignal` handling. A
+timeout or abort sends `SIGTERM` and escalates to `SIGKILL` after a bounded grace
+period (default 5 s), so a child that ignores termination cannot hang the tool call;
+every timer and listener is cleared on the first settle.
+
+Failure evidence for a stdin delivery is fixed and non-textual — exit code, killed
+flag, per-stream presence, exact byte size, and truncation — because a failing CLI
+can echo part of a sender-authored body. The captured text is used only in-process to
+classify a rejected `--stdin` flag, and is never placed in error details, results, or
+rendered rows. Argv-only calls keep their existing bounded textual evidence.
 
 If the installed CLI rejects `--stdin`, the CLI fails its argument parse before
 touching the agent, so no bytes reach the recipient. That failure maps to
@@ -183,13 +191,30 @@ Owned by `herdr-tools`, modelled on the existing profile prompt-source store.
   - `ATTACHMENT_STORE_QUOTA_BYTES` = 64 MiB;
   - `ATTACHMENT_STORE_MAX_RECORDS` = 256;
   - `ATTACHMENT_RETENTION_HOURS` = 24.
+- Cross-process serialization: publication takes an exclusive `<root>/.lock`
+  directory (created non-recursively, so creation is the atomic test-and-set) and
+  holds it across abandoned-staging purge, expiry sweep, quota check, staging, and
+  rename. The lock is the quota reservation: two processes cannot both pass the
+  boundary check. Acquisition retries a bounded number of times (default 200 × 25 ms)
+  and then fails with `ATTACHMENT_STORE_FAILED` and `operation: "lock"`. A lock older
+  than 30 seconds is treated as abandoned and reclaimed. Release failure is not fatal;
+  the next publish reclaims it as stale. `.lock` is never scanned as a recipient.
+- Abandoned-staging purge, under the lock and before any quota decision: staging
+  directories only ever exist while the lock is held, so every `.tmp-*` directory
+  found at that point is a crash remnant and is deleted. An attachment directory
+  whose `meta.json` is missing (`ENOENT`) is likewise an interrupted publication and
+  is deleted; any other metadata read failure fails closed. Crash-left bodies
+  therefore cannot evade expiry or inflate the quota basis.
 - Expiry sweep runs only inside a publish call, never on a timer, and never from the
   extension factory. It removes attachment directories whose recorded expiry has
-  passed and then removes empty recipient directories. A sweep failure is a bounded
-  diagnostic on the publish result, not a silent success and not a body disclosure.
-- Quota is enforced after the sweep. Exceeding the byte quota or the record cap
-  fails the publish with `ATTACHMENT_QUOTA_EXCEEDED`. Live attachments are never
-  evicted to make room, because eviction could break a pending recipient read.
+  passed, then removes empty recipient directories that are older than
+  `EMPTY_RECIPIENT_GRACE_MS` (60 s) so a just-granted launch directory is never
+  swept out from under a starting agent. A sweep failure is a typed, body-free
+  failure, not a silent success.
+- Quota is enforced after the purge and sweep, against the post-purge scan.
+  Exceeding the byte quota or the record cap fails the publish with
+  `ATTACHMENT_QUOTA_EXCEEDED`. Live attachments are never evicted to make room,
+  because eviction could break a pending recipient read.
 - Session shutdown does not delete attachments. Recipients outlive the sending Pi
   session, and expiry is the only deletion trigger.
 - Recipient scoping is a contract and an access-narrowing measure, not an operating
@@ -205,11 +230,15 @@ path. Capability is derived from the profile that launched the recipient, record
 a session-scoped in-memory registry, and rechecked against fresh authoritative state
 before every attachment send.
 
-- `attachmentCapability(profile)` returns capable/incapable plus a reason:
-  - `pi`: capable when `runtime.tools` is empty (the default tool set includes
-    `read`) or explicitly includes `read`;
-  - `claude`: capable when `Read` is not in `disallowedTools` and `allowedTools` is
-    either empty or includes `Read`.
+- `attachmentCapability(profile, overrides)` returns capable/incapable plus a reason,
+  evaluated against the **effective post-override runtime**, because a typed call
+  override can remove the read tool the reference depends on:
+  - `pi`: capable when the effective `tools` (override if present, else profile) is
+    empty (the default tool set includes `read`) or explicitly includes `read`;
+  - `claude`: capable when the effective `disallowedTools` excludes `Read` and the
+    effective `allowedTools` is either empty or includes `Read`.
+  Typed override validation runs first, so an incompatible-kind override still fails
+  as `INVALID_PROFILE_OVERRIDE` rather than as a capability refusal.
 - Every bundled Pi and Claude profile satisfies this today: none of them restricts
   tools. A user or project profile that does is reported incapable, not repaired.
 - Profile-backed `herdr_launch` mints the recipient key, ensures the recipient
@@ -251,6 +280,12 @@ before every attachment send.
 - `details` gains `delivery`, `envelope.delivery`, and for the attachment route
   `attachment: { attachmentId, path, bytes, sha256, expiresAt, recipientPaneId }`.
   It never contains the body, and no existing field is removed.
+- A failure after the pre-state read keeps its typed code and gains `delivery`,
+  `route`, and `phase` (`publish`, `send`, or `post_state`). When the attachment was
+  already published, it also gains `attachmentRetained: true` and the same body-free
+  `attachment` block, because the file stays on disk until it expires. Refusals
+  before publication (`ATTACHMENT_TARGET_UNVERIFIED`) carry `delivery` and the
+  verification reason.
 
 ### `herdr_launch`
 
@@ -278,6 +313,13 @@ before every attachment send.
 - `details` gains `initialPromptDelivery`, the same `attachment` block, and the
   recipient record identity. Streamed progress gains an `attachment_publish` phase
   before `placement`.
+- Failure details keep the existing partial-launch codes (`LAUNCH_FAILED`,
+  `READY_TIMEOUT`, `POSTSTATE_UNAVAILABLE`, `ABORTED`) and `created`/`causeCode`
+  evidence, and add `phase`, `delivery`, `initialPromptDelivery`, and, once the
+  attachment is published, `attachmentRetained: true` plus the body-free `attachment`
+  block. A publish-phase failure keeps the store's own typed code
+  (`ATTACHMENT_STORE_FAILED` or `ATTACHMENT_QUOTA_EXCEEDED`) because no topology was
+  mutated, and carries `delivery` with `phase: "attachment_publish"`.
 
 ### `herdr_inspect`
 
@@ -290,10 +332,13 @@ Unchanged in this slice. An attachment-metadata inspect mode is deferred.
 - `PAYLOAD_TOO_LARGE`: attachment route payload exceeds the attachment bound.
 - `ATTACHMENT_TARGET_UNVERIFIED`: no capable, identity-matched recipient record in
   this runtime. Nothing published, nothing sent.
-- `ATTACHMENT_STORE_FAILED`: store root, recipient directory, publish, or metadata
-  write failed. Details carry the failing operation and path, never the body.
+- `ATTACHMENT_STORE_FAILED`: store root, recipient directory, lock, purge, sweep,
+  publish, or metadata read/write failed. Details carry the failing operation
+  (`ensure_root`, `ensure_recipient`, `lock`, `purge_staging`, `purge_incomplete`,
+  `sweep`, `list_recipients`, `list_attachments`, `read_metadata`, `publish`,
+  `validate_recipient`) and a bounded path, never the body.
 - `ATTACHMENT_QUOTA_EXCEEDED`: store byte quota or record cap reached after the
-  expiry sweep.
+  abandoned-staging purge and expiry sweep.
 - `CLI_INCOMPATIBLE` is reused when the installed CLI does not accept `--stdin`.
 
 Existing codes keep their meaning. No new code substitutes a guessed route, a
@@ -311,8 +356,12 @@ truncated payload, or a fabricated success.
   updates, TUI rows, job notifications, or store diagnostics. Only identifiers,
   paths, byte counts, digests, and timestamps are reported.
 - Store files are owner-only (`0700` directories, `0600` files) and atomically
-  published. The store holds sender-authored text, so it is exactly as sensitive as
-  the messages themselves and is bounded and expired accordingly.
+  published under an exclusive store lock. The store holds sender-authored text, so it
+  is exactly as sensitive as the messages themselves and is bounded and expired
+  accordingly.
+- A failing CLI may echo part of a delivered body, so stdin-delivery failures expose
+  no process text at all — only exit code, killed flag, per-stream presence, byte
+  size, and truncation.
 - The attachment envelope restates agent (not user/owner) authority, so a recipient
   cannot be tricked into treating attached text as owner instruction.
 - Recipient capability is never inferred from an agent kind alone, and never asserted
@@ -341,9 +390,10 @@ HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration
 src/exec-stdin.ts               stdin-capable spawn executor (argv array, no shell)
 src/cli.ts                      optional stdin executor injection and error mapping
 src/messages/limits.ts          inline/attachment/quota/retention constants
-src/messages/store.ts           owner-only atomic attachment store, sweep, quota
+src/messages/store.ts           locked atomic store: purge, sweep, quota, publish
 src/messages/recipients.ts      session-scoped recipient capability registry
-src/profiles/capability.ts      attachmentCapability(profile)
+src/messages/failure.ts         body-free delivery failure evidence
+src/profiles/capability.ts      attachmentCapability(profile, overrides)
 src/profiles/adapters.ts        extension-owned Claude --add-dir grant
 src/provenance.ts               v1 delivery and attachment header lines
 src/schemas.ts                  herdr_communicate delivery field
@@ -385,30 +435,47 @@ store failures. Never infer a route, never trim a payload, never echo a body.
 
 Unit tests with injected IO and a fake executor:
 
-- store: owner-only modes, atomic publish, immutability, exact digest and byte count,
-  metadata shape without a body, expiry sweep, empty recipient directory removal,
-  quota and record-cap rejection, sweep-failure diagnostics;
+- store, over a real temporary filesystem with targeted failure injection: owner-only
+  modes, atomic publish, immutability, exact digest and byte count, metadata shape
+  without a body, expiry sweep, aged-empty recipient removal versus a fresh launch
+  grant, quota and record-cap rejection, abandoned `.tmp-*` and metadata-less record
+  purge, every typed store failure operation;
+- store locking: held-lock timeout, stale-lock reclaim, release-during-wait,
+  reclaim failures, release failure, concurrent publication at the record cap in one
+  process, and concurrent publication at the record cap across two operating-system
+  processes (exactly one publication admitted in both cases);
 - recipients: capability derivation for every bundled profile, incapable Pi and
-  Claude tool restrictions, registry record and reset on session start/shutdown,
-  identity-mismatch rejection, missing-record rejection;
+  Claude tool restrictions, capability-removing and capability-restoring typed
+  overrides, registry record and reset on session start/shutdown, identity-mismatch
+  rejection, missing-record rejection;
 - envelope: additive `delivery` line for both routes, attachment header values,
   header injection resistance, preserved sentinel and authority lines;
 - stdin transport: argv array and `shell: false`, input written and stream closed,
-  timeout and abort parity with `pi.exec`, EPIPE and non-zero exit mapping, no
-  payload in bounded evidence;
+  timeout and abort parity with `pi.exec`, `SIGTERM`-to-`SIGKILL` escalation for a
+  child that ignores termination (mocked and real), timer/listener cleanup on every
+  settle path, EPIPE and non-zero exit mapping, and no process text or payload
+  fragment in stdin-delivery failure evidence, including partial echoes;
 - `herdr_communicate`: default inline route, oversized inline rejection, explicit
   attachment route ordering, unverified target rejection with nothing sent, `keys`
   rejecting `delivery`, unchanged busy/steer/post-state behaviour;
 - `herdr_launch`: pre-mutation publish ordering, Claude `--add-dir` grant, raw-kind
-  attachment rejection before mutation, registry record on success, retained
-  resources on failure;
-- rendering: delivery-aware rows that never print a body.
+  attachment rejection before mutation, capability-removing override rejection before
+  storage or mutation, registry record on success, retained resources and retained
+  attachment evidence on failure;
+- failure evidence: typed code preserved with `delivery`, `route`, `phase`, and
+  body-free retained attachment metadata for publish, send, and post-read failures;
+- rendering: delivery-aware success and error rows that never print a body.
 
-Integration in a disposable named session: inline delivery over `--stdin`, an
-attachment delivery read back by a launched bundled Pi profile agent, an attachment
-delivery read back by a launched bundled Claude profile agent through its granted
-`--add-dir`, and a visible refusal for an unprofiled target. Never mutate or close
-the active user workspace.
+Integration in a disposable named session: every extension call, including stdin
+deliveries, is routed through the named session (a session-bound stdin executor is
+injected exactly like `pi.exec`, and stdin payloads are captured separately from
+argv); inline delivery over `--stdin` with a regression check that no payload text
+appears in argv; an attachment delivery read back at its exact published path from a
+launched bundled Pi profile agent's assignment; an attachment delivery to a launched
+bundled Claude profile agent read back inside its granted `--add-dir` directory; and
+visible `ATTACHMENT_TARGET_UNVERIFIED` refusals for an unprofiled launched pane and
+for a raw-kind attachment launch, with no prompt sent. The run removes the recipient
+directories it created and never mutates or closes the active user workspace.
 
 ## Boundaries
 

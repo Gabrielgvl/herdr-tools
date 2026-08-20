@@ -227,6 +227,69 @@ describe("herdr_communicate", () => {
     expect(unverifiedStore.publish).not.toHaveBeenCalled();
   });
 
+  it("refuses attachment delivery for unregistered, incapable, and identity-mismatched recipients", async () => {
+    const attachments = (publish = vi.fn()): AttachmentStore => ({
+      root: "/cache",
+      recipientDirectory: (key: string) => `/cache/${key}`,
+      ensureRecipient: async (key: string) => `/cache/${key}`,
+      publish
+    } as unknown as AttachmentStore);
+    const attachment = { target: "reviewer", operation: "prompt" as const, text: "body", delivery: "attachment" as const };
+
+    const unregistered = makeCli();
+    const unregisteredStore = attachments();
+    await expect(createCommunicateTool({ cli: unregistered.cli, context, attachments: unregisteredStore, recipients: new RecipientRegistry() }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: "w1:p2", delivery: "attachment", reason: "recipient capability is not registered in this runtime" } });
+    expect(unregisteredStore.publish).not.toHaveBeenCalled();
+
+    const incapable = new RecipientRegistry();
+    incapable.register({ paneId: "w1:p2", recipientKey: "recipient-key", profileName: "restricted", kind: "pi", capable: false, reason: "Pi profile excludes the local read tool", agentName: "reviewer", agentId: "agent-7" });
+    const incapableStore = attachments();
+    await expect(createCommunicateTool({ cli: makeCli().cli, context, attachments: incapableStore, recipients: incapable }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "Pi profile excludes the local read tool" } });
+    expect(incapableStore.publish).not.toHaveBeenCalled();
+
+    const mismatched = new RecipientRegistry();
+    mismatched.register({ paneId: "w1:p2", recipientKey: "recipient-key", profileName: "worker-pi", kind: "pi", capable: true, reason: "read", agentName: "reviewer", agentId: "agent-replaced" });
+    const mismatchedStore = attachments();
+    await expect(createCommunicateTool({ cli: makeCli().cli, context, attachments: mismatchedStore, recipients: mismatched }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "recipient identity no longer matches the authoritative snapshot" } });
+    expect(mismatchedStore.publish).not.toHaveBeenCalled();
+  });
+
+  it("keeps typed codes and reports retained attachments when a send or post-read fails", async () => {
+    const published = { attachmentId: "attachment-1", path: "/cache/recipient-key/attachment-1/body.txt", bytes: 4, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" };
+    const recipients = new RecipientRegistry();
+    recipients.register({ paneId: "w1:p2", recipientKey: "recipient-key", profileName: "worker-pi", kind: "pi", capable: true, reason: "read", agentName: "reviewer", agentId: "agent-7" });
+    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => `/cache/${key}`, publish: async () => published } as unknown as AttachmentStore;
+
+    const sendFailure = makeCli();
+    sendFailure.stdinExec.mockImplementation(async () => ({ stdout: "", stderr: "submission refused", code: 1, killed: false }));
+    const sendError = await createCommunicateTool({ cli: sendFailure.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext).catch((error: { code?: string; details?: Record<string, unknown> }) => error);
+    expect(sendError).toMatchObject({
+      code: "CLI_PROTOCOL_ERROR",
+      details: { evidence: "omitted_for_stdin_delivery", delivery: "attachment", route: "prompt_direct", phase: "send", attachmentRetained: true, attachment: { attachmentId: "attachment-1", path: published.path } }
+    });
+    expect(JSON.stringify(sendError)).not.toContain("submission refused");
+
+    const postFailure = makeCli("idle", { postState: "idle" });
+    await expect(createCommunicateTool({ cli: postFailure.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE", details: { delivery: "attachment", phase: "post_state", attachmentRetained: true, attachment: { attachmentId: "attachment-1" } } });
+
+    const publishFailure = { ...attachments, publish: async () => { throw Object.assign(new Error("store"), { code: "ATTACHMENT_STORE_FAILED", details: { operation: "publish" } }); } } as unknown as AttachmentStore;
+    await expect(createCommunicateTool({ cli: makeCli().cli, context, attachments: publishFailure, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "publish", delivery: "attachment", phase: "publish" } });
+
+    const keysFailure = makeCli();
+    keysFailure.exec.mockImplementation(async (_command, argv) => {
+      if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot-1", result: { type: "session_snapshot", snapshot: baseSnapshot } }), stderr: "", code: 0, killed: false };
+      if (argv[0] === "pane") return { stdout: JSON.stringify({ id: "pane-1", result: { pane: { ...basePane, agent_status: "idle" } } }), stderr: "", code: 0, killed: false };
+      return { stdout: "", stderr: "keys rejected", code: 1, killed: false };
+    });
+    await expect(createCommunicateTool({ cli: keysFailure.cli, context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "send" } });
+  });
+
   it("rejects oversized inline text before any Herdr call and rejects delivery on keys", async () => {
     const harness = makeCli();
     const preflight = vi.fn(async () => undefined);

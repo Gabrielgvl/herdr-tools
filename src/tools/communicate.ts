@@ -1,6 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli, JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
+import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import type { AttachmentStore, PublishedAttachment } from "../messages/store.js";
 import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
@@ -11,6 +12,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 
 export type CommunicateRoute = "prompt_direct" | "steer_direct";
 export type CommunicateState = "idle" | "working" | "blocked" | "done" | "unknown";
+export type CommunicatePhase = "publish" | "send" | "post_state";
 
 export interface CommunicateDetails {
   operation: "prompt" | "steer" | "keys";
@@ -95,6 +97,7 @@ function operationId(envelope: JsonEnvelope | undefined): string | undefined {
   return envelope?.id;
 }
 
+
 export function createCommunicateTool(deps: CommunicateDependencies): ToolDefinition<typeof CommunicateParamsSchema, CommunicateDetails> {
   return {
     name: "herdr_communicate",
@@ -132,14 +135,14 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       let recipientAgentName: string | undefined;
       if (delivery === "attachment") {
         if (!deps.attachments || !deps.recipients || !target.paneId) {
-          throw Object.assign(new Error("Attachment target capability is unavailable"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId } });
+          throw Object.assign(new Error("Attachment target capability is unavailable"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, delivery } });
         }
         const recipient = deps.recipients.get(target.paneId);
         const verification = verifyRecipient(snapshot, recipient);
-        if (!verification.verified || !recipient) {
-          throw Object.assign(new Error("Attachment target capability is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: verification.reason } });
+        if (!verification.verified) {
+          throw Object.assign(new Error("Attachment target capability is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, delivery, reason: verification.reason } });
         }
-        recipientKey = recipient.recipientKey;
+        recipientKey = recipient!.recipientKey;
         recipientAgentName = verification.identity.agentName;
       }
       const preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
@@ -153,35 +156,47 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       let keys: JsonEnvelope | undefined;
       let route: CommunicateRoute | undefined;
       let published: PublishedAttachment | undefined;
-      if (params.operation === "keys") {
-        keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...params.keys], activeSignal);
-      } else {
-        route = params.operation === "steer" ? "steer_direct" : "prompt_direct";
-        if (delivery === "attachment") {
-          published = await deps.attachments!.publish({
-            body: params.text,
-            recipientKey: recipientKey!,
-            recipientPaneId: target.paneId,
-            recipientAgentName,
-            senderPaneId: sender!.paneId,
-            senderDisplay: sender!.display,
-            operation: params.operation
-          });
+      let phase: CommunicatePhase | undefined;
+      let postEnvelope: JsonEnvelope;
+      let after: Record<string, unknown>;
+      let afterState: CommunicateState;
+      try {
+        if (params.operation === "keys") {
+          phase = "send";
+          keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...params.keys], activeSignal);
+        } else {
+          route = params.operation === "steer" ? "steer_direct" : "prompt_direct";
+          if (delivery === "attachment") {
+            phase = "publish";
+            published = await deps.attachments!.publish({
+              body: params.text,
+              recipientKey: recipientKey!,
+              recipientPaneId: target.paneId,
+              recipientAgentName,
+              senderPaneId: sender!.paneId,
+              senderDisplay: sender!.display,
+              operation: params.operation
+            });
+          }
+          const envelope = delivery === "attachment"
+            ? buildEnvelope(sender!, params.operation, params.text, "attachment", { ...published!, encoding: "utf-8" })
+            : buildEnvelope(sender!, params.operation, params.text, "inline");
+          const promptArgs = params.operation === "steer" && beforeState === "working"
+            ? ["agent", "prompt", target.paneId!, "--stdin"]
+            : ["agent", "prompt", target.paneId!, "--stdin", "--wait", "--until", "working", "--timeout", "5000"];
+          phase = "send";
+          prompt = await deps.cli.runJsonWithStdin(promptArgs, envelope, activeSignal);
         }
-        const envelope = delivery === "attachment"
-          ? buildEnvelope(sender!, params.operation, params.text, "attachment", { ...published!, encoding: "utf-8" })
-          : buildEnvelope(sender!, params.operation, params.text, "inline");
-        const promptArgs = params.operation === "steer" && beforeState === "working"
-          ? ["agent", "prompt", target.paneId!, "--stdin"]
-          : ["agent", "prompt", target.paneId!, "--stdin", "--wait", "--until", "working", "--timeout", "5000"];
-        prompt = await deps.cli.runJsonWithStdin(promptArgs, envelope, activeSignal);
-      }
 
-      const postEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
-      const after = paneFrom(postEnvelope.result, target.paneId!);
-      const afterState = assertPostState(after);
-      if (params.operation !== "keys" && afterState !== "working") {
-        throw Object.assign(new Error("Target did not enter working state"), { code: "POSTSTATE_UNAVAILABLE", details: { target: target.paneId, postState: compactPane(after) } });
+        phase = "post_state";
+        postEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
+        after = paneFrom(postEnvelope.result, target.paneId!);
+        afterState = assertPostState(after);
+        if (params.operation !== "keys" && afterState !== "working") {
+          throw Object.assign(new Error("Target did not enter working state"), { code: "POSTSTATE_UNAVAILABLE", details: { target: target.paneId, postState: compactPane(after) } });
+        }
+      } catch (error) {
+        throw withDeliveryFailureEvidence(error, { delivery, route, phase, published });
       }
 
       const details: CommunicateDetails = {

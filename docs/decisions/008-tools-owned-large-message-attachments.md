@@ -53,6 +53,15 @@ published, text-only, and bounded: 16 KiB inline maximum, 1 MiB per attachment,
 inside a publish call, quota exhaustion fails visibly, and a live attachment is never
 evicted or deleted on shutdown.
 
+Store mutation is serialized by an exclusive `<root>/.lock` directory held across
+abandoned-staging purge, expiry sweep, quota check, staging, and rename, so the lock
+is also the quota reservation and two concurrent processes cannot both cross the
+boundary. Because staging only happens under that lock, any `.tmp-*` directory or
+metadata-less attachment directory present at acquisition is a crash remnant and is
+purged before the quota basis is computed. Locks older than 30 seconds are reclaimed
+as abandoned, and empty recipient directories are only swept after a 60-second grace
+so a just-granted launch directory is never removed from under a starting agent.
+
 `delivery` is an explicit caller field defaulting to `inline`, mirrored by
 `initialPromptDelivery` on `herdr_launch`. The chosen route appears in the envelope,
 the structured result, and the rendered row. There is no fallback in either
@@ -63,7 +72,9 @@ Attachment recipients are scoped and capability-gated. Each profile-backed launc
 mints an unguessable recipient key, creates `<root>/<recipientKey>/`, and records the
 recipient's pane ID, profile, agent identity, and derived capability in a
 session-scoped in-memory registry that follows the existing ownership rules and is
-never reconstructed. Claude profile launches receive an extension-owned
+never reconstructed. Capability is derived from the effective post-override runtime,
+not from the profile file alone, because a typed call override can remove the read
+tool the reference depends on. Claude profile launches receive an extension-owned
 `--add-dir <root>/<recipientKey>` from the launch adapter, because profile
 configuration cannot express that path; no bundled profile file changes, and every
 bundled Pi and Claude profile is capable as written. An attachment send requires a
@@ -120,6 +131,27 @@ text. Message attachments use unguessable identifiers instead.
 Rejected because eviction can delete a body a recipient is still reading. Quota
 exhaustion is a visible failure.
 
+### Serialize the store with an in-process mutex
+
+Rejected because several Pi sessions and their launched agents run as separate
+processes against one shared cache directory. An in-process guard would leave the
+quota check, staging, and rename interleaved across processes. A filesystem lock
+directory is the smallest primitive that actually covers that case, and it needs no
+new dependency.
+
+### Age out crash-left staging directories instead of purging them
+
+Rejected. Staging exists only while the lock is held, so a staging directory seen at
+acquisition is already known to be abandoned; an age heuristic would let orphaned
+bodies count toward the quota and evade expiry for as long as the grace lasted.
+
+### Expose bounded CLI text for failed stdin deliveries
+
+Rejected. Exact-string redaction of the payload cannot remove a partial echo of it,
+so any textual stdout/stderr in a stdin failure risks leaking a fragment of a
+sender-authored body. The evidence is reduced to non-textual status, size, and
+truncation, and the text is used only in-process to classify a rejected `--stdin`.
+
 ### Use `pi.exec` and accept argv delivery
 
 Rejected because it caps a message at the operating system argument limit, publishes
@@ -140,7 +172,16 @@ other execution guarantee.
   notification, or rendered row.
 - One process-execution path is no longer `pi.exec`. The security boundary now reads
   "explicit executable and argv arrays, no shell" rather than "always `pi.exec`", and
-  the exception is scoped to `herdr agent prompt --stdin`.
+  the exception is scoped to `herdr agent prompt --stdin`. That executor owns its own
+  termination behaviour: `SIGTERM` on timeout or abort, escalating to `SIGKILL` after
+  a bounded grace so an unresponsive child cannot hang a tool call.
+- Failure evidence gains a delivery shape: a typed failure after the pre-state read
+  carries `delivery`, `route`/`phase`, and, once published, `attachmentRetained` plus
+  body-free attachment metadata, so an operator can find or clean up a retained
+  attachment after a failed send.
+- Any test or harness that drives the extension must inject a session-bound stdin
+  executor alongside `pi.exec`. Injecting only `pi.exec` silently sends real prompts
+  to the default Herdr session.
 - Recipient scoping is an access-narrowing contract, not an operating system
   boundary: all store files belong to the same local user, and the unguessable
   recipient key plus per-recipient Claude grant is what prevents cross-recipient

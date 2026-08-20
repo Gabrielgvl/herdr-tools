@@ -35,21 +35,40 @@ function bounded(value: string, limit = MAX_EVIDENCE_BYTES): { value: string; co
   return { value: result.truncated ? `${result.content}\n[output truncated]` : result.content, content: result.content, truncated: result.truncated };
 }
 
-function redact(value: string, input: string | undefined): string {
-  if (!input || input.length === 0) return value;
-  return value.split(input).join("[payload omitted]");
-}
-
+/** Classify a rejected `--stdin` invocation from process text that is never exposed. */
 function stdinRejected(result: ExecResult): boolean {
   const evidence = `${result.stdout}\n${result.stderr}`.toLowerCase();
   return evidence.includes("--stdin") && /(unknown|unrecognized|unexpected|invalid|unsupported|option|argument|usage)/u.test(evidence);
 }
 
+/**
+ * Stdin deliveries carry sender-authored message bodies, which a failing CLI may echo in
+ * part. Their evidence is therefore fixed and non-textual: presence, exact byte size, and
+ * truncation only.
+ */
+function nonTextualEvidence(value: string, limit: number, field: "stdout" | "stderr"): Record<string, unknown> {
+  const size = Buffer.byteLength(value, "utf8");
+  return {
+    [`${field}Present`]: size > 0,
+    [`${field}Bytes`]: size,
+    [`${field}Truncated`]: size > limit
+  };
+}
+
 function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES, input?: string): CliProtocolError {
-  const stdout = bounded(redact(result.stdout, input), limit);
-  const stderr = bounded(redact(result.stderr, input), limit);
-  const code: CliFailureCode = result.killed ? "CLI_TIMEOUT" : input !== undefined && stdinRejected(result) ? "CLI_INCOMPATIBLE" : "CLI_PROTOCOL_ERROR";
-  return new CliProtocolError(code, code === "CLI_INCOMPATIBLE" ? "Herdr CLI does not support stdin prompt delivery" : "Herdr CLI did not return a usable response", {
+  if (input !== undefined) {
+    const code: CliFailureCode = result.killed ? "CLI_TIMEOUT" : stdinRejected(result) ? "CLI_INCOMPATIBLE" : "CLI_PROTOCOL_ERROR";
+    return new CliProtocolError(code, code === "CLI_INCOMPATIBLE" ? "Herdr CLI does not support stdin prompt delivery" : "Herdr CLI did not return a usable response", {
+      exitCode: result.code,
+      killed: result.killed,
+      evidence: "omitted_for_stdin_delivery",
+      ...nonTextualEvidence(result.stdout, limit, "stdout"),
+      ...nonTextualEvidence(result.stderr, limit, "stderr")
+    });
+  }
+  const stdout = bounded(result.stdout, limit);
+  const stderr = bounded(result.stderr, limit);
+  return new CliProtocolError(result.killed ? "CLI_TIMEOUT" : "CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", {
     exitCode: result.code,
     killed: result.killed,
     stdout: stdout.value,
@@ -64,7 +83,9 @@ function parseEnvelope(stdout: string, evidenceLimit = MAX_EVIDENCE_BYTES, input
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned malformed JSON", { stdout: bounded(redact(stdout, input), evidenceLimit).value });
+    throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned malformed JSON", input !== undefined
+      ? { evidence: "omitted_for_stdin_delivery", ...nonTextualEvidence(stdout, evidenceLimit, "stdout") }
+      : { stdout: bounded(stdout, evidenceLimit).value });
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned a non-object envelope");

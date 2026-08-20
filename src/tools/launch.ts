@@ -1,6 +1,7 @@
 import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
+import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment } from "../messages/store.js";
 import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
@@ -218,14 +219,17 @@ function focusArgs(focus: boolean): string[] {
   return [focus ? "--focus" : "--no-focus"];
 }
 
-function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"]): LaunchError {
+function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"], delivery?: MessageDelivery, published?: PublishedAttachment): LaunchError {
   const causeCode = error instanceof LaunchError ? error.code : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
   const message = error instanceof Error ? error.message : String(error);
   const code = causeCode === "ABORTED" ? "ABORTED" : causeCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : causeCode === "READY_TIMEOUT" || (causeCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
   return new LaunchError(code, `Launch did not complete: ${message}`, {
     ...(error instanceof LaunchError ? error.details : {}),
     created: { ...created },
-    causeCode
+    causeCode,
+    phase,
+    ...(delivery ? { delivery, initialPromptDelivery: delivery } : {}),
+    ...(published ? { attachmentRetained: true, attachment: { ...published } } : {})
   });
 }
 
@@ -287,11 +291,11 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       if (params.profile !== undefined) {
         if (!deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
         profileResolution = resolveProfile(params.profile, await deps.profiles.load());
-        capability = attachmentCapability(profileResolution.profile);
+        buildProfileArgv(profileResolution.profile, params.overrides);
+        capability = attachmentCapability(profileResolution.profile, params.overrides);
         if (initialPromptDelivery === "attachment" && !capability.capable) {
           throw new LaunchError("ATTACHMENT_TARGET_UNVERIFIED", "Profile cannot read a local attachment", { profile: profileResolution.profile.name, reason: capability.reason });
         }
-        buildProfileArgv(profileResolution.profile, params.overrides);
       }
       const effectiveKind = profileResolution?.profile.runtime.kind ?? params.kind!;
       const effectiveArgv = profileResolution ? undefined : params.argv;
@@ -323,8 +327,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let phase: LaunchDetails["phase"] = "placement";
       const created: LaunchResourceIds = {};
       if (profileResolution && initialPromptDelivery === "attachment") {
-          phase = "attachment_publish";
-          progress(onUpdate, phase, created);
+        phase = "attachment_publish";
+        progress(onUpdate, phase, created);
+        try {
           published = await attachmentStore.publish({
             body: params.initialPrompt!,
             recipientKey: recipientKey!,
@@ -334,6 +339,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             senderDisplay: sender!.display,
             operation: "assignment"
           });
+        } catch (error) {
+          throw withDeliveryFailureEvidence(error, { delivery: initialPromptDelivery, phase });
+        }
         profileArgv = buildProfileArgv(profileResolution.profile, params.overrides, promptSource!.path, recipientDirectory);
       }
       try {
@@ -427,7 +435,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         };
         return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: initialPromptDelivery }) }], details };
       } catch (error) {
-        throw partialError(error, created, phase);
+        throw partialError(error, created, phase, initialPromptDelivery, published);
       }
     },
     renderCall(args, theme) {

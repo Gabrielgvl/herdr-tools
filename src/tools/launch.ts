@@ -13,7 +13,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type RuntimeProfile } from "../profiles/types.js";
-import { HERDR_AGENT_START_TIMEOUT_MS } from "../cli.js";
+import { boundedEvidence, HERDR_AGENT_START_TIMEOUT_MS } from "../cli.js";
 import { withoutEnvironment } from "../redaction.js";
 
 export interface LaunchCli {
@@ -23,6 +23,7 @@ export interface LaunchCli {
 
 export interface LaunchResourceRegistry {
   record(resource: { kind: "pane" | "tab"; id: string; parentId?: string }): void;
+  has?(resource: { kind: "pane" | "tab"; id: string }): boolean;
 }
 
 export interface LaunchDependencies {
@@ -225,8 +226,31 @@ function noAgentFromPane(pane: Record<string, unknown>): boolean {
   return pane.agent_status === "unknown" && agentFields.every((field) => pane[field] === undefined || pane[field] === null);
 }
 
+function prelaunchPaneIsAgentFree(snapshot: HerdrSnapshot, pane: Record<string, unknown>): boolean {
+  return noAgentFromPane(pane) && !snapshot.agents.some((agent) => agent.pane_id === pane.pane_id);
+}
+
+function agentRecord(result: unknown): Record<string, unknown> {
+  if (!record(result)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr agent post-state is incompatible");
+  const agent = record(result.agent) ? result.agent : result;
+  return agent;
+}
+
+function exactPromptRecoveryAgent(agent: Record<string, unknown>, started: StartedAgent, stateChangeSeq: number): boolean {
+  const actualSequence = agent.state_change_seq;
+  const actualAgentId = idFrom(agent, "agent_id") ?? idFrom(agent, "id");
+  return stringFrom(agent, "name") === started.name
+    && idFrom(agent, "pane_id") === started.paneId
+    && stringFrom(agent, "agent") === started.kind
+    && stateFrom(agent) === "idle"
+    && typeof actualSequence === "number"
+    && Number.isSafeInteger(actualSequence)
+    && actualSequence === stateChangeSeq
+    && (started.agentId === undefined || actualAgentId === started.agentId);
+}
+
 function compactAttemptState(pane: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(["pane_id", "tab_id", "workspace_id", "agent_id", "agent_name", "agent_status", "status"].flatMap((field): Array<[string, unknown]> => {
+  return Object.fromEntries(["pane_id", "tab_id", "workspace_id", "agent_id", "agent_name", "name", "agent_kind", "agent", "kind", "agent_status", "state_change_seq", "agent_session", "status"].flatMap((field): Array<[string, unknown]> => {
     const value = pane[field];
     if (value === undefined) return [];
     if (typeof value === "string") return [[field, value.slice(0, 256)]];
@@ -279,24 +303,52 @@ function focusArgs(focus: boolean): string[] {
   return [focus ? "--focus" : "--no-focus"];
 }
 
-function isPromptStalled(error: unknown): boolean {
-  if (!record(error) || error.code !== "CLI_PROTOCOL_ERROR" || !record(error.details)) return false;
+interface PromptStallEvidence {
+  stateChangeSeq?: number;
+}
+
+function promptStallEvidence(error: unknown): PromptStallEvidence | undefined {
+  if (!record(error) || error.code !== "CLI_PROTOCOL_ERROR" || !record(error.details)) return undefined;
   const { exitCode, killed, stderr, evidence } = error.details;
-  if (exitCode !== 1 || killed !== false) return false;
-  // A stdin delivery withholds process text on purpose, so the stalled envelope can
-  // never be read back on that transport; its exit signature stands in for the text.
-  if (evidence === "omitted_for_stdin_delivery") return true;
-  if (typeof stderr !== "string") return false;
+  if (exitCode !== 1 || killed !== false) return undefined;
+  // Stdin delivery deliberately withholds process text. Preserve the newer transport's
+  // bounded new-pane recovery, but require textual sequence evidence before an existing
+  // pane can receive a recovery key.
+  if (evidence === "omitted_for_stdin_delivery") return {};
+  if (typeof stderr !== "string") return undefined;
   let envelope: unknown;
   try {
     envelope = JSON.parse(stderr.trim());
   } catch {
-    return false;
+    return undefined;
   }
-  if (!record(envelope) || envelope.id !== "cli:agent:prompt" || !record(envelope.error)) return false;
-  return envelope.error.code === "agent_prompt_stalled"
-    && typeof envelope.error.message === "string"
-    && /^agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained \d+$/.test(envelope.error.message);
+  if (!record(envelope) || envelope.id !== "cli:agent:prompt" || !record(envelope.error) || envelope.error.code !== "agent_prompt_stalled" || typeof envelope.error.message !== "string") return undefined;
+  const match = /^agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained (\d+)$/.exec(envelope.error.message);
+  if (!match) return undefined;
+  const stateChangeSeq = Number(match[1]);
+  return Number.isSafeInteger(stateChangeSeq) ? { stateChangeSeq } : undefined;
+}
+
+function cliFailureEvidence(error: unknown): Record<string, unknown> | undefined {
+  if (!record(error) || !record(error.details)) return undefined;
+  const details: Record<string, unknown> = {};
+  for (const key of ["exitCode", "stdoutBytes", "stderrBytes"] as const) {
+    const value = error.details[key];
+    if (typeof value === "number" && Number.isSafeInteger(value)) details[key] = value;
+  }
+  for (const key of ["killed", "stdoutPresent", "stderrPresent", "stdoutTruncated", "stderrTruncated"] as const) {
+    const value = error.details[key];
+    if (typeof value === "boolean") details[key] = value;
+  }
+  if (error.details.evidence === "omitted_for_stdin_delivery") details.evidence = error.details.evidence;
+  for (const key of ["stdout", "stderr", "cause"] as const) {
+    const value = error.details[key];
+    if (typeof value === "string") details[key] = boundedEvidence(value).value;
+  }
+  const code = typeof error.code === "string" ? error.code : undefined;
+  const message = error instanceof Error ? boundedEvidence(error.message, 2_000).value : undefined;
+  if (code === undefined && message === undefined && Object.keys(details).length === 0) return undefined;
+  return { ...(code === undefined ? {} : { code }), ...(message === undefined ? {} : { message }), ...(Object.keys(details).length === 0 ? {} : { details }) };
 }
 
 function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"], delivery?: MessageDelivery, published?: PublishedAttachment): LaunchError {
@@ -305,12 +357,16 @@ function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchD
     : error instanceof LaunchError ? error.code
       : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
   const message = error instanceof Error ? error.message : String(error);
-  const code = causeCode === "ABORTED" ? "ABORTED" : causeCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : causeCode === "READY_TIMEOUT" || (causeCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
+  const code = error instanceof LaunchError && error.code === "POSTSTATE_UNAVAILABLE"
+    ? "POSTSTATE_UNAVAILABLE"
+    : causeCode === "ABORTED" ? "ABORTED" : causeCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : causeCode === "READY_TIMEOUT" || (causeCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
+  const evidence = error instanceof LaunchError ? undefined : cliFailureEvidence(error);
   return new LaunchError(code, `Launch did not complete: ${message}`, {
     ...(error instanceof LaunchError ? error.details : {}),
+    phase,
+    ...(evidence ? { cliFailure: evidence } : {}),
     created: { ...created },
     causeCode,
-    phase,
     ...(delivery ? { delivery, initialPromptDelivery: delivery } : {}),
     ...(published ? { attachmentRetained: true, attachment: { ...published } } : {})
   });
@@ -376,6 +432,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let published: PublishedAttachment | undefined;
       let sender: SenderIdentity | undefined;
       let existingTarget: ResolvedTarget | undefined;
+      let existingPaneOwned = false;
+      let existingPaneAgentFree = false;
       let workspaceId: string | undefined;
       let phase: LaunchDetails["phase"] = "validate";
       const created: LaunchResourceIds = {};
@@ -426,6 +484,12 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           throw new LaunchError("INVALID_INPUT", `Agent name is already in use: ${params.name}`);
         }
         existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, deps.context) : undefined;
+        existingPaneOwned = placement.mode === "existing_pane"
+          && existingTarget !== undefined
+          && deps.ownership?.has?.({ kind: "pane", id: existingTarget.id }) === true;
+        existingPaneAgentFree = placement.mode === "existing_pane"
+          && existingTarget !== undefined
+          && prelaunchPaneIsAgentFree(snapshot, existingTarget.record);
         workspaceId = placement.mode === "new_tab" ? deps.context.workspaceId! : undefined;
         if (initialPromptDelivery === "attachment") {
           phase = "attachment_publish";
@@ -527,7 +591,28 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           try {
             await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
           } catch (error) {
-            if (placement.mode === "existing_pane" || !isPromptStalled(error)) throw error;
+            const stalled = promptStallEvidence(error);
+            if (!stalled) throw error;
+            if (placement.mode === "existing_pane") {
+              if (stalled.stateChangeSeq === undefined) {
+                throw new LaunchError("LAUNCH_FAILED", "Initial prompt stalled; existing-pane recovery requires exact state-change evidence", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_stall_evidence_unavailable" });
+              }
+              if (!existingPaneOwned) {
+                throw new LaunchError("LAUNCH_FAILED", "Initial prompt stalled; existing-pane recovery requires runtime ownership", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_not_owned" });
+              }
+              if (!existingPaneAgentFree) {
+                throw new LaunchError("LAUNCH_FAILED", "Initial prompt stalled; existing-pane recovery requires an agent-free pre-launch pane", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_preexisting_agent" });
+              }
+              let stalledAgent: Record<string, unknown>;
+              try {
+                stalledAgent = agentRecord(await run(deps.cli, ["agent", "get", resolvedPaneId], abortSignal));
+              } catch {
+                throw new LaunchError("POSTSTATE_UNAVAILABLE", "Initial prompt stalled; authoritative agent post-state was unavailable for bounded recovery", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_post_state_unavailable" });
+              }
+              if (!exactPromptRecoveryAgent(stalledAgent, chosenAgent, stalled.stateChangeSeq)) {
+                throw new LaunchError("POSTSTATE_UNAVAILABLE", "Initial prompt stalled; authoritative agent post-state did not prove the exact idle agent", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_post_state_unproven", postState: compactAttemptState(stalledAgent), expectedStateChangeSeq: stalled.stateChangeSeq });
+              }
+            }
             await run(deps.cli, ["agent", "send-keys", resolvedPaneId, "enter"], abortSignal);
             await run(deps.cli, ["agent", "wait", resolvedPaneId, "--until", "working", "--timeout", "5000"], abortSignal);
           }

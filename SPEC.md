@@ -189,7 +189,7 @@ Rules:
     | { kind: "output", match: { kind: "literal" | "regex", value: string } },
   timeoutMs: integer,          // required, 1 through 3,600,000 inclusive
   label?: string,              // optional single-line display label
-  runInBackground?: boolean    // optional; default false
+  runInBackground?: boolean    // optional; omitted auto-detaches long waits
 }
 ```
 
@@ -221,9 +221,9 @@ Long waits use mandatory in-process, tool-less reviewer calls:
 
 ### Detached wait jobs and `herdr_jobs`
 
-`herdr_wait` accepts an optional camelCase `runInBackground` boolean. Its schema is strict: omitted or `false` retains the blocking behavior, while snake_case and unknown fields are rejected. Background mode performs parameter validation, extension-owned settings loading, one authoritative snapshot read, exact target resolution, and duplicate resolved-resource rejection before registering anything. These preflight steps use the initiating tool signal and throw directly on failure without creating a job.
+`herdr_wait` accepts an optional camelCase `runInBackground` boolean. Its schema is strict: `true` explicitly detaches, `false` explicitly retains blocking behavior, and an omitted value automatically detaches waits whose timeout exceeds the configured review cadence. Snake_case and unknown fields are rejected. Background mode performs parameter validation, extension-owned settings loading, one authoritative snapshot read, exact target resolution, and duplicate resolved-resource rejection before registering anything. These preflight steps use the initiating tool signal and throw directly on failure without creating a job.
 
-After preflight, the extension registers a stable opaque `job_${randomUUID()}` identifier and runs the same prepared wait engine used by foreground waits under a fresh per-job `AbortController`. The prepared params, settings, and resolved IDs are copied at registration. Timeout starts after preflight. The initiating signal and call-scoped update callback are never used by post-registration work. A session generation/token check prevents stale preflight from registering into a replacement session.
+After preflight, the extension registers a stable opaque `job_${randomUUID()}` identifier and runs the same prepared wait engine used by foreground waits under a fresh per-job `AbortController`. Automatically detached long waits retain the mandatory in-process watcher model, and its terminal notification wakes the initiating Pi agent through the normal steer queue. The prepared params, settings, and resolved IDs are copied at registration. Timeout starts after preflight. The initiating signal and call-scoped update callback are never used by post-registration work. A session generation/token check prevents stale preflight from registering into a replacement session.
 
 The in-memory, session-wide registry has no concurrency cap and retains terminal jobs until shutdown. Generic job status is `running`, `completed`, `failed`, or `cancelled`; wait outcome is separately `success`, `timeout`, or `manager_judgment_required`. Only latest bounded progress is stored. Terminal transitions are first-wins. `herdr_jobs` is the sole public registry view and is strict:
 
@@ -271,11 +271,11 @@ Rules:
 
 - `name` is required and must be unique according to an authoritative agent listing. The extension never generates a name or silently renames a collision.
 - Default placement splits the current pane to the right in the current tab, with no focus change, current Pi cwd, and a pane label equal to `name` unless `label` is supplied. `new_tab` and `existing_pane` retain their existing explicit semantics.
-- Profile body sources are created before topology mutation. Initial prompts are sent only after the selected agent starts, wrapped in the mandatory v1 assignment envelope, and verified as `working`.
+- Profile body sources are created before topology mutation. Initial prompts are sent only after the selected agent starts, wrapped in the mandatory v1 assignment envelope, and verified as `working`. If the exact typed `agent_prompt_stalled` response is returned, the existing new-pane recovery remains available; an existing-pane recovery may send at most one Enter only when the pane is owned by this runtime, was agent-free in the authoritative pre-launch snapshot, and a fresh authoritative agent read/get proves the exact started name, pane, kind, idle state, and stalled state-change sequence. Unowned, preexisting-agent, mismatched, missing, or otherwise uncertain existing-pane evidence fails closed without sending keys.
 - Overrides apply only to the requested primary profile. Every fallback uses its own untouched defaults, including runtime, model, source, timeout, and permissions. Profile `timeoutMinutes` is task policy; Herdr startup uses a separate valid 120000 ms readiness timeout, while the CLI subprocess receives a small execution margin.
 - Automatic fallback is permitted only for the installed CLI failure envelope `{id:"cli:agent:start",error:{code:"agent_start_failed",message:"agent process exited before becoming interactive"}}` with non-killed exit 1 and untruncated stderr, followed by an authoritative pane read with `agent_status:"unknown"` and no agent identity/session fields. Timeout, malformed/protocol, identity/kind, prompt, and uncertain-state failures stop without fallback.
 - Fallback attempts reuse the resolved pane; the ordered reachable profile chain is deterministic and capped at three. An exhausted chain stops and reports bounded attempt evidence; no profile is improvised.
-- Launch details report requested and selected profiles, effective runtime/model/source/timeout/permissions, bounded attempt evidence, authoritative IDs/post-state, and any visible provenance. Failed launches retain created resources and never auto-clean them.
+- Launch details report requested and selected profiles, effective runtime/model/source/timeout/permissions, bounded attempt evidence, authoritative IDs/post-state, and any visible provenance. Failed launches retain created resources and never auto-clean them. When a typed CLI failure reaches the launch boundary, the error retains its failing phase and bounded stdout/stderr evidence so placement, startup, prompt, recovery, wait, and post-state failures remain diagnosable without retries.
 
 ### `herdr_pane`
 

@@ -524,6 +524,16 @@ describe("herdr_wait", () => {
     expect(prepared.settings.reviewerThinking).toBe("low");
   });
 
+  it("keeps an omitted wait at exactly the review cadence in the foreground", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_exact_cadence" });
+    const reviewerFactory = vi.fn(() => { throw new Error("exact-cadence waits must not start review supervision"); });
+    const tool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock(), pollIntervalMs: 100_000, reviewerFactory });
+    const result = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } as never, new AbortController().signal, undefined, extensionContext);
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(registry.size()).toBe(0);
+    expect(reviewerFactory).not.toHaveBeenCalled();
+  });
+
   it("rejects background waits when the registry is unavailable", async () => {
     const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings });
     await expect(tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT", message: "INVALID_INPUT: background waits are unavailable in this runtime" });

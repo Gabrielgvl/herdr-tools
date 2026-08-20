@@ -8,6 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import extension, { CORE_TOOL_NAMES } from "../../index.js";
 import { spawnWithStdin } from "../../src/exec-stdin.js";
+import { stopDisposableServer } from "./disposable-session.js";
 
 interface ExecutableTool {
   name: string;
@@ -187,6 +188,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+
     }
   }, 120_000);
 
@@ -196,9 +198,11 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     }
     if (state.sessionStarted) {
       await run("session", "stop", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_STOP_FAILURE ${String(error)}\n`));
+    }
+    await stopDisposableServer(state.server);
+    if (state.sessionStarted) {
       await run("session", "delete", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
     }
-    if (state.server?.exitCode === null) state.server.kill("SIGTERM");
     // Remove only the recipient directories this run published into.
     for (const path of state.attachmentPaths) {
       await rm(dirname(dirname(path)), { recursive: true, force: true }).catch((error) => process.stderr.write(`INTEGRATION_ATTACHMENT_CLEANUP_FAILURE ${String(error)}\n`));

@@ -3,6 +3,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, type LaunchCli, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LAUNCH_AGENT_KINDS, LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
+import { RecipientRegistry } from "../../src/messages/recipients.js";
+import type { AttachmentStore } from "../../src/messages/store.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
 const testPreflight = async () => undefined;
@@ -17,7 +19,6 @@ const snapshot: HerdrSnapshot = {
   agents: []
 };
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
-const assignmentEnvelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const extensionContext = { cwd: "/repo", hasUI: false } as ExtensionContext;
 const ok = (id: string, result: unknown) => ({ id, result });
 
@@ -33,7 +34,13 @@ function makeCli(overrides: Partial<LaunchCli> = {}) {
     if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "worker", agent_name: "worker", agent_status: "working" } });
     throw new Error(`unexpected argv: ${argv.join(" ")}`);
   });
-  return { cli: { runJson, ...overrides } as LaunchCli, calls };
+  const runJsonWithStdin = vi.fn(async (argv: string[], input: string) => {
+    void input;
+    calls.push(argv);
+    if (argv[0] === "agent" && argv[1] === "prompt") return ok("prompt", { ok: true });
+    throw new Error(`unexpected stdin argv: ${argv.join(" ")}`);
+  });
+  return { cli: { runJson, runJsonWithStdin, ...overrides } as LaunchCli, calls };
 }
 
 function launch(overrides: Partial<LaunchParams> = {}, deps: { cli?: LaunchCli; cwd?: string } = {}) {
@@ -174,9 +181,9 @@ describe("herdr_launch", () => {
     const { promise, calls } = launch({ initialPrompt: "begin" });
     const result = await promise;
     expect(calls[3]).toEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000"]);
-    expect(calls[4]).toEqual(["agent", "prompt", "w1:p2", assignmentEnvelope("begin"), "--wait", "--until", "working", "--timeout", "5000"]);
+    expect(calls[4]).toEqual(["agent", "prompt", "w1:p2", "--stdin", "--wait", "--until", "working", "--timeout", "5000"]);
     expect(calls[5]).toEqual(["pane", "get", "w1:p2"]);
-    expect(result.details).toMatchObject({ postState: { agent_status: "working" }, initialPromptSent: true, envelope: { version: "v1", kind: "assignment" }, sender: { paneId: "w1:p1", display: "caller" } });
+    expect(result.details).toMatchObject({ postState: { agent_status: "working" }, initialPromptSent: true, initialPromptDelivery: "inline", envelope: { version: "v1", kind: "assignment", delivery: "inline" }, sender: { paneId: "w1:p1", display: "caller" } });
   });
 
   it("fails before placement when an initial-prompt caller pane is absent", async () => {
@@ -252,6 +259,10 @@ describe("herdr_launch", () => {
       { ...valid, initialPrompt: 1 },
       { ...valid, initialPrompt: "" },
       { ...valid, initialPrompt: "bad\0prompt" },
+      { ...valid, initialPromptDelivery: "other" },
+      { ...valid, initialPromptDelivery: "inline" },
+      { ...valid, initialPromptDelivery: "attachment" },
+      { ...valid, initialPrompt: "body", initialPromptDelivery: "other" },
       { ...valid, focus: 1 },
       { ...valid, env: null },
       { ...valid, env: { "": "value" } },
@@ -455,6 +466,62 @@ describe("herdr_launch", () => {
       code: "ABORTED",
       details: { created: { paneId: "w1:p9", tabId: "w1:t1" } }
     });
+  });
+
+  it("publishes an attachment before profile placement and registers the recipient", async () => {
+    const { cli, calls } = makeCli();
+    const recipients = new RecipientRegistry();
+    const attachments: AttachmentStore = {
+      root: "/cache",
+      recipientDirectory: (key) => `/cache/${key}`,
+      ensureRecipient: vi.fn(async (key) => `/cache/${key}`),
+      publish: vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/key/attachment-1/body.txt", bytes: 4, sha256: "b".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" }))
+    };
+    const profile = {
+      name: "worker-pi",
+      description: "worker",
+      timeoutMinutes: 1,
+      sessionPersistence: false,
+      runtime: { kind: "pi" as const, model: "test/model", thinking: "low" as const, tools: [], extensions: [], skills: [] },
+      fallbackProfiles: [],
+      body: "profile body",
+      source: { kind: "bundled" as const, path: "/profiles/worker-pi.md", scopeRoot: "/profiles", precedence: 0 }
+    };
+    const promptSources = { create: vi.fn(async () => ({ path: "/tmp/profile.md" })) };
+    const result = await createLaunchTool({ cli, context, cwd: "/repo", attachments, recipients, promptSources, profiles: { load: async () => ({ effective: new Map([[profile.name, profile]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker-pi", initialPrompt: "body", initialPromptDelivery: "attachment" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(attachments.ensureRecipient).toHaveBeenCalledTimes(1);
+    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: "body", operation: "assignment" }));
+    expect(calls).toContainEqual(["agent", "prompt", "w1:p2", "--stdin", "--wait", "--until", "working", "--timeout", "5000"]);
+    expect(result.details).toMatchObject({ initialPromptDelivery: "attachment", attachment: { attachmentId: "attachment-1" }, recipient: { paneId: "w1:p2", profileName: "worker-pi", capable: true } });
+    expect(recipients.size).toBe(1);
+  });
+
+  it("rejects incapable attachment profiles before topology mutation", async () => {
+    const { cli, calls } = makeCli();
+    const profile = {
+      name: "restricted",
+      description: "restricted",
+      timeoutMinutes: 1,
+      sessionPersistence: false,
+      runtime: { kind: "pi" as const, model: "test/model", thinking: "low" as const, tools: ["bash"], extensions: [], skills: [] },
+      fallbackProfiles: [], body: "body", source: { kind: "bundled" as const, path: "/profiles/restricted.md", scopeRoot: "/profiles", precedence: 0 }
+    };
+    await expect(createLaunchTool({ cli, context, cwd: "/repo", profiles: { load: async () => ({ effective: new Map([[profile.name, profile]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "restricted", initialPrompt: "body", initialPromptDelivery: "attachment" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("fails closed when the stdin transport is unavailable or aborts", async () => {
+    const unavailable = makeCli();
+    delete (unavailable.cli as { runJsonWithStdin?: unknown }).runJsonWithStdin;
+    await expect(createLaunchTool({ cli: unavailable.cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "body" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_INCOMPATIBLE" } });
+
+    const controller = new AbortController();
+    const aborted = makeCli();
+    aborted.cli.runJsonWithStdin = vi.fn(async () => {
+      controller.abort();
+      return ok("prompt", {});
+    });
+    await expect(createLaunchTool({ cli: aborted.cli, context, cwd: "/repo" }).execute("id", { name: "worker", kind: "pi", initialPrompt: "body" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
   });
 
   it("renders compact calls and results", () => {

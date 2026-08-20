@@ -71,6 +71,9 @@ describe("profile catalog", () => {
     expect(buildProfileArgv(resources, {}, "/tmp/prompt")).toEqual(["--model", "test/model", "--thinking", "low", "--tools", "read", "--extension", join(root, "ext.ts"), "--skill", join(root, "skills"), "--no-session", "--append-system-prompt", "/tmp/prompt"]);
     const claudeResources = parseProfile(profileText("claude-resource", "claude").replace("effort: medium", "effort: medium\n  permissionMode: acceptEdits\n  allowedTools: [Read]\n  disallowedTools: [Bash]\n  addDirs: [./docs]\n  pluginDirs: [./plugin]"), source(root, "claude-resource"));
     expect(buildProfileArgv(claudeResources, {}, "/tmp/prompt")).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "acceptEdits", "--allowed-tools", "Read", "--disallowed-tools", "Bash", "--add-dir", join(root, "docs"), "--plugin-dir", join(root, "plugin"), "--append-system-prompt-file", "/tmp/prompt"]);
+    expect(buildProfileArgv(claudeResources, {}, undefined, "/tmp/message-attachments/key")).toContain("/tmp/message-attachments/key");
+    expect(() => buildProfileArgv(claudeResources, {}, undefined, "relative/key")).toThrow(/absolute/);
+    expect(() => buildProfileArgv(claudeResources, {}, undefined, "/tmp/bad\npath")).toThrow(/absolute/);
   });
 
   it("rejects malformed frontmatter and unknown or invalid fields", () => {

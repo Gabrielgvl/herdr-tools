@@ -150,3 +150,6 @@ other execution guarantee.
   relaunching the recipient from a profile.
 - Profile argv construction moves after the recipient key is minted, so the launch
   ordering test changes even though the launch contract does not.
+- A pre-placement attachment for a newly-created launch cannot truthfully record a
+  pane ID that Herdr has not assigned yet. Its immutable metadata omits that field;
+  the successful post-state and runtime-only recipient record complete the binding.

@@ -173,8 +173,10 @@ Owned by `herdr-tools`, modelled on the existing profile prompt-source store.
   directory into place. A published attachment is never rewritten in place, so a
   recipient's chunked read is always self-consistent.
 - `meta.json` holds the exact byte count, SHA-256, UTF-8 encoding marker, creation
-  and expiry timestamps, sender pane ID and display, recipient pane ID and agent
-  name, and the originating tool operation. It never holds the body.
+  and expiry timestamps, sender pane ID and display, the recipient pane ID when
+  authoritative placement already knows it (otherwise the field is omitted),
+  recipient agent name, and the originating tool operation. It never holds the
+  body.
 - Bounds, all fixed constants in this slice:
   - `MESSAGE_INLINE_MAX_BYTES` = 16 KiB;
   - `ATTACHMENT_MAX_BYTES` = 1 MiB;
@@ -265,7 +267,12 @@ before every attachment send.
   check capability → create prompt source → mint recipient key and directory →
   publish attachment → build argv (including the Claude `--add-dir` grant) → create
   pane/tab → start agent → send envelope over `--stdin` → verify `working`.
-  Building profile argv therefore moves after the recipient key is minted.
+  Building profile argv therefore moves after the recipient key is minted. A
+  newly-created pane has no authoritative pane ID before placement, so its
+  pre-placement attachment metadata omits `recipientPaneId`; the final launch
+  details and in-memory recipient record bind the key to the authoritative pane
+  and agent identity after the post-state read. Existing-pane placements include
+  the known pane ID in metadata.
 - A launch failure still performs no cleanup: created panes and tabs remain and are
   reported, and a published attachment remains until expiry.
 - `details` gains `initialPromptDelivery`, the same `attachment` block, and the

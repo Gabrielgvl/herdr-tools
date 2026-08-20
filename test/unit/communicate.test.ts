@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
+import type { StdinExec } from "../../src/exec-stdin.js";
+import { RecipientRegistry } from "../../src/messages/recipients.js";
+import type { AttachmentStore } from "../../src/messages/store.js";
 import { compactPane, createCommunicateTool as createCommunicateToolImplementation, paneFrom, type CommunicateDependencies } from "../../src/tools/communicate.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
@@ -19,13 +22,14 @@ const testPreflight = async () => undefined;
 const createCommunicateTool = (deps: Omit<CommunicateDependencies, "preflight"> & Partial<Pick<CommunicateDependencies, "preflight">>) => createCommunicateToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
 
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
-const senderEnvelope = (kind: "prompt" | "steer", payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: ${kind}\nauthority: agent; not user/owner\npayload: all text after this blank line is sender-authored\n\n${payload}`;
+const senderEnvelope = (kind: "prompt" | "steer", payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: ${kind}\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const extensionContext = { signal: undefined, hasUI: false } as unknown as ExtensionContext;
 
 type State = "idle" | "working" | "blocked" | "done" | "unknown" | "malformed";
 
 function makeCli(initial: State = "idle", options: { postState?: State } = {}) {
   const calls: string[][] = [];
+  const stdinInputs: string[] = [];
   const states: State[] = [];
   let state = initial;
   const response = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
@@ -45,12 +49,16 @@ function makeCli(initial: State = "idle", options: { postState?: State } = {}) {
       return response("interrupt-1", { ok: true });
     }
     if (argv[0] === "agent" && argv[1] === "prompt") {
-      state = "working";
-      return response("prompt-1", { ok: true });
+      throw new Error("text prompt must use the stdin executor");
     }
     throw new Error(`unexpected argv ${argv.join(" ")}`);
   });
-  return { cli: new HerdrCli(exec), calls, exec };
+  const stdinExec = vi.fn<StdinExec>().mockImplementation(async (_command, _argv, input) => {
+    stdinInputs.push(input);
+    state = "working";
+    return response("prompt-1", { ok: true });
+  });
+  return { cli: new HerdrCli(exec, 10_000, 50_000, stdinExec), calls, stdinInputs, exec, stdinExec };
 }
 
 function execute(cli: HerdrCli, params: Record<string, unknown>) {
@@ -64,9 +72,9 @@ describe("herdr_communicate", () => {
     expect(harness.calls).toEqual([
       ["api", "snapshot"],
       ["pane", "get", "w1:p2"],
-      ["agent", "prompt", "w1:p2", senderEnvelope("steer", "new direction"), "--wait", "--until", "working", "--timeout", "5000"],
       ["pane", "get", "w1:p2"]
     ]);
+    expect(harness.stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin", "--wait", "--until", "working", "--timeout", "5000"], senderEnvelope("steer", "new direction"), expect.anything());
     expect(harness.calls.some((call) => call.includes("esc"))).toBe(false);
     expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: state }, postState: { agent_status: "working" }, operationIds: { prompt: "prompt-1", postState: "pane-2" } });
   });
@@ -77,9 +85,9 @@ describe("herdr_communicate", () => {
     expect(harness.calls).toEqual([
       ["api", "snapshot"],
       ["pane", "get", "w1:p2"],
-      ["agent", "prompt", "w1:p2", senderEnvelope("steer", "replace direction")],
       ["pane", "get", "w1:p2"]
     ]);
+    expect(harness.stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin"], senderEnvelope("steer", "replace direction"), expect.anything());
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "send-keys")).toBe(false);
     expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: "working" }, operationIds: { prompt: "prompt-1", postState: "pane-2" } });
   });
@@ -114,8 +122,9 @@ describe("herdr_communicate", () => {
   it("prompts idle directly and returns bounded operation IDs and states", async () => {
     const harness = makeCli();
     const result = await execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" });
-    expect(harness.calls[2]).toEqual(["agent", "prompt", "w1:p2", senderEnvelope("prompt", "hello"), "--wait", "--until", "working", "--timeout", "5000"]);
-    expect(result.details).toMatchObject({ operation: "prompt", route: "prompt_direct", preState: { agent_status: "idle" }, postState: { agent_status: "working" }, operationIds: { snapshot: "snapshot-1", preState: "pane-1", prompt: "prompt-1", postState: "pane-2" }, envelope: { version: "v1", kind: "prompt" } });
+    expect(harness.calls[2]).toEqual(["pane", "get", "w1:p2"]);
+    expect(harness.stdinInputs).toEqual([senderEnvelope("prompt", "hello")]);
+    expect(result.details).toMatchObject({ operation: "prompt", delivery: "inline", route: "prompt_direct", preState: { agent_status: "idle" }, postState: { agent_status: "working" }, operationIds: { snapshot: "snapshot-1", preState: "pane-1", prompt: "prompt-1", postState: "pane-2" }, envelope: { version: "v1", kind: "prompt", delivery: "inline" } });
     expect(JSON.stringify(result)).not.toContain("environment");
   });
 
@@ -196,13 +205,48 @@ describe("herdr_communicate", () => {
     await expect(tool.execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { operation: "prompt" } });
   });
 
+  it("publishes explicit attachments only for a verified profile recipient", async () => {
+    const harness = makeCli();
+    const recipients = new RecipientRegistry();
+    recipients.register({ paneId: "w1:p2", recipientKey: "recipient-key", profileName: "worker-pi", kind: "pi", capable: true, reason: "read", agentName: "reviewer", agentId: "agent-7" });
+    const attachments: AttachmentStore = {
+      root: "/cache",
+      recipientDirectory: (key) => `/cache/${key}`,
+      ensureRecipient: async (key) => `/cache/${key}`,
+      publish: vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/recipient-key/attachment-1/body.txt", bytes: 15, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }))
+    };
+    const tool = createCommunicateTool({ cli: harness.cli, context, attachments, recipients });
+    const result = await tool.execute("id", { target: "reviewer", operation: "prompt", text: "attachment body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
+    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: "attachment body", recipientKey: "recipient-key", recipientPaneId: "w1:p2" }));
+    expect(harness.stdinInputs[0]).toContain("delivery: attachment");
+    expect(harness.stdinInputs[0]).not.toContain("attachment body");
+    expect(result.details).toMatchObject({ delivery: "attachment", attachment: { attachmentId: "attachment-1", bytes: 15 } });
+
+    const unverifiedStore = { ...attachments, publish: vi.fn() } as unknown as AttachmentStore;
+    await expect(createCommunicateTool({ cli: harness.cli, context, attachments: unverifiedStore }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED" });
+    expect(unverifiedStore.publish).not.toHaveBeenCalled();
+  });
+
+  it("rejects oversized inline text before any Herdr call and rejects delivery on keys", async () => {
+    const harness = makeCli();
+    const preflight = vi.fn(async () => undefined);
+    const tool = createCommunicateTool({ cli: harness.cli, context, preflight });
+    await expect(tool.execute("id", { target: "reviewer", operation: "prompt", text: "x".repeat(16 * 1024 + 1) }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE_FOR_INLINE" });
+    expect(preflight).not.toHaveBeenCalled();
+    await expect(tool.execute("id", { target: "reviewer", operation: "keys", keys: ["enter"], delivery: "inline" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(tool.execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "other" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
   it("renders compact call/result rows", () => {
     const tool = createCommunicateTool({ cli: makeCli().cli, context });
+    const keyCall = tool.renderCall?.({ target: "reviewer", operation: "keys", keys: ["enter"] } as never, {} as never, {} as never);
+    expect(keyCall?.render(80)).toEqual(["herdr_communicate · keys · reviewer"]);
+    keyCall?.invalidate();
     const call = tool.renderCall?.({ target: "reviewer", operation: "prompt", text: "hi" } as never, {} as never, {} as never);
-    expect(call?.render(80)).toEqual(["herdr_communicate · prompt · reviewer"]);
+    expect(call?.render(80)).toEqual(["herdr_communicate · prompt · inline · reviewer"]);
     call?.invalidate();
-    const result = tool.renderResult?.({ content: [], details: { operation: "prompt", outcome: "sent", target: { paneId: "w1:p2" }, preState: {}, postState: { agent_status: "working" }, operationIds: {} }, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(result?.render(80)).toEqual(["sent · w1:p2 · working"]);
+    const result = tool.renderResult?.({ content: [], details: { operation: "prompt", outcome: "sent", delivery: "inline", target: { paneId: "w1:p2" }, preState: {}, postState: { agent_status: "working" }, operationIds: {} }, isError: false } as never, {} as never, {} as never, {} as never);
+    expect(result?.render(80)).toEqual(["sent · inline · w1:p2 · working"]);
     result?.invalidate();
   });
 });

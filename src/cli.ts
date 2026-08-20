@@ -1,5 +1,6 @@
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
+import { spawnWithStdin, type StdinExec } from "./exec-stdin.js";
 
 export type PiExec = (command: string, args: string[], options: ExecOptions) => Promise<ExecResult>;
 
@@ -34,11 +35,21 @@ function bounded(value: string, limit = MAX_EVIDENCE_BYTES): { value: string; co
   return { value: result.truncated ? `${result.content}\n[output truncated]` : result.content, content: result.content, truncated: result.truncated };
 }
 
-function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES): CliProtocolError {
-  const stdout = bounded(result.stdout, limit);
-  const stderr = bounded(result.stderr, limit);
-  const code: CliFailureCode = result.killed ? "CLI_TIMEOUT" : "CLI_PROTOCOL_ERROR";
-  return new CliProtocolError(code, "Herdr CLI did not return a usable response", {
+function redact(value: string, input: string | undefined): string {
+  if (!input || input.length === 0) return value;
+  return value.split(input).join("[payload omitted]");
+}
+
+function stdinRejected(result: ExecResult): boolean {
+  const evidence = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return evidence.includes("--stdin") && /(unknown|unrecognized|unexpected|invalid|unsupported|option|argument|usage)/u.test(evidence);
+}
+
+function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES, input?: string): CliProtocolError {
+  const stdout = bounded(redact(result.stdout, input), limit);
+  const stderr = bounded(redact(result.stderr, input), limit);
+  const code: CliFailureCode = result.killed ? "CLI_TIMEOUT" : input !== undefined && stdinRejected(result) ? "CLI_INCOMPATIBLE" : "CLI_PROTOCOL_ERROR";
+  return new CliProtocolError(code, code === "CLI_INCOMPATIBLE" ? "Herdr CLI does not support stdin prompt delivery" : "Herdr CLI did not return a usable response", {
     exitCode: result.code,
     killed: result.killed,
     stdout: stdout.value,
@@ -48,12 +59,12 @@ function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES): CliPro
   });
 }
 
-function parseEnvelope(stdout: string, evidenceLimit = MAX_EVIDENCE_BYTES): JsonEnvelope {
+function parseEnvelope(stdout: string, evidenceLimit = MAX_EVIDENCE_BYTES, input?: string): JsonEnvelope {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned malformed JSON", { stdout: bounded(stdout, evidenceLimit).value });
+    throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned malformed JSON", { stdout: bounded(redact(stdout, input), evidenceLimit).value });
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned a non-object envelope");
@@ -73,13 +84,22 @@ export class HerdrCli {
   constructor(
     private readonly exec: PiExec,
     private readonly timeout = 10_000,
-    private readonly evidenceLimit = MAX_EVIDENCE_BYTES
+    private readonly evidenceLimit = MAX_EVIDENCE_BYTES,
+    private readonly stdinExec: StdinExec = spawnWithStdin
   ) {}
 
   async runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<JsonEnvelope> {
-    const result = await this.runRaw(argv, signal, preserveCompletedMutation);
-    if (result.code !== 0 || result.killed) throw failureFromExec(result, this.evidenceLimit);
-    return parseEnvelope(result.stdout, this.evidenceLimit);
+    return this.runJsonInternal(argv, signal, preserveCompletedMutation);
+  }
+
+  async runJsonWithStdin(argv: string[], input: string, signal: AbortSignal, preserveCompletedMutation = false): Promise<JsonEnvelope> {
+    return this.runJsonInternal(argv, signal, preserveCompletedMutation, input);
+  }
+
+  private async runJsonInternal(argv: string[], signal: AbortSignal, preserveCompletedMutation = false, input?: string): Promise<JsonEnvelope> {
+    const result = await this.runRaw(argv, signal, preserveCompletedMutation, input);
+    if (result.code !== 0 || result.killed) throw failureFromExec(result, this.evidenceLimit, input);
+    return parseEnvelope(result.stdout, this.evidenceLimit, input);
   }
 
   async runTextResult(argv: string[], signal: AbortSignal): Promise<CliTextResult> {
@@ -105,11 +125,13 @@ export class HerdrCli {
     return output.truncated ? `${output.value}\n[output truncated]` : output.value;
   }
 
-  private async runRaw(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<ExecResult> {
+  private async runRaw(argv: string[], signal: AbortSignal, preserveCompletedMutation = false, input?: string): Promise<ExecResult> {
     if (signal.aborted) throw new CliProtocolError("ABORTED", "Operation aborted");
     try {
       const timeout = argv[0] === "agent" && argv[1] === "start" ? Math.max(this.timeout, 120_000) : this.timeout;
-      const result = await this.exec("herdr", argv, { signal, timeout });
+      const result = input === undefined
+        ? await this.exec("herdr", argv, { signal, timeout })
+        : await this.stdinExec("herdr", argv, input, { signal, timeout });
       if (signal.aborted && !preserveCompletedMutation) throw new CliProtocolError("ABORTED", "Operation aborted");
       return result;
     } catch (error) {

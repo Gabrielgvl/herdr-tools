@@ -1,6 +1,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type ThinkingLevel } from "./profiles/types.js";
+import { type MessageDelivery } from "./messages/limits.js";
 
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
 const AgentArgument = Type.String({ pattern: "^[^\\u0000]*$" });
@@ -40,7 +41,8 @@ const LaunchCommonProperties = {
   label: Type.Optional(Identifier),
   cwd: Type.Optional(Identifier),
   focus: Type.Optional(Type.Boolean()),
-  initialPrompt: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" }))
+  initialPrompt: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" })),
+  initialPromptDelivery: Type.Optional(StringEnum(["inline", "attachment"] as const))
 };
 
 const RawLaunchParamsSchema = Type.Object({
@@ -91,6 +93,7 @@ export interface LaunchRequest {
   env?: Record<string, string>;
   focus?: boolean;
   initialPrompt?: string;
+  initialPromptDelivery?: MessageDelivery;
 }
 
 export function isLaunchAgentKind(value: unknown): value is LaunchAgentKind {

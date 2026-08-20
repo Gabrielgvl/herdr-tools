@@ -1,5 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { type MessageDelivery } from "./messages/limits.js";
 
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
 
@@ -14,17 +15,19 @@ export const InspectParamsSchema = Type.Union([
 
 export const SUPPORTED_NAMED_KEYS = ["esc", "escape", "enter", "tab", "space", "backspace", "delete", "up", "down", "left", "right", "home", "end", "pageup", "pagedown", "ctrl+c", "ctrl+d", "ctrl+z"] as const;
 const NamedKey = StringEnum(SUPPORTED_NAMED_KEYS);
+const Delivery = StringEnum(["inline", "attachment"] as const);
+const MessageText = Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" });
 
 export const CommunicateParamsSchema = Type.Union([
-  Type.Object({ target: Identifier, operation: Type.Literal("prompt"), text: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
-  Type.Object({ target: Identifier, operation: Type.Literal("steer"), text: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+  Type.Object({ target: Identifier, operation: Type.Literal("prompt"), text: MessageText, delivery: Type.Optional(Delivery) }, { additionalProperties: false }),
+  Type.Object({ target: Identifier, operation: Type.Literal("steer"), text: MessageText, delivery: Type.Optional(Delivery) }, { additionalProperties: false }),
   Type.Object({ target: Identifier, operation: Type.Literal("keys"), keys: Type.Array(NamedKey, { minItems: 1 }) }, { additionalProperties: false })
 ]);
 
 export type InspectParams = { mode?: "context" | "target" | "collection" | "profile" | "health"; target?: string; collection?: "panes" | "agents" | "tabs" | "profiles"; profile?: string };
 export type CommunicateParams =
-  | { target: string; operation: "prompt"; text: string }
-  | { target: string; operation: "steer"; text: string }
+  | { target: string; operation: "prompt"; text: string; delivery?: MessageDelivery }
+  | { target: string; operation: "steer"; text: string; delivery?: MessageDelivery }
   | { target: string; operation: "keys"; keys: string[] };
 
 const SUPPORTED_NAMED_KEY_SET = new Set<string>(SUPPORTED_NAMED_KEYS);

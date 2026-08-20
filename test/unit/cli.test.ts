@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { CliProtocolError, HerdrCli, type PiExec } from "../../src/cli.js";
+import type { StdinExec } from "../../src/exec-stdin.js";
 
 const signal = new AbortController().signal;
 
@@ -123,6 +124,19 @@ describe("HerdrCli", () => {
 
     const stringFailure = vi.fn<PiExec>().mockRejectedValue("missing executable");
     await expect(new HerdrCli(stringFailure).runText(["status"], signal)).rejects.toMatchObject({ code: "CLI_NOT_FOUND", details: { cause: "missing executable" } });
+  });
+
+  it("uses the narrow stdin executor without placing the payload in argv", async () => {
+    const input = "payload that must stay out of argv";
+    const exec = vi.fn<PiExec>().mockResolvedValue(response('{"id":"prompt","result":{"ok":true}}'));
+    const stdinExec = vi.fn<StdinExec>().mockResolvedValue(response('{"id":"prompt","result":{"ok":true}}'));
+    const cli = new HerdrCli(exec, 1000, 1000, stdinExec);
+    await expect(cli.runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], input, signal)).resolves.toMatchObject({ id: "prompt" });
+    expect(exec).not.toHaveBeenCalled();
+    expect(stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin"], input, { signal, timeout: 1000 });
+
+    const incompatible = vi.fn<StdinExec>().mockResolvedValue(response("", 2, "unknown option --stdin; payload that must stay out of argv"));
+    await expect(new HerdrCli(exec, 1000, 1000, incompatible).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], input, signal)).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE", details: { stderr: expect.not.stringContaining(input) } });
   });
 
   it("passes the caller signal to every call and reports cancellation", async () => {

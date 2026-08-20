@@ -1,6 +1,10 @@
 import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
+import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
+import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment } from "../messages/store.js";
+import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
+import { attachmentCapability } from "../profiles/capability.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
@@ -10,6 +14,7 @@ import { buildProfileArgv, defaultPromptSourceStore, resolveProfile, type Profil
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
+  runJsonWithStdin?(argv: string[], input: string, signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
 }
 
 export interface LaunchResourceRegistry {
@@ -24,6 +29,8 @@ export interface LaunchDependencies {
   ownership?: LaunchResourceRegistry;
   profiles?: { load: () => Promise<ProfileCatalog> };
   promptSources?: PromptSourceStore;
+  attachments?: AttachmentStore;
+  recipients?: RecipientRegistry;
 }
 
 export interface LaunchResourceIds {
@@ -40,11 +47,14 @@ export interface LaunchDetails extends LaunchResourceIds {
   placement?: LaunchPlacement;
   postState?: Record<string, unknown>;
   initialPromptSent?: boolean;
-  phase?: "placement" | "agent_start" | "ready" | "prompt_verification";
+  initialPromptDelivery?: MessageDelivery;
+  phase?: "attachment_publish" | "placement" | "agent_start" | "ready" | "prompt_verification";
   created?: LaunchResourceIds;
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
-  envelope?: { version: "v1"; kind: "assignment" };
+  envelope?: { version: "v1"; kind: "assignment"; delivery: MessageDelivery };
+  attachment?: PublishedAttachment;
+  recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; profileName: string; kind: "pi" | "claude"; capable: boolean; reason: string };
   profile?: { name: string; source: { kind: string; path: string }; timeoutMinutes: number; sessionPersistence: boolean; fallbackProfiles: string[]; reachableNames: string[] };
 }
 
@@ -92,6 +102,15 @@ function validateParams(params: LaunchRequest): void {
   if (params.cwd !== undefined) identifier(params.cwd, "cwd");
   if (params.initialPrompt !== undefined && (typeof params.initialPrompt !== "string" || params.initialPrompt.length === 0 || /\0/.test(params.initialPrompt))) {
     throw new LaunchError("INVALID_INPUT", "initialPrompt must be a non-empty string without NUL");
+  }
+  if (params.initialPromptDelivery !== undefined && params.initialPromptDelivery !== "inline" && params.initialPromptDelivery !== "attachment") {
+    throw new LaunchError("INVALID_INPUT", "initialPromptDelivery must be inline or attachment");
+  }
+  if (params.initialPrompt === undefined && params.initialPromptDelivery !== undefined) {
+    throw new LaunchError("INVALID_INPUT", "initialPromptDelivery requires initialPrompt");
+  }
+  if (params.initialPromptDelivery === "attachment" && !profileMode) {
+    throw new LaunchError("ATTACHMENT_TARGET_UNVERIFIED", "Attachment initial prompts require a capable profile launch");
   }
   if (params.focus !== undefined && typeof params.focus !== "boolean") throw new LaunchError("INVALID_INPUT", "focus must be a boolean");
   if (params.env !== undefined) {
@@ -229,6 +248,19 @@ async function run(cli: LaunchCli, argv: string[], signal: AbortSignal, preserve
   }
 }
 
+async function runPrompt(cli: LaunchCli, paneId: string, envelope: string, signal: AbortSignal): Promise<unknown> {
+  if (!cli.runJsonWithStdin) throw new LaunchError("CLI_INCOMPATIBLE", "Herdr CLI stdin prompt transport is unavailable");
+  const argv = ["agent", "prompt", paneId, "--stdin", "--wait", "--until", "working", "--timeout", "5000"];
+  try {
+    const response = await cli.runJsonWithStdin(argv, envelope, signal);
+    if (signal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
+    return response.result;
+  } catch (error) {
+    if (signal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
+    throw error;
+  }
+}
+
 export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeof LaunchParamsSchema, LaunchDetails> {
   return {
     name: "herdr_launch",
@@ -238,7 +270,12 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
     async execute(_id, rawParams, signal, onUpdate, ctx) {
       const params = rawParams as unknown as LaunchRequest;
       validateParams(params);
-      const abortSignal = signal!;
+      const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
+      const initialPromptDelivery: MessageDelivery | undefined = params.initialPrompt === undefined ? undefined : (params.initialPromptDelivery ?? "inline");
+      if (params.initialPrompt !== undefined) {
+        assertMessageText(params.initialPrompt);
+        assertDeliverySize(params.initialPrompt, initialPromptDelivery!);
+      }
       await deps.preflight(abortSignal);
       const cwd = params.cwd ?? deps.cwd ?? ctx.cwd;
       identifier(cwd, "cwd");
@@ -246,9 +283,14 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       const label = params.label ?? params.name;
       let profileResolution: ProfileResolution | undefined;
       let profileArgv: string[] | undefined;
+      let capability: ReturnType<typeof attachmentCapability> | undefined;
       if (params.profile !== undefined) {
         if (!deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
         profileResolution = resolveProfile(params.profile, await deps.profiles.load());
+        capability = attachmentCapability(profileResolution.profile);
+        if (initialPromptDelivery === "attachment" && !capability.capable) {
+          throw new LaunchError("ATTACHMENT_TARGET_UNVERIFIED", "Profile cannot read a local attachment", { profile: profileResolution.profile.name, reason: capability.reason });
+        }
         buildProfileArgv(profileResolution.profile, params.overrides);
       }
       const effectiveKind = profileResolution?.profile.runtime.kind ?? params.kind!;
@@ -256,7 +298,15 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       const promptSource = profileResolution
         ? await (deps.promptSources ?? defaultPromptSourceStore).create(profileResolution.profile.body)
         : undefined;
-      if (profileResolution) profileArgv = buildProfileArgv(profileResolution.profile, params.overrides, promptSource!.path);
+      const attachmentStore = deps.attachments ?? defaultAttachmentStore;
+      let recipientKey: string | undefined;
+      let recipientDirectory: string | undefined;
+      let published: PublishedAttachment | undefined;
+      if (profileResolution) {
+        recipientKey = mintRecipientKey();
+        recipientDirectory = await attachmentStore.ensureRecipient(recipientKey);
+        if (initialPromptDelivery !== "attachment") profileArgv = buildProfileArgv(profileResolution.profile, params.overrides, promptSource!.path, recipientDirectory);
+      }
       const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
       const sender = params.initialPrompt !== undefined ? resolveSender(snapshot, deps.context.paneId) : undefined;
       assertCurrentContext(snapshot, deps.context);
@@ -272,7 +322,22 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let tabId: string | undefined;
       let phase: LaunchDetails["phase"] = "placement";
       const created: LaunchResourceIds = {};
+      if (profileResolution && initialPromptDelivery === "attachment") {
+          phase = "attachment_publish";
+          progress(onUpdate, phase, created);
+          published = await attachmentStore.publish({
+            body: params.initialPrompt!,
+            recipientKey: recipientKey!,
+            ...(existingTarget?.paneId ? { recipientPaneId: existingTarget.paneId } : {}),
+            recipientAgentName: params.name,
+            senderPaneId: sender!.paneId,
+            senderDisplay: sender!.display,
+            operation: "assignment"
+          });
+        profileArgv = buildProfileArgv(profileResolution.profile, params.overrides, promptSource!.path, recipientDirectory);
+      }
       try {
+        phase = "placement";
         progress(onUpdate, phase, created);
         if (placement.mode === "existing_pane") {
           paneId = existingTarget!.paneId!;
@@ -314,17 +379,17 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         const startedAgent = agentIdentity(started);
         let agentId = startedAgent.agentId;
         const returnedName = startedAgent.name;
-        if (agentId) {
-          created.agentId = agentId;
-        }
+        if (agentId) created.agentId = agentId;
         phase = "ready";
         progress(onUpdate, phase, created);
         if (placement.mode === "existing_pane" && params.focus === true) await run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal);
         let initialPromptSent = false;
         if (params.initialPrompt !== undefined) {
           phase = "prompt_verification";
-          const envelope = buildEnvelope(sender!, "assignment", params.initialPrompt);
-          await run(deps.cli, ["agent", "prompt", resolvedPaneId, envelope, "--wait", "--until", "working", "--timeout", "5000"], abortSignal);
+          const envelope = initialPromptDelivery === "attachment"
+            ? buildEnvelope(sender!, "assignment", params.initialPrompt, "attachment", { ...published!, encoding: "utf-8" })
+            : buildEnvelope(sender!, "assignment", params.initialPrompt, "inline");
+          await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
           initialPromptSent = true;
           progress(onUpdate, phase, created);
         }
@@ -335,6 +400,11 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         agentId ??= idFrom(postState, "agent_id");
         const authoritativeName = returnedName ?? stringFrom(postState, "agent_name") ?? stringFrom(postState, "name");
         if (!authoritativeName) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr launch post-state omitted authoritative agent name");
+        const identity = { agentName: authoritativeName, ...(agentId ? { agentId } : {}) };
+        const recipient = profileResolution && recipientKey && capability
+          ? { recipientKey, paneId: resolvedPaneId, agentName: authoritativeName, ...(agentId ? { agentId } : {}), profileName: profileResolution.profile.name, kind: capability.kind, capable: capability.capable, reason: capability.reason }
+          : undefined;
+        if (recipient && deps.recipients) deps.recipients.recordFor(profileResolution!.profile.name, resolvedPaneId, recipient.recipientKey, capability!, identity);
         const details: LaunchDetails = {
           operation: "launch",
           outcome: "launched",
@@ -346,19 +416,24 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           ...(agentId ? { agentId } : {}),
           postState,
           initialPromptSent,
+          ...(initialPromptDelivery ? { initialPromptDelivery } : {}),
           ...(sender ? {
             sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
-            envelope: { version: "v1" as const, kind: "assignment" as const }
+            envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },
+            ...(published ? { attachment: published } : {})
           } : {}),
+          ...(recipient ? { recipient } : {}),
           ...(profileResolution ? { profile: { name: profileResolution.profile.name, source: { kind: profileResolution.profile.source.kind, path: profileResolution.profile.source.path }, timeoutMinutes: profileResolution.profile.timeoutMinutes, sessionPersistence: profileResolution.profile.sessionPersistence, fallbackProfiles: [...profileResolution.fallbackProfiles], reachableNames: [...profileResolution.reachableNames] } } : {})
         };
-        return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId }) }], details };
+        return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: initialPromptDelivery }) }], details };
       } catch (error) {
         throw partialError(error, created, phase);
       }
     },
     renderCall(args, theme) {
-      return textComponent(formatCall("herdr_launch", "kind" in args ? args.kind : "profile", args.name), theme, "accent");
+      const kind = "kind" in args ? args.kind : "profile";
+      const delivery = args.initialPrompt !== undefined ? args.initialPromptDelivery ?? "inline" : undefined;
+      return textComponent(formatCall("herdr_launch", delivery ? `${kind} · ${delivery}` : kind, args.name), theme, "accent");
     },
     renderResult(result, options, theme) {
       return renderResultComponent("launch", result, options, theme, result.details?.paneId);

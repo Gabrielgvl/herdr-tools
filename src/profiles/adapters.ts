@@ -1,5 +1,6 @@
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeRuntimeOverrides, type ClaudeEffort, type ClaudePermissionMode, type PiRuntimeOverrides, type Profile, type RuntimeOverrides, type ThinkingLevel } from "./types.js";
 import { normalizeScopedResourcePath } from "./parser.js";
+import { isAbsolute } from "node:path";
 
 export class ProfileAdapterError extends Error {
   readonly code = "INVALID_PROFILE_OVERRIDE" as const;
@@ -75,6 +76,12 @@ function promptFileArg(flag: string, path: string | undefined): string[] {
   return [flag, path];
 }
 
+function attachmentDirectoryArg(path: string | undefined): string[] {
+  if (path === undefined) return [];
+  if (path.length === 0 || /[\0\r\n]/.test(path) || !isAbsolute(path)) throw new ProfileAdapterError("attachment directory must be an absolute single-line path");
+  return ["--add-dir", path];
+}
+
 export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, sessionPersistence: boolean, overrides: PiRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
   rejectIncompatible("pi", overrides as Record<string, unknown>);
   const args = ["--model", model(overrides.model, profile.model), "--thinking", thinking(overrides.thinking, profile.thinking), ...commaSeparated("--tools", values(overrides.tools, profile.tools)), ...repeated("--extension", scopedValues(overrides.extensions, profile.extensions, "overrides.extensions", scopeRoot)), ...repeated("--skill", scopedValues(overrides.skills, profile.skills, "overrides.skills", scopeRoot))];
@@ -82,14 +89,14 @@ export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>
   return [...args, ...promptFileArg("--append-system-prompt", promptFilePath)];
 }
 
-export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
+export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string, attachmentDirectory?: string): string[] {
   if (!sessionPersistence) throw new ProfileAdapterError("Claude profiles must set sessionPersistence to true for interactive launches");
   rejectIncompatible("claude", overrides as Record<string, unknown>);
-  const args = ["--model", model(overrides.model, profile.model), "--effort", effort(overrides.effort, profile.effort), ...permissionArgs(permissionMode(overrides.permissionMode, profile.permissionMode)), ...repeated("--allowed-tools", values(overrides.allowedTools, profile.allowedTools)), ...repeated("--disallowed-tools", values(overrides.disallowedTools, profile.disallowedTools)), ...repeated("--add-dir", scopedValues(overrides.addDirs, profile.addDirs, "overrides.addDirs", scopeRoot)), ...repeated("--plugin-dir", scopedValues(overrides.pluginDirs, profile.pluginDirs, "overrides.pluginDirs", scopeRoot))];
+  const args = ["--model", model(overrides.model, profile.model), "--effort", effort(overrides.effort, profile.effort), ...permissionArgs(permissionMode(overrides.permissionMode, profile.permissionMode)), ...repeated("--allowed-tools", values(overrides.allowedTools, profile.allowedTools)), ...repeated("--disallowed-tools", values(overrides.disallowedTools, profile.disallowedTools)), ...repeated("--add-dir", scopedValues(overrides.addDirs, profile.addDirs, "overrides.addDirs", scopeRoot)), ...repeated("--plugin-dir", scopedValues(overrides.pluginDirs, profile.pluginDirs, "overrides.pluginDirs", scopeRoot)), ...attachmentDirectoryArg(attachmentDirectory)];
   return [...args, ...promptFileArg("--append-system-prompt-file", promptFilePath)];
 }
 
-export function buildProfileArgv(profile: Profile, overrides: RuntimeOverrides = {}, promptFilePath?: string): string[] {
+export function buildProfileArgv(profile: Profile, overrides: RuntimeOverrides = {}, promptFilePath?: string, attachmentDirectory?: string): string[] {
   if (profile.runtime.kind === "pi") return buildPiArgv(profile.runtime, profile.sessionPersistence, overrides as PiRuntimeOverrides, promptFilePath, profile.source.scopeRoot);
-  return buildClaudeArgv(profile.runtime, profile.sessionPersistence, overrides as ClaudeRuntimeOverrides, promptFilePath, profile.source.scopeRoot);
+  return buildClaudeArgv(profile.runtime, profile.sessionPersistence, overrides as ClaudeRuntimeOverrides, promptFilePath, profile.source.scopeRoot, attachmentDirectory);
 }

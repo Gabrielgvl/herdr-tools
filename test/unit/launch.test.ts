@@ -171,7 +171,10 @@ describe("herdr_launch profile-only contract", () => {
   it("retains the failing phase and bounded CLI evidence at the launch boundary", async () => {
     const failure = new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", {
       exitCode: 1,
+      stdoutBytes: 0,
+      stderrBytes: 123,
       killed: false,
+      evidence: "omitted_for_stdin_delivery",
       stdout: "",
       stderr: JSON.stringify({ id: "cli:tab:create", error: { code: "tab_create_failed", message: "disposable placement failed" } }),
       stdoutTruncated: false,
@@ -189,7 +192,7 @@ describe("herdr_launch profile-only contract", () => {
         cliFailure: {
           code: "CLI_PROTOCOL_ERROR",
           message: "Herdr CLI did not return a usable response",
-          details: { exitCode: 1, killed: false, stdout: "", stderr: failure.details.stderr, stdoutTruncated: false, stderrTruncated: false }
+          details: { exitCode: 1, stdoutBytes: 0, stderrBytes: 123, killed: false, evidence: "omitted_for_stdin_delivery", stdout: "", stderr: failure.details.stderr, stdoutTruncated: false, stderrTruncated: false }
         }
       }
     });

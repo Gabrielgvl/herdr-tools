@@ -41,7 +41,7 @@ describe("Claude manager plugin package", () => {
     expect(Object.keys(serverMap)).toEqual(["herdr"]);
     expect(serverMap.herdr).toEqual({
       command: "node",
-      args: ["${CLAUDE_PLUGIN_ROOT}/../../../dist/src/mcp-server.js"]
+      args: ["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"]
     });
     // `CLAUDE_PROJECT_DIR` is exported to MCP server subprocesses by Claude Code
     // itself, verified live against a loaded plugin, so no explicit `env`

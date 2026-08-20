@@ -534,6 +534,43 @@ describe("herdr_wait", () => {
     expect(reviewerFactory).not.toHaveBeenCalled();
   });
 
+  it("automatically detaches omitted long waits while retaining the watcher model", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_auto_background" });
+    const reviewed: string[] = [];
+    const tool = createWaitTool({
+      cli: fakeCli({ p1: "working" }),
+      context,
+      settingsLoader: async () => settings,
+      jobRegistry: registry,
+      clock: clock(),
+      pollIntervalMs: 100_000,
+      reviewerFactory: () => ({ review: async ({ targetId }) => { reviewed.push(targetId); return { targetId, classification: "progress", summary: "still progressing" }; } })
+    });
+    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 } as never, new AbortController().signal, undefined, extensionContext);
+    expect(started.details).toMatchObject({ outcome: "background", jobId: "job_auto_background" });
+    for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(reviewed).toEqual(["p1"]);
+    expect(registry.get("job_auto_background")).toMatchObject({ status: "completed", outcome: "timeout", result: { reviewerSummaries: [{ targetId: "p1", classification: "progress" }] } });
+  });
+
+  it("keeps an explicit synchronous long wait foreground with its watcher", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_sync_opt_out" });
+    const reviewed: string[] = [];
+    const tool = createWaitTool({
+      cli: fakeCli({ p1: "working" }),
+      context,
+      settingsLoader: async () => settings,
+      jobRegistry: registry,
+      clock: clock(),
+      pollIntervalMs: 100_000,
+      reviewerFactory: () => ({ review: async ({ targetId }) => { reviewed.push(targetId); return { targetId, classification: "progress", summary: "still progressing" }; } })
+    });
+    const result = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_001, runInBackground: false } as never, new AbortController().signal, undefined, extensionContext);
+    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reviewerSummaries: [{ targetId: "p1", classification: "progress" }] });
+    expect(reviewed).toEqual(["p1"]);
+    expect(registry.size()).toBe(0);
+  });
+
   it("rejects background waits when the registry is unavailable", async () => {
     const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings });
     await expect(tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT", message: "INVALID_INPUT: background waits are unavailable in this runtime" });

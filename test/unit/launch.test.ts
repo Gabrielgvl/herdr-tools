@@ -8,6 +8,8 @@ import type { AttachmentStore } from "../../src/messages/store.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
 const testPreflight = async () => undefined;
+const fakeGrant = (key: string) => ({ path: `/cache/${key}`, token: `grant-${key}`, renew: async () => undefined, release: async () => undefined });
+
 const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight"> & Partial<Pick<LaunchDependencies, "preflight">>) => createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
 
 const snapshot: HerdrSnapshot = {
@@ -474,7 +476,7 @@ describe("herdr_launch", () => {
     const attachments: AttachmentStore = {
       root: "/cache",
       recipientDirectory: (key) => `/cache/${key}`,
-      ensureRecipient: vi.fn(async (key) => `/cache/${key}`),
+      ensureRecipient: vi.fn(async (key: string) => fakeGrant(key)),
       publish: vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/key/attachment-1/body.txt", bytes: 4, sha256: "b".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" }))
     };
     const profile = {
@@ -545,7 +547,7 @@ describe("herdr_launch", () => {
     const store = (): AttachmentStore => ({
       root: "/cache",
       recipientDirectory: (key) => `/cache/${key}`,
-      ensureRecipient: vi.fn(async (key: string) => `/cache/${key}`),
+      ensureRecipient: vi.fn(async (key: string) => fakeGrant(key)),
       publish: vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/key/attachment-1/body.txt", bytes: 4, sha256: "b".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" }))
     });
 
@@ -589,7 +591,7 @@ describe("herdr_launch", () => {
     const attachments: AttachmentStore = {
       root: "/cache",
       recipientDirectory: (key) => `/cache/${key}`,
-      ensureRecipient: async (key) => `/cache/${key}`,
+      ensureRecipient: async (key: string) => fakeGrant(key),
       publish: async () => published
     };
 
@@ -605,7 +607,7 @@ describe("herdr_launch", () => {
     const publishFailure: AttachmentStore = {
       root: "/cache",
       recipientDirectory: (key) => `/cache/${key}`,
-      ensureRecipient: async (key) => `/cache/${key}`,
+      ensureRecipient: async (key: string) => fakeGrant(key),
       publish: async () => { throw Object.assign(new Error("quota"), { code: "ATTACHMENT_QUOTA_EXCEEDED", details: { operation: "quota" } }); }
     };
     const publishCli = makeCli();
@@ -626,7 +628,7 @@ describe("herdr_launch", () => {
     const paneScoped: AttachmentStore = {
       root: "/cache",
       recipientDirectory: (key) => `/cache/${key}`,
-      ensureRecipient: async (key) => `/cache/${key}`,
+      ensureRecipient: async (key: string) => fakeGrant(key),
       publish: async (request) => { recipientPaneRecords.push(String(request.recipientPaneId)); return published; }
     };
     const existingResult = await createLaunchTool({ cli: existingPane.cli, context, cwd: "/repo", attachments: paneScoped, recipients: new RecipientRegistry(), promptSources, profiles })

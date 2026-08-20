@@ -12,7 +12,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 
 export type CommunicateRoute = "prompt_direct" | "steer_direct";
 export type CommunicateState = "idle" | "working" | "blocked" | "done" | "unknown";
-export type CommunicatePhase = "publish" | "send" | "post_state";
+export type CommunicatePhase = "validate" | "resolve_target" | "verify_recipient" | "pre_state" | "publish" | "send" | "post_state";
 
 export interface CommunicateDetails {
   operation: "prompt" | "steer" | "keys";
@@ -107,60 +107,68 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
     parameters: CommunicateParamsSchema,
     async execute(_id, params: CommunicateParams, signal, _onUpdate, ctx) {
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
-      if (params.operation === "keys") {
-        if (Object.prototype.hasOwnProperty.call(params, "delivery")) throw Object.assign(new Error("delivery is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "delivery" } });
-        if (params.keys.some((key) => !isNamedKey(key))) {
-          throw Object.assign(new Error("Unsupported named key"), { code: "KEY_REJECTED" });
-        }
-      } else {
-        assertMessageText(params.text);
-        const delivery = params.delivery ?? "inline";
-        if (delivery !== "inline" && delivery !== "attachment") throw Object.assign(new Error("delivery must be inline or attachment"), { code: "INVALID_INPUT", details: { field: "delivery" } });
-        assertDeliverySize(params.text, delivery);
-      }
-
-      await deps.preflight(activeSignal);
-      const snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], activeSignal);
-      const snapshot = parseSnapshotResult(snapshotEnvelope.result);
-      const sender = params.operation === "keys" ? undefined : resolveSender(snapshot, deps.context.paneId);
-      if (sender && (params.target === "current" || params.target === sender.paneId)) {
-        throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: sender.paneId } });
-      }
-      const target = resolveTarget(snapshot, params.target, "agent", deps.context);
-      if (sender && target.paneId === sender.paneId) {
-        throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: target.paneId } });
-      }
-      const delivery: MessageDelivery | undefined = params.operation === "keys" ? undefined : (params.delivery ?? "inline");
-      let recipientKey: string | undefined;
-      let recipientAgentName: string | undefined;
-      if (delivery === "attachment") {
-        if (!deps.attachments || !deps.recipients || !target.paneId) {
-          throw Object.assign(new Error("Attachment target capability is unavailable"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, delivery } });
-        }
-        const recipient = deps.recipients.get(target.paneId);
-        const verification = verifyRecipient(snapshot, recipient);
-        if (!verification.verified) {
-          throw Object.assign(new Error("Attachment target capability is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, delivery, reason: verification.reason } });
-        }
-        recipientKey = recipient!.recipientKey;
-        recipientAgentName = verification.identity.agentName;
-      }
-      const preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
-      const before = paneFrom(preEnvelope.result, target.paneId!);
-      const beforeState = assertSendableState(before);
-      if (params.operation === "prompt" && beforeState === "working") {
-        throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: target.paneId, state: beforeState } });
-      }
-
+      // Establish the route before any precondition so every refusal names it.
+      const delivery: MessageDelivery | undefined = params.operation === "keys" ? undefined : (params.delivery === "attachment" ? "attachment" : "inline");
       let prompt: JsonEnvelope | undefined;
       let keys: JsonEnvelope | undefined;
       let route: CommunicateRoute | undefined;
       let published: PublishedAttachment | undefined;
-      let phase: CommunicatePhase | undefined;
+      let phase: CommunicatePhase = "validate";
+      let snapshotEnvelope: JsonEnvelope;
+      let target: ReturnType<typeof resolveTarget>;
+      let preEnvelope: JsonEnvelope;
+      let before: Record<string, unknown>;
+      let sender: SenderIdentity | undefined;
       let postEnvelope: JsonEnvelope;
       let after: Record<string, unknown>;
       let afterState: CommunicateState;
       try {
+        if (params.operation === "keys") {
+          if (Object.prototype.hasOwnProperty.call(params, "delivery")) throw Object.assign(new Error("delivery is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "delivery" } });
+          if (params.keys.some((key) => !isNamedKey(key))) {
+            throw Object.assign(new Error("Unsupported named key"), { code: "KEY_REJECTED" });
+          }
+        } else {
+          assertMessageText(params.text);
+          if (params.delivery !== undefined && params.delivery !== "inline" && params.delivery !== "attachment") throw Object.assign(new Error("delivery must be inline or attachment"), { code: "INVALID_INPUT", details: { field: "delivery" } });
+          assertDeliverySize(params.text, delivery!);
+        }
+
+        phase = "resolve_target";
+        await deps.preflight(activeSignal);
+        snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], activeSignal);
+        const snapshot = parseSnapshotResult(snapshotEnvelope.result);
+        sender = params.operation === "keys" ? undefined : resolveSender(snapshot, deps.context.paneId);
+        if (sender && (params.target === "current" || params.target === sender.paneId)) {
+          throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: sender.paneId } });
+        }
+        target = resolveTarget(snapshot, params.target, "agent", deps.context);
+        if (sender && target.paneId === sender.paneId) {
+          throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: target.paneId } });
+        }
+        let recipientKey: string | undefined;
+        let recipientAgentName: string | undefined;
+        if (delivery === "attachment") {
+          phase = "verify_recipient";
+          if (!deps.attachments || !deps.recipients || !target.paneId) {
+            throw Object.assign(new Error("Attachment target capability is unavailable"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId } });
+          }
+          const recipient = deps.recipients.get(target.paneId);
+          const verification = verifyRecipient(snapshot, recipient);
+          if (!verification.verified) {
+            throw Object.assign(new Error("Attachment target capability is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: verification.reason } });
+          }
+          recipientKey = recipient!.recipientKey;
+          recipientAgentName = verification.identity.agentName;
+        }
+        phase = "pre_state";
+        preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
+        before = paneFrom(preEnvelope.result, target.paneId!);
+        const beforeState = assertSendableState(before);
+        if (params.operation === "prompt" && beforeState === "working") {
+          throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: target.paneId, state: beforeState } });
+        }
+
         if (params.operation === "keys") {
           phase = "send";
           keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...params.keys], activeSignal);

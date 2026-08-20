@@ -19,6 +19,8 @@ const baseSnapshot: HerdrSnapshot = {
   agents: [{ pane_id: "w1:p1", agent_id: "agent-caller", name: "caller", agent_status: "idle" }, { pane_id: "w1:p2", agent_id: "agent-7", name: "reviewer", agent_status: "idle" }]
 };
 const testPreflight = async () => undefined;
+const fakeGrant = (key: string) => ({ path: `/cache/${key}`, token: `grant-${key}`, renew: async () => undefined, release: async () => undefined });
+
 const createCommunicateTool = (deps: Omit<CommunicateDependencies, "preflight"> & Partial<Pick<CommunicateDependencies, "preflight">>) => createCommunicateToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
 
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
@@ -212,7 +214,7 @@ describe("herdr_communicate", () => {
     const attachments: AttachmentStore = {
       root: "/cache",
       recipientDirectory: (key) => `/cache/${key}`,
-      ensureRecipient: async (key) => `/cache/${key}`,
+      ensureRecipient: async (key: string) => fakeGrant(key),
       publish: vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/recipient-key/attachment-1/body.txt", bytes: 15, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }))
     };
     const tool = createCommunicateTool({ cli: harness.cli, context, attachments, recipients });
@@ -231,7 +233,7 @@ describe("herdr_communicate", () => {
     const attachments = (publish = vi.fn()): AttachmentStore => ({
       root: "/cache",
       recipientDirectory: (key: string) => `/cache/${key}`,
-      ensureRecipient: async (key: string) => `/cache/${key}`,
+      ensureRecipient: async (key: string) => fakeGrant(key),
       publish
     } as unknown as AttachmentStore);
     const attachment = { target: "reviewer", operation: "prompt" as const, text: "body", delivery: "attachment" as const };
@@ -261,7 +263,7 @@ describe("herdr_communicate", () => {
     const published = { attachmentId: "attachment-1", path: "/cache/recipient-key/attachment-1/body.txt", bytes: 4, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" };
     const recipients = new RecipientRegistry();
     recipients.register({ paneId: "w1:p2", recipientKey: "recipient-key", profileName: "worker-pi", kind: "pi", capable: true, reason: "read", agentName: "reviewer", agentId: "agent-7" });
-    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => `/cache/${key}`, publish: async () => published } as unknown as AttachmentStore;
+    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish: async () => published } as unknown as AttachmentStore;
 
     const sendFailure = makeCli();
     sendFailure.stdinExec.mockImplementation(async () => ({ stdout: "", stderr: "submission refused", code: 1, killed: false }));

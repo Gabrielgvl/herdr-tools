@@ -43,17 +43,44 @@ const nodeAttachmentStoreIo: AttachmentStoreIo = {
 
 /** Serializing lock directory; every mutating store phase runs while it is held. */
 export const ATTACHMENT_LOCK_NAME = ".lock";
+export const ATTACHMENT_LOCK_OWNER_FILE = "owner.json";
+/** Marker naming an in-progress launch grant for a recipient directory. */
+export const ATTACHMENT_GRANT_NAME = ".grant.json";
 export const DEFAULT_LOCK_RETRY_MS = 25;
 export const DEFAULT_LOCK_ATTEMPTS = 200;
-export const DEFAULT_LOCK_STALE_MS = 30_000;
-/** An empty recipient directory is a live launch grant until it is this old. */
-export const EMPTY_RECIPIENT_GRACE_MS = 60_000;
+/** A held lock is only reclaimable once its owner stops renewing for this long. */
+export const DEFAULT_LOCK_LEASE_MS = 30_000;
+/** A launch grant outlives the 120 s agent-start window and is renewed per phase. */
+export const DEFAULT_GRANT_LEASE_MS = 300_000;
 
 export interface AttachmentStoreOptions {
   sleep?: (ms: number) => Promise<void>;
   lockRetryMs?: number;
   lockAttempts?: number;
-  lockStaleMs?: number;
+  lockLeaseMs?: number;
+  grantLeaseMs?: number;
+}
+
+/** An owned lease over the store lock. Every mutation validates it before committing. */
+export interface StoreLease {
+  readonly token: string;
+  renew(): Promise<void>;
+  validate(): Promise<void>;
+  release(): Promise<void>;
+}
+
+/** An owned lease over a recipient directory created for an in-progress launch. */
+export interface RecipientGrant {
+  readonly path: string;
+  readonly token: string;
+  renew(): Promise<void>;
+  release(): Promise<void>;
+}
+
+interface LeaseRecord {
+  token: string;
+  acquiredAt: string;
+  renewedAt: string;
 }
 
 export interface AttachmentMetadata {
@@ -106,7 +133,7 @@ export class AttachmentStoreError extends Error {
 export interface AttachmentStore {
   readonly root: string;
   recipientDirectory(recipientKey: string): string;
-  ensureRecipient(recipientKey: string): Promise<string>;
+  ensureRecipient(recipientKey: string): Promise<RecipientGrant>;
   publish(input: AttachmentPublishInput): Promise<PublishedAttachment>;
 }
 
@@ -119,11 +146,36 @@ interface StoreScan {
   records: LiveRecord[];
   staging: string[];
   incomplete: string[];
-  recipients: Array<{ path: string; entries: number }>;
+  recipients: Array<{ path: string; entries: number; grant?: ObservedLease }>;
+}
+
+interface ObservedLease {
+  token: string;
+  renewedAtMs: number;
 }
 
 function errorCode(error: unknown): unknown {
   return error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
+}
+
+function leaseRecord(token: string, acquiredAt: string, renewedAt: string): Buffer {
+  const record: LeaseRecord = { token, acquiredAt, renewedAt };
+  return Buffer.from(JSON.stringify(record), "utf8");
+}
+
+/** Parse a lease marker. An unparseable marker is reported as absent, never as live. */
+function parsedLease(value: Uint8Array): ObservedLease | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(value).toString("utf8"));
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const candidate = parsed as Record<string, unknown>;
+  const renewedAtMs = typeof candidate.renewedAt === "string" ? Date.parse(candidate.renewedAt) : Number.NaN;
+  if (typeof candidate.token !== "string" || candidate.token.length === 0 || !Number.isFinite(renewedAtMs)) return undefined;
+  return { token: candidate.token, renewedAtMs };
 }
 
 function safePath(value: string): string {
@@ -219,7 +271,8 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
   const lockPath = join(root, ATTACHMENT_LOCK_NAME);
   const lockRetryMs = options.lockRetryMs ?? DEFAULT_LOCK_RETRY_MS;
   const lockAttempts = options.lockAttempts ?? DEFAULT_LOCK_ATTEMPTS;
-  const lockStaleMs = options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS;
+  const lockLeaseMs = options.lockLeaseMs ?? DEFAULT_LOCK_LEASE_MS;
+  const grantLeaseMs = options.grantLeaseMs ?? DEFAULT_GRANT_LEASE_MS;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }));
 
   const recipientDirectory = (recipientKey: string): string => {
@@ -236,7 +289,7 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
     }
   };
 
-  const ensureRecipient = async (recipientKey: string): Promise<string> => {
+  const ensureRecipientDirectory = async (recipientKey: string): Promise<string> => {
     const directory = recipientDirectory(recipientKey);
     await ensureRoot();
     try {
@@ -246,6 +299,37 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
     } catch (error) {
       throw storeFailure("ensure_recipient", directory, error);
     }
+  };
+
+  /**
+   * A launch needs its recipient directory to exist before the agent starts, which can
+   * take minutes. The grant marker is an owned lease: sweeping skips a directory whose
+   * grant is live, and only an abandoned lease is reclaimed.
+   */
+  const ensureRecipient = async (recipientKey: string): Promise<RecipientGrant> => {
+    const directory = await ensureRecipientDirectory(recipientKey);
+    const grantPath = join(directory, ATTACHMENT_GRANT_NAME);
+    const token = randomUUID();
+    const acquiredAt = now().toISOString();
+    await writeLease(grantPath, token, acquiredAt, "ensure_recipient");
+    return {
+      path: directory,
+      token,
+      renew: async () => {
+        const current = await observeLease(grantPath);
+        if (current !== undefined && current.token !== token) throw leaseLost(grantPath, "grant_renew");
+        await writeLease(grantPath, token, acquiredAt, "grant_renew");
+      },
+      release: async () => {
+        try {
+          const current = await observeLease(grantPath);
+          if (current?.token !== token) return;
+          await io.rm(grantPath, { force: true, recursive: false });
+        } catch {
+          // An unreleased grant expires on its own; never fail the caller's operation.
+        }
+      }
+    };
   };
 
   const list = async (path: string, operation: string): Promise<readonly AttachmentDirEntry[]> => {
@@ -279,7 +363,14 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
         continue;
       }
       const attachments = await list(recipientPath, "list_attachments");
-      result.recipients.push({ path: recipientPath, entries: attachments.length });
+      const grant = attachments.some((entry) => entry.name === ATTACHMENT_GRANT_NAME)
+        ? await observeLease(join(recipientPath, ATTACHMENT_GRANT_NAME))
+        : undefined;
+      result.recipients.push({
+        path: recipientPath,
+        entries: attachments.filter((entry) => entry.name !== ATTACHMENT_GRANT_NAME).length,
+        ...(grant ? { grant } : {})
+      });
       for (const attachment of attachments) {
         if (!attachment.isDirectory()) continue;
         const attachmentPath = join(recipientPath, attachment.name);
@@ -304,34 +395,91 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
     return result;
   };
 
-  const acquireLock = async (): Promise<void> => {
+  const observeLease = async (path: string): Promise<ObservedLease | undefined> => {
+    try {
+      return parsedLease(await io.readFile(path));
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw storeFailure("lock", path, error);
+    }
+  };
+
+  const writeLease = async (path: string, token: string, acquiredAt: string, operation: string): Promise<void> => {
+    try {
+      await io.writeFile(path, leaseRecord(token, acquiredAt, now().toISOString()), { mode: 0o600 });
+      await io.chmod(path, 0o600);
+    } catch (error) {
+      throw storeFailure(operation, path, error);
+    }
+  };
+
+  const leaseLost = (path: string, operation: string): AttachmentStoreError =>
+    new AttachmentStoreError("ATTACHMENT_STORE_FAILED", "Attachment store lease is no longer owned", { operation, path: safePath(path) });
+
+  /**
+   * A held lock is reclaimed only when its owner has stopped renewing for a full lease
+   * and the same owner token is still present on a second read. The owner validates its
+   * own lease before committing, so a reclaimed publication aborts instead of racing.
+   */
+  const acquireLock = async (): Promise<StoreLease> => {
+    const ownerPath = join(lockPath, ATTACHMENT_LOCK_OWNER_FILE);
     for (let attempt = 0; attempt < lockAttempts; attempt += 1) {
+      let held = false;
       try {
         await io.mkdir(lockPath, { recursive: false, mode: 0o700 });
-        return;
+        held = true;
       } catch (error) {
         if (errorCode(error) !== "EEXIST") throw storeFailure("lock", lockPath, error);
       }
-      let heldSinceMs: number | undefined;
-      try {
-        heldSinceMs = (await io.stat(lockPath)).mtimeMs;
-      } catch (error) {
-        if (errorCode(error) !== "ENOENT") throw storeFailure("lock", lockPath, error);
+      if (held) {
+        const token = randomUUID();
+        const acquiredAt = now().toISOString();
+        await writeLease(ownerPath, token, acquiredAt, "lock");
+        const owned = async (operation: string): Promise<void> => {
+          const current = await observeLease(ownerPath);
+          if (current?.token !== token) throw leaseLost(lockPath, operation);
+        };
+        return {
+          token,
+          renew: async () => {
+            await owned("lock_renew");
+            await writeLease(ownerPath, token, acquiredAt, "lock_renew");
+          },
+          validate: () => owned("lock_validate"),
+          release: async () => {
+            try {
+              const current = await observeLease(ownerPath);
+              if (current?.token !== token) return;
+              await io.rm(lockPath, { force: true, recursive: true });
+            } catch {
+              // Preserve the publication outcome; an abandoned lease is reclaimed later.
+            }
+          }
+        };
       }
-      if (heldSinceMs !== undefined && now().getTime() - heldSinceMs >= lockStaleMs) {
-        await remove(lockPath, "lock");
-        continue;
+      const observed = await observeLease(ownerPath);
+      const expired = observed === undefined
+        ? await lockDirectoryAbandoned()
+        : now().getTime() - observed.renewedAtMs >= lockLeaseMs;
+      if (expired) {
+        const confirmed = await observeLease(ownerPath);
+        if (confirmed?.token === observed?.token) {
+          await remove(lockPath, "lock");
+          continue;
+        }
       }
       await sleep(lockRetryMs);
     }
     throw new AttachmentStoreError("ATTACHMENT_STORE_FAILED", "Attachment store lock is unavailable", { operation: "lock", path: safePath(lockPath), attempts: lockAttempts });
   };
 
-  const releaseLock = async (): Promise<void> => {
+  /** A lock whose owner file never appeared is only abandoned once the directory ages out. */
+  const lockDirectoryAbandoned = async (): Promise<boolean> => {
     try {
-      await io.rm(lockPath, { force: true, recursive: true });
-    } catch {
-      // Preserve the publication outcome; a retained lock is reclaimed as stale.
+      return now().getTime() - (await io.stat(lockPath)).mtimeMs >= lockLeaseMs;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return false;
+      throw storeFailure("lock", lockPath, error);
     }
   };
 
@@ -349,13 +497,9 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
     const remaining = await scan();
     for (const recipient of remaining.recipients) {
       if (recipient.entries > 0) continue;
-      let mtimeMs: number | undefined;
-      try {
-        mtimeMs = (await io.stat(recipient.path)).mtimeMs;
-      } catch (error) {
-        if (errorCode(error) !== "ENOENT") throw storeFailure("sweep", recipient.path, error);
-      }
-      if (mtimeMs !== undefined && now().getTime() - mtimeMs >= EMPTY_RECIPIENT_GRACE_MS) await remove(recipient.path, "sweep");
+      // A live launch grant keeps its directory even when it holds no attachment yet.
+      if (recipient.grant !== undefined && now().getTime() - recipient.grant.renewedAtMs < grantLeaseMs) continue;
+      await remove(recipient.path, "sweep");
     }
     return remaining;
   };
@@ -369,9 +513,10 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
     const attachmentId = randomUUID();
     const digest = createHash("sha256").update(data).digest("hex");
     await ensureRoot();
-    await acquireLock();
+    const lease = await acquireLock();
     try {
       const live = await reclaim();
+      await lease.renew();
       const liveBytes = live.records.reduce((total, item) => total + item.metadata.bytes, 0);
       if (live.records.length >= ATTACHMENT_STORE_MAX_RECORDS || liveBytes + data.byteLength > ATTACHMENT_STORE_QUOTA_BYTES) {
         throw new AttachmentStoreError("ATTACHMENT_QUOTA_EXCEEDED", "Attachment store quota is exhausted", {
@@ -383,7 +528,7 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
           limitRecords: ATTACHMENT_STORE_MAX_RECORDS
         });
       }
-      const recipientPath = await ensureRecipient(input.recipientKey);
+      const recipientPath = await ensureRecipientDirectory(input.recipientKey);
       const finalPath = join(recipientPath, attachmentId);
       const temporaryPath = await io.mkdtemp(join(recipientPath, ".tmp-"));
       const bodyPath = join(temporaryPath, "body.txt");
@@ -407,6 +552,8 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
         await io.chmod(bodyPath, 0o600);
         await io.writeFile(metadataPath, Buffer.from(JSON.stringify(metadata), "utf8"), { mode: 0o600 });
         await io.chmod(metadataPath, 0o600);
+        // Commit only while the lease is still owned; a reclaimed lock aborts instead.
+        await lease.validate();
         await io.rename(temporaryPath, finalPath);
       } catch (error) {
         try { await io.rm(temporaryPath, { force: true, recursive: true }); } catch { /* preserve the publication error */ }
@@ -416,7 +563,7 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
     } catch (error) {
       throw storeFailure("publish", root, error);
     } finally {
-      await releaseLock();
+      await lease.release();
     }
   };
 

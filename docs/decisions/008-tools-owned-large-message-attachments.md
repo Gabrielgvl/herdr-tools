@@ -58,9 +58,24 @@ abandoned-staging purge, expiry sweep, quota check, staging, and rename, so the 
 is also the quota reservation and two concurrent processes cannot both cross the
 boundary. Because staging only happens under that lock, any `.tmp-*` directory or
 metadata-less attachment directory present at acquisition is a crash remnant and is
-purged before the quota basis is computed. Locks older than 30 seconds are reclaimed
-as abandoned, and empty recipient directories are only swept after a 60-second grace
-so a just-granted launch directory is never removed from under a starting agent.
+purged before the quota basis is computed.
+
+Lock ownership is a lease, not an age heuristic. The holder writes an unguessable token
+with a renewal timestamp into `.lock/owner.json`, renews it at each publish phase
+boundary, validates the token immediately before the commit rename, and releases the
+lock only while its own token is present. A competitor may reclaim only a lease that has
+gone unrenewed for a full lease interval and whose token is unchanged across a confirming
+second read; unreadable, malformed, or changing markers are treated as unsafe to reclaim.
+A publication whose lease was reclaimed anyway aborts at validation instead of racing the
+new owner, and an ownership-checked release means a slow owner can never delete a
+replacement owner's lock.
+
+In-progress launch grants use the same ownership model. A profile-backed launch writes a
+token-bearing `.grant.json` into its recipient directory before the agent starts, renews
+it before delivering the prompt, and releases it when the launch ends. Sweeping skips
+directories with a live grant and reclaims only abandoned or released ones, so a Claude
+`--add-dir` path cannot be swept away during the 120-second start window — the failure
+mode a fixed grace period left open.
 
 `delivery` is an explicit caller field defaulting to `inline`, mirrored by
 `initialPromptDelivery` on `herdr_launch`. The chosen route appears in the envelope,
@@ -139,6 +154,28 @@ quota check, staging, and rename interleaved across processes. A filesystem lock
 directory is the smallest primitive that actually covers that case, and it needs no
 new dependency.
 
+### Reclaim a lock purely by its age
+
+Rejected after review. Age alone cannot distinguish a crashed publisher from a slow one,
+so an age-only rule lets a competitor delete a live owner's lock and then lets the
+original owner delete the replacement on release. Leases with ownership tokens,
+per-phase renewal, pre-commit validation, and ownership-checked release remove both
+failure modes; the age check survives only for a lock directory whose owner marker never
+appeared.
+
+### Use an established file-locking dependency
+
+Considered, and rejected for this store. A library would bypass the injected IO seam the
+store is built and tested on, which is exactly where the required concurrency, reclaim,
+and lease-loss cases are exercised, and it would add a runtime dependency to reimplement
+the same lease semantics in about the same amount of code.
+
+### Give launch grants a fixed grace period instead of a lease
+
+Rejected. A fixed grace has to be guessed against an agent-start window that Herdr caps
+at 120 seconds, and the review found the 60-second grace could delete a Claude
+`--add-dir` path mid-launch. A renewable lease is bounded by the launch itself.
+
 ### Age out crash-left staging directories instead of purging them
 
 Rejected. Staging exists only while the lock is held, so a staging directory seen at
@@ -175,10 +212,17 @@ other execution guarantee.
   the exception is scoped to `herdr agent prompt --stdin`. That executor owns its own
   termination behaviour: `SIGTERM` on timeout or abort, escalating to `SIGKILL` after
   a bounded grace so an unresponsive child cannot hang a tool call.
-- Failure evidence gains a delivery shape: a typed failure after the pre-state read
-  carries `delivery`, `route`/`phase`, and, once published, `attachmentRetained` plus
-  body-free attachment metadata, so an operator can find or clean up a retained
-  attachment after a failed send.
+- Failure evidence gains a delivery shape. The route is established before any
+  precondition and one body-free wrapper adds it to every failure, so self-target,
+  busy-target, raw-kind, incapable-profile, and store failures all name the requested
+  route and phase; once published, they also carry `attachmentRetained` plus body-free
+  attachment metadata, so an operator can find or clean up a retained attachment after a
+  failed send.
+- Integration separates a gating recipient-readback acceptance test — which requires a
+  confirmed delivery plus evidence only the recipient could produce, and reports itself
+  blocked and skipped otherwise — from a non-gating transport smoke that records
+  unconfirmed deliveries. Host-side reads of a published attachment are transport
+  evidence and never a readback claim.
 - Any test or harness that drives the extension must inject a session-bound stdin
   executor alongside `pi.exec`. Injecting only `pi.exec` silently sends real prompts
   to the default Herdr session.

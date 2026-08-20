@@ -8,7 +8,7 @@ import { ATTACHMENT_MAX_BYTES, ATTACHMENT_RETENTION_HOURS, ATTACHMENT_STORE_MAX_
 import { RecipientRegistry, mintRecipientKey, recipientIdentity, verifyRecipient } from "../../src/messages/recipients.js";
 import { withDeliveryFailureEvidence } from "../../src/messages/failure.js";
 import { attachmentCapability } from "../../src/profiles/capability.js";
-import { ATTACHMENT_LOCK_NAME, EMPTY_RECIPIENT_GRACE_MS, attachmentMetadataBytes, createAttachmentStore, type AttachmentDirEntry, type AttachmentStoreIo } from "../../src/messages/store.js";
+import { ATTACHMENT_GRANT_NAME, ATTACHMENT_LOCK_NAME, ATTACHMENT_LOCK_OWNER_FILE, DEFAULT_GRANT_LEASE_MS, DEFAULT_LOCK_LEASE_MS, attachmentMetadataBytes, createAttachmentStore, type AttachmentDirEntry, type AttachmentStoreIo } from "../../src/messages/store.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import type { Profile } from "../../src/profiles/types.js";
 
@@ -141,7 +141,8 @@ describe("attachment store", () => {
     try {
       let now = new Date("2026-08-20T12:00:00.000Z");
       const store = createAttachmentStore(undefined, storeRoot, () => now);
-      const directory = await store.ensureRecipient(KEY);
+      const grant = await store.ensureRecipient(KEY);
+      const directory = grant.path;
       const body = "large\n☃";
       const published = await store.publish({ ...input, body, recipientPaneId: "w:p1", recipientAgentName: "worker" });
       expect(published).toMatchObject({ bytes: Buffer.byteLength(body), recipientPaneId: "w:p1", path: join(directory, published.attachmentId, "body.txt") });
@@ -189,19 +190,48 @@ describe("attachment store", () => {
     }
   });
 
-  it("removes only aged empty recipient directories so launch grants survive", async () => {
-    const storeRoot = await root("empty");
+  it("keeps a launch grant through a slow launch and reclaims only abandoned grants", async () => {
+    const storeRoot = await root("grant");
     try {
-      const now = new Date("2026-08-20T12:00:00.000Z");
-      const store = createAttachmentStore(io(), storeRoot, () => now);
-      const fresh = await store.ensureRecipient("fresh-recipient-key");
-      await utimes(fresh, now, now);
-      const aged = await store.ensureRecipient("aged-recipient-key");
-      const agedTime = new Date(now.getTime() - EMPTY_RECIPIENT_GRACE_MS - 1_000);
-      await utimes(aged, agedTime, agedTime);
-      await store.publish({ ...input, body: "body" });
-      expect((await stat(fresh)).isDirectory()).toBe(true);
-      await expect(stat(aged)).rejects.toMatchObject({ code: "ENOENT" });
+      let clock = new Date("2026-08-20T12:00:00.000Z");
+      const holder = createAttachmentStore(io(), storeRoot, () => clock);
+      const sweeper = createAttachmentStore(io(), storeRoot, () => clock);
+      const grant = await holder.ensureRecipient("slow-launch-key");
+      const marker = JSON.parse(await readFile(join(grant.path, ATTACHMENT_GRANT_NAME), "utf8")) as Record<string, unknown>;
+      expect(marker).toMatchObject({ token: grant.token });
+      expect((await stat(join(grant.path, ATTACHMENT_GRANT_NAME))).mode & 0o777).toBe(0o600);
+      expect(DEFAULT_GRANT_LEASE_MS).toBeGreaterThan(120_000);
+
+      // A launch delayed well past the old 60 s grace keeps its Claude --add-dir path.
+      clock = new Date(clock.getTime() + 90_000);
+      await sweeper.publish({ ...input, body: "unrelated" });
+      expect((await stat(grant.path)).isDirectory()).toBe(true);
+
+      // A renewed grant survives a sweep after the full lease window as well.
+      clock = new Date(clock.getTime() + DEFAULT_GRANT_LEASE_MS);
+      await grant.renew();
+      await sweeper.publish({ ...input, body: "unrelated-again" });
+      expect((await stat(grant.path)).isDirectory()).toBe(true);
+
+      // An abandoned grant is reclaimed; a released grant leaves nothing behind.
+      clock = new Date(clock.getTime() + DEFAULT_GRANT_LEASE_MS + 1);
+      await sweeper.publish({ ...input, body: "after-abandon" });
+      await expect(stat(grant.path)).rejects.toMatchObject({ code: "ENOENT" });
+
+      const released = await holder.ensureRecipient("released-key");
+      await released.release();
+      await expect(stat(join(released.path, ATTACHMENT_GRANT_NAME))).rejects.toMatchObject({ code: "ENOENT" });
+      await sweeper.publish({ ...input, body: "after-release" });
+      await expect(stat(released.path)).rejects.toMatchObject({ code: "ENOENT" });
+
+      // A grant taken over by a newer launch cannot be renewed or released by the old one.
+      const first = await holder.ensureRecipient("replaced-key");
+      const second = await holder.ensureRecipient("replaced-key");
+      await expect(first.renew()).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "grant_renew" } });
+      await first.release();
+      expect((JSON.parse(await readFile(join(second.path, ATTACHMENT_GRANT_NAME), "utf8")) as { token: string }).token).toBe(second.token);
+      await second.renew();
+      await second.release();
     } finally {
       await rm(storeRoot, { recursive: true, force: true });
     }
@@ -267,8 +297,8 @@ describe("attachment store", () => {
 
   it("reports every storage boundary without exposing body text", async () => {
     const storeRoot = await root("failures");
-    /** Lock contention is not the subject here, so leftover locks are treated as stale. */
-    const fast = { lockRetryMs: 1, lockAttempts: 5, lockStaleMs: 0 };
+    /** Lock contention is not the subject here, so leftover leases expire immediately. */
+    const fast = { lockRetryMs: 1, lockAttempts: 5, lockLeaseMs: 0 };
     /** Fail only the targeted removal so the lock can still be released. */
     const failRemovalOf = (needle: string, message: string) => vi.fn(async (path: string, options: { force: boolean; recursive: boolean }) => {
       if (path.includes(needle)) throw new Error(message);
@@ -322,19 +352,17 @@ describe("attachment store", () => {
       await rm(join(storeRoot, KEY, "99999999-9999-4999-8999-999999999999"), { recursive: true, force: true });
 
       await fs.mkdir(join(storeRoot, "aged-recipient-key"), { recursive: true });
-      const emptyStatFailure = createAttachmentStore(io({
-        stat: vi.fn(async (path: string) => {
-          if (path.endsWith("aged-recipient-key")) throw Object.assign(new Error("stat"), { code: "EACCES" });
-          return { mtimeMs: (await fs.stat(path)).mtimeMs };
-        })
-      }), storeRoot, undefined, fast);
-      await expect(emptyStatFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "sweep" } });
+      const grantlessSweepFailure = createAttachmentStore(io({ rm: failRemovalOf("grantless-key", "remove empty recipient") }), storeRoot, undefined, fast);
+      await fs.mkdir(join(storeRoot, "grantless-key"), { recursive: true });
+      await expect(grantlessSweepFailure.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "sweep" } });
+      const grantless = createAttachmentStore(io(), storeRoot, undefined, fast);
+      await expect(grantless.publish({ ...input, body: "kept" })).resolves.toMatchObject({ bytes: 4 });
+      await expect(stat(join(storeRoot, "grantless-key"))).rejects.toMatchObject({ code: "ENOENT" });
 
-      const vanishing = createAttachmentStore(io({ stat: vi.fn(async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); }) }), storeRoot, undefined, fast);
-      await expect(vanishing.publish({ ...input, body: "kept" })).resolves.toMatchObject({ bytes: 4 });
-      await rm(join(storeRoot, "aged-recipient-key"), { recursive: true, force: true });
-
-      const writeFailure = vi.fn(async () => { throw new Error("write failed"); });
+      const writeFailure = vi.fn(async (path: string, data: Uint8Array, options: { mode: number }) => {
+        if (path.endsWith(ATTACHMENT_LOCK_OWNER_FILE) || path.endsWith(ATTACHMENT_GRANT_NAME)) return fs.writeFile(path, data, options);
+        throw new Error("write failed");
+      });
       const writeStore = createAttachmentStore(io({ writeFile: writeFailure }), storeRoot, undefined, fast);
       await expect(writeStore.publish({ ...input, body: secret })).rejects.toMatchObject({ details: { operation: "publish" } });
       expect(JSON.stringify(writeFailure.mock.calls)).not.toContain(secret);
@@ -349,56 +377,166 @@ describe("attachment store", () => {
     }
   });
 
-  it("serializes publication behind a filesystem lock and reclaims stale locks", async () => {
-    const storeRoot = await root("lock");
+  it("never reclaims a live owner's lock and only reclaims an abandoned lease", async () => {
+    const storeRoot = await root("lock-lease");
+    const ownerPath = join(storeRoot, ATTACHMENT_LOCK_NAME, ATTACHMENT_LOCK_OWNER_FILE);
     try {
-      const heldStore = createAttachmentStore(io(), storeRoot, () => new Date("2026-08-20T12:00:00.000Z"), { lockAttempts: 3, lockRetryMs: 1, lockStaleMs: 30_000 });
-      await fs.mkdir(storeRoot, { recursive: true });
-      await fs.mkdir(join(storeRoot, ATTACHMENT_LOCK_NAME));
-      const now = new Date("2026-08-20T12:00:00.000Z");
-      await utimes(join(storeRoot, ATTACHMENT_LOCK_NAME), now, now);
-      await expect(heldStore.publish({ ...input, body: "blocked" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "lock", attempts: 3 } });
+      let clock = new Date("2026-08-20T12:00:00.000Z");
+      await fs.mkdir(join(storeRoot, ATTACHMENT_LOCK_NAME), { recursive: true, mode: 0o700 });
+      const holdLock = async (token: string): Promise<void> => {
+        await fs.writeFile(ownerPath, JSON.stringify({ token, acquiredAt: clock.toISOString(), renewedAt: clock.toISOString() }), { mode: 0o600 });
+      };
+      await holdLock("live-owner");
+      const competitors = [
+        createAttachmentStore(io(), storeRoot, () => clock, { lockAttempts: 3, lockRetryMs: 1 }),
+        createAttachmentStore(io(), storeRoot, () => clock, { lockAttempts: 3, lockRetryMs: 1 })
+      ];
+
+      // A live publisher renewing past the lease interval keeps its lock against both.
+      for (let elapsed = 0; elapsed < DEFAULT_LOCK_LEASE_MS * 3; elapsed += DEFAULT_LOCK_LEASE_MS) {
+        clock = new Date(clock.getTime() + DEFAULT_LOCK_LEASE_MS - 1);
+        await holdLock("live-owner");
+        const blocked = await Promise.allSettled(competitors.map((store) => store.publish({ ...input, body: "blocked" })));
+        expect(blocked.every((outcome) => outcome.status === "rejected")).toBe(true);
+        for (const outcome of blocked) expect((outcome as PromiseRejectedResult).reason).toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "lock", attempts: 3 } });
+        expect((JSON.parse(await readFile(ownerPath, "utf8")) as { token: string }).token).toBe("live-owner");
+      }
       expect(await fs.readdir(join(storeRoot, KEY)).catch(() => [])).toEqual([]);
 
-      const staleStore = createAttachmentStore(io(), storeRoot, () => now, { lockAttempts: 3, lockRetryMs: 1, lockStaleMs: 1_000 });
-      const stale = new Date(now.getTime() - 60_000);
-      await utimes(join(storeRoot, ATTACHMENT_LOCK_NAME), stale, stale);
-      await expect(staleStore.publish({ ...input, body: "reclaimed" })).resolves.toMatchObject({ bytes: 9 });
+      // Once the owner stops renewing, exactly one competitor reclaims the abandoned lease.
+      clock = new Date(clock.getTime() + DEFAULT_LOCK_LEASE_MS + 1);
+      const reclaimed = await Promise.allSettled(competitors.map((store) => store.publish({ ...input, body: "reclaimed" })));
+      expect(reclaimed.filter((outcome) => outcome.status === "fulfilled").length).toBeGreaterThanOrEqual(1);
       await expect(stat(join(storeRoot, ATTACHMENT_LOCK_NAME))).rejects.toMatchObject({ code: "ENOENT" });
 
-      const releasedDuringWait = createAttachmentStore(io({
+      // A lock directory whose owner file never appeared is reclaimed only once it ages out.
+      await fs.mkdir(join(storeRoot, ATTACHMENT_LOCK_NAME), { recursive: true });
+      const fresh = new Date(clock.getTime());
+      await utimes(join(storeRoot, ATTACHMENT_LOCK_NAME), fresh, fresh);
+      await expect(competitors[0]!.publish({ ...input, body: "orphan" })).rejects.toMatchObject({ details: { operation: "lock" } });
+      const aged = new Date(clock.getTime() - DEFAULT_LOCK_LEASE_MS - 1);
+      await utimes(join(storeRoot, ATTACHMENT_LOCK_NAME), aged, aged);
+      await expect(competitors[0]!.publish({ ...input, body: "orphan" })).resolves.toMatchObject({ bytes: 6 });
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts publication and keeps a replacement lock when the lease is lost", async () => {
+    const storeRoot = await root("lease-loss");
+    const ownerPath = join(storeRoot, ATTACHMENT_LOCK_NAME, ATTACHMENT_LOCK_OWNER_FILE);
+    try {
+      const clock = new Date("2026-08-20T12:00:00.000Z");
+      const stolen = createAttachmentStore(io({
+        // Simulate a competitor reclaiming the lock while this publication is staging.
+        writeFile: vi.fn(async (path: string, data: Uint8Array, options: { mode: number }) => {
+          await fs.writeFile(path, data, options);
+          if (path.endsWith("meta.json")) await fs.writeFile(ownerPath, JSON.stringify({ token: "competitor", acquiredAt: clock.toISOString(), renewedAt: clock.toISOString() }), { mode: 0o600 });
+        })
+      }), storeRoot, () => clock, { lockAttempts: 2, lockRetryMs: 1 });
+      await expect(stolen.publish({ ...input, body: "aborted" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "lock_validate" } });
+      expect((JSON.parse(await readFile(ownerPath, "utf8")) as { token: string }).token).toBe("competitor");
+      const staged = await fs.readdir(join(storeRoot, KEY));
+      expect(staged).toEqual([]);
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("treats an unreadable or changing owner marker as unsafe to reclaim", async () => {
+    const storeRoot = await root("lock-marker");
+    const lockPath = join(storeRoot, ATTACHMENT_LOCK_NAME);
+    const ownerPath = join(lockPath, ATTACHMENT_LOCK_OWNER_FILE);
+    try {
+      const clock = new Date("2026-08-20T12:00:00.000Z");
+      // A lock directory with no owner marker at all: reclaimed only once it ages out.
+      await fs.mkdir(lockPath, { recursive: true });
+      const defaultIoStore = createAttachmentStore(undefined, storeRoot, () => clock, { lockAttempts: 2, lockRetryMs: 1 });
+      await expect(defaultIoStore.publish({ ...input, body: "orphan" })).rejects.toMatchObject({ details: { operation: "lock" } });
+      const aged = new Date(clock.getTime() - DEFAULT_LOCK_LEASE_MS - 1);
+      await utimes(lockPath, aged, aged);
+      await expect(defaultIoStore.publish({ ...input, body: "orphan" })).resolves.toMatchObject({ bytes: 6 });
+
+      // A vanished lock directory is retried instead of reported as abandoned.
+      await fs.mkdir(lockPath, { recursive: true });
+      const vanishing = createAttachmentStore(io({
         stat: vi.fn(async (path: string) => {
           if (path.endsWith(ATTACHMENT_LOCK_NAME)) {
             await fs.rm(path, { recursive: true, force: true });
-            throw Object.assign(new Error("released"), { code: "ENOENT" });
+            throw Object.assign(new Error("gone"), { code: "ENOENT" });
           }
           return { mtimeMs: (await fs.stat(path)).mtimeMs };
         })
-      }), storeRoot, () => now, { lockAttempts: 5, lockRetryMs: 1 });
-      await fs.mkdir(join(storeRoot, ATTACHMENT_LOCK_NAME));
-      await expect(releasedDuringWait.publish({ ...input, body: "waited" })).resolves.toMatchObject({ bytes: 6 });
+      }), storeRoot, () => clock, { lockAttempts: 5, lockRetryMs: 1 });
+      await expect(vanishing.publish({ ...input, body: "retried" })).resolves.toMatchObject({ bytes: 7 });
 
+      // An owner marker that changes between reads is never deleted.
+      await fs.mkdir(lockPath, { recursive: true });
+      const expired = new Date(clock.getTime() - DEFAULT_LOCK_LEASE_MS - 1).toISOString();
+      await fs.writeFile(ownerPath, JSON.stringify({ token: "first", acquiredAt: expired, renewedAt: expired }));
+      let reads = 0;
+      const changing = createAttachmentStore(io({
+        readFile: vi.fn(async (path: string) => {
+          if (path.endsWith(ATTACHMENT_LOCK_OWNER_FILE)) {
+            reads += 1;
+            return Buffer.from(JSON.stringify({ token: `owner-${reads}`, acquiredAt: expired, renewedAt: expired }), "utf8");
+          }
+          return fs.readFile(path);
+        })
+      }), storeRoot, () => clock, { lockAttempts: 2, lockRetryMs: 1 });
+      await expect(changing.publish({ ...input, body: "unsafe" })).rejects.toMatchObject({ details: { operation: "lock" } });
+      expect((await stat(lockPath)).isDirectory()).toBe(true);
+      expect(reads).toBeGreaterThanOrEqual(2);
+
+      // Malformed markers are reported as absent, never as a live lease.
+      for (const malformed of ["not json", "[]", JSON.stringify({ token: "", renewedAt: expired }), JSON.stringify({ token: "t", renewedAt: "nonsense" }), JSON.stringify({ token: "t", renewedAt: 5 })]) {
+        await fs.writeFile(ownerPath, malformed);
+        const fresh = new Date(clock.getTime());
+        await utimes(lockPath, fresh, fresh);
+        const malformedStore = createAttachmentStore(io(), storeRoot, () => clock, { lockAttempts: 2, lockRetryMs: 1 });
+        await expect(malformedStore.publish({ ...input, body: "malformed" })).rejects.toMatchObject({ details: { operation: "lock" } });
+      }
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reports lock failures without publishing and tolerates a failed release", async () => {
+    const storeRoot = await root("lock-failures");
+    const lockPath = join(storeRoot, ATTACHMENT_LOCK_NAME);
+    const ownerPath = join(lockPath, ATTACHMENT_LOCK_OWNER_FILE);
+    try {
+      const clock = new Date("2026-08-20T12:00:00.000Z");
       const lockMkdirFailure = createAttachmentStore(io({
         mkdir: vi.fn(async (path: string, options: { recursive: boolean; mode: number }) => {
           if (path.endsWith(ATTACHMENT_LOCK_NAME)) throw Object.assign(new Error("denied"), { code: "EACCES" });
           await fs.mkdir(path, options);
         })
-      }), storeRoot);
+      }), storeRoot, () => clock);
       await expect(lockMkdirFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock", causeCode: "EACCES" } });
 
-      const staleStatFailure = createAttachmentStore(io({ stat: vi.fn(async () => { throw Object.assign(new Error("stat"), { code: "EACCES" }); }) }), storeRoot, () => now, { lockAttempts: 2, lockRetryMs: 1 });
-      await fs.mkdir(join(storeRoot, ATTACHMENT_LOCK_NAME));
-      await expect(staleStatFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock" } });
+      await fs.mkdir(lockPath, { recursive: true });
+      await fs.writeFile(ownerPath, "not json");
+      const orphanStatFailure = createAttachmentStore(io({ stat: vi.fn(async () => { throw Object.assign(new Error("stat"), { code: "EACCES" }); }) }), storeRoot, () => clock, { lockAttempts: 2, lockRetryMs: 1 });
+      await expect(orphanStatFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock" } });
 
-      const staleRemoveFailure = createAttachmentStore(io({ rm: vi.fn(async () => { throw new Error("stuck lock"); }) }), storeRoot, () => now, { lockAttempts: 2, lockRetryMs: 1, lockStaleMs: 1_000 });
-      await utimes(join(storeRoot, ATTACHMENT_LOCK_NAME), stale, stale);
-      await expect(staleRemoveFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock" } });
+      const ownerReadFailure = createAttachmentStore(io({ readFile: vi.fn(async () => { throw Object.assign(new Error("owner"), { code: "EACCES" }); }) }), storeRoot, () => clock, { lockAttempts: 2, lockRetryMs: 1 });
+      await expect(ownerReadFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock", causeCode: "EACCES" } });
 
-      await rm(join(storeRoot, ATTACHMENT_LOCK_NAME), { recursive: true, force: true });
-      const releaseFailure = createAttachmentStore(io({ rm: vi.fn(async (path: string, options: { force: boolean; recursive: boolean }) => { if (path.endsWith(ATTACHMENT_LOCK_NAME)) throw new Error("release failed"); await fs.rm(path, options); }) }), storeRoot, () => now, { lockStaleMs: 1_000 });
+      const aged = new Date(clock.getTime() - DEFAULT_LOCK_LEASE_MS - 1);
+      await utimes(lockPath, aged, aged);
+      const reclaimRemoveFailure = createAttachmentStore(io({ rm: vi.fn(async () => { throw new Error("stuck lock"); }) }), storeRoot, () => clock, { lockAttempts: 2, lockRetryMs: 1 });
+      await expect(reclaimRemoveFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock" } });
+
+      await rm(lockPath, { recursive: true, force: true });
+      const releaseFailure = createAttachmentStore(io({ rm: vi.fn(async (path: string, options: { force: boolean; recursive: boolean }) => { if (path.endsWith(ATTACHMENT_LOCK_NAME)) throw new Error("release failed"); await fs.rm(path, options); }) }), storeRoot, () => clock);
       await expect(releaseFailure.publish({ ...input, body: "kept" })).resolves.toMatchObject({ bytes: 4 });
-      expect((await stat(join(storeRoot, ATTACHMENT_LOCK_NAME))).isDirectory()).toBe(true);
-      await rm(join(storeRoot, ATTACHMENT_LOCK_NAME), { recursive: true, force: true });
+      expect((await stat(lockPath)).isDirectory()).toBe(true);
+
+      const ownerWriteFailure = createAttachmentStore(io({
+        writeFile: vi.fn(async (path: string) => { if (path.endsWith(ATTACHMENT_LOCK_OWNER_FILE)) throw Object.assign(new Error("owner write"), { code: "EACCES" }); })
+      }), storeRoot, () => clock, { lockAttempts: 2, lockRetryMs: 1, lockLeaseMs: 0 });
+      await expect(ownerWriteFailure.publish({ ...input, body: "denied" })).rejects.toMatchObject({ details: { operation: "lock", causeCode: "EACCES" } });
     } finally {
       await rm(storeRoot, { recursive: true, force: true });
     }
@@ -410,8 +548,10 @@ describe("attachment store", () => {
       for (let index = 0; index < ATTACHMENT_STORE_MAX_RECORDS - 1; index += 1) {
         await seedRecord(storeRoot, KEY, `a${String(index).padStart(7, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`);
       }
-      const first = createAttachmentStore(io(), storeRoot, () => new Date("2026-08-20T12:00:00.000Z"), { lockRetryMs: 1 });
-      const second = createAttachmentStore(io(), storeRoot, () => new Date("2026-08-20T12:00:00.000Z"), { lockRetryMs: 1 });
+      // The loser must wait for the winner rather than give up on the lock.
+      const raceOptions = { lockRetryMs: 1, lockAttempts: 20_000 };
+      const first = createAttachmentStore(io(), storeRoot, () => new Date("2026-08-20T12:00:00.000Z"), raceOptions);
+      const second = createAttachmentStore(io(), storeRoot, () => new Date("2026-08-20T12:00:00.000Z"), raceOptions);
       const outcomes = await Promise.allSettled([
         first.publish({ ...input, body: "first" }),
         second.publish({ ...input, body: "second" })
@@ -426,7 +566,7 @@ describe("attachment store", () => {
     } finally {
       await rm(storeRoot, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("admits exactly one concurrent publication at the record cap across processes", async () => {
     const storeRoot = await root("cross-process");
@@ -437,7 +577,7 @@ describe("attachment store", () => {
       const storeModule = join(dirname(new URL(import.meta.url).pathname), "..", "..", "src", "messages", "store.ts");
       const script = `
         import { createAttachmentStore } from ${JSON.stringify(storeModule)};
-        const store = createAttachmentStore(undefined, ${JSON.stringify(storeRoot)}, () => new Date(), { lockRetryMs: 1 });
+        const store = createAttachmentStore(undefined, ${JSON.stringify(storeRoot)}, () => new Date(), { lockRetryMs: 1, lockAttempts: 20_000 });
         store.publish({ body: "child", recipientKey: ${JSON.stringify(KEY)}, senderPaneId: "w:p0", senderDisplay: "caller", operation: "prompt" })
           .then(() => process.stdout.write("PUBLISHED"))
           .catch((error) => process.stdout.write(String(error.code)));
@@ -447,7 +587,7 @@ describe("attachment store", () => {
       let childError = "";
       child.stdout.on("data", (chunk: Buffer) => { childOutput += chunk.toString(); });
       child.stderr?.on("data", (chunk: Buffer) => { childError += chunk.toString(); });
-      const local = createAttachmentStore(io(), storeRoot, () => new Date(), { lockRetryMs: 1, lockAttempts: 2_000 });
+      const local = createAttachmentStore(io(), storeRoot, () => new Date(), { lockRetryMs: 1, lockAttempts: 20_000 });
       const localOutcome = await local.publish({ ...input, body: "local" }).then(() => "PUBLISHED").catch((error: { code?: string }) => String(error.code));
       await new Promise<void>((resolve) => child.on("close", () => resolve()));
 

@@ -195,10 +195,22 @@ Owned by `herdr-tools`, modelled on the existing profile prompt-source store.
   directory (created non-recursively, so creation is the atomic test-and-set) and
   holds it across abandoned-staging purge, expiry sweep, quota check, staging, and
   rename. The lock is the quota reservation: two processes cannot both pass the
-  boundary check. Acquisition retries a bounded number of times (default 200 × 25 ms)
-  and then fails with `ATTACHMENT_STORE_FAILED` and `operation: "lock"`. A lock older
-  than 30 seconds is treated as abandoned and reclaimed. Release failure is not fatal;
-  the next publish reclaims it as stale. `.lock` is never scanned as a recipient.
+  boundary check. Acquisition retries a bounded number of attempts (default
+  200 × 25 ms) and then fails with `ATTACHMENT_STORE_FAILED` and `operation: "lock"`.
+  `.lock` is never scanned as a recipient.
+- Lock ownership is an explicit lease, never an age guess. The holder writes
+  `<root>/.lock/owner.json` with an unguessable token and an ISO `renewedAt`, renews it
+  at each publish phase boundary, and **validates the token immediately before the
+  commit rename** — a publication whose lease was reclaimed aborts with
+  `operation: "lock_validate"` instead of racing the new owner. Release is
+  ownership-checked: a holder deletes the lock only while its own token is present, so a
+  slow owner can never delete a replacement owner's lock. A lock is reclaimable only
+  when its lease has not been renewed for a full `DEFAULT_LOCK_LEASE_MS` (30 s) **and**
+  the same token is still present on a confirming second read; a marker that is
+  unreadable, malformed, or changing between reads is treated as unsafe to reclaim. A
+  lock directory whose owner marker never appeared is reclaimed only once the directory
+  itself has aged past the lease. A failed release is not fatal: the abandoned lease
+  expires and the next publisher reclaims it under the same rules.
 - Abandoned-staging purge, under the lock and before any quota decision: staging
   directories only ever exist while the lock is held, so every `.tmp-*` directory
   found at that point is a crash remnant and is deleted. An attachment directory
@@ -207,10 +219,17 @@ Owned by `herdr-tools`, modelled on the existing profile prompt-source store.
   therefore cannot evade expiry or inflate the quota basis.
 - Expiry sweep runs only inside a publish call, never on a timer, and never from the
   extension factory. It removes attachment directories whose recorded expiry has
-  passed, then removes empty recipient directories that are older than
-  `EMPTY_RECIPIENT_GRACE_MS` (60 s) so a just-granted launch directory is never
-  swept out from under a starting agent. A sweep failure is a typed, body-free
-  failure, not a silent success.
+  passed, then removes empty recipient directories that no live launch grant claims.
+  A sweep failure is a typed, body-free failure, not a silent success.
+- A launch grant is an owned lease over a recipient directory, not a grace period. A
+  profile-backed launch writes `<root>/<recipientKey>/.grant.json` with an unguessable
+  token before the agent starts, renews it before delivering the prompt, and releases it
+  when the launch finishes; the marker never counts as directory content. Sweeping skips
+  a directory whose grant was renewed within `DEFAULT_GRANT_LEASE_MS` (5 minutes,
+  comfortably longer than the 120 s agent-start window), and reclaims only abandoned or
+  released grants. Renew and release are ownership-checked, so a superseded launch can
+  neither refresh nor delete a newer launch's grant. This is what keeps a Claude
+  `--add-dir` path alive while its agent is still starting.
 - Quota is enforced after the purge and sweep, against the post-purge scan.
   Exceeding the byte quota or the record cap fails the publish with
   `ATTACHMENT_QUOTA_EXCEEDED`. Live attachments are never evicted to make room,
@@ -280,12 +299,14 @@ before every attachment send.
 - `details` gains `delivery`, `envelope.delivery`, and for the attachment route
   `attachment: { attachmentId, path, bytes, sha256, expiresAt, recipientPaneId }`.
   It never contains the body, and no existing field is removed.
-- A failure after the pre-state read keeps its typed code and gains `delivery`,
-  `route`, and `phase` (`publish`, `send`, or `post_state`). When the attachment was
-  already published, it also gains `attachmentRetained: true` and the same body-free
-  `attachment` block, because the file stays on disk until it expires. Refusals
-  before publication (`ATTACHMENT_TARGET_UNVERIFIED`) carry `delivery` and the
-  verification reason.
+- The route is established before any precondition, and one body-free wrapper adds it to
+  every failure. A failure keeps its typed code and gains `delivery` and `phase`
+  (`validate`, `resolve_target`, `verify_recipient`, `pre_state`, `publish`, `send`, or
+  `post_state`), plus `route` once the operation is known. `SELF_TARGET_REJECTED`,
+  `TARGET_BUSY`, `KEY_REJECTED`, `ATTACHMENT_TARGET_UNVERIFIED`, and oversize refusals
+  therefore all name the requested route. When the attachment was already published, the
+  failure also gains `attachmentRetained: true` and the same body-free `attachment`
+  block, because the file stays on disk until it expires.
 
 ### `herdr_launch`
 
@@ -317,9 +338,13 @@ before every attachment send.
   `READY_TIMEOUT`, `POSTSTATE_UNAVAILABLE`, `ABORTED`) and `created`/`causeCode`
   evidence, and add `phase`, `delivery`, `initialPromptDelivery`, and, once the
   attachment is published, `attachmentRetained: true` plus the body-free `attachment`
-  block. A publish-phase failure keeps the store's own typed code
-  (`ATTACHMENT_STORE_FAILED` or `ATTACHMENT_QUOTA_EXCEEDED`) because no topology was
-  mutated, and carries `delivery` with `phase: "attachment_publish"`.
+  block. Pre-topology refusals keep their own typed codes because nothing was mutated,
+  and still carry the route: a raw-kind attachment request reports
+  `ATTACHMENT_TARGET_UNVERIFIED` with `phase: "validate"`, an incapable profile reports
+  it with `phase: "resolve_profile"`, and a store failure reports
+  `ATTACHMENT_STORE_FAILED`/`ATTACHMENT_QUOTA_EXCEEDED` with
+  `phase: "attachment_publish"`. Post-publication argv construction runs inside the same
+  guarded block, so an argv failure also reports the retained attachment.
 
 ### `herdr_inspect`
 
@@ -437,13 +462,18 @@ Unit tests with injected IO and a fake executor:
 
 - store, over a real temporary filesystem with targeted failure injection: owner-only
   modes, atomic publish, immutability, exact digest and byte count, metadata shape
-  without a body, expiry sweep, aged-empty recipient removal versus a fresh launch
-  grant, quota and record-cap rejection, abandoned `.tmp-*` and metadata-less record
-  purge, every typed store failure operation;
-- store locking: held-lock timeout, stale-lock reclaim, release-during-wait,
-  reclaim failures, release failure, concurrent publication at the record cap in one
-  process, and concurrent publication at the record cap across two operating-system
-  processes (exactly one publication admitted in both cases);
+  without a body, expiry sweep, quota and record-cap rejection, abandoned `.tmp-*` and
+  metadata-less record purge, every typed store failure operation;
+- store locking: a live publisher that keeps renewing past the lease interval while two
+  competitors attempt acquisition (both refused, owner token unchanged), abandoned-lease
+  reclaim, unreadable/malformed/changing owner markers treated as unsafe to reclaim,
+  orphan lock directory aged out, lease loss aborting a staged publication with the
+  replacement lock intact, ownership-checked release, release failure, concurrent
+  publication at the record cap in one process, and concurrent publication at the record
+  cap across two operating-system processes (exactly one publication admitted in both);
+- launch grants: a grant surviving a sweep 90 s into a launch and again after a renewal
+  past the full lease, an abandoned grant reclaimed, a released grant leaving nothing
+  behind, and a superseded grant unable to renew or delete the newer one;
 - recipients: capability derivation for every bundled profile, incapable Pi and
   Claude tool restrictions, capability-removing and capability-restoring typed
   overrides, registry record and reset on session start/shutdown, identity-mismatch
@@ -466,16 +496,34 @@ Unit tests with injected IO and a fake executor:
   body-free retained attachment metadata for publish, send, and post-read failures;
 - rendering: delivery-aware success and error rows that never print a body.
 
-Integration in a disposable named session: every extension call, including stdin
-deliveries, is routed through the named session (a session-bound stdin executor is
-injected exactly like `pi.exec`, and stdin payloads are captured separately from
-argv); inline delivery over `--stdin` with a regression check that no payload text
-appears in argv; an attachment delivery read back at its exact published path from a
-launched bundled Pi profile agent's assignment; an attachment delivery to a launched
-bundled Claude profile agent read back inside its granted `--add-dir` directory; and
-visible `ATTACHMENT_TARGET_UNVERIFIED` refusals for an unprofiled launched pane and
-for a raw-kind attachment launch, with no prompt sent. The run removes the recipient
-directories it created and never mutates or closes the active user workspace.
+Integration runs in a disposable named session where every extension call, including
+stdin deliveries, is routed through that session: a session-bound stdin executor is
+injected exactly like `pi.exec`, and stdin payloads are captured separately from argv.
+The suite separates gating acceptance from non-gating evidence.
+
+**Gating acceptance — recipient readback.** One test per bundled runtime requires both a
+*confirmed* delivery and evidence only the recipient could produce: the attachment body
+carries a fresh token that appears nowhere in the envelope or argv and instructs the
+agent to write it to an exact marker path, and the test polls for that marker. A
+launched bundled Pi profile agent and a launched bundled Claude profile agent must each
+read their own attachment — the Claude case through its granted `--add-dir` directory.
+Host-side reads of the published file are transport evidence and never substitute for
+recipient evidence. If a delivery cannot be confirmed, the acceptance test records
+`INTEGRATION_ACCEPTANCE_BLOCKED` with the exact code and phase and is reported as
+skipped; it is never reported as passing, and no readback claim is made for it.
+
+**Non-gating transport smoke.** A separate test records confirmed or unconfirmed
+delivery (`INTEGRATION_DELIVERY_CONFIRMED` / `INTEGRATION_DELIVERY_UNCONFIRMED` with
+code, cause, phase, and bounded argv-path evidence) and asserts route and artifact
+invariants: inline delivery over `--stdin`, a regression check that no payload text
+reaches argv, and the published attachment's exact bytes, digest, and `0600` mode taken
+from success or from retained-attachment failure evidence. It makes no claim about what
+any recipient read.
+
+Environment-independent behaviour stays strict: `ATTACHMENT_TARGET_UNVERIFIED` refusals
+for an unprofiled launched pane and for a raw-kind attachment launch must carry the
+route and phase and send nothing. The run removes the recipient directories it created
+and never mutates or closes the active user workspace.
 
 ## Boundaries
 
@@ -512,11 +560,16 @@ directories it created and never mutates or closes the active user workspace.
 - [ ] A 1 MiB `attachment` request publishes an owner-only atomic attachment and
       delivers a reference envelope whose digest and byte count match the file.
 - [ ] A launched bundled Pi profile agent and a launched bundled Claude profile agent
-      each read their own attachment successfully in a disposable session.
+      each read their own attachment in a disposable session, proven by recipient-
+      produced evidence; an unconfirmed delivery leaves that criterion explicitly
+      blocked rather than satisfied.
 - [ ] An unprofiled or incapable target fails with `ATTACHMENT_TARGET_UNVERIFIED`
-      before any publish or send.
+      before any publish or send, naming the requested route and phase.
 - [ ] Expired attachments are swept, quota exhaustion fails visibly, and no live
       attachment is evicted.
+- [ ] A live publisher's lock is never reclaimed while its lease is renewed, and a
+      publication whose lease is lost aborts instead of committing.
+- [ ] A launch grant keeps its recipient directory for the whole start window.
 - [ ] No test, result, notification, or rendered row contains a message body.
 - [ ] Unit, typecheck, lint, build, and integration gates are green.
 
@@ -536,3 +589,11 @@ directories it created and never mutates or closes the active user workspace.
   repository content.
 - Cross-session attachment sends are deliberately impossible in this slice. Whether
   durable capability records are worth their reconciliation cost is deferred.
+- Known environment limitation, outside this repository: an agent in a **headless named
+  Herdr session** accepts prompt submission but is not always observed entering
+  `working`. Probed directly on the CLI, `herdr --session <name> agent prompt <pane>
+  --stdin --wait --until working --timeout 5000` returns `agent_prompt_stalled` ("no
+  observed state change within 5000 ms"), identical argv delivery stalls the same way,
+  and the submitted text never reaches the pane. Confirming the Pi acceptance criterion
+  needs Herdr-side prompt delivery in headless named sessions; until then that criterion
+  reports as blocked, with the Claude path confirmed.

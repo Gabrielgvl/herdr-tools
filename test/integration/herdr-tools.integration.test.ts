@@ -159,7 +159,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       const launched = await registered.get("herdr_launch")!.execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: "integration assignment" }, signal, undefined, toolContext);
       expect(launched.details).toMatchObject({ kind: "pi", profile: { name: "worker-pi" }, initialPromptSent: true, envelope: { version: "v1", kind: "assignment" } });
       const startArgs = cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
-      expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "high", "--append-system-prompt"]));
+      expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--append-system-prompt"]));
       expect(profilePromptContent).toContain("Implement the assigned change");
       const assignmentPrompt = cliCalls.find((args) => args[0] === "agent" && args[1] === "prompt" && args.some((arg) => arg.includes("integration assignment")));
       expect(assignmentPrompt?.[3]).toContain("[HERDR AGENT MESSAGE v1]");

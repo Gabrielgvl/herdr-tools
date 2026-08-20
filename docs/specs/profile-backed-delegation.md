@@ -26,7 +26,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Bundled roles are `scout`, `planner`, `worker`, `reviewer`, and `researcher`, with Pi and Claude variants. Bundled direction/model policy:
   - scout: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - researcher: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
-  - worker: `openai-codex/gpt-5.6-luna` -> `claude-opus-5`;
+  - worker: `openai-codex/gpt-5.6-luna` at max thinking -> `claude-opus-5`;
   - reviewer: `openai-codex/gpt-5.6-sol` -> `claude-opus-5`;
   - planner: `claude-fable-5` -> `openai-codex/gpt-5.6-sol`.
 - Bundled role bodies are rewritten for Herdr; they do not preserve chain, artifact, fork, or `pi-subagents` implementation assumptions.

@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import extension, { CORE_TOOL_NAMES } from "../../index.js";
+import { stopDisposableServer } from "./disposable-session.js";
 
 interface ExecutableTool {
   name: string;
@@ -187,11 +188,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       if (fixtureCreated && workspaceId) {
         await runNamed(["workspace", "close", workspaceId]).catch((error) => process.stderr.write(`INTEGRATION_TEARDOWN_FAILURE ${String(error)}\n`));
       }
-      if (sessionStarted) {
-        await run("session", "stop", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_STOP_FAILURE ${String(error)}\n`));
-        await run("session", "delete", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
-      }
-      if (server?.exitCode === null) server.kill("SIGTERM");
+      if (sessionStarted) await run("session", "stop", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_STOP_FAILURE ${String(error)}\n`));
+      await stopDisposableServer(server);
+      if (sessionStarted) await run("session", "delete", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
       await rm(cwd, { recursive: true, force: true });
     }
   }, 120_000);

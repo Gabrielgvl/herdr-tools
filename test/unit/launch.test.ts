@@ -131,6 +131,48 @@ describe("herdr_launch profile-only contract", () => {
     expect(() => validateLaunchParams({ ...valid, overrides: { model: "m", tools: [], extensions: [], skills: [], allowedTools: [], disallowedTools: [], addDirs: [], pluginDirs: [] }, placement: { mode: "same_tab" } })).not.toThrow();
   });
 
+  it("retains the failing phase and bounded CLI evidence at the launch boundary", async () => {
+    const failure = new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", {
+      exitCode: 1,
+      killed: false,
+      stdout: "",
+      stderr: JSON.stringify({ id: "cli:tab:create", error: { code: "tab_create_failed", message: "disposable placement failed" } }),
+      stdoutTruncated: false,
+      stderrTruncated: false
+    });
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? Promise.reject(failure) : base(argv, signal, preserve));
+
+    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        phase: "placement",
+        causeCode: "CLI_PROTOCOL_ERROR",
+        cliFailure: {
+          code: "CLI_PROTOCOL_ERROR",
+          message: "Herdr CLI did not return a usable response",
+          details: { exitCode: 1, killed: false, stdout: "", stderr: failure.details.stderr, stdoutTruncated: false, stderrTruncated: false }
+        }
+      }
+    });
+
+    const noEvidence = makeCli();
+    const noEvidenceBase = noEvidence.cli.runJson;
+    noEvidence.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? Promise.reject({ details: {} }) : noEvidenceBase(argv, signal, preserve));
+    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), noEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR" } });
+
+    const detailsOnly = makeCli();
+    const detailsOnlyBase = detailsOnly.cli.runJson;
+    detailsOnly.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? Promise.reject({ details: { stderr: "placement evidence" } }) : detailsOnlyBase(argv, signal, preserve));
+    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), detailsOnly.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR", cliFailure: { details: { stderr: "placement evidence" } } } });
+
+    const messageOnly = makeCli();
+    const messageOnlyBase = messageOnly.cli.runJson;
+    messageOnly.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? Promise.reject(Object.assign(new Error("placement message"), { details: {} })) : messageOnlyBase(argv, signal, preserve));
+    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), messageOnly.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR", cliFailure: { message: "placement message" } } });
+  });
+
   it("covers exact startup identities, pane variants, prompt recovery, and terminal renderers", async () => {
     const worker = profile("worker");
     for (const startResult of [null, {}, { agent: {} }, { agent: null }]) {

@@ -12,6 +12,7 @@ import { JobRegistry } from "../../src/job-registry.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
 import { publishedInputSchema } from "../../src/mcp/adapter.js";
 import { createPreflight, createToolSurface, CORE_TOOL_NAMES } from "../../src/tool-surface.js";
+import { stopDisposableServer } from "./disposable-session.js";
 
 const execFileAsync = promisify(execFile);
 const REQUIRED_SESSION = "herdr-tools-integration";
@@ -298,11 +299,9 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       if (fixtureCreated && workspaceId) {
         await runNamed(["workspace", "close", workspaceId]).catch((error: unknown) => process.stderr.write(`INTEGRATION_TEARDOWN_FAILURE ${String(error)}\n`));
       }
-      if (sessionStarted) {
-        await run("session", "stop", REQUIRED_SESSION, "--json").catch((error: unknown) => process.stderr.write(`INTEGRATION_SESSION_STOP_FAILURE ${String(error)}\n`));
-        await run("session", "delete", REQUIRED_SESSION, "--json").catch((error: unknown) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
-      }
-      if (server?.exitCode === null) server.kill("SIGTERM");
+      if (sessionStarted) await run("session", "stop", REQUIRED_SESSION, "--json").catch((error: unknown) => process.stderr.write(`INTEGRATION_SESSION_STOP_FAILURE ${String(error)}\n`));
+      await stopDisposableServer(server);
+      if (sessionStarted) await run("session", "delete", REQUIRED_SESSION, "--json").catch((error: unknown) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
       await rm(cwd, { recursive: true, force: true });
     }
   }, 240_000);

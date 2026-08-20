@@ -8,7 +8,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type RuntimeProfile } from "../profiles/types.js";
-import { HERDR_AGENT_START_TIMEOUT_MS } from "../cli.js";
+import { boundedEvidence, HERDR_AGENT_START_TIMEOUT_MS } from "../cli.js";
 import { withoutEnvironment } from "../redaction.js";
 
 export interface LaunchCli {
@@ -307,6 +307,24 @@ function promptStallEvidence(error: unknown): PromptStallEvidence | undefined {
   return Number.isSafeInteger(stateChangeSeq) ? { stateChangeSeq } : undefined;
 }
 
+function cliFailureEvidence(error: unknown): Record<string, unknown> | undefined {
+  if (!record(error) || !record(error.details)) return undefined;
+  const details: Record<string, unknown> = {};
+  for (const key of ["exitCode", "killed", "stdoutTruncated", "stderrTruncated"] as const) {
+    const value = error.details[key];
+    if (typeof value === "number" && Number.isSafeInteger(value)) details[key] = value;
+    if (typeof value === "boolean") details[key] = value;
+  }
+  for (const key of ["stdout", "stderr", "cause"] as const) {
+    const value = error.details[key];
+    if (typeof value === "string") details[key] = boundedEvidence(value).value;
+  }
+  const code = typeof error.code === "string" ? error.code : undefined;
+  const message = error instanceof Error ? boundedEvidence(error.message, 2_000).value : undefined;
+  if (code === undefined && message === undefined && Object.keys(details).length === 0) return undefined;
+  return { ...(code === undefined ? {} : { code }), ...(message === undefined ? {} : { message }), ...(Object.keys(details).length === 0 ? {} : { details }) };
+}
+
 function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"]): LaunchError {
   const causeCode = error instanceof LaunchError && typeof error.details.causeCode === "string"
     ? error.details.causeCode
@@ -316,8 +334,11 @@ function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchD
   const code = error instanceof LaunchError && error.code === "POSTSTATE_UNAVAILABLE"
     ? "POSTSTATE_UNAVAILABLE"
     : causeCode === "ABORTED" ? "ABORTED" : causeCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : causeCode === "READY_TIMEOUT" || (causeCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
+  const evidence = error instanceof LaunchError ? undefined : cliFailureEvidence(error);
   return new LaunchError(code, `Launch did not complete: ${message}`, {
     ...(error instanceof LaunchError ? error.details : {}),
+    phase,
+    ...(evidence ? { cliFailure: evidence } : {}),
     created: { ...created },
     causeCode
   });

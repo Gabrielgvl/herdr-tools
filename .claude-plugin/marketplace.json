@@ -1,0 +1,19 @@
+{
+  "name": "herdr-tools",
+  "owner": {
+    "name": "Gabriel Lima"
+  },
+  "metadata": {
+    "description": "Local Herdr tools plugin (manager conduct skill + herdr MCP server) for global Claude Code sessions",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "herdr-tools",
+      "source": "./herdr-profiles/role-plugins/manager",
+      "description": "Herdr manager conduct skill and the local Herdr tools MCP server",
+      "version": "1.0.0",
+      "author": { "name": "Herdr Tools" }
+    }
+  ]
+}

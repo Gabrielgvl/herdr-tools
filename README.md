@@ -18,12 +18,14 @@ Pi discovers the directory through its root `index.ts` when it is installed at `
 
 ## Claude Fable manager
 
-A Claude Fable session running in a Herdr pane can act as the manager through the local stdio MCP server in `herdr-profiles/role-plugins/manager/`. Build the server first, then start the session from the manager's own project directory:
+A Claude Fable session running in a Herdr pane can act as the manager through the local stdio MCP server. Build the server, add the bundled marketplace, install the plugin globally for the user, then restart Claude:
 
 ```bash
+cd /home/gabriel/.pi/agent/extensions/herdr-tools
 npm run build:mcp
-claude --model claude-fable-5 \
-  --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/role-plugins/manager
+claude plugin marketplace add /home/gabriel/.pi/agent/extensions/herdr-tools --scope user
+claude plugin install herdr-tools@herdr-tools --scope user -y
+claude --model claude-fable-5
 ```
 
 `/mcp` must list the `herdr` server with the seven tools as `mcp__plugin_herdr-tools_herdr__herdr_inspect` through `mcp__plugin_herdr-tools_herdr__herdr_tab`. The bundled `manager-claude` profile uses this same plugin and is selected for owner-requested Claude/Fable management or Claude-to-Claude succession; `manager-pi` remains the generic advisory default. Inside a running session the owner switches models with `/model fable`; the packaged skill reports a mismatch and stops rather than claiming enforcement.
@@ -37,7 +39,15 @@ Two host differences are deliberate:
 - **Waits are polled, not pushed.** Nothing notifies the manager session when a detached wait finishes. Start long waits with `runInBackground: true` and read them with `herdr_jobs` `list` and `get`.
 - **No model-backed wait review.** The MCP host has no model registry, so a wait whose timeout exceeds `wait.reviewCadenceMinutes` fails closed with `REVIEWER_FAILED` in both foreground and detached form. Use repeated bounded waits, or raise the cadence (maximum 30) in `config.json`.
 
-The package loads only from its place in this repository with `--plugin-dir`, because its server command resolves through `${CLAUDE_PLUGIN_ROOT}/../../../dist/src/mcp-server.js` into this build. Marketplace publication is blocked: a cached install keeps the package directory alone and loses the build it points at.
+For refreshes, rebuild main, update the user-installed plugin, and restart Claude:
+
+```bash
+cd /home/gabriel/.pi/agent/extensions/herdr-tools
+npm run build:mcp
+claude plugin update herdr-tools@herdr-tools --scope user -y
+```
+
+The cached plugin intentionally points back to `/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js`, so main installed at that path must be built. For development or sideloading, `claude --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/role-plugins/manager` remains an explicit alternative to the global marketplace installation.
 
 ## Configuration
 

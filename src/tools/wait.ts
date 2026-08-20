@@ -449,16 +449,19 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
   return {
     name: "herdr_wait",
     label: "Herdr Wait",
-    description: "MCP wait for exact Herdr agent targets to satisfy an authoritative state or pane-output condition; distinct from the CLI agent wait readiness command.",
+    description: "MCP wait for exact Herdr agent targets to satisfy an authoritative state or pane-output condition; long waits automatically detach unless runInBackground is false; distinct from the CLI agent wait readiness command.",
     parameters: WaitParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, context) {
       const activeSignal = signal ?? new AbortController().signal;
       checkAbort(activeSignal);
-      const runInBackground = typeof rawParams === "object" && rawParams !== null && !Array.isArray(rawParams) && (rawParams as { runInBackground?: unknown }).runInBackground === true;
-      const generation = runInBackground ? deps.jobRegistry?.captureGeneration() : undefined;
-      if (runInBackground && !deps.jobRegistry) throw new WaitError("INVALID_INPUT", "INVALID_INPUT: background waits are unavailable in this runtime");
+      const generation = deps.jobRegistry?.captureGeneration();
       const prepared = await prepareWait({ ...deps, settingsLoader }, rawParams, activeSignal);
-      if (runInBackground) {
+      const runInBackground = prepared.params.runInBackground === true;
+      const runSynchronously = prepared.params.runInBackground === false;
+      if (runInBackground && !deps.jobRegistry) throw new WaitError("INVALID_INPUT", "INVALID_INPUT: background waits are unavailable in this runtime");
+      const autoBackground = !runInBackground && !runSynchronously && deps.jobRegistry !== undefined
+        && prepared.params.timeoutMs > prepared.settings.reviewCadenceMinutes * 60_000;
+      if (runInBackground || autoBackground) {
         if (!generation || !deps.jobRegistry!.isCurrent(generation)) throw new WaitError("SESSION_REPLACED", "SESSION_REPLACED: wait session was replaced before registration");
         const registered = deps.jobRegistry!.register(
           jobRequestFromPrepared(prepared),

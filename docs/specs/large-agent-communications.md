@@ -81,6 +81,9 @@ herdr agent prompt <TARGET> --stdin [--wait --until working --timeout 5000]
 
 `--wait` flag selection is unchanged: a steer whose authoritative pre-state is
 already `working` omits the wait flags; every other wrapped delivery keeps them.
+The initial prompt issued by `herdr_launch` uses a 10,000 ms CLI deadline, leaving
+Herdr's fixed 5,000 ms state-change observation enough time to return its typed
+`agent_prompt_stalled` envelope instead of a boundary timeout.
 
 Pi's `pi.exec` helper spawns children with `stdio: ["ignore", "pipe", "pipe"]` and
 has no input option, so the extension adds one narrow stdin-capable executor of its
@@ -92,8 +95,11 @@ every timer and listener is cleared on the first settle.
 
 Failure evidence for a stdin delivery is fixed and non-textual — exit code, killed
 flag, per-stream presence, exact byte size, and truncation — because a failing CLI
-can echo part of a sender-authored body. The captured text is used only in-process to
-classify a rejected `--stdin` flag, and is never placed in error details, results, or
+can echo part of a sender-authored body. For only the exact non-killed exit-1
+`cli:agent:prompt` / `agent_prompt_stalled` envelope, the adapter additionally
+retains a safe-integer `promptStallStateChangeSeq` hint; it never retains the raw
+stream. The captured text is used only in-process to classify a rejected `--stdin`
+flag or this exact typed envelope, and is never placed in error details, results, or
 rendered rows. Argv-only calls keep their existing bounded textual evidence.
 
 If the installed CLI rejects `--stdin`, the CLI fails its argument parse before
@@ -593,18 +599,18 @@ and never mutates or closes the active user workspace.
   repository content.
 - Cross-session attachment sends are deliberately impossible in this slice. Whether
   durable capability records are worth their reconciliation cost is deferred.
-- Known environment limitation, outside this repository: an agent in a **headless named
-  Herdr session** accepts prompt submission but is not always observed entering
-  `working`. Probed directly on the CLI, `herdr --session <name> agent prompt <pane>
-  --stdin --wait --until working --timeout 5000` returns `agent_prompt_stalled` ("no
-  observed state change within 5000 ms"), identical argv delivery stalls the same way,
-  and the submitted text never reaches the pane. Confirming the Pi acceptance criterion
-  needs Herdr-side prompt delivery in headless named sessions; until then that criterion
-  reports as blocked, with the Claude path confirmed.
-- `herdr_launch` keeps the keystroke recovery for a stalled initial prompt in a pane it
-  created itself (send `enter`, then wait for `working`). On the stdin transport the
-  stalled envelope cannot be read back — stdin-delivery evidence is non-textual by
-  design — so the recovery is triggered by that failure's exit signature (exit code 1,
-  not killed, evidence withheld) instead of by the envelope text. The recovery is still
-  proven by the authoritative `agent wait` and the final `working` post-state check, and
-  it is never attempted in an `existing_pane` placement.
+- Known environment behavior, outside this repository: an agent in a **headless named
+  Herdr session** may not be observed entering `working` after prompt submission. The
+  launch path gives the CLI a 10,000 ms deadline so its fixed 5,000 ms observation can
+  return `agent_prompt_stalled` ("no observed state change within 5000 ms"). The
+  disposable MCP integration now confirms the Pi launch path through the exact typed
+  stall evidence and bounded recovery; this does not broaden recovery for generic or
+  uncertain failures.
+- `herdr_launch` keeps the keystroke recovery for a stalled initial prompt bounded to
+  one `enter` and one wait. On the stdin transport the raw stalled envelope is never
+  retained or published; the exact typed envelope is reduced to its safe-integer
+  `promptStallStateChangeSeq` hint. New-pane recovery remains available for that
+  evidence, while existing-pane recovery additionally requires runtime ownership, an
+  agent-free authoritative pre-launch snapshot, and an exact idle post-state identity
+  and sequence match. Generic, malformed, killed, or mismatched stdin failures never
+  authorize a recovery key.

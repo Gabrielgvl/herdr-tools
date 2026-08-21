@@ -188,6 +188,59 @@ describe("HerdrCli", () => {
     await expect(new HerdrCli(argvFailure).runJson(["pane", "get", "w1:p1"], signal)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { stdout: "plain text", stderr: "plain error" } });
   });
 
+  it("carries only a safe sequence hint for the exact stdin prompt stall envelope", async () => {
+    const stallMessage = "agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained 7";
+    const exactStall = JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: stallMessage } });
+    const exact = vi.fn<StdinExec>().mockResolvedValue(response("", 1, exactStall));
+    const exactFailure = await new HerdrCli(vi.fn<PiExec>(), 1000, 1000, exact).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], "body", signal).catch((error: CliProtocolError) => error);
+    expect((exactFailure as CliProtocolError).details).toEqual({
+      exitCode: 1,
+      killed: false,
+      evidence: "omitted_for_stdin_delivery",
+      stdoutPresent: false,
+      stdoutBytes: 0,
+      stdoutTruncated: false,
+      stderrPresent: true,
+      stderrBytes: Buffer.byteLength(exactStall, "utf8"),
+      stderrTruncated: false,
+      promptStallStateChangeSeq: 7
+    });
+    expect(JSON.stringify((exactFailure as CliProtocolError).details)).not.toContain(stallMessage);
+
+    const exactBytes = Buffer.byteLength(exactStall, "utf8");
+    const oversizedStalls = [
+      `${" ".repeat(16)}${exactStall}`,
+      `${exactStall}${" ".repeat(16)}`,
+      `${"\t".repeat(8)}${exactStall}${"\n".repeat(8)}`
+    ];
+    for (const stderr of oversizedStalls) {
+      const stdin = vi.fn<StdinExec>().mockResolvedValue(response("", 1, stderr));
+      const failure = await new HerdrCli(vi.fn<PiExec>(), 1000, exactBytes, stdin).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], "body", signal).catch((error: CliProtocolError) => error);
+      expect((failure as CliProtocolError).details).toMatchObject({ stderrBytes: Buffer.byteLength(stderr, "utf8"), stderrTruncated: true });
+      expect((failure as CliProtocolError).details).not.toHaveProperty("promptStallStateChangeSeq");
+    }
+
+    const invalidEnvelopes: Array<[string, number, boolean]> = [
+      ["[]", 1, false],
+      [JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: stallMessage }, extra: true }), 1, false],
+      [JSON.stringify({ id: "wrong", error: { code: "agent_prompt_stalled", message: stallMessage } }), 1, false],
+      [JSON.stringify({ id: "cli:agent:prompt" }), 1, false],
+      [JSON.stringify({ id: "cli:agent:prompt", error: null }), 1, false],
+      [JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: stallMessage, extra: true } }), 1, false],
+      [JSON.stringify({ id: "cli:agent:prompt", error: { code: "other", message: stallMessage } }), 1, false],
+      [JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: 7 } }), 1, false],
+      [JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: "agent prompt stalled" } }), 1, false],
+      [JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: `agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained ${"9".repeat(400)}` } }), 1, false],
+      [exactStall, 2, false],
+      [exactStall, 1, true]
+    ];
+    for (const [stderr, exitCode, killed] of invalidEnvelopes) {
+      const stdin = vi.fn<StdinExec>().mockResolvedValue(response("", exitCode, stderr, killed));
+      const failure = await new HerdrCli(vi.fn<PiExec>(), 1000, 1000, stdin).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], "body", signal).catch((error: CliProtocolError) => error);
+      expect((failure as CliProtocolError).details).not.toHaveProperty("promptStallStateChangeSeq");
+    }
+  });
+
   it("passes the caller signal to every call and reports cancellation", async () => {
     const controller = new AbortController();
     const exec = vi.fn<PiExec>().mockImplementation(async (_command, _argv, options) => {

@@ -42,7 +42,8 @@ const startFailure = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI
   stderr: JSON.stringify({ id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } })
 });
 const envelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`;
-const PROMPT_ARGV = (paneId: string) => ["agent", "prompt", paneId, "--stdin", "--wait", "--until", "working", "--timeout", "5000"];
+const PROMPT_ARGV = (paneId: string) => ["agent", "prompt", paneId, "--stdin", "--wait", "--until", "working", "--timeout", "10000"];
+const stdinStallDetails = (promptStallStateChangeSeq: unknown = 7): Record<string, unknown> => ({ exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery", promptStallStateChangeSeq });
 
 function profile(name: string, kind: "pi" | "claude" = "pi", fallbackProfiles: string[] = []) {
   const runtime = kind === "pi"
@@ -255,11 +256,9 @@ describe("herdr_launch profile-only contract", () => {
       await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), malformed.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
     }
 
-    // The stalled envelope is recovered on both transports: a textual stderr envelope, and
-    // the stdin transport whose evidence is non-textual by design.
+    // Stdin recovery consumes only the typed safe-integer sequence hint.
     for (const stalledDetails of [
-      { exitCode: 1, killed: false, stderr: JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained 7" } }) },
-      { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery", stdoutPresent: false, stdoutBytes: 0, stdoutTruncated: false }
+      { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery", stdoutPresent: false, stdoutBytes: 0, stdoutTruncated: false, promptStallStateChangeSeq: 7 }
     ]) {
       const recovery: string[][] = [];
       const stalled = makeCli();
@@ -273,8 +272,8 @@ describe("herdr_launch profile-only contract", () => {
       expect(recovery).toEqual([["agent", "send-keys", "w1:p2", "enter"], ["agent", "wait", "w1:p2", "--until", "working", "--timeout", "5000"]]);
     }
 
-    // Non-textual stdin evidence preserves new-pane recovery but cannot authorize
-    // an existing-pane recovery key without the exact stalled sequence.
+    // Missing typed sequence evidence never authorizes recovery, including for an
+    // existing pane.
     const existingStalled = makeCli();
     const existingStalledBase = existingStalled.cli.runJson;
     existingStalled.cli.runJsonWithStdin = vi.fn(async () => { throw Object.assign(new Error("stalled"), { code: "CLI_PROTOCOL_ERROR", details: { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery" } }); });
@@ -283,7 +282,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "idle" } });
       return existingStalledBase(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, initialPrompt: "go" }, catalog(worker), existingStalled.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_stall_evidence_unavailable" } });
+    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, initialPrompt: "go" }, catalog(worker), existingStalled.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
     expect(existingStalled.calls.some((call) => call[1] === "send-keys")).toBe(false);
 
     const safeEvidence = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown", agent_id: 1, status: {} }] });
@@ -356,12 +355,7 @@ describe("herdr_launch profile-only contract", () => {
     const emptyTargetSnapshot: HerdrSnapshot = { ...snapshot, panes: [...snapshot.panes, emptyTargetPane], agents: [] };
     const stalledAgent = { name: "worker", pane_id: "w1:p2", agent: "pi", agent_status: "idle", state_change_seq: 7, agent_session: "session-worker", ...(agentId ? { agent_id: agentId } : {}) };
     const workingPane = { ...emptyTargetPane, agent: "pi", agent_status: "working" };
-    const stall = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", {
-      exitCode: 1,
-      killed: false,
-      stderrTruncated: false,
-      stderr: JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained 7" } })
-    });
+    const stall = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", stdinStallDetails());
     const owned = new RuntimeOwnership();
     owned.record({ kind: "pane", id: "w1:p2", parentId: "w1:t1" });
     const harness = makeCli({
@@ -401,7 +395,7 @@ describe("herdr_launch profile-only contract", () => {
     harness.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
       harness.calls.push(argv);
       harness.stdinInputs.push(input);
-      throw Object.assign(new Error("stalled"), { code: "CLI_PROTOCOL_ERROR", details: { exitCode: 1, killed: false, stderrTruncated: false, stderr: JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained 7" } }) } });
+      throw Object.assign(new Error("stalled"), { code: "CLI_PROTOCOL_ERROR", details: stdinStallDetails() });
     });
     const ownership = new RuntimeOwnership();
     if (occupied !== undefined) ownership.record({ kind: "pane", id: "w1:p2", parentId: "w1:t1" });
@@ -422,7 +416,7 @@ describe("herdr_launch profile-only contract", () => {
     harness.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
       harness.calls.push(argv);
       harness.stdinInputs.push(input);
-      throw Object.assign(new Error("stalled"), { code: "CLI_PROTOCOL_ERROR", details: { exitCode: 1, killed: false, stderrTruncated: false, stderr: JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained 7" } }) } });
+      throw Object.assign(new Error("stalled"), { code: "CLI_PROTOCOL_ERROR", details: stdinStallDetails() });
     });
     harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
       if (argv[0] === "agent" && argv[1] === "get" && agentGets++ === 0) { harness.calls.push(argv); return ok("get", postState === null ? null : { agent: postState }); }
@@ -442,7 +436,7 @@ describe("herdr_launch profile-only contract", () => {
     harness.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
       harness.calls.push(argv);
       harness.stdinInputs.push(input);
-      throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", { exitCode: 1, killed: false, stderrTruncated: false, stderr: JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change within 5000 ms; status is idle" } }) });
+      throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery" });
     });
     const ownership = new RuntimeOwnership();
     ownership.record({ kind: "pane", id: "w1:p2", parentId: "w1:t1" });
@@ -458,13 +452,43 @@ describe("herdr_launch profile-only contract", () => {
     harness.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
       harness.calls.push(argv);
       harness.stdinInputs.push(input);
-      throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", { exitCode: 1, killed: false, stderrTruncated: false, stderr: JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: `agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained ${"9".repeat(400)}` } }) });
+      throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", stdinStallDetails(Number.MAX_SAFE_INTEGER + 1));
     });
     const ownership = new RuntimeOwnership();
     ownership.record({ kind: "pane", id: "w1:p2", parentId: "w1:t1" });
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", ownership, profiles: { load: async () => catalog(profile("worker")) } });
     await expect(tool.execute("id", { name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "target" }, initialPrompt: "go" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "send-keys")).toBe(false);
+  });
+
+  it.each(["new pane", "existing pane"] as const)("never sends recovery keys for %s malformed or missing stdin stall evidence", async (placementName) => {
+    const targetPane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "target", agent_status: "unknown" };
+    const targetSnapshot: HerdrSnapshot = placementName === "existing pane"
+      ? { ...snapshot, panes: [...snapshot.panes, targetPane], agents: [] }
+      : snapshot;
+    const failures: Array<[string, Record<string, unknown>]> = [
+      ["malformed", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery", promptStallStateChangeSeq: {} }],
+      ["extra-key", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery", extra: true }],
+      ["mismatched", { exitCode: 1, killed: false, evidence: "wrong_transport", promptStallStateChangeSeq: 7 }],
+      ["generic", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery", stdoutPresent: true, stdoutBytes: 4, stdoutTruncated: false, stderrPresent: true, stderrBytes: 4, stderrTruncated: false }],
+      ["missing-hint", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery" }]
+    ];
+    for (const [label, details] of failures) {
+      const harness = makeCli({ snapshot: targetSnapshot });
+      harness.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
+        harness.calls.push(argv);
+        harness.stdinInputs.push(input);
+        throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", details);
+      });
+      const ownership = new RuntimeOwnership();
+      const params = placementName === "existing pane"
+        ? { name: "worker", profile: "worker", placement: { mode: "existing_pane" as const, target: "target" }, initialPrompt: "go" }
+        : { name: "worker", profile: "worker", initialPrompt: "go" };
+      if (placementName === "existing pane") ownership.record({ kind: "pane", id: "w1:p2", parentId: "w1:t1" });
+      const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", ownership, profiles: { load: async () => catalog(profile("worker")) } });
+      await expect(tool.execute("id", params, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
+      expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "send-keys"), `${placementName} ${label}`).toBe(false);
+    }
   });
 
   it("covers guarded fallback, focus, and authoritative post-state refusals", async () => {

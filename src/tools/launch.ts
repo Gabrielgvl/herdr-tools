@@ -304,29 +304,16 @@ function focusArgs(focus: boolean): string[] {
 }
 
 interface PromptStallEvidence {
-  stateChangeSeq?: number;
+  stateChangeSeq: number;
 }
 
 function promptStallEvidence(error: unknown): PromptStallEvidence | undefined {
   if (!record(error) || error.code !== "CLI_PROTOCOL_ERROR" || !record(error.details)) return undefined;
-  const { exitCode, killed, stderr, evidence } = error.details;
-  if (exitCode !== 1 || killed !== false) return undefined;
-  // Stdin delivery deliberately withholds process text. Preserve the newer transport's
-  // bounded new-pane recovery, but require textual sequence evidence before an existing
-  // pane can receive a recovery key.
-  if (evidence === "omitted_for_stdin_delivery") return {};
-  if (typeof stderr !== "string") return undefined;
-  let envelope: unknown;
-  try {
-    envelope = JSON.parse(stderr.trim());
-  } catch {
-    return undefined;
-  }
-  if (!record(envelope) || envelope.id !== "cli:agent:prompt" || !record(envelope.error) || envelope.error.code !== "agent_prompt_stalled" || typeof envelope.error.message !== "string") return undefined;
-  const match = /^agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained (\d+)$/.exec(envelope.error.message);
-  if (!match) return undefined;
-  const stateChangeSeq = Number(match[1]);
-  return Number.isSafeInteger(stateChangeSeq) ? { stateChangeSeq } : undefined;
+  const { exitCode, killed, evidence, promptStallStateChangeSeq } = error.details;
+  if (exitCode !== 1 || killed !== false || evidence !== "omitted_for_stdin_delivery") return undefined;
+  return typeof promptStallStateChangeSeq === "number" && Number.isSafeInteger(promptStallStateChangeSeq)
+    ? { stateChangeSeq: promptStallStateChangeSeq }
+    : undefined;
 }
 
 function cliFailureEvidence(error: unknown): Record<string, unknown> | undefined {
@@ -393,7 +380,10 @@ async function run(cli: LaunchCli, argv: string[], signal: AbortSignal, preserve
 
 async function runPrompt(cli: LaunchCli, paneId: string, envelope: string, signal: AbortSignal): Promise<unknown> {
   if (!cli.runJsonWithStdin) throw new LaunchError("CLI_INCOMPATIBLE", "Herdr CLI stdin prompt transport is unavailable");
-  const argv = ["agent", "prompt", paneId, "--stdin", "--wait", "--until", "working", "--timeout", "5000"];
+  // Herdr reserves the first 5000 ms for observing a state change before emitting
+  // agent_prompt_stalled. Keep a separate CLI deadline so that typed stall evidence wins
+  // over the outer timeout at the boundary.
+  const argv = ["agent", "prompt", paneId, "--stdin", "--wait", "--until", "working", "--timeout", "10000"];
   try {
     const response = await cli.runJsonWithStdin(argv, envelope, signal);
     if (signal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
@@ -594,9 +584,6 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             const stalled = promptStallEvidence(error);
             if (!stalled) throw error;
             if (placement.mode === "existing_pane") {
-              if (stalled.stateChangeSeq === undefined) {
-                throw new LaunchError("LAUNCH_FAILED", "Initial prompt stalled; existing-pane recovery requires exact state-change evidence", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_stall_evidence_unavailable" });
-              }
               if (!existingPaneOwned) {
                 throw new LaunchError("LAUNCH_FAILED", "Initial prompt stalled; existing-pane recovery requires runtime ownership", { causeCode: "agent_prompt_stalled", promptRecovery: "refused_existing_pane_not_owned" });
               }

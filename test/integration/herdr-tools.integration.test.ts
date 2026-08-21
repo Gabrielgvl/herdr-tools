@@ -262,7 +262,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     if (inlineDelivery === undefined) {
       process.stderr.write(`INTEGRATION_TRANSPORT_UNOBSERVED pi-inline-launch phase=${String(inline.details.phase)}\n`);
     } else {
-      expect(inlineDelivery.args).toEqual(["agent", "prompt", inlinePaneId, "--stdin", "--wait", "--until", "working", "--timeout", "5000"]);
+      expect(inlineDelivery.args).toEqual(["agent", "prompt", inlinePaneId, "--stdin", "--wait", "--until", "working", "--timeout", "10000"]);
       expect(inlineDelivery.input).toContain("[HERDR AGENT MESSAGE v1]");
       expect(inlineDelivery.input).toContain("authority: agent; not user/owner");
       expect(inlineDelivery.input).toContain("delivery: inline");

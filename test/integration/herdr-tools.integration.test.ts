@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -238,6 +238,53 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const defaultAfter = resultObject(resultObject(resultObject(await run("api", "snapshot")).result).snapshot);
     expect(topologyIds(defaultAfter)).toEqual(state.baseline);
   }, 120_000);
+
+  it("fails closed for a deterministic Bash-tool interrupt in the disposable session", async () => {
+    const turnMarker = `turn-control-${randomUUID()}`;
+    const turnMarkerPath = join(state.cwd, "turn-control-started.txt");
+    const turnScriptPath = join(state.cwd, "turn-control.sh");
+    await writeFile(turnScriptPath, `printf '%s' '${turnMarker}' > '${turnMarkerPath}'\nsleep 120\n`, { mode: 0o700 });
+    const launched = await tool("herdr_launch").execute("turn-control-launch", {
+      name: `integration-turn-control-${process.pid}`,
+      profile: "worker-pi",
+      placement: { mode: "new_tab", tabLabel: "turn-control" },
+      initialPrompt: `Use Bash to execute exactly ${turnScriptPath} now. Do not use any other tool. Remain in this turn until the script exits; do not finish the task or send a final response.`
+    }, signal(), undefined, toolContext());
+    expect(await waitForMarker(turnMarkerPath, turnMarker, 60_000), "turn-control fixture did not reach its deterministic sleep command").toBe(true);
+    const details = resultObject(launched.details);
+    const paneId = details.paneId;
+    if (typeof paneId !== "string") throw new Error("turn-control fixture launch did not return an authoritative pane ID");
+
+    const fixtureSnapshot = resultObject(resultObject(resultObject(await runNamed(["api", "snapshot"])).result).snapshot);
+    const fixturePanes = Array.isArray(fixtureSnapshot.panes) ? fixtureSnapshot.panes.map(resultObject) : [];
+    const fixtureAgents = Array.isArray(fixtureSnapshot.agents) ? fixtureSnapshot.agents.map(resultObject) : [];
+    expect(fixturePanes).toEqual(expect.arrayContaining([expect.objectContaining({ pane_id: paneId, agent_status: "working" })]));
+    expect(fixtureAgents).toEqual(expect.arrayContaining([expect.objectContaining({ pane_id: paneId, agent_status: "working" })]));
+
+    let failure: { code?: unknown; details?: Record<string, unknown> } | undefined;
+    try {
+      await tool("herdr_communicate").execute("turn-control", { target: paneId, operation: "interrupt" }, signal(), undefined, toolContext());
+    } catch (error) {
+      failure = error as { code?: unknown; details?: Record<string, unknown> };
+    }
+    expect(failure?.code).toBe("INTERRUPT_UNCONFIRMED");
+    const failureDetails = resultObject(failure?.details);
+    expect(failureDetails).toMatchObject({
+      dispatchAttempted: true,
+      dispatchAcknowledged: true,
+      confirmation: { kind: "unconfirmed" }
+    });
+    const preEvidence = resultObject(failureDetails.preEvidence);
+    const finalEvidence = resultObject(failureDetails.finalEvidence);
+    expect(finalEvidence).toMatchObject({
+      pane_id: paneId,
+      terminal_id: preEvidence.terminal_id,
+      agent_session: preEvidence.agent_session,
+      agent_status: "working"
+    });
+    const controls = state.cliCalls.filter((args) => args[0] === "agent" && args[1] === "send-keys" && args[2] === paneId);
+    expect(controls).toEqual([["agent", "send-keys", paneId, "ctrl+c"]]);
+  }, 180_000);
 
   // The unprofiled-launch refusal this suite used to cover has no reachable path left:
   // launch is profile-only, so an unregistered recipient can no longer be created here.

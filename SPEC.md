@@ -151,16 +151,18 @@ The first-line sentinel and version are stable protocol. All metadata values are
 
 ### `herdr_communicate`
 
-**Execution:** This mutating tool is registered with `executionMode: "sequential"` so prompt/key/steer calls cannot overlap.
+**Execution:** This mutating tool is registered with `executionMode: "sequential"` so communication and turn-control calls cannot overlap.
 
-**Purpose:** Send a normal prompt, explicitly steer an agent, or send named keys. This tool does not wait for completion.
+**Purpose:** Send a normal prompt, explicitly steer an agent, send named keys, request safe cancellation, or request a stronger interruption. Prompt, steer, and keys operations do not wait for turn completion; cancel and interrupt perform bounded authoritative settlement confirmation.
 
 **Input:** exactly one of these operation shapes:
 
 ```text
-{ target: TargetRef, operation: "prompt", text: string }
-{ target: TargetRef, operation: "steer",  text: string }
-{ target: TargetRef, operation: "keys",   keys: NamedKey[] }
+{ target: TargetRef, operation: "prompt",    text: string }
+{ target: TargetRef, operation: "steer",     text: string }
+{ target: TargetRef, operation: "keys",      keys: NamedKey[] }
+{ target: TargetRef, operation: "cancel" }
+{ target: TargetRef, operation: "interrupt" }
 ```
 
 Rules:
@@ -174,6 +176,23 @@ Rules:
 - `keys` sends only validated named keys. There is no additional confirmation prompt for keys.
 - After text submission, fresh agent and pane reads form an optional identity-bound observation. Details retain the acknowledgement plus an observation status of `working`, `not_working`, `unknown`, `detection_skipped`, `stale`, or `unavailable`; a missing or replaced post identity omits `postState` and success-row state and may retain only bounded mismatch evidence in the observation. `screen_detection_skipped:true` and an unchanged/older `revision` never downgrade the confirmed submission. No communication operation waits for completion.
 - Every Herdr envelope ID is retained for snapshot, identity, prompt/key, and post-state calls. Details include bounded pre/post state, bounded captured identity-bound submission evidence, observation evidence, and route (`prompt_direct` or `steer_direct`). Keys retain their strict authoritative post-state requirement.
+
+#### Explicit turn control
+
+The public `herdr_communicate` union also accepts exactly these strict variants:
+
+```text
+{ target: TargetRef, operation: "cancel" }
+{ target: TargetRef, operation: "interrupt" }
+```
+
+These variants have no text, keys, delivery, or other fields. Prompt, steer, and named-key behavior is unchanged. Turn-control calls remain sequential in both Pi and MCP hosts.
+
+Turn control is fail-closed and only applies to an authoritative `working` target. After exact snapshot resolution, the extension performs one fresh `herdr agent get` against the resolved pane ID. The snapshot and `agent get` must both report `working`, and their stable identity must match exactly by the snapshot-resolved pane ID, terminal ID, and complete `agentSession` tuple (`source`, `agent`, `kind`, `value`). The fresh `agent get` must carry its own non-empty `pane_id`; the extension never fills that required field from the earlier snapshot. Missing identity is `TARGET_IDENTITY_UNAVAILABLE`; a changed identity is `TARGET_IDENTITY_CHANGED`; a non-working target is `TURN_NOT_ACTIVE`; existing unknown or malformed state errors remain typed and no key is sent.
+
+`cancel` sends exactly one named `esc`. `interrupt` sends exactly one named `ctrl+c`. Neither operation retries, escalates, falls back, focuses a pane, or sends any other key. Each then waits at most the fixed 5,000 ms window for `idle`, `blocked`, `done`, or `unknown`. The final verification is always an independent fresh `api snapshot`, even when the wait fails or the caller aborts after dispatch. Same-agent confirmation requires the original pane/terminal/session identity, a terminal state of `idle`, `blocked`, or `done`, and a strictly advanced `state_change_seq`. When both pre-dispatch reads provide a sequence, fresh `agent get` evidence must not regress below the snapshot baseline; a regressed read is rejected before dispatch, and confirmation binds to the freshest non-regressed sequence. Cancel never treats disappearance as success and returns `CANCEL_UNCONFIRMED` instead. Interrupt may return `agent_exited` only when the dispatch response was acknowledged and the final snapshot proves there is exactly one target-pane record, zero target-agent records, the exact pane and terminal remain under the original tab/workspace, the pane is agent-free `unknown`, and the captured session identity is absent everywhere else. Duplicate target-pane or target-agent records are rejected before the global absence proof. The absence scan covers every recognized session representation on every pane and agent record, including structured and legacy `agent_session`, `agent_session_id`, `session_id`, and two independent flattened alias families (`agent_session_*` and `session_*`); a partial family, matching, malformed, or contradictory evidence fails closed, and fields are never merged across families. The reported reason is `post_dispatch_absence_proven`; it never claims that the key directly caused the exit. Otherwise the operation returns `INTERRUPT_UNCONFIRMED` or the appropriate stable identity/state error.
+
+Abort before key dispatch is `ABORTED`. After dispatch, the dispatch evidence is retained and wait/final verification use independent bounded signals, so a caller abort cannot erase mutation evidence or produce an unverified success. Details for both success and post-dispatch failure include bounded pre/final evidence, phase, reason, dispatch acknowledgement/attempt, operation IDs, control key/window, wait evidence, and the confirmation kind. Compact renderers show only the operation outcome, target ID, and final state; they do not expand this into raw CLI output.
 
 ### `herdr_wait`
 
@@ -440,6 +459,11 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `MANAGER_JUDGMENT_REQUIRED`: reviewer ended the wait early because the result requires manager judgment.
 - `CLI_TIMEOUT`: an individual CLI call exceeded its bounded internal timeout.
 - `CLI_OUTPUT_OVERFLOW`: a CLI call produced more output than the host collects while streaming. The child is killed and the call fails with bounded evidence; output is never silently truncated into a partial envelope.
+- `TURN_NOT_ACTIVE`: explicit cancel/interrupt requires an authoritative working turn.
+- `TARGET_IDENTITY_UNAVAILABLE`: the snapshot or fresh agent read lacks pane, terminal, or complete agent-session identity.
+- `TARGET_IDENTITY_CHANGED`: the stable pane/terminal/session identity changed between the snapshot and fresh agent read or final confirmation.
+- `CANCEL_UNCONFIRMED`: one Escape was dispatched but cancel was not proven; target disappearance is never cancel success.
+- `INTERRUPT_UNCONFIRMED`: one Ctrl-C was dispatched but same-agent termination or the strict agent-exited proof was not established.
 
 `herdr_wait` timeout is a normal structured result with `matched: false`, not `CLI_TIMEOUT`. No error path may substitute a guessed ID, focused pane, fallback model, generic success, or automatic cleanup.
 
@@ -492,6 +516,7 @@ The implementation belongs only under the separate directory below:
 │   ├── settings.ts                 # extension-owned settings validation
 │   ├── wait-review.ts              # bounded, tool-less in-process reviewers
 │   ├── tools/                      # seven tool implementations
+│   │   └── turn-control.ts          # strict cancel/interrupt protocol
 │   └── tui.ts                      # compact call/result/progress rendering
 ├── test/unit/                      # mocked CLI/model unit tests
 └── test/integration/               # disposable named-session tests
@@ -541,6 +566,7 @@ Mock `pi.exec`, CLI stdout/stderr/exit codes, target listings, post-state reads,
 - normal prompt refusal while working;
 - explicit steer submission to idle/done/blocked/working targets with zero interrupt-key calls;
 - named-key validation without confirmation;
+- strict cancel/interrupt variants, snapshot plus fresh-agent identity binding, complete-string identity prefix-collision replacements, independently validated flattened session alias families, exactly-one-key dispatch, fixed wait/final-snapshot sequencing, abort races, state-change confirmation, duplicate-record rejection, disappearance and agent-exited rules, stable errors, bounded evidence, redaction, compact rendering, MCP parity/FIFO, and exact negative disposable integration;
 - wait state semantics, literal/regex matching, any/all, immediate matches, bounded timeout final snapshots, abort, and internal CLI failures;
 - every long-wait reviewer rule, including concurrent one-per-target calls, bounded deltas, no tools, manager-judgment early exit, and immediate reviewer failure;
 - unique launch names, strict profile schemas, typed overrides, startup-timeout margins, real failure-envelope fallback, AgentInfo correlation, initial prompt readiness, post-state reads, and failed-launch retention;
@@ -608,7 +634,7 @@ The feature is complete only when all of the following are true:
 - A Pi process inside Herdr exposes exactly the seven named core tools and no deferred tool.
 - Every target operation uses an exact stable ID/current context, exact pane label, or unique agent name and fails closed otherwise.
 - Inspection has the specified current, single-target, collection, and health behavior.
-- Communication distinguishes normal prompt, explicit steer, and named keys; normal prompt never interrupts a working target; no communication operation waits for completion.
+- Communication distinguishes normal prompt, explicit steer, named keys, cancel, and interrupt; normal prompt never interrupts a working target; steer never synthesizes an interrupt; turn control binds one key to one stable working identity and independently verifies the outcome.
 - Wait supports the specified raw/semantic states, literal/regex output, any/all, explicit one-hour maximum, structured timeout snapshots, and mandatory reviewer supervision for long waits.
 - Reviewer calls are in-process, tool-less, concurrent per target, bounded, non-mutating, fixed at low thinking, use the extension-owned reviewer model (default `openai-codex/gpt-5.6-luna`), and fail immediately without fallback when unavailable.
 - Launch requires a unique caller name and supported kind, uses the specified placement defaults, supports argv without arbitrary executables, verifies initial work, streams progress, and never cleans failed launches.

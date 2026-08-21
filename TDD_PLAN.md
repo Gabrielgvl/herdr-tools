@@ -105,6 +105,7 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Prompt fails while target is working | `communicate_prompt_rejects_working_agent_without_mutation` | A structured precondition failure is returned. | No prompt, interrupt, focus, or confirmation occurs. |
 | Steer submits directly without interruption | `communicate_steer_direct_for_idle_done_blocked_working`; `communicate_steer_never_sends_escape`; `communicate_working_steer_omits_wait_flags` | Idle/done/blocked/working steer submits exactly once through `agent prompt --stdin`; working input is interpreted by the target agent TUI and uses no wait flags. | Unknown/malformed state sends zero bytes; no steer path sends Escape, Enter, duplicate text, or waits for settlement. |
 | Prompt/steer separate atomic acknowledgement from observation | `communicate_prompt_verifies_working_without_waiting_completion`; `communicate_steer_verifies_working_without_waiting_completion`; strict identity mismatch/missing/replacement cases; `communicate_replacement_post_state_is_not_authoritative` | Fresh snapshot plus agent-get/pane evidence must establish exact pane/terminal/name/kind and complete `agent_session`; one typed `agent_prompted` response with that exact identity confirms acceptance; paired post-reads may report working, non-working, skipped, stale, or unavailable. | Missing, malformed, contradictory, or replaced identity sends zero prompt bytes; a replaced post-state is absent from `postState` and the success row and survives only as bounded mismatch evidence; normal prompt refuses working; steer submits directly; neither waits for completion, retries, or sends Enter. |
+| Explicit turn control is strict and identity-bound | `turn_control_schema_is_strict`; `turn_control_requires_working_snapshot_and_agent_get`; `turn_control_requires_exact_stable_identity`; `turn_control_dispatches_exactly_one_control_key`; `turn_control_waits_fixed_window_and_always_final_snapshots`; `turn_control_confirms_advanced_same_agent_state`; `cancel_disappearance_is_unconfirmed`; `interrupt_agent_exit_requires_strict_absence_proof`; `turn_control_abort_before_dispatch_is_aborted`; `turn_control_abort_after_dispatch_preserves_evidence`; `turn_control_errors_are_stable`; `turn_control_mcp_schema_and_fifo_parity`; `turn_control_rendering_and_redaction_are_bounded`; `turn_control_disposable_integration` | `cancel` sends exactly one `esc`; `interrupt` sends exactly one `ctrl+c` only after both authoritative reads prove the same working pane/terminal/full session identity. A fixed 5,000 ms wait and independent final snapshot confirm a terminal same agent or the narrowly proven interrupt `agent_exited` state. | No extra fields, retries, escalation, fallback, focus, synthetic causality, cancel-on-disappearance, or generic success is possible. Abort before dispatch is `ABORTED`; after dispatch, independent bounded verification retains evidence.
 | Communicate uses named keys and no confirmation | `communicate_uses_named_keys_only`; `communicate_never_calls_confirmation_ui` | Only caller-requested validated named keys are sent. | No synthesized Escape, raw control bytes, arbitrary key bytes, or UI confirmation is sent. |
 | Wait supports single and multi-target any/all | `wait_supports_single_target`; `wait_multi_target_any_returns_first_match`; `wait_multi_target_all_waits_for_every_match` | The matching target set and snapshots are returned. | Any does not wait for unrelated targets; all does not return before every target matches. |
 | Wait supports semantic and raw conditions | `wait_matches_semantic_condition`; `wait_matches_raw_literal`; `wait_matches_raw_regex`; `wait_combines_raw_and_semantic_conditions` | A condition is satisfied only by the requested predicate. | Status is not inferred from text, and literal matching is not accidentally regex matching. |
@@ -483,6 +484,40 @@ uses the validated snapshot captured at its start.
 - `communicate_does_not_prompt_after_resolution_failure`
 - `communicate_completion_race_returns_verified_working_or_truthful_error`
 
+### `turn-control.test.ts` / explicit cancel and interrupt
+
+- `turn_control_schema_is_strict`
+- `turn_control_requires_working_snapshot_and_agent_get`
+- `turn_control_requires_exact_stable_identity`
+- `turn_control_requires_fresh_agent_get_pane_id_without_snapshot_fallback`
+- `turn_control_rejects_identity_change_before_dispatch`
+- `turn_control_rejects_regressed_fresh_sequence_before_dispatch`
+- `turn_control_dispatches_exactly_one_escape_for_cancel`
+- `turn_control_dispatches_exactly_one_ctrl_c_for_interrupt`
+- `turn_control_waits_for_idle_blocked_done_or_unknown_with_fixed_5000ms_window`
+- `turn_control_always_performs_independent_final_snapshot_after_wait_failure`
+- `turn_control_confirms_same_agent_only_with_advanced_state_change_seq`
+- `cancel_disappearance_is_cancel_unconfirmed`
+- `interrupt_agent_exited_requires_acknowledged_dispatch_and_strict_absence`
+- `interrupt_absence_scan_rejects_flattened_legacy_and_malformed_session_evidence`
+- `interrupt_does_not_claim_causality`
+- `turn_control_abort_before_dispatch_is_aborted`
+- `turn_control_abort_after_dispatch_uses_independent_verification`
+- `turn_control_abort_after_successful_dispatch_retains_evidence_and_final_snapshot`
+- `turn_control_never_retries_or_escalates`
+- `turn_control_details_are_bounded_and_rendered_compactly`
+- `turn_control_mcp_schema_matches_pi_and_fifo_serializes_calls`
+- `turn_control_evidence_is_redacted`
+
+The fixture carries pane ID, terminal ID, and the complete `{source, agent, kind,
+value}` session object in both the snapshot and `agent get` response. Fresh
+`agent get` fixtures also vary missing and mismatched pane IDs, and sequence
+fixtures cover snapshot 10/fresh 9/final 10 without dispatch plus binding to the
+freshest non-regressed sequence. Tests vary state, identity, wait failure,
+caller abort timing, pane movement, replacement agents, disappeared panes,
+legacy/flattened/malformed session evidence, and agent-free unknown panes. The
+operation key call count must remain exactly one in every dispatched case.
+
 ### `wait-predicates.test.ts`, `wait-orchestration.test.ts`, and `herdr_wait`
 
 - `wait_supports_single_target`
@@ -676,30 +711,37 @@ refactor while all prior tests remain green.
    preconditions, direct steer submission without synthesized interrupt keys,
    authoritative working verification, envelope correlation, no completion wait,
    and no UI confirmation. Reuse the same envelope for launch initial assignments.
-6. **Pane/tab creation.** Implement required labels, right/down direction,
+6. **Explicit turn control.** Add the strict cancel/interrupt schema variants and
+   internal turn-control module. Bind each one-key dispatch to the snapshot plus
+   fresh `agent get` identity, require `working`, wait only within the fixed 5,000
+   ms window, always take an independent final snapshot, and prove either an
+   advanced same-agent terminal state or the narrow interrupt agent-exited state.
+   Cover abort, wait failure, disappearance, replacement, redaction, rendering,
+   MCP parity/FIFO, and disposable-session evidence before topology work.
+7. **Pane/tab creation.** Implement required labels, right/down direction,
    explicit focus, current cwd/workspace defaults, returned IDs, post-reads, and
    no implicit-close behavior.
-7. **Close reliability.** Add current-session resource bookkeeping and lifecycle
+8. **Close reliability.** Add current-session resource bookkeeping and lifecycle
    clearing, protected topology validation, sequential mutation registration,
    completed-mutation preservation, fresh post-readback, reconciliation, and
    typed uncertainty; keep caller resources protected and never retry a lost close.
-8. **Launch.** Add known kind validation, unique name preflight, exact argv/env
+9. **Launch.** Add known kind validation, unique name preflight, exact argv/env
    passing, default label/placement, new-tab/existing-pane choices, ready prompt,
    working verification, and no cleanup.
-9. **Wait predicates and polling.** Add semantic/raw literal/raw regex
+10. **Wait predicates and polling.** Add semantic/raw literal/raw regex
    conjunctions, single/multi target any/all, explicit bounded timeout, latest
    snapshots, authoritative polling, partial failures, and cancellation.
-10. **Mandatory reviewer and config sampling.** Add extension-owned
+11. **Mandatory reviewer and config sampling.** Add extension-owned
     `config.json` defaults/validation and per-wait snapshot semantics, then add
     the one-per-target tool-less in-process reviewer, bounded deltas, concurrent
     uncapped fan-out, terminal findings, reviewer failure, and reviewer
     cancellation races.
-11. **Results and renderers.** Add structured success/error/partial/timeout/
+12. **Results and renderers.** Add structured success/error/partial/timeout/
     cancelled details, compact call/result renderers, expansion, bounded output,
     and partial-progress behavior.
-12. **Disposable integration.** Run the named Herdr session procedure below. Add
+13. **Disposable integration.** Run the named Herdr session procedure below. Add
     only integration assertions not reliable with fakes; do not weaken unit tests.
-13. **Final gates and bounded refactor.** Run the configured test, coverage,
+14. **Final gates and bounded refactor.** Run the configured test, coverage,
     build, and lint commands. Stop after the agreed final review pass; record any
     remaining issue as a deviation/escalation rather than starting an endless
     review/fix loop.

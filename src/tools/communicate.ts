@@ -9,13 +9,14 @@ import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext } from "../targets.js";
+import { executeTurnControl, type TurnControlDetails } from "./turn-control.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
 export type CommunicateRoute = "prompt_direct" | "steer_direct";
 export type CommunicateState = "idle" | "working" | "blocked" | "done" | "unknown";
 export type CommunicatePhase = "validate" | "resolve_target" | "verify_recipient" | "pre_state" | "publish" | "send" | "post_state";
 
-export interface CommunicateDetails {
+export interface LegacyCommunicateDetails {
   operation: "prompt" | "steer" | "keys";
   outcome: "sent";
   target: { paneId?: string; tabId?: string; workspaceId?: string; label?: string; agentName?: string };
@@ -38,6 +39,8 @@ export interface CommunicateDetails {
   envelope?: { version: "v1"; kind: "prompt" | "steer"; delivery: MessageDelivery };
   attachment?: { attachmentId: string; path: string; bytes: number; sha256: string; expiresAt: string; recipientPaneId?: string };
 }
+
+export type CommunicateDetails = LegacyCommunicateDetails | TurnControlDetails;
 
 export interface CommunicateDependencies {
   cli: HerdrCli;
@@ -135,13 +138,17 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
   return {
     name: "herdr_communicate",
     label: "Herdr Communicate",
-    description: "Send a normal prompt, explicitly steer, or send validated named keys to an exact Herdr agent target.",
+    description: "Send a normal prompt, explicitly steer, send validated named keys, or perform strict cancel/interrupt turn control on an exact Herdr agent target.",
     executionMode: "sequential",
     parameters: CommunicateParamsSchema,
     async execute(_id, params: CommunicateParams, signal, _onUpdate, ctx) {
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
+      if (params.operation === "cancel" || params.operation === "interrupt") {
+        return executeTurnControl(params, { cli: deps.cli, context: deps.context, preflight: deps.preflight }, activeSignal);
+      }
       // Establish the route before any precondition so every refusal names it.
-      const delivery: MessageDelivery | undefined = params.operation === "keys" ? undefined : (params.delivery === "attachment" ? "attachment" : "inline");
+      const legacyParams = params as Exclude<CommunicateParams, { operation: "cancel" | "interrupt" }>;
+      const delivery: MessageDelivery | undefined = legacyParams.operation === "keys" ? undefined : (legacyParams.delivery === "attachment" ? "attachment" : "inline");
       let prompt: JsonEnvelope | undefined;
       let keys: JsonEnvelope | undefined;
       let route: CommunicateRoute | undefined;
@@ -161,26 +168,26 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       let submission: PromptSubmissionEvidence | undefined;
       let observation: PromptObservation | undefined;
       try {
-        if (params.operation === "keys") {
-          if (Object.prototype.hasOwnProperty.call(params, "delivery")) throw Object.assign(new Error("delivery is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "delivery" } });
-          if (params.keys.some((key) => !isNamedKey(key))) {
+        if (legacyParams.operation === "keys") {
+          if (Object.prototype.hasOwnProperty.call(legacyParams, "delivery")) throw Object.assign(new Error("delivery is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "delivery" } });
+          if (legacyParams.keys.some((key) => !isNamedKey(key))) {
             throw Object.assign(new Error("Unsupported named key"), { code: "KEY_REJECTED" });
           }
         } else {
-          assertMessageText(params.text);
-          if (params.delivery !== undefined && params.delivery !== "inline" && params.delivery !== "attachment") throw Object.assign(new Error("delivery must be inline or attachment"), { code: "INVALID_INPUT", details: { field: "delivery" } });
-          assertDeliverySize(params.text, delivery!);
+          assertMessageText(legacyParams.text);
+          if (legacyParams.delivery !== undefined && legacyParams.delivery !== "inline" && legacyParams.delivery !== "attachment") throw Object.assign(new Error("delivery must be inline or attachment"), { code: "INVALID_INPUT", details: { field: "delivery" } });
+          assertDeliverySize(legacyParams.text, delivery!);
         }
 
         phase = "resolve_target";
         await deps.preflight(activeSignal);
         snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], activeSignal);
         const snapshot = parseSnapshotResult(snapshotEnvelope.result);
-        sender = params.operation === "keys" ? undefined : resolveSender(snapshot, deps.context.paneId);
-        if (sender && (params.target === "current" || params.target === sender.paneId)) {
+        sender = legacyParams.operation === "keys" ? undefined : resolveSender(snapshot, deps.context.paneId);
+        if (sender && (legacyParams.target === "current" || legacyParams.target === sender.paneId)) {
           throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: sender.paneId } });
         }
-        target = resolveTarget(snapshot, params.target, "agent", deps.context);
+        target = resolveTarget(snapshot, legacyParams.target, "agent", deps.context);
         if (sender && target.paneId === sender.paneId) {
           throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: target.paneId } });
         }
@@ -207,7 +214,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
         before = paneFrom(preEnvelope.result, target.paneId!);
         const beforeState = assertSendableState(before);
-        if (params.operation === "prompt" && beforeState === "working") {
+        if (legacyParams.operation === "prompt" && beforeState === "working") {
           throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: target.paneId, state: beforeState } });
         }
         if (params.operation !== "keys") {
@@ -218,26 +225,26 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           ], target.paneId!);
         }
 
-        if (params.operation === "keys") {
+        if (legacyParams.operation === "keys") {
           phase = "send";
-          keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...params.keys], activeSignal);
+          keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...legacyParams.keys], activeSignal);
         } else {
-          route = params.operation === "steer" ? "steer_direct" : "prompt_direct";
+          route = legacyParams.operation === "steer" ? "steer_direct" : "prompt_direct";
           if (delivery === "attachment") {
             phase = "publish";
             published = await deps.attachments!.publish({
-              body: params.text,
+              body: legacyParams.text,
               recipientKey: recipientKey!,
               recipientPaneId: target.paneId,
               recipientAgentName,
               senderPaneId: sender!.paneId,
               senderDisplay: sender!.display,
-              operation: params.operation
+              operation: legacyParams.operation
             });
           }
           const envelope = delivery === "attachment"
-            ? buildEnvelope(sender!, params.operation, params.text, "attachment", { ...published!, encoding: "utf-8" })
-            : buildEnvelope(sender!, params.operation, params.text, "inline");
+            ? buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "attachment", { ...published!, encoding: "utf-8" })
+            : buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "inline");
           const promptArgs = ["agent", "prompt", target.paneId!, "--stdin"];
           phase = "send";
           // The stdin command is a completed mutation once its response arrives.
@@ -294,7 +301,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       }
 
       const details: CommunicateDetails = {
-        operation: params.operation,
+        operation: legacyParams.operation,
         outcome: "sent",
         target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName },
         ...(delivery ? { delivery } : {}),
@@ -312,16 +319,16 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           ...(postAgentEnvelope ? { postAgentGet: operationId(postAgentEnvelope) } : {}),
           ...(postEnvelope ? { postState: operationId(postEnvelope) } : {})
         },
-        ...(params.operation !== "keys" ? {
+        ...(legacyParams.operation !== "keys" ? {
           sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
-          envelope: { version: "v1" as const, kind: params.operation, delivery: delivery! },
+          envelope: { version: "v1" as const, kind: legacyParams.operation, delivery: delivery! },
           ...(published ? { attachment: published } : {})
         } : {})
       };
       return { content: [{ type: "text", text: formatResult({ operation: "communicate", outcome: "success", targetId: target.paneId, delivery, ...(afterState === undefined ? {} : { postState: { agent_status: afterState } }) }) }], details };
     },
     renderCall(args, theme) {
-      const delivery = args.operation === "keys" ? undefined : args.delivery ?? "inline";
+      const delivery = args.operation === "keys" || args.operation === "cancel" || args.operation === "interrupt" ? undefined : args.delivery ?? "inline";
       return textComponent(formatCall("herdr_communicate", delivery ? `${args.operation} · ${delivery}` : args.operation, args.target), theme, "accent");
     },
     renderResult(result, options, theme) {

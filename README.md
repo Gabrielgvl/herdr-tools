@@ -70,6 +70,8 @@ The cadence is an integer from 1 through 30. A configured reviewer uses fixed `l
 herdr_inspect({"mode":"context"})
 herdr_inspect({"mode":"target","target":"worker-id"})
 herdr_communicate({"target":"worker-id","operation":"prompt","text":"Continue the implementation"})
+herdr_communicate({"target":"worker-id","operation":"cancel"})
+herdr_communicate({"target":"worker-id","operation":"interrupt"})
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000})
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000,"label":"worker review","runInBackground":true})
 herdr_jobs({"operation":"list","status":"running"})
@@ -81,6 +83,8 @@ herdr_tab({"operation":"create","label":"review"})
 Targets are exact opaque IDs, `current`, exact pane labels, or unique exact agent names where the operation permits. No focused-pane, prefix, display-number, or fuzzy fallback exists. Launch and topology mutations return authoritative post-state, and failed launches retain any resources already created for manual handling.
 
 Communication prompts and launch initial prompts always include the visible `[HERDR AGENT MESSAGE v1]` sender envelope; the caller payload remains unchanged after the envelope blank line. Named-key delivery is not wrapped, and there is no provenance opt-out.
+
+`herdr_communicate` also supports the strict turn-control variants `{"target":"worker","operation":"cancel"}` and `{"target":"worker","operation":"interrupt"}`. They accept no extra fields, require the same authoritative working pane/terminal/full agent-session identity across a snapshot and fresh `agent get`, send exactly one `esc` or `ctrl+c`, wait within the fixed 5,000 ms window, and always perform an independent final snapshot. Same-agent confirmation requires an advanced `state_change_seq`; cancel disappearance is `CANCEL_UNCONFIRMED`. Interrupt can report `agent_exited` only from acknowledged dispatch plus strict agent-free absence proof, reported as `post_dispatch_absence_proven` rather than direct causality. No retries or fallback are used.
 
 Detached waits show a live Pi footer status with active count and oldest elapsed time. Run `/herdr-waits` to toggle the read-only active-wait widget; each row shows its label, elapsed time, and exact job ID for `herdr_jobs` inspection or cancellation. Labels are optional and are derived from targets plus condition when omitted.
 
@@ -108,7 +112,7 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `herdr-profiles/role-plugins/manager/` is the self-contained Claude manager plugin: a stable `herdr-tools` manifest, the `herdr` stdio server map, and the shared `skills/manager/SKILL.md`. It carries the local MCP registration and manager conduct, while the profile keeps permissions explicit and owner-gated.
 - `src/cli.ts` bounds and validates CLI responses.
 - `src/targets.ts` resolves exact targets and injected current context.
-- `src/tools/` contains the seven public tools. Profile discovery and typed Pi/Claude adapters live under `src/profiles/`; `herdr_launch` is strict profile-only: no profile, no launch.
+- `src/tools/` contains the seven public tools. `src/tools/turn-control.ts` owns the internal identity-bound cancel/interrupt protocol. Profile discovery and typed Pi/Claude adapters live under `src/profiles/`; `herdr_launch` is strict profile-only: no profile, no launch.
 - `src/reviewer.ts` contains the tool-less in-process model reviewer used by long waits.
 - `src/wait-jobs-ui.ts` owns session-scoped footer/widget rendering for active detached waits.
 - `src/tui.ts` uses Pi `Text` components with bounded semantic rows.

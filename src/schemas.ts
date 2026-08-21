@@ -21,14 +21,18 @@ const MessageText = Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" });
 export const CommunicateParamsSchema = Type.Union([
   Type.Object({ target: Identifier, operation: Type.Literal("prompt"), text: MessageText, delivery: Type.Optional(Delivery) }, { additionalProperties: false }),
   Type.Object({ target: Identifier, operation: Type.Literal("steer"), text: MessageText, delivery: Type.Optional(Delivery) }, { additionalProperties: false }),
-  Type.Object({ target: Identifier, operation: Type.Literal("keys"), keys: Type.Array(NamedKey, { minItems: 1 }) }, { additionalProperties: false })
+  Type.Object({ target: Identifier, operation: Type.Literal("keys"), keys: Type.Array(NamedKey, { minItems: 1 }) }, { additionalProperties: false }),
+  Type.Object({ target: Identifier, operation: Type.Literal("cancel") }, { additionalProperties: false }),
+  Type.Object({ target: Identifier, operation: Type.Literal("interrupt") }, { additionalProperties: false })
 ]);
 
 export type InspectParams = { mode?: "context" | "target" | "collection" | "profile" | "health"; target?: string; collection?: "panes" | "agents" | "tabs" | "profiles"; profile?: string };
+export type TurnControlOperation = "cancel" | "interrupt";
 export type CommunicateParams =
   | { target: string; operation: "prompt"; text: string; delivery?: MessageDelivery }
   | { target: string; operation: "steer"; text: string; delivery?: MessageDelivery }
-  | { target: string; operation: "keys"; keys: string[] };
+  | { target: string; operation: "keys"; keys: string[] }
+  | { target: string; operation: TurnControlOperation };
 
 const SUPPORTED_NAMED_KEY_SET = new Set<string>(SUPPORTED_NAMED_KEYS);
 export function isNamedKey(value: string): boolean {

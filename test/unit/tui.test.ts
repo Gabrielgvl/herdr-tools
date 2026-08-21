@@ -9,6 +9,9 @@ describe("compact tool rows", () => {
     expect(formatResult({ operation: "communicate", outcome: "error", code: "TARGET_BUSY", targetId: "w1:p2" })).toBe("error TARGET_BUSY · w1:p2");
     expect(formatResult({ operation: "communicate", outcome: "error", code: "CLI_INCOMPATIBLE", delivery: "attachment", targetId: "w1:p2" })).toBe("error CLI_INCOMPATIBLE · attachment · w1:p2");
     expect(formatResult({ operation: "communicate", outcome: "success", targetId: "w1:p2", postState: { agent_status: "working" } })).toBe("sent · w1:p2 · working");
+    expect(formatResult({ operation: "communicate", outcome: "cancelled", targetId: "w1:p2", postState: { agent_status: "idle" } })).toBe("cancelled · w1:p2 · idle");
+    expect(formatResult({ operation: "communicate", outcome: "interrupted", targetId: "w1:p2", postState: { agent_status: "blocked" } })).toBe("interrupted · w1:p2 · blocked");
+    expect(formatResult({ operation: "communicate", outcome: "agent_exited", targetId: "w1:p2", postState: { agent_status: "unknown" } })).toBe("agent_exited · w1:p2 · unknown");
   });
 
   it("uses Pi components that wrap to narrow widths and keep every line bounded", () => {
@@ -27,6 +30,8 @@ describe("compact tool rows", () => {
     expect(resultForRender("wait", {}, {})).toEqual({ text: "error UNKNOWN", tone: "error" });
     expect(resultForRender("wait", { isError: true, details: { code: "REVIEWER_FAILED" } })).toEqual({ text: "error REVIEWER_FAILED", tone: "error" });
     expect(resultForRender("communicate", { details: { outcome: "success", delivery: "attachment" } })).toEqual({ text: "sent · attachment", tone: "success" });
+    expect(resultForRender("communicate", { details: { outcome: "cancelled", postState: { agent_status: "idle" } } }, {}, "p2")).toEqual({ text: "cancelled · p2 · idle", tone: "success" });
+    expect(resultForRender("communicate", { details: { outcome: "agent_exited", postState: { agent_status: "unknown" } } }, {}, "p2")).toEqual({ text: "agent_exited · p2 · unknown", tone: "warning" });
     expect(resultForRender("communicate", { isError: true, details: { code: "CLI_TIMEOUT", delivery: "attachment" } }, {}, "p2")).toEqual({ text: "error CLI_TIMEOUT · attachment · p2", tone: "error" });
     expect(resultForRender("launch", { isError: true, details: { code: "LAUNCH_FAILED", delivery: "inline" } })).toEqual({ text: "error LAUNCH_FAILED · inline", tone: "error" });
     expect(resultForRender("wait", { isError: true })).toEqual({ text: "error UNKNOWN", tone: "error" });

@@ -10,6 +10,7 @@ import { createPreflight, createToolSurface, CORE_TOOL_NAMES, type HerdrToolDefi
 import { AdapterContractError, HERDR_DETAILS_LABEL, MCP_RESULT_MAX_BYTES, callTool, describeTools, publishedInputSchema, type McpCallOutcome } from "../../src/mcp/adapter.js";
 import { HostCapabilityError } from "../../src/mcp/host.js";
 import { SequentialToolQueue } from "../../src/mcp/queue.js";
+import { CommunicateParamsSchema } from "../../src/schemas.js";
 
 const health = { client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "0.8.0", protocol: 19, compatible: true } };
 const snapshot = {
@@ -147,6 +148,9 @@ describe("MCP published schema parity", () => {
       ["herdr_inspect", { collection: "panes" }, false],
       ["herdr_inspect", { mode: "context", extra: true }, false],
       ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi" }, true],
+      ["herdr_communicate", { target: "w:p2", operation: "cancel" }, true],
+      ["herdr_communicate", { target: "w:p2", operation: "interrupt" }, true],
+      ["herdr_communicate", { target: "w:p2", operation: "cancel", extra: true }, false],
       ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi", keys: ["enter"] }, false],
       ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["enter"], text: "hi" }, false],
       ["herdr_jobs", { operation: "list" }, true],
@@ -535,7 +539,56 @@ describe("MCP model-boundary redaction", () => {
   });
 });
 
+describe("MCP turn-control redaction", () => {
+  it("redacts environment-shaped turn evidence before publication", async () => {
+    const outcome = await call(stub({
+      execute: async () => ({
+        content: [{ type: "text", text: "cancelled" }],
+        details: {
+          operation: "cancel",
+          outcome: "cancelled",
+          preEvidence: { pane_id: "p1", agent_status: "working", environment: { SECRET: "turn-secret" } },
+          finalEvidence: { pane_id: "p1", agent_status: "idle", history: [{ env_vars: { SECRET: "nested-turn-secret" } }] }
+        }
+      })
+    }));
+    const text = outcome.content.map((block) => block.text).join("\n");
+    expect(text).not.toContain("turn-secret");
+    expect(text).not.toContain("nested-turn-secret");
+    expect(text).toContain("agent_status");
+  });
+});
+
 describe("MCP sequential execution", () => {
+  it("keeps cancel and interrupt in the shared FIFO communication lane", async () => {
+    const order: string[] = [];
+    const waiting: Array<() => void> = [];
+    const surface: { definitions: HerdrToolDefinition[] } = { definitions: [{
+      name: "herdr_communicate",
+      label: "Herdr Communicate",
+      description: "turn control",
+      executionMode: "sequential",
+      parameters: CommunicateParamsSchema,
+      async execute(_id, args) {
+        order.push((args as { operation: string }).operation);
+        await new Promise<void>((resolve) => waiting.push(resolve));
+        return { content: [{ type: "text" as const, text: "done" }], details: { operation: (args as { operation: string }).operation } };
+      }
+    }] };
+    const queue = new SequentialToolQueue();
+    const first = callTool({ surface, name: "herdr_communicate", args: { target: "p1", operation: "cancel" }, host, callId: "cancel", queue });
+    await vi.waitFor(() => expect(order).toEqual(["cancel"]));
+    const second = callTool({ surface, name: "herdr_communicate", args: { target: "p1", operation: "interrupt" }, host, callId: "interrupt", queue });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(order).toEqual(["cancel"]);
+    waiting.shift()?.();
+    await vi.waitFor(() => expect(order).toEqual(["cancel", "interrupt"]));
+    waiting.shift()?.();
+    const firstOutcome = await first;
+    const secondOutcome = await second;
+    expect(firstOutcome.isError).toBeUndefined();
+    expect(secondOutcome.isError).toBeUndefined();
+  });
   function overlapping(name: string, executionMode?: "sequential"): { definitions: HerdrToolDefinition[]; active: () => number; started: () => number; peak: () => number; release: () => void } {
     let active = 0;
     let started = 0;

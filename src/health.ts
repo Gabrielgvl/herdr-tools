@@ -15,6 +15,7 @@ export type CompatibilityPreflight = (signal: AbortSignal) => Promise<void>;
 
 export const MAX_HEALTH_VERSION_LENGTH = 128;
 export const MAX_HEALTH_STATUS_LENGTH = 64;
+export const REQUIRED_HERDR_PROTOCOL = 20;
 
 function validVersion(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_HEALTH_VERSION_LENGTH;
@@ -53,6 +54,7 @@ export function parseHealth(text: string): HealthDetails {
   const compatible = serverRecord.compatible === null ? undefined : serverRecord.compatible;
   if (!validVersion(clientRecord.version) || !validProtocol(clientRecord.protocol) || !validStatus(status)) throw incompatibleHealth();
   if ((serverVersion !== undefined && !validVersion(serverVersion)) || (serverProtocol !== undefined && !validProtocol(serverProtocol)) || (compatible !== undefined && typeof compatible !== "boolean")) throw incompatibleHealth();
+  if (clientRecord.protocol !== REQUIRED_HERDR_PROTOCOL || (serverProtocol !== undefined && serverProtocol !== REQUIRED_HERDR_PROTOCOL)) throw incompatibleHealth();
   if (status === "running" && (serverVersion === undefined || serverProtocol === undefined || typeof compatible !== "boolean")) throw incompatibleHealth();
   return {
     client: { version: clientRecord.version, protocol: clientRecord.protocol },
@@ -79,6 +81,7 @@ function safeHealthDetails(value: unknown): HealthDetails | undefined {
   const serverProtocol = serverRecord.protocol;
   const compatible = root.compatible;
   if (!validVersion(clientRecord.version) || !validProtocol(clientRecord.protocol) || !validStatus(status) || (serverVersion !== undefined && !validVersion(serverVersion)) || (serverProtocol !== undefined && !validProtocol(serverProtocol)) || (compatible !== undefined && typeof compatible !== "boolean") || typeof root.socketReachable !== "boolean") return undefined;
+  if (clientRecord.protocol !== REQUIRED_HERDR_PROTOCOL || (serverProtocol !== undefined && serverProtocol !== REQUIRED_HERDR_PROTOCOL)) return undefined;
   return {
     client: { version: clientRecord.version, protocol: clientRecord.protocol },
     server: {
@@ -128,9 +131,6 @@ export async function preflightCompatibility(cli: HealthCli, signal: AbortSignal
     throw mapPreflightFailure(error);
   }
   if (!health.socketReachable) throw new CliProtocolError("BACKEND_UNAVAILABLE", "Herdr backend is unavailable", safePreflightDetails({ health }));
-  if (health.compatible === true && health.server.protocol !== health.client.protocol) {
-    throw new CliProtocolError("CLI_INCOMPATIBLE", "Herdr CLI and backend report contradictory protocol compatibility", safePreflightDetails({ health }));
-  }
   if (health.compatible !== true) throw new CliProtocolError("CLI_INCOMPATIBLE", "Herdr CLI and backend are incompatible", safePreflightDetails({ health }));
   return health;
 }

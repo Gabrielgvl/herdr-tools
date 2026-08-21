@@ -4,6 +4,12 @@
 
 Accepted; partially supersedes ADR-006
 
+> **Partial supersession:** Prompt-observation and Enter-recovery behavior is
+> superseded by `docs/decisions/013-prompt-submission-acknowledgement.md`
+> (ADR-013: Separate prompt submission acknowledgement from working-state
+> observation). This ADR remains authoritative for profile-only launch and
+> bounded fallback.
+
 ## Date
 
 2026-08-10

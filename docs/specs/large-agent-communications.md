@@ -84,9 +84,10 @@ No text delivery uses `--wait`, `--until`, or a synthesized Enter. For
 are the complete identity source: one strict join must establish the exact pane ID,
 terminal ID, agent name/kind, and complete `agent_session`, while every supplied field
 must agree and omitted/null fields remain absent. For `herdr_launch.initialPrompt`,
-real Herdr 0.8.2 `agent_started` records may omit identity fields. Launch therefore
-runs one bounded, read-only identity-readiness preflight (target approximately five
-seconds with short polling) before dispatch or recipient registration. Every sample
+real Herdr protocol 20 `agent_started` records may omit identity fields. Launch
+therefore runs one bounded, read-only identity-readiness preflight (target
+approximately five seconds with short polling) before dispatch or recipient
+registration. Every sample
 freshly reads snapshot, `agent get`, and pane, and joins that single coherent sample
 only with fields actually supplied by `agent_started`; no missing component is
 carried from an earlier sample. A complete start field may cover a fresh omission,
@@ -337,7 +338,10 @@ before every attachment send.
   acknowledgement without changing its confirmed status. `postState` and the
   success-row state are emitted only when the full identity still matches; a
   replacement is omitted from authoritative fields and appears only as bounded
-  mismatch evidence. Named keys retain strict authoritative post-state verification.
+  mismatch evidence. Named keys remain a separate lower-level raw dispatch
+  escape hatch, including `esc`, `escape`, and `ctrl+c`; they do not claim the
+  verified cancel/interrupt semantic or causal contract and are not routed
+  through it.
 - Order for an attachment send: preflight → snapshot → sender → target →
   capability recheck → pre-state → publish → prompt over `--stdin` → post-state.
 - `details` gains `delivery`, `envelope.delivery`, `submission`, `observation`, and
@@ -367,8 +371,10 @@ before every attachment send.
 - Storage happens before topology mutation, matching ADR-006: resolve profile →
   check capability → create prompt source → mint recipient key and directory →
   publish attachment → build argv (including the Claude `--add-dir` grant) → create
-  pane/tab → start agent and require its complete 0.8.2 identity envelope → join
-  a fresh snapshot plus `agent get` plus pane identity → send exactly one
+  pane/tab → start agent and validate only the identity fields supplied by
+  `agent_started` → run the bounded protocol-20 identity-readiness preflight
+  until one coherent fresh snapshot plus `agent get` plus pane identity is
+  complete → send exactly one
   identity-bound envelope over `--stdin` → validate the typed `agent_prompted`
   acknowledgement → optionally observe the paired agent/pane state. The fresh joined
   identity is mandatory even when no initial prompt is requested, and the same full

@@ -51,7 +51,7 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 
 const { runHerdrMcpServer, packageRoot, refusalLine, fatalLine, MCP_SERVER_NAME } = await import("../../src/mcp/run.js");
 
-const health = { client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "0.8.0", protocol: 19, compatible: true } };
+const health = { client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true } };
 const snapshot = {
   type: "session_snapshot",
   snapshot: {

@@ -4,6 +4,11 @@
 
 Accepted
 
+> **Partial supersession:** Any historical prompt-observation or Enter-recovery
+> wording is superseded by `docs/decisions/013-prompt-submission-acknowledgement.md`
+> (ADR-013: Separate prompt submission acknowledgement from working-state
+> observation). This ADR remains authoritative for active wait visibility.
+
 ## Date
 
 2026-08-11

@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted; supersedes the prompt-observation and Enter-recovery portions of ADR-004, ADR-007, and ADR-008
+Accepted; supersedes only the prompt-observation and Enter-recovery portions of the following decisions:
+
+- `docs/decisions/004-direct-prompt-steering.md` — ADR-004: Steer by direct prompt submission
+- `docs/decisions/007-active-wait-job-visibility.md` — ADR-007: Show active wait jobs in Pi's footer and a toggleable widget
+- `docs/decisions/008-profile-only-launch-and-bounded-fallback.md` — ADR-008: Make Herdr launch profile-only with bounded fallback
+
+Those files retain their unrelated active decisions. This file is authoritative
+for prompt acknowledgement and optional post-observation.
 
 ## Date
 
@@ -22,13 +29,13 @@ The previous Tools recovery pressed Enter after a typed stall. That could duplic
 
 ## Decision
 
-`herdr_communicate` prompt and steer, and `herdr_launch.initialPrompt`, use exactly one `herdr agent prompt <pane> --stdin` call without `--wait`, `--until`, or an extension-generated Enter.
+`herdr_communicate` prompt and steer, and `herdr_launch.initialPrompt`, use exactly one `herdr agent prompt <pane> --stdin` call without `--wait`, `--until`, or an extension-generated Enter. The health preflight gates this contract to Herdr protocol 20 on the client and running server; older protocols are incompatible and cannot reach prompt mutation.
 
 Before every text submission, the extension reads fresh snapshot, `agent get`, and pane evidence. For `herdr_communicate`, there is no start envelope: those fresh records are the complete identity source after one strict join, and their supplied fields must agree. For `herdr_launch.initialPrompt`, real Herdr 0.8.2 may omit identity fields from `agent_started` and immediate fresh records, so launch runs one bounded, read-only identity-readiness preflight (target approximately five seconds with short polling) before stdin or recipient registration. Each sample reads all three fresh sources and is joined only with identity fields actually supplied by `agent_started`; no missing component is carried from an earlier sample. A complete start field may cover a fresh omission, but a missing start session must be supplied by one sample. In both paths the resulting identity is exact: pane ID, terminal ID, agent name, agent kind, and the complete `agent_session` object (`source`, `agent`, `kind`, and `value`). Contradictory supplied data fails immediately; timeout or caller abort fails closed with bounded evidence. This readiness window is not a prompt retry: stdin remains zero or one submission, with no Enter, runtime hook, fallback, or duplicate bytes.
 
 ### Start-envelope source of truth
 
-The installed Herdr 0.8.2 `cli:agent:start` envelope was captured during disposable
+The installed Herdr protocol 20 `cli:agent:start` envelope was captured during disposable
 session verification. Its `result.agent` record normally supplies `pane_id`,
 `terminal_id`, `name`, `agent` (the runtime kind), and the complete `agent_session`
 object with `source`, `agent`, `kind`, and `value` (the live Pi source is `herdr:pi`;
@@ -62,9 +69,9 @@ The acknowledgement is compared against the captured identity, not merely agains
 
 The extension retains safe `state_change_seq` and `screen_detection_skipped` metadata when present, but neither field is used as a prompt receipt. A failed, malformed, or identity-mismatched acknowledgement fails closed. The extension never retries a submission, falls back to argv, invokes a runtime hook, sends Enter, or submits duplicate bytes.
 
-After a confirmed submission, fresh agent and pane reads are an optional paired observation. Their identity must still match the captured terminal/session before state is reported; a missing, malformed, or replaced identity becomes an `unavailable` observation and never describes the replacement process. A replaced `postState` and success-row state are omitted; only bounded mismatch evidence may remain in the observation. The observation reports `working`, `not_working`, `unknown`, `detection_skipped`, `stale`, or `unavailable`. An idle/done/blocked state, `screen_detection_skipped: true`, an unchanged/older revision, or an unavailable read does not revoke the atomic submission acknowledgement and does not claim turn completion. A post-read failure is visible in structured observation evidence; the sender-authored body and stdin process text remain excluded from diagnostics.
+After a confirmed submission, fresh agent and pane reads are an optional paired post-observation. Their identity must still match the captured terminal/session before state is reported; a missing, malformed, or replaced identity becomes an `unavailable` observation and never describes the replacement process. A replaced `postState` and success-row state are omitted; only bounded mismatch evidence may remain in the observation. The observation reports `working`, `not_working`, `unknown`, `detection_skipped`, `stale`, or `unavailable`. An idle/done/blocked state, `screen_detection_skipped: true`, an unchanged/older revision, or an unavailable read does not revoke the atomic submission acknowledgement and does not claim turn completion. A post-read failure is visible in structured observation evidence; the sender-authored body and stdin process text remain excluded from diagnostics.
 
-Named-key operations retain their existing strict post-state verification because they have no prompt acknowledgement envelope. Attachment recipient registrations persist pane ID, terminal ID, name, kind, and the complete session object; optional `agent_id` is diagnostic only, so same-name/pane replacement is rejected. Communication remains sequential, and all existing sender provenance, target identity, ownership, attachment, abort, and bounded-evidence contracts remain in force. Model-visible identity/session strings are bounded while full values remain internal for exact comparison.
+Named-key operations remain a separate lower-level raw control-input escape hatch. The existing named-key allowlist, including `esc`, `escape`, and `ctrl+c`, is unchanged; those direct `send-keys` calls do not claim prompt acknowledgement, turn settlement, or causal verification. Attachment recipient registrations persist pane ID, terminal ID, name, kind, and the complete session object; optional `agent_id` is diagnostic only, so same-name/pane replacement is rejected. Communication remains sequential, and all existing sender provenance, target identity, ownership, attachment, abort, and bounded-evidence contracts remain in force. Model-visible identity/session strings are bounded while full values remain internal for exact comparison.
 
 ## Alternatives considered
 

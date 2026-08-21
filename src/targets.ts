@@ -90,7 +90,7 @@ export function parseSnapshotResult(value: unknown): HerdrSnapshot {
   const panes = raw.panes.map((item) => {
     if (!record(item)) throw Object.assign(new Error("Herdr pane record is incompatible"), { code: "CLI_PROTOCOL_ERROR" });
     const pane = { ...item, pane_id: requiredString(item.pane_id, "pane_id"), tab_id: requiredString(item.tab_id, "tab_id"), workspace_id: requiredString(item.workspace_id, "workspace_id") } as PaneRecord;
-    if (typeof item.name === "string") pane.agent_name = item.name;
+    if (typeof item.name === "string" && !Object.prototype.hasOwnProperty.call(item, "agent_name")) pane.agent_name = item.name;
     return pane;
   });
   const agents = raw.agents.map((item) => {

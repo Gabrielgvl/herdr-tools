@@ -37,7 +37,7 @@ function snapshot(pane: Record<string, unknown> | null = workerPane("working"), 
   const effectiveAgent = agent === null || pane === null ? undefined : agent ?? workerAgent(String(pane.agent_status ?? "working"), safeSeq(pane.state_change_seq));
   return {
     version: "0.8.2",
-    protocol: 19,
+    protocol: 20,
     workspaces: [{ workspace_id: "w1", label: "workspace" }],
     tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main" }],
     panes: [callerPane, ...(pane ? [pane as never] : [])],
@@ -95,16 +95,21 @@ describe("explicit turn-control schema", () => {
   it("accepts strict cancel and interrupt variants and rejects extra fields", () => {
     expect(Value.Check(CommunicateParamsSchema, { target: "worker", operation: "cancel" })).toBe(true);
     expect(Value.Check(CommunicateParamsSchema, { target: "worker", operation: "interrupt" })).toBe(true);
+    for (const key of ["esc", "escape", "ctrl+c"] as const) {
+      expect(Value.Check(CommunicateParamsSchema, { target: "worker", operation: "keys", keys: [key] })).toBe(true);
+    }
     expect(Value.Check(CommunicateParamsSchema, { target: "worker", operation: "cancel", keys: ["esc"] })).toBe(false);
     expect(Value.Check(CommunicateParamsSchema, { target: "worker", operation: "interrupt", delivery: "inline" })).toBe(false);
   });
 });
 
 describe("turn-control bounded internal helpers", () => {
-  const stable = { paneId: "w1:p2", terminalId: "term-worker", tabId: "w1:t1", workspaceId: "w1", agentSession: { source: "pi", agent: "pi", kind: "id", value: "session-worker" } };
+  const stable = { paneId: "w1:p2", terminalId: "term-worker", tabId: "w1:t1", workspaceId: "w1", agentName: "worker", agentKind: "pi", agentSession: { source: "pi", agent: "pi", kind: "id", value: "session-worker" } };
 
   it("covers strict evidence, identity, state, and proof helpers", () => {
     expect(internals.bounded("x".repeat(400))).toHaveLength(256);
+    expect(internals.boundedOperationId(undefined)).toBeUndefined();
+    expect(internals.boundedOperationId("")).toBeUndefined();
     expect(internals.safeString(undefined)).toBeUndefined();
     expect(internals.safeString(1)).toBeUndefined();
     expect(internals.safeString("")).toBeUndefined();
@@ -154,14 +159,16 @@ describe("turn-control bounded internal helpers", () => {
     expect(internals.sessionEvidence({ agent_session: { source: "other", agent: "other", kind: "id", value: "one" }, session_id: "two" }, stable.agentSession)).toMatchObject({ kind: "contradictory" });
     expect(internals.sessionEvidence({}, stable.agentSession)).toMatchObject({ kind: "none" });
 
+    expect(() => internals.stateFrom(undefined, "pre_state")).toThrowError(/unavailable/);
     expect(() => internals.stateFrom({}, "pre_state")).toThrowError(/unavailable/);
     expect(() => internals.stateFrom({ agent_status: "not-a-state" }, "pre_state")).toThrowError(/unavailable/);
     expect(internals.stateFrom({ status: "idle" }, "pre_state")).toBe("idle");
     expect(internals.stateFrom({ agent_status: "unknown" }, "pre_state")).toBe("unknown");
-    expect(internals.stableIdentity({ pane_id: "p", terminal_id: "t", tab_id: "tab", workspace_id: "w", agent_session: stable.agentSession }, undefined)).toMatchObject({ paneId: "p" });
+    expect(internals.stableIdentity({ pane_id: "p", terminal_id: "t", tab_id: "tab", workspace_id: "w", name: "worker", agent: "pi", agent_session: stable.agentSession }, undefined)).toMatchObject({ paneId: "p" });
     expect(internals.stableIdentity({ pane_id: "p", tab_id: "tab", workspace_id: "w", agent_session: stable.agentSession }, undefined)).toBeUndefined();
     expect(internals.stableIdentity({ pane_id: "p", terminal_id: "t", tab_id: "tab", workspace_id: "w", agent_session: {} }, undefined)).toBeUndefined();
-    expect(internals.stableIdentity({ terminal_id: "t", agent_session: stable.agentSession }, { paneId: "p", tabId: "tab", workspaceId: "w" } as never)).toMatchObject({ paneId: "p", tabId: "tab", workspaceId: "w" });
+    expect(internals.stableIdentity({ terminal_id: "t", name: "worker", agent: "pi", agent_session: stable.agentSession }, { paneId: "p", tabId: "tab", workspaceId: "w" } as never)).toMatchObject({ paneId: "p", tabId: "tab", workspaceId: "w" });
+    expect(internals.stableIdentity({ terminal_id: "t", name: "worker", agent: "pi", agent_session: stable.agentSession }, { paneId: "p", tabId: "tab", workspaceId: "w" } as never, true)).toBeUndefined();
     const sessionVariants = ["source", "agent", "kind", "value"] as const;
     for (const field of sessionVariants) {
       const changed = { ...stable.agentSession, [field]: `${field}-changed` };
@@ -173,6 +180,19 @@ describe("turn-control bounded internal helpers", () => {
     expect(internals.sameIdentity(stable, { ...stable, agentSession: { ...stable.agentSession, value: "other" } })).toBe(false);
     expect(internals.sameIdentity(stable, stable)).toBe(true);
 
+    const joinPane = workerPane("working") as Record<string, unknown>;
+    const joinAgent = workerAgent("working") as Record<string, unknown>;
+    expect(internals.joinTurnIdentity([joinPane, joinAgent], "w1:p2", "pre_state")).toMatchObject({ paneId: "w1:p2", agentName: "worker", agentKind: "pi", state: "working" });
+    expect(() => internals.joinTurnIdentity([{ ...joinPane, tab_id: null }, joinAgent], "w1:p2", "pre_state")).toThrowError(/malformed/);
+    expect(() => internals.joinTurnIdentity([joinPane, { ...joinAgent, tab_id: "other" }], "w1:p2", "pre_state")).toThrowError(/contradictory/);
+    const noTabPane = { ...joinPane };
+    const noTabAgent = { ...joinAgent };
+    delete noTabPane.tab_id;
+    delete noTabAgent.tab_id;
+    expect(() => internals.joinTurnIdentity([noTabPane, noTabAgent], "w1:p2", "pre_state")).toThrowError(/missing/);
+    expect(() => internals.stateChangeSeq([{ state_change_seq: "bad" }], "identity")).toThrowError(/invalid/);
+    expect(() => internals.stateChangeSeq([{ state_change_seq: 1 }, { state_change_seq: 2 }], "identity")).toThrowError(/contradictory/);
+
     const collisionPrefix = "x".repeat(256);
     const longRecord = (suffix: string) => ({
       pane_id: `${collisionPrefix}-pane-${suffix}`,
@@ -180,6 +200,8 @@ describe("turn-control bounded internal helpers", () => {
       tab_id: `${collisionPrefix}-tab-${suffix}`,
       workspace_id: `${collisionPrefix}-workspace-${suffix}`,
       agent_status: "working",
+      name: `${collisionPrefix}-name-${suffix}`,
+      agent: `${collisionPrefix}-kind-${suffix}`,
       agent_session: {
         source: `${collisionPrefix}-source-${suffix}`,
         agent: `${collisionPrefix}-agent-${suffix}`,
@@ -214,12 +236,15 @@ describe("turn-control bounded internal helpers", () => {
     expect(internals.mergedSnapshotAgent(liveSnapshot, target)).toMatchObject({ pane_id: "w1:p2" });
     expect(internals.mergedSnapshotAgent(liveSnapshot, { ...target, paneId: undefined } as never)).toBeUndefined();
     expect(internals.mergedSnapshotAgent(liveSnapshot, { ...target, paneId: "missing" })).toBeUndefined();
+    const conflictingSnapshot = snapshot(workerPane("working", 10, { agent_name: "different" }));
+    expect(internals.mergedSnapshotAgent(conflictingSnapshot, target)).toBeUndefined();
     const paneOnly = snapshot(workerPane("working"), null);
-    expect(internals.mergedSnapshotAgent(paneOnly, target)).toMatchObject({ pane_id: "w1:p2" });
+    expect(internals.mergedSnapshotAgent(paneOnly, target)).toBeUndefined();
     expect(internals.agentGetResult({ agent: { pane_id: "p" } })).toEqual({ pane_id: "p" });
     expect(() => internals.agentGetResult(null)).toThrowError(/identity/);
     expect(internals.baseDetails("cancel", "esc", { pane_id: "p" }, undefined, "preflight", {}, false, false)).toMatchObject({ target: { paneId: "p", agentSession: { source: "unknown" } } });
     expect(internals.baseDetails("interrupt", "ctrl+c", { pane_id: "p", label: "worker", agent_name: "worker" }, stable, "confirmed", {}, true, true).target).toMatchObject({ label: "worker", agentName: "worker" });
+    expect(internals.baseDetails("interrupt", "ctrl+c", { pane_id: "p" }, { ...stable, agentName: "worker", agentKind: "pi" }, "confirmed", {}, true, true).target).toMatchObject({ agentName: "worker" });
     expect(internals.baseDetails("interrupt", "ctrl+c", { pane_id: "p" }, stable, "confirmed", {}, true, true).target).not.toHaveProperty("label");
     const bounded = internals.boundedSignal();
     bounded.dispose();
@@ -240,6 +265,8 @@ describe("turn-control bounded internal helpers", () => {
     const freePane = free.panes[1] as unknown as Record<string, unknown>;
     expect(internals.isAgentFreeUnknown(free, { ...freePane, terminal_id: "other" }, stable)).toBe(true);
     expect(internals.isAgentFreeUnknown(free, { ...freePane, agent_status: "working" }, stable)).toBe(false);
+    expect(internals.isAgentFreeUnknown(free, { ...freePane, status: "working" }, stable)).toBe(false);
+    expect(internals.isAgentFreeUnknown(free, { ...freePane, agent_status: "unknown", status: "working" }, stable)).toBe(false);
     expect(internals.isAgentFreeUnknown(free, { ...freePane, agent: "pi" }, stable)).toBe(false);
     expect(internals.isAgentFreeUnknown(free, { ...freePane, agent_session_id: "session-worker" }, stable)).toBe(false);
     expect(internals.isAgentFreeUnknown({ ...free, agents: [workerAgent("unknown") as never] }, freePane, stable)).toBe(false);
@@ -329,6 +356,44 @@ describe("explicit turn control", () => {
     expect(changed.calls.some((call) => call[1] === "send-keys")).toBe(false);
   });
 
+  it("requires exactly one pre-dispatch pane and agent record and rejects contradictions without a key", async () => {
+    const missingPane = snapshot(workerPane("working"));
+    missingPane.panes = [callerPane as never];
+    const targetAgent = { ...workerAgent("working"), agent_id: "agent-worker" };
+    missingPane.agents = [missingPane.agents[0]!, targetAgent as never];
+    const missingPaneHarness = makeCli(snapshot(workerPane("idle", 11)), { initialSnapshot: missingPane });
+    await expect(execute(missingPaneHarness.cli, { target: "agent-worker", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    expect(missingPaneHarness.calls.some((call) => call[1] === "send-keys")).toBe(false);
+
+    const missingAgent = snapshot(workerPane("working"), null);
+    expect(internals.snapshotTargetRecords(missingAgent, "w1:p2")).toMatchObject({ paneCount: 1, agentCount: 0 });
+    const duplicatePane = snapshot(workerPane("working"), workerAgent("working"));
+    duplicatePane.panes.push({ ...duplicatePane.panes[1]! } as never);
+    const duplicatePaneHarness = makeCli(snapshot(workerPane("idle", 11)), { initialSnapshot: duplicatePane });
+    await expect(execute(duplicatePaneHarness.cli, { target: "w1:p2", operation: "interrupt" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    expect(duplicatePaneHarness.calls.some((call) => call[1] === "send-keys")).toBe(false);
+
+    const duplicateAgent = snapshot(workerPane("working"), workerAgent("working"));
+    duplicateAgent.agents.push({ ...duplicateAgent.agents[1]! } as never);
+    const duplicateAgentHarness = makeCli(snapshot(workerPane("idle", 11)), { initialSnapshot: duplicateAgent });
+    await expect(execute(duplicateAgentHarness.cli, { target: "w1:p2", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    expect(duplicateAgentHarness.calls.some((call) => call[1] === "send-keys")).toBe(false);
+
+    for (const contradiction of [
+      { pane: { agent_name: "different" } },
+      { agent: { terminal_id: "different" } },
+      { agent: { name: "different" } },
+      { agent: { agent: "claude" } },
+      { agent: { agent_session: { ...identity.agent_session, value: "different" } } },
+      { agent: { agent_status: "idle" } }
+    ]) {
+      const initial = snapshot(workerPane("working", 10, contradiction.pane), workerAgent("working", 10, contradiction.agent));
+      const harness = makeCli(snapshot(workerPane("idle", 11)), { initialSnapshot: initial });
+      await expect(execute(harness.cli, { target: "w1:p2", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_CHANGED" });
+      expect(harness.calls.some((call) => call[1] === "send-keys")).toBe(false);
+    }
+  });
+
   it("requires fresh agent-get evidence to carry the captured pane ID", async () => {
     const missing = makeCli(snapshot(workerPane("idle", 11)));
     const missingBase = missing.runJson.getMockImplementation()!;
@@ -403,6 +468,85 @@ describe("explicit turn control", () => {
     });
     expect(duplicatePaneHarness.calls.filter((call) => call[0] === "agent" && call[1] === "send-keys")).toEqual([["agent", "send-keys", "w1:p2", "ctrl+c"]]);
     expect(duplicateAgentHarness.calls.filter((call) => call[0] === "agent" && call[1] === "send-keys")).toEqual([["agent", "send-keys", "w1:p2", "ctrl+c"]]);
+  });
+
+  it("bounds every turn-control operation ID at the Pi result surface", async () => {
+    const harness = makeCli(snapshot(workerPane("idle", 11)));
+    const base = harness.runJson.getMockImplementation()!;
+    const oversized = "operation-" + "x".repeat(400);
+    harness.runJson.mockImplementation(async (argv: string[], signal: AbortSignal) => {
+      const response = await base(argv, signal);
+      return { ...response, id: oversized };
+    });
+    const result = await execute(harness.cli, { target: "worker", operation: "cancel" });
+    expect(result.details.operationIds).toEqual({ snapshot: oversized.slice(0, 256), agentGet: oversized.slice(0, 256), dispatch: oversized.slice(0, 256), wait: oversized.slice(0, 256), finalSnapshot: oversized.slice(0, 256) });
+    expect(JSON.stringify(result)).not.toContain(oversized);
+  });
+
+  it("requires exactly one same-agent record for final confirmation", async () => {
+    const finalMissingAgent = makeCli(snapshot(workerPane("idle", 11), null));
+    await expect(execute(finalMissingAgent.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({ code: "CANCEL_UNCONFIRMED", details: { targetAgentRecordCount: 0 } });
+
+    const finalDuplicatePane = snapshot(workerPane("idle", 11));
+    finalDuplicatePane.panes.push({ ...finalDuplicatePane.panes[1]! } as never);
+    const duplicatePaneHarness = makeCli(finalDuplicatePane);
+    await expect(execute(duplicatePaneHarness.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({ code: "CANCEL_UNCONFIRMED", details: { targetPaneRecordCount: 2 } });
+
+    const finalDuplicateAgent = snapshot(workerPane("idle", 11));
+    finalDuplicateAgent.agents.push({ ...finalDuplicateAgent.agents[1]! } as never);
+    const duplicateAgentHarness = makeCli(finalDuplicateAgent);
+    await expect(execute(duplicateAgentHarness.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({ code: "CANCEL_UNCONFIRMED", details: { targetAgentRecordCount: 2 } });
+
+    const contradiction = snapshot(workerPane("idle", 11), workerAgent("idle", 11, { agent: "claude" }));
+    const contradictionHarness = makeCli(contradiction);
+    await expect(execute(contradictionHarness.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_CHANGED" });
+  });
+
+  it("preserves post-dispatch evidence for final identity, state, and sequence contradictions", async () => {
+    const cases = [
+      {
+        final: snapshot(workerPane("idle", 11), workerAgent("idle", 11, { terminal_id: "term-replaced" })),
+        code: "TARGET_IDENTITY_CHANGED",
+        message: "Authoritative prompt identity is contradictory",
+        originalDetails: { field: "terminal_id", expected: "term-worker", actual: "term-replaced" }
+      },
+      {
+        final: snapshot(workerPane("idle", 11), workerAgent("done", 11)),
+        code: "TARGET_IDENTITY_CHANGED",
+        message: "Authoritative target state is contradictory",
+        originalDetails: { expectedState: "idle", actualState: "done" }
+      },
+      {
+        final: snapshot(workerPane("idle", 11), workerAgent("idle", 12)),
+        code: "TARGET_IDENTITY_CHANGED",
+        message: "Authoritative target evidence is contradictory",
+        originalDetails: { field: "state_change_seq" }
+      },
+      {
+        final: snapshot(workerPane("idle", 11, { state_change_seq: "invalid" }), workerAgent("idle", 11, { state_change_seq: "invalid" })),
+        code: "TARGET_STATE_UNAVAILABLE",
+        message: "Authoritative target state-change sequence is invalid",
+        originalDetails: {}
+      }
+    ] as const;
+
+    for (const testCase of cases) {
+      const harness = makeCli(testCase.final, { dispatchError: Object.assign(new Error("dispatch lost"), { code: "ABORTED" }) });
+      await expect(execute(harness.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({
+        code: testCase.code,
+        message: testCase.message,
+        details: {
+          ...testCase.originalDetails,
+          phase: "confirmation",
+          preEvidence: expect.objectContaining({ pane_id: "w1:p2", agent_status: "working" }),
+          finalEvidence: expect.objectContaining({ pane_id: "w1:p2", agent_status: "idle" }),
+          dispatchAcknowledged: false,
+          dispatchAttempted: true,
+          wait: { outcome: "completed" },
+          dispatch: { outcome: "failed", code: "ABORTED" }
+        }
+      });
+    }
   });
 
   it("preserves post-dispatch evidence when wait fails and confirms from final state", async () => {
@@ -523,7 +667,7 @@ describe("explicit turn control", () => {
     await expect(execute(cancelFree.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({ code: "CANCEL_UNCONFIRMED" });
 
     const missingFinalIdentity = makeCli(snapshot(workerPane("idle", 11, { agent_session: undefined }), workerAgent("idle", 11, { agent_session: undefined })));
-    await expect(execute(missingFinalIdentity.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_CHANGED" });
+    await expect(execute(missingFinalIdentity.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
 
     const changedSession = { source: "pi", agent: "pi", kind: "id", value: "replacement" };
     const changedFinal = makeCli(snapshot(workerPane("idle", 11, { agent_session: changedSession }), workerAgent("idle", 11, { agent_session: changedSession })));

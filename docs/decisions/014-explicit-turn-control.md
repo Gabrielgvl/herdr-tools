@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted; adds the explicit cancel/interrupt contract without superseding direct steering in `docs/decisions/004-direct-prompt-steering.md` (ADR-004: Steer by direct prompt submission). The obsolete interrupt/steer history in `docs/decisions/003-reliable-communication-and-close.md` (ADR-003: State-aware communication and reconciled autonomous close) remains historical; this ADR is authoritative for turn control.
 
 ## Date
 
@@ -31,14 +31,18 @@ Add only these public `herdr_communicate` variants:
 
 Both variants reject every additional field. They are implemented by a small
 internal turn-control module and inherit the existing sequential scheduling in
-both hosts.
+both hosts. Cancel and interrupt are safe, verified semantic contracts: they
+bind one named control to one exact working agent and confirm the resulting
+same-agent terminal state (or the separate narrow exit proof below).
 
 Before dispatch, the module resolves the exact target from an authoritative
-snapshot and performs one fresh `herdr agent get` against the resolved pane ID.
-Both reads must identify the same currently `working` agent by exact pane ID,
-terminal ID, and full `{source, agent, kind, value}` `agentSession`. The fresh
-`agent get` must carry its own non-empty `pane_id`; required pane identity is
-never inherited from the earlier snapshot. Missing or changed identity,
+snapshot and requires exactly one target pane record and exactly one target
+agent record. It strictly joins those records and one fresh `herdr agent get`
+against the resolved pane ID. Repeated pane, terminal, name, kind, complete
+session, state, parent, and sequence evidence must agree; no record is merged
+by object-spread overwrite. The fresh `agent get` must carry its own non-empty
+`pane_id`; required pane identity is never inherited from the earlier snapshot.
+Missing records or identity fields, duplicates, contradictions,
 unknown/malformed state, and a non-working turn fail closed without sending a
 key.
 
@@ -66,8 +70,16 @@ process to exit.
 An abort before dispatch is `ABORTED`. Once dispatch is attempted, the key
 operation evidence is retained and wait/final verification use independent
 bounded signals. Details retain only bounded pre/final evidence, phase, reason,
-dispatch acknowledgement/attempt, operation IDs, control key/window, wait
-status, and confirmation. Compact rows remain intentionally small.
+dispatch acknowledgement/attempt, bounded operation IDs, control key/window,
+wait status, and confirmation. Compact rows remain intentionally small.
+
+The existing `{ target, operation: "keys", keys: NamedKey[] }` escape hatch
+remains separate and unchanged. `esc`, `escape`, and `ctrl+c` remain valid
+named keys (as do the other existing named keys); they dispatch directly as
+lower-level control input and do not acquire cancel/interrupt's verified
+semantic or causal contract. The turn-control change adds no new restriction or routing to
+`operation:"keys"`; its existing `NamedKey` validation and direct dispatch
+remain unchanged.
 
 ## Alternatives considered
 
@@ -77,11 +89,13 @@ Rejected. It would duplicate target resolution, host scheduling, MCP publication
 rendering, and error mapping while making the public surface larger. Turn
 control belongs with the existing typed communication boundary.
 
-### Expose raw `send-keys` or arbitrary control text
+### Replace the raw named-key escape hatch with semantic turn control
 
-Rejected. Raw bytes and caller-selected escape sequences cannot provide a stable
-operation contract or prevent accidental destructive input. Only the two named
-control keys are reachable through explicit discriminants.
+Rejected. Existing named keys are intentionally lower-level, unverified
+control dispatch. They remain available, including `esc`, `escape`, and
+`ctrl+c`, for callers that explicitly choose `operation:"keys"`; routing them
+through cancel/interrupt would change that owner-approved contract. The two
+new operations instead provide the separate safe, verified semantic contract.
 
 ### Use prompt, Escape-then-prompt, or a generic fallback sequence
 

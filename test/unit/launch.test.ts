@@ -25,7 +25,7 @@ function fakeAttachments(overrides: Partial<AttachmentStore> = {}): AttachmentSt
 
 const snapshot: HerdrSnapshot = {
   version: "0.8.0",
-  protocol: 19,
+  protocol: 20,
   workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
   tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
   panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }],

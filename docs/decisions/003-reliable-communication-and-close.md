@@ -3,7 +3,7 @@
 ## Status
 Accepted for close reliability; communication/steer decision superseded by ADR-004
 
-> **Supersession:** The steer/interrupt decision and consequences below are historical and must not be implemented. ADR-004 is authoritative for communication. The close-reliability decision remains active.
+> **Supersession:** The steer/interrupt decision and consequences below are historical and must not be implemented. `docs/decisions/004-direct-prompt-steering.md` (ADR-004: Steer by direct prompt submission) is authoritative for prompt/steer communication, and `docs/decisions/014-explicit-turn-control.md` (ADR-014: Tools-only explicit turn control) is authoritative for explicit cancel/interrupt. The close-reliability decision remains active.
 
 ## Date
 2026-08-07

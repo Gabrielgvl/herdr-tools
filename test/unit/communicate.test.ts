@@ -15,7 +15,7 @@ const basePane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label:
 const callerPane = { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" };
 const baseSnapshot: HerdrSnapshot = {
   version: "0.8.0",
-  protocol: 19,
+  protocol: 20,
   workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
   tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
   panes: [callerPane, basePane],
@@ -195,6 +195,13 @@ describe("herdr_communicate", () => {
     const callsBefore = harness.calls.length;
     await expect(execute(harness.cli, { target: "reviewer", operation: "keys", keys: ["raw-byte"] })).rejects.toMatchObject({ code: "KEY_REJECTED" });
     expect(harness.calls).toHaveLength(callsBefore);
+  });
+
+  it.each(["esc", "escape", "ctrl+c"] as const)("keeps raw named key %s on the direct send-keys route", async (key) => {
+    const harness = makeCli();
+    await expect(execute(harness.cli, { target: "reviewer", operation: "keys", keys: [key] })).resolves.toMatchObject({ details: { operation: "keys" } });
+    expect(harness.calls).toContainEqual(["agent", "send-keys", "w1:p2", key]);
+    expect(harness.calls.some((call) => call[0] === "api")).toBe(true);
   });
 
   it("fails closed when a named-key post-state is explicitly unknown", async () => {

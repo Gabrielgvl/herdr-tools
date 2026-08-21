@@ -32,7 +32,7 @@ The extension controls two agent-to-agent text paths: `herdr_communicate` prompt
 5. If the fresh snapshot does not contain the caller pane, the operation fails before mutation with `SENDER_IDENTITY_UNAVAILABLE`.
 6. `herdr_communicate` rejects self-targeting with `SELF_TARGET_REJECTED`.
 7. Metadata is normalized to one line and bounded so labels cannot inject envelope fields. Payload bytes are preserved after the separating blank line.
-8. Named keys remain raw control input and are not wrapped.
+8. Named keys remain raw lower-level control input and are not wrapped. The existing escape hatch, including `esc`, `escape`, and `ctrl+c`, is not routed through the verified cancel/interrupt semantic contract in `docs/decisions/014-explicit-turn-control.md` (ADR-014: Tools-only explicit turn control).
 9. No automatic acknowledgement, message ID, or reply protocol is added. The sender pane ID is a deliberate reply target; tool success proves dispatch evidence, not comprehension.
 10. The envelope is cooperative provenance, not cryptographic authentication. Raw terminal or CLI/API input can imitate the text. The implementation and documentation must not claim otherwise.
 

@@ -32,7 +32,7 @@ const snapshot = {
   }
 };
 
-const health = { client: { version: "0.8.0", protocol: 19 }, server: { status: "running", version: "0.8.0", protocol: 19, compatible: true } };
+const health = { client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true } };
 const context = { workspaceId: "w", tabId: "w:t", paneId: "w:p" };
 const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const };
 

@@ -1,7 +1,14 @@
 # ADR-004: Steer by direct prompt submission
 
 ## Status
-Accepted; supersedes the communication/steer portion of ADR-003
+Accepted; supersedes the communication/steer portion of
+`docs/decisions/003-reliable-communication-and-close.md` (ADR-003: State-aware
+communication and reconciled autonomous close).
+
+> **Partial supersession:** The prompt-observation and Enter-recovery portions
+> of this decision are superseded by `docs/decisions/013-prompt-submission-acknowledgement.md`
+> (ADR-013: Separate prompt submission acknowledgement from working-state
+> observation). The direct prompt-steering decision above remains authoritative.
 
 ## Date
 2026-08-07

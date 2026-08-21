@@ -1,5 +1,6 @@
 import type { HerdrCli } from "../cli.js";
 import { formatResult } from "../tui.js";
+import { joinPromptTargetIdentity, type PromptIdentityError, type PromptTargetIdentity } from "../messages/prompt.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext, type HerdrSnapshot, type ResolvedTarget } from "../targets.js";
 import type { TurnControlOperation } from "../schemas.js";
 
@@ -63,12 +64,25 @@ interface AgentSessionIdentity {
 interface StableIdentity {
   paneId: string;
   terminalId: string;
+  agentName: string;
+  agentKind: string;
   agentSession: AgentSessionIdentity;
 }
 
 interface TurnIdentity extends StableIdentity {
   tabId: string;
   workspaceId: string;
+}
+
+interface TurnRecordIdentity extends TurnIdentity {
+  state: AgentState;
+}
+
+interface TargetRecords {
+  pane?: Record<string, unknown>;
+  agent?: Record<string, unknown>;
+  paneCount: number;
+  agentCount: number;
 }
 
 export interface TurnControlDetails {
@@ -135,6 +149,10 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function bounded(value: string): string {
   return [...value].slice(0, MAX_EVIDENCE_STRING).join("");
+}
+
+function boundedOperationId(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? bounded(value) : undefined;
 }
 
 function safeString(value: unknown): string | undefined {
@@ -296,12 +314,71 @@ function hasSessionRepresentation(value: Record<string, unknown>): boolean {
   return SESSION_FIELDS.some((field) => owns(value, field));
 }
 
-function stateFrom(value: Record<string, unknown> | undefined, phase: TurnControlPhase): AgentState {
-  const state = value?.agent_status ?? value?.status;
-  if (typeof state !== "string" || !KNOWN_STATES.has(state as AgentState)) {
-    throw new TurnControlError("TARGET_STATE_UNAVAILABLE", "Authoritative target state is unavailable", { phase, state: typeof state === "string" ? bounded(state) : undefined });
+const TURN_IDENTITY_FIELDS = [
+  "pane_id",
+  "terminal_id",
+  "name",
+  "agent_name",
+  "agent",
+  "agent_kind",
+  "managed_kind",
+  "kind",
+  "agent_session"
+] as const;
+
+function identityFailure(error: PromptIdentityError, phase: TurnControlPhase): TurnControlError {
+  return new TurnControlError(error.code, error.message, { phase, ...error.details });
+}
+
+function validateIdentityFieldShapes(records: Record<string, unknown>[], phase: TurnControlPhase): void {
+  for (const value of records) {
+    for (const field of TURN_IDENTITY_FIELDS) {
+      if (!owns(value, field)) continue;
+      if (value[field] === null || value[field] === undefined) {
+        throw new TurnControlError("TARGET_IDENTITY_UNAVAILABLE", "Authoritative target identity is malformed", { phase, field });
+      }
+    }
   }
-  return state as AgentState;
+}
+
+function repeatedString(records: Record<string, unknown>[], fields: readonly string[], field: string, phase: TurnControlPhase): string {
+  let selected: string | undefined;
+  for (const value of records) {
+    for (const alias of fields) {
+      if (!owns(value, alias)) continue;
+      const candidate = authoritativeString(value[alias]);
+      if (!candidate) throw new TurnControlError("TARGET_IDENTITY_UNAVAILABLE", "Authoritative target identity is malformed", { phase, field: alias });
+      if (selected !== undefined && selected !== candidate) {
+        throw new TurnControlError("TARGET_IDENTITY_CHANGED", "Authoritative target identity is contradictory", { phase, field, expected: bounded(selected), actual: bounded(candidate) });
+      }
+      selected ??= candidate;
+    }
+  }
+  if (selected === undefined) throw new TurnControlError("TARGET_IDENTITY_UNAVAILABLE", "Authoritative target identity is missing", { phase, field });
+  return selected;
+}
+
+function stateFromRecords(records: Record<string, unknown>[], phase: TurnControlPhase): AgentState {
+  let selected: AgentState | undefined;
+  for (const value of records) {
+    for (const field of ["agent_status", "status"] as const) {
+      if (!owns(value, field)) continue;
+      const candidate = value[field];
+      if (typeof candidate !== "string" || !KNOWN_STATES.has(candidate as AgentState)) {
+        throw new TurnControlError("TARGET_STATE_UNAVAILABLE", "Authoritative target state is unavailable", { phase, state: typeof candidate === "string" ? bounded(candidate) : undefined });
+      }
+      if (selected !== undefined && selected !== candidate) {
+        throw new TurnControlError("TARGET_IDENTITY_CHANGED", "Authoritative target state is contradictory", { phase, expectedState: selected, actualState: candidate });
+      }
+      selected ??= candidate as AgentState;
+    }
+  }
+  if (selected === undefined) throw new TurnControlError("TARGET_STATE_UNAVAILABLE", "Authoritative target state is unavailable", { phase });
+  return selected;
+}
+
+function stateFrom(value: Record<string, unknown> | undefined, phase: TurnControlPhase): AgentState {
+  return stateFromRecords(value ? [value] : [], phase);
 }
 
 function requireWorking(value: Record<string, unknown>, phase: TurnControlPhase): AgentState {
@@ -311,30 +388,111 @@ function requireWorking(value: Record<string, unknown>, phase: TurnControlPhase)
   return state;
 }
 
+function snapshotTargetRecords(snapshot: HerdrSnapshot, paneId: string): TargetRecords {
+  const panes = snapshot.panes.filter((candidate) => candidate.pane_id === paneId) as Array<Record<string, unknown>>;
+  const agents = snapshot.agents.filter((candidate) => candidate.pane_id === paneId) as Array<Record<string, unknown>>;
+  return { pane: panes[0], agent: agents[0], paneCount: panes.length, agentCount: agents.length };
+}
+
+function requireSnapshotTargetRecords(snapshot: HerdrSnapshot, paneId: string, phase: TurnControlPhase): { pane: Record<string, unknown>; agent: Record<string, unknown> } {
+  const located = snapshotTargetRecords(snapshot, paneId);
+  if (located.paneCount !== 1 || located.agentCount !== 1 || !located.pane || !located.agent) {
+    throw new TurnControlError("TARGET_IDENTITY_UNAVAILABLE", "Snapshot does not contain exactly one target pane and agent record", {
+      phase,
+      paneId: bounded(paneId),
+      targetPaneRecordCount: located.paneCount,
+      targetAgentRecordCount: located.agentCount
+    });
+  }
+  return { pane: located.pane, agent: located.agent };
+}
+
+function stateChangeSeq(records: Record<string, unknown>[], phase: TurnControlPhase): number | undefined {
+  let selected: number | undefined;
+  for (const value of records) {
+    if (!owns(value, "state_change_seq") || value.state_change_seq === undefined) continue;
+    const candidate = safeInteger(value.state_change_seq);
+    if (candidate === undefined) throw new TurnControlError("TARGET_STATE_UNAVAILABLE", "Authoritative target state-change sequence is invalid", { phase });
+    if (selected !== undefined && selected !== candidate) {
+      throw new TurnControlError("TARGET_STATE_UNAVAILABLE", "Authoritative target state-change sequence is contradictory", { phase, expected: selected, actual: candidate });
+    }
+    selected ??= candidate;
+  }
+  return selected;
+}
+
+function evidenceValueEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mergeEvidence(records: Record<string, unknown>[], overwrite: readonly string[] = []): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  const overwriteFields = new Set(overwrite);
+  for (const value of records) {
+    const evidence = compactEvidence(value);
+    for (const [field, candidate] of Object.entries(evidence)) {
+      if (!owns(result, field)) {
+        result[field] = candidate;
+      } else if (overwriteFields.has(field)) {
+        result[field] = candidate;
+      } else if (!evidenceValueEqual(result[field], candidate)) {
+        throw new TurnControlError("TARGET_IDENTITY_CHANGED", "Authoritative target evidence is contradictory", { field });
+      }
+    }
+  }
+  return result;
+}
+
+function joinTurnIdentity(records: Record<string, unknown>[], expectedPaneId: string, phase: TurnControlPhase): TurnRecordIdentity {
+  validateIdentityFieldShapes(records, phase);
+  let promptIdentity: PromptTargetIdentity;
+  try {
+    promptIdentity = joinPromptTargetIdentity(records, expectedPaneId);
+  } catch (error) {
+    throw identityFailure(error as PromptIdentityError, phase);
+  }
+  const tabId = repeatedString(records, ["tab_id"], "tab_id", phase);
+  const workspaceId = repeatedString(records, ["workspace_id"], "workspace_id", phase);
+  const state = stateFromRecords(records, phase);
+  return { ...promptIdentity, tabId, workspaceId, state };
+}
+
 function stableIdentity(value: Record<string, unknown> | undefined, fallback: ResolvedTarget | undefined, requireOwnPaneId = false): TurnIdentity | undefined {
   const paneId = authoritativeString(value?.pane_id) ?? (requireOwnPaneId ? undefined : fallback?.paneId);
   const terminalId = authoritativeString(value?.terminal_id);
   const tabId = authoritativeString(value?.tab_id) ?? fallback?.tabId;
   const workspaceId = authoritativeString(value?.workspace_id) ?? fallback?.workspaceId;
+  const agentName = authoritativeString(value?.name) ?? authoritativeString(value?.agent_name);
+  const agentKind = authoritativeString(value?.agent) ?? authoritativeString(value?.agent_kind) ?? authoritativeString(value?.kind);
   const agentSession = authoritativeSessionFrom(value?.agent_session);
-  if (!paneId || !terminalId || !tabId || !workspaceId || !agentSession) return undefined;
-  return { paneId, terminalId, tabId, workspaceId, agentSession };
+  if (!paneId || !terminalId || !tabId || !workspaceId || !agentName || !agentKind || !agentSession) return undefined;
+  return { paneId, terminalId, tabId, workspaceId, agentName, agentKind, agentSession };
 }
 
 function sameSession(left: AgentSessionIdentity, right: AgentSessionIdentity): boolean {
   return left.source === right.source && left.agent === right.agent && left.kind === right.kind && left.value === right.value;
 }
 
-function sameIdentity(left: StableIdentity, right: StableIdentity): boolean {
-  return left.paneId === right.paneId && left.terminalId === right.terminalId && sameSession(left.agentSession, right.agentSession);
+function sameIdentity(left: TurnIdentity, right: TurnIdentity): boolean {
+  return left.paneId === right.paneId
+    && left.terminalId === right.terminalId
+    && left.agentName === right.agentName
+    && left.agentKind === right.agentKind
+    && sameSession(left.agentSession, right.agentSession)
+    && left.tabId === right.tabId
+    && left.workspaceId === right.workspaceId;
 }
 
 function mergedSnapshotAgent(snapshot: HerdrSnapshot, target: ResolvedTarget): Record<string, unknown> | undefined {
   if (!target.paneId) return undefined;
-  const pane = snapshot.panes.find((candidate) => candidate.pane_id === target.paneId);
-  if (!pane) return undefined;
-  const agent = snapshot.agents.find((candidate) => candidate.pane_id === target.paneId);
-  return { ...pane, ...(agent ?? {}) };
+  const located = snapshotTargetRecords(snapshot, target.paneId);
+  if (located.paneCount !== 1 || located.agentCount !== 1 || !located.pane || !located.agent) return undefined;
+  try {
+    joinTurnIdentity([located.pane, located.agent], target.paneId, "snapshot");
+    return mergeEvidence([located.pane, located.agent]);
+  } catch {
+    return undefined;
+  }
 }
 
 function agentGetResult(value: unknown): Record<string, unknown> {
@@ -344,7 +502,7 @@ function agentGetResult(value: unknown): Record<string, unknown> {
 
 function turnTarget(identity: TurnIdentity, recordValue: Record<string, unknown>): TurnControlDetails["target"] {
   const label = safeString(recordValue.label);
-  const agentName = safeString(recordValue.name) ?? safeString(recordValue.agent_name);
+  const agentName = safeString(recordValue.name) ?? safeString(recordValue.agent_name) ?? bounded(identity.agentName);
   return {
     paneId: bounded(identity.paneId),
     tabId: bounded(identity.tabId),
@@ -357,7 +515,7 @@ function turnTarget(identity: TurnIdentity, recordValue: Record<string, unknown>
       value: bounded(identity.agentSession.value)
     },
     ...(label ? { label } : {}),
-    ...(agentName ? { agentName } : {})
+    agentName
   };
 }
 
@@ -446,7 +604,12 @@ function hasCapturedSessionElsewhere(snapshot: HerdrSnapshot, identity: TurnIden
 }
 
 function isAgentFreeUnknown(snapshot: HerdrSnapshot, pane: Record<string, unknown>, identity: TurnIdentity): boolean {
-  const state = pane.agent_status;
+  let state: AgentState;
+  try {
+    state = stateFrom(pane, "confirmation");
+  } catch {
+    return false;
+  }
   if (state !== "unknown") return false;
   if (hasAgentFields(pane) || hasSessionRepresentation(pane)) return false;
   const located = finalRecord(snapshot, identity);
@@ -471,15 +634,15 @@ function finalRecord(snapshot: HerdrSnapshot, identity: TurnIdentity): {
   const agentRecords = snapshot.agents.filter((candidate) => candidate.pane_id === identity.paneId) as Array<Record<string, unknown>>;
   const pane = paneRecords[0];
   const agent = agentRecords[0];
-  return {
-    pane,
-    agent,
-    merged: pane ? { ...pane, ...(agent ?? {}) } : undefined,
-    paneRecords,
-    agentRecords,
-    paneCount: paneRecords.length,
-    agentCount: agentRecords.length
-  };
+  let merged: Record<string, unknown> | undefined;
+  if (pane) {
+    try {
+      merged = mergeEvidence(agent ? [pane, agent] : [pane]);
+    } catch {
+      merged = undefined;
+    }
+  }
+  return { pane, agent, merged, paneRecords, agentRecords, paneCount: paneRecords.length, agentCount: agentRecords.length };
 }
 
 function postWaitDetails(waitError: unknown): { outcome: "completed" | "failed"; code?: string } {
@@ -511,6 +674,8 @@ export async function executeTurnControl(
   const operationIds: TurnControlDetails["operationIds"] = {};
   let dispatchAcknowledged = false;
   let dispatchAttempted = false;
+  let dispatchError: unknown;
+  let finalValidationFailed = false;
   let waitEvidence: { outcome: "completed" | "failed"; code?: string } | undefined;
 
   try {
@@ -520,29 +685,28 @@ export async function executeTurnControl(
 
     phase = "snapshot";
     const snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], signal);
-    operationIds.snapshot = snapshotEnvelope.id;
+    operationIds.snapshot = boundedOperationId(snapshotEnvelope.id);
     const snapshot = parseSnapshotResult(snapshotEnvelope.result);
     const resolved = resolveTarget(snapshot, params.target, "agent", deps.context);
-    const snapshotAgent = mergedSnapshotAgent(snapshot, resolved);
-    preEvidence = compactEvidence(snapshotAgent);
+    const snapshotRecords = requireSnapshotTargetRecords(snapshot, resolved.paneId!, "pre_state");
 
     phase = "pre_state";
-    requireWorking(snapshotAgent!, phase);
+    const snapshotIdentity = joinTurnIdentity([snapshotRecords.pane, snapshotRecords.agent], resolved.paneId!, phase);
+    requireWorking(snapshotRecords.pane, phase);
+    requireWorking(snapshotRecords.agent, phase);
+    preEvidence = mergeEvidence([snapshotRecords.pane, snapshotRecords.agent]);
 
     phase = "identity";
-    identity = stableIdentity(snapshotAgent, resolved);
-    if (!identity) fail(operation, key, "TARGET_IDENTITY_UNAVAILABLE", "Stable target identity is unavailable", preEvidence, identity, phase, operationIds, false, false, finalEvidence);
-    const baselineSeq = safeInteger(snapshotAgent?.state_change_seq);
+    identity = snapshotIdentity;
+    const baselineSeq = stateChangeSeq([snapshotRecords.pane, snapshotRecords.agent], phase);
 
     const agentEnvelope = await deps.cli.runJson(["agent", "get", identity.paneId], signal);
-    operationIds.agentGet = agentEnvelope.id;
+    operationIds.agentGet = boundedOperationId(agentEnvelope.id);
     const freshAgent = agentGetResult(agentEnvelope.result);
     const freshEvidence = compactEvidence(freshAgent);
     requireWorking(freshAgent, phase);
-    const freshIdentity = stableIdentity(freshAgent, resolved, true);
-    if (!freshIdentity) fail(operation, key, "TARGET_IDENTITY_UNAVAILABLE", "Fresh target identity is unavailable", preEvidence, identity, phase, operationIds, false, false, finalEvidence, { freshEvidence });
-    if (!sameIdentity(identity, freshIdentity)) fail(operation, key, "TARGET_IDENTITY_CHANGED", "Target identity changed before turn-control dispatch", preEvidence, identity, phase, operationIds, false, false, finalEvidence, { freshEvidence });
-    const freshSeq = safeInteger(freshAgent.state_change_seq);
+    joinTurnIdentity([snapshotRecords.pane, snapshotRecords.agent, freshAgent], identity.paneId, phase);
+    const freshSeq = stateChangeSeq([freshAgent], phase);
     if (freshSeq === undefined && baselineSeq === undefined) fail(operation, key, "TARGET_IDENTITY_UNAVAILABLE", "Target state-change sequence is unavailable", preEvidence, identity, phase, operationIds, false, false, finalEvidence, { freshEvidence });
     if (baselineSeq !== undefined && freshSeq !== undefined && freshSeq < baselineSeq) {
       fail(operation, key, "TARGET_STATE_UNAVAILABLE", "Fresh target state-change sequence regressed from the snapshot baseline", preEvidence, identity, phase, operationIds, false, false, finalEvidence, {
@@ -551,17 +715,17 @@ export async function executeTurnControl(
       });
     }
     const beforeSeq = freshSeq ?? baselineSeq!;
-    preEvidence = { ...preEvidence, ...freshEvidence, state_change_seq: beforeSeq };
+    preEvidence = mergeEvidence([snapshotRecords.pane, snapshotRecords.agent, freshAgent], ["state_change_seq"]);
+    preEvidence.state_change_seq = beforeSeq;
 
     if (signal.aborted) throw new TurnControlError("ABORTED", "Operation aborted before turn-control dispatch", baseDetails(operation, key, preEvidence, identity, phase, operationIds, false, false, finalEvidence));
 
     phase = "dispatch";
     dispatchAttempted = true;
-    let dispatchError: unknown;
     try {
       const dispatchEnvelope = await deps.cli.runJson(["agent", "send-keys", identity.paneId, key], signal, true);
       dispatchAcknowledged = true;
-      operationIds.dispatch = dispatchEnvelope.id;
+      operationIds.dispatch = boundedOperationId(dispatchEnvelope.id);
     } catch (error) {
       dispatchError = error;
     }
@@ -584,7 +748,7 @@ export async function executeTurnControl(
         "--timeout",
         String(TURN_CONTROL_WINDOW_MS)
       ], waitWindow.signal);
-      operationIds.wait = waitEnvelope.id;
+      operationIds.wait = boundedOperationId(waitEnvelope.id);
       waitEvidence = { outcome: "completed" };
     } catch (error) {
       waitEvidence = postWaitDetails(error);
@@ -598,7 +762,7 @@ export async function executeTurnControl(
     let finalError: unknown;
     try {
       const finalEnvelope = await deps.cli.runJson(["api", "snapshot"], finalWindow.signal);
-      operationIds.finalSnapshot = finalEnvelope.id;
+      operationIds.finalSnapshot = boundedOperationId(finalEnvelope.id);
       finalSnapshot = parseSnapshotResult(finalEnvelope.result);
     } catch (error) {
       finalError = error;
@@ -622,7 +786,7 @@ export async function executeTurnControl(
       fail(operation, key, unconfirmedCode(operation), "Final target pane did not remain in its original context", preEvidence, identity, phase, operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, { wait: waitEvidence!, ...failureEvidence });
     }
 
-    finalEvidence = compactEvidence(located.merged!);
+    finalEvidence = compactEvidence(located.pane);
     if (operation === "cancel" && located.pane.agent_status === "unknown" && !hasAgentFields(located.pane) && located.agent === undefined) {
       fail(operation, key, "CANCEL_UNCONFIRMED", "Target agent disappeared before cancel could be confirmed", preEvidence, identity, "confirmation", operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, { wait: waitEvidence!, ...failureEvidence });
     }
@@ -656,14 +820,36 @@ export async function executeTurnControl(
       };
     }
 
-    const finalIdentity = stableIdentity(located.merged, resolved);
-    if (!finalIdentity) fail(operation, key, "TARGET_IDENTITY_CHANGED", "Final target identity is unavailable or changed", preEvidence, identity, phase, operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, { wait: waitEvidence!, ...failureEvidence });
+    phase = "confirmation";
+    if (located.paneCount !== 1 || located.agentCount !== 1 || !located.agent) {
+      fail(operation, key, unconfirmedCode(operation), "Final snapshot does not contain exactly one target pane and agent record", preEvidence, identity, phase, operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, {
+        wait: waitEvidence!,
+        ...failureEvidence,
+        targetPaneRecordCount: located.paneCount,
+        targetAgentRecordCount: located.agentCount
+      });
+    }
+    finalEvidence = compactEvidence(located.pane);
+    let finalIdentity: TurnRecordIdentity;
+    try {
+      finalIdentity = joinTurnIdentity([located.pane, located.agent], identity.paneId, phase);
+      finalEvidence = mergeEvidence([located.pane, located.agent]);
+    } catch (error) {
+      finalValidationFailed = true;
+      throw error;
+    }
     if (!sameIdentity(identity, finalIdentity)) fail(operation, key, "TARGET_IDENTITY_CHANGED", "Final target identity changed after turn-control dispatch", preEvidence, identity, phase, operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, { wait: waitEvidence!, ...failureEvidence });
 
-    const finalState = stateFrom(located.merged, "confirmation");
-    const afterSeq = safeInteger(located.merged?.state_change_seq);
+    const finalState = finalIdentity.state;
+    let afterSeq: number | undefined;
+    try {
+      afterSeq = stateChangeSeq([located.pane, located.agent], phase);
+    } catch (error) {
+      finalValidationFailed = true;
+      throw error;
+    }
     if (!isTerminalState(finalState) || afterSeq === undefined || afterSeq <= beforeSeq) {
-      fail(operation, key, unconfirmedCode(operation), "The same agent did not reach a confirmed terminal state", preEvidence, identity, "confirmation", operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, { wait: waitEvidence!, ...failureEvidence, finalState });
+      fail(operation, key, unconfirmedCode(operation), "The same agent did not reach a confirmed terminal state", preEvidence, identity, phase, operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, { wait: waitEvidence!, ...failureEvidence, finalState });
     }
 
     const details = {
@@ -682,6 +868,15 @@ export async function executeTurnControl(
   } catch (error) {
     if (error instanceof TurnControlError) {
       if (error.details.preEvidence) throw error;
+      if (finalValidationFailed) {
+        fail(operation, key, error.code, error.message, preEvidence, identity, phase, operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, {
+          ...error.details,
+          cause: error.details,
+          reason: error.message,
+          wait: waitEvidence!,
+          ...dispatchEvidence(dispatchError)
+        });
+      }
       throw new TurnControlError(error.code, error.message, {
         ...baseDetails(operation, key, preEvidence, identity, phase, operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence),
         ...error.details,
@@ -704,6 +899,7 @@ export async function executeTurnControl(
 
 export const turnControlInternals = {
   bounded,
+  boundedOperationId,
   safeString,
   safeInteger,
   errorCode,
@@ -718,6 +914,10 @@ export const turnControlInternals = {
   sameSession,
   sameIdentity,
   mergedSnapshotAgent,
+  snapshotTargetRecords,
+  joinTurnIdentity,
+  stateChangeSeq,
+  mergeEvidence,
   agentGetResult,
   baseDetails,
   boundedSignal,

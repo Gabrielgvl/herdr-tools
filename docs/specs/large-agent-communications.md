@@ -73,17 +73,38 @@ want the body out of the recipient's prompt. The extension never upgrades an
 ### Inline route
 
 The existing v1 envelope, plus the new `delivery: inline` header line, is written to
-the child process standard input:
+the child process standard input exactly once:
 
 ```text
-herdr agent prompt <TARGET> --stdin [--wait --until working --timeout 5000]
+herdr agent prompt <TARGET> --stdin
 ```
 
-`--wait` flag selection is unchanged: a steer whose authoritative pre-state is
-already `working` omits the wait flags; every other wrapped delivery keeps them.
-The initial prompt issued by `herdr_launch` uses a 10,000 ms CLI deadline, leaving
-Herdr's fixed 5,000 ms state-change observation enough time to return its typed
-`agent_prompt_stalled` envelope instead of a boundary timeout.
+No text delivery uses `--wait`, `--until`, or a synthesized Enter. For
+`herdr_communicate`, the fresh snapshot agent record, `agent get`, and pane records
+are the complete identity source: one strict join must establish the exact pane ID,
+terminal ID, agent name/kind, and complete `agent_session`, while every supplied field
+must agree and omitted/null fields remain absent. For `herdr_launch.initialPrompt`,
+real Herdr 0.8.2 `agent_started` records may omit identity fields. Launch therefore
+runs one bounded, read-only identity-readiness preflight (target approximately five
+seconds with short polling) before dispatch or recipient registration. Every sample
+freshly reads snapshot, `agent get`, and pane, and joins that single coherent sample
+only with fields actually supplied by `agent_started`; no missing component is
+carried from an earlier sample. A complete start field may cover a fresh omission,
+but a missing start session must be present in one sample. Any contradiction against
+start or within a sample fails immediately; timeout or caller abort fails closed with
+bounded evidence. This is identity readiness, not a prompt retry: stdin remains
+zero or one submission, with no Enter, runtime hook, fallback, or duplicate bytes.
+A pane/name/kind match alone is insufficient.
+Herdr's optional working-state observation can report `agent_prompt_stalled` after
+accepting the bytes, and headless panes commonly return
+`screen_detection_skipped:true` with an idle post-state. A successful
+`cli:agent:prompt` / `agent_prompted` envelope whose returned identity exactly
+matches the captured identity, with `interactive_ready` and safe `revision`, is
+the atomic submission acknowledgement. It confirms acceptance, not turn progress
+or completion. The follow-up agent/pane reads are optional identity-bound
+observation and report working, non-working, unknown, skipped, stale, or
+unavailable without resubmitting the body; a replacement is never described as
+the original target.
 
 Pi's `pi.exec` helper spawns children with `stdio: ["ignore", "pipe", "pipe"]` and
 has no input option, so the extension adds one narrow stdin-capable executor of its
@@ -91,16 +112,17 @@ own. It keeps every existing guarantee: explicit `herdr` executable, argv array,
 `shell: false`, the same bounded timeout, and the same `AbortSignal` handling. A
 timeout or abort sends `SIGTERM` and escalates to `SIGKILL` after a bounded grace
 period (default 5 s), so a child that ignores termination cannot hang the tool call;
-every timer and listener is cleared on the first settle.
+every timer and listener is cleared on the first settle. The executor records the
+child's actual `exit` code/signal before resolving `close`, so an abort delivered in
+the exit-to-close window cannot turn a successful code-0 acknowledgement into a
+killed result.
 
 Failure evidence for a stdin delivery is fixed and non-textual — exit code, killed
 flag, per-stream presence, exact byte size, and truncation — because a failing CLI
-can echo part of a sender-authored body. For only the exact non-killed exit-1
-`cli:agent:prompt` / `agent_prompt_stalled` envelope, the adapter additionally
-retains a safe-integer `promptStallStateChangeSeq` hint; it never retains the raw
-stream. The captured text is used only in-process to classify a rejected `--stdin`
-flag or this exact typed envelope, and is never placed in error details, results, or
-rendered rows. Argv-only calls keep their existing bounded textual evidence.
+can echo part of a sender-authored body. The adapter never retains a stall sequence
+hint or raw process stream. Captured text is used only in-process to classify a
+rejected `--stdin` flag and is never placed in error details, results, or rendered
+rows. Argv-only calls keep their existing bounded textual evidence.
 
 If the installed CLI rejects `--stdin`, the CLI fails its argument parse before
 touching the agent, so no bytes reach the recipient. That failure maps to
@@ -268,7 +290,9 @@ before every attachment send.
   tools. A user or project profile that does is reported incapable, not repaired.
 - Profile-backed `herdr_launch` mints the recipient key, ensures the recipient
   directory, and records `paneId → { recipientKey, profileName, kind, capable,
-  reason, agentName, agentId }` in the registry on success.
+  reason, terminalId, agentName, agentKind, agentSession, agentId }` in the registry
+  on success. The pane, terminal, name, kind, and complete session object are the
+  binding; `agentId` is optional diagnostic metadata only.
 - Claude profile launches additionally receive an extension-owned
   `--add-dir <root>/<recipientKey>`. Profile `addDirs` cannot express this path
   (they are validated as relative to the profile scope root), so the grant belongs to
@@ -283,9 +307,11 @@ before every attachment send.
   only, is cleared on session start and shutdown, and is never reconstructed from
   session entries, labels, or Herdr metadata.
 - Before an attachment send, `herdr_communicate` requires a registry record for the
-  resolved pane whose recorded agent name and agent ID still match the fresh
-  authoritative snapshot. A missing record, an incapable record, or an identity
-  mismatch fails with `ATTACHMENT_TARGET_UNVERIFIED` and sends nothing.
+  resolved pane whose recorded pane, terminal, name, kind, and complete session
+  identity still match the fresh authoritative snapshot and the pre-send join. A
+  same-name/pane replacement therefore fails even when `agent_id` is absent or
+  unchanged. A missing record, an incapable record, or an identity mismatch fails
+  with `ATTACHMENT_TARGET_UNVERIFIED` and sends nothing.
 - Recovery for an unverified target is explicit: send `inline`, or relaunch the
   recipient from a profile in the current runtime. The extension never guesses.
 
@@ -303,12 +329,20 @@ before every attachment send.
 - `text` must be non-empty and NUL-free; a NUL is `INVALID_INPUT`.
 - Existing behaviour is otherwise unchanged: sequential execution, fresh snapshot,
   sender resolution, self-target rejection, `TARGET_BUSY` for a working `prompt`,
-  steer wait-flag selection, and mandatory authoritative post-state verification.
+  direct prompt/steer submission without wait flags, and body-free submission plus
+  optional-observation evidence. A complete identity-bound `agent_prompted`
+  acknowledgement is required; a missing, malformed, contradictory, or mismatched
+  identity/acknowledgement sends no second submission. Paired agent/pane reads may
+  report working, non-working, unknown, skipped, stale, or unavailable after the
+  acknowledgement without changing its confirmed status. `postState` and the
+  success-row state are emitted only when the full identity still matches; a
+  replacement is omitted from authoritative fields and appears only as bounded
+  mismatch evidence. Named keys retain strict authoritative post-state verification.
 - Order for an attachment send: preflight → snapshot → sender → target →
   capability recheck → pre-state → publish → prompt over `--stdin` → post-state.
-- `details` gains `delivery`, `envelope.delivery`, and for the attachment route
-  `attachment: { attachmentId, path, bytes, sha256, expiresAt, recipientPaneId }`.
-  It never contains the body, and no existing field is removed.
+- `details` gains `delivery`, `envelope.delivery`, `submission`, `observation`, and
+  for the attachment route `attachment: { attachmentId, path, bytes, sha256, expiresAt,
+  recipientPaneId }`. It never contains the body, and no existing field is removed.
 - The route is established before any precondition, and one body-free wrapper adds it to
   every failure. A failure keeps its typed code and gains `delivery` and `phase`
   (`validate`, `resolve_target`, `verify_recipient`, `pre_state`, `publish`, `send`, or
@@ -333,18 +367,28 @@ before every attachment send.
 - Storage happens before topology mutation, matching ADR-006: resolve profile →
   check capability → create prompt source → mint recipient key and directory →
   publish attachment → build argv (including the Claude `--add-dir` grant) → create
-  pane/tab → start agent → send envelope over `--stdin` → verify `working`.
-  Building profile argv therefore moves after the recipient key is minted. A
-  newly-created pane has no authoritative pane ID before placement, so its
-  pre-placement attachment metadata omits `recipientPaneId`; the final launch
-  details and in-memory recipient record bind the key to the authoritative pane
-  and agent identity after the post-state read. Existing-pane placements include
-  the known pane ID in metadata.
+  pane/tab → start agent and require its complete 0.8.2 identity envelope → join
+  a fresh snapshot plus `agent get` plus pane identity → send exactly one
+  identity-bound envelope over `--stdin` → validate the typed `agent_prompted`
+  acknowledgement → optionally observe the paired agent/pane state. The fresh joined
+  identity is mandatory even when no initial prompt is requested, and the same full
+  pane/terminal/name/kind/session binding is persisted in the recipient registry;
+  `agent_id` is diagnostic only. Building profile argv therefore moves after the
+  recipient key is minted. A newly-created pane has no authoritative pane ID before
+  placement, so its pre-placement attachment metadata omits `recipientPaneId`; final
+  launch details and the in-memory recipient record bind the key to the authoritative
+  pane and agent identity. Existing-pane placements include the known pane ID in
+  metadata. Working-state detection is not delivery confirmation:
+  `interactive_ready`, `revision`, `state_change_seq`, and
+  `screen_detection_skipped` are retained as bounded evidence, and idle/done/blocked,
+  stale, or unavailable observation never triggers Enter or a duplicate prompt.
+  A replacement post-read is retained only as bounded mismatch evidence; it is never
+  returned as `postState`, rendered as success-row state, or used for registration.
 - A launch failure still performs no cleanup: created panes and tabs remain and are
   reported, and a published attachment remains until expiry.
-- `details` gains `initialPromptDelivery`, the same `attachment` block, and the
-  recipient record identity. Streamed progress gains an `attachment_publish` phase
-  before `placement`.
+- `details` gains `initialPromptDelivery`, `initialPromptSubmission`,
+  `initialPromptObservation`, the same `attachment` block, and the recipient record
+  identity. Streamed progress gains an `attachment_publish` phase before `placement`.
 - Failure details keep the existing partial-launch codes (`LAUNCH_FAILED`,
   `READY_TIMEOUT`, `POSTSTATE_UNAVAILABLE`, `ABORTED`) and `created`/`causeCode`
   evidence, and add `phase`, `delivery`, `initialPromptDelivery`, and, once the
@@ -518,17 +562,16 @@ agent to write it to an exact marker path, and the test polls for that marker. A
 launched bundled Pi profile agent and a launched bundled Claude profile agent must each
 read their own attachment — the Claude case through its granted `--add-dir` directory.
 Host-side reads of the published file are transport evidence and never substitute for
-recipient evidence. If a delivery cannot be confirmed, the acceptance test records
-`INTEGRATION_ACCEPTANCE_BLOCKED` with the exact code and phase and is reported as
-skipped; it is never reported as passing, and no readback claim is made for it.
+recipient evidence. If a delivery cannot be confirmed, the acceptance test records a
+bounded failure with the exact code and phase and fails; it never converts the missing
+acknowledgement into a skipped or passing readback claim.
 
-**Non-gating transport smoke.** A separate test records confirmed or unconfirmed
-delivery (`INTEGRATION_DELIVERY_CONFIRMED` / `INTEGRATION_DELIVERY_UNCONFIRMED` with
-code, cause, phase, and bounded argv-path evidence) and asserts route and artifact
+**Non-gating transport smoke.** A separate test records confirmed delivery, or records
+bounded failure evidence before rethrowing it, and asserts route and artifact
 invariants: inline delivery over `--stdin`, a regression check that no payload text
 reaches argv, and the published attachment's exact bytes, digest, and `0600` mode taken
 from success or from retained-attachment failure evidence. It makes no claim about what
-any recipient read.
+any recipient read, but a post-feature delivery failure still fails the run.
 
 Environment-independent behaviour stays strict: `ATTACHMENT_TARGET_UNVERIFIED` refusals
 for an unregistered recipient pane and for an incapable profile must carry the
@@ -600,17 +643,13 @@ and never mutates or closes the active user workspace.
 - Cross-session attachment sends are deliberately impossible in this slice. Whether
   durable capability records are worth their reconciliation cost is deferred.
 - Known environment behavior, outside this repository: an agent in a **headless named
-  Herdr session** may not be observed entering `working` after prompt submission. The
-  launch path gives the CLI a 10,000 ms deadline so its fixed 5,000 ms observation can
-  return `agent_prompt_stalled` ("no observed state change within 5000 ms"). The
-  disposable MCP integration now confirms the Pi launch path through the exact typed
-  stall evidence and bounded recovery; this does not broaden recovery for generic or
-  uncertain failures.
-- `herdr_launch` keeps the keystroke recovery for a stalled initial prompt bounded to
-  one `enter` and one wait. On the stdin transport the raw stalled envelope is never
-  retained or published; the exact typed envelope is reduced to its safe-integer
-  `promptStallStateChangeSeq` hint. New-pane recovery remains available for that
-  evidence, while existing-pane recovery additionally requires runtime ownership, an
-  agent-free authoritative pre-launch snapshot, and an exact idle post-state identity
-  and sequence match. Generic, malformed, killed, or mismatched stdin failures never
-  authorize a recovery key.
+  Herdr session** may accept a prompt while its optional working-state observation is
+  skipped. The direct command can return `agent_prompted` with `agent_status: idle`,
+  `screen_detection_skipped: true`, and a revision that is unchanged while the TUI
+  later renders and processes the assignment. The disposable integration covers this
+  as confirmed submission plus explicit observation evidence; it does not claim a
+  working transition or completion.
+- Prompt delivery never uses a keystroke recovery. The atomic acknowledgement is the
+  only acceptance claim; malformed, killed, or mismatched responses fail closed, and
+  a stale/unavailable follow-up read is reported as observation without retrying or
+  exposing stdin process text.

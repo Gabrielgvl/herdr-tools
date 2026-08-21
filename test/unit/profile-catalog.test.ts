@@ -302,13 +302,17 @@ describe("profile catalog", () => {
     const calls: string[][] = [];
     const snapshot = { type: "session_snapshot", snapshot: { version: "0.8", protocol: 1, workspaces: [{ workspace_id: "w", label: "workspace" }], tabs: [{ tab_id: "w:t", workspace_id: "w", label: "main" }], panes: [{ pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "caller", agent_status: "idle" }], agents: [] } };
     const promptSources = { create: vi.fn(async (body: string) => ({ path: `/tmp/profile-${Buffer.byteLength(body, "utf8")}.md` })) };
+    let started = false;
+    let lastName = "worker";
+    const identity = { terminal_id: "terminal-a", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-a" } };
     const cli = { runJson: async (argv: string[]) => {
       calls.push(argv);
-      if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+      if (argv[0] === "api") return { id: "snapshot", result: started ? { ...snapshot, snapshot: { ...snapshot.snapshot, panes: [...snapshot.snapshot.panes, { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent_name: lastName, agent: "pi", ...identity }], agents: [{ pane_id: "w:p2", name: lastName, agent: "pi", ...identity }] } } : snapshot };
       if (argv[0] === "pane" && argv[1] === "split") return { id: "split", result: { pane: { pane_id: "w:p2", tab_id: "w:t" } } };
       if (argv[0] === "pane" && argv[1] === "rename") return { id: "rename", result: {} };
-      if (argv[0] === "agent" && argv[1] === "start") return { id: "start", result: { agent: { name: argv[2], pane_id: "w:p2", agent: "pi", terminal_id: "terminal-a" } } };
-      if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent: "pi", agent_status: "idle" } } };
+      if (argv[0] === "agent" && argv[1] === "start") { started = true; lastName = argv[2]!; return { id: "start", result: { agent: { name: argv[2], pane_id: "w:p2", agent: "pi", ...identity } } }; }
+      if (argv[0] === "agent" && argv[1] === "get") return { id: "agent-get", result: { agent: { name: lastName, pane_id: "w:p2", agent: "pi", ...identity } } };
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent_name: lastName, agent: "pi", ...identity, agent_status: "idle" } } };
       throw new Error(`unexpected ${argv.join(" ")}`);
     } } as unknown as HerdrCli;
     const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);

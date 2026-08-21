@@ -3,6 +3,7 @@ import type { HerdrCli, JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
+import { classifyPromptObservation, compactPromptSubmission, requirePromptTargetIdentity, parsePromptSubmission, PromptIdentityError, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import type { AttachmentStore, PublishedAttachment } from "../messages/store.js";
 import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
@@ -21,12 +22,16 @@ export interface CommunicateDetails {
   delivery?: MessageDelivery;
   route?: CommunicateRoute;
   preState: Record<string, unknown>;
-  postState: Record<string, unknown>;
+  postState?: Record<string, unknown>;
+  submission?: PromptSubmissionEvidence;
+  observation?: PromptObservation;
   operationIds: {
     snapshot?: string;
+    agentGet?: string;
     preState?: string;
     prompt?: string;
     keys?: string;
+    postAgentGet?: string;
     postState?: string;
   };
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
@@ -51,7 +56,20 @@ export function compactPane(pane: Record<string, unknown>): Record<string, unkno
     ...(typeof pane.label === "string" ? { label: pane.label.slice(0, 256) } : {}),
     ...(typeof pane.agent_id === "string" ? { agent_id: pane.agent_id.slice(0, 256) } : {}),
     ...(typeof pane.agent_name === "string" ? { agent_name: pane.agent_name.slice(0, 256) } : {}),
-    agent_status: pane.agent_status
+    ...(typeof pane.terminal_id === "string" ? { terminal_id: pane.terminal_id.slice(0, 256) } : {}),
+    ...(typeof pane.agent_session === "object" && pane.agent_session !== null && !Array.isArray(pane.agent_session)
+      && typeof (pane.agent_session as Record<string, unknown>).source === "string"
+      && typeof (pane.agent_session as Record<string, unknown>).agent === "string"
+      && typeof (pane.agent_session as Record<string, unknown>).kind === "string"
+      && typeof (pane.agent_session as Record<string, unknown>).value === "string"
+      ? { agent_session: {
+        source: ((pane.agent_session as Record<string, unknown>).source as string).slice(0, 256),
+        agent: ((pane.agent_session as Record<string, unknown>).agent as string).slice(0, 256),
+        kind: ((pane.agent_session as Record<string, unknown>).kind as string).slice(0, 256),
+        value: ((pane.agent_session as Record<string, unknown>).value as string).slice(0, 256)
+      } } : {}),
+    agent_status: pane.agent_status,
+    ...(typeof pane.revision === "number" && Number.isSafeInteger(pane.revision) && pane.revision >= 0 ? { revision: pane.revision } : {})
   };
 }
 
@@ -67,6 +85,22 @@ export function paneFrom(value: unknown, expectedPaneId: string): Record<string,
     throw Object.assign(new Error("Herdr pane response does not match the resolved target"), { code: "CLI_PROTOCOL_ERROR", details: { expectedPaneId, actualPaneId: pane.pane_id } });
   }
   return pane;
+}
+
+function agentFrom(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || typeof (value as { agent?: unknown }).agent !== "object" || (value as { agent?: unknown }).agent === null || Array.isArray((value as { agent?: unknown }).agent)) {
+    throw new PromptIdentityError("TARGET_IDENTITY_UNAVAILABLE", "Fresh Herdr agent identity is unavailable");
+  }
+  return (value as { agent: Record<string, unknown> }).agent;
+}
+
+function snapshotIdentityRecords(snapshot: ReturnType<typeof parseSnapshotResult>, paneId: string): Record<string, unknown>[] {
+  const panes = snapshot.panes.filter((pane) => pane.pane_id === paneId);
+  const agents = snapshot.agents.filter((agent) => agent.pane_id === paneId);
+  if (panes.length !== 1 || agents.length !== 1) {
+    throw new PromptIdentityError("TARGET_IDENTITY_UNAVAILABLE", "Fresh snapshot does not contain one authoritative target agent", { paneId, paneRecords: panes.length, agentRecords: agents.length });
+  }
+  return [panes[0]!, agents[0]!];
 }
 
 function stateOf(pane: Record<string, unknown>): CommunicateState {
@@ -97,7 +131,6 @@ function operationId(envelope: JsonEnvelope | undefined): string | undefined {
   return envelope?.id;
 }
 
-
 export function createCommunicateTool(deps: CommunicateDependencies): ToolDefinition<typeof CommunicateParamsSchema, CommunicateDetails> {
   return {
     name: "herdr_communicate",
@@ -116,12 +149,17 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       let phase: CommunicatePhase = "validate";
       let snapshotEnvelope: JsonEnvelope;
       let target: ReturnType<typeof resolveTarget>;
+      let preAgentEnvelope: JsonEnvelope | undefined;
       let preEnvelope: JsonEnvelope;
       let before: Record<string, unknown>;
       let sender: SenderIdentity | undefined;
-      let postEnvelope: JsonEnvelope;
-      let after: Record<string, unknown>;
-      let afterState: CommunicateState;
+      let promptIdentity: PromptTargetIdentity | undefined;
+      let postAgentEnvelope: JsonEnvelope | undefined;
+      let postEnvelope: JsonEnvelope | undefined;
+      let after: Record<string, unknown> | undefined;
+      let afterState: CommunicateState | undefined;
+      let submission: PromptSubmissionEvidence | undefined;
+      let observation: PromptObservation | undefined;
       try {
         if (params.operation === "keys") {
           if (Object.prototype.hasOwnProperty.call(params, "delivery")) throw Object.assign(new Error("delivery is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "delivery" } });
@@ -148,25 +186,36 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         }
         let recipientKey: string | undefined;
         let recipientAgentName: string | undefined;
+        let recipientRecord: ReturnType<RecipientRegistry["get"]>;
         if (delivery === "attachment") {
           phase = "verify_recipient";
           if (!deps.attachments || !deps.recipients || !target.paneId) {
             throw Object.assign(new Error("Attachment target capability is unavailable"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId } });
           }
-          const recipient = deps.recipients.get(target.paneId);
-          const verification = verifyRecipient(snapshot, recipient);
+          recipientRecord = deps.recipients.get(target.paneId);
+          const verification = verifyRecipient(snapshot, recipientRecord);
           if (!verification.verified) {
             throw Object.assign(new Error("Attachment target capability is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: verification.reason } });
           }
-          recipientKey = recipient!.recipientKey;
+          recipientKey = recipientRecord!.recipientKey;
           recipientAgentName = verification.identity.agentName;
         }
         phase = "pre_state";
+        if (params.operation !== "keys") {
+          preAgentEnvelope = await deps.cli.runJson(["agent", "get", target.paneId!], activeSignal);
+        }
         preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
         before = paneFrom(preEnvelope.result, target.paneId!);
         const beforeState = assertSendableState(before);
         if (params.operation === "prompt" && beforeState === "working") {
           throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: target.paneId, state: beforeState } });
+        }
+        if (params.operation !== "keys") {
+          promptIdentity = requirePromptTargetIdentity([
+            ...snapshotIdentityRecords(snapshot, target.paneId!),
+            agentFrom(preAgentEnvelope!.result),
+            before
+          ], target.paneId!);
         }
 
         if (params.operation === "keys") {
@@ -189,19 +238,56 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           const envelope = delivery === "attachment"
             ? buildEnvelope(sender!, params.operation, params.text, "attachment", { ...published!, encoding: "utf-8" })
             : buildEnvelope(sender!, params.operation, params.text, "inline");
-          const promptArgs = params.operation === "steer" && beforeState === "working"
-            ? ["agent", "prompt", target.paneId!, "--stdin"]
-            : ["agent", "prompt", target.paneId!, "--stdin", "--wait", "--until", "working", "--timeout", "5000"];
+          const promptArgs = ["agent", "prompt", target.paneId!, "--stdin"];
           phase = "send";
-          prompt = await deps.cli.runJsonWithStdin(promptArgs, envelope, activeSignal);
+          // The stdin command is a completed mutation once its response arrives.
+          // Preserve that response if the caller aborts in the same turn; only
+          // the later observation is optional after acknowledgement parsing.
+          prompt = await deps.cli.runJsonWithStdin(promptArgs, envelope, activeSignal, true);
+          submission = parsePromptSubmission(prompt, promptIdentity!);
         }
 
         phase = "post_state";
-        postEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
-        after = paneFrom(postEnvelope.result, target.paneId!);
-        afterState = assertPostState(after);
-        if (params.operation !== "keys" && afterState !== "working") {
-          throw Object.assign(new Error("Target did not enter working state"), { code: "POSTSTATE_UNAVAILABLE", details: { target: target.paneId, postState: compactPane(after) } });
+        try {
+          if (submission) {
+            postAgentEnvelope = await deps.cli.runJson(["agent", "get", target.paneId!], activeSignal);
+            postEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
+            const candidate = paneFrom(postEnvelope.result, target.paneId!);
+            const postEvidence = [agentFrom(postAgentEnvelope.result), candidate];
+            observation = classifyPromptObservation(postEvidence, submission);
+            let identityMatches = false;
+            try {
+              const postIdentity = requirePromptTargetIdentity(postEvidence, target.paneId!);
+              identityMatches = samePromptTargetIdentity(postIdentity, submission);
+            } catch {
+              identityMatches = false;
+            }
+            // A pane can be reused by a same-name replacement after the prompt
+            // acknowledgement. Never retain or render that process as the target.
+            if (identityMatches) {
+              after = candidate;
+              try {
+                afterState = stateOf(candidate);
+              } catch {
+                afterState = undefined;
+              }
+            } else {
+              after = undefined;
+              afterState = undefined;
+            }
+          } else {
+            postEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
+            after = paneFrom(postEnvelope.result, target.paneId!);
+            afterState = assertPostState(after);
+          }
+        } catch (error) {
+          if (!submission) throw error;
+          // The typed prompt response is the atomic submission acknowledgement. A
+          // later identity/state read can be stale or unavailable without changing
+          // that fact; an abort after acknowledgement applies only to observation.
+          after = undefined;
+          afterState = undefined;
+          observation = unavailablePromptObservation(error);
         }
       } catch (error) {
         throw withDeliveryFailureEvidence(error, { delivery, route, phase, published });
@@ -214,13 +300,17 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         ...(delivery ? { delivery } : {}),
         ...(route ? { route } : {}),
         preState: compactPane(before),
-        postState: compactPane(after),
+        ...(after ? { postState: compactPane(after) } : {}),
+        ...(submission ? { submission: compactPromptSubmission(submission) } : {}),
+        ...(observation ? { observation } : {}),
         operationIds: {
           snapshot: operationId(snapshotEnvelope),
+          ...(preAgentEnvelope ? { agentGet: operationId(preAgentEnvelope) } : {}),
           preState: operationId(preEnvelope),
           ...(prompt ? { prompt: operationId(prompt) } : {}),
           ...(keys ? { keys: operationId(keys) } : {}),
-          postState: operationId(postEnvelope)
+          ...(postAgentEnvelope ? { postAgentGet: operationId(postAgentEnvelope) } : {}),
+          ...(postEnvelope ? { postState: operationId(postEnvelope) } : {})
         },
         ...(params.operation !== "keys" ? {
           sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
@@ -228,7 +318,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           ...(published ? { attachment: published } : {})
         } : {})
       };
-      return { content: [{ type: "text", text: formatResult({ operation: "communicate", outcome: "success", targetId: target.paneId, delivery, postState: { agent_status: afterState } }) }], details };
+      return { content: [{ type: "text", text: formatResult({ operation: "communicate", outcome: "success", targetId: target.paneId, delivery, ...(afterState === undefined ? {} : { postState: { agent_status: afterState } }) }) }], details };
     },
     renderCall(args, theme) {
       const delivery = args.operation === "keys" ? undefined : args.delivery ?? "inline";

@@ -20,9 +20,12 @@ function parseSession(argv: string[]): string {
 }
 
 const session = parseSession(process.argv.slice(2));
+if (process.env.HERDR_TOOLS_RUN_INTEGRATION !== "1") {
+  throw new Error("HERDR_TOOLS_RUN_INTEGRATION=1 is required for disposable integration");
+}
 const result = spawnSync(process.execPath, ["node_modules/vitest/vitest.mjs", "run", "--config", "vitest.integration.config.ts"], {
   cwd: process.cwd(),
-  env: { ...process.env, HERDR_TOOLS_INTEGRATION_SESSION: session },
+  env: { ...process.env, HERDR_TOOLS_RUN_INTEGRATION: "1", HERDR_TOOLS_INTEGRATION_SESSION: session },
   stdio: "inherit",
 });
 

@@ -44,7 +44,7 @@ npm run test:unit
 npm run typecheck
 npm run lint
 npm run build
-npm run test:integration
+HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration
 ```
 
 ## Project Structure
@@ -196,7 +196,7 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 - Non-manager roles exclude hidden delegation tools.
 - Pi and Claude launch argv contain the exact tool, skill, permission, and plugin flags.
 - Invalid or escaping role resource paths remain rejected by existing parser tests.
-- A newly created owned pane receives exactly one lowercase `enter` retry only after exact `cli:agent:prompt` `agent_prompt_stalled` evidence reports five seconds with no state change while status remains idle; non-matching failures and pre-existing panes do not retry.
+- A profile launch accepts that real Herdr 0.8.2 `agent_started` may omit identity fields, then runs one bounded, read-only identity-readiness preflight (target approximately five seconds with short polling) before any prompt dispatch or recipient registration. Each sample freshly reads snapshot, `agent get`, and pane and joins only that coherent sample with fields actually supplied by start; missing components are never merged across samples. A complete start field may cover a fresh omission, but a missing start session must arrive in one sample. Contradictions fail immediately; timeout or caller abort fails closed with bounded evidence. Only the exact captured pane/terminal/name/kind and complete `agent_session` identity permits one provenance-wrapped `agent prompt --stdin` submission without `--wait`; the readiness window is not a prompt retry. The exact captured identity plus `agent_prompted` and `interactive_ready:true` acknowledge acceptance. The same full identity is persisted for attachment recipients; optional `agent_id` is diagnostic only. Headless `screen_detection_skipped`, idle post-state, stale revision, or unavailable/replaced observation never triggers Enter, a runtime hook, fallback, or a duplicate submission, and a replacement is never returned as authoritative post-state.
 
 ### Integration
 
@@ -229,8 +229,8 @@ Checkpoint: catalog resolution has 12 effective profiles, no diagnostics, and ev
 - Extend `test/unit/profile-catalog.test.ts` with an exact capability matrix and role-resource existence checks.
 - Add representative `buildProfileArgv` assertions for manager, worker, read-only Pi, and Claude profiles.
 - Update `test/integration/herdr-tools.integration.test.ts` to inspect 12 profiles, inspect both manager profiles, and verify exact worker tool/skill launch arguments without changing provenance or topology assertions.
-- Add the owner-approved bounded launch recovery in `src/tools/launch.ts`: after exact `agent_prompt_stalled` evidence reports five seconds with no state change and idle status in a newly created pane, send one lowercase `enter` and re-verify `working`; never retry non-matching failures or pre-existing panes.
-- Cover the positive and negative recovery boundaries in `test/unit/launch.test.ts`.
+- Add identity-bound prompt acknowledgement and optional post-dispatch observation in `src/tools/launch.ts`: accept partial Herdr 0.8.2 `agent_started` identity, then run one bounded read-only snapshot + `agent get` + pane preflight sample at a time before submission and before no-prompt return. Join each sample only with start-supplied fields; never merge missing components across samples, and fail immediately on supplied contradictions. After one sample yields the exact pane/terminal/name/kind and complete `agent_session`, submit exactly once through `agent prompt --stdin` and require the typed `agent_prompted` response to match that captured identity, `interactive_ready:true`, and safe revision. Abort/timeout stops before stdin and recipient registration with bounded evidence. Persist that identity for attachments, report working/skipped/stale/unavailable observation without waiting, retrying, runtime hooks, fallback, or sending Enter, and omit replacement post-state from authoritative details and success rows.
+- Cover accepted idle/screen-detection-skipped launches, stale/unavailable observation, malformed/mismatched acknowledgements, and the no-duplicate/no-key boundary in `test/unit/launch.test.ts`.
 - Do not weaken strict parser, inspection-budget, discovery, or fallback tests.
 
 Checkpoint: unit tests and typecheck pass before documentation finalization.
@@ -252,7 +252,7 @@ npm run test:unit
 npm run typecheck
 npm run lint
 npm run build
-npm run test:integration
+HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration
 ```
 
 Then inspect the live profile collection from the built extension and confirm:
@@ -281,7 +281,7 @@ Then inspect the live profile collection from the built extension and confirm:
 
 - [x] Extend integration evidence.
   - Acceptance: disposable integration proves collection count, manager inspection, worker tools/skill argv, and unchanged provenance.
-  - Verify: `npm run test:integration`.
+  - Verify: `HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration`.
   - Files: `test/integration/herdr-tools.integration.test.ts`.
 
 - [x] Update living specification and ADR.
@@ -325,4 +325,4 @@ Then inspect the live profile collection from the built extension and confirm:
 
 - `manager-pi` receives `herdr_tab` for explicit tab lifecycle control in addition to pane operations.
 - Worker profiles receive `bash_bg`, `jobs`, `job_decide`, and `monitor` for bounded long-running work.
-- On verified `cli:agent:prompt` `agent_prompt_stalled` evidence reporting five seconds with no state change and idle status, a newly created owned pane receives exactly one lowercase `enter` submission retry followed by authoritative `working` verification. This recovery never applies to pre-existing panes or non-matching failures.
+- Herdr 0.8 prompt acknowledgement is atomic and separate from working-state observation. Communication requires the exact pane/terminal/name/kind and complete `agent_session` identity from a strict fresh-record join; profile launch binds those continuity reads to the fields supplied by `agent_started` plus one coherent fresh sample in a bounded read-only readiness window. Missing components are never merged across samples; a complete start field can cover a fresh omission, but a missing start session must appear in that sample. Contradictory supplied identity, timeout, or caller abort fails closed before stdin and recipient registration. A confirmed `agent_prompted` response is retained even when `screen_detection_skipped:true`, the post-state is idle/done/blocked, or the follow-up revision is stale/unavailable; a replaced identity is never described as the original target. The extension never presses Enter, invokes a runtime hook, falls back, retries submission, or submits duplicate prompt bytes.

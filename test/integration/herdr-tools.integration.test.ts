@@ -26,10 +26,6 @@ function resultObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function blocked(reason: string): void {
-  process.stderr.write(`INTEGRATION_ACCEPTANCE_BLOCKED ${reason}\n`);
-}
-
 describe.skipIf(!enabled)("disposable Herdr integration", () => {
   const state: {
     cwd: string;
@@ -61,10 +57,11 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   });
 
   /**
-   * Deliveries either confirm (the tool returned success) or do not. Callers decide what
-   * an unconfirmed delivery means: the transport smoke records it, acceptance blocks on it.
+   * Every feature delivery is a gate. Keep bounded diagnostic evidence, then
+   * rethrow so a lost or unacknowledged prompt/attachment fails the run rather
+   * than being converted into a skipped acceptance claim.
    */
-  const deliver = async (label: string, call: Promise<{ details?: Record<string, unknown> }>): Promise<{ confirmed: boolean; details: Record<string, unknown> }> => {
+  const deliver = async (label: string, call: Promise<{ details?: Record<string, unknown> }>): Promise<{ confirmed: true; details: Record<string, unknown> }> => {
     try {
       const result = await call;
       process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
@@ -74,8 +71,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       if (failure.details === undefined) throw error;
       // Argv-path failures keep bounded CLI text; stdin deliveries are non-textual by design.
       const evidence = [failure.details.stdout, failure.details.stderr].filter((value) => typeof value === "string" && value.length > 0).join(" | ").slice(0, 600).replace(/\s+/gu, " ");
-      process.stderr.write(`INTEGRATION_DELIVERY_UNCONFIRMED ${label} code=${String(failure.code)} causeCode=${String(failure.details.causeCode)} phase=${String(failure.details.phase)}${evidence ? ` evidence=${evidence}` : ""}\n`);
-      return { confirmed: false, details: failure.details };
+      const attachment = resultObject(failure.details.attachment ?? {});
+      if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
+      process.stderr.write(`INTEGRATION_DELIVERY_FAILED ${label} code=${String(failure.code)} causeCode=${String(failure.details.causeCode)} phase=${String(failure.details.phase)}${evidence ? ` evidence=${evidence}` : ""}\n`);
+      throw error;
     }
   };
 
@@ -250,23 +249,20 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    * acceptance tests below own that claim.
    */
   it("routes wrapped text over the session-bound stdin transport and publishes exact artifacts", async () => {
-    const inline = await deliver("pi-inline-launch", tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: "integration assignment" }, signal(), undefined, toolContext()));
-    expect(inline.details).toMatchObject({ initialPromptDelivery: "inline" });
+    const inlineBody = ["integration assignment", ...Array.from({ length: 320 }, (_value, index) => `long assignment line ${index}`)].join("\n");
+    const inline = await deliver("pi-inline-launch", tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: inlineBody }, signal(), undefined, toolContext()));
+    expect(inline.details).toMatchObject({ initialPromptDelivery: "inline", initialPromptSubmission: { confirmed: true } });
     const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
     expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", "read,bash,grep,find,ls,ffgrep,fffind,ctx_execute,ctx_execute_file,ctx_search,web_search,source_check,fetch_content,get_search_content,edit,write,bash_bg,jobs,job_decide,monitor", "--skill", expect.stringContaining("herdr-profiles/role-plugins/worker/skills/worker"), "--append-system-prompt"]));
     expect(state.profilePromptContent).toContain("Use the worker role skill");
 
     const inlinePaneId = String(inline.details.paneId ?? resultObject(inline.details.created).paneId);
     const inlineDelivery = state.stdinCalls.find((call) => call.input.includes("integration assignment"));
-    // A launch that never reached its prompt phase produces no transport evidence to check.
-    if (inlineDelivery === undefined) {
-      process.stderr.write(`INTEGRATION_TRANSPORT_UNOBSERVED pi-inline-launch phase=${String(inline.details.phase)}\n`);
-    } else {
-      expect(inlineDelivery.args).toEqual(["agent", "prompt", inlinePaneId, "--stdin", "--wait", "--until", "working", "--timeout", "10000"]);
-      expect(inlineDelivery.input).toContain("[HERDR AGENT MESSAGE v1]");
-      expect(inlineDelivery.input).toContain("authority: agent; not user/owner");
-      expect(inlineDelivery.input).toContain("delivery: inline");
-    }
+    expect(inlineDelivery, `pi-inline-launch did not record its stdin submission (phase=${String(inline.details.phase)})`).toBeDefined();
+    expect(inlineDelivery!.args).toEqual(["agent", "prompt", inlinePaneId, "--stdin"]);
+    expect(inlineDelivery!.input).toContain("[HERDR AGENT MESSAGE v1]");
+    expect(inlineDelivery!.input).toContain("authority: agent; not user/owner");
+    expect(inlineDelivery!.input).toContain("delivery: inline");
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("integration assignment")))).toBe(false);
 
     const body = `Transport smoke body.\n${"detail line\n".repeat(200)}`;
@@ -279,21 +275,18 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(attachment.bytes).toBe(Buffer.byteLength(body, "utf8"));
     expect((await stat(String(attachment.path))).mode & 0o777).toBe(0o600);
     const envelope = state.stdinCalls.find((call) => call.input.includes(String(attachment.path)));
-    if (envelope === undefined) {
-      process.stderr.write(`INTEGRATION_TRANSPORT_UNOBSERVED pi-attachment-launch phase=${String(attachmentLaunch.details.phase)}\n`);
-    } else {
-      expect(envelope.input).toContain("delivery: attachment");
-      expect(envelope.input).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
-      expect(envelope.input).not.toContain("detail line");
-    }
+    expect(envelope, `pi-attachment-launch did not record its stdin submission (phase=${String(attachmentLaunch.details.phase)})`).toBeDefined();
+    expect(envelope!.input).toContain("delivery: attachment");
+    expect(envelope!.input).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
+    expect(envelope!.input).not.toContain("detail line");
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("detail line")))).toBe(false);
   }, 240_000);
 
   /**
    * Acceptance: a recipient agent must read the attachment and produce evidence only
-   * obtainable from its content. An unconfirmed delivery blocks the gate; it never passes.
+   * obtainable from its content. An unconfirmed delivery fails the gate; it never passes.
    */
-  it("accepts Pi recipient readback only with agent-produced evidence", async (context) => {
+  it("accepts Pi recipient readback only with agent-produced evidence", async () => {
     const nonce = randomUUID();
     const markerPath = join(state.cwd, "readback-pi.txt");
     const body = [
@@ -306,17 +299,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const launched = await deliver("pi-acceptance-launch", tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "accept-pi" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
     const attachment = resultObject(launched.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
-    if (!launched.confirmed) {
-      blocked(`pi delivery unconfirmed: code=${String(launched.details.causeCode ?? launched.details.code)} phase=${String(launched.details.phase)}; Herdr did not observe the agent entering working in a headless named session`);
-      context.skip();
-      return;
-    }
     expect(await readFile(String(attachment.path), "utf8")).toContain(nonce);
     const produced = await waitForMarker(markerPath, nonce, ACCEPTANCE_DEADLINE_MS);
     expect(produced, `Pi recipient did not produce ${markerPath} containing the attachment token`).toBe(true);
   }, 300_000);
 
-  it("accepts Claude recipient readback only with agent-produced evidence", async (context) => {
+  it("accepts Claude recipient readback only with agent-produced evidence", async () => {
     const nonce = randomUUID();
     const markerPath = join(state.cwd, "readback-claude.txt");
     const body = [
@@ -338,11 +326,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const attachment = resultObject(sent.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
     expect(dirname(dirname(String(attachment.path)))).toBe(grantedDirectory);
-    if (!sent.confirmed) {
-      blocked(`claude delivery unconfirmed: code=${String(sent.details.code)} phase=${String(sent.details.phase)}; Herdr did not observe the agent entering working in a headless named session`);
-      context.skip();
-      return;
-    }
     expect(await readFile(String(attachment.path), "utf8")).toContain(nonce);
     const produced = await waitForMarker(markerPath, nonce, ACCEPTANCE_DEADLINE_MS);
     expect(produced, `Claude recipient did not produce ${markerPath} containing the attachment token`).toBe(true);

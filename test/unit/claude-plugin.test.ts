@@ -49,9 +49,9 @@ describe("Claude manager plugin package", () => {
     expect(serverMap.herdr!.env).toBeUndefined();
   });
 
-  it("resolves its command to the built entry this repository emits", () => {
-    const entry = serverMap.herdr!.args![0]!.replace("${CLAUDE_PLUGIN_ROOT}", packageRoot);
-    expect(resolve(entry)).toBe(join(repoRoot, "dist/src/mcp-server.js"));
+  it("resolves its command to the installed main build entry", () => {
+    const entry = serverMap.herdr!.args![0]!;
+    expect(resolve(entry)).toBe("/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js");
     const build = JSON.parse(readFileSync(join(repoRoot, "tsconfig.build.json"), "utf8")) as { compilerOptions: { rootDir: string; outDir: string }; include: string[] };
     expect(build.compilerOptions).toMatchObject({ rootDir: ".", outDir: "dist" });
     expect(build.include).toContain("src/**/*.ts");

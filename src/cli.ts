@@ -1,6 +1,6 @@
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
-import { spawnWithStdin, type StdinExec } from "./exec-stdin.js";
+import { spawnWithStdin, type StdinExec, type StdinExecResult } from "./exec-stdin.js";
 
 export type PiExec = (command: string, args: string[], options: ExecOptions) => Promise<ExecResult>;
 
@@ -58,49 +58,15 @@ function nonTextualEvidence(value: string, limit: number, field: "stdout" | "std
   };
 }
 
-interface PromptStallSequenceHint {
-  promptStallStateChangeSeq: number;
-}
-
-function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value);
-  return actual.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
-}
-
-/**
- * Extract the one non-textual piece of stderr evidence that can authorize existing-pane
- * prompt recovery. The raw stderr is intentionally parsed and discarded here.
- */
-function promptStallSequenceHint(stderr: string, exitCode: number, killed: boolean, limit: number): PromptStallSequenceHint | undefined {
-  if (exitCode !== 1 || killed || Buffer.byteLength(stderr, "utf8") > limit) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(stderr.trim());
-  } catch {
-    return undefined;
-  }
-  if (!record(parsed) || !hasExactKeys(parsed, ["id", "error"]) || parsed.id !== "cli:agent:prompt" || !record(parsed.error) || !hasExactKeys(parsed.error, ["code", "message"]) || parsed.error.code !== "agent_prompt_stalled" || typeof parsed.error.message !== "string") return undefined;
-  const match = /^agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained (\d+)$/.exec(parsed.error.message);
-  if (!match) return undefined;
-  const stateChangeSeq = Number(match[1]);
-  return Number.isSafeInteger(stateChangeSeq) ? { promptStallStateChangeSeq: stateChangeSeq } : undefined;
-}
-
 function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES, input?: string): CliProtocolError {
   if (input !== undefined) {
     const code: CliFailureCode = result.killed ? "CLI_TIMEOUT" : stdinRejected(result) ? "CLI_INCOMPATIBLE" : "CLI_PROTOCOL_ERROR";
-    const promptStall = promptStallSequenceHint(result.stderr, result.code, result.killed, limit);
     return new CliProtocolError(code, code === "CLI_INCOMPATIBLE" ? "Herdr CLI does not support stdin prompt delivery" : "Herdr CLI did not return a usable response", {
       exitCode: result.code,
       killed: result.killed,
       evidence: "omitted_for_stdin_delivery",
       ...nonTextualEvidence(result.stdout, limit, "stdout"),
-      ...nonTextualEvidence(result.stderr, limit, "stderr"),
-      ...(promptStall ?? {})
+      ...nonTextualEvidence(result.stderr, limit, "stderr")
     });
   }
   const stdout = boundedEvidence(result.stdout, limit);
@@ -139,6 +105,16 @@ function parseEnvelope(stdout: string, evidenceLimit = MAX_EVIDENCE_BYTES, input
   return { id: candidate.id, result: candidate.result };
 }
 
+function normalizeCompletedStdinResult(result: ExecResult, preserveCompletedMutation: boolean): ExecResult {
+  if (!preserveCompletedMutation || result.code !== 0 || !result.killed) return result;
+  const evidence = result as StdinExecResult;
+  // A code-0 close with no signal and an unsuccessful kill call proves that abort
+  // landed after the child had completed but before Node emitted `close`. Do not
+  // discard its acknowledgement because a stale killed flag would force a retry.
+  if (evidence.signalCode === null && evidence.killDelivered === false) return { ...result, killed: false };
+  return result;
+}
+
 function requestedAgentStartTimeout(argv: string[]): number {
   const timeoutIndex = argv.indexOf("--timeout");
   if (timeoutIndex >= 0) {
@@ -160,7 +136,10 @@ export class HerdrCli {
     return this.runJsonInternal(argv, signal, preserveCompletedMutation);
   }
 
-  async runJsonWithStdin(argv: string[], input: string, signal: AbortSignal, preserveCompletedMutation = false): Promise<JsonEnvelope> {
+  async runJsonWithStdin(argv: string[], input: string, signal: AbortSignal, preserveCompletedMutation = true): Promise<JsonEnvelope> {
+    // stdin is reserved for prompt mutations. A valid response remains usable
+    // when the caller aborts after the child has completed, so callers do not
+    // lose the only acknowledgement or retry an already-submitted body.
     return this.runJsonInternal(argv, signal, preserveCompletedMutation, input);
   }
 
@@ -202,8 +181,9 @@ export class HerdrCli {
       const result = input === undefined
         ? await this.exec("herdr", argv, { signal, timeout })
         : await this.stdinExec("herdr", argv, input, { signal, timeout });
+      const normalized = input === undefined ? result : normalizeCompletedStdinResult(result, preserveCompletedMutation);
       if (signal.aborted && !preserveCompletedMutation) throw new CliProtocolError("ABORTED", "Operation aborted");
-      return result;
+      return normalized;
     } catch (error) {
       if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
         throw new CliProtocolError("ABORTED", "Operation aborted");

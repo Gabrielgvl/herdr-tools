@@ -12,13 +12,14 @@ import { ATTACHMENT_GRANT_NAME, ATTACHMENT_LOCK_NAME, ATTACHMENT_LOCK_OWNER_FILE
 import type { HerdrSnapshot } from "../../src/targets.js";
 import type { Profile } from "../../src/profiles/types.js";
 
+const targetIdentity = { terminal_id: "term-worker", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-worker" } };
 const snapshot: HerdrSnapshot = {
   version: "0.8.0",
   protocol: 19,
   workspaces: [],
   tabs: [],
-  panes: [{ pane_id: "w:p1", tab_id: "w:t1", workspace_id: "w1", agent_name: "worker", agent_id: "agent-1" }],
-  agents: [{ pane_id: "w:p1", name: "worker", agent_id: "agent-1" }]
+  panes: [{ pane_id: "w:p1", tab_id: "w:t1", workspace_id: "w1", agent_name: "worker", agent_id: "agent-1", agent: "pi", ...targetIdentity }],
+  agents: [{ pane_id: "w:p1", name: "worker", agent_id: "agent-1", agent: "pi", ...targetIdentity }]
 };
 
 const KEY = "recipient-key";
@@ -109,15 +110,27 @@ describe("large message limits and recipient capabilities", () => {
     const capability = attachmentCapability(profile("pi"));
     const key = mintRecipientKey();
     expect(key).toMatch(/^[0-9a-f-]{36}$/);
-    const record = registry.recordFor("pi-profile", "w:p1", key, capability, { agentName: "worker", agentId: "agent-1" });
+    const record = registry.recordFor("pi-profile", "w:p1", key, capability, { paneId: "w:p1", terminalId: "term-worker", agentName: "worker", agentKind: "pi", agentSession: targetIdentity.agent_session, agentId: "agent-1" });
     expect(registry.size).toBe(1);
     expect(registry.get("w:p1")).toEqual(record);
     expect(registry.get("missing")).toBeUndefined();
     expect(verifyRecipient(snapshot, record)).toMatchObject({ verified: true, identity: { agentName: "worker", agentId: "agent-1" } });
     expect(verifyRecipient(snapshot, { ...record, capable: false, reason: "restricted" })).toMatchObject({ verified: false, reason: "restricted" });
-    expect(verifyRecipient(snapshot, { ...record, agentId: "different" })).toMatchObject({ verified: false });
+    // Optional agent IDs are diagnostic only; the stable terminal/session identity is authoritative.
+    expect(verifyRecipient(snapshot, { ...record, agentId: "different" })).toMatchObject({ verified: true });
+    expect(verifyRecipient(snapshot, { ...record, agentSession: { ...record.agentSession, value: "replacement" } })).toMatchObject({ verified: false });
+    expect(verifyRecipient(snapshot, { ...record, terminalId: "replacement-terminal" })).toMatchObject({ verified: false });
     expect(verifyRecipient(snapshot, undefined)).toMatchObject({ verified: false, identity: {} });
     expect(recipientIdentity(snapshot, "missing")).toEqual({});
+    const malformedSnapshot = { ...snapshot, panes: [{ ...snapshot.panes[0]!, agent_session: { ...targetIdentity.agent_session, value: "replacement" } }] };
+    expect(recipientIdentity(malformedSnapshot, "w:p1")).toEqual({});
+    expect(verifyRecipient(malformedSnapshot, record)).toMatchObject({ verified: false, reason: "recipient identity is unavailable or contradictory in the authoritative snapshot" });
+    const paneIdOnlySnapshot = { ...snapshot, panes: [{ ...snapshot.panes[0]!, agent_id: "pane-agent" }], agents: [{ ...snapshot.agents[0]!, agent_id: undefined }] };
+    expect(recipientIdentity(paneIdOnlySnapshot, "w:p1")).toMatchObject({ agentId: "pane-agent" });
+    const noAgentIdSnapshot = { ...snapshot, panes: [{ ...snapshot.panes[0]!, agent_id: undefined }], agents: [{ ...snapshot.agents[0]!, agent_id: undefined }] };
+    expect(recipientIdentity(noAgentIdSnapshot, "w:p1")).not.toHaveProperty("agentId");
+    expect(() => registry.recordFor("pi-profile", "other-pane", key, capability, { paneId: "w:p1", terminalId: "term-worker", agentName: "worker", agentKind: "pi", agentSession: targetIdentity.agent_session })).toThrow(/does not match/);
+    expect(() => registry.recordFor("pi-profile", "w:p1", key, capability, { paneId: "w:p1", terminalId: "term-worker", agentName: "worker", agentKind: "claude", agentSession: targetIdentity.agent_session })).toThrow(/does not match/);
     registry.reset();
     expect(registry.size).toBe(0);
   });

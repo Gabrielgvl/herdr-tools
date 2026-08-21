@@ -1,0 +1,207 @@
+import { describe, expect, it } from "vitest";
+import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
+import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, joinPromptTargetIdentity, parsePromptSubmission, parsePromptTargetIdentityFields, requirePromptTargetIdentity, unavailablePromptObservation, type PromptSubmissionEvidence } from "../../src/messages/prompt.js";
+
+const agent = {
+  name: "worker",
+  pane_id: "w1:p2",
+  agent: "pi",
+  terminal_id: "term-worker",
+  agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-worker" },
+  agent_status: "idle",
+  interactive_ready: true,
+  revision: 7,
+  state_change_seq: 4,
+  screen_detection_skipped: true
+};
+
+const response = (result: unknown, id = "cli:agent:prompt"): JsonEnvelope => ({ id, result });
+const expected = { paneId: "w1:p2", terminalId: "term-worker", agentName: "worker", agentKind: "pi", agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-worker" } };
+
+function validSubmission(overrides: Record<string, unknown> = {}): PromptSubmissionEvidence {
+  return parsePromptSubmission(response({ type: "agent_prompted", agent: { ...agent, ...overrides } }), expected);
+}
+
+describe("prompt submission acknowledgement", () => {
+  it("accepts the exact Herdr acknowledgement and retains safe observation metadata", () => {
+    expect(validSubmission()).toEqual({
+      confirmed: true,
+      operationId: "cli:agent:prompt",
+      paneId: "w1:p2",
+      agentName: "worker",
+      agentKind: "pi",
+      terminalId: "term-worker",
+      agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-worker" },
+      interactiveReady: true,
+      revision: 7,
+      stateChangeSeq: 4,
+      screenDetectionSkipped: true
+    });
+    expect(validSubmission({ state_change_seq: undefined, screen_detection_skipped: undefined })).toEqual(expect.objectContaining({ revision: 7, interactiveReady: true }));
+  });
+
+  it.each([
+    ["wrong operation ID", response({ type: "agent_prompted", agent }, "cli:agent:other")],
+    ["missing result", response(undefined)],
+    ["wrong result type", response({ type: "other", agent })],
+    ["missing agent", response({ type: "agent_prompted" })],
+    ["null agent", response({ type: "agent_prompted", agent: null })],
+    ["array agent", response({ type: "agent_prompted", agent: [] })]
+  ])("rejects %s before claiming delivery", (_label, envelope) => {
+    expect(() => parsePromptSubmission(envelope, expected)).toThrowError(CliProtocolError);
+  });
+
+  it.each([
+    ["pane ID", { pane_id: "w1:p9" }, expected],
+    ["terminal ID", { terminal_id: "term-other" }, expected],
+    ["name", { name: "other" }, expected],
+    ["kind", { agent: "claude" }, expected],
+    ["agent session", { agent_session: { source: "pi", agent: "pi", kind: "id", value: "replacement" } }, expected]
+  ])("rejects a target %s mismatch", (_label, overrides, wanted) => {
+    expect(() => parsePromptSubmission(response({ type: "agent_prompted", agent: { ...agent, ...overrides } }), wanted)).toThrowError(/does not match/);
+  });
+
+  it.each([
+    ["missing name", { name: undefined }],
+    ["empty name", { name: "" }],
+    ["missing kind", { agent: undefined }],
+    ["empty kind", { agent: "" }],
+    ["missing terminal ID", { terminal_id: undefined }],
+    ["empty terminal ID", { terminal_id: "" }],
+    ["missing agent session", { agent_session: undefined }],
+    ["malformed agent session", { agent_session: "session-worker" }],
+    ["incomplete agent session", { agent_session: { source: "pi", agent: "pi", kind: "id" } }],
+    ["not interactive", { interactive_ready: false }],
+    ["missing interactive flag", { interactive_ready: undefined }],
+    ["missing revision", { revision: undefined }],
+    ["negative revision", { revision: -1 }],
+    ["fractional revision", { revision: 1.5 }],
+    ["invalid state sequence", { state_change_seq: "4" }],
+    ["negative state sequence", { state_change_seq: -1 }],
+    ["invalid detection flag", { screen_detection_skipped: "yes" }]
+  ])("rejects %s without retaining unsafe evidence", (_label, overrides) => {
+    expect(() => parsePromptSubmission(response({ type: "agent_prompted", agent: { ...agent, ...overrides } }), expected)).toThrowError(CliProtocolError);
+  });
+
+  it("requires every authoritative identity field before confirming delivery", () => {
+    for (const field of ["terminal_id", "agent_session"] as const) {
+      const missing = { ...agent };
+      delete missing[field];
+      expect(() => parsePromptSubmission(response({ type: "agent_prompted", agent: missing }), expected)).toThrowError(CliProtocolError);
+    }
+  });
+
+  it("rejects empty and malformed identity record collections", () => {
+    expect(() => joinPromptTargetIdentity([], "w1:p2")).toThrowError(/identity is missing/);
+    expect(() => joinPromptTargetIdentity([null], "w1:p2")).toThrowError(/record is malformed/);
+    expect(() => requirePromptTargetIdentity([], "w1:p2")).toThrowError(/identity is missing/);
+    expect(() => parsePromptTargetIdentityFields(null)).toThrowError(/record is malformed/);
+  });
+
+  it("validates incomplete start fields without inventing omitted identity", () => {
+    expect(parsePromptTargetIdentityFields({ name: "worker", agent: "pi" }, "w1:p2")).toEqual({ agentName: "worker", agentKind: "pi" });
+    expect(() => parsePromptTargetIdentityFields({ agent: "pi", agent_session: { source: "herdr:pi", agent: "claude", kind: "id", value: "replacement" } }, "w1:p2")).toThrowError(/contradictory/);
+  });
+
+  it("joins complete identity fields from independent authoritative records", () => {
+    const complementary = [
+      { pane_id: "w1:p2", terminal_id: "term-worker", agent_name: "worker" },
+      { pane_id: "w1:p2", agent: "pi", agent_session: agent.agent_session }
+    ];
+    expect(joinPromptTargetIdentity(complementary, "w1:p2")).toEqual(expected);
+    expect(requirePromptTargetIdentity(complementary, "w1:p2")).toEqual(expected);
+    expect(joinPromptTargetIdentity([
+      { pane_id: "w1:p2", terminal_id: null, agent_name: null, agent_session: null },
+      { pane_id: "w1:p2", terminal_id: "term-worker", name: "worker", agent: "pi", agent_session: agent.agent_session }
+    ], "w1:p2")).toEqual(expected);
+    expect(() => joinPromptTargetIdentity([
+      { pane_id: "w1:p2", terminal_id: "term-worker", agent_name: "worker", agent_session: agent.agent_session },
+      { pane_id: "w1:p2", agent: "pi", agent_session: { ...agent.agent_session, value: "replacement" } }
+    ], "w1:p2")).toThrowError(/contradictory/);
+    expect(() => joinPromptTargetIdentity([
+      { pane_id: "w1:p2", terminal_id: "term-worker", agent_name: "worker", agent: "pi" },
+      { pane_id: "w1:p2", agent_session: { ...agent.agent_session, agent: "claude" } }
+    ], "w1:p2")).toThrowError(/contradictory/);
+    expect(() => joinPromptTargetIdentity([{ ...agent, agent_name: "replacement" }], "w1:p2")).toThrowError(/contradictory/);
+  });
+});
+
+describe("prompt post-dispatch observation", () => {
+  it("distinguishes working, ordinary non-working, unknown, skipped, stale, and malformed reads", () => {
+    const working = validSubmission({ screen_detection_skipped: false });
+    const post = (state?: string, revision: number | undefined = 7): Record<string, unknown> => ({ ...agent, agent_status: state, revision });
+    expect(classifyPromptObservation(post("working"), working)).toEqual({ status: "working", state: "working", revision: 7, screenDetectionSkipped: false });
+    expect(classifyPromptObservation(post("idle"), working)).toEqual({ status: "not_working", state: "idle", revision: 7, screenDetectionSkipped: false });
+    expect(classifyPromptObservation(post("unknown"), working)).toEqual({ status: "unknown", state: "unknown", revision: 7, screenDetectionSkipped: false });
+    expect(classifyPromptObservation({ ...post("working"), revision: 6 }, working)).toEqual({ status: "stale", state: "working", revision: 6, screenDetectionSkipped: false });
+    expect(classifyPromptObservation(post("idle"), validSubmission())).toEqual({ status: "detection_skipped", state: "idle", revision: 7, screenDetectionSkipped: true });
+    expect(classifyPromptObservation(post("idle"), validSubmission({ screen_detection_skipped: undefined }))).toEqual({ status: "not_working", state: "idle", revision: 7 });
+    expect(classifyPromptObservation({ ...post("idle"), revision: undefined }, working)).toEqual({ status: "not_working", state: "idle", screenDetectionSkipped: false });
+    expect(classifyPromptObservation({ ...post(undefined), revision: 7 }, working)).toEqual({ status: "unavailable", code: "POSTSTATE_UNAVAILABLE", revision: 7, screenDetectionSkipped: false });
+    expect(classifyPromptObservation({ ...post("working"), terminal_id: "term-replaced" }, working)).toMatchObject({ status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence: { records: [expect.objectContaining({ terminal_id: "term-replaced" })] } });
+    expect(classifyPromptObservation({ agent_status: "working", revision: 7 }, working)).toEqual({ status: "unavailable", code: "POSTSTATE_IDENTITY_UNAVAILABLE" });
+  });
+
+  it("bounds model-visible session evidence while retaining exact internal values", () => {
+    const long = "x".repeat(2_000);
+    const full = parsePromptSubmission(
+      response({ type: "agent_prompted", agent: { ...agent, agent_session: { source: long, agent: "pi", kind: "id", value: long } } }),
+      { ...expected, agentSession: { source: long, agent: "pi", kind: "id", value: long } }
+    );
+    const compact = compactPromptSubmission(full);
+    expect(full.agentSession.value).toHaveLength(2_000);
+    expect(compact.agentSession.value).toHaveLength(256);
+    const bounded = boundAgentSessionStrings({ expectedAgentSession: full.agentSession });
+    expect((bounded as { expectedAgentSession: { value: string } }).expectedAgentSession.value).toHaveLength(256);
+    expect(boundAgentSessionStrings("plain")).toBe("plain");
+    expect(boundAgentSessionStrings([full.agentSession])).toHaveLength(1);
+    expect(boundAgentSessionStrings({ agent_session: { source: 1, agent: null, kind: {}, value: undefined } })).toMatchObject({ agent_session: { source: "", agent: "", kind: "", value: "" } });
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(boundAgentSessionStrings(cyclic)).toMatchObject({ self: "[cyclic]" });
+    const replacementValue = "y".repeat(2_000);
+    const malformedObservation = classifyPromptObservation({ pane_id: "w1:p2", terminal_id: 7, name: null, agent: {}, agent_session: { source: 1, agent: null, kind: {}, value: undefined }, agent_status: "working", revision: 7 }, full);
+    expect(malformedObservation).toMatchObject({ status: "unavailable", code: "POSTSTATE_IDENTITY_UNAVAILABLE" });
+    expect(malformedObservation).not.toHaveProperty("evidence");
+    expect(classifyPromptObservation({ ...agent, agent_status: "working", revision: 7, agent_session: { ...agent.agent_session, value: replacementValue } }, full)).toMatchObject({ status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence: { records: [expect.objectContaining({ agent_session: expect.objectContaining({ value: replacementValue.slice(0, 256) }) })] } });
+
+    const longValue = (suffix: string): string => `${"z".repeat(256)}${suffix}`;
+    const longExpected = {
+      paneId: longValue("-pane-expected"),
+      terminalId: longValue("-terminal-expected"),
+      agentName: longValue("-name-expected"),
+      agentKind: longValue("-kind-expected"),
+      agentSession: { source: longValue("-source-expected"), agent: longValue("-kind-expected"), kind: longValue("-session-kind-expected"), value: longValue("-session-value-expected") }
+    };
+    const longActual = {
+      pane_id: longExpected.paneId,
+      terminal_id: longValue("-terminal-actual"),
+      name: longValue("-name-actual"),
+      agent: longValue("-kind-actual"),
+      agent_session: { source: longValue("-source-actual"), agent: longValue("-kind-actual"), kind: longValue("-session-kind-actual"), value: longValue("-session-value-actual") },
+      interactive_ready: true,
+      revision: 7
+    };
+    let acknowledgementError: unknown;
+    try {
+      parsePromptSubmission(response({ type: "agent_prompted", agent: longActual }), longExpected);
+    } catch (error) {
+      acknowledgementError = error;
+    }
+    expect(acknowledgementError).toBeInstanceOf(CliProtocolError);
+    const acknowledgementDetails = (acknowledgementError as CliProtocolError).details;
+    expect(acknowledgementDetails.expectedTerminalId).toHaveLength(256);
+    expect(acknowledgementDetails.actualTerminalId).toHaveLength(256);
+    expect((acknowledgementDetails.expectedAgentSession as Record<string, string>).value).toHaveLength(256);
+    expect((acknowledgementDetails.actualAgentSession as Record<string, string>).value).toHaveLength(256);
+    expect(JSON.stringify(acknowledgementDetails)).not.toContain("-terminal-expected");
+    expect(boundAgentSessionStrings({ nested: { protocol: { terminal: longValue("-nested") } } })).toEqual({ nested: { protocol: { terminal: "z".repeat(256) } } });
+  });
+
+  it("reports unavailable observation errors without exposing process text", () => {
+    expect(unavailablePromptObservation(Object.assign(new Error("secret process output"), { code: "CLI_PROTOCOL_ERROR" }))).toEqual({ status: "unavailable", code: "CLI_PROTOCOL_ERROR" });
+    expect(unavailablePromptObservation({ code: "POSTSTATE_UNAVAILABLE" })).toEqual({ status: "unavailable", code: "POSTSTATE_UNAVAILABLE" });
+    expect(unavailablePromptObservation("failure")).toEqual({ status: "unavailable", code: "POSTSTATE_UNAVAILABLE" });
+    expect(JSON.stringify(unavailablePromptObservation(new Error("secret process output")))).not.toContain("secret");
+  });
+});

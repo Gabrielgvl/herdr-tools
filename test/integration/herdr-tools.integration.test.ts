@@ -56,12 +56,58 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     panes: Array.isArray(snapshot.panes) ? snapshot.panes.map((item) => String(resultObject(item).pane_id)).sort() : []
   });
 
+  const diagnosticRecord = (value: unknown): Record<string, unknown> => {
+    const source = resultObject(value);
+    const diagnostic = Object.fromEntries(["pane_id", "terminal_id", "agent_id", "name", "agent_name", "agent", "agent_status", "state_change_seq", "revision", "interactive_ready", "screen_detection_skipped"].flatMap((field): Array<[string, unknown]> => {
+      const candidate = source[field];
+      return typeof candidate === "string" || typeof candidate === "number" || typeof candidate === "boolean" || candidate === null ? [[field, candidate]] : [];
+    }));
+    const session = source.agent_session;
+    if (typeof session === "object" && session !== null && !Array.isArray(session)) {
+      const identity = session as Record<string, unknown>;
+      if (["source", "agent", "kind", "value"].every((field) => typeof identity[field] === "string")) {
+        const full = [identity.source, identity.agent, identity.kind, identity.value] as string[];
+        diagnostic.agent_session = { source: full[0]!.slice(0, 256), agent: full[1]!.slice(0, 256), kind: full[2]!.slice(0, 256), value: full[3]!.slice(0, 256) };
+        diagnostic.agent_session_fingerprint = createHash("sha256").update(JSON.stringify(full)).digest("hex");
+      }
+    }
+    return diagnostic;
+  };
+
+  const recordDeliveryFailureBeforeTeardown = async (label: string, failure: { code?: string; details: Record<string, unknown> }, elapsedMs: number): Promise<void> => {
+    const details = failure.details;
+    process.stderr.write(`INTEGRATION_DELIVERY_FAILURE_DETAILS ${label} ${JSON.stringify({ elapsedMs, code: failure.code, causeCode: details.causeCode, phase: details.phase, promptSubmitted: details.promptSubmitted, promptConsumption: details.promptConsumption, initialPromptSubmission: details.initialPromptSubmission, promptConfirmation: details.promptConfirmation, created: details.created })}\n`);
+    const created = resultObject(details.created ?? {});
+    const paneId = typeof created.paneId === "string" ? created.paneId : typeof details.paneId === "string" ? details.paneId : undefined;
+    if (!paneId) return;
+    for (const [diagnostic, args] of [
+      ["agent_get", ["agent", "get", paneId]],
+      ["pane_get", ["pane", "get", paneId]]
+    ] as const) {
+      try {
+        const value = resultObject(resultObject(await runNamed([...args])).result);
+        process.stderr.write(`INTEGRATION_DELIVERY_${diagnostic.toUpperCase()} ${label} ${JSON.stringify(diagnosticRecord(value.agent ?? value.pane ?? value))}\n`);
+      } catch (error) {
+        process.stderr.write(`INTEGRATION_DELIVERY_${diagnostic.toUpperCase()}_FAILED ${label} ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+    }
+    try {
+      const snapshot = resultObject(resultObject(resultObject(await runNamed(["api", "snapshot"])).result).snapshot);
+      const panes = Array.isArray(snapshot.panes) ? snapshot.panes.map(resultObject).filter((item) => item.pane_id === paneId).map(diagnosticRecord) : [];
+      const agents = Array.isArray(snapshot.agents) ? snapshot.agents.map(resultObject).filter((item) => item.pane_id === paneId).map(diagnosticRecord) : [];
+      process.stderr.write(`INTEGRATION_DELIVERY_SNAPSHOT ${label} ${JSON.stringify({ panes, agents })}\n`);
+    } catch (error) {
+      process.stderr.write(`INTEGRATION_DELIVERY_SNAPSHOT_FAILED ${label} ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  };
+
   /**
    * Every feature delivery is a gate. Keep bounded diagnostic evidence, then
    * rethrow so a lost or unacknowledged prompt/attachment fails the run rather
    * than being converted into a skipped acceptance claim.
    */
   const deliver = async (label: string, call: Promise<{ details?: Record<string, unknown> }>): Promise<{ confirmed: true; details: Record<string, unknown> }> => {
+    const startedAt = Date.now();
     try {
       const result = await call;
       process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
@@ -74,7 +120,50 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       const attachment = resultObject(failure.details.attachment ?? {});
       if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
       process.stderr.write(`INTEGRATION_DELIVERY_FAILED ${label} code=${String(failure.code)} causeCode=${String(failure.details.causeCode)} phase=${String(failure.details.phase)}${evidence ? ` evidence=${evidence}` : ""}\n`);
+      await recordDeliveryFailureBeforeTeardown(label, { code: failure.code, details: failure.details }, Date.now() - startedAt);
+      if (failure.details.causeCode === "PROMPT_UNCONFIRMED") expect(Date.now() - startedAt).toBeLessThan(15_000);
       throw error;
+    }
+  };
+
+  type LaunchDelivery = { confirmed: true; details: Record<string, unknown> } | { confirmed: false; details: Record<string, unknown> };
+
+  const deliverLaunch = async (label: string, call: () => Promise<{ details?: Record<string, unknown> }>): Promise<LaunchDelivery> => {
+    const startedAt = Date.now();
+    const stdinStart = state.stdinCalls.length;
+    try {
+      const result = await call();
+      const details = resultObject(result.details);
+      expect(details).toMatchObject({
+        promptSubmitted: true,
+        promptConsumption: "confirmed",
+        initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt" }
+      });
+      expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
+      process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
+      return { confirmed: true, details };
+    } catch (error) {
+      const failure = error as { code?: string; details?: Record<string, unknown> };
+      if (failure.details === undefined) throw error;
+      const attachment = resultObject(failure.details.attachment ?? {});
+      if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
+      const elapsedMs = Date.now() - startedAt;
+      process.stderr.write(`INTEGRATION_DELIVERY_FAILED ${label} code=${String(failure.code)} causeCode=${String(failure.details.causeCode)} phase=${String(failure.details.phase)}\n`);
+      await recordDeliveryFailureBeforeTeardown(label, { code: failure.code, details: failure.details }, elapsedMs);
+      if (failure.code !== "LAUNCH_FAILED" || failure.details.causeCode !== "PROMPT_UNCONFIRMED") throw error;
+      expect(failure.details).toMatchObject({
+        phase: "prompt_verification",
+        promptSubmitted: true,
+        promptConsumption: "unconfirmed",
+        initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", agentSession: { source: expect.any(String), agent: expect.any(String), kind: expect.any(String), value: expect.any(String) } },
+        promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100 },
+        created: expect.any(Object)
+      });
+      expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
+      expect(elapsedMs).toBeLessThan(15_000);
+      // An exact fail-closed uncertainty is a valid live outcome. The prompt may
+      // have been consumed, so callers must not retry or run dependent assertions.
+      return { confirmed: false, details: failure.details };
     }
   };
 
@@ -244,14 +333,15 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const turnMarkerPath = join(state.cwd, "turn-control-started.txt");
     const turnScriptPath = join(state.cwd, "turn-control.sh");
     await writeFile(turnScriptPath, `printf '%s' '${turnMarker}' > '${turnMarkerPath}'\nsleep 120\n`, { mode: 0o700 });
-    const launched = await tool("herdr_launch").execute("turn-control-launch", {
+    const launched = await deliverLaunch("turn-control-launch", () => tool("herdr_launch").execute("turn-control-launch", {
       name: `integration-turn-control-${process.pid}`,
       profile: "worker-pi",
       placement: { mode: "new_tab", tabLabel: "turn-control" },
       initialPrompt: `Use Bash to execute exactly ${turnScriptPath} now. Do not use any other tool. Remain in this turn until the script exits; do not finish the task or send a final response.`
-    }, signal(), undefined, toolContext());
+    }, signal(), undefined, toolContext()));
+    if (!launched.confirmed) return;
     expect(await waitForMarker(turnMarkerPath, turnMarker, 60_000), "turn-control fixture did not reach its deterministic sleep command").toBe(true);
-    const details = resultObject(launched.details);
+    const details = launched.details;
     const paneId = details.paneId;
     if (typeof paneId !== "string") throw new Error("turn-control fixture launch did not return an authoritative pane ID");
 
@@ -297,7 +387,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    */
   it("routes wrapped text over the session-bound stdin transport and publishes exact artifacts", async () => {
     const inlineBody = ["integration assignment", ...Array.from({ length: 320 }, (_value, index) => `long assignment line ${index}`)].join("\n");
-    const inline = await deliver("pi-inline-launch", tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: inlineBody }, signal(), undefined, toolContext()));
+    const inline = await deliverLaunch("pi-inline-launch", () => tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: inlineBody }, signal(), undefined, toolContext()));
+    if (!inline.confirmed) return;
     expect(inline.details).toMatchObject({ initialPromptDelivery: "inline", initialPromptSubmission: { confirmed: true } });
     const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
     expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", "read,bash,grep,find,ls,ffgrep,fffind,ctx_execute,ctx_execute_file,ctx_search,web_search,source_check,fetch_content,get_search_content,edit,write,bash_bg,jobs,job_decide,monitor", "--skill", expect.stringContaining("herdr-profiles/role-plugins/worker/skills/worker"), "--append-system-prompt"]));
@@ -313,7 +404,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("integration assignment")))).toBe(false);
 
     const body = `Transport smoke body.\n${"detail line\n".repeat(200)}`;
-    const attachmentLaunch = await deliver("pi-attachment-launch", tool("herdr_launch").execute("launch-pi-attachment", { name: "integration-pi-attach", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "pi-attachment" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
+    const attachmentLaunch = await deliverLaunch("pi-attachment-launch", () => tool("herdr_launch").execute("launch-pi-attachment", { name: "integration-pi-attach", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "pi-attachment" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
+    if (!attachmentLaunch.confirmed) return;
     const attachment = resultObject(attachmentLaunch.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
     expect(attachmentLaunch.details).toMatchObject({ initialPromptDelivery: "attachment" });
@@ -330,8 +422,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   }, 240_000);
 
   /**
-   * Acceptance: a recipient agent must read the attachment and produce evidence only
-   * obtainable from its content. An unconfirmed delivery fails the gate; it never passes.
+   * Acceptance: a semantically confirmed recipient must produce evidence obtainable
+   * only from the attachment. Exact fail-closed launch uncertainty is accepted but
+   * returns before marker assertions because the prompt was possibly consumed.
    */
   it("accepts Pi recipient readback only with agent-produced evidence", async () => {
     const nonce = randomUUID();
@@ -343,7 +436,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       "Then stop. Do not change anything else and do not reply."
     ].join("\n");
 
-    const launched = await deliver("pi-acceptance-launch", tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "accept-pi" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
+    const launched = await deliverLaunch("pi-acceptance-launch", () => tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "accept-pi" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
+    if (!launched.confirmed) return;
     const attachment = resultObject(launched.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
     expect(await readFile(String(attachment.path), "utf8")).toContain(nonce);

@@ -101,7 +101,7 @@ describe("herdr_communicate", () => {
     ]);
     expect(harness.stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin"], senderEnvelope("steer", "new direction"), expect.anything());
     expect(harness.calls.some((call) => call.includes("esc"))).toBe(false);
-    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: state }, postState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt", screenDetectionSkipped: true }, observation: { status: "detection_skipped", state: "working" }, operationIds: { prompt: "cli:agent:prompt", postState: "pane-2" } });
+    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: state }, postState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt", screenDetectionSkipped: true }, observation: { status: "working", state: "working", screenDetectionSkipped: true }, operationIds: { prompt: "cli:agent:prompt", postState: "pane-2" } });
   });
 
   it("steers a working agent by submitting directly without interrupting", async () => {
@@ -116,7 +116,7 @@ describe("herdr_communicate", () => {
     ]);
     expect(harness.stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin"], senderEnvelope("steer", "replace direction"), expect.anything());
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "send-keys")).toBe(false);
-    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt" }, observation: { status: "detection_skipped" }, operationIds: { prompt: "cli:agent:prompt", postState: "pane-2" } });
+    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt" }, observation: { status: "working", screenDetectionSkipped: true }, operationIds: { prompt: "cli:agent:prompt", postState: "pane-2" } });
   });
 
   it("requires complete pre-submission identity and sends no bytes for missing or replaced records", async () => {
@@ -180,7 +180,7 @@ describe("herdr_communicate", () => {
     const result = await execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" });
     expect(harness.calls[2]).toEqual(["pane", "get", "w1:p2"]);
     expect(harness.stdinInputs).toEqual([senderEnvelope("prompt", "hello")]);
-    expect(result.details).toMatchObject({ operation: "prompt", delivery: "inline", route: "prompt_direct", preState: { agent_status: "idle" }, postState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt", revision: 3 }, observation: { status: "detection_skipped", state: "working" }, operationIds: { snapshot: "snapshot-1", preState: "pane-1", prompt: "cli:agent:prompt", postState: "pane-2" }, envelope: { version: "v1", kind: "prompt", delivery: "inline" } });
+    expect(result.details).toMatchObject({ operation: "prompt", delivery: "inline", route: "prompt_direct", preState: { agent_status: "idle" }, postState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt", revision: 3 }, observation: { status: "working", state: "working", screenDetectionSkipped: true }, operationIds: { snapshot: "snapshot-1", preState: "pane-1", prompt: "cli:agent:prompt", postState: "pane-2" }, envelope: { version: "v1", kind: "prompt", delivery: "inline" } });
     expect(JSON.stringify(result)).not.toContain("environment");
   });
 
@@ -235,9 +235,9 @@ describe("herdr_communicate", () => {
 
   it("reports idle and unknown post-state as observation without rejecting an accepted prompt", async () => {
     const idle = makeCli("idle", { postState: "idle" });
-    await expect(execute(idle.cli, { target: "reviewer", operation: "prompt", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "detection_skipped", state: "idle" } } });
+    await expect(execute(idle.cli, { target: "reviewer", operation: "prompt", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "not_working", state: "idle", screenDetectionSkipped: true } } });
     const unknown = makeCli("idle", { postState: "unknown" });
-    await expect(execute(unknown.cli, { target: "reviewer", operation: "prompt", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "detection_skipped", state: "unknown" } } });
+    await expect(execute(unknown.cli, { target: "reviewer", operation: "prompt", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "unknown", state: "unknown", screenDetectionSkipped: true } } });
 
     const replacement = makeCli();
     const replacementBase = replacement.cli.runJson;
@@ -253,7 +253,7 @@ describe("herdr_communicate", () => {
     expect(replacement.stdinExec).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps post-state identity and state observations fail-closed", async () => {
+  it("keeps post-state identity fail-closed while ignoring pane lifecycle skew", async () => {
     const malformedPost = makeCli();
     const malformedBase = malformedPost.cli.runJson;
     let paneReads = 0;
@@ -261,7 +261,7 @@ describe("herdr_communicate", () => {
       if (argv[0] === "pane" && argv[1] === "get" && paneReads++ > 0) return { id: "pane-post", result: { pane: { ...basePane, agent_status: undefined } } };
       return malformedBase.call(malformedPost.cli, argv, signal, preserve);
     });
-    await expect(execute(malformedPost.cli, { target: "reviewer", operation: "steer", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "unavailable", code: "POSTSTATE_UNAVAILABLE" } } });
+    await expect(execute(malformedPost.cli, { target: "reviewer", operation: "steer", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "working", state: "working" } } });
 
     const replacementPost = makeCli();
     const replacementBase = replacementPost.cli.runJson;
@@ -463,7 +463,7 @@ describe("herdr_communicate", () => {
 
     const postFailure = makeCli("idle", { postState: "idle" });
     await expect(createCommunicateTool({ cli: postFailure.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
-      .resolves.toMatchObject({ details: { delivery: "attachment", observation: { status: "detection_skipped", state: "idle" }, attachment: { attachmentId: "attachment-1" } } });
+      .resolves.toMatchObject({ details: { delivery: "attachment", observation: { status: "not_working", state: "idle", screenDetectionSkipped: true }, attachment: { attachmentId: "attachment-1" } } });
 
     const publishFailure = { ...attachments, publish: async () => { throw Object.assign(new Error("store"), { code: "ATTACHMENT_STORE_FAILED", details: { operation: "publish" } }); } } as unknown as AttachmentStore;
     await expect(createCommunicateTool({ cli: makeCli().cli, context, attachments: publishFailure, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))

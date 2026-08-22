@@ -261,7 +261,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             postEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
             const candidate = paneFrom(postEnvelope.result, target.paneId!);
             const postEvidence = [agentFrom(postAgentEnvelope.result), candidate];
-            observation = classifyPromptObservation(postEvidence, submission);
+            observation = classifyPromptObservation(postEvidence[0]!, submission, undefined, [postEvidence[1]!]);
             let identityMatches = false;
             try {
               const postIdentity = requirePromptTargetIdentity(postEvidence, target.paneId!);

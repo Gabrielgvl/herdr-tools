@@ -3,7 +3,7 @@ import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type H
 import type { CompatibilityPreflight } from "../health.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
-import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, PromptIdentityError, requirePromptTargetIdentity, joinPromptTargetIdentity, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
+import { boundAgentSessionStrings, capturePromptObservationBaseline, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, PromptIdentityError, joinPromptTargetIdentity, type PromptConsumption, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
 import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
 import { attachmentCapability } from "../profiles/capability.js";
@@ -64,6 +64,17 @@ export interface LaunchEffectiveProfile {
   reachableNames: string[];
 }
 
+export interface PromptConfirmationEvidence {
+  timeoutMs: number;
+  pollIntervalMs: number;
+  elapsedMs: number;
+  samples: number;
+  reason: "working" | "state_change_seq_advanced" | "timeout" | "caller_aborted" | "identity_changed" | "identity_unavailable" | "contradictory" | "read_failed";
+  baseline: PromptObservationBaseline;
+  last?: Pick<PromptObservation, "status" | "state" | "stateChangeSeq" | "revision" | "screenDetectionSkipped" | "code">;
+  sourceCode?: string;
+}
+
 export interface LaunchDetails extends LaunchResourceIds {
   operation: "launch";
   outcome: "launched" | "partial";
@@ -72,9 +83,12 @@ export interface LaunchDetails extends LaunchResourceIds {
   placement?: LaunchPlacement;
   postState?: Record<string, unknown>;
   initialPromptSent?: boolean;
+  promptSubmitted?: boolean;
+  promptConsumption?: PromptConsumption;
   initialPromptDelivery?: MessageDelivery;
   initialPromptSubmission?: PromptSubmissionEvidence;
   initialPromptObservation?: PromptObservation;
+  promptConfirmation?: PromptConfirmationEvidence;
   phase?: "validate" | "resolve_profile" | "attachment_publish" | "placement" | "agent_start" | "ready" | "prompt_verification";
   created?: LaunchResourceIds;
   causeCode?: string;
@@ -516,6 +530,120 @@ async function freshPostStartIdentity(cli: LaunchCli, paneId: string, callerSign
   }
 }
 
+function promptBaseline(agentState: Record<string, unknown>, identity: PromptTargetIdentity): PromptObservationBaseline {
+  try {
+    return capturePromptObservationBaseline(agentState, identity);
+  } catch (error) {
+    const identityError = error as PromptIdentityError;
+    throw new LaunchError(identityError.code, "Fresh post-start state cannot establish a stable prompt baseline", identityError.details);
+  }
+}
+
+function compactConfirmationObservation(observation: PromptObservation | undefined): PromptConfirmationEvidence["last"] | undefined {
+  if (!observation) return undefined;
+  return {
+    status: observation.status,
+    ...(observation.state === undefined ? {} : { state: observation.state }),
+    ...(observation.stateChangeSeq === undefined ? {} : { stateChangeSeq: observation.stateChangeSeq }),
+    ...(observation.revision === undefined ? {} : { revision: observation.revision }),
+    ...(observation.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: observation.screenDetectionSkipped }),
+    ...(observation.code === undefined ? {} : { code: observation.code })
+  };
+}
+
+function promptConfirmationEvidence(
+  startedAt: number,
+  samples: number,
+  reason: PromptConfirmationEvidence["reason"],
+  baseline: PromptObservationBaseline,
+  last?: PromptObservation,
+  sourceCode?: string
+): PromptConfirmationEvidence {
+  return {
+    timeoutMs: LAUNCH_IDENTITY_PREFLIGHT_TIMEOUT_MS,
+    pollIntervalMs: LAUNCH_IDENTITY_PREFLIGHT_POLL_INTERVAL_MS,
+    elapsedMs: Math.min(LAUNCH_IDENTITY_PREFLIGHT_TIMEOUT_MS, Math.max(0, Date.now() - startedAt)),
+    samples,
+    reason,
+    baseline,
+    ...(compactConfirmationObservation(last) ? { last: compactConfirmationObservation(last) } : {}),
+    ...(sourceCode === undefined ? {} : { sourceCode })
+  };
+}
+
+function promptUnconfirmed(
+  submission: PromptSubmissionEvidence,
+  confirmation: PromptConfirmationEvidence,
+  last?: PromptObservation
+): LaunchError {
+  return new LaunchError("PROMPT_UNCONFIRMED", "Initial prompt consumption was not proven; the acknowledged prompt was possibly consumed", {
+    causeCode: "PROMPT_UNCONFIRMED",
+    promptSubmitted: true,
+    promptConsumption: "unconfirmed",
+    initialPromptSubmission: compactPromptSubmission(submission),
+    ...(last === undefined ? {} : { initialPromptObservation: last }),
+    promptConfirmation: confirmation
+  });
+}
+
+async function confirmPromptConsumption(
+  cli: LaunchCli,
+  paneId: string,
+  callerSignal: AbortSignal,
+  submission: PromptSubmissionEvidence,
+  baseline: PromptObservationBaseline
+): Promise<{ agent: Record<string, unknown>; pane: Record<string, unknown>; observation: PromptObservation; confirmation: PromptConfirmationEvidence }> {
+  const window = createIdentityPreflightWindow(callerSignal);
+  const startedAt = Date.now();
+  let samples = 0;
+  let last: PromptObservation | undefined;
+  try {
+    while (true) {
+      window.assertActive();
+      samples += 1;
+      let agent: Record<string, unknown>;
+      let pane: Record<string, unknown>;
+      try {
+        // The two authoritative reads are deliberately sequential and race one
+        // shared whole-window cancellation. No source from an earlier sample is
+        // carried forward and no prompt/start mutation is retried.
+        agent = agentGetRecord(await readWithinIdentityPreflight(cli, ["agent", "get", paneId], window));
+        pane = paneRecord(await readWithinIdentityPreflight(cli, ["pane", "get", paneId], window), paneId);
+      } catch (error) {
+        if (window.cancellation()) throw error;
+        const sourceCode = record(error) && typeof error.code === "string" ? error.code : "POSTSTATE_UNAVAILABLE";
+        const reason: PromptConfirmationEvidence["reason"] = sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "read_failed";
+        throw promptUnconfirmed(submission, promptConfirmationEvidence(startedAt, samples, reason, baseline, last, sourceCode), last);
+      }
+      last = classifyPromptObservation(agent, submission, baseline, [pane]);
+      if (last.status === "unavailable" && last.code !== "POSTSTATE_UNAVAILABLE") {
+        const reason: PromptConfirmationEvidence["reason"] = last.code === "POSTSTATE_IDENTITY_CHANGED"
+          ? "identity_changed"
+          : last.code === "POSTSTATE_IDENTITY_UNAVAILABLE"
+            ? "identity_unavailable"
+            : "contradictory";
+        throw promptUnconfirmed(submission, promptConfirmationEvidence(startedAt, samples, reason, baseline, last, last.code), last);
+      }
+      if (last.consumption === "confirmed") {
+        const reason: PromptConfirmationEvidence["reason"] = last.status === "working" ? "working" : "state_change_seq_advanced";
+        return { agent, pane, observation: last, confirmation: promptConfirmationEvidence(startedAt, samples, reason, baseline, last) };
+      }
+      await waitForIdentityPreflightPoll(window);
+    }
+  } catch (error) {
+    if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") throw error;
+    // Every non-PromptUnconfirmed escape is the shared window's typed caller or
+    // deadline cancellation. The deadline branch is distinct; the remaining
+    // bounded cancellation preserves acknowledged effect as caller abort.
+    if (window.cancellation()?.reason === "deadline") {
+      throw promptUnconfirmed(submission, promptConfirmationEvidence(startedAt, samples, "timeout", baseline, last), last);
+    }
+    throw promptUnconfirmed(submission, promptConfirmationEvidence(startedAt, samples, "caller_aborted", baseline, last, "ABORTED"), last);
+  } finally {
+    window.cleanup();
+  }
+}
+
 function existingAgentNames(snapshot: HerdrSnapshot): string[] {
   const names = snapshot.agents.flatMap((agent) => typeof agent.name === "string" ? [agent.name] : []);
   for (const pane of snapshot.panes) {
@@ -795,48 +923,33 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (agentId) created.agentId = agentId;
 
         let initialPromptSent = false;
+        let promptSubmitted = false;
+        let promptConsumption: PromptConsumption | undefined;
         let initialPromptSubmission: PromptSubmissionEvidence | undefined;
         let initialPromptObservation: PromptObservation | undefined;
+        let promptConfirmation: PromptConfirmationEvidence | undefined;
         let postState: Record<string, unknown> | undefined = postStart.pane;
         if (params.initialPrompt !== undefined) {
+          // Baseline identity and lifecycle come only from the one authoritative
+          // agent-get record. Pane/start fields cannot fill lifecycle or identity
+          // omissions, and a non-idle baseline fails before stdin submission.
+          const baseline = promptBaseline(postStart.agent, capturedIdentity);
           const envelope = initialPromptDelivery === "attachment"
             ? buildEnvelope(sender!, "assignment", params.initialPrompt, "attachment", { ...published!, encoding: "utf-8" })
             : buildEnvelope(sender!, "assignment", params.initialPrompt, "inline");
           const promptResponse = await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
+          promptSubmitted = true;
           initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity);
-          initialPromptSent = true;
           progress(onUpdate, phase, created);
 
-          try {
-            const postAgent = agentGetRecord(await run(deps.cli, ["agent", "get", resolvedPaneId], abortSignal));
-            const candidate = paneRecord(await run(deps.cli, ["pane", "get", resolvedPaneId], abortSignal), resolvedPaneId);
-            const postEvidence = [postAgent, candidate];
-            initialPromptObservation = classifyPromptObservation(postEvidence, initialPromptSubmission);
-            let identityMatches = false;
-            try {
-              const postIdentity = requirePromptTargetIdentity(postEvidence, resolvedPaneId);
-              identityMatches = samePromptTargetIdentity(postIdentity, initialPromptSubmission);
-            } catch {
-              // Keep the initialized false value; an unusable identity is never state.
-            }
-            // A same-name pane replacement is evidence about the race, never the
-            // launched recipient's state or identity. Keep only the bounded
-            // observation produced above and retain the captured target binding.
-            if (identityMatches) {
-              postState = candidate;
-              agentId ??= idFrom(postAgent, "agent_id") ?? idFrom(postAgent, "id") ?? idFrom(candidate, "agent_id");
-              if (agentId) created.agentId = agentId;
-            } else {
-              postState = undefined;
-            }
-          } catch (error) {
-            // A valid agent_prompted envelope already confirms acceptance. Keep a
-            // stale/unavailable identity or state observation visible without
-            // resubmitting the prompt. Caller aborts after acknowledgement affect
-            // only this optional observation.
-            postState = undefined;
-            initialPromptObservation = unavailablePromptObservation(error);
-          }
+          const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission, baseline);
+          initialPromptObservation = confirmed.observation;
+          promptConfirmation = confirmed.confirmation;
+          promptConsumption = "confirmed";
+          initialPromptSent = true;
+          postState = confirmed.pane;
+          agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+          if (agentId) created.agentId = agentId;
         }
         const authoritativeName = capturedIdentity.agentName;
         const capability = capabilities.get(chosenProfile.name)!;
@@ -846,11 +959,13 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         const launchDetails: LaunchDetails = {
           operation: "launch", outcome: "launched", name: authoritativeName, kind: chosenRuntime.kind, placement, tabId, paneId: resolvedPaneId,
           ...(agentId ? { agentId } : {}),
-          ...(postState ? { postState: boundAgentSessionStrings(withoutEnvironment(postState)) } : {}),
+          postState: boundAgentSessionStrings(withoutEnvironment(postState)),
           initialPromptSent,
+          ...(params.initialPrompt === undefined ? {} : { promptSubmitted, promptConsumption }),
           ...(initialPromptDelivery ? { initialPromptDelivery } : {}),
           ...(initialPromptSubmission ? { initialPromptSubmission: compactPromptSubmission(initialPromptSubmission) } : {}),
           ...(initialPromptObservation ? { initialPromptObservation } : {}),
+          ...(promptConfirmation ? { promptConfirmation } : {}),
           ...(sender ? {
             sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
             envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },

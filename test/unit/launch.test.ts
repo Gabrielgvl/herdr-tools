@@ -43,6 +43,19 @@ const startFailure = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "agent pro
 });
 const envelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const PROMPT_ARGV = (paneId: string) => ["agent", "prompt", paneId, "--stdin"];
+const TEST_SESSION = { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" };
+const observedAgent = (state: string | undefined, stateChangeSeq: number | undefined, revision = 3): Record<string, unknown> => ({
+  name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-0", agent_session: TEST_SESSION,
+  ...(state === undefined ? {} : { agent_status: state }),
+  ...(stateChangeSeq === undefined ? {} : { state_change_seq: stateChangeSeq }),
+  revision
+});
+const observedPane = (state: string | undefined, stateChangeSeq: number | undefined, revision = 3): Record<string, unknown> => ({
+  pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "pi", terminal_id: "terminal-0", agent_session: TEST_SESSION,
+  ...(state === undefined ? {} : { agent_status: state }),
+  ...(stateChangeSeq === undefined ? {} : { state_change_seq: stateChangeSeq }),
+  revision
+});
 
 function profile(name: string, kind: "pi" | "claude" = "pi", fallbackProfiles: string[] = []) {
   const runtime = kind === "pi"
@@ -55,10 +68,11 @@ function catalog(...profiles: ReturnType<typeof profile>[]): ProfileCatalog {
   return { effective: new Map(profiles.map((item) => [item.name, item])), candidates: [], diagnostics: [] };
 }
 
-function makeCli(options: { start?: (argv: string[], attempt: number) => unknown; paneStates?: Array<Record<string, unknown>>; calls?: string[][]; stdinInputs?: string[]; snapshot?: HerdrSnapshot; omitFreshAgentSession?: boolean } = {}) {
+function makeCli(options: { start?: (argv: string[], attempt: number) => unknown; agentStates?: Array<Record<string, unknown>>; paneStates?: Array<Record<string, unknown>>; calls?: string[][]; stdinInputs?: string[]; snapshot?: HerdrSnapshot; omitFreshAgentSession?: boolean } = {}) {
   const calls = options.calls ?? [];
   const stdinInputs = options.stdinInputs ?? [];
   const liveSnapshot = options.snapshot ?? snapshot;
+  let agentReads = 0;
   let paneReads = 0;
   let starts = 0;
   let lastKind = "pi";
@@ -131,11 +145,27 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
       }
       if (argv[0] === "agent" && argv[1] === "prompt") return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: lastName, pane_id: lastPaneId, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 7, screen_detection_skipped: true } });
       if (argv[0] === "agent" && argv[1] === "focus") return ok("focus", {});
-      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: stripFreshSession({ name: lastName, pane_id: lastPaneId, agent: lastKind, terminal_id: lastTerminalId, agent_status: "working", state_change_seq: 7, agent_session: lastAgentSession }) });
+      if (argv[0] === "agent" && argv[1] === "get") {
+        const configured = options.agentStates && options.agentStates.length > 0
+          ? options.agentStates[Math.min(agentReads++, options.agentStates.length - 1)]
+          : undefined;
+        return ok("agent-get", { agent: configured ?? stripFreshSession({
+          name: lastName,
+          pane_id: lastPaneId,
+          agent: lastKind,
+          terminal_id: lastTerminalId,
+          agent_status: promptSubmitted ? "working" : "idle",
+          state_change_seq: promptSubmitted ? 8 : 7,
+          revision: promptSubmitted ? 4 : 3,
+          agent_session: lastAgentSession
+        }) });
+      }
       if (argv[0] === "pane" && argv[1] === "get") {
-        const configured = options.paneStates?.[paneReads++];
+        const configured = options.paneStates && options.paneStates.length > 0
+          ? options.paneStates[Math.min(paneReads++, options.paneStates.length - 1)]
+          : undefined;
         const paneId = lastPaneId;
-        return ok("get", { pane: configured ?? stripFreshSession({ pane_id: paneId, tab_id: paneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "working", revision: 3 }) });
+        return ok("get", { pane: configured ?? stripFreshSession({ pane_id: paneId, tab_id: paneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: promptSubmitted ? "working" : "idle", state_change_seq: promptSubmitted ? 8 : 7, revision: promptSubmitted ? 4 : 3 }) });
       }
       if (argv[0] === "tab" && argv[1] === "get") return ok("tab-get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1:t2" } });
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
@@ -159,11 +189,13 @@ function configureFreshIdentitySamples(harness: ReturnType<typeof makeCli>, samp
     const shared = {
       ...(sample.terminalId === undefined ? {} : { terminal_id: sample.terminalId }),
       ...(sample.kind === undefined ? {} : { agent: sample.kind }),
-      ...(sample.agentSession === undefined ? {} : { agent_session: sample.agentSession })
+      ...(sample.agentSession === undefined ? {} : { agent_session: sample.agentSession }),
+      state_change_seq: 7,
+      revision: 3
     };
     return {
-      pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", ...shared, ...(sample.name === undefined ? {} : { agent_name: sample.name }), agent_status: "working" },
-      agent: { pane_id: "w1:p2", ...shared, ...(sample.name === undefined ? {} : { name: sample.name }), agent_status: "working" }
+      pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", ...shared, ...(sample.name === undefined ? {} : { agent_name: sample.name }), agent_status: "idle" },
+      agent: { pane_id: "w1:p2", ...shared, ...(sample.name === undefined ? {} : { name: sample.name }), agent_status: "idle" }
     };
   };
   harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
@@ -175,8 +207,8 @@ function configureFreshIdentitySamples(harness: ReturnType<typeof makeCli>, samp
       const sample = records(current);
       return { ...result, result: { ...value, snapshot: { ...value.snapshot, panes: [...value.snapshot.panes.filter((pane) => pane.pane_id !== "w1:p2"), sample.pane], agents: [...value.snapshot.agents.filter((agent) => agent.pane_id !== "w1:p2"), sample.agent] } } };
     }
-    if (current && argv[0] === "agent" && argv[1] === "get") { harness.calls.push(argv); return ok("agent-get", { agent: records(current).agent }); }
-    if (current && argv[0] === "pane" && argv[1] === "get") { harness.calls.push(argv); return ok("pane-get", { pane: records(current).pane }); }
+    if (current && argv[0] === "agent" && argv[1] === "get" && harness.stdinInputs.length === 0) { harness.calls.push(argv); return ok("agent-get", { agent: records(current).agent }); }
+    if (current && argv[0] === "pane" && argv[1] === "get" && harness.stdinInputs.length === 0) { harness.calls.push(argv); return ok("pane-get", { pane: records(current).pane }); }
     return base(argv, signal, preserve);
   });
 }
@@ -240,6 +272,176 @@ describe("herdr_launch profile-only contract", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("waits through an unconfirmed idle sample until the same agent becomes working", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({
+        agentStates: [observedAgent("idle", 7), observedAgent("idle", 7), observedAgent("working", 8, 4)],
+        paneStates: [observedPane("idle", 7), observedPane("idle", 7), observedPane("working", 8, 4)]
+      });
+      const recipients = new RecipientRegistry();
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "delayed working" }, catalog(profile("worker")), harness.cli, undefined, { recipients });
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await pending;
+      expect(result.details).toMatchObject({
+        initialPromptSent: true,
+        promptSubmitted: true,
+        promptConsumption: "confirmed",
+        initialPromptObservation: { status: "working", consumption: "confirmed" },
+        promptConfirmation: { reason: "working", samples: 2, baseline: { stateChangeSeq: 7, revision: 3 }, last: { state: "working", stateChangeSeq: 8, revision: 4 } }
+      });
+      expect(harness.stdinInputs).toHaveLength(1);
+      expect(recipients.get("w1:p2")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("confirms a fast completed turn only from an advanced same-agent state sequence", async () => {
+    const harness = makeCli({
+      agentStates: [observedAgent("idle", 7), observedAgent("idle", 8, 4)],
+      paneStates: [observedPane("idle", 7), observedPane("idle", 8, 4)]
+    });
+    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "fast turn" }, catalog(profile("worker")), harness.cli);
+    expect(result.details).toMatchObject({
+      promptSubmitted: true,
+      promptConsumption: "confirmed",
+      initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8, consumption: "confirmed" },
+      promptConfirmation: { reason: "state_change_seq_advanced", samples: 1, baseline: { stateChangeSeq: 7 }, last: { stateChangeSeq: 8 } }
+    });
+    expect(harness.stdinInputs).toHaveLength(1);
+  });
+
+  it.each([
+    ["missing sequence", observedAgent("idle", undefined)],
+    ["working state", observedAgent("working", 7)],
+    ["unknown state", observedAgent("unknown", 7)],
+    ["missing state", observedAgent(undefined, 7)],
+    ["missing revision", (() => { const value = observedAgent("idle", 7); delete value.revision; return value; })()],
+    ["incomplete identity", (() => { const value = observedAgent("idle", 7); delete value.terminal_id; return value; })()]
+  ] as const)("refuses a %s pre-submit agent-get baseline before any prompt bytes", async (_label, agentState) => {
+    const harness = makeCli({ agentStates: [agentState], paneStates: [observedPane("idle", 99, 99)] });
+    const recipients = new RecipientRegistry();
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "no baseline" }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
+      code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "prompt_verification" }
+    });
+    expect(harness.stdinInputs).toHaveLength(0);
+    expect(recipients.get("w1:p2")).toBeUndefined();
+  });
+
+  it.each(["idle", "unknown", "working"])("times out bounded semantic confirmation for unchanged %s without retry or recipient registration", async (state) => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({
+        agentStates: [observedAgent("idle", 7), observedAgent(state, 7)],
+        paneStates: [observedPane("idle", 7), observedPane(state, 7)]
+      });
+      const recipients = new RecipientRegistry();
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: `unchanged ${state}` }, catalog(profile("worker")), harness.cli, undefined, { recipients });
+      const failure = expect(pending).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: {
+          causeCode: "PROMPT_UNCONFIRMED",
+          phase: "prompt_verification",
+          promptSubmitted: true,
+          promptConsumption: "unconfirmed",
+          initialPromptSubmission: { confirmed: true, stateChangeSeq: 7, revision: 3 },
+          promptConfirmation: {
+            timeoutMs: 5_000,
+            pollIntervalMs: 100,
+            elapsedMs: 5_000,
+            samples: expect.any(Number),
+            reason: "timeout",
+            baseline: { state: "idle", stateChangeSeq: 7, revision: 3 },
+            last: { state, stateChangeSeq: 7, revision: 3 }
+          },
+          created: { paneId: "w1:p2", tabId: "w1:t1" }
+        }
+      });
+      await vi.advanceTimersByTimeAsync(5_100);
+      await failure;
+      const promptCalls = harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt");
+      expect(promptCalls).toHaveLength(1);
+      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+      expect(recipients.get("w1:p2")).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps cross-record idle-7/working-8 lifecycle skew unconfirmed until timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({
+        agentStates: [observedAgent("idle", 7), observedAgent("idle", 7)],
+        paneStates: [observedPane("idle", 7), observedPane("working", 8, 4)]
+      });
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "skew" }, catalog(profile("worker")), harness.cli);
+      const failure = expect(pending).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: {
+          causeCode: "PROMPT_UNCONFIRMED",
+          promptConfirmation: { reason: "timeout", last: { status: "not_working", state: "idle", stateChangeSeq: 7, revision: 3 } }
+        }
+      });
+      await vi.advanceTimersByTimeAsync(5_100);
+      await failure;
+      expect(harness.stdinInputs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["disappears", { agent_status: "unknown" }, observedPane("unknown", 7), "identity_unavailable", "POSTSTATE_IDENTITY_UNAVAILABLE"],
+    ["reports malformed lifecycle evidence", { ...observedAgent("working", 8, 4), state_change_seq: "invalid" }, observedPane("idle", 900, 4), "contradictory", "POSTSTATE_CONTRADICTORY"]
+  ] as const)("fails closed immediately when the acknowledged target %s", async (_label, postAgent, postPane, reason, sourceCode) => {
+    const harness = makeCli({
+      agentStates: [observedAgent("idle", 7), postAgent],
+      paneStates: [observedPane("idle", 7), postPane]
+    });
+    const recipients = new RecipientRegistry();
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "fail closed" }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason, samples: 1, sourceCode } }
+    });
+    expect(harness.stdinInputs).toHaveLength(1);
+    expect(recipients.get("w1:p2")).toBeUndefined();
+  });
+
+  it("fails closed immediately when the acknowledged target is replaced", async () => {
+    const replacementAgent = { ...observedAgent("working", 8, 4), terminal_id: "terminal-replacement", agent_session: { ...TEST_SESSION, value: "replacement" } };
+    const replacementPane = { ...observedPane("working", 8, 4), terminal_id: "terminal-replacement", agent_session: { ...TEST_SESSION, value: "replacement" } };
+    const harness = makeCli({
+      agentStates: [observedAgent("idle", 7), replacementAgent],
+      paneStates: [observedPane("idle", 7), replacementPane]
+    });
+    const recipients = new RecipientRegistry();
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "replacement" }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason: "identity_changed", samples: 1, sourceCode: "POSTSTATE_IDENTITY_CHANGED" } }
+    });
+    expect(harness.stdinInputs).toHaveLength(1);
+    expect(recipients.get("w1:p2")).toBeUndefined();
+  });
+
+  it("fails closed when a post-ack authoritative agent read disappears", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let agentReads = 0;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "get" && agentReads++ > 0) return ok("agent-missing", { agent: null });
+      return base(argv, signal, preserve);
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "missing agent" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "PROMPT_UNCONFIRMED", promptConfirmation: { reason: "identity_unavailable", sourceCode: "TARGET_IDENTITY_UNAVAILABLE", samples: 1 } }
+    });
+    expect(harness.stdinInputs).toHaveLength(1);
   });
 
   it("aborts the read-only identity preflight before any prompt bytes or recipient registration", async () => {
@@ -573,20 +775,22 @@ describe("herdr_launch profile-only contract", () => {
     }
 
     {
-      const harness = makeCli({ paneStates: [
-        { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_name: "worker", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" }, agent_status: "working", revision: 3 },
-        { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_name: "worker", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" }, agent_status: "idle", revision: 3 }
-      ] });
+      const harness = makeCli({
+        agentStates: [observedAgent("idle", 7), observedAgent("idle", 8, 4)],
+        paneStates: [observedPane("working", 700), observedPane("working", 900, 4)]
+      });
       const result = await launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli);
-      expect(result.details).toMatchObject({ initialPromptSent: true, initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: "w1:p2", interactiveReady: true, revision: 3, screenDetectionSkipped: true }, initialPromptObservation: { status: "detection_skipped", state: "idle", revision: 3 } });
+      expect(result.details).toMatchObject({ initialPromptSent: true, promptSubmitted: true, promptConsumption: "confirmed", initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: "w1:p2", interactiveReady: true, revision: 3, screenDetectionSkipped: true }, initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8, revision: 4, screenDetectionSkipped: true, consumption: "confirmed" } });
       expect(harness.calls).toContainEqual(["agent", "prompt", "w1:p2", "--stdin"]);
       expect(harness.calls.some((call) => call[1] === "send-keys" || call[1] === "wait")).toBe(false);
       expect(harness.stdinInputs).toHaveLength(1);
 
       const registrationLag = makeCli({ omitFreshAgentSession: true });
-      const registrationLagResult = await launch({ name: "worker", profile: "worker", initialPrompt: "registration lag" }, catalog(worker), registrationLag.cli);
-      expect(registrationLagResult.details).toMatchObject({ initialPromptSent: true, initialPromptSubmission: { confirmed: true, agentSession: { value: "session-0" } } });
-      expect(registrationLag.stdinInputs).toHaveLength(1);
+      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "registration lag" }, catalog(worker), registrationLag.cli)).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "prompt_verification" }
+      });
+      expect(registrationLag.stdinInputs).toHaveLength(0);
 
       vi.useFakeTimers();
       const missingIdentity = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
@@ -682,10 +886,10 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get" && postAgentReads > 1) return ok("pane-post", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "pi", terminal_id: "terminal-replacement", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working", revision: 4 } });
         return postStateBase(argv, signal, preserve);
       });
-      const postStateResult = await launch({ name: "worker", profile: "worker", initialPrompt: "post replacement" }, catalog(worker), postStateReplacement.cli);
-      expect(postStateResult.details).toMatchObject({ initialPromptSubmission: { confirmed: true }, initialPromptObservation: { status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence: { records: expect.any(Array) } } });
-      expect(postStateResult.details).not.toHaveProperty("postState");
-      expect(JSON.stringify(postStateResult.content)).not.toContain("working");
+      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "post replacement" }, catalog(worker), postStateReplacement.cli)).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", initialPromptSubmission: { confirmed: true }, initialPromptObservation: { status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence: { records: expect.any(Array) } } }
+      });
       expect(postStateReplacement.stdinInputs).toHaveLength(1);
       const postPromptIndex = postStateReplacement.calls.findIndex((call) => call[0] === "agent" && call[1] === "prompt");
       expect(postStateReplacement.calls.slice(0, postPromptIndex)).toContainEqual(["api", "snapshot"]);
@@ -726,21 +930,26 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get" && paneReads++ > 0) throw Object.assign(new Error("observation unavailable"), { code: "CLI_PROTOCOL_ERROR" });
         return base.call(harness.cli, argv, signal, preserve);
       });
-      const result = await launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli);
-      expect(result.details).toMatchObject({ initialPromptSubmission: { confirmed: true }, initialPromptObservation: { status: "unavailable", code: "CLI_PROTOCOL_ERROR" } });
+      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli)).rejects.toMatchObject({
+        code: "LAUNCH_FAILED", details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConfirmation: { reason: "read_failed", sourceCode: "CLI_PROTOCOL_ERROR" } }
+      });
       expect(harness.stdinInputs).toHaveLength(1);
 
       const stringFailure = makeCli();
       const stringBase = stringFailure.cli.runJson;
       let stringPaneReads = 0;
       stringFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" && stringPaneReads++ > 0 ? Promise.reject("observation unavailable") : stringBase.call(stringFailure.cli, argv, signal, preserve));
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), stringFailure.cli)).resolves.toMatchObject({ details: { initialPromptSubmission: { confirmed: true }, initialPromptObservation: { status: "unavailable", code: "POSTSTATE_UNAVAILABLE" } } });
+      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), stringFailure.cli)).rejects.toMatchObject({
+        code: "LAUNCH_FAILED", details: { causeCode: "PROMPT_UNCONFIRMED", promptConfirmation: { reason: "read_failed", sourceCode: "POSTSTATE_UNAVAILABLE" } }
+      });
 
       const aborted = makeCli();
       const abortBase = aborted.cli.runJson;
       let abortedPaneReads = 0;
       aborted.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" && abortedPaneReads++ > 0 ? Promise.reject(Object.assign(new Error("aborted"), { code: "ABORTED" })) : abortBase.call(aborted.cli, argv, signal, preserve));
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), aborted.cli)).resolves.toMatchObject({ details: { initialPromptSubmission: { confirmed: true }, initialPromptObservation: { status: "unavailable", code: "ABORTED" } } });
+      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), aborted.cli)).rejects.toMatchObject({
+        code: "LAUNCH_FAILED", details: { causeCode: "PROMPT_UNCONFIRMED", promptConfirmation: { reason: "read_failed", sourceCode: "ABORTED" } }
+      });
     }
 
     {
@@ -870,17 +1079,11 @@ describe("herdr_launch profile-only contract", () => {
       await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focusFailure.cli)).rejects.toMatchObject({ code: "READY_TIMEOUT" });
     }
 
-    const idlePrompt = makeCli({ paneStates: [
-      { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_name: "worker", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" }, agent_status: "working", revision: 3 },
-      { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_name: "worker", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" }, agent_status: "idle", revision: 3 }
-    ] });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), idlePrompt.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptObservation: { status: "detection_skipped", state: "idle" } } });
-
-    const unknownState = makeCli({ paneStates: [
-      { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_name: "worker", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" }, agent_status: "working", revision: 3 },
-      { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_name: "worker", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } }
-    ] });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), unknownState.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptObservation: { status: "detection_skipped", state: "working" } } });
+    const idlePrompt = makeCli({
+      agentStates: [observedAgent("idle", 7), observedAgent("idle", 8, 4)],
+      paneStates: [observedPane("working", 700), observedPane("working", 900, 4)]
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), idlePrompt.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, promptConsumption: "confirmed", initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8 } } });
 
     const genericPostState = makeCli();
     const genericPostBase = genericPostState.cli.runJson;
@@ -952,9 +1155,43 @@ describe("herdr_launch profile-only contract", () => {
       controller.abort();
       return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" }, interactive_ready: true, revision: 3 } });
     });
-    const tool = createLaunchTool({ cli: aborted.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    await expect(tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "go" }, controller.signal, undefined, extensionContext)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptSubmission: { confirmed: true }, initialPromptObservation: { status: "unavailable", code: "ABORTED" } } });
+    const recipients = new RecipientRegistry();
+    const tool = createLaunchTool({ cli: aborted.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) }, attachments: fakeAttachments(), recipients });
+    await expect(tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "go" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode: "PROMPT_UNCONFIRMED",
+        promptSubmitted: true,
+        promptConsumption: "unconfirmed",
+        initialPromptSubmission: { confirmed: true },
+        promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED", samples: 0 },
+        created: { paneId: "w1:p2", tabId: "w1:t1" }
+      }
+    });
     expect(aborted.stdinInputs).toHaveLength(1);
+    expect(recipients.get("w1:p2")).toBeUndefined();
+  });
+
+  it("preserves acknowledged effect evidence when abort cancels an in-flight confirmation read", async () => {
+    const controller = new AbortController();
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let agentReads = 0;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "get" && agentReads++ > 0) return new Promise<never>(() => undefined);
+      return base(argv, signal, preserve);
+    });
+    const recipients = new RecipientRegistry();
+    const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
+    const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "abort read" }, controller.signal, undefined, extensionContext);
+    await vi.waitFor(() => expect(agentReads).toBe(2), { timeout: 1_000, interval: 1 });
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED", samples: 1 } }
+    });
+    expect(harness.stdinInputs).toHaveLength(1);
+    expect(recipients.get("w1:p2")).toBeUndefined();
   });
 
   it("falls back to the context signal and then to a fresh signal", async () => {
@@ -1045,18 +1282,23 @@ describe("herdr_launch profile-only contract", () => {
     const existingPane = makeCli();
     const existingBase = existingPane.cli.runJson;
     let existingStarted = false;
+    let promptSubmitted = false;
     const existingIdentity = { terminal_id: "terminal-existing-attachment", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-existing-attachment" } };
     existingPane.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-      if (argv[0] === "api" && existingStarted) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, pane_id: "w1:p1", agent_name: "worker", agent: "claude", ...existingIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "claude", ...existingIdentity }] } });
+      const status = promptSubmitted ? "working" : "idle";
+      const stateChangeSeq = promptSubmitted ? 2 : 1;
+      const revision = promptSubmitted ? 4 : 3;
+      if (argv[0] === "api" && existingStarted) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, pane_id: "w1:p1", agent_name: "worker", agent: "claude", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "claude", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision }] } });
       if (argv[0] === "agent" && argv[1] === "start") { existingStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "claude", ...existingIdentity } }); }
-      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { pane_id: "w1:p1", name: "worker", agent: "claude", ...existingIdentity, agent_status: "working" } });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "claude", ...existingIdentity, agent_status: "working", revision: 3 } });
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { pane_id: "w1:p1", name: "worker", agent: "claude", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "claude", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision } });
       return existingBase(argv, signal, preserve);
     });
     existingPane.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
       existingPane.calls.push(argv);
       existingPane.stdinInputs.push(input);
-      return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p1", agent: "claude", terminal_id: "terminal-existing-attachment", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-existing-attachment" }, agent_status: "working", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } });
+      promptSubmitted = true;
+      return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p1", agent: "claude", terminal_id: "terminal-existing-attachment", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-existing-attachment" }, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } });
     });
     const result = await launch({ name: "worker", profile: "worker-claude", placement: { mode: "existing_pane", target: "caller" }, initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), existingPane.cli, undefined, { attachments });
     expect(recipientPanes).toEqual(["w1:p1"]);

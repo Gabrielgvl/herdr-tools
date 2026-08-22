@@ -2,14 +2,17 @@
 
 ## Status
 
-Accepted; supersedes only the prompt-observation and Enter-recovery portions of the following decisions:
+Superseded by `docs/decisions/015-semantic-initial-prompt-consumption-confirmation.md`
+(ADR-015: Require semantic consumption confirmation for launch initial prompts).
+
+ADR-015 retains this decision's single-submit, no-Enter, exact acknowledgement
+contract for `herdr_communicate`, but replaces launch's acknowledgement-only success
+with bounded semantic consumption confirmation. The older decisions referenced
+below retain their unrelated active decisions:
 
 - `docs/decisions/004-direct-prompt-steering.md` — ADR-004: Steer by direct prompt submission
 - `docs/decisions/007-active-wait-job-visibility.md` — ADR-007: Show active wait jobs in Pi's footer and a toggleable widget
 - `docs/decisions/008-profile-only-launch-and-bounded-fallback.md` — ADR-008: Make Herdr launch profile-only with bounded fallback
-
-Those files retain their unrelated active decisions. This file is authoritative
-for prompt acknowledgement and optional post-observation.
 
 ## Date
 

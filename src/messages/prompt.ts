@@ -76,13 +76,24 @@ export interface PromptSubmissionEvidence extends PromptTargetIdentity {
   screenDetectionSkipped?: boolean;
 }
 
-export type PromptObservationStatus = "working" | "not_working" | "unknown" | "detection_skipped" | "stale" | "unavailable";
+export type PromptConsumption = "confirmed" | "unconfirmed";
+
+export interface PromptObservationBaseline {
+  state: string;
+  stateChangeSeq: number;
+  revision: number;
+  screenDetectionSkipped?: boolean;
+}
+
+export type PromptObservationStatus = "working" | "not_working" | "unknown" | "stale" | "unavailable";
 
 export interface PromptObservation {
   status: PromptObservationStatus;
   state?: string;
+  stateChangeSeq?: number;
   revision?: number;
   screenDetectionSkipped?: boolean;
+  consumption?: PromptConsumption;
   code?: string;
   /** Bounded identity/state evidence for a replaced or otherwise unusable read. */
   evidence?: Record<string, unknown>;
@@ -349,10 +360,9 @@ export function parsePromptSubmission(response: JsonEnvelope, expected: PromptSu
     promptProtocolError("Herdr prompt acknowledgement omitted the authoritative revision", { field: "revision" });
   }
   const stateChangeSeq = optionalSafeInteger(agent.state_change_seq, "state_change_seq");
-  const screenDetectionSkipped = agent.screen_detection_skipped;
-  if (screenDetectionSkipped !== undefined && typeof screenDetectionSkipped !== "boolean") {
-    promptProtocolError("Herdr prompt acknowledgement contains an invalid screen-detection flag", { field: "screen_detection_skipped" });
-  }
+  // Screen detection is best-effort diagnostic metadata. A malformed flag cannot
+  // validate or invalidate the acknowledgement; retain it only when it is safe.
+  const screenDetectionSkipped = typeof agent.screen_detection_skipped === "boolean" ? agent.screen_detection_skipped : undefined;
   return {
     confirmed: true,
     operationId: response.id,
@@ -364,44 +374,123 @@ export function parsePromptSubmission(response: JsonEnvelope, expected: PromptSu
   };
 }
 
-function safeRevision(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+const KNOWN_PROMPT_STATES = new Set(["idle", "working", "blocked", "done", "unknown"]);
+
+interface PromptLifecycleValues {
+  state?: string;
+  stateChangeSeq?: number;
+  revision?: number;
+  screenDetectionSkipped?: boolean;
+  invalid: boolean;
 }
 
 /**
- * Classify only the optional observation after a confirmed submission. A missing,
- * malformed, or replaced identity is never allowed to describe another process;
- * it becomes an unavailable observation without revoking the accepted submission.
+ * Read one coherent lifecycle tuple. Agent-get is the only authoritative source
+ * for these fields; pane-get is intentionally excluded from scalar selection.
  */
-export function classifyPromptObservation(postState: Record<string, unknown> | Record<string, unknown>[], submission: PromptSubmissionEvidence): PromptObservation {
-  const records = Array.isArray(postState) ? postState : [postState];
+function promptLifecycle(value: Record<string, unknown>): PromptLifecycleValues {
+  const rawState = value.agent_status;
+  const state = typeof rawState === "string" && KNOWN_PROMPT_STATES.has(rawState) ? rawState : undefined;
+  const rawStateChangeSeq = value.state_change_seq;
+  const stateChangeSeq = typeof rawStateChangeSeq === "number" && Number.isSafeInteger(rawStateChangeSeq) && rawStateChangeSeq >= 0 ? rawStateChangeSeq : undefined;
+  const rawRevision = value.revision;
+  const revision = typeof rawRevision === "number" && Number.isSafeInteger(rawRevision) && rawRevision >= 0 ? rawRevision : undefined;
+  const screenDetectionSkipped = typeof value.screen_detection_skipped === "boolean" ? value.screen_detection_skipped : undefined;
+  return {
+    ...(state === undefined ? {} : { state }),
+    ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }),
+    ...(revision === undefined ? {} : { revision }),
+    ...(screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped }),
+    invalid: (rawState !== undefined && rawState !== null && state === undefined)
+      || (rawStateChangeSeq !== undefined && rawStateChangeSeq !== null && stateChangeSeq === undefined)
+      || (rawRevision !== undefined && rawRevision !== null && revision === undefined)
+  };
+}
+
+/** Capture the exact idle agent-get lifecycle tuple used as the pre-submit baseline. */
+export function capturePromptObservationBaseline(agentState: Record<string, unknown>, identity: PromptTargetIdentity): PromptObservationBaseline {
+  // Baseline identity and lifecycle must be complete in this one authoritative
+  // agent-get record. Neither start nor pane fields may fill an omission.
+  const observedIdentity = requirePromptTargetIdentity([agentState], identity.paneId);
+  if (!samePromptTargetIdentity(observedIdentity, identity)) {
+    throw new PromptIdentityError("TARGET_IDENTITY_CHANGED", "Prompt observation baseline identity changed", { evidence: boundedObservationEvidence([agentState]) });
+  }
+  const values = promptLifecycle(agentState);
+  if (values.invalid || values.state !== "idle" || values.stateChangeSeq === undefined || values.revision === undefined) {
+    throw new PromptIdentityError("TARGET_IDENTITY_UNAVAILABLE", "Prompt observation baseline must be one complete idle agent-get lifecycle tuple", {
+      evidence: boundedObservationEvidence([agentState])
+    });
+  }
+  return {
+    state: values.state,
+    stateChangeSeq: values.stateChangeSeq,
+    revision: values.revision,
+    ...(values.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: values.screenDetectionSkipped })
+  };
+}
+
+/**
+ * Classify one agent-get observation after a confirmed submission. Optional
+ * continuity records prove pane identity only; their lifecycle fields are never
+ * merged with or compared against the authoritative agent-get tuple.
+ */
+export function classifyPromptObservation(
+  agentState: Record<string, unknown>,
+  submission: PromptSubmissionEvidence,
+  baseline?: PromptObservationBaseline,
+  identityContinuity: Record<string, unknown>[] = []
+): PromptObservation {
+  const records = [agentState, ...identityContinuity];
   const evidence = boundedObservationEvidence(records);
   let identity: PromptTargetIdentity;
   try {
+    // Requiring the complete agent-get identity first prevents continuity records
+    // from filling it. The second join can only preserve that identity or throw on
+    // a contradictory pane record.
+    requirePromptTargetIdentity([agentState], submission.paneId);
     identity = requirePromptTargetIdentity(records, submission.paneId);
   } catch (error) {
     const identityError = error as PromptIdentityError;
     return {
       status: "unavailable",
       code: `POSTSTATE_${identityError.code === "TARGET_IDENTITY_CHANGED" ? "IDENTITY_CHANGED" : "IDENTITY_UNAVAILABLE"}`,
-      ...(identityError.code === "TARGET_IDENTITY_CHANGED" ? { evidence } : {})
+      ...(identityError.code === "TARGET_IDENTITY_CHANGED" ? { evidence } : {}),
+      ...(baseline === undefined ? {} : { consumption: "unconfirmed" })
     };
   }
-  if (!samePromptTargetIdentity(identity, submission)) return { status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence };
-  const merged = records.reduce<Record<string, unknown>>((result, value) => ({ ...result, ...value }), {});
-  const state = typeof merged.agent_status === "string" ? merged.agent_status : undefined;
-  const revision = safeRevision(merged.revision);
+  if (!samePromptTargetIdentity(identity, submission)) {
+    return { status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence, ...(baseline === undefined ? {} : { consumption: "unconfirmed" }) };
+  }
+  const values = promptLifecycle(agentState);
+  const diagnosticSkipped = values.screenDetectionSkipped ?? submission.screenDetectionSkipped;
   const common = {
-    ...(state === undefined ? {} : { state }),
-    ...(revision === undefined ? {} : { revision }),
-    ...(submission.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: submission.screenDetectionSkipped })
+    ...(values.state === undefined ? {} : { state: values.state }),
+    ...(values.stateChangeSeq === undefined ? {} : { stateChangeSeq: values.stateChangeSeq }),
+    ...(values.revision === undefined ? {} : { revision: values.revision }),
+    ...(diagnosticSkipped === undefined ? {} : { screenDetectionSkipped: diagnosticSkipped })
   };
-  if (state === undefined) return { status: "unavailable", code: "POSTSTATE_UNAVAILABLE", ...common };
-  if (revision !== undefined && revision < submission.revision) return { status: "stale", ...common };
-  if (submission.screenDetectionSkipped === true) return { status: "detection_skipped", ...common };
-  if (state === "working") return { status: "working", ...common };
-  if (state === "unknown") return { status: "unknown", ...common };
-  return { status: "not_working", ...common };
+  if (values.invalid) {
+    return { status: "unavailable", code: "POSTSTATE_CONTRADICTORY", evidence, ...common, ...(baseline === undefined ? {} : { consumption: "unconfirmed" }) };
+  }
+  if (values.state === undefined) {
+    return { status: "unavailable", code: "POSTSTATE_UNAVAILABLE", ...common, ...(baseline === undefined ? {} : { consumption: "unconfirmed" }) };
+  }
+  const minimumRevision = baseline === undefined ? submission.revision : Math.max(submission.revision, baseline.revision);
+  if (values.revision !== undefined && values.revision < minimumRevision) {
+    return { status: "stale", ...common, ...(baseline === undefined ? {} : { consumption: "unconfirmed" }) };
+  }
+  const status: PromptObservationStatus = values.state === "working"
+    ? "working"
+    : values.state === "unknown"
+      ? "unknown"
+      : "not_working";
+  if (baseline === undefined) return { status, ...common };
+  const confirmed = status !== "unknown"
+    && values.stateChangeSeq !== undefined
+    && values.stateChangeSeq > baseline.stateChangeSeq
+    && values.revision !== undefined
+    && values.revision >= minimumRevision;
+  return { status, ...common, consumption: confirmed ? "confirmed" : "unconfirmed" };
 }
 
 export function unavailablePromptObservation(error: unknown): PromptObservation {

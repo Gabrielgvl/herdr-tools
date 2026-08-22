@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
-import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, joinPromptTargetIdentity, parsePromptSubmission, parsePromptTargetIdentityFields, requirePromptTargetIdentity, unavailablePromptObservation, type PromptSubmissionEvidence } from "../../src/messages/prompt.js";
+import { boundAgentSessionStrings, capturePromptObservationBaseline, classifyPromptObservation, compactPromptSubmission, joinPromptTargetIdentity, parsePromptSubmission, parsePromptTargetIdentityFields, requirePromptTargetIdentity, unavailablePromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence } from "../../src/messages/prompt.js";
 
 const agent = {
   name: "worker",
@@ -38,6 +38,7 @@ describe("prompt submission acknowledgement", () => {
       screenDetectionSkipped: true
     });
     expect(validSubmission({ state_change_seq: undefined, screen_detection_skipped: undefined })).toEqual(expect.objectContaining({ revision: 7, interactiveReady: true }));
+    expect(validSubmission({ screen_detection_skipped: "invalid" })).not.toHaveProperty("screenDetectionSkipped");
   });
 
   it.each([
@@ -77,8 +78,7 @@ describe("prompt submission acknowledgement", () => {
     ["negative revision", { revision: -1 }],
     ["fractional revision", { revision: 1.5 }],
     ["invalid state sequence", { state_change_seq: "4" }],
-    ["negative state sequence", { state_change_seq: -1 }],
-    ["invalid detection flag", { screen_detection_skipped: "yes" }]
+    ["negative state sequence", { state_change_seq: -1 }]
   ])("rejects %s without retaining unsafe evidence", (_label, overrides) => {
     expect(() => parsePromptSubmission(response({ type: "agent_prompted", agent: { ...agent, ...overrides } }), expected)).toThrowError(CliProtocolError);
   });
@@ -127,17 +127,117 @@ describe("prompt submission acknowledgement", () => {
 });
 
 describe("prompt post-dispatch observation", () => {
-  it("distinguishes working, ordinary non-working, unknown, skipped, stale, and malformed reads", () => {
+  const baseline: PromptObservationBaseline = { state: "idle", stateChangeSeq: 4, revision: 7, screenDetectionSkipped: false };
+
+  it("captures a complete idle baseline from one full agent-get record only", () => {
+    expect(capturePromptObservationBaseline({ ...agent, screen_detection_skipped: false }, expected)).toEqual(baseline);
+    const noFlag = { ...agent } as Record<string, unknown>;
+    delete noFlag.screen_detection_skipped;
+    expect(capturePromptObservationBaseline(noFlag, expected)).toEqual({ state: "idle", stateChangeSeq: 4, revision: 7 });
+    expect(capturePromptObservationBaseline({ ...agent, screen_detection_skipped: "invalid" }, expected)).toEqual({ state: "idle", stateChangeSeq: 4, revision: 7 });
+    for (const malformed of [
+      { ...agent, agent_status: "working" },
+      { ...agent, agent_status: "unknown" },
+      { ...agent, agent_status: undefined },
+      { ...agent, state_change_seq: undefined },
+      { ...agent, revision: undefined }
+    ]) {
+      expect(() => capturePromptObservationBaseline(malformed, expected)).toThrowError(/complete idle agent-get lifecycle tuple/);
+    }
+    expect(() => capturePromptObservationBaseline({ ...agent, terminal_id: undefined }, expected)).toThrowError(/identity is malformed/);
+    expect(() => capturePromptObservationBaseline({ ...agent, terminal_id: "replacement" }, expected)).toThrowError(/identity changed|does not match|changed/i);
+  });
+
+  it("confirms only from an advanced agent-get sequence with a present non-regressed revision", () => {
+    const submission = validSubmission({ screen_detection_skipped: false });
+    const post = (state?: string, revision: number | undefined = 7, stateChangeSeq: number | undefined = 4, skipped: unknown = false): Record<string, unknown> => ({
+      ...agent,
+      agent_status: state,
+      revision,
+      state_change_seq: stateChangeSeq,
+      screen_detection_skipped: skipped
+    });
+    expect(classifyPromptObservation(post("working", 7, 5), submission, baseline)).toEqual({ status: "working", state: "working", stateChangeSeq: 5, revision: 7, screenDetectionSkipped: false, consumption: "confirmed" });
+    expect(classifyPromptObservation(post("idle", 8, 5, true), submission, baseline)).toEqual({ status: "not_working", state: "idle", stateChangeSeq: 5, revision: 8, screenDetectionSkipped: true, consumption: "confirmed" });
+    expect(classifyPromptObservation(post("done", 7, 5), submission, baseline)).toEqual({ status: "not_working", state: "done", stateChangeSeq: 5, revision: 7, screenDetectionSkipped: false, consumption: "confirmed" });
+    expect(classifyPromptObservation(post("working"), submission, baseline)).toMatchObject({ status: "working", stateChangeSeq: 4, consumption: "unconfirmed" });
+    expect(classifyPromptObservation(post("working", 7, 3), submission, baseline)).toMatchObject({ status: "working", stateChangeSeq: 3, consumption: "unconfirmed" });
+    const missingRevision = post("working", 7, 5);
+    delete missingRevision.revision;
+    expect(classifyPromptObservation(missingRevision, submission, baseline)).toMatchObject({ status: "working", stateChangeSeq: 5, consumption: "unconfirmed" });
+    expect(classifyPromptObservation(post("working", 6, 5), submission, baseline)).toMatchObject({ status: "stale", revision: 6, consumption: "unconfirmed" });
+    const missingSequence = post("working", 7, 5);
+    delete missingSequence.state_change_seq;
+    expect(classifyPromptObservation(missingSequence, submission, baseline)).toMatchObject({ status: "working", consumption: "unconfirmed" });
+    expect(classifyPromptObservation(post("unknown", 8, 5), submission, baseline)).toMatchObject({ status: "unknown", consumption: "unconfirmed" });
+    expect(classifyPromptObservation(post("idle", 7, 4), submission, baseline)).toMatchObject({ status: "not_working", consumption: "unconfirmed" });
+  });
+
+  it("uses agent-get as the sole lifecycle tuple and ignores pane lifecycle/screen skew", () => {
+    const submission = validSubmission({ screen_detection_skipped: undefined });
+    const skewBaseline: PromptObservationBaseline = { state: "idle", stateChangeSeq: 7, revision: 7 };
+    const agentGet = { ...agent, agent_status: "idle", state_change_seq: 7, revision: 7, screen_detection_skipped: false };
+    const paneGet = { ...agent, agent_status: "working", state_change_seq: 8, revision: 8, screen_detection_skipped: true };
+    expect(classifyPromptObservation(agentGet, submission, skewBaseline, [paneGet])).toEqual({
+      status: "not_working",
+      state: "idle",
+      stateChangeSeq: 7,
+      revision: 7,
+      screenDetectionSkipped: false,
+      consumption: "unconfirmed"
+    });
+    expect(classifyPromptObservation({ ...agentGet, screen_detection_skipped: "invalid" }, submission, skewBaseline, [paneGet])).toEqual({
+      status: "not_working",
+      state: "idle",
+      stateChangeSeq: 7,
+      revision: 7,
+      consumption: "unconfirmed"
+    });
+  });
+
+  it("fails closed on malformed authoritative lifecycle scalars", () => {
+    const submission = validSubmission({ screen_detection_skipped: undefined });
+    const base = { ...agent } as Record<string, unknown>;
+    delete base.screen_detection_skipped;
+    for (const malformed of [
+      { ...base, agent_status: "other" },
+      { ...base, state_change_seq: "4" },
+      { ...base, state_change_seq: -1 },
+      { ...base, state_change_seq: 1.5 },
+      { ...base, revision: "7" },
+      { ...base, revision: -1 },
+      { ...base, revision: 1.5 }
+    ]) {
+      expect(classifyPromptObservation(malformed, submission, baseline)).toMatchObject({ status: "unavailable", code: "POSTSTATE_CONTRADICTORY", consumption: "unconfirmed" });
+    }
+    expect(classifyPromptObservation({ ...base, revision: "invalid" }, submission)).toMatchObject({ status: "unavailable", code: "POSTSTATE_CONTRADICTORY" });
+  });
+
+  it("keeps missing state unconfirmed and distinguishes identity failures with a baseline", () => {
+    const submission = validSubmission({ screen_detection_skipped: undefined });
+    const missingState = { ...agent } as Record<string, unknown>;
+    delete missingState.agent_status;
+    delete missingState.screen_detection_skipped;
+    expect(classifyPromptObservation(missingState, submission, baseline)).toEqual({ status: "unavailable", code: "POSTSTATE_UNAVAILABLE", stateChangeSeq: 4, revision: 7, consumption: "unconfirmed" });
+    expect(classifyPromptObservation({ agent_status: "working" }, submission, baseline)).toEqual({ status: "unavailable", code: "POSTSTATE_IDENTITY_UNAVAILABLE", consumption: "unconfirmed" });
+    expect(classifyPromptObservation({ ...agent, terminal_id: "replacement" }, submission, baseline)).toMatchObject({ status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", consumption: "unconfirmed", evidence: { records: expect.any(Array) } });
+  });
+
+  it("keeps communication observation diagnostic-only without a baseline", () => {
     const working = validSubmission({ screen_detection_skipped: false });
-    const post = (state?: string, revision: number | undefined = 7): Record<string, unknown> => ({ ...agent, agent_status: state, revision });
-    expect(classifyPromptObservation(post("working"), working)).toEqual({ status: "working", state: "working", revision: 7, screenDetectionSkipped: false });
-    expect(classifyPromptObservation(post("idle"), working)).toEqual({ status: "not_working", state: "idle", revision: 7, screenDetectionSkipped: false });
-    expect(classifyPromptObservation(post("unknown"), working)).toEqual({ status: "unknown", state: "unknown", revision: 7, screenDetectionSkipped: false });
-    expect(classifyPromptObservation({ ...post("working"), revision: 6 }, working)).toEqual({ status: "stale", state: "working", revision: 6, screenDetectionSkipped: false });
-    expect(classifyPromptObservation(post("idle"), validSubmission())).toEqual({ status: "detection_skipped", state: "idle", revision: 7, screenDetectionSkipped: true });
-    expect(classifyPromptObservation(post("idle"), validSubmission({ screen_detection_skipped: undefined }))).toEqual({ status: "not_working", state: "idle", revision: 7 });
-    expect(classifyPromptObservation({ ...post("idle"), revision: undefined }, working)).toEqual({ status: "not_working", state: "idle", screenDetectionSkipped: false });
-    expect(classifyPromptObservation({ ...post(undefined), revision: 7 }, working)).toEqual({ status: "unavailable", code: "POSTSTATE_UNAVAILABLE", revision: 7, screenDetectionSkipped: false });
+    const post = (state?: string, revision: number | undefined = 7): Record<string, unknown> => ({ ...agent, agent_status: state, revision, screen_detection_skipped: false });
+    expect(classifyPromptObservation(post("working"), working)).toEqual({ status: "working", state: "working", stateChangeSeq: 4, revision: 7, screenDetectionSkipped: false });
+    expect(classifyPromptObservation(post("idle"), working)).toEqual({ status: "not_working", state: "idle", stateChangeSeq: 4, revision: 7, screenDetectionSkipped: false });
+    expect(classifyPromptObservation({ ...post("working"), revision: 6 }, working)).toEqual({ status: "stale", state: "working", stateChangeSeq: 4, revision: 6, screenDetectionSkipped: false });
+    const noDiagnostics = post("idle");
+    delete noDiagnostics.state_change_seq;
+    delete noDiagnostics.revision;
+    delete noDiagnostics.screen_detection_skipped;
+    expect(classifyPromptObservation(noDiagnostics, validSubmission({ screen_detection_skipped: undefined }))).toEqual({ status: "not_working", state: "idle" });
+    const noState = post("idle");
+    delete noState.agent_status;
+    expect(classifyPromptObservation(noState, working)).toEqual({ status: "unavailable", code: "POSTSTATE_UNAVAILABLE", stateChangeSeq: 4, revision: 7, screenDetectionSkipped: false });
+    expect(classifyPromptObservation({ ...post(undefined), revision: 7 }, working)).toEqual({ status: "unavailable", code: "POSTSTATE_UNAVAILABLE", stateChangeSeq: 4, revision: 7, screenDetectionSkipped: false });
     expect(classifyPromptObservation({ ...post("working"), terminal_id: "term-replaced" }, working)).toMatchObject({ status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence: { records: [expect.objectContaining({ terminal_id: "term-replaced" })] } });
     expect(classifyPromptObservation({ agent_status: "working", revision: 7 }, working)).toEqual({ status: "unavailable", code: "POSTSTATE_IDENTITY_UNAVAILABLE" });
   });

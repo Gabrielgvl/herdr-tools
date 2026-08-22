@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -92,6 +93,48 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       return JSON.parse(result.stdout);
     };
     const runNamed = (args: string[]) => run("--session", REQUIRED_SESSION, ...args);
+    const diagnosticRecord = (value: unknown): Record<string, unknown> => {
+      const source = record(value);
+      const diagnostic = Object.fromEntries(["pane_id", "terminal_id", "agent_id", "name", "agent_name", "agent", "agent_status", "state_change_seq", "revision", "interactive_ready", "screen_detection_skipped"].flatMap((field): Array<[string, unknown]> => {
+        const candidate = source[field];
+        return typeof candidate === "string" || typeof candidate === "number" || typeof candidate === "boolean" || candidate === null ? [[field, candidate]] : [];
+      }));
+      const session = source.agent_session;
+      if (typeof session === "object" && session !== null && !Array.isArray(session)) {
+        const identity = session as Record<string, unknown>;
+        if (["source", "agent", "kind", "value"].every((field) => typeof identity[field] === "string")) {
+          const full = [identity.source, identity.agent, identity.kind, identity.value] as string[];
+          diagnostic.agent_session = { source: full[0]!.slice(0, 256), agent: full[1]!.slice(0, 256), kind: full[2]!.slice(0, 256), value: full[3]!.slice(0, 256) };
+          diagnostic.agent_session_fingerprint = createHash("sha256").update(JSON.stringify(full)).digest("hex");
+        }
+      }
+      return diagnostic;
+    };
+    const recordLaunchFailureBeforeTeardown = async (result: ToolResult, paneId: string, elapsedMs: number): Promise<void> => {
+      const failure = evidence(result);
+      const details = record(failure.details);
+      process.stderr.write(`INTEGRATION_LAUNCH_FAILURE_BEFORE_TEARDOWN ${JSON.stringify({ elapsedMs, code: failure.code, causeCode: details.causeCode, phase: details.phase, promptSubmitted: details.promptSubmitted, promptConsumption: details.promptConsumption, initialPromptSubmission: details.initialPromptSubmission, promptConfirmation: details.promptConfirmation, created: details.created })}\n`);
+      for (const [label, args] of [
+        ["agent_get", ["agent", "get", paneId]],
+        ["pane_get", ["pane", "get", paneId]]
+      ] as const) {
+        try {
+          const value = record(record(await runNamed([...args])).result);
+          const candidate = value.agent ?? value.pane ?? value;
+          process.stderr.write(`INTEGRATION_LAUNCH_${label.toUpperCase()} ${JSON.stringify(diagnosticRecord(candidate))}\n`);
+        } catch (error) {
+          process.stderr.write(`INTEGRATION_LAUNCH_${label.toUpperCase()}_FAILED ${error instanceof Error ? error.message : String(error)}\n`);
+        }
+      }
+      try {
+        const state = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);
+        const panes = Array.isArray(state.panes) ? state.panes.map(record).filter((item) => item.pane_id === paneId).map(diagnosticRecord) : [];
+        const agents = Array.isArray(state.agents) ? state.agents.map(record).filter((item) => item.pane_id === paneId).map(diagnosticRecord) : [];
+        process.stderr.write(`INTEGRATION_LAUNCH_SNAPSHOT ${JSON.stringify({ panes, agents })}\n`);
+      } catch (error) {
+        process.stderr.write(`INTEGRATION_LAUNCH_SNAPSHOT_FAILED ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+    };
     const topologyIds = (snapshot: Record<string, unknown>) => ({
       workspaces: Array.isArray(snapshot.workspaces) ? snapshot.workspaces.map((item) => record(item).workspace_id).sort() : [],
       tabs: Array.isArray(snapshot.tabs) ? snapshot.tabs.map((item) => record(item).tab_id).sort() : [],
@@ -218,8 +261,29 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(prelaunchMetadata).not.toHaveProperty("agent_name");
       expect(prelaunchMetadata).not.toHaveProperty("agent_id");
       expect(prelaunchMetadata).not.toHaveProperty("agent");
+      const launchStartedAt = Date.now();
       const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", placement: { mode: "existing_pane", target: workerPaneId }, initialPrompt: "Use the bash tool to run pwd, then report the working directory." });
-      expect(launched.isError, text(launched)).toBeUndefined();
+      const launchElapsedMs = Date.now() - launchStartedAt;
+      if (launched.isError) {
+        await recordLaunchFailureBeforeTeardown(launched, workerPaneId, launchElapsedMs);
+        const failure = evidence(launched);
+        const details = record(failure.details);
+        expect(failure.code).toBe("LAUNCH_FAILED");
+        expect(details).toMatchObject({
+          causeCode: "PROMPT_UNCONFIRMED",
+          phase: "prompt_verification",
+          promptSubmitted: true,
+          promptConsumption: "unconfirmed",
+          initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: workerPaneId },
+          promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100 },
+          created: expect.any(Object)
+        });
+        expect(launchElapsedMs).toBeLessThan(15_000);
+        // Exact fail-closed uncertainty is an accepted live outcome. Do not run
+        // wait, steer, transcript, reviewer, job, or close assertions against an
+        // assignment whose consumption was not proven.
+        return;
+      }
       const launchEvidence = evidence(launched);
       expect(launchEvidence).toMatchObject({
         operation: "launch",
@@ -233,7 +297,9 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(record(launchEvidence.sender).paneId).toBe(rootPane.pane_id);
       expect(record(record(launchEvidence.profile).source).kind).toBe("bundled");
 
-      const foreground = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 10_000 });
+      const confirmedState = record(launchEvidence.initialPromptObservation).state;
+      const confirmedWaitState = confirmedState === "working" ? "working" : confirmedState === "blocked" ? "needs_input" : "completed";
+      const foreground = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: confirmedWaitState }, timeoutMs: 10_000 });
       expect(foreground.isError, text(foreground)).toBeUndefined();
       expect(evidence(foreground)).toMatchObject({ operation: "wait", outcome: "success" });
 

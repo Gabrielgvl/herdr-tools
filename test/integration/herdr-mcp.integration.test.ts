@@ -110,10 +110,31 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       }
       return diagnostic;
     };
+    const schedulingToleranceMs = 500;
+    const assertLaunchPhaseTiming = (details: Record<string, unknown>, monotonicWallElapsedMs: number, confirmationTimedOut: boolean): void => {
+      const readiness = record(details.readiness);
+      const confirmation = record(details.promptConfirmation);
+      const timing = record(details.timing);
+      const selectedStartReadinessMs = timing.selectedStartReadinessMs;
+      const promptSubmissionAckMs = timing.promptSubmissionAckMs;
+      const postAckConfirmationMs = timing.postAckConfirmationMs;
+      for (const duration of [selectedStartReadinessMs, promptSubmissionAckMs, postAckConfirmationMs]) {
+        expect(Number.isSafeInteger(duration)).toBe(true);
+        expect(Number(duration)).toBeGreaterThanOrEqual(0);
+      }
+      const decomposedPhaseElapsedMs = Number(selectedStartReadinessMs) + Number(promptSubmissionAckMs) + Number(postAckConfirmationMs);
+      expect(decomposedPhaseElapsedMs).toBeLessThanOrEqual(monotonicWallElapsedMs + schedulingToleranceMs);
+      expect(readiness.elapsedMs).toBe(selectedStartReadinessMs);
+      expect(confirmation.elapsedMs).toBe(postAckConfirmationMs);
+      if (confirmationTimedOut) {
+        expect(Number(postAckConfirmationMs)).toBeGreaterThanOrEqual(5_000 - schedulingToleranceMs);
+        expect(Number(postAckConfirmationMs)).toBeLessThanOrEqual(monotonicWallElapsedMs + schedulingToleranceMs);
+      }
+    };
     const recordLaunchFailureBeforeTeardown = async (result: ToolResult, paneId: string, elapsedMs: number): Promise<void> => {
       const failure = evidence(result);
       const details = record(failure.details);
-      process.stderr.write(`INTEGRATION_LAUNCH_FAILURE_BEFORE_TEARDOWN ${JSON.stringify({ elapsedMs, code: failure.code, causeCode: details.causeCode, phase: details.phase, promptSubmitted: details.promptSubmitted, promptConsumption: details.promptConsumption, initialPromptSubmission: details.initialPromptSubmission, promptConfirmation: details.promptConfirmation, created: details.created })}\n`);
+      process.stderr.write(`INTEGRATION_LAUNCH_FAILURE_BEFORE_TEARDOWN ${JSON.stringify({ elapsedMs, code: failure.code, causeCode: details.causeCode, phase: details.phase, promptSubmitted: details.promptSubmitted, promptConsumption: details.promptConsumption, initialPromptSubmission: details.initialPromptSubmission, promptConfirmation: details.promptConfirmation, timing: details.timing, created: details.created })}\n`);
       for (const [label, args] of [
         ["agent_get", ["agent", "get", paneId]],
         ["pane_get", ["pane", "get", paneId]]
@@ -154,8 +175,8 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       let startupError = "";
       server = spawn("herdr", ["--session", REQUIRED_SESSION, "server"], { cwd, stdio: ["ignore", "ignore", "pipe"] });
       server.stderr?.on("data", (chunk: Buffer) => { startupError = (startupError + chunk.toString()).slice(-2_000); });
-      const startupDeadline = Date.now() + 10_000;
-      while (Date.now() < startupDeadline) {
+      const startupDeadline = performance.now() + 10_000;
+      while (performance.now() < startupDeadline) {
         if (server.exitCode !== null) throw new Error(`named Herdr server exited during startup: ${startupError}`);
         const listed = record(await run("session", "list", "--json"));
         sessionStarted = Array.isArray(listed.sessions) && listed.sessions.some((session) => {
@@ -261,9 +282,9 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(prelaunchMetadata).not.toHaveProperty("agent_name");
       expect(prelaunchMetadata).not.toHaveProperty("agent_id");
       expect(prelaunchMetadata).not.toHaveProperty("agent");
-      const launchStartedAt = Date.now();
+      const launchStartedAt = performance.now();
       const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", placement: { mode: "existing_pane", target: workerPaneId }, initialPrompt: "Use the bash tool to run pwd, then report the working directory." });
-      const launchElapsedMs = Date.now() - launchStartedAt;
+      const launchElapsedMs = performance.now() - launchStartedAt;
       if (launched.isError) {
         await recordLaunchFailureBeforeTeardown(launched, workerPaneId, launchElapsedMs);
         const failure = evidence(launched);
@@ -275,10 +296,11 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
           promptSubmitted: true,
           promptConsumption: "unconfirmed",
           initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: workerPaneId },
-          promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100 },
+          promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100, elapsedMs: expect.any(Number) },
+          timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
           created: expect.any(Object)
         });
-        expect(launchElapsedMs).toBeLessThan(15_000);
+        assertLaunchPhaseTiming(details, launchElapsedMs, record(details.promptConfirmation).reason === "timeout");
         // Exact fail-closed uncertainty is an accepted live outcome. Do not run
         // wait, steer, transcript, reviewer, job, or close assertions against an
         // assignment whose consumption was not proven.
@@ -292,8 +314,11 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         paneId: workerPaneId,
         initialPromptSent: true,
         envelope: { version: "v1", kind: "assignment" },
+        promptConfirmation: { elapsedMs: expect.any(Number) },
+        timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
         profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max" } }
       });
+      assertLaunchPhaseTiming(launchEvidence, launchElapsedMs, false);
       expect(record(launchEvidence.sender).paneId).toBe(rootPane.pane_id);
       expect(record(record(launchEvidence.profile).source).kind).toBe("bundled");
 

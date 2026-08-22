@@ -7,8 +7,11 @@ Superseded by `docs/decisions/015-semantic-initial-prompt-consumption-confirmati
 
 ADR-015 retains this decision's single-submit, no-Enter, exact acknowledgement
 contract for `herdr_communicate`, but replaces launch's acknowledgement-only success
-with bounded semantic consumption confirmation. The older decisions referenced
-below retain their unrelated active decisions:
+with bounded semantic consumption confirmation. ADR-016 supersedes this ADR's
+five-second launch identity preflight and later one-shot baseline references with one
+condition-based readiness loop bound to the selected start attempt's absolute
+120,000 ms budget. The older decisions referenced below retain their unrelated active
+decisions:
 
 - `docs/decisions/004-direct-prompt-steering.md` — ADR-004: Steer by direct prompt submission
 - `docs/decisions/007-active-wait-job-visibility.md` — ADR-007: Show active wait jobs in Pi's footer and a toggleable widget
@@ -34,7 +37,7 @@ The previous Tools recovery pressed Enter after a typed stall. That could duplic
 
 `herdr_communicate` prompt and steer, and `herdr_launch.initialPrompt`, use exactly one `herdr agent prompt <pane> --stdin` call without `--wait`, `--until`, or an extension-generated Enter. The health preflight gates this contract to Herdr protocol 20 on the client and running server; older protocols are incompatible and cannot reach prompt mutation.
 
-Before every text submission, the extension reads fresh snapshot, `agent get`, and pane evidence. For `herdr_communicate`, there is no start envelope: those fresh records are the complete identity source after one strict join, and their supplied fields must agree. For `herdr_launch.initialPrompt`, real Herdr 0.8.2 may omit identity fields from `agent_started` and immediate fresh records, so launch runs one bounded, read-only identity-readiness preflight (target approximately five seconds with short polling) before stdin or recipient registration. Each sample reads all three fresh sources and is joined only with identity fields actually supplied by `agent_started`; no missing component is carried from an earlier sample. A complete start field may cover a fresh omission, but a missing start session must be supplied by one sample. In both paths the resulting identity is exact: pane ID, terminal ID, agent name, agent kind, and the complete `agent_session` object (`source`, `agent`, `kind`, and `value`). Contradictory supplied data fails immediately; timeout or caller abort fails closed with bounded evidence. This readiness window is not a prompt retry: stdin remains zero or one submission, with no Enter, runtime hook, fallback, or duplicate bytes.
+Before every text submission, the extension reads fresh snapshot, `agent get`, and pane evidence. For `herdr_communicate`, there is no start envelope: those fresh records are the complete identity source after one strict join, and their supplied fields must agree. For `herdr_launch.initialPrompt`, ADR-016 replaces the former five-second preflight with one condition-based, read-only readiness loop bounded by the selected start attempt's existing absolute 120,000 ms startup budget. Every sample remains fresh ordered snapshot, `agent get`, then pane evidence with no cross-sample carry. The same sample's agent-get record must independently provide the exact complete identity and idle lifecycle baseline before stdin. Missing/null noncontradictory startup metadata and valid same-identity lifecycle skew are pending only within readiness; malformed lifecycle shapes, duplicate records, contradictory identity, or replacement is terminal. In both communication and launch the resulting identity remains exact: pane ID, terminal ID, agent name, agent kind, and the complete `agent_session` object (`source`, `agent`, `kind`, and `value`). This readiness loop is not a prompt retry: stdin remains zero or one submission, with no Enter, runtime hook, fallback, or duplicate bytes.
 
 ### Start-envelope source of truth
 
@@ -43,23 +46,31 @@ session verification. Its `result.agent` record normally supplies `pane_id`,
 `terminal_id`, `name`, `agent` (the runtime kind), and the complete `agent_session`
 object with `source`, `agent`, `kind`, and `value` (the live Pi source is `herdr:pi`;
 Claude is `herdr:claude`), but real 0.8.2 can intermittently omit one or more of
-those fields. Launch preserves and validates only the fields actually supplied by
-start, then allows one bounded fresh sample to complete the identity. A malformed or
-contradictory supplied field stops immediately; a missing field that never becomes
-ready times out before stdin bytes. There is no compatibility fallback or prompt
-submission retry.
+those fields. Launch preserves and validates only the identity fields actually
+supplied by start, then allows fresh coherent readiness polling samples to complete
+the identity. It also validates every non-null start lifecycle field's shape, but
+those values are an older process-start observation and never overwrite or veto a
+fresh sample. A malformed field or contradictory identity stops immediately; a
+missing identity field that never becomes ready times out before stdin bytes. There
+is no compatibility fallback or prompt submission retry.
 
 The immediately fresh post-start snapshot, `agent get`, and pane records remain
-mandatory continuity reads. Each readiness sample reads all three sources and is
-evaluated as one coherent set. Launch joins that single sample with only the fields
-supplied by `agent_started`; it never carries a terminal, name, kind, or session
-component from an earlier sample. A complete start field may cover an omitted/null
-fresh field, but a session absent from start must appear in that same sample. Every
-supplied fresh field must match the start identity and every repeated field within the
-sample must agree. Any contradiction is an immediate zero-dispatch refusal; bounded
-identity timeout or caller abort is also fail-closed. The acknowledgement, optional
-post-observation, and recipient registry are then bound to the captured complete
-identity; neither a pane/name/kind match nor a fresh omission can repair or replace it.
+mandatory continuity reads under ADR-016. Each readiness sample reads all three
+sources in order and is evaluated as one coherent set only after all three reads
+complete under the selected start attempt's never-reset absolute deadline. Fixed
+readiness diagnostics retain completed current-sample projections as the reads finish,
+so a pane-read failure still reports the current snapshot and agent record without
+evaluating readiness. Launch never carries a terminal, name, kind, session, status,
+sequence, or revision from an earlier sample. Supplied identity
+fields must agree. For an initial prompt, other records may corroborate but may not
+fill the agent-get anchor's complete exact identity, idle status, non-negative
+sequence, or non-negative revision. Every non-null lifecycle field is shape-validated;
+a valid same-identity snapshot/pane disagreement with the anchor is sequential skew,
+so the sample is discarded and resampled without merging or submission. Missing/null
+noncontradictory metadata remains pending only in readiness; malformed lifecycle
+shapes, duplicate records, contradictory identity, or replacement stops before
+dispatch. The acknowledgement, post-ack semantic confirmation, and recipient registry
+are then bound to the captured complete identity.
 
 A delivery is confirmed only by a valid success envelope with:
 

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError } from "../../src/cli.js";
-import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, type LaunchCli, type LaunchDependencies } from "../../src/tools/launch.js";
+import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
@@ -104,11 +104,11 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
           ...liveSnapshot,
           panes: [
             ...liveSnapshot.panes.filter((pane) => pane.pane_id !== lastPaneId),
-            stripFreshSession({ pane_id: lastPaneId, tab_id: lastPaneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent_name: lastName, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "working", revision: 3 })
+            stripFreshSession({ pane_id: lastPaneId, tab_id: lastPaneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent_name: lastName, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "idle", state_change_seq: 7, revision: 3 })
           ],
           agents: [
             ...liveSnapshot.agents.filter((agent) => agent.pane_id !== lastPaneId),
-            stripFreshSession({ pane_id: lastPaneId, name: lastName, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "working", revision: 3 })
+            stripFreshSession({ pane_id: lastPaneId, name: lastName, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "idle", state_change_seq: 7, revision: 3 })
           ]
         };
         return ok("snapshot", { type: "session_snapshot", snapshot: currentSnapshot });
@@ -175,11 +175,37 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
 }
 
 type LaunchIdentitySample = {
-  terminalId?: string;
-  name?: string;
-  kind?: string;
-  agentSession?: Record<string, string>;
+  terminalId?: string | null;
+  name?: string | null;
+  kind?: string | null;
+  agentSession?: Record<string, string> | null;
 };
+
+function fakeStartBudgetClock(startElapsedMs = 119_900): { clock: LaunchClock; consumeStartBudget(): void; advance(milliseconds: number): void } {
+  const followsFakeTimers = vi.isFakeTimers();
+  let now = 0;
+  let observedAt = Date.now();
+  const elapsed = (): number => now + (followsFakeTimers ? Date.now() - observedAt : 0);
+  return {
+    clock: { now: elapsed },
+    consumeStartBudget(): void {
+      now = startElapsedMs;
+      observedAt = Date.now();
+    },
+    advance(milliseconds: number): void {
+      now = elapsed() + milliseconds;
+      observedAt = Date.now();
+    }
+  };
+}
+
+function fakeManualClock(): { clock: LaunchClock; advance(milliseconds: number): void } {
+  let now = 0;
+  return {
+    clock: { now: () => now },
+    advance(milliseconds: number): void { now += milliseconds; }
+  };
+}
 
 function configureFreshIdentitySamples(harness: ReturnType<typeof makeCli>, samples: LaunchIdentitySample[]): void {
   const base = harness.cli.runJson;
@@ -218,7 +244,7 @@ function launch(
   profiles: ProfileCatalog,
   cli = makeCli().cli,
   promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) },
-  extras: { attachments?: AttachmentStore; recipients?: RecipientRegistry } = {}
+  extras: { attachments?: AttachmentStore; recipients?: RecipientRegistry; clock?: LaunchClock } = {}
 ) {
   const tool = createLaunchTool({
     cli,
@@ -227,7 +253,8 @@ function launch(
     profiles: { load: async () => profiles },
     promptSources,
     attachments: extras.attachments ?? fakeAttachments(),
-    recipients: extras.recipients ?? new RecipientRegistry()
+    recipients: extras.recipients ?? new RecipientRegistry(),
+    ...(extras.clock === undefined ? {} : { clock: extras.clock })
   });
   return tool.execute("id", params, new AbortController().signal, undefined, extensionContext);
 }
@@ -245,30 +272,350 @@ describe("herdr_launch evidence redaction", () => {
       history: [{ env: { SECRET: "array-secret" } }, { child: { environment_overrides: { SECRET: "deep-secret" } } }]
     };
     const result = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli({ paneStates: [leaky, leaky] }).cli);
-    expect(result.details).toMatchObject({ operation: "launch", outcome: "launched", paneId: "w1:p2" });
+    expect(result.details).toMatchObject({ operation: "launch", outcome: "launched", paneId: "w1:p2", readiness: { baselineRequired: false }, promptSubmitted: false, recipientRegistered: true });
     expect(result.details?.postState).toEqual({ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "working", history: [{}, { child: {} }] });
     expect(JSON.stringify(result)).not.toContain("secret");
   });
 });
 
 describe("herdr_launch profile-only contract", () => {
-  it("waits for delayed identity readiness, then submits exactly once and registers the captured recipient", async () => {
+  it("waits more than five seconds for delayed readiness, then submits exactly once and registers the captured recipient", async () => {
     vi.useFakeTimers();
     try {
       const harness = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
       configureFreshIdentitySamples(harness, [
-        { name: "worker", kind: "pi" },
+        ...Array.from({ length: 52 }, () => ({ name: "worker", kind: "pi" })),
         { name: "worker", kind: "pi", terminalId: "terminal-0", agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } }
       ]);
       const recipients = new RecipientRegistry();
       const pending = launch({ name: "worker", profile: "worker", initialPrompt: "delayed" }, catalog(profile("worker")), harness.cli, undefined, { recipients });
-      await vi.advanceTimersByTimeAsync(100);
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(5_300);
       const result = await pending;
-      expect(result.details).toMatchObject({ initialPromptSent: true, initialPromptSubmission: { confirmed: true, agentSession: { value: "session-0" } }, recipient: { paneId: "w1:p2", agentName: "worker" } });
+      expect(result.details).toMatchObject({
+        initialPromptSent: true,
+        initialPromptSubmission: { confirmed: true, agentSession: { value: "session-0" } },
+        readiness: { budgetBasis: "immediately_before_selected_agent_start", budgetMs: 120_000, baselineRequired: true, samples: 53, elapsedMs: expect.any(Number) },
+        recipient: { paneId: "w1:p2", agentName: "worker" }
+      });
+      expect(result.details?.readiness?.elapsedMs).toBeGreaterThan(5_000);
       expect(harness.stdinInputs).toHaveLength(1);
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
       expect(recipients.get("w1:p2")).toMatchObject({ paneId: "w1:p2", agentName: "worker" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports independent monotonic start/readiness, submission acknowledgement, and post-ack confirmation timing", async () => {
+    const phaseClock = fakeManualClock();
+    const harness = makeCli({ snapshot: { ...snapshot, agents: [{ pane_id: "w1:p9", name: "unrelated" }] } });
+    const base = harness.cli.runJson;
+    let selected = false;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const result = await base(argv, signal, preserve);
+      if (argv[0] === "agent" && argv[1] === "start") {
+        phaseClock.advance(31);
+        selected = true;
+      } else if (selected && argv[0] === "api") {
+        phaseClock.advance(11);
+      } else if (selected && argv[0] === "agent" && argv[1] === "get") {
+        phaseClock.advance(harness.stdinInputs.length === 0 ? 13 : 19);
+      } else if (selected && argv[0] === "pane" && argv[1] === "get") {
+        phaseClock.advance(harness.stdinInputs.length === 0 ? 17 : 29);
+      }
+      return result;
+    });
+    const baseStdin = harness.cli.runJsonWithStdin!;
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+      const result = await baseStdin(argv, input, signal, preserve);
+      phaseClock.advance(23);
+      return result;
+    });
+
+    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "timed" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock });
+    expect(result.details).toMatchObject({
+      readiness: { elapsedMs: 72 },
+      promptConfirmation: { elapsedMs: 48 },
+      timing: { selectedStartReadinessMs: 72, promptSubmissionAckMs: 23, postAckConfirmationMs: 48 }
+    });
+    for (const duration of Object.values(result.details!.timing!)) {
+      expect(Number.isSafeInteger(duration)).toBe(true);
+      expect(duration).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("includes typed acknowledgement parsing and identity validation in submission timing", async () => {
+    const phaseClock = fakeManualClock();
+    const harness = makeCli();
+    const baseStdin = harness.cli.runJsonWithStdin!;
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+      const response = await baseStdin(argv, input, signal, preserve);
+      phaseClock.advance(23);
+      const result = response.result;
+      let parseDelayApplied = false;
+      return {
+        id: response.id,
+        get result() {
+          if (!parseDelayApplied) {
+            parseDelayApplied = true;
+            phaseClock.advance(17);
+          }
+          return result;
+        }
+      };
+    });
+
+    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "timed parse" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock });
+    expect(result.details).toMatchObject({
+      promptSubmitted: true,
+      initialPromptSubmission: { confirmed: true },
+      timing: { promptSubmissionAckMs: 40 }
+    });
+    expect(harness.stdinInputs).toHaveLength(1);
+  });
+
+  it("preserves submitted effect and parse duration when acknowledgement identity validation fails", async () => {
+    const phaseClock = fakeManualClock();
+    const harness = makeCli();
+    const baseStdin = harness.cli.runJsonWithStdin!;
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+      const response = await baseStdin(argv, input, signal, preserve);
+      phaseClock.advance(23);
+      const result = response.result as { type: string; agent: Record<string, unknown> };
+      const mismatched = { ...result, agent: { ...result.agent, terminal_id: "terminal-replacement" } };
+      let parseDelayApplied = false;
+      return {
+        id: response.id,
+        get result() {
+          if (!parseDelayApplied) {
+            parseDelayApplied = true;
+            phaseClock.advance(17);
+          }
+          return mismatched;
+        }
+      };
+    });
+
+    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "timed bad parse" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })
+      .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode: "CLI_PROTOCOL_ERROR",
+        phase: "prompt_verification",
+        agentStarted: true,
+        promptSubmitted: true,
+        recipientRegistered: false,
+        timing: { promptSubmissionAckMs: 40 }
+      }
+    });
+    expect(failure.details).not.toHaveProperty("initialPromptSubmission");
+    expect(harness.stdinInputs).toHaveLength(1);
+  });
+
+  it("preserves all independent monotonic phase durations on post-ack failure", async () => {
+    const phaseClock = fakeManualClock();
+    const replacementAgent = { ...observedAgent("working", 8, 4), terminal_id: "terminal-replacement", agent_session: { ...TEST_SESSION, value: "replacement" } };
+    const replacementPane = { ...observedPane("working", 8, 4), terminal_id: "terminal-replacement", agent_session: { ...TEST_SESSION, value: "replacement" } };
+    const harness = makeCli({
+      start: () => {
+        phaseClock.advance(31);
+        return ok("start", { agent: observedAgent("idle", 7) });
+      },
+      agentStates: [observedAgent("idle", 7), replacementAgent],
+      paneStates: [observedPane("idle", 7), replacementPane]
+    });
+    const base = harness.cli.runJson;
+    let selected = false;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const result = await base(argv, signal, preserve);
+      if (argv[0] === "agent" && argv[1] === "start") selected = true;
+      else if (selected && argv[0] === "api") phaseClock.advance(11);
+      else if (selected && argv[0] === "agent" && argv[1] === "get") phaseClock.advance(harness.stdinInputs.length === 0 ? 13 : 19);
+      else if (selected && argv[0] === "pane" && argv[1] === "get") phaseClock.advance(harness.stdinInputs.length === 0 ? 17 : 29);
+      return result;
+    });
+    const baseStdin = harness.cli.runJsonWithStdin!;
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+      const result = await baseStdin(argv, input, signal, preserve);
+      phaseClock.advance(23);
+      return result;
+    });
+
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "timed failure" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode: "PROMPT_UNCONFIRMED",
+        readiness: { elapsedMs: 72 },
+        promptConfirmation: { elapsedMs: 48 },
+        timing: { selectedStartReadinessMs: 72, promptSubmissionAckMs: 23, postAckConfirmationMs: 48 }
+      }
+    });
+  });
+
+  it.each([
+    ["malformed", { name: "worker", pane_id: "w1:p3", agent: "pi", terminal_id: { deeply: { malformed: true } }, agent_session: [] }],
+    ["contradictory", { name: "replacement", pane_id: "w1:p3", agent: "pi", terminal_id: "terminal-0", agent_session: TEST_SESSION }]
+  ] as const)("records a zero-exit %s start as a selected started effect without fallback or prompt mutation", async (_label, agent) => {
+    const phaseClock = fakeManualClock();
+    const primary = profile("primary", "pi", ["fallback"]);
+    const fallback = profile("fallback");
+    const harness = makeCli({
+      start: () => {
+        phaseClock.advance(37);
+        return ok("start", { agent });
+      }
+    });
+    const failure = await launch({ name: "worker", profile: "primary", placement: { mode: "new_tab", tabLabel: "workers" }, initialPrompt: "must not send" }, catalog(primary, fallback), harness.cli, undefined, { clock: phaseClock.clock })
+      .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        phase: "agent_start",
+        agentStarted: true,
+        promptSubmitted: false,
+        recipientRegistered: false,
+        created: { tabId: "w1:t2", paneId: "w1:p3" },
+        attempts: [{ profile: "primary", outcome: "selected" }],
+        timing: { selectedStartReadinessMs: 37 }
+      }
+    });
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("does not clamp selected-start readiness timing to the configured budget", async () => {
+    const phaseClock = fakeManualClock();
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const result = await base(argv, signal, preserve);
+      if (argv[0] === "agent" && argv[1] === "start") phaseClock.advance(120_123);
+      return result;
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "no readiness budget" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
+      code: "READY_TIMEOUT",
+      details: {
+        causeCode: "READY_TIMEOUT",
+        readiness: { budgetMs: 120_000, elapsedMs: 120_123, samples: 0 },
+        timing: { selectedStartReadinessMs: 120_123 }
+      }
+    });
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("treats missing and null noncontradictory startup metadata as pending only inside readiness", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({ start: () => ok("start", { agent: { name: null, pane_id: null, agent: null, terminal_id: null, agent_session: null } }) });
+      configureFreshIdentitySamples(harness, [
+        { name: null, kind: null, terminalId: null, agentSession: null },
+        { name: "worker", kind: "pi", terminalId: "terminal-0", agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } }
+      ]);
+      const resultPromise = launch({ name: "worker", profile: "worker", initialPrompt: "null then ready" }, catalog(profile("worker")), harness.cli);
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await resultPromise;
+      expect(result.details).toMatchObject({ readiness: { baselineRequired: true, samples: 2, lastPendingReason: expect.stringContaining("identity_incomplete") }, promptSubmitted: true, recipientRegistered: true });
+      expect(harness.stdinInputs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects malformed start-record lifecycle values before readiness", async () => {
+    const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
+    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { phase: "agent_start", causeCode: "TARGET_IDENTITY_UNAVAILABLE", agentStarted: true, promptSubmitted: false }
+    });
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "get")).toHaveLength(0);
+  });
+
+  it("validates but does not use stale start-record lifecycle values as the prompt anchor", async () => {
+    const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("working", 1, 1), screen_detection_skipped: true } }) });
+    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "fresh anchor" }, catalog(profile("worker")), harness.cli);
+    expect(result.details).toMatchObject({
+      readiness: { samples: 1, baselineRequired: true },
+      promptConfirmation: { baseline: { state: "idle", stateChangeSeq: 7, revision: 3 } },
+      promptSubmitted: true,
+      promptConsumption: "confirmed"
+    });
+    expect(result.details?.promptConfirmation?.baseline).not.toHaveProperty("screenDetectionSkipped");
+    expect(harness.stdinInputs).toHaveLength(1);
+  });
+
+  it("resamples same-identity lifecycle skew before submitting the prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({
+        agentStates: [observedAgent("idle", 7), observedAgent("idle", 7), observedAgent("working", 8, 4)],
+        paneStates: [observedPane("working", 8, 4), observedPane("idle", 7), observedPane("working", 8, 4)]
+      });
+      const base = harness.cli.runJson;
+      let apiReads = 0;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        const result = await base(argv, signal, preserve);
+        if (argv[0] !== "api" || apiReads++ !== 1) return result;
+        const value = result.result as { type: string; snapshot: HerdrSnapshot };
+        const skewed = (record: Record<string, unknown>): Record<string, unknown> => ({ ...record, agent_status: "working", state_change_seq: 8, revision: 4 });
+        return {
+          ...result,
+          result: {
+            ...value,
+            snapshot: {
+              ...value.snapshot,
+              panes: value.snapshot.panes.map((pane) => pane.pane_id === "w1:p2" ? skewed(pane) : pane),
+              agents: value.snapshot.agents.map((agent) => agent.pane_id === "w1:p2" ? skewed(agent) : agent)
+            }
+          }
+        };
+      });
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "skew then ready" }, catalog(profile("worker")), harness.cli);
+      await vi.waitFor(() => expect(harness.calls.filter((call) => call[0] === "pane" && call[1] === "get")).toHaveLength(1), { timeout: 1_000, interval: 1 });
+      expect(harness.stdinInputs).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await pending;
+      expect(result.details).toMatchObject({
+        readiness: { samples: 2, lastPendingReason: expect.stringContaining("lifecycle_skew:snapshot_pane:agent_status") },
+        promptSubmitted: true,
+        promptConsumption: "confirmed"
+      });
+      expect(result.details?.readiness?.lastPendingReason).toContain("lifecycle_skew:snapshot_agent:state_change_seq");
+      expect(result.details?.readiness?.lastPendingReason).toContain("lifecycle_skew:pane_get:revision");
+      expect(harness.stdinInputs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not carry terminal or session identity across readiness samples", async () => {
+    vi.useFakeTimers();
+    try {
+      const budget = fakeStartBudgetClock(119_750);
+      const harness = makeCli({
+        start: () => {
+          budget.consumeStartBudget();
+          return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } });
+        }
+      });
+      configureFreshIdentitySamples(harness, [
+        { name: "worker", kind: "pi", terminalId: "terminal-0" },
+        { name: "worker", kind: "pi", agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } }
+      ]);
+      const recipients = new RecipientRegistry();
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "no carry" }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
+      const failure = expect(pending).rejects.toMatchObject({
+        code: "READY_TIMEOUT",
+        details: {
+          causeCode: "READY_TIMEOUT",
+          phase: "ready",
+          readiness: { elapsedMs: 120_000, samples: 3, lastPendingReason: expect.stringContaining("identity_incomplete"), baselineRequired: true }
+        }
+      });
+      await vi.advanceTimersByTimeAsync(300);
+      await failure;
+      expect(harness.stdinInputs).toHaveLength(0);
+      expect(recipients.get("w1:p2")).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }
@@ -301,7 +648,7 @@ describe("herdr_launch profile-only contract", () => {
 
   it("confirms a fast completed turn only from an advanced same-agent state sequence", async () => {
     const harness = makeCli({
-      agentStates: [observedAgent("idle", 7), observedAgent("idle", 8, 4)],
+      agentStates: [{ ...observedAgent("idle", 7), screen_detection_skipped: true }, observedAgent("idle", 8, 4)],
       paneStates: [observedPane("idle", 7), observedPane("idle", 8, 4)]
     });
     const result = await launch({ name: "worker", profile: "worker", initialPrompt: "fast turn" }, catalog(profile("worker")), harness.cli);
@@ -309,26 +656,47 @@ describe("herdr_launch profile-only contract", () => {
       promptSubmitted: true,
       promptConsumption: "confirmed",
       initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8, consumption: "confirmed" },
-      promptConfirmation: { reason: "state_change_seq_advanced", samples: 1, baseline: { stateChangeSeq: 7 }, last: { stateChangeSeq: 8 } }
+      promptConfirmation: { reason: "state_change_seq_advanced", samples: 1, baseline: { stateChangeSeq: 7, screenDetectionSkipped: true }, last: { stateChangeSeq: 8 } }
     });
     expect(harness.stdinInputs).toHaveLength(1);
   });
 
   it.each([
-    ["missing sequence", observedAgent("idle", undefined)],
-    ["working state", observedAgent("working", 7)],
-    ["unknown state", observedAgent("unknown", 7)],
-    ["missing state", observedAgent(undefined, 7)],
-    ["missing revision", (() => { const value = observedAgent("idle", 7); delete value.revision; return value; })()],
-    ["incomplete identity", (() => { const value = observedAgent("idle", 7); delete value.terminal_id; return value; })()]
-  ] as const)("refuses a %s pre-submit agent-get baseline before any prompt bytes", async (_label, agentState) => {
-    const harness = makeCli({ agentStates: [agentState], paneStates: [observedPane("idle", 99, 99)] });
-    const recipients = new RecipientRegistry();
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "no baseline" }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
-      code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "prompt_verification" }
-    });
-    expect(harness.stdinInputs).toHaveLength(0);
-    expect(recipients.get("w1:p2")).toBeUndefined();
+    ["missing sequence", observedAgent("idle", undefined), "agent_get_state_change_seq_missing"],
+    ["working state", observedAgent("working", 7), "agent_get_not_idle:working"],
+    ["unknown state", observedAgent("unknown", 7), "agent_get_not_idle:unknown"],
+    ["missing state", observedAgent(undefined, 7), "agent_get_status_missing"],
+    ["missing revision", (() => { const value = observedAgent("idle", 7); delete value.revision; return value; })(), "agent_get_revision_missing"],
+    ["incomplete identity despite complete other records", (() => { const value = observedAgent("idle", 7); delete value.terminal_id; return value; })(), "agent_get_identity_incomplete"]
+  ] as const)("keeps a %s pending inside readiness without prompt bytes", async (_label, agentState, pendingReason) => {
+    vi.useFakeTimers();
+    try {
+      const budget = fakeStartBudgetClock();
+      const harness = makeCli({
+        start: () => { budget.consumeStartBudget(); return ok("start", { agent: observedAgent("idle", 7) }); },
+        agentStates: [agentState],
+        paneStates: [observedPane("idle", 99, 99)]
+      });
+      const recipients = new RecipientRegistry();
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "no baseline" }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
+      const failure = expect(pending).rejects.toMatchObject({
+        code: "READY_TIMEOUT",
+        details: {
+          causeCode: "READY_TIMEOUT",
+          phase: "ready",
+          agentStarted: true,
+          promptSubmitted: false,
+          recipientRegistered: false,
+          readiness: { budgetMs: 120_000, elapsedMs: 120_000, baselineRequired: true, lastPendingReason: expect.stringContaining(pendingReason) }
+        }
+      });
+      await vi.advanceTimersByTimeAsync(200);
+      await failure;
+      expect(harness.stdinInputs).toHaveLength(0);
+      expect(recipients.get("w1:p2")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each(["idle", "unknown", "working"])("times out bounded semantic confirmation for unchanged %s without retry or recipient registration", async (state) => {
@@ -413,6 +781,24 @@ describe("herdr_launch profile-only contract", () => {
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
 
+  it.each([
+    ["malformed pane result", null, "CLI_PROTOCOL_ERROR"],
+    ["wrong pane result", { pane: { pane_id: "w1:p9" } }, "POSTSTATE_UNAVAILABLE"]
+  ] as const)("fails closed when post-ack confirmation reads a %s", async (_label, result, sourceCode) => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let paneReads = 0;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "pane" && argv[1] === "get" && paneReads++ === 1) return ok("pane-post", result);
+      return base(argv, signal, preserve);
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "bad pane" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "PROMPT_UNCONFIRMED", phase: "prompt_verification", promptSubmitted: true, promptConfirmation: { reason: "read_failed", sourceCode } }
+    });
+    expect(harness.stdinInputs).toHaveLength(1);
+  });
+
   it("fails closed immediately when the acknowledged target is replaced", async () => {
     const replacementAgent = { ...observedAgent("working", 8, 4), terminal_id: "terminal-replacement", agent_session: { ...TEST_SESSION, value: "replacement" } };
     const replacementPane = { ...observedPane("working", 8, 4), terminal_id: "terminal-replacement", agent_session: { ...TEST_SESSION, value: "replacement" } };
@@ -444,7 +830,7 @@ describe("herdr_launch profile-only contract", () => {
     expect(harness.stdinInputs).toHaveLength(1);
   });
 
-  it("aborts the read-only identity preflight before any prompt bytes or recipient registration", async () => {
+  it("aborts read-only readiness with partial-effect evidence before prompt bytes or recipient registration", async () => {
     vi.useFakeTimers();
     try {
       const controller = new AbortController();
@@ -455,7 +841,18 @@ describe("herdr_launch profile-only contract", () => {
       const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "abort" }, controller.signal, undefined, extensionContext);
       await vi.waitFor(() => expect(harness.calls).toContainEqual(["pane", "get", "w1:p2"]), { timeout: 1_000, interval: 1 });
       controller.abort();
-      await expect(pending).rejects.toMatchObject({ code: "ABORTED", details: { causeCode: "ABORTED" } });
+      await expect(pending).rejects.toMatchObject({
+        code: "ABORTED",
+        details: {
+          causeCode: "ABORTED",
+          phase: "ready",
+          agentStarted: true,
+          promptSubmitted: false,
+          recipientRegistered: false,
+          readiness: { budgetBasis: "immediately_before_selected_agent_start", baselineRequired: true, samples: 1, records: expect.any(Array) },
+          created: { paneId: "w1:p2", tabId: "w1:t1" }
+        }
+      });
       expect(harness.stdinInputs).toHaveLength(0);
       expect(recipients.get("w1:p2")).toBeUndefined();
     } finally {
@@ -463,7 +860,70 @@ describe("herdr_launch profile-only contract", () => {
     }
   });
 
-  it("bounds a slow successful read to the whole five-second window and cleans up", async () => {
+  it("does not focus, fall back, or register a recipient when readiness times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const budget = fakeStartBudgetClock();
+      const primary = profile("primary", "pi", ["fallback"]);
+      const fallback = profile("fallback");
+      const harness = makeCli({
+        snapshot,
+        start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi" } })
+      });
+      const base = harness.cli.runJson;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (argv[0] === "agent" && argv[1] === "start") budget.consumeStartBudget();
+        if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: null });
+        return base(argv, signal, preserve);
+      });
+      const recipients = new RecipientRegistry();
+      const pending = launch({ name: "worker", profile: "primary", placement: { mode: "existing_pane", target: "caller" }, focus: true, initialPrompt: "do not mutate" }, catalog(primary, fallback), harness.cli, undefined, { recipients, clock: budget.clock });
+      const failure = expect(pending).rejects.toMatchObject({
+        code: "READY_TIMEOUT",
+        details: { causeCode: "READY_TIMEOUT", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { baselineRequired: true } }
+      });
+      await vi.advanceTimersByTimeAsync(200);
+      await failure;
+      expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+      expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "focus")).toBe(false);
+      expect(harness.stdinInputs).toHaveLength(0);
+      expect(recipients.get("w1:p1")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the first deadline reason when caller abort follows the readiness deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const budget = fakeStartBudgetClock();
+      const harness = makeCli();
+      const base = harness.cli.runJson;
+      let abortScheduled = false;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (argv[0] === "agent" && argv[1] === "start") budget.consumeStartBudget();
+        if (argv[0] === "agent" && argv[1] === "get") {
+          abortScheduled = true;
+          return ok("agent-missing", { agent: null });
+        }
+        return base(argv, signal, preserve);
+      });
+      const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), clock: budget.clock });
+      const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "race" }, controller.signal, undefined, extensionContext);
+      const failure = expect(pending).rejects.toMatchObject({ code: "READY_TIMEOUT", details: { causeCode: "READY_TIMEOUT", readiness: { elapsedMs: expect.any(Number) } } });
+      await vi.waitFor(() => expect(abortScheduled).toBe(true), { timeout: 1_000, interval: 1 });
+      budget.advance(100);
+      await vi.advanceTimersByTimeAsync(100);
+      controller.abort();
+      await failure;
+      expect(harness.stdinInputs).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts a slow successful readiness read beyond five seconds and cleans up", async () => {
     vi.useFakeTimers();
     try {
       const harness = makeCli();
@@ -478,7 +938,7 @@ describe("herdr_launch profile-only contract", () => {
       const recipients = new RecipientRegistry();
       const pending = launch({ name: "worker", profile: "worker", initialPrompt: "slow but valid" }, catalog(profile("worker")), harness.cli, undefined, { recipients });
       await vi.waitFor(() => expect(apiReads).toBe(2), { timeout: 1_000, interval: 1 });
-      await vi.advanceTimersByTimeAsync(4_800);
+      await vi.advanceTimersByTimeAsync(5_500);
       releaseFresh(await base(["api", "snapshot"], new AbortController().signal));
       const result = await pending;
       expect(result.details).toMatchObject({ initialPromptSent: true, recipient: { paneId: "w1:p2" } });
@@ -490,37 +950,84 @@ describe("herdr_launch profile-only contract", () => {
     }
   });
 
-  it("times out an in-flight identity read without dispatch, registration, or leaked timers", async () => {
+  it("uses the selected start attempt's absolute deadline without resetting it for an in-flight readiness read", async () => {
     vi.useFakeTimers();
     try {
+      const budget = fakeStartBudgetClock();
       const harness = makeCli();
       const base = harness.cli.runJson;
       let apiReads = 0;
       let releaseFresh!: (value: Awaited<ReturnType<LaunchCli["runJson"]>>) => void;
       const delayedFresh = new Promise<Awaited<ReturnType<LaunchCli["runJson"]>>>((resolve) => { releaseFresh = resolve; });
       harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (argv[0] === "agent" && argv[1] === "start") budget.consumeStartBudget();
         if (argv[0] === "api" && apiReads++ === 1) return delayedFresh;
         return base(argv, signal, preserve);
       });
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "must not dispatch" }, catalog(profile("worker")), harness.cli, undefined, { recipients });
-      const expectation = expect(pending).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", identityPreflight: { timeoutMs: 5_000 } } });
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "must not dispatch" }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
+      const expectation = expect(pending).rejects.toMatchObject({
+        code: "READY_TIMEOUT",
+        details: {
+          causeCode: "READY_TIMEOUT",
+          phase: "ready",
+          agentStarted: true,
+          promptSubmitted: false,
+          recipientRegistered: false,
+          readiness: { budgetMs: 120_000, elapsedMs: 120_000, samples: 1, baselineRequired: true, records: expect.any(Array) }
+        }
+      });
       await vi.waitFor(() => expect(apiReads).toBe(2), { timeout: 1_000, interval: 1 });
-      await vi.advanceTimersByTimeAsync(4_000);
-      vi.setSystemTime(Date.now() + 2_000);
-      releaseFresh(await base(["api", "snapshot"], new AbortController().signal));
+      await vi.advanceTimersByTimeAsync(100);
       await expectation;
       expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
       expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
       expect(recipients.get("w1:p2")).toBeUndefined();
       expect(vi.getTimerCount()).toBe(0);
+      releaseFresh(await base(["api", "snapshot"], new AbortController().signal));
       await Promise.resolve();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("rejects when the caller is already aborted at the identity-preflight boundary", async () => {
+  it("fails with zero samples when agent start consumes the entire absolute readiness budget", async () => {
+    const budget = fakeStartBudgetClock(120_000);
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "start") budget.consumeStartBudget();
+      return base(argv, signal, preserve);
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "no budget" }, catalog(profile("worker")), harness.cli, undefined, { clock: budget.clock })).rejects.toMatchObject({
+      code: "READY_TIMEOUT",
+      details: { causeCode: "READY_TIMEOUT", phase: "ready", agentStarted: true, promptSubmitted: false, readiness: { elapsedMs: 120_000, samples: 0, lastPendingReason: "readiness_budget_exhausted_before_sample" } }
+    });
+    expect(harness.calls.filter((call) => call[0] === "api")).toHaveLength(1);
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("rejects a sample that resolves only after the monotonic absolute deadline", async () => {
+    const budget = fakeStartBudgetClock();
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let apiReads = 0;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "start") budget.consumeStartBudget();
+      const result = await base(argv, signal, preserve);
+      if (argv[0] === "api" && apiReads++ === 1) budget.advance(100);
+      return result;
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "late sample" }, catalog(profile("worker")), harness.cli, undefined, { clock: budget.clock })).rejects.toMatchObject({
+      code: "READY_TIMEOUT",
+      details: { causeCode: "READY_TIMEOUT", phase: "ready", readiness: { elapsedMs: 120_000, samples: 1, baselineRequired: true } }
+    });
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "get")).toHaveLength(0);
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("preserves a successful start when the caller is already aborted at readiness", async () => {
     const controller = new AbortController();
     const harness = makeCli();
     const base = harness.cli.runJson;
@@ -531,12 +1038,15 @@ describe("herdr_launch profile-only contract", () => {
     });
     const recipients = new RecipientRegistry();
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
-    await expect(tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "must not dispatch" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED", details: { causeCode: "ABORTED" } });
+    await expect(tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "must not dispatch" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({
+      code: "ABORTED",
+      details: { causeCode: "ABORTED", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 0, baselineRequired: true } }
+    });
     expect(harness.stdinInputs).toHaveLength(0);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
 
-  it("distinguishes caller abort during an in-flight identity read and cleans up", async () => {
+  it("distinguishes caller abort during an in-flight readiness read and cleans up", async () => {
     vi.useFakeTimers();
     try {
       const controller = new AbortController();
@@ -552,7 +1062,10 @@ describe("herdr_launch profile-only contract", () => {
       const recipients = new RecipientRegistry();
       const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
       const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "caller abort" }, controller.signal, undefined, extensionContext);
-      const expectation = expect(pending).rejects.toMatchObject({ code: "ABORTED", details: { causeCode: "ABORTED" } });
+      const expectation = expect(pending).rejects.toMatchObject({
+        code: "ABORTED",
+        details: { causeCode: "ABORTED", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 1, baselineRequired: true, records: expect.any(Array) } }
+      });
       await vi.waitFor(() => expect(apiReads).toBe(2), { timeout: 1_000, interval: 1 });
       await vi.advanceTimersByTimeAsync(1_000);
       controller.abort();
@@ -566,6 +1079,381 @@ describe("herdr_launch profile-only contract", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it.each([
+    ["malformed agent-get result", "agent", null, "CLI_PROTOCOL_ERROR"],
+    ["malformed agent-get record", "agent", { agent: "invalid" }, "TARGET_IDENTITY_UNAVAILABLE"],
+    ["malformed pane-get result", "pane", null, "CLI_PROTOCOL_ERROR"],
+    ["malformed pane-get record", "pane", { pane: "invalid" }, "TARGET_IDENTITY_UNAVAILABLE"]
+  ] as const)("rejects a %s after only one ordered readiness sample", async (_label, source, result, causeCode) => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (source === "agent" && argv[0] === "agent" && argv[1] === "get") return ok("agent-malformed", result);
+      if (source === "pane" && argv[0] === "pane" && argv[1] === "get") return ok("pane-malformed", result);
+      return base(argv, signal, preserve);
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "malformed record" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode, phase: "ready", readiness: { samples: 1, baselineRequired: true } }
+    });
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it.each([
+    ["coded snapshot protocol error", Object.assign(new Error("snapshot protocol"), { code: "CLI_PROTOCOL_ERROR" })],
+    ["bounded CLI snapshot failure", new CliProtocolError("CLI_PROTOCOL_ERROR", "snapshot CLI", { exitCode: 1, killed: false, stdoutBytes: 0, stderrBytes: 12 })],
+    ["uncoded snapshot error", new Error("snapshot read")],
+    ["non-error snapshot failure", "snapshot string failure"]
+  ] as const)("retains partial effects for a %s", async (_label, readFailure) => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let apiReads = 0;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "api" && apiReads++ === 1) throw readFailure;
+      return base(argv, signal, preserve);
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "read failure" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "CLI_PROTOCOL_ERROR", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 1, records: [] } }
+    });
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("preserves bounded CliProtocolError evidence through readiness and final launch wrapping", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let apiReads = 0;
+    const stderr = "e".repeat(4_000);
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "api" && apiReads++ === 1) {
+        throw new CliProtocolError("CLI_PROTOCOL_ERROR", "snapshot protocol failure", {
+          exitCode: 7,
+          killed: false,
+          stdoutBytes: 0,
+          stderrBytes: stderr.length,
+          stderr,
+          stderrTruncated: false,
+          arbitrary: { nested: "must-not-survive" }
+        });
+      }
+      return base(argv, signal, preserve);
+    });
+    const failure = await (launch({ name: "worker", profile: "worker", initialPrompt: "read failure" }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as { code: string; details: Record<string, unknown> }) as unknown as Promise<{ code: string; details: Record<string, unknown> }>);
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode: "CLI_PROTOCOL_ERROR",
+        phase: "ready",
+        cliFailure: {
+          code: "CLI_PROTOCOL_ERROR",
+          message: "snapshot protocol failure",
+          details: { exitCode: 7, killed: false, stdoutBytes: 0, stderrBytes: 4_000, stderrTruncated: false }
+        },
+        readiness: { samples: 1, records: [] }
+      }
+    });
+    const cliFailure = failure.details.cliFailure as { details: Record<string, unknown> };
+    expect(typeof cliFailure.details.stderr).toBe("string");
+    expect((cliFailure.details.stderr as string).length).toBeLessThanOrEqual(256);
+    expect(cliFailure.details.stderr).not.toBe(stderr);
+    expect(Object.keys(cliFailure.details).sort()).toEqual(["exitCode", "killed", "stderr", "stderrBytes", "stderrTruncated", "stdoutBytes"].sort());
+    expect(JSON.stringify(failure.details)).not.toContain("must-not-survive");
+  });
+
+  it("retains current agent evidence when pane-get fails before readiness evaluation", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const result = await base(argv, signal, preserve);
+      if (argv[0] === "agent" && argv[1] === "get") {
+        const agent = (result.result as { agent: Record<string, unknown> }).agent;
+        return { ...result, result: { agent: { ...agent, agent_status: { nested: ["must-not-be-evaluated"] } } } };
+      }
+      if (argv[0] === "pane" && argv[1] === "get") {
+        throw new CliProtocolError("CLI_PROTOCOL_ERROR", "pane read failed", { exitCode: 9, killed: false, stderr: "pane failure" });
+      }
+      return result;
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "pane failure" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode: "CLI_PROTOCOL_ERROR",
+        phase: "ready",
+        cliFailure: { code: "CLI_PROTOCOL_ERROR", message: "pane read failed", details: { exitCode: 9, killed: false, stderr: "pane failure" } },
+        readiness: {
+          samples: 1,
+          records: expect.arrayContaining([expect.objectContaining({ source: "agent_get", pane_id: "w1:p2", agent_status: "[malformed]" })])
+        }
+      }
+    });
+    expect(harness.calls.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it.each([
+    ["CLI timeout", "CLI_TIMEOUT", "CLI_TIMEOUT"],
+    ["spurious transport readiness code", "READY_TIMEOUT", "CLI_PROTOCOL_ERROR"]
+  ] as const)("does not promote a readiness-read %s into READY_TIMEOUT", async (_label, sourceCode, causeCode) => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let apiReads = 0;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "api" && apiReads++ === 1) throw Object.assign(new Error(sourceCode), { code: sourceCode });
+      return base(argv, signal, preserve);
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "read timeout" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode,
+        phase: "ready",
+        promptSubmitted: false,
+        readiness: { samples: 1, records: [] },
+        ...(sourceCode === "READY_TIMEOUT" ? { sourceCode: "READY_TIMEOUT" } : {})
+      }
+    });
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("clears prior-sample records before a later readiness read failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const incomplete = observedAgent(undefined, 7);
+      const harness = makeCli({ agentStates: [incomplete], paneStates: [observedPane("idle", 7)] });
+      const base = harness.cli.runJson;
+      let apiReads = 0;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (argv[0] === "api" && apiReads++ === 2) throw Object.assign(new Error("later sample failed"), { code: "CLI_PROTOCOL_ERROR" });
+        return base(argv, signal, preserve);
+      });
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "read failure after pending" }, catalog(profile("worker")), harness.cli);
+      const failure = expect(pending).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: { causeCode: "CLI_PROTOCOL_ERROR", phase: "ready", readiness: { samples: 2, records: [] } }
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      await failure;
+      expect(harness.stdinInputs).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("projects deeply malformed readiness fields without recursive retention or serialization overflow", async () => {
+    const deep: Record<string, unknown> = {};
+    let cursor = deep;
+    for (let index = 0; index < 20_000; index += 1) {
+      const next: Record<string, unknown> = {};
+      cursor.next = next;
+      cursor = next;
+    }
+    cursor.secretLeaf = "must-not-survive";
+    const harness = makeCli({ agentStates: [{ ...observedAgent("idle", 7), terminal_id: deep }], paneStates: [observedPane("idle", 7)] });
+    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "deep malformed" }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode: "TARGET_IDENTITY_UNAVAILABLE",
+        readiness: { records: expect.arrayContaining([expect.objectContaining({ source: "agent_get", terminal_id: "[malformed]" })]) }
+      }
+    });
+    const serialized = JSON.stringify(failure.details);
+    expect(serialized.length).toBeLessThan(5_000);
+    expect(serialized).not.toContain("must-not-survive");
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("retains only fixed readiness fields and markers from huge malformed records", async () => {
+    const hugeArray = Array.from({ length: 20_000 }, (_, index) => ({ index, secret: "must-not-survive" }));
+    const session = { source: hugeArray, agent: "pi", kind: null, value: { hugeArray }, ignored: hugeArray };
+    Object.defineProperty(session, "__proto__", { value: hugeArray, enumerable: true });
+    Object.defineProperties(session, {
+      constructor: { value: hugeArray, enumerable: true },
+      prototype: { value: hugeArray, enumerable: true }
+    });
+    const inheritedSession = Object.create({ source: "inherited", agent: "pi", kind: "id", value: "must-not-survive" }) as Record<string, unknown>;
+    const malformed: Record<string, unknown> = {
+      ...observedAgent("idle", 7),
+      terminal_id: "t".repeat(20_000),
+      agent_status: hugeArray,
+      revision: { hugeArray },
+      interactive_ready: Number.POSITIVE_INFINITY,
+      agent_session: session,
+      unrelated: hugeArray
+    };
+    Object.defineProperty(malformed, "__proto__", { value: hugeArray, enumerable: true });
+    Object.defineProperties(malformed, {
+      constructor: { value: hugeArray, enumerable: true },
+      prototype: { value: hugeArray, enumerable: true }
+    });
+    const harness = makeCli({ agentStates: [malformed], paneStates: [{ ...observedPane("idle", 7), agent_session: inheritedSession }] });
+    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "huge malformed" }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
+    const readiness = failure.details.readiness as { records: Record<string, unknown>[] };
+    const projected = readiness.records.find((candidate) => candidate.source === "agent_get")!;
+    const projectedSession = projected.agent_session as Record<string, unknown>;
+    const projectedPaneSession = readiness.records.find((candidate) => candidate.source === "pane_get")!.agent_session;
+    const serialized = JSON.stringify(failure.details);
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        readiness: {
+          records: expect.arrayContaining([expect.objectContaining({
+            source: "agent_get",
+            terminal_id: "t".repeat(256),
+            agent_status: "[malformed]",
+            revision: "[malformed]",
+            interactive_ready: "[malformed]",
+            agent_session: { source: "[malformed]", agent: "pi", kind: "[malformed]", value: "[malformed]" }
+          })])
+        }
+      }
+    });
+    expect(Object.keys(projected).sort()).toEqual(["agent", "agent_session", "agent_status", "interactive_ready", "name", "pane_id", "revision", "source", "state_change_seq", "terminal_id"].sort());
+    expect(Object.keys(projectedSession).sort()).toEqual(["agent", "kind", "source", "value"]);
+    expect(projectedPaneSession).toEqual({ source: "[missing]", agent: "[missing]", kind: "[missing]", value: "[missing]" });
+    for (const dangerous of ["__proto__", "constructor", "prototype", "unrelated", "ignored"]) {
+      expect(Object.prototype.hasOwnProperty.call(projected, dangerous)).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(projectedSession, dangerous)).toBe(false);
+      expect(serialized).not.toContain(`"${dangerous}"`);
+    }
+    expect(serialized.length).toBeLessThan(5_000);
+    expect(serialized).not.toContain("must-not-survive");
+  });
+
+  it("bounds duplicate-target readiness evidence without expanding every untrusted snapshot record", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let apiReads = 0;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const result = await base(argv, signal, preserve);
+      if (argv[0] !== "api" || apiReads++ === 0) return result;
+      const value = result.result as { type: string; snapshot: HerdrSnapshot };
+      const duplicate = value.snapshot.agents.find((agent) => agent.pane_id === "w1:p2")!;
+      const agents = Array.from({ length: 10_000 }, () => ({ ...duplicate }));
+      return { ...result, result: { ...value, snapshot: { ...value.snapshot, agents } } };
+    });
+    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "duplicates" }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode: "TARGET_IDENTITY_UNAVAILABLE",
+        readiness: { samples: 1, records: expect.any(Array) }
+      }
+    });
+    const records = (failure.details.readiness as { records: unknown[] }).records;
+    expect(records).toHaveLength(4);
+    expect(JSON.stringify(failure.details).length).toBeLessThan(5_000);
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("rejects malformed readiness metadata after one complete ordered sample", async () => {
+    const malformed = { ...observedAgent("idle", 7), terminal_id: 42 };
+    const harness = makeCli({ agentStates: [malformed], paneStates: [observedPane("idle", 7)] });
+    const recipients = new RecipientRegistry();
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "malformed" }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 1, baselineRequired: true } }
+    });
+    const readinessReads = harness.calls.filter((call) => call[0] === "api" || (call[0] === "agent" && call[1] === "get") || (call[0] === "pane" && call[1] === "get"));
+    expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    expect(harness.stdinInputs).toHaveLength(0);
+    expect(recipients.get("w1:p2")).toBeUndefined();
+  });
+
+  it.each([
+    ["pane ID", { ...observedAgent("idle", 7), pane_id: 42 }],
+    ["agent status", { ...observedAgent("idle", 7), agent_status: "starting" }],
+    ["state sequence", { ...observedAgent("idle", 7), state_change_seq: -1 }],
+    ["revision", { ...observedAgent("idle", 7), revision: -1 }],
+    ["screen detection diagnostic", { ...observedAgent("idle", 7), screen_detection_skipped: "yes" }]
+  ] as const)("rejects malformed non-null readiness %s", async (_label, malformed) => {
+    const harness = makeCli({ agentStates: [malformed], paneStates: [observedPane("idle", 7)] });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "malformed metadata" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1, baselineRequired: true } }
+    });
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it.each([
+    ["agent status", { agent_status: [] }],
+    ["state sequence", { state_change_seq: "7" }],
+    ["revision", { revision: -1 }],
+    ["screen detection diagnostic", { screen_detection_skipped: "yes" }]
+  ] as const)("rejects malformed no-prompt %s lifecycle evidence", async (_label, patch) => {
+    const harness = makeCli({ agentStates: [{ ...observedAgent("idle", 7), ...patch }], paneStates: [observedPane("idle", 7)] });
+    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", promptSubmitted: false, readiness: { samples: 1, baselineRequired: false } }
+    });
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it.each(["agent pane ID", "pane record"] as const)("keeps a missing %s pending in one sample, then uses only the next complete sample", async (missing) => {
+    vi.useFakeTimers();
+    try {
+      const firstAgent = observedAgent("idle", 7);
+      delete firstAgent.pane_id;
+      const harness = makeCli({
+        agentStates: missing === "agent pane ID" ? [firstAgent, observedAgent("idle", 7), observedAgent("working", 8, 4)] : [observedAgent("idle", 7), observedAgent("idle", 7), observedAgent("working", 8, 4)]
+      });
+      if (missing === "pane record") {
+        const base = harness.cli.runJson;
+        let paneReads = 0;
+        harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+          if (argv[0] === "pane" && argv[1] === "get" && paneReads++ === 0) return ok("pane-missing", { pane: null });
+          return base(argv, signal, preserve);
+        });
+      }
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "pending sample" }, catalog(profile("worker")), harness.cli);
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await pending;
+      expect(result.details).toMatchObject({ readiness: { samples: 2, lastPendingReason: expect.any(String), baselineRequired: true }, promptSubmitted: true, promptConsumption: "confirmed" });
+      expect(harness.stdinInputs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["kind/session contradiction", "requested kind replacement"] as const)("rejects a coherent-sample %s", async (variant) => {
+    const session = { source: "herdr:claude", agent: "claude", kind: "id", value: "session-claude" };
+    const harness = makeCli({
+      start: () => variant === "kind/session contradiction"
+        ? ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } })
+        : ok("start", { agent: { name: null, pane_id: null, agent: null, terminal_id: null, agent_session: null } })
+    });
+    configureFreshIdentitySamples(harness, [{ name: "worker", kind: variant === "kind/session contradiction" ? undefined : "claude", terminalId: "terminal-0", agentSession: session }]);
+    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "TARGET_IDENTITY_CHANGED", phase: "ready", readiness: { samples: 1, baselineRequired: false } }
+    });
+    expect(harness.stdinInputs).toHaveLength(0);
+  });
+
+  it("rejects duplicate target records without polling or submitting", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let apiReads = 0;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const result = await base(argv, signal, preserve);
+      if (argv[0] !== "api" || apiReads++ === 0) return result;
+      const value = result.result as { type: string; snapshot: HerdrSnapshot };
+      const duplicate = value.snapshot.agents.find((agent) => agent.pane_id === "w1:p2")!;
+      return { ...result, result: { ...value, snapshot: { ...value.snapshot, agents: [...value.snapshot.agents, { ...duplicate }] } } };
+    });
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "duplicate" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1, records: expect.any(Array) } }
+    });
+    const readinessReads = harness.calls.filter((call) => call[0] === "api" || (call[0] === "agent" && call[1] === "get") || (call[0] === "pane" && call[1] === "get"));
+    expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
   });
 
   it("rejects a replacement identity within one coherent sample without waiting or submitting", async () => {
@@ -777,7 +1665,7 @@ describe("herdr_launch profile-only contract", () => {
     {
       const harness = makeCli({
         agentStates: [observedAgent("idle", 7), observedAgent("idle", 8, 4)],
-        paneStates: [observedPane("working", 700), observedPane("working", 900, 4)]
+        paneStates: [observedPane("idle", 7), observedPane("working", 900, 4)]
       });
       const result = await launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli);
       expect(result.details).toMatchObject({ initialPromptSent: true, promptSubmitted: true, promptConsumption: "confirmed", initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: "w1:p2", interactiveReady: true, revision: 3, screenDetectionSkipped: true }, initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8, revision: 4, screenDetectionSkipped: true, consumption: "confirmed" } });
@@ -785,14 +1673,23 @@ describe("herdr_launch profile-only contract", () => {
       expect(harness.calls.some((call) => call[1] === "send-keys" || call[1] === "wait")).toBe(false);
       expect(harness.stdinInputs).toHaveLength(1);
 
-      const registrationLag = makeCli({ omitFreshAgentSession: true });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "registration lag" }, catalog(worker), registrationLag.cli)).rejects.toMatchObject({
-        code: "LAUNCH_FAILED",
-        details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "prompt_verification" }
-      });
-      expect(registrationLag.stdinInputs).toHaveLength(0);
-
       vi.useFakeTimers();
+      const registrationBudget = fakeStartBudgetClock();
+      const registrationLag = makeCli({
+        omitFreshAgentSession: true,
+        start: () => {
+          registrationBudget.consumeStartBudget();
+          return ok("start", { agent: observedAgent("idle", 7) });
+        }
+      });
+      const registrationPending = launch({ name: "worker", profile: "worker", initialPrompt: "registration lag" }, catalog(worker), registrationLag.cli, undefined, { clock: registrationBudget.clock });
+      const registrationFailure = expect(registrationPending).rejects.toMatchObject({
+        code: "READY_TIMEOUT",
+        details: { causeCode: "READY_TIMEOUT", phase: "ready", readiness: { lastPendingReason: expect.stringContaining("agent_get_identity_incomplete") } }
+      });
+      await vi.advanceTimersByTimeAsync(200);
+      await registrationFailure;
+      expect(registrationLag.stdinInputs).toHaveLength(0);
       const missingIdentity = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
       const missingBase = missingIdentity.cli.runJson;
       missingIdentity.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
@@ -805,21 +1702,23 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get") return ok("pane-get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_session: { source: 1, agent: null, kind: {}, value: undefined }, agent_status: "idle" } });
         return missingBase(argv, signal, preserve);
       });
-      const missingIdentityPending = launch({ name: "worker", profile: "worker", initialPrompt: "missing fresh agent record" }, catalog(worker), missingIdentity.cli);
-      const missingIdentityExpectation = expect(missingIdentityPending).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", identityPreflight: { samples: expect.any(Number) } } });
-      await vi.advanceTimersByTimeAsync(5_100);
-      await missingIdentityExpectation;
+      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "malformed fresh agent record" }, catalog(worker), missingIdentity.cli)).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1 } }
+      });
       expect(missingIdentity.stdinInputs).toHaveLength(0);
 
+      const missingAgentBudget = fakeStartBudgetClock();
       const missingAgentRecord = makeCli();
       const missingAgentBase = missingAgentRecord.cli.runJson;
       missingAgentRecord.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (argv[0] === "agent" && argv[1] === "start") missingAgentBudget.consumeStartBudget();
         if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: null });
         return missingAgentBase(argv, signal, preserve);
       });
-      const missingAgentPending = launch({ name: "worker", profile: "worker", initialPrompt: "missing agent record" }, catalog(worker), missingAgentRecord.cli);
-      const missingAgentExpectation = expect(missingAgentPending).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", identityPreflight: { samples: expect.any(Number) } } });
-      await vi.advanceTimersByTimeAsync(5_100);
+      const missingAgentPending = launch({ name: "worker", profile: "worker", initialPrompt: "missing agent record" }, catalog(worker), missingAgentRecord.cli, undefined, { clock: missingAgentBudget.clock });
+      const missingAgentExpectation = expect(missingAgentPending).rejects.toMatchObject({ code: "READY_TIMEOUT", details: { causeCode: "READY_TIMEOUT", readiness: { lastPendingReason: expect.stringContaining("agent_get_record_missing") } } });
+      await vi.advanceTimersByTimeAsync(200);
       await missingAgentExpectation;
       expect(missingAgentRecord.stdinInputs).toHaveLength(0);
 
@@ -953,9 +1852,17 @@ describe("herdr_launch profile-only contract", () => {
     }
 
     {
+      const phaseClock = fakeManualClock();
       const harness = makeCli();
-      harness.cli.runJsonWithStdin = vi.fn(async (_argv, input) => { harness.stdinInputs.push(input); throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery" }); });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
+      harness.cli.runJsonWithStdin = vi.fn(async (_argv, input) => {
+        harness.stdinInputs.push(input);
+        phaseClock.advance(29);
+        throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery" });
+      });
+      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: { causeCode: "CLI_PROTOCOL_ERROR", promptSubmitted: false, timing: { promptSubmissionAckMs: 29 } }
+      });
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "send-keys")).toHaveLength(0);
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "wait")).toHaveLength(0);
       expect(harness.stdinInputs).toHaveLength(1);
@@ -981,7 +1888,7 @@ describe("herdr_launch profile-only contract", () => {
     const mismatchPane = makeCli();
     const mismatchBase = mismatchPane.cli.runJson;
     mismatchPane.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? ok("get", { pane: { pane_id: "wrong" } }) : mismatchBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), mismatchPane.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), mismatchPane.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED", phase: "ready" } });
 
     for (const placement of [null, {}, { tab: {} }, { tab: { tab_id: "" } }]) {
       const tabHarness = makeCli();
@@ -1067,21 +1974,26 @@ describe("herdr_launch profile-only contract", () => {
     });
     await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focused.cli)).resolves.toMatchObject({ details: { paneId: "w1:p1" } });
     expect(focused.calls).toContainEqual(["agent", "focus", "w1:p1"]);
-    for (const focusError of ["CLI_TIMEOUT", "READY_TIMEOUT"]) {
-      const focusFailure = makeCli();
-      const focusBase = focusFailure.cli.runJson;
-      focusFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-        if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", terminal_id: "terminal-focus-failure", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-focus-failure" } } });
-        if (argv[0] === "agent" && argv[1] === "focus") throw Object.assign(new Error(focusError), { code: focusError });
-        if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "idle" } });
-        return focusBase(argv, signal, preserve);
-      });
-      await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focusFailure.cli)).rejects.toMatchObject({ code: "READY_TIMEOUT" });
-    }
+    const focusFailure = makeCli();
+    const focusBase = focusFailure.cli.runJson;
+    let focusStarted = false;
+    const focusIdentity = { terminal_id: "terminal-focus-failure", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-focus-failure" } };
+    focusFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "api" && focusStarted) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, agent_name: "worker", agent: "pi", ...focusIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...focusIdentity }] } });
+      if (argv[0] === "agent" && argv[1] === "start") { focusStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusIdentity } }); }
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusIdentity } });
+      if (argv[0] === "agent" && argv[1] === "focus") throw Object.assign(new Error("focus timeout"), { code: "CLI_TIMEOUT" });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...focusIdentity, agent_status: "idle" } });
+      return focusBase(argv, signal, preserve);
+    });
+    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focusFailure.cli)).rejects.toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { phase: "focus", causeCode: "CLI_TIMEOUT", readiness: { baselineRequired: false } }
+    });
 
     const idlePrompt = makeCli({
       agentStates: [observedAgent("idle", 7), observedAgent("idle", 8, 4)],
-      paneStates: [observedPane("working", 700), observedPane("working", 900, 4)]
+      paneStates: [observedPane("idle", 7), observedPane("working", 900, 4)]
     });
     await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), idlePrompt.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, promptConsumption: "confirmed", initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8 } } });
 
@@ -1091,16 +2003,17 @@ describe("herdr_launch profile-only contract", () => {
     await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), genericPostState.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
 
     vi.useFakeTimers();
+    const noNameBudget = fakeStartBudgetClock();
     const noName = makeCli();
     const noNameBase = noName.cli.runJson;
     noName.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-      if (argv[0] === "agent" && argv[1] === "start") return ok("start", { agent: { agent_id: "agent-only" } });
+      if (argv[0] === "agent" && argv[1] === "start") { noNameBudget.consumeStartBudget(); return ok("start", { agent: { agent_id: "agent-only" } }); }
       if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "idle" } });
       return noNameBase(argv, signal, preserve);
     });
-    const noNamePending = launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), noName.cli);
-    const noNameExpectation = expect(noNamePending).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", identityPreflight: { samples: expect.any(Number) } } });
-    await vi.advanceTimersByTimeAsync(5_100);
+    const noNamePending = launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), noName.cli, undefined, { clock: noNameBudget.clock });
+    const noNameExpectation = expect(noNamePending).rejects.toMatchObject({ code: "READY_TIMEOUT", details: { causeCode: "READY_TIMEOUT", readiness: { samples: expect.any(Number), baselineRequired: false } } });
+    await vi.advanceTimersByTimeAsync(200);
     await noNameExpectation;
     vi.useRealTimers();
 
@@ -1248,6 +2161,43 @@ describe("herdr_launch profile-only contract", () => {
     expect(chainCalls).toHaveLength(0);
   });
 
+  it("retains grant and attachment evidence when readiness times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const budget = fakeStartBudgetClock();
+      const released: string[] = [];
+      const grant = { path: GRANT_PATH, token: "grant-recipient", renew: async () => { released.push("renew"); }, release: async () => { released.push("release"); } };
+      const attachments = fakeAttachments({ ensureRecipient: vi.fn(async () => grant) });
+      const harness = makeCli();
+      const base = harness.cli.runJson;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (argv[0] === "agent" && argv[1] === "start") budget.consumeStartBudget();
+        if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: null });
+        return base(argv, signal, preserve);
+      });
+      const pending = launch({ name: "worker", profile: "worker-claude", initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), harness.cli, undefined, { attachments, clock: budget.clock });
+      const failure = expect(pending).rejects.toMatchObject({
+        code: "READY_TIMEOUT",
+        details: {
+          causeCode: "READY_TIMEOUT",
+          phase: "ready",
+          promptSubmitted: false,
+          recipientRegistered: false,
+          recipientGrant: { path: GRANT_PATH },
+          attachmentRetained: true,
+          attachment: { attachmentId: "attachment-1" },
+          readiness: { baselineRequired: true }
+        }
+      });
+      await vi.advanceTimersByTimeAsync(200);
+      await failure;
+      expect(released).toEqual(["renew", "release"]);
+      expect(harness.stdinInputs).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports a retained attachment when delivery fails and releases the grant either way", async () => {
     const released: string[] = [];
     const grant = { path: GRANT_PATH, token: "grant-recipient", renew: async () => { released.push("renew"); }, release: async () => { released.push("release"); } };
@@ -1378,6 +2328,23 @@ describe("herdr_launch profile-only contract", () => {
     expect(result.details).toMatchObject({ initialPromptSent: true, initialPromptDelivery: "inline", envelope: { version: "v1", kind: "assignment", delivery: "inline" } });
   });
 
+  it("moves prompt_verification immediately before the single stdin submission", async () => {
+    const updates: string[] = [];
+    const harness = makeCli();
+    const baseStdin = harness.cli.runJsonWithStdin!;
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+      expect(updates.at(-1)).toBe("prompt_verification");
+      return baseStdin(argv, input, signal, preserve);
+    });
+    const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
+    await tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "phase" }, new AbortController().signal, (update) => {
+      if (typeof update.details?.phase === "string") updates.push(update.details.phase);
+    }, extensionContext);
+    expect(updates).toContain("ready");
+    expect(updates.filter((phase) => phase === "prompt_verification")).toHaveLength(1);
+    expect(harness.stdinInputs).toHaveLength(1);
+  });
+
   it("falls back only after exact typed start failure and authoritative no-agent proof", async () => {
     const first = profile("primary", "pi", ["fallback"]);
     const second = profile("fallback", "claude");
@@ -1460,7 +2427,8 @@ describe("herdr_launch profile-only contract", () => {
     const worker = profile("worker");
     const newTab = makeCli();
     await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" }, focus: true }, catalog(worker), newTab.cli)).resolves.toMatchObject({ details: { placement: { mode: "new_tab", tabLabel: "agents" }, tabId: "w1:t2", paneId: "w1:p3" } });
-    expect(newTab.calls).toContainEqual(["tab", "create", "--workspace", "w1", "--cwd", "/repo", "--label", "agents", "--focus"]);
+    expect(newTab.calls).toContainEqual(["tab", "create", "--workspace", "w1", "--cwd", "/repo", "--label", "agents", "--no-focus"]);
+    expect(newTab.calls).toContainEqual(["agent", "focus", "w1:p3"]);
 
     const existing = { ...snapshot, panes: [{ ...snapshot.panes[0]!, label: "target" }] };
     const existingIdentity = { terminal_id: "terminal-existing", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing" } };

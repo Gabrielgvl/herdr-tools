@@ -3,7 +3,7 @@ import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type H
 import type { CompatibilityPreflight } from "../health.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
-import { boundAgentSessionStrings, capturePromptObservationBaseline, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, PromptIdentityError, joinPromptTargetIdentity, type PromptConsumption, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
+import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
 import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
 import { attachmentCapability } from "../profiles/capability.js";
@@ -26,6 +26,11 @@ export interface LaunchResourceRegistry {
   has?(resource: { kind: "pane" | "tab"; id: string }): boolean;
 }
 
+export interface LaunchClock {
+  /** Monotonic milliseconds. */
+  now(): number;
+}
+
 export interface LaunchDependencies {
   cli: LaunchCli;
   context: CurrentContext;
@@ -36,6 +41,7 @@ export interface LaunchDependencies {
   promptSources?: PromptSourceStore;
   attachments?: AttachmentStore;
   recipients?: RecipientRegistry;
+  clock?: LaunchClock;
 }
 
 export interface LaunchResourceIds {
@@ -64,6 +70,17 @@ export interface LaunchEffectiveProfile {
   reachableNames: string[];
 }
 
+export interface LaunchReadinessEvidence {
+  budgetBasis: "immediately_before_selected_agent_start";
+  budgetMs: number;
+  pollIntervalMs: number;
+  elapsedMs: number;
+  samples: number;
+  lastPendingReason?: string;
+  records: Record<string, unknown>[];
+  baselineRequired: boolean;
+}
+
 export interface PromptConfirmationEvidence {
   timeoutMs: number;
   pollIntervalMs: number;
@@ -75,6 +92,12 @@ export interface PromptConfirmationEvidence {
   sourceCode?: string;
 }
 
+export interface LaunchTimingEvidence {
+  selectedStartReadinessMs?: number;
+  promptSubmissionAckMs?: number;
+  postAckConfirmationMs?: number;
+}
+
 export interface LaunchDetails extends LaunchResourceIds {
   operation: "launch";
   outcome: "launched" | "partial";
@@ -82,14 +105,18 @@ export interface LaunchDetails extends LaunchResourceIds {
   kind?: string;
   placement?: LaunchPlacement;
   postState?: Record<string, unknown>;
+  agentStarted?: boolean;
   initialPromptSent?: boolean;
   promptSubmitted?: boolean;
+  recipientRegistered?: boolean;
   promptConsumption?: PromptConsumption;
   initialPromptDelivery?: MessageDelivery;
   initialPromptSubmission?: PromptSubmissionEvidence;
   initialPromptObservation?: PromptObservation;
+  readiness?: LaunchReadinessEvidence;
   promptConfirmation?: PromptConfirmationEvidence;
-  phase?: "validate" | "resolve_profile" | "attachment_publish" | "placement" | "agent_start" | "ready" | "prompt_verification";
+  timing?: LaunchTimingEvidence;
+  phase?: "validate" | "resolve_profile" | "attachment_publish" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification";
   created?: LaunchResourceIds;
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
@@ -99,8 +126,10 @@ export interface LaunchDetails extends LaunchResourceIds {
   profile?: LaunchEffectiveProfile & { name: string; sessionPersistence: boolean };
 }
 
-const LAUNCH_IDENTITY_PREFLIGHT_TIMEOUT_MS = 5_000;
-const LAUNCH_IDENTITY_PREFLIGHT_POLL_INTERVAL_MS = 100;
+const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
+const PROMPT_CONFIRMATION_TIMEOUT_MS = 5_000;
+const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
+const realLaunchClock: LaunchClock = { now: () => performance.now() };
 
 class LaunchError extends Error {
   readonly details: Record<string, unknown>;
@@ -206,11 +235,15 @@ function agentIdentity(value: unknown, expectedName: string, expectedPaneId: str
     else if (typeof value.agent !== "string") agent = undefined;
   }
   if (!record(agent)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr agent-start response omitted the authoritative agent record");
+  // Start lifecycle values describe an earlier process-start observation. Their
+  // shapes are authoritative enough to validate, but their values never anchor or
+  // overwrite a later coherent readiness sample.
+  readinessLifecycle(agent, "agent_start");
   let fields: Partial<PromptTargetIdentity>;
   try {
     // Herdr 0.8.2 can omit identity fields from agent_started. Validate every
-    // field it does supply now, but let one bounded fresh read-only sample fill
-    // only the missing fields. No expected value is fabricated into startRecord.
+    // field it does supply now, but let bounded fresh coherent polling samples
+    // fill only the missing fields. No expected value is fabricated into startRecord.
     fields = parsePromptTargetIdentityFields(agent, expectedPaneId);
   } catch (error) {
     const identityError = error as PromptIdentityError;
@@ -311,96 +344,280 @@ function snapshotOf(result: unknown): HerdrSnapshot {
   return parseSnapshotResult(result);
 }
 
-function snapshotIdentityRecords(snapshot: HerdrSnapshot, paneId: string): Record<string, unknown>[] {
-  const panes = snapshot.panes.filter((pane) => pane.pane_id === paneId);
-  const agents = snapshot.agents.filter((agent) => agent.pane_id === paneId);
-  if (panes.length !== 1 || agents.length !== 1) {
-    throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Fresh post-start snapshot does not contain one authoritative target agent", { paneId, paneRecords: panes.length, agentRecords: agents.length });
-  }
-  return [panes[0]!, agents[0]!];
+interface ReadinessRecord {
+  source: "snapshot_pane" | "snapshot_agent" | "agent_get" | "pane_get";
+  value: Record<string, unknown>;
 }
 
-function compactIdentityRecord(value: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
+interface LaunchReadinessResult {
+  identity: PromptTargetIdentity;
+  agent: Record<string, unknown>;
+  pane: Record<string, unknown>;
+  baseline?: PromptObservationBaseline;
+  evidence: LaunchReadinessEvidence;
+}
+
+const READINESS_RECORD_LIMIT = 4;
+const READINESS_MALFORMED = "[malformed]";
+const READINESS_SESSION_MISSING = "[missing]";
+
+function readinessScalar(value: unknown): string | number | boolean | null {
+  if (typeof value === "string") return value.slice(0, 256);
+  if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+  if (typeof value === "boolean" || value === null) return value;
+  return READINESS_MALFORMED;
+}
+
+function readinessSessionField(value: unknown): string {
+  if (typeof value === "string") return value.slice(0, 256);
+  return value === undefined ? READINESS_SESSION_MISSING : READINESS_MALFORMED;
+}
+
+function ownReadinessSessionField(value: Record<string, unknown>, field: "source" | "agent" | "kind" | "value"): string {
+  return readinessSessionField(own(value, field) ? value[field] : undefined);
+}
+
+function compactIdentityRecord(value: Record<string, unknown>, source: ReadinessRecord["source"]): Record<string, unknown> {
+  const result: Record<string, unknown> = { source };
   for (const field of ["pane_id", "terminal_id", "name", "agent_name", "agent", "agent_kind", "kind", "agent_status", "revision", "state_change_seq", "interactive_ready", "screen_detection_skipped"] as const) {
-    const candidate = value[field];
-    if (candidate === undefined) continue;
-    result[field] = typeof candidate === "string" ? candidate.slice(0, 256) : candidate;
+    if (!own(value, field)) continue;
+    result[field] = readinessScalar(value[field]);
   }
-  const session = value.agent_session;
-  if (record(session)) {
-    result.agent_session = {
-      source: typeof session.source === "string" ? session.source.slice(0, 256) : "",
-      agent: typeof session.agent === "string" ? session.agent.slice(0, 256) : "",
-      kind: typeof session.kind === "string" ? session.kind.slice(0, 256) : "",
-      value: typeof session.value === "string" ? session.value.slice(0, 256) : ""
-    };
+  if (own(value, "agent_session")) {
+    const session = value.agent_session;
+    result.agent_session = record(session)
+      ? {
+        source: ownReadinessSessionField(session, "source"),
+        agent: ownReadinessSessionField(session, "agent"),
+        kind: ownReadinessSessionField(session, "kind"),
+        value: ownReadinessSessionField(session, "value")
+      }
+      : readinessScalar(session);
   }
   return result;
 }
 
-function compactIdentityEvidence(values: unknown[]): Record<string, unknown> {
-  return { records: values.filter(record).map(compactIdentityRecord) };
+function compactReadinessRecords(values: ReadinessRecord[]): Record<string, unknown>[] {
+  return values.slice(0, READINESS_RECORD_LIMIT).map(({ source, value }) => compactIdentityRecord(value, source));
 }
 
-function preflightFailureEvidence(error: LaunchError | PromptIdentityError): Record<string, unknown> {
-  return { code: error.code, details: boundAgentSessionStrings(error.details) };
+function own(value: Record<string, unknown>, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, field);
 }
 
-function identityPreflightTimeout(samples: number, lastEvidence: Record<string, unknown>, lastFailure: Record<string, unknown>): LaunchError {
-  return new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Launch identity did not become ready during the bounded read-only preflight", {
-    identityPreflight: {
-      timeoutMs: LAUNCH_IDENTITY_PREFLIGHT_TIMEOUT_MS,
-      pollIntervalMs: LAUNCH_IDENTITY_PREFLIGHT_POLL_INTERVAL_MS,
-      samples,
-      lastFailure,
-      lastEvidence
+function sameSession(left: PromptTargetIdentity["agentSession"], right: PromptTargetIdentity["agentSession"]): boolean {
+  return left.source === right.source && left.agent === right.agent && left.kind === right.kind && left.value === right.value;
+}
+
+function mergeReadinessIdentity(records: Record<string, unknown>[], paneId: string): Partial<PromptTargetIdentity> {
+  const selected: Partial<PromptTargetIdentity> = {};
+  for (const value of records) {
+    let fields: Partial<PromptTargetIdentity>;
+    try {
+      fields = parsePromptTargetIdentityFields(value, paneId);
+    } catch (error) {
+      const identityError = error as PromptIdentityError;
+      throw new LaunchError(identityError.code, "Launch readiness identity evidence is malformed or contradictory", identityError.details);
     }
-  });
+    for (const field of ["paneId", "terminalId", "agentName", "agentKind"] as const) {
+      const candidate = fields[field];
+      const current = selected[field];
+      if (candidate !== undefined && current !== undefined && candidate !== current) {
+        throw new LaunchError("TARGET_IDENTITY_CHANGED", "Launch readiness identity evidence is contradictory", { field, expected: current, actual: candidate });
+      }
+      if (candidate !== undefined) Object.assign(selected, { [field]: candidate });
+    }
+    if (fields.agentSession !== undefined) {
+      if (selected.agentSession !== undefined && !sameSession(selected.agentSession, fields.agentSession)) {
+        throw new LaunchError("TARGET_IDENTITY_CHANGED", "Launch readiness agent session is contradictory", { field: "agent_session", expected: selected.agentSession, actual: fields.agentSession });
+      }
+      selected.agentSession = fields.agentSession;
+    }
+  }
+  if (selected.agentKind !== undefined && selected.agentSession !== undefined && selected.agentKind !== selected.agentSession.agent) {
+    throw new LaunchError("TARGET_IDENTITY_CHANGED", "Launch readiness kind and session are contradictory", { field: "agent_session.agent", expected: selected.agentKind, actual: selected.agentSession.agent });
+  }
+  return selected;
 }
 
-type IdentityPreflightAbortReason = "caller" | "deadline";
+function completeReadinessIdentity(fields: Partial<PromptTargetIdentity>, paneId: string, expectedName: string, expectedKind: string): PromptTargetIdentity | undefined {
+  if (fields.agentName !== undefined && fields.agentName !== expectedName) {
+    throw new LaunchError("TARGET_IDENTITY_CHANGED", "Launch readiness agent name was replaced", { expectedName, actualName: fields.agentName });
+  }
+  if (fields.agentKind !== undefined && fields.agentKind !== expectedKind) {
+    throw new LaunchError("TARGET_IDENTITY_CHANGED", "Launch readiness agent kind was replaced", { expectedKind, actualKind: fields.agentKind });
+  }
+  if (fields.terminalId === undefined || fields.agentName === undefined || fields.agentKind === undefined || fields.agentSession === undefined) return undefined;
+  return { paneId, terminalId: fields.terminalId, agentName: fields.agentName, agentKind: fields.agentKind, agentSession: fields.agentSession };
+}
 
-class IdentityPreflightAbort extends Error {
-  constructor(readonly reason: IdentityPreflightAbortReason) {
-    super(reason === "caller" ? "Operation aborted" : "Identity preflight deadline expired");
-    this.name = "IdentityPreflightAbort";
+function requiredReadinessPaneId(value: Record<string, unknown>, paneId: string, source: string): string | undefined {
+  if (!own(value, "pane_id") || value.pane_id === null || value.pane_id === undefined) return `${source}_pane_id_missing`;
+  if (typeof value.pane_id !== "string" || value.pane_id.length === 0 || /[\0\r\n]/u.test(value.pane_id)) {
+    throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Launch readiness pane identity is malformed", { field: "pane_id", source });
+  }
+  if (value.pane_id !== paneId) {
+    throw new LaunchError("TARGET_IDENTITY_CHANGED", "Launch readiness pane identity was replaced", { expectedPaneId: paneId, actualPaneId: value.pane_id, source });
+  }
+  return undefined;
+}
+
+function snapshotReadinessRecords(snapshot: HerdrSnapshot, paneId: string): { records: ReadinessRecord[]; pending: string[]; duplicates?: { paneRecords: number; agentRecords: number } } {
+  let paneRecord: Record<string, unknown> | undefined;
+  let agentRecord: Record<string, unknown> | undefined;
+  let paneRecords = 0;
+  let agentRecords = 0;
+  for (const pane of snapshot.panes) {
+    if (pane.pane_id !== paneId) continue;
+    paneRecords += 1;
+    paneRecord ??= pane;
+  }
+  for (const agent of snapshot.agents) {
+    if (agent.pane_id !== paneId) continue;
+    agentRecords += 1;
+    agentRecord ??= agent;
+  }
+  const duplicates = paneRecords > 1 || agentRecords > 1 ? { paneRecords, agentRecords } : undefined;
+  const records: ReadinessRecord[] = [
+    ...(paneRecord === undefined ? [] : [{ source: "snapshot_pane" as const, value: paneRecord }]),
+    ...(agentRecord === undefined ? [] : [{ source: "snapshot_agent" as const, value: agentRecord }])
+  ];
+  const pending: string[] = [];
+  if (paneRecord === undefined) pending.push("snapshot_pane_missing");
+  if (agentRecord === undefined) pending.push("snapshot_agent_missing");
+  return { records, pending, ...(duplicates === undefined ? {} : { duplicates }) };
+}
+
+function readinessAgentRecord(value: unknown): { record?: ReadinessRecord; pending?: string } {
+  if (!record(value)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Launch readiness agent-get result is malformed");
+  if (!own(value, "agent") || value.agent === null || value.agent === undefined) return { pending: "agent_get_record_missing" };
+  if (!record(value.agent)) throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Launch readiness agent-get record is malformed", { source: "agent_get", evidenceKind: "malformed" });
+  return { record: { source: "agent_get", value: value.agent } };
+}
+
+function readinessPaneRecord(value: unknown): { record?: ReadinessRecord; pending?: string } {
+  if (!record(value)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Launch readiness pane-get result is malformed");
+  if (!own(value, "pane") || value.pane === null || value.pane === undefined) return { pending: "pane_get_record_missing" };
+  if (!record(value.pane)) throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Launch readiness pane-get record is malformed", { source: "pane_get", evidenceKind: "malformed" });
+  return { record: { source: "pane_get", value: value.pane } };
+}
+
+const READINESS_AGENT_STATES = new Set(["idle", "working", "blocked", "done", "unknown"]);
+
+type ReadinessLifecycleSource = ReadinessRecord["source"] | "agent_start";
+
+interface ReadinessLifecycle {
+  agentStatus?: string;
+  stateChangeSeq?: number;
+  revision?: number;
+  screenDetectionSkipped?: boolean;
+}
+
+function readinessLifecycle(value: Record<string, unknown>, source: ReadinessLifecycleSource): ReadinessLifecycle {
+  const result: ReadinessLifecycle = {};
+  const state = value.agent_status;
+  if (state !== undefined && state !== null) {
+    if (typeof state !== "string" || !READINESS_AGENT_STATES.has(state)) {
+      throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Launch readiness agent status is malformed", { field: "agent_status", source, evidenceKind: "malformed" });
+    }
+    result.agentStatus = state;
+  }
+  for (const [field, target] of [["state_change_seq", "stateChangeSeq"], ["revision", "revision"]] as const) {
+    const candidate = value[field];
+    if (candidate === undefined || candidate === null) continue;
+    if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < 0) {
+      throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Launch readiness lifecycle counter is malformed", { field, source, evidenceKind: "malformed" });
+    }
+    result[target] = candidate;
+  }
+  const skipped = value.screen_detection_skipped;
+  if (skipped !== undefined && skipped !== null) {
+    if (typeof skipped !== "boolean") {
+      throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Launch readiness lifecycle diagnostic is malformed", { field: "screen_detection_skipped", source, evidenceKind: "malformed" });
+    }
+    result.screenDetectionSkipped = skipped;
+  }
+  return result;
+}
+
+function readinessLifecycleSkew(records: Array<{ source: ReadinessRecord["source"]; lifecycle: ReadinessLifecycle }>, baseline: PromptObservationBaseline): string[] {
+  const anchor: ReadinessLifecycle = {
+    agentStatus: baseline.state,
+    stateChangeSeq: baseline.stateChangeSeq,
+    revision: baseline.revision,
+    ...(baseline.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: baseline.screenDetectionSkipped })
+  };
+  const pending: string[] = [];
+  for (const { source, lifecycle } of records) {
+    for (const [field, diagnostic] of [["agentStatus", "agent_status"], ["stateChangeSeq", "state_change_seq"], ["revision", "revision"], ["screenDetectionSkipped", "screen_detection_skipped"]] as const) {
+      const supplied = lifecycle[field];
+      if (supplied !== undefined && supplied !== anchor[field]) pending.push(`lifecycle_skew:${source}:${diagnostic}`);
+    }
+  }
+  return pending;
+}
+
+function readinessBaseline(agent: Record<string, unknown>, identity: PromptTargetIdentity, lifecycle: ReadinessLifecycle): { baseline?: PromptObservationBaseline; pending: string[] } {
+  const pending: string[] = [];
+  const fields = mergeReadinessIdentity([agent], identity.paneId);
+  const independent = completeReadinessIdentity(fields, identity.paneId, identity.agentName, identity.agentKind);
+  if (independent === undefined) pending.push("agent_get_identity_incomplete");
+
+  const state = lifecycle.agentStatus;
+  if (state === undefined) pending.push("agent_get_status_missing");
+  else if (state !== "idle") pending.push(`agent_get_not_idle:${state}`);
+  if (lifecycle.stateChangeSeq === undefined) pending.push("agent_get_state_change_seq_missing");
+  if (lifecycle.revision === undefined) pending.push("agent_get_revision_missing");
+
+  if (pending.length > 0 || independent === undefined) return { pending };
+  return {
+    pending,
+    baseline: {
+      state: "idle",
+      stateChangeSeq: lifecycle.stateChangeSeq!,
+      revision: lifecycle.revision!,
+      ...(lifecycle.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: lifecycle.screenDetectionSkipped })
+    }
+  };
+}
+
+type ReadWindowAbortReason = "caller" | "deadline";
+
+class ReadWindowAbort extends Error {
+  constructor(readonly reason: ReadWindowAbortReason) {
+    super(reason === "caller" ? "Operation aborted" : "Read deadline expired");
+    this.name = "ReadWindowAbort";
   }
 }
 
-interface IdentityPreflightWindow {
+interface ReadWindow {
   signal: AbortSignal;
-  cancellation(): IdentityPreflightAbort | undefined;
+  cancellation(): ReadWindowAbort | undefined;
   assertActive(): void;
   cleanup(): void;
 }
 
-function createIdentityPreflightWindow(callerSignal: AbortSignal): IdentityPreflightWindow {
+function createReadWindow(callerSignal: AbortSignal, deadline: number, clock: LaunchClock): ReadWindow {
   const controller = new AbortController();
-  const deadline = Date.now() + LAUNCH_IDENTITY_PREFLIGHT_TIMEOUT_MS;
-  let reason: IdentityPreflightAbortReason | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const abort = (next: IdentityPreflightAbortReason): void => {
-    if (reason !== undefined) return;
-    reason = next;
-    controller.abort();
-  };
+  const abort = (next: ReadWindowAbortReason): void => controller.abort(next);
   const onCallerAbort = (): void => abort("caller");
   const onDeadline = (): void => abort("deadline");
-  const cancellation = (): IdentityPreflightAbort | undefined => {
-    if (reason !== undefined) return new IdentityPreflightAbort(reason);
-    if (Date.now() >= deadline) {
+  const cancellation = (): ReadWindowAbort | undefined => {
+    const reason = controller.signal.reason;
+    if (reason === "caller" || reason === "deadline") return new ReadWindowAbort(reason);
+    if (clock.now() >= deadline) {
       abort("deadline");
-      return new IdentityPreflightAbort("deadline");
+      return new ReadWindowAbort("deadline");
     }
     return undefined;
   };
 
-  if (callerSignal.aborted) {
-    abort("caller");
-  } else {
+  if (callerSignal.aborted) abort("caller");
+  else if (clock.now() >= deadline) abort("deadline");
+  else {
     callerSignal.addEventListener("abort", onCallerAbort, { once: true });
-    timer = setTimeout(onDeadline, Math.max(0, deadline - Date.now()));
+    timer = setTimeout(onDeadline, Math.max(0, deadline - clock.now()));
   }
 
   return {
@@ -417,7 +634,7 @@ function createIdentityPreflightWindow(callerSignal: AbortSignal): IdentityPrefl
   };
 }
 
-async function readWithinIdentityPreflight(cli: LaunchCli, argv: string[], window: IdentityPreflightWindow): Promise<unknown> {
+async function readWithinWindow(cli: LaunchCli, argv: string[], window: ReadWindow): Promise<unknown> {
   window.assertActive();
   const read = run(cli, argv, window.signal);
   const cancellationState = {} as { reject: (reason?: unknown) => void };
@@ -435,107 +652,200 @@ async function readWithinIdentityPreflight(cli: LaunchCli, argv: string[], windo
   }
 }
 
-function waitForIdentityPreflightPoll(window: IdentityPreflightWindow): Promise<void> {
+function waitForReadPoll(window: ReadWindow, intervalMs: number): Promise<void> {
   window.assertActive();
   return new Promise<void>((resolve, reject) => {
-    const timerState: { timer?: ReturnType<typeof setTimeout> } = {};
     const onAbort = (): void => {
-      clearTimeout(timerState.timer!);
+      clearTimeout(timer);
       window.signal.removeEventListener("abort", onAbort);
       reject(window.cancellation()!);
     };
     const timer = setTimeout(() => {
       window.signal.removeEventListener("abort", onAbort);
       resolve();
-    }, LAUNCH_IDENTITY_PREFLIGHT_POLL_INTERVAL_MS);
-    timerState.timer = timer;
+    }, intervalMs);
     window.signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
-async function freshPostStartIdentity(cli: LaunchCli, paneId: string, callerSignal: AbortSignal, expectedName: string, expectedKind: string, expected: StartedAgent): Promise<{ identity: PromptTargetIdentity; agent: Record<string, unknown>; pane: Record<string, unknown> }> {
-  const window = createIdentityPreflightWindow(callerSignal);
+function monotonicDurationMs(clock: LaunchClock, startedAt: number): number {
+  const elapsed = clock.now() - startedAt;
+  return Number.isFinite(elapsed) && elapsed > 0
+    ? Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(elapsed))
+    : 0;
+}
+
+function readinessEvidence(
+  clock: LaunchClock,
+  attemptStartedAt: number,
+  samples: number,
+  records: Record<string, unknown>[],
+  baselineRequired: boolean,
+  lastPendingReason?: string
+): LaunchReadinessEvidence {
+  return {
+    budgetBasis: "immediately_before_selected_agent_start",
+    budgetMs: HERDR_AGENT_START_TIMEOUT_MS,
+    pollIntervalMs: LAUNCH_READINESS_POLL_INTERVAL_MS,
+    elapsedMs: monotonicDurationMs(clock, attemptStartedAt),
+    samples,
+    ...(lastPendingReason === undefined ? {} : { lastPendingReason }),
+    records,
+    baselineRequired
+  };
+}
+
+const READINESS_ERROR_METADATA_FIELDS = [
+  "field", "source", "expectedSource", "evidenceKind", "expected", "actual",
+  "expectedName", "actualName", "expectedKind", "actualKind", "expectedPaneId",
+  "actualPaneId", "paneId", "paneRecords", "agentRecords", "sourceCode"
+] as const;
+
+function compactReadinessErrorValue(value: unknown): unknown {
+  if (!record(value)) return readinessScalar(value);
+  return {
+    source: ownReadinessSessionField(value, "source"),
+    agent: ownReadinessSessionField(value, "agent"),
+    kind: ownReadinessSessionField(value, "kind"),
+    value: ownReadinessSessionField(value, "value")
+  };
+}
+
+function compactReadinessErrorMetadata(value: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const field of READINESS_ERROR_METADATA_FIELDS) {
+    if (own(value, field)) result[field] = compactReadinessErrorValue(value[field]);
+  }
+  return result;
+}
+
+function readinessFailure(code: string, message: string, evidence: LaunchReadinessEvidence, details: Record<string, unknown> = {}): LaunchError {
+  const cliFailure = compactCliFailureEvidence(details.cliFailure);
+  return new LaunchError(code.slice(0, 256), message, {
+    ...compactReadinessErrorMetadata(details),
+    ...(cliFailure === undefined ? {} : { cliFailure }),
+    causeCode: code.slice(0, 256),
+    agentStarted: true,
+    promptSubmitted: false,
+    recipientRegistered: false,
+    readiness: evidence
+  });
+}
+
+async function waitForLaunchReadiness(
+  cli: LaunchCli,
+  paneId: string,
+  callerSignal: AbortSignal,
+  expectedName: string,
+  expectedKind: string,
+  expected: StartedAgent,
+  attemptStartedAt: number,
+  baselineRequired: boolean,
+  clock: LaunchClock
+): Promise<LaunchReadinessResult> {
+  const deadline = attemptStartedAt + HERDR_AGENT_START_TIMEOUT_MS;
+  const window = createReadWindow(callerSignal, deadline, clock);
   let samples = 0;
-  let lastEvidence: Record<string, unknown> = { records: [] };
-  let lastFailure: Record<string, unknown> = { code: "TARGET_IDENTITY_UNAVAILABLE" };
+  let lastRecords: Record<string, unknown>[] = [];
+  let lastPendingReason: string | undefined;
   try {
     while (true) {
       window.assertActive();
       samples += 1;
-      let snapshot: HerdrSnapshot | undefined;
-      let agent: Record<string, unknown> | undefined;
-      let pane: Record<string, unknown> | undefined;
+      // A new sample owns new record evidence. If any later read fails,
+      // diagnostics must not retain records from the preceding sample.
+      lastRecords = [];
+      const sampleRecords: ReadinessRecord[] = [];
       try {
-        // Every sample is a fresh, ordered snapshot + agent-get + pane read. The
-        // three records are joined only after all reads complete; no record from a
-        // prior sample is carried into this attempt. Each read races the same
-        // whole-window cancellation, so an uncooperative CLI cannot extend it.
-        const snapshotResult = await readWithinIdentityPreflight(cli, ["api", "snapshot"], window);
-        snapshot = snapshotOf(snapshotResult);
-        const agentResult = await readWithinIdentityPreflight(cli, ["agent", "get", paneId], window);
-        agent = agentGetRecord(agentResult);
-        const paneResult = await readWithinIdentityPreflight(cli, ["pane", "get", paneId], window);
-        pane = paneRecord(paneResult, paneId);
-        const records = [...snapshotIdentityRecords(snapshot, paneId), agent, pane];
-        lastEvidence = compactIdentityEvidence(records);
-        const identity = joinPromptTargetIdentity([expected.startRecord, ...records], paneId, { allowIncompleteFirstRecord: true });
-        if (identity.agentName !== expectedName || identity.agentKind !== expectedKind) {
-          throw new LaunchError("TARGET_IDENTITY_CHANGED", "Fresh launch identity does not match the requested identity", {
-            expectedName, actualName: identity.agentName, expectedKind, actualKind: identity.agentKind
-          });
+        // One readiness sample is always ordered snapshot -> agent get -> pane get.
+        // All records are local to this iteration and are discarded before polling.
+        const snapshot = snapshotOf(await readWithinWindow(cli, ["api", "snapshot"], window));
+        const snapshotRecords = snapshotReadinessRecords(snapshot, paneId);
+        sampleRecords.push(...snapshotRecords.records);
+        lastRecords = compactReadinessRecords(sampleRecords);
+
+        const agentResult = await readWithinWindow(cli, ["agent", "get", paneId], window);
+        const currentAgentRecord = record(agentResult) && own(agentResult, "agent") && record(agentResult.agent)
+          ? { source: "agent_get" as const, value: agentResult.agent }
+          : undefined;
+        if (currentAgentRecord !== undefined) {
+          sampleRecords.push(currentAgentRecord);
+          lastRecords = compactReadinessRecords(sampleRecords);
         }
-        // A read can resolve after the deadline signal was delivered (for example,
-        // a test double or an uncooperative child). Never return a success from
-        // that sample or proceed to prompt bytes/recipient registration.
-        window.assertActive();
-        return { identity, agent, pane };
+        const paneResult = await readWithinWindow(cli, ["pane", "get", paneId], window);
+
+        // All three reads complete before readiness is evaluated. The early compact
+        // agent projection above exists only so a pane-read failure retains current-
+        // sample evidence rather than falling back to the preceding sample.
+        const agentRecord = readinessAgentRecord(agentResult);
+        lastRecords = compactReadinessRecords(sampleRecords);
+        const paneRecordResult = readinessPaneRecord(paneResult);
+        if (paneRecordResult.record) sampleRecords.push(paneRecordResult.record);
+        lastRecords = compactReadinessRecords(sampleRecords);
+
+        if (snapshotRecords.duplicates !== undefined) {
+          throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Launch readiness snapshot contains duplicate target records", { paneId, ...snapshotRecords.duplicates, evidenceKind: "duplicate" });
+        }
+        const pending = [...snapshotRecords.pending];
+        if (agentRecord.pending) pending.push(agentRecord.pending);
+        if (paneRecordResult.pending) pending.push(paneRecordResult.pending);
+        for (const item of sampleRecords) {
+          const panePending = requiredReadinessPaneId(item.value, paneId, item.source);
+          if (panePending) pending.push(panePending);
+        }
+        const sampleLifecycles = sampleRecords.map(({ source, value }) => ({ source, lifecycle: readinessLifecycle(value, source) }));
+
+        const merged = mergeReadinessIdentity([expected.startRecord, ...sampleRecords.map(({ value }) => value)], paneId);
+        const identity = completeReadinessIdentity(merged, paneId, expectedName, expectedKind);
+        if (identity === undefined) pending.push("identity_incomplete");
+
+        let baseline: PromptObservationBaseline | undefined;
+        const authoritativeAgent = agentRecord.record?.value;
+        const authoritativeLifecycle = sampleLifecycles.find(({ source }) => source === "agent_get")?.lifecycle;
+        if (baselineRequired && authoritativeAgent !== undefined && authoritativeLifecycle !== undefined && identity !== undefined) {
+          const baselineState = readinessBaseline(authoritativeAgent, identity, authoritativeLifecycle);
+          pending.push(...baselineState.pending);
+          baseline = baselineState.baseline;
+          if (baseline !== undefined) {
+            pending.push(...readinessLifecycleSkew(sampleLifecycles.filter(({ source }) => source !== "agent_get"), baseline));
+          }
+        } else if (baselineRequired && authoritativeAgent === undefined) {
+          pending.push("baseline_agent_get_missing");
+        }
+
+        if (pending.length === 0 && identity !== undefined && authoritativeAgent !== undefined && paneRecordResult.record !== undefined && (!baselineRequired || baseline !== undefined)) {
+          window.assertActive();
+          const evidence = readinessEvidence(clock, attemptStartedAt, samples, lastRecords, baselineRequired, lastPendingReason);
+          return { identity, agent: authoritativeAgent, pane: paneRecordResult.record.value, ...(baseline === undefined ? {} : { baseline }), evidence };
+        }
+        lastPendingReason = [...new Set(pending)].join(",");
       } catch (error) {
-        if (window.cancellation()) throw error;
-        if (error instanceof LaunchError) {
-          if (error.code === "TARGET_IDENTITY_CHANGED") {
-            throw new LaunchError(error.code, "Fresh post-start identity is contradictory", {
-              ...error.details,
-              identityPreflight: { samples, lastEvidence }
-            });
-          }
-          if (error.code !== "TARGET_IDENTITY_UNAVAILABLE") throw error;
-        } else if (error instanceof PromptIdentityError) {
-          if (error.code === "TARGET_IDENTITY_CHANGED") {
-            throw new LaunchError(error.code, "Fresh post-start identity is contradictory", {
-              ...error.details,
-              identityPreflight: { samples, lastEvidence }
-            });
-          }
-        } else {
-          throw error;
-        }
-        const available = [
-          ...snapshot!.panes.filter((item) => item.pane_id === paneId),
-          ...snapshot!.agents.filter((item) => item.pane_id === paneId),
-          ...(agent ? [agent] : []),
-          ...(pane ? [pane] : [])
-        ];
-        lastEvidence = compactIdentityEvidence(available);
-        lastFailure = preflightFailureEvidence(error as LaunchError | PromptIdentityError);
+        const cancellation = window.cancellation();
+        if (cancellation) throw cancellation;
+        const evidence = readinessEvidence(clock, attemptStartedAt, samples, lastRecords, baselineRequired, lastPendingReason);
+        if (error instanceof LaunchError) throw readinessFailure(error.code, error.message, evidence, error.details);
+        const sourceCode = record(error) && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
+        const failureCode = sourceCode === "READY_TIMEOUT" ? "CLI_PROTOCOL_ERROR" : sourceCode;
+        const cliFailure = cliFailureEvidence(error);
+        throw readinessFailure(failureCode, error instanceof Error ? error.message : String(error), evidence, {
+          ...(sourceCode === failureCode ? {} : { sourceCode }),
+          ...(cliFailure ? { cliFailure } : {})
+        });
       }
-      await waitForIdentityPreflightPoll(window);
+      await waitForReadPoll(window, LAUNCH_READINESS_POLL_INTERVAL_MS);
     }
   } catch (error) {
-    const aborted = window.cancellation();
-    if (aborted?.reason === "caller") throw new LaunchError("ABORTED", "Operation aborted");
-    if (aborted?.reason === "deadline") throw identityPreflightTimeout(samples, lastEvidence, lastFailure);
+    const cancellation = window.cancellation();
+    if (cancellation?.reason === "caller") {
+      throw readinessFailure("ABORTED", "Operation aborted during launch readiness", readinessEvidence(clock, attemptStartedAt, samples, lastRecords, baselineRequired, lastPendingReason));
+    }
+    if (cancellation?.reason === "deadline") {
+      const pendingReason = lastPendingReason ?? "readiness_budget_exhausted_before_sample";
+      throw readinessFailure("READY_TIMEOUT", "Launch did not become ready within the selected agent-start attempt budget", readinessEvidence(clock, attemptStartedAt, samples, lastRecords, baselineRequired, pendingReason));
+    }
     throw error;
   } finally {
     window.cleanup();
-  }
-}
-
-function promptBaseline(agentState: Record<string, unknown>, identity: PromptTargetIdentity): PromptObservationBaseline {
-  try {
-    return capturePromptObservationBaseline(agentState, identity);
-  } catch (error) {
-    const identityError = error as PromptIdentityError;
-    throw new LaunchError(identityError.code, "Fresh post-start state cannot establish a stable prompt baseline", identityError.details);
   }
 }
 
@@ -552,6 +862,7 @@ function compactConfirmationObservation(observation: PromptObservation | undefin
 }
 
 function promptConfirmationEvidence(
+  clock: LaunchClock,
   startedAt: number,
   samples: number,
   reason: PromptConfirmationEvidence["reason"],
@@ -560,9 +871,9 @@ function promptConfirmationEvidence(
   sourceCode?: string
 ): PromptConfirmationEvidence {
   return {
-    timeoutMs: LAUNCH_IDENTITY_PREFLIGHT_TIMEOUT_MS,
-    pollIntervalMs: LAUNCH_IDENTITY_PREFLIGHT_POLL_INTERVAL_MS,
-    elapsedMs: Math.min(LAUNCH_IDENTITY_PREFLIGHT_TIMEOUT_MS, Math.max(0, Date.now() - startedAt)),
+    timeoutMs: PROMPT_CONFIRMATION_TIMEOUT_MS,
+    pollIntervalMs: PROMPT_CONFIRMATION_POLL_INTERVAL_MS,
+    elapsedMs: monotonicDurationMs(clock, startedAt),
     samples,
     reason,
     baseline,
@@ -591,10 +902,11 @@ async function confirmPromptConsumption(
   paneId: string,
   callerSignal: AbortSignal,
   submission: PromptSubmissionEvidence,
-  baseline: PromptObservationBaseline
+  baseline: PromptObservationBaseline,
+  clock: LaunchClock,
+  startedAt: number
 ): Promise<{ agent: Record<string, unknown>; pane: Record<string, unknown>; observation: PromptObservation; confirmation: PromptConfirmationEvidence }> {
-  const window = createIdentityPreflightWindow(callerSignal);
-  const startedAt = Date.now();
+  const window = createReadWindow(callerSignal, startedAt + PROMPT_CONFIRMATION_TIMEOUT_MS, clock);
   let samples = 0;
   let last: PromptObservation | undefined;
   try {
@@ -607,13 +919,13 @@ async function confirmPromptConsumption(
         // The two authoritative reads are deliberately sequential and race one
         // shared whole-window cancellation. No source from an earlier sample is
         // carried forward and no prompt/start mutation is retried.
-        agent = agentGetRecord(await readWithinIdentityPreflight(cli, ["agent", "get", paneId], window));
-        pane = paneRecord(await readWithinIdentityPreflight(cli, ["pane", "get", paneId], window), paneId);
+        agent = agentGetRecord(await readWithinWindow(cli, ["agent", "get", paneId], window));
+        pane = paneRecord(await readWithinWindow(cli, ["pane", "get", paneId], window), paneId);
       } catch (error) {
         if (window.cancellation()) throw error;
         const sourceCode = record(error) && typeof error.code === "string" ? error.code : "POSTSTATE_UNAVAILABLE";
         const reason: PromptConfirmationEvidence["reason"] = sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "read_failed";
-        throw promptUnconfirmed(submission, promptConfirmationEvidence(startedAt, samples, reason, baseline, last, sourceCode), last);
+        throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last, sourceCode), last);
       }
       last = classifyPromptObservation(agent, submission, baseline, [pane]);
       if (last.status === "unavailable" && last.code !== "POSTSTATE_UNAVAILABLE") {
@@ -622,13 +934,13 @@ async function confirmPromptConsumption(
           : last.code === "POSTSTATE_IDENTITY_UNAVAILABLE"
             ? "identity_unavailable"
             : "contradictory";
-        throw promptUnconfirmed(submission, promptConfirmationEvidence(startedAt, samples, reason, baseline, last, last.code), last);
+        throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last, last.code), last);
       }
       if (last.consumption === "confirmed") {
         const reason: PromptConfirmationEvidence["reason"] = last.status === "working" ? "working" : "state_change_seq_advanced";
-        return { agent, pane, observation: last, confirmation: promptConfirmationEvidence(startedAt, samples, reason, baseline, last) };
+        return { agent, pane, observation: last, confirmation: promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last) };
       }
-      await waitForIdentityPreflightPoll(window);
+      await waitForReadPoll(window, PROMPT_CONFIRMATION_POLL_INTERVAL_MS);
     }
   } catch (error) {
     if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") throw error;
@@ -636,9 +948,9 @@ async function confirmPromptConsumption(
     // deadline cancellation. The deadline branch is distinct; the remaining
     // bounded cancellation preserves acknowledged effect as caller abort.
     if (window.cancellation()?.reason === "deadline") {
-      throw promptUnconfirmed(submission, promptConfirmationEvidence(startedAt, samples, "timeout", baseline, last), last);
+      throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, samples, "timeout", baseline, last), last);
     }
-    throw promptUnconfirmed(submission, promptConfirmationEvidence(startedAt, samples, "caller_aborted", baseline, last, "ABORTED"), last);
+    throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, samples, "caller_aborted", baseline, last, "ABORTED"), last);
   } finally {
     window.cleanup();
   }
@@ -657,36 +969,67 @@ function paneForPlacement(snapshot: HerdrSnapshot, target: string, context: Curr
   return resolveTarget(snapshot, target, "pane", context);
 }
 
-function focusArgs(focus: boolean): string[] {
-  return [focus ? "--focus" : "--no-focus"];
+function noFocusArgs(): string[] {
+  return ["--no-focus"];
 }
 
-function cliFailureEvidence(error: unknown): Record<string, unknown> | undefined {
-  if (!record(error) || !record(error.details)) return undefined;
+function compactCliFailureEvidence(value: unknown): Record<string, unknown> | undefined {
+  if (!record(value)) return undefined;
   const details: Record<string, unknown> = {};
-  for (const key of ["exitCode", "stdoutBytes", "stderrBytes"] as const) {
-    const value = error.details[key];
-    if (typeof value === "number" && Number.isSafeInteger(value)) details[key] = value;
+  const sourceDetails = record(value.details) ? value.details : undefined;
+  if (sourceDetails !== undefined) {
+    for (const key of ["exitCode", "stdoutBytes", "stderrBytes"] as const) {
+      const candidate = sourceDetails[key];
+      if (typeof candidate === "number" && Number.isSafeInteger(candidate)) details[key] = candidate;
+    }
+    for (const key of ["killed", "stdoutPresent", "stderrPresent", "stdoutTruncated", "stderrTruncated"] as const) {
+      const candidate = sourceDetails[key];
+      if (typeof candidate === "boolean") details[key] = candidate;
+    }
+    if (sourceDetails.evidence === "omitted_for_stdin_delivery") details.evidence = sourceDetails.evidence;
+    for (const key of ["stdout", "stderr", "cause"] as const) {
+      const candidate = sourceDetails[key];
+      if (typeof candidate === "string") details[key] = boundedEvidence(candidate, 2_000).value;
+    }
+    if (sourceDetails.errorStream === "stdout" || sourceDetails.errorStream === "stderr") details.errorStream = sourceDetails.errorStream;
+    if (record(sourceDetails.errorEnvelope) && typeof sourceDetails.errorEnvelope.id === "string" && record(sourceDetails.errorEnvelope.error)) {
+      const envelopeError = sourceDetails.errorEnvelope.error;
+      if (typeof envelopeError.code === "string" && typeof envelopeError.message === "string") {
+        details.errorEnvelope = {
+          id: sourceDetails.errorEnvelope.id.slice(0, 256),
+          error: { code: envelopeError.code.slice(0, 256), message: boundedEvidence(envelopeError.message, 2_000).value }
+        };
+      }
+    }
   }
-  for (const key of ["killed", "stdoutPresent", "stderrPresent", "stdoutTruncated", "stderrTruncated"] as const) {
-    const value = error.details[key];
-    if (typeof value === "boolean") details[key] = value;
-  }
-  if (error.details.evidence === "omitted_for_stdin_delivery") details.evidence = error.details.evidence;
-  for (const key of ["stdout", "stderr", "cause"] as const) {
-    const value = error.details[key];
-    if (typeof value === "string") details[key] = boundedEvidence(value).value;
-  }
-  if (error.details.errorStream === "stdout" || error.details.errorStream === "stderr") details.errorStream = error.details.errorStream;
-  const envelope = cliErrorEnvelope(error);
-  if (envelope) details.errorEnvelope = envelope;
-  const code = typeof error.code === "string" ? error.code : undefined;
-  const message = error instanceof Error ? boundedEvidence(error.message, 2_000).value : undefined;
+  const code = typeof value.code === "string" ? value.code.slice(0, 256) : undefined;
+  const message = typeof value.message === "string" ? boundedEvidence(value.message, 2_000).value : undefined;
   if (code === undefined && message === undefined && Object.keys(details).length === 0) return undefined;
   return { ...(code === undefined ? {} : { code }), ...(message === undefined ? {} : { message }), ...(Object.keys(details).length === 0 ? {} : { details }) };
 }
 
-function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"], delivery?: MessageDelivery, published?: PublishedAttachment): LaunchError {
+function cliFailureEvidence(error: unknown): Record<string, unknown> | undefined {
+  if (!record(error)) return undefined;
+  const envelope = cliErrorEnvelope(error);
+  const sourceDetails = record(error.details)
+    ? { ...error.details, ...(envelope === undefined ? {} : { errorEnvelope: envelope }) }
+    : undefined;
+  return compactCliFailureEvidence({
+    ...(typeof error.code === "string" ? { code: error.code } : {}),
+    ...(error instanceof Error ? { message: error.message } : {}),
+    ...(sourceDetails === undefined ? {} : { details: sourceDetails })
+  });
+}
+
+function partialError(
+  error: unknown,
+  created: LaunchResourceIds,
+  phase: LaunchDetails["phase"],
+  grant: RecipientGrant,
+  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; readiness?: LaunchReadinessEvidence; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
+  delivery?: MessageDelivery,
+  published?: PublishedAttachment
+): LaunchError {
   const transportCode = error instanceof LaunchError
     ? error.code
     : error instanceof CliProtocolError
@@ -699,16 +1042,39 @@ function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchD
   const message = error instanceof Error ? error.message : String(error);
   const code = error instanceof LaunchError && error.code === "POSTSTATE_UNAVAILABLE"
     ? "POSTSTATE_UNAVAILABLE"
-    : transportCode === "ABORTED" ? "ABORTED" : transportCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : transportCode === "READY_TIMEOUT" || (transportCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
-  const evidence = error instanceof LaunchError ? undefined : cliFailureEvidence(error);
+    : transportCode === "ABORTED"
+      ? "ABORTED"
+      : error instanceof LaunchError && error.code === "READY_TIMEOUT"
+        ? "READY_TIMEOUT"
+        : "LAUNCH_FAILED";
+  const errorDetails = error instanceof LaunchError ? error.details : {};
+  const cliFailure = error instanceof LaunchError
+    ? compactCliFailureEvidence(errorDetails.cliFailure)
+    : cliFailureEvidence(error);
+  const errorReadiness = phase === "ready" && error instanceof LaunchError && record(errorDetails.readiness)
+    ? errorDetails.readiness as unknown as LaunchReadinessEvidence
+    : undefined;
+  const readiness = effects.readiness ?? errorReadiness;
+  const supplementalDetails = phase === "ready"
+    ? compactReadinessErrorMetadata(errorDetails)
+    : errorDetails;
   return new LaunchError(code, `Launch did not complete: ${message}`, {
-    ...(error instanceof LaunchError ? error.details : {}),
+    ...supplementalDetails,
     phase,
-    ...(evidence ? { cliFailure: evidence } : {}),
     created: { ...created },
     causeCode,
+    ...(effects.agentStarted ? {
+      agentStarted: true,
+      promptSubmitted: effects.promptSubmitted,
+      recipientRegistered: effects.recipientRegistered
+    } : {}),
+    ...(Object.keys(effects.timing).length === 0 ? {} : { timing: effects.timing }),
+    ...(effects.attempts.length === 0 ? {} : { attempts: effects.attempts }),
+    ...(cliFailure ? { cliFailure } : {}),
     ...(delivery ? { delivery, initialPromptDelivery: delivery } : {}),
-    ...(published ? { attachmentRetained: true, attachment: { ...published } } : {})
+    recipientGrant: { path: grant.path },
+    ...(published ? { attachmentRetained: true, attachment: { ...published } } : {}),
+    ...(readiness === undefined ? {} : { readiness })
   });
 }
 
@@ -754,6 +1120,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         : undefined;
       const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
       const attachmentStore = deps.attachments ?? defaultAttachmentStore;
+      const clock = deps.clock ?? realLaunchClock;
       let initialPromptDelivery: MessageDelivery | undefined;
       let profileResolution: ProfileResolution | undefined;
       let profiles: Profile[] = [];
@@ -838,6 +1205,12 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       }
       let paneId: string | undefined;
       let tabId: string | undefined;
+      let agentStarted = false;
+      let promptSubmitted = false;
+      let recipientRegistered = false;
+      let readiness: LaunchReadinessEvidence | undefined;
+      let selectedAttemptStartedAt: number | undefined;
+      const timing: LaunchTimingEvidence = {};
       try {
         phase = "placement";
         progress(onUpdate, phase, created);
@@ -845,7 +1218,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           paneId = existingTarget!.paneId!;
           tabId = existingTarget!.tabId;
         } else if (placement.mode === "new_tab") {
-          const result = tabRefFrom(await run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...focusArgs(params.focus === true)], abortSignal, true));
+          const result = tabRefFrom(await run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...noFocusArgs()], abortSignal, true));
           tabId = result.tabId;
           paneId = result.paneId;
           created.tabId = tabId;
@@ -857,7 +1230,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           created.paneId = paneId;
           deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
         } else {
-          const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...focusArgs(params.focus === true), "--cwd", cwd], abortSignal, true));
+          const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...noFocusArgs(), "--cwd", cwd], abortSignal, true));
           paneId = result.paneId;
           tabId = result.tabId ?? deps.context.tabId!;
           created.paneId = paneId;
@@ -875,12 +1248,15 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         for (const profile of profiles) {
           const runtime = effectiveRuntimes.get(profile.name)!;
           const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path)];
+          const attemptStartedAt = clock.now();
           try {
             started = await run(deps.cli, startArgs, abortSignal, true);
-            startedAgent = agentIdentity(started, params.name, resolvedPaneId, runtime.kind);
+            agentStarted = true;
+            attempts.push({ profile: profile.name, outcome: "selected" });
+            selectedAttemptStartedAt = attemptStartedAt;
             selectedProfile = profile;
             selectedRuntime = runtime;
-            attempts.push({ profile: profile.name, outcome: "selected" });
+            startedAgent = agentIdentity(started, params.name, resolvedPaneId, runtime.kind);
             break;
           } catch (error) {
             const eligible = startFailureEvidence(error);
@@ -907,65 +1283,94 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (agentId) created.agentId = agentId;
         phase = "ready";
         progress(onUpdate, phase, created);
-        if (placement.mode === "existing_pane" && params.focus === true) await run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal);
-
-        // The start acknowledgement is not enough to dispatch into a pane that may
-        // already have been reused. Always join one fresh post-start snapshot with
-        // agent-get and pane evidence before any assignment bytes are opened.
         if (params.initialPrompt !== undefined) {
-          phase = "prompt_verification";
-          // Keep the grant alive across an arbitrarily long start before delivery.
+          // Keep the grant alive while the selected start attempt's remaining
+          // absolute startup budget is spent on read-only readiness sampling.
           await grant?.renew();
         }
-        const postStart = await freshPostStartIdentity(deps.cli, resolvedPaneId, abortSignal, params.name, chosenRuntime.kind, chosenAgent);
-        const capturedIdentity = postStart.identity;
-        agentId ??= idFrom(postStart.agent, "agent_id") ?? idFrom(postStart.agent, "id") ?? idFrom(postStart.pane, "agent_id");
+        const ready = await waitForLaunchReadiness(
+          deps.cli,
+          resolvedPaneId,
+          abortSignal,
+          params.name,
+          chosenRuntime.kind,
+          chosenAgent,
+          selectedAttemptStartedAt!,
+          params.initialPrompt !== undefined,
+          clock
+        );
+        readiness = ready.evidence;
+        timing.selectedStartReadinessMs = readiness.elapsedMs;
+        const capturedIdentity = ready.identity;
+        agentId ??= idFrom(ready.agent, "agent_id") ?? idFrom(ready.agent, "id") ?? idFrom(ready.pane, "agent_id");
+        if (params.focus === true) {
+          phase = "focus";
+          progress(onUpdate, phase, created);
+          await run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal);
+        }
         if (agentId) created.agentId = agentId;
 
         let initialPromptSent = false;
-        let promptSubmitted = false;
         let promptConsumption: PromptConsumption | undefined;
         let initialPromptSubmission: PromptSubmissionEvidence | undefined;
         let initialPromptObservation: PromptObservation | undefined;
         let promptConfirmation: PromptConfirmationEvidence | undefined;
-        let postState: Record<string, unknown> | undefined = postStart.pane;
+        let postState: Record<string, unknown> | undefined = ready.pane;
         if (params.initialPrompt !== undefined) {
-          // Baseline identity and lifecycle come only from the one authoritative
-          // agent-get record. Pane/start fields cannot fill lifecycle or identity
-          // omissions, and a non-idle baseline fails before stdin submission.
-          const baseline = promptBaseline(postStart.agent, capturedIdentity);
+          // Readiness returned this baseline from the same coherent sample that
+          // captured identity; there is no later one-shot baseline read.
+          const baseline = ready.baseline!;
           const envelope = initialPromptDelivery === "attachment"
             ? buildEnvelope(sender!, "assignment", params.initialPrompt, "attachment", { ...published!, encoding: "utf-8" })
             : buildEnvelope(sender!, "assignment", params.initialPrompt, "inline");
-          const promptResponse = await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
-          promptSubmitted = true;
-          initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity);
+          phase = "prompt_verification";
           progress(onUpdate, phase, created);
+          const promptSubmissionStartedAt = clock.now();
+          try {
+            const promptResponse = await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
+            promptSubmitted = true;
+            initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity);
+          } finally {
+            timing.promptSubmissionAckMs = monotonicDurationMs(clock, promptSubmissionStartedAt);
+          }
 
-          const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission, baseline);
-          initialPromptObservation = confirmed.observation;
-          promptConfirmation = confirmed.confirmation;
+          const confirmationStartedAt = clock.now();
+          try {
+            const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission, baseline, clock, confirmationStartedAt);
+            initialPromptObservation = confirmed.observation;
+            promptConfirmation = confirmed.confirmation;
+            timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
+            postState = confirmed.pane;
+            agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+          } catch (error) {
+            timing.postAckConfirmationMs = ((error as LaunchError).details.promptConfirmation as PromptConfirmationEvidence).elapsedMs;
+            throw error;
+          }
           promptConsumption = "confirmed";
           initialPromptSent = true;
-          postState = confirmed.pane;
-          agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
           if (agentId) created.agentId = agentId;
         }
         const authoritativeName = capturedIdentity.agentName;
         const capability = capabilities.get(chosenProfile.name)!;
         const recipient = { recipientKey: recipientKey!, paneId: resolvedPaneId, agentName: authoritativeName, ...(agentId ? { agentId } : {}), profileName: chosenProfile.name, kind: capability.kind, capable: capability.capable, reason: capability.reason };
         deps.recipients?.recordFor(chosenProfile.name, resolvedPaneId, recipient.recipientKey, capability, { ...capturedIdentity, ...(agentId ? { agentId } : {}) });
+        recipientRegistered = deps.recipients !== undefined;
         const effective = effectiveDetails(chosenProfile, chosenRuntime);
         const launchDetails: LaunchDetails = {
           operation: "launch", outcome: "launched", name: authoritativeName, kind: chosenRuntime.kind, placement, tabId, paneId: resolvedPaneId,
           ...(agentId ? { agentId } : {}),
           postState: boundAgentSessionStrings(withoutEnvironment(postState)),
+          agentStarted,
           initialPromptSent,
-          ...(params.initialPrompt === undefined ? {} : { promptSubmitted, promptConsumption }),
+          promptSubmitted,
+          recipientRegistered,
+          readiness,
+          ...(params.initialPrompt === undefined ? {} : { promptConsumption }),
           ...(initialPromptDelivery ? { initialPromptDelivery } : {}),
           ...(initialPromptSubmission ? { initialPromptSubmission: compactPromptSubmission(initialPromptSubmission) } : {}),
           ...(initialPromptObservation ? { initialPromptObservation } : {}),
           ...(promptConfirmation ? { promptConfirmation } : {}),
+          timing,
           ...(sender ? {
             sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
             envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },
@@ -981,8 +1386,15 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         };
         return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: initialPromptDelivery }) }], details: launchDetails };
       } catch (error) {
-        if (error instanceof LaunchError && attempts.length > 0 && error.details.attempts === undefined) error.details.attempts = attempts;
-        throw partialError(error, created, phase, initialPromptDelivery, published);
+        if (agentStarted && selectedAttemptStartedAt !== undefined && timing.selectedStartReadinessMs === undefined) {
+          const failureReadiness = error instanceof LaunchError && record(error.details.readiness)
+            ? error.details.readiness.elapsedMs
+            : undefined;
+          timing.selectedStartReadinessMs = typeof failureReadiness === "number" && Number.isSafeInteger(failureReadiness) && failureReadiness >= 0
+            ? failureReadiness
+            : monotonicDurationMs(clock, selectedAttemptStartedAt);
+        }
+        throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, ...(readiness === undefined ? {} : { readiness }), timing, attempts }, initialPromptDelivery, published);
       } finally {
         // The launch window is over; the directory is kept only by its own content.
         await grant?.release();

@@ -71,12 +71,55 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         diagnostic.agent_session_fingerprint = createHash("sha256").update(JSON.stringify(full)).digest("hex");
       }
     }
+    const identityTuple = [source.pane_id, source.terminal_id, source.name ?? source.agent_name, source.agent, diagnostic.agent_session_fingerprint];
+    if (identityTuple.every((field) => typeof field === "string")) {
+      diagnostic.identity_fingerprint = createHash("sha256").update(JSON.stringify(identityTuple)).digest("hex");
+    }
     return diagnostic;
+  };
+
+  const readinessDiagnostic = (details: Record<string, unknown>): Record<string, unknown> => {
+    const readiness = resultObject(details.readiness ?? {});
+    const records = Array.isArray(readiness.records) ? readiness.records.map((value) => {
+      const record = resultObject(value);
+      return { recordSource: record.source, ...diagnosticRecord(record) };
+    }) : [];
+    return {
+      budgetBasis: readiness.budgetBasis,
+      budgetMs: readiness.budgetMs,
+      elapsedMs: readiness.elapsedMs,
+      samples: readiness.samples,
+      lastPendingReason: readiness.lastPendingReason,
+      baselineRequired: readiness.baselineRequired,
+      records
+    };
+  };
+
+  const SCHEDULING_TOLERANCE_MS = 500;
+  const assertLaunchPhaseTiming = (details: Record<string, unknown>, monotonicWallElapsedMs: number, confirmationTimedOut: boolean): void => {
+    const readiness = resultObject(details.readiness);
+    const confirmation = resultObject(details.promptConfirmation);
+    const timing = resultObject(details.timing);
+    const selectedStartReadinessMs = timing.selectedStartReadinessMs;
+    const promptSubmissionAckMs = timing.promptSubmissionAckMs;
+    const postAckConfirmationMs = timing.postAckConfirmationMs;
+    for (const duration of [selectedStartReadinessMs, promptSubmissionAckMs, postAckConfirmationMs]) {
+      expect(Number.isSafeInteger(duration)).toBe(true);
+      expect(Number(duration)).toBeGreaterThanOrEqual(0);
+    }
+    const decomposedPhaseElapsedMs = Number(selectedStartReadinessMs) + Number(promptSubmissionAckMs) + Number(postAckConfirmationMs);
+    expect(decomposedPhaseElapsedMs).toBeLessThanOrEqual(monotonicWallElapsedMs + SCHEDULING_TOLERANCE_MS);
+    expect(readiness.elapsedMs).toBe(selectedStartReadinessMs);
+    expect(confirmation.elapsedMs).toBe(postAckConfirmationMs);
+    if (confirmationTimedOut) {
+      expect(Number(postAckConfirmationMs)).toBeGreaterThanOrEqual(5_000 - SCHEDULING_TOLERANCE_MS);
+      expect(Number(postAckConfirmationMs)).toBeLessThanOrEqual(monotonicWallElapsedMs + SCHEDULING_TOLERANCE_MS);
+    }
   };
 
   const recordDeliveryFailureBeforeTeardown = async (label: string, failure: { code?: string; details: Record<string, unknown> }, elapsedMs: number): Promise<void> => {
     const details = failure.details;
-    process.stderr.write(`INTEGRATION_DELIVERY_FAILURE_DETAILS ${label} ${JSON.stringify({ elapsedMs, code: failure.code, causeCode: details.causeCode, phase: details.phase, promptSubmitted: details.promptSubmitted, promptConsumption: details.promptConsumption, initialPromptSubmission: details.initialPromptSubmission, promptConfirmation: details.promptConfirmation, created: details.created })}\n`);
+    process.stderr.write(`INTEGRATION_DELIVERY_FAILURE_DETAILS ${label} ${JSON.stringify({ elapsedMs, code: failure.code, causeCode: details.causeCode, phase: details.phase, promptSubmitted: details.promptSubmitted, promptConsumption: details.promptConsumption, readiness: readinessDiagnostic(details), initialPromptSubmission: details.initialPromptSubmission, promptConfirmation: details.promptConfirmation, timing: details.timing, created: details.created })}\n`);
     const created = resultObject(details.created ?? {});
     const paneId = typeof created.paneId === "string" ? created.paneId : typeof details.paneId === "string" ? details.paneId : undefined;
     if (!paneId) return;
@@ -107,7 +150,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    * than being converted into a skipped acceptance claim.
    */
   const deliver = async (label: string, call: Promise<{ details?: Record<string, unknown> }>): Promise<{ confirmed: true; details: Record<string, unknown> }> => {
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     try {
       const result = await call;
       process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
@@ -120,8 +163,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       const attachment = resultObject(failure.details.attachment ?? {});
       if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
       process.stderr.write(`INTEGRATION_DELIVERY_FAILED ${label} code=${String(failure.code)} causeCode=${String(failure.details.causeCode)} phase=${String(failure.details.phase)}${evidence ? ` evidence=${evidence}` : ""}\n`);
-      await recordDeliveryFailureBeforeTeardown(label, { code: failure.code, details: failure.details }, Date.now() - startedAt);
-      if (failure.details.causeCode === "PROMPT_UNCONFIRMED") expect(Date.now() - startedAt).toBeLessThan(15_000);
+      await recordDeliveryFailureBeforeTeardown(label, { code: failure.code, details: failure.details }, performance.now() - startedAt);
       throw error;
     }
   };
@@ -129,17 +171,23 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   type LaunchDelivery = { confirmed: true; details: Record<string, unknown> } | { confirmed: false; details: Record<string, unknown> };
 
   const deliverLaunch = async (label: string, call: () => Promise<{ details?: Record<string, unknown> }>): Promise<LaunchDelivery> => {
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     const stdinStart = state.stdinCalls.length;
     try {
       const result = await call();
+      const wallElapsedMs = performance.now() - startedAt;
       const details = resultObject(result.details);
       expect(details).toMatchObject({
         promptSubmitted: true,
         promptConsumption: "confirmed",
-        initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt" }
+        readiness: { budgetBasis: "immediately_before_selected_agent_start", budgetMs: 120_000, elapsedMs: expect.any(Number), samples: expect.any(Number), baselineRequired: true, records: expect.any(Array) },
+        initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt" },
+        promptConfirmation: { elapsedMs: expect.any(Number) },
+        timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) }
       });
+      assertLaunchPhaseTiming(details, wallElapsedMs, false);
       expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
+      process.stderr.write(`INTEGRATION_LAUNCH_READINESS ${label} ${JSON.stringify(readinessDiagnostic(details))}\n`);
       process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
       return { confirmed: true, details };
     } catch (error) {
@@ -147,7 +195,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       if (failure.details === undefined) throw error;
       const attachment = resultObject(failure.details.attachment ?? {});
       if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
-      const elapsedMs = Date.now() - startedAt;
+      const elapsedMs = performance.now() - startedAt;
       process.stderr.write(`INTEGRATION_DELIVERY_FAILED ${label} code=${String(failure.code)} causeCode=${String(failure.details.causeCode)} phase=${String(failure.details.phase)}\n`);
       await recordDeliveryFailureBeforeTeardown(label, { code: failure.code, details: failure.details }, elapsedMs);
       if (failure.code !== "LAUNCH_FAILED" || failure.details.causeCode !== "PROMPT_UNCONFIRMED") throw error;
@@ -155,12 +203,14 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         phase: "prompt_verification",
         promptSubmitted: true,
         promptConsumption: "unconfirmed",
+        readiness: { budgetBasis: "immediately_before_selected_agent_start", budgetMs: 120_000, elapsedMs: expect.any(Number), samples: expect.any(Number), baselineRequired: true, records: expect.any(Array) },
         initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", agentSession: { source: expect.any(String), agent: expect.any(String), kind: expect.any(String), value: expect.any(String) } },
-        promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100 },
+        promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100, elapsedMs: expect.any(Number) },
+        timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
         created: expect.any(Object)
       });
       expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
-      expect(elapsedMs).toBeLessThan(15_000);
+      assertLaunchPhaseTiming(failure.details, elapsedMs, resultObject(failure.details.promptConfirmation).reason === "timeout");
       // An exact fail-closed uncertainty is a valid live outcome. The prompt may
       // have been consumed, so callers must not retry or run dependent assertions.
       return { confirmed: false, details: failure.details };
@@ -177,8 +227,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   const signal = () => new AbortController().signal;
 
   const waitForMarker = async (path: string, nonce: string, deadlineMs: number): Promise<boolean> => {
-    const deadline = Date.now() + deadlineMs;
-    while (Date.now() < deadline) {
+    const deadline = performance.now() + deadlineMs;
+    while (performance.now() < deadline) {
       const content = await readFile(path, "utf8").catch(() => undefined);
       if (content?.includes(nonce)) return true;
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -200,8 +250,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     let startupError = "";
     state.server = spawn("herdr", ["--session", REQUIRED_SESSION, "server"], { cwd: state.cwd, stdio: ["ignore", "ignore", "pipe"] });
     state.server.stderr?.on("data", (chunk: Buffer) => { startupError = (startupError + chunk.toString()).slice(-2_000); });
-    const startupDeadline = Date.now() + 10_000;
-    while (Date.now() < startupDeadline) {
+    const startupDeadline = performance.now() + 10_000;
+    while (performance.now() < startupDeadline) {
       if (state.server.exitCode !== null) throw new Error(`named Herdr server exited during startup: ${startupError}`);
       const listed = resultObject(await run("session", "list", "--json"));
       state.sessionStarted = Array.isArray(listed.sessions) && listed.sessions.some((session) => {

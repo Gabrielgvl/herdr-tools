@@ -7,7 +7,9 @@ Accepted; supersedes `docs/decisions/013-prompt-submission-acknowledgement.md`.
 ADR-013 correctly prohibited resubmission and Enter recovery, but its
 `agent_prompted` acknowledgement was too weak for `herdr_launch.initialPrompt`.
 This ADR retains the single-submit communication contract while making launch
-assignment success require semantic prompt-consumption evidence.
+assignment success require semantic prompt-consumption evidence. ADR-016 supersedes
+only this ADR's pre-submit readiness and one-shot baseline references; the separate
+post-acknowledgement 5,000 ms semantic confirmation defined here remains accepted.
 
 ## Date
 
@@ -38,21 +40,34 @@ start, sends a recovery key, falls back after prompt submission, or automaticall
 cleans partial resources. Existing zero-assignment start fallback remains governed
 by ADR-008 and can occur only before one profile successfully starts.
 
-The existing bounded launch identity preflight is unchanged. Before submission,
-one authoritative `agent get` record must independently contain the exact captured
-pane, terminal, name, kind, and complete agent-session identity plus one coherent
-lifecycle baseline:
+ADR-016 replaces the former five-second identity preflight plus later one-shot
+baseline read with one condition-based readiness loop under the selected
+agent-start attempt's existing absolute 120,000 ms budget. Each fresh sample is
+ordered snapshot, `agent get`, then pane get, carries no record across samples, and is
+evaluated only after all three reads complete. Fixed diagnostics retain completed
+current-sample projections, including agent evidence when the pane read fails, without
+using that incomplete sample for readiness. For submission readiness, that same
+sample's authoritative `agent get` record must
+independently contain the exact captured pane, terminal, name, kind, and complete
+agent-session identity plus:
 
 - `agent_status: "idle"`;
 - safe non-negative `state_change_seq`; and
 - safe non-negative `revision`.
 
-Start, snapshot, and pane fields cannot fill any baseline omission. A working,
-unknown, missing, malformed, incomplete, or replaced baseline fails before stdin
-submission.
+As clarified by ADR-016, every non-null lifecycle value from start and readiness
+records is shape-validated. Valid start lifecycle values are older process-start
+observations and never overwrite or veto the fresh agent-get anchor. Same-sample
+snapshot and pane lifecycle values must agree with the anchor when supplied, but a
+valid same-identity disagreement is sequential skew: discard the sample and resample
+without field merging or submission. Missing/null anchor metadata and valid non-idle
+state are also pending. Malformed lifecycle shapes, duplicate records, contradictory
+identity, or replacement is terminal. The readiness result returns one accepted
+coherent baseline; there is no later one-shot baseline read.
 
 After one exact identity-bound `agent_prompted` acknowledgement, launch runs a
-read-only confirmation loop for at most 5,000 ms at a 100 ms cadence. Each sample
+separate read-only confirmation loop for exactly the existing maximum 5,000 ms at a
+100 ms cadence. This window neither reuses nor extends the startup-readiness budget. Each sample
 performs sequential `agent get` then `pane get` reads under one shared cancellation
 window. No record is carried between samples. The `agent get` record is the sole
 coherent source for `agent_status`, `state_change_seq`, and `revision`; `pane get`
@@ -139,8 +154,9 @@ launch proved that its initial assignment was consumed.
   `PROMPT_UNCONFIRMED` rather than risking false success.
 - `PROMPT_UNCONFIRMED` means "not proven, possibly consumed." Callers must preserve
   effect evidence and must not retry, clean up, register, or continue dependent work.
-- An idle worker with unchanged sequence fails within about five seconds instead of
-  surfacing later through a 60-second smoke wait.
+- An idle worker with unchanged sequence after prompt acknowledgement fails within
+  the separate five-second semantic window instead of surfacing later through a
+  60-second smoke wait; pre-submit readiness uses ADR-016's start-attempt budget.
 - Partial resources and acknowledged-effect evidence remain available for manual
   diagnosis; launch never auto-cleans or resends.
 - Communication remains low-latency and non-blocking, while launch carries the

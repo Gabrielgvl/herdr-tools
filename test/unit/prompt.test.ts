@@ -100,6 +100,7 @@ describe("prompt submission acknowledgement", () => {
 
   it("validates incomplete start fields without inventing omitted identity", () => {
     expect(parsePromptTargetIdentityFields({ name: "worker", agent: "pi" }, "w1:p2")).toEqual({ agentName: "worker", agentKind: "pi" });
+    expect(joinPromptTargetIdentity([{ name: "worker", agent: "pi" }, agent], "w1:p2", { allowIncompleteFirstRecord: true })).toEqual(expected);
     expect(() => parsePromptTargetIdentityFields({ agent: "pi", agent_session: { source: "herdr:pi", agent: "claude", kind: "id", value: "replacement" } }, "w1:p2")).toThrowError(/contradictory/);
   });
 

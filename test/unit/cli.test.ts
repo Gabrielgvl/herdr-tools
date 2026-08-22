@@ -72,6 +72,46 @@ describe("HerdrCli", () => {
     });
   });
 
+  it("retains only bounded primitive diagnostics from structured CLI failures", async () => {
+    const stderrEnvelope = JSON.stringify({
+      id: "cli:agent:start",
+      error: { code: "agent_pane_busy", message: "agent target pane is not an available shell", environment: { TOKEN: "secret" } },
+      extra: { nested: "must not survive" }
+    });
+    const stderrFailure = await new HerdrCli(vi.fn<PiExec>().mockResolvedValue(response("ordinary stdout", 1, stderrEnvelope)))
+      .runJson(["agent", "start"], signal).catch((error: CliProtocolError) => error) as CliProtocolError;
+    expect(stderrFailure).toMatchObject({
+      code: "CLI_PROTOCOL_ERROR",
+      message: "agent target pane is not an available shell",
+      details: {
+        errorStream: "stderr",
+        errorEnvelope: { id: "cli:agent:start", error: { code: "agent_pane_busy", message: "agent target pane is not an available shell" } },
+        stdoutPresent: true,
+        stderrPresent: true
+      }
+    });
+    expect(stderrFailure.details).not.toHaveProperty("stdout");
+    expect(stderrFailure.details).not.toHaveProperty("stderr");
+    expect(JSON.stringify(stderrFailure.details)).not.toContain("secret");
+    expect(JSON.stringify(stderrFailure.details)).not.toContain("must not survive");
+
+    const stdoutEnvelope = JSON.stringify({ id: "cli:agent:start", error: { code: "agent_pane_busy", message: "stdout diagnostic" } });
+    await expect(new HerdrCli(vi.fn<PiExec>().mockResolvedValue(response(stdoutEnvelope, 1, "plain stderr")))
+      .runJson(["agent", "start"], signal)).rejects.toMatchObject({ details: { errorStream: "stdout", errorEnvelope: { error: { message: "stdout diagnostic" } } } });
+
+    for (const incomplete of [
+      JSON.stringify({ error: { code: "agent_pane_busy", message: "missing id" } }),
+      "[]",
+      JSON.stringify({ id: "cli:agent:start", error: [] })
+    ]) {
+      await expect(new HerdrCli(vi.fn<PiExec>().mockResolvedValue(response("", 1, incomplete)))
+        .runJson(["agent", "start"], signal)).rejects.toMatchObject({ details: { stderr: incomplete } });
+    }
+
+    await expect(new HerdrCli(vi.fn<PiExec>().mockResolvedValue(response("", 137, stderrEnvelope, true)))
+      .runJson(["agent", "start"], signal)).rejects.toMatchObject({ code: "CLI_TIMEOUT", details: { stderr: stderrEnvelope } });
+  });
+
   it("rejects malformed successful JSON and incompatible envelopes", async () => {
     const malformed = vi.fn<PiExec>().mockResolvedValue(response("not-json"));
     await expect(new HerdrCli(malformed).runJson(["api", "snapshot"], signal)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { stdout: "not-json" } });

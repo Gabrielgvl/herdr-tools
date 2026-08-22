@@ -1,5 +1,5 @@
 import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { JsonEnvelope } from "../cli.js";
+import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
@@ -14,7 +14,6 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type RuntimeProfile } from "../profiles/types.js";
-import { boundedEvidence, HERDR_AGENT_START_TIMEOUT_MS } from "../cli.js";
 import { withoutEnvironment } from "../redaction.js";
 
 export interface LaunchCli {
@@ -263,15 +262,23 @@ function compactAttemptState(pane: Record<string, unknown>): Record<string, unkn
   return result;
 }
 
+function cliErrorEnvelope(error: unknown): HerdrErrorEnvelope | undefined {
+  if (!(error instanceof CliProtocolError) || !record(error.details.errorEnvelope)) return undefined;
+  const envelope = error.details.errorEnvelope;
+  if (typeof envelope.id !== "string" || !record(envelope.error)) return undefined;
+  const { code, message } = envelope.error;
+  if (typeof code !== "string" || typeof message !== "string") return undefined;
+  return { id: envelope.id, error: { code, message } };
+}
+
 function startFailureEvidence(error: unknown): { code: string; message: string } | undefined {
-  if (!record(error) || !record(error.details)) return undefined;
-  const { exitCode, killed, stderr, stderrTruncated } = error.details;
-  if (exitCode !== 1 || killed !== false || stderrTruncated !== false || typeof stderr !== "string") return undefined;
-  let envelope: unknown;
-  try { envelope = JSON.parse(stderr); } catch { return undefined; }
-  if (!record(envelope) || envelope.id !== "cli:agent:start" || !record(envelope.error)) return undefined;
+  if (!(error instanceof CliProtocolError)) return undefined;
+  const { exitCode, killed, errorStream, stderrTruncated } = error.details;
+  if (error.code !== "CLI_PROTOCOL_ERROR" || exitCode !== 1 || killed !== false || errorStream !== "stderr" || stderrTruncated !== false) return undefined;
+  const envelope = cliErrorEnvelope(error);
+  if (!envelope || envelope.id !== "cli:agent:start") return undefined;
   if (envelope.error.code !== "agent_start_failed" || envelope.error.message !== "agent process exited before becoming interactive") return undefined;
-  return { code: envelope.error.code, message: envelope.error.message };
+  return { ...envelope.error };
 }
 
 function effectiveDetails(profile: Profile, runtime: RuntimeProfile): { runtime: Record<string, unknown>; permissions: Record<string, unknown> } {
@@ -542,6 +549,9 @@ function cliFailureEvidence(error: unknown): Record<string, unknown> | undefined
     const value = error.details[key];
     if (typeof value === "string") details[key] = boundedEvidence(value).value;
   }
+  if (error.details.errorStream === "stdout" || error.details.errorStream === "stderr") details.errorStream = error.details.errorStream;
+  const envelope = cliErrorEnvelope(error);
+  if (envelope) details.errorEnvelope = envelope;
   const code = typeof error.code === "string" ? error.code : undefined;
   const message = error instanceof Error ? boundedEvidence(error.message, 2_000).value : undefined;
   if (code === undefined && message === undefined && Object.keys(details).length === 0) return undefined;
@@ -549,14 +559,19 @@ function cliFailureEvidence(error: unknown): Record<string, unknown> | undefined
 }
 
 function partialError(error: unknown, created: LaunchResourceIds, phase: LaunchDetails["phase"], delivery?: MessageDelivery, published?: PublishedAttachment): LaunchError {
+  const transportCode = error instanceof LaunchError
+    ? error.code
+    : error instanceof CliProtocolError
+      ? error.code
+      : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
+  const backend = phase === "agent_start" ? cliErrorEnvelope(error) : undefined;
   const causeCode = error instanceof LaunchError && typeof error.details.causeCode === "string"
     ? error.details.causeCode
-    : error instanceof LaunchError ? error.code
-      : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
+    : backend?.id === "cli:agent:start" ? backend.error.code : transportCode;
   const message = error instanceof Error ? error.message : String(error);
   const code = error instanceof LaunchError && error.code === "POSTSTATE_UNAVAILABLE"
     ? "POSTSTATE_UNAVAILABLE"
-    : causeCode === "ABORTED" ? "ABORTED" : causeCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : causeCode === "READY_TIMEOUT" || (causeCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
+    : transportCode === "ABORTED" ? "ABORTED" : transportCode === "POSTSTATE_UNAVAILABLE" ? "POSTSTATE_UNAVAILABLE" : transportCode === "READY_TIMEOUT" || (transportCode === "CLI_TIMEOUT" && phase === "ready") ? "READY_TIMEOUT" : "LAUNCH_FAILED";
   const evidence = error instanceof LaunchError ? undefined : cliFailureEvidence(error);
   return new LaunchError(code, `Launch did not complete: ${message}`, {
     ...(error instanceof LaunchError ? error.details : {}),

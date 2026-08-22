@@ -34,11 +34,12 @@ const snapshot: HerdrSnapshot = {
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
 const extensionContext = { cwd: "/repo", hasUI: false } as ExtensionContext;
 const ok = (id: string, result: unknown) => ({ id, result });
-const startFailure = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", {
+const startFailure = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "agent process exited before becoming interactive", {
   exitCode: 1,
   killed: false,
+  errorStream: "stderr",
   stderrTruncated: false,
-  stderr: JSON.stringify({ id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } })
+  errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } }
 });
 const envelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const PROMPT_ARGV = (paneId: string) => ["agent", "prompt", paneId, "--stdin"];
@@ -1166,9 +1167,50 @@ describe("herdr_launch profile-only contract", () => {
       { id: "cli:agent:start", error: { code: "agent_start_transport_failed", message: "agent process exited before becoming interactive" } },
       { id: "cli:agent:start", error: { code: "agent_start_failed", message: "process exited before becoming interactive" } }
     ]) {
-      const invalid = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "failure", { exitCode: 1, killed: false, stderrTruncated: false, stderr: JSON.stringify(errorEnvelope) }); } });
+      const invalid = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "failure", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope }); } });
       await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), invalid.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
       expect(invalid.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    }
+  });
+
+  it("projects structured start diagnostics without promoting backend codes to transport outcomes", async () => {
+    for (const backendCode of ["agent_pane_busy", "ABORTED"]) {
+      const failure = new CliProtocolError("CLI_PROTOCOL_ERROR", "agent target pane is not an available shell", {
+        exitCode: 1,
+        killed: false,
+        stdoutPresent: false,
+        stdoutBytes: 0,
+        stderrPresent: true,
+        stderrBytes: 128,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        errorStream: "stderr",
+        errorEnvelope: { id: "cli:agent:start", error: { code: backendCode, message: "agent target pane is not an available shell" } }
+      });
+      const harness = makeCli({ start: () => { throw failure; } });
+      await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: {
+          phase: "agent_start",
+          causeCode: backendCode,
+          cliFailure: {
+            code: "CLI_PROTOCOL_ERROR",
+            details: {
+              errorStream: "stderr",
+              errorEnvelope: { id: "cli:agent:start", error: { code: backendCode, message: "agent target pane is not an available shell" } }
+            }
+          }
+        }
+      });
+      expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    }
+
+    for (const errorEnvelope of [null, { id: 1, error: {} }, { id: "cli:agent:start", error: [] }, { id: "cli:agent:start", error: { code: 1, message: false } }]) {
+      const malformed = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "generic failure", { killed: false, errorEnvelope }); } });
+      await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), malformed.cli)).rejects.toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: { causeCode: "CLI_PROTOCOL_ERROR" }
+      });
     }
   });
 

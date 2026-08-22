@@ -23,12 +23,21 @@ export interface JsonEnvelope {
   result: unknown;
 }
 
+export interface HerdrErrorEnvelope {
+  id: string;
+  error: {
+    code: string;
+    message: string;
+  };
+}
+
 export interface CliTextResult {
   value: string;
   truncated: boolean;
 }
 
 const MAX_EVIDENCE_BYTES = 50_000;
+const MAX_ERROR_FIELD_BYTES = 4_096;
 export const HERDR_AGENT_START_TIMEOUT_MS = 120_000;
 export const HERDR_AGENT_START_EXEC_MARGIN_MS = 5_000;
 
@@ -36,6 +45,26 @@ export const HERDR_AGENT_START_EXEC_MARGIN_MS = 5_000;
 export function boundedEvidence(value: string, limit = MAX_EVIDENCE_BYTES): { value: string; content: string; truncated: boolean } {
   const result = truncateTail(value, { maxBytes: limit, maxLines: 2_000 });
   return { value: result.truncated ? `${result.content}\n[output truncated]` : result.content, content: result.content, truncated: result.truncated };
+}
+
+function boundedErrorField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_ERROR_FIELD_BYTES
+    ? value
+    : undefined;
+}
+
+/** Parse a complete Herdr error response and retain only bounded primitive diagnostics. */
+function parseErrorEnvelope(value: string): HerdrErrorEnvelope | undefined {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return undefined; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const candidate = parsed as { id?: unknown; error?: unknown };
+  if (typeof candidate.error !== "object" || candidate.error === null || Array.isArray(candidate.error)) return undefined;
+  const error = candidate.error as { code?: unknown; message?: unknown };
+  const id = boundedErrorField(candidate.id);
+  const code = boundedErrorField(error.code);
+  const message = boundedErrorField(error.message);
+  return id && code && message ? { id, error: { code, message } } : undefined;
 }
 
 /** Classify a rejected `--stdin` invocation from process text that is never exposed. */
@@ -71,14 +100,32 @@ function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES, input?:
   }
   const stdout = boundedEvidence(result.stdout, limit);
   const stderr = boundedEvidence(result.stderr, limit);
+  const stderrEnvelope = !result.killed && !stderr.truncated ? parseErrorEnvelope(result.stderr) : undefined;
+  const stdoutEnvelope = !result.killed && !stdout.truncated ? parseErrorEnvelope(result.stdout) : undefined;
+  const selected = stderrEnvelope
+    ? { stream: "stderr" as const, envelope: stderrEnvelope }
+    : stdoutEnvelope ? { stream: "stdout" as const, envelope: stdoutEnvelope } : undefined;
   const code: CliFailureCode = result.killed ? "CLI_TIMEOUT" : "CLI_PROTOCOL_ERROR";
-  return new CliProtocolError(code, "Herdr CLI did not return a usable response", {
+  return new CliProtocolError(code, selected?.envelope.error.message ?? "Herdr CLI did not return a usable response", {
     exitCode: result.code,
     killed: result.killed,
-    stdout: stdout.value,
-    stderr: stderr.value,
-    stdoutTruncated: stdout.truncated,
-    stderrTruncated: stderr.truncated
+    ...(selected
+      ? {
+          stdoutPresent: result.stdout.length > 0,
+          stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
+          stderrPresent: result.stderr.length > 0,
+          stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
+          stdoutTruncated: stdout.truncated,
+          stderrTruncated: stderr.truncated,
+          errorStream: selected.stream,
+          errorEnvelope: selected.envelope
+        }
+      : {
+          stdout: stdout.value,
+          stderr: stderr.value,
+          stdoutTruncated: stdout.truncated,
+          stderrTruncated: stderr.truncated
+        })
   });
 }
 

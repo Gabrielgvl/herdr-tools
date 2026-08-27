@@ -99,6 +99,7 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
     }),
     runJson: vi.fn<LaunchCli["runJson"]>(async (argv) => {
       calls.push(argv);
+      if (argv[0] === "pane" && argv[1] === "current") return ok("current", { type: "pane_current", pane: { pane_id: context.paneId, tab_id: context.tabId, workspace_id: context.workspaceId } });
       if (argv[0] === "api") {
         const currentSnapshot = starts === 0 ? liveSnapshot : {
           ...liveSnapshot,
@@ -2320,7 +2321,7 @@ describe("herdr_launch profile-only contract", () => {
       runJsonWithStdin: vi.fn(async (argv, input, signal, preserve) => { order.push(argv.slice(0, 2).join(" ")); return base.cli.runJsonWithStdin!(argv, input, signal, preserve); })
     };
     const result = await launch({ name: "worker", profile: "worker", initialPrompt: "begin" }, catalog(worker), cli, promptSources);
-    expect(order.slice(0, 4)).toEqual(["source", "api snapshot", "pane split", "pane rename"]);
+    expect(order.slice(0, 5)).toEqual(["source", "pane current", "api snapshot", "pane split", "pane rename"]);
     // The wrapped envelope travels over stdin, never in argv.
     expect(base.calls).toContainEqual(PROMPT_ARGV("w1:p2"));
     expect(base.stdinInputs).toEqual([envelope("begin")]);
@@ -2434,6 +2435,7 @@ describe("herdr_launch profile-only contract", () => {
     const existingIdentity = { terminal_id: "terminal-existing", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing" } };
     let existingStarted = false;
     const existingCli: LaunchCli = { runJson: vi.fn(async (argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return ok("current", { type: "pane_current", pane: existing.panes[0] });
       if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: existingStarted ? { ...existing, panes: [{ ...existing.panes[0]!, agent_name: "worker", agent: "pi", ...existingIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...existingIdentity }] } : existing });
       if (argv[0] === "agent" && argv[1] === "start") { existingStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...existingIdentity } }); }
       if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...existingIdentity } });

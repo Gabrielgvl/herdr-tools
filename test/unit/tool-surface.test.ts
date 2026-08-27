@@ -42,6 +42,7 @@ function fakeExec(): { exec: PiExec; calls: string[][] } {
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
     calls.push(argv);
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
+    if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: snapshot.snapshot.panes[0] });
     if (argv[0] === "api") return envelope("snapshot", snapshot);
     if (argv[0] === "pane" && argv[1] === "get") {
       const pane = snapshot.snapshot.panes.find((item) => item.pane_id === argv[2]) ?? { pane_id: argv[2], tab_id: "w:t", workspace_id: "w", label: "created", agent_status: "idle" };

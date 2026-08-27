@@ -307,6 +307,7 @@ describe("profile catalog", () => {
     const identity = { terminal_id: "terminal-a", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-a" } };
     const cli = { runJson: async (argv: string[]) => {
       calls.push(argv);
+      if (argv[0] === "pane" && argv[1] === "current") return { id: "current", result: { type: "pane_current", pane: snapshot.snapshot.panes[0] } };
       if (argv[0] === "api") return { id: "snapshot", result: started ? { ...snapshot, snapshot: { ...snapshot.snapshot, panes: [...snapshot.snapshot.panes, { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent_name: lastName, agent: "pi", ...identity }], agents: [{ pane_id: "w:p2", name: lastName, agent: "pi", ...identity }] } } : snapshot };
       if (argv[0] === "pane" && argv[1] === "split") return { id: "split", result: { pane: { pane_id: "w:p2", tab_id: "w:t" } } };
       if (argv[0] === "pane" && argv[1] === "rename") return { id: "rename", result: {} };

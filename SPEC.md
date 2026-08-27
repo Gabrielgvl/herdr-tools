@@ -76,7 +76,7 @@ Herdr 0.8 does not expose conditional compare-and-send or compare-and-close flag
 
 For pane/agent operations, an exact pane label or unique agent name is resolved to an authoritative pane/agent record before mutation. For tab operations, stable tab IDs and `current` are accepted; tab labels are not silently treated as pane labels. Collection inspection is scoped to the current Herdr context and uses authoritative collection results.
 
-The caller's context is taken from Herdr-injected IDs (`HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, `HERDR_PANE_ID`) and authoritative CLI reads. If those values are missing or inconsistent, health reports the condition and operations requiring that context fail closed.
+The caller's injected IDs (`HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, `HERDR_PANE_ID`) are required syntactic bootstrap identity, not an immutable topology snapshot. Every context-dependent operation reads `herdr pane current --current`, using the injected pane identity as the selection anchor, then verifies the returned effective pane against one authoritative `api snapshot`. Herdr may return a new public pane ID for an old pane alias. When that happens, both records must carry the same terminal identity. The live tab and workspace become the effective context, so a pane move can rebind stale ancestors. A small bounded retry may handle a concurrent move. Missing, malformed, unresolved, duplicate, incoherent, replaced, or persistently racing identity fails closed. Health reports the injected presence and validity flags and does not call stale ancestor IDs malformed.
 
 ## Common schemas and result rules
 
@@ -123,7 +123,7 @@ Expected domain failures are represented by a stable error code, concise summary
 
 Rules:
 
-- `context` is the default, resolves the caller's current pane/context, and uses the same single-target payload: authoritative metadata plus at most the 100 most recent unwrapped output lines, in order.
+- `context` is the default, resolves the caller's current pane/context through the shared live context resolver, and uses the same single-target payload: authoritative metadata plus at most the 100 most recent unwrapped output lines, in order. Its structured details visibly include injected IDs, effective IDs, and whether rebinding occurred.
 - `target` reads exactly one resolved pane/agent target and returns authoritative metadata plus at most the 100 most recent unwrapped output lines, in order. The line cap is fixed and cannot be overridden by the tool call.
 - `collection` returns compact metadata only for the requested current-context collection. It does not include pane transcripts, full process output, or a per-item 100-line payload.
 - `health` returns environment presence, client status/version, server status/version, socket reachability as available, and an explicit client/server compatibility result. Secret values and full socket paths are not exposed; presence and safe diagnostic labels are sufficient.
@@ -565,6 +565,7 @@ Mock `pi.exec`, CLI stdout/stderr/exit codes, target listings, post-state reads,
 - disabled registration and exact seven-tool registration;
 - strict schemas and cross-field validation;
 - exact ID/current/label/name resolution, missing and ambiguous matches;
+- live caller-context rebinding after same-workspace and cross-workspace pane moves, unchanged coherent reads, bounded concurrent-move retry, unresolved/duplicate/incoherent/replaced/racing reads, and visible inspect diagnostics;
 - current-context protection from UI focus;
 - single-target 100-line inspect cap and collection compactness;
 - health environment and client/server compatibility reporting;

@@ -288,7 +288,20 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
           if (promptFlag >= 0 && typeof args[promptFlag + 1] === "string") state.profilePromptContent = await readFile(args[promptFlag + 1]!, "utf8");
         }
         try {
-          const result = await execFileAsync(command, ["--session", REQUIRED_SESSION, ...args], { cwd: state.cwd, encoding: "utf8", maxBuffer: 2_000_000, signal: options?.signal, timeout: options?.timeout });
+          const result = await execFileAsync(command, ["--session", REQUIRED_SESSION, ...args], {
+            cwd: state.cwd,
+            encoding: "utf8",
+            maxBuffer: 2_000_000,
+            signal: options?.signal,
+            timeout: options?.timeout,
+            env: {
+              ...process.env,
+              HERDR_ENV: "1",
+              HERDR_WORKSPACE_ID: state.workspaceId,
+              HERDR_TAB_ID: state.rootTabId,
+              HERDR_PANE_ID: state.rootPaneId
+            }
+          });
           return { stdout: String(result.stdout), stderr: String(result.stderr), code: 0, killed: false };
         } catch (error) {
           const failed = error as Error & { stdout?: string | Buffer; stderr?: string | Buffer; code?: number; killed?: boolean };

@@ -65,6 +65,7 @@ function makeCli(finalSnapshot: HerdrSnapshot, options: { waitError?: Error; dis
   let wait = false;
   const initialSnapshot = options.initialSnapshot ?? snapshot();
   const runJson = vi.fn(async (argv: string[], signal: AbortSignal): Promise<JsonEnvelope> => {
+    if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: callerPane });
     calls.push(argv);
     signals.push(signal);
     if (argv[0] === "api") {
@@ -348,6 +349,7 @@ describe("explicit turn control", () => {
     const changed = makeCli(snapshot(workerPane("idle", 11)));
     changed.runJson.mockImplementation(async (argv: string[]) => {
       changed.calls.push(argv);
+      if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: callerPane });
       if (argv[0] === "api") return resultForSnapshot(snapshot());
       if (argv[0] === "agent" && argv[1] === "get") return responseForAgent(workerAgent("working", 10, { terminal_id: "term-replaced" }));
       throw new Error(`unexpected ${argv.join(" ")}`);

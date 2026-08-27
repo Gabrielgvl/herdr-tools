@@ -1,5 +1,6 @@
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
+import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver, type EffectiveContext } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { recordCreatedResource, runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { paneCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
@@ -12,6 +13,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 export interface PaneDetails {
   operation: PaneParams["operation"];
   outcome: "success" | "reconciled";
+  contextRebinding?: ContextResolutionDiagnostics;
   paneId?: string;
   tabId?: string;
   workspaceId?: string;
@@ -26,6 +28,7 @@ export interface PaneDetails {
 export interface PaneDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  contextResolver?: ContextResolver;
   preflight: CompatibilityPreflight;
   cwd?: string;
   ownership?: RuntimeOwnership;
@@ -87,20 +90,7 @@ function layoutFrom(value: unknown): { tabId: string; focusedPaneId: string; pan
   return { tabId, focusedPaneId, panes };
 }
 
-function assertContext(snapshot: HerdrSnapshot, context: CurrentContext): void {
-  if (!context.workspaceId || !context.tabId || !context.paneId) {
-    throw Object.assign(new Error("CONTEXT_UNAVAILABLE: current Herdr context is unavailable"), { code: "CONTEXT_UNAVAILABLE" });
-  }
-  const workspace = snapshot.workspaces.find((item) => item.workspace_id === context.workspaceId);
-  const tab = snapshot.tabs.find((item) => item.tab_id === context.tabId);
-  const pane = snapshot.panes.find((item) => item.pane_id === context.paneId);
-  if (!workspace || !tab || !pane || tab.workspace_id !== workspace.workspace_id || pane.tab_id !== tab.tab_id || pane.workspace_id !== workspace.workspace_id) {
-    throw Object.assign(new Error("CONTEXT_UNAVAILABLE: injected Herdr context is inconsistent"), { code: "CONTEXT_UNAVAILABLE" });
-  }
-}
-
 function stateTarget(snapshot: HerdrSnapshot, ref: string | undefined, context: CurrentContext): ResolvedTarget {
-  assertContext(snapshot, context);
   return resolvePaneRef(snapshot, ref ?? "current", context);
 }
 
@@ -151,10 +141,10 @@ async function focusExactPane(cli: HerdrCli, target: ResolvedTarget, signal: Abo
   throw Object.assign(new Error("Herdr could not reach the exact pane through authoritative layout"), { code: "CLI_PROTOCOL_ERROR" });
 }
 
-async function closePane(deps: PaneDependencies, params: Extract<PaneParams, { operation: "close" }>, signal: AbortSignal): Promise<PaneDetails> {
-  const before = await readSnapshot(deps.cli, signal);
-  const target = stateTarget(before, params.target, deps.context);
-  const validation = validateClose(paneCloseTopology(before, deps.context), { kind: "pane", id: target.id, parentId: target.tabId });
+async function closePane(deps: PaneDependencies, params: Extract<PaneParams, { operation: "close" }>, signal: AbortSignal, effective: EffectiveContext): Promise<PaneDetails> {
+  const before = effective.snapshot;
+  const target = stateTarget(before, params.target, effective.context);
+  const validation = validateClose(paneCloseTopology(before, effective.context), { kind: "pane", id: target.id, parentId: target.tabId });
   if (!validation.allowed) {
     throw Object.assign(new Error(`${validation.code}: pane close is not permitted`), { code: validation.code, details: { resourceIds: validation.resourceIds } });
   }
@@ -180,11 +170,13 @@ async function closePane(deps: PaneDependencies, params: Extract<PaneParams, { o
     ...(closed.reconciled ? { reconciliation: { targetAbsent: true, causality: "absence_proven_only" as const, operationIdAvailable: false } } : {}),
     removedIds: removed,
     containingContext: { tabId: target.tabId, workspaceId: target.workspaceId },
-    postState: topologySummary(closed.readback)
+    postState: topologySummary(closed.readback),
+    ...contextRebindingDetails(effective.diagnostics)
   };
 }
 
 export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof PaneParamsSchema, PaneDetails> {
+  const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   return {
     name: "herdr_pane",
     label: "Herdr Pane",
@@ -198,8 +190,9 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         await deps.preflight(activeSignal);
         assertSafeIdentifier(params.label, "label");
         assertSafeEnvironment(params.env);
-        const snapshot = await readSnapshot(deps.cli, activeSignal);
-        const target = stateTarget(snapshot, params.target, deps.context);
+        const effective = await contextResolver(activeSignal);
+        const snapshot = effective.snapshot;
+        const target = stateTarget(snapshot, params.target, effective.context);
         const newPaneResponse = await deps.cli.runJson([
           "pane", "split", target.id, "--direction", params.direction ?? "right",
           "--cwd", params.cwd ?? deps.cwd ?? ctx.cwd,
@@ -210,20 +203,21 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         recordCreatedResource({ kind: "pane", id: paneId, parentId: target.tabId }, deps.ownership ?? runtimeOwnership);
         await deps.cli.runJson(["pane", "rename", paneId, params.label], activeSignal);
         const postState = await readPane(deps.cli, paneId, activeSignal);
-        return result({ operation: "split", outcome: "success", paneId, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "split", paneId);
+        return result({ operation: "split", outcome: "success", paneId, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "split", paneId);
       }
       if (params.operation === "move") {
         await deps.preflight(activeSignal);
-        const snapshot = await readSnapshot(deps.cli, activeSignal);
-        const source = stateTarget(snapshot, params.target, deps.context);
+        const effective = await contextResolver(activeSignal);
+        const snapshot = effective.snapshot;
+        const source = stateTarget(snapshot, params.target, effective.context);
         const destination = params.destination;
         let argv = ["pane", "move", source.id];
         if (destination.kind === "tab") {
-          const tab = exactTabTarget(snapshot, destination.target, deps.context);
+          const tab = exactTabTarget(snapshot, destination.target, effective.context);
           argv = [...argv, "--tab", tab.id, "--split", params.direction ?? "right"];
         } else {
           assertSafeIdentifier(destination.label, "destination.label");
-          argv = [...argv, "--new-tab", "--workspace", deps.context.workspaceId!, "--label", destination.label];
+          argv = [...argv, "--new-tab", "--workspace", effective.context.workspaceId, "--label", destination.label];
         }
         argv = [...argv, ...(params.focus ? ["--focus"] : ["--no-focus"] )];
         const moved = await deps.cli.runJson(argv, activeSignal);
@@ -235,55 +229,61 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
           if (source.id === paneId) ledger.record({ kind: "pane", id: paneId, parentId: postState.tab_id });
           else ledger.transfer({ kind: "pane", id: source.id }, { kind: "pane", id: paneId, parentId: postState.tab_id });
         }
-        return result({ operation: "move", outcome: "success", paneId, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "move", paneId);
+        return result({ operation: "move", outcome: "success", paneId, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "move", paneId);
       }
       if (params.operation === "rename") {
         assertSafeIdentifier(params.label, "label");
         await deps.preflight(activeSignal);
-        const snapshot = await readSnapshot(deps.cli, activeSignal);
-        const target = stateTarget(snapshot, params.target, deps.context);
+        const effective = await contextResolver(activeSignal);
+        const snapshot = effective.snapshot;
+        const target = stateTarget(snapshot, params.target, effective.context);
         await deps.cli.runJson(["pane", "rename", target.id, params.label], activeSignal);
         const postState = await readPane(deps.cli, target.id, activeSignal);
-        return result({ operation: "rename", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "rename", postState.pane_id);
+        return result({ operation: "rename", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "rename", postState.pane_id);
       }
       if (params.operation === "focus") {
         await deps.preflight(activeSignal);
-        const snapshot = await readSnapshot(deps.cli, activeSignal);
-        const target = stateTarget(snapshot, params.target, deps.context);
+        const effective = await contextResolver(activeSignal);
+        const snapshot = effective.snapshot;
+        const target = stateTarget(snapshot, params.target, effective.context);
         await focusExactPane(deps.cli, target, activeSignal);
         const postState = await readPane(deps.cli, target.id, activeSignal);
-        return result({ operation: "focus", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "focus", postState.pane_id);
+        return result({ operation: "focus", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "focus", postState.pane_id);
       }
       if (params.operation === "resize") {
         if (typeof params.amount !== "number" || !Number.isFinite(params.amount) || params.amount <= 0) throw Object.assign(new Error("resize amount must be finite and positive"), { code: "INVALID_INPUT" });
         await deps.preflight(activeSignal);
-        const snapshot = await readSnapshot(deps.cli, activeSignal);
-        const target = stateTarget(snapshot, params.target, deps.context);
+        const effective = await contextResolver(activeSignal);
+        const snapshot = effective.snapshot;
+        const target = stateTarget(snapshot, params.target, effective.context);
         await deps.cli.runJson(["pane", "resize", "--direction", params.direction, "--amount", String(params.amount), "--pane", target.id], activeSignal);
         const postState = await readPane(deps.cli, target.id, activeSignal);
-        return result({ operation: "resize", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "resize", postState.pane_id);
+        return result({ operation: "resize", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "resize", postState.pane_id);
       }
       if (params.operation === "swap") {
         await deps.preflight(activeSignal);
-        const snapshot = await readSnapshot(deps.cli, activeSignal);
-        const source = stateTarget(snapshot, params.source, deps.context);
+        const effective = await contextResolver(activeSignal);
+        const snapshot = effective.snapshot;
+        const source = stateTarget(snapshot, params.source, effective.context);
         const withTarget = params.with;
-        const argv = ["pane", "swap", ...(isDirection(withTarget) ? ["--direction", withTarget, "--pane", source.id] : ["--source-pane", source.id, "--target-pane", resolvePaneRef(snapshot, withTarget, deps.context).id])];
+        const argv = ["pane", "swap", ...(isDirection(withTarget) ? ["--direction", withTarget, "--pane", source.id] : ["--source-pane", source.id, "--target-pane", resolvePaneRef(snapshot, withTarget, effective.context).id])];
         await deps.cli.runJson(argv, activeSignal);
         const postState = await readPane(deps.cli, source.id, activeSignal);
-        return result({ operation: "swap", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "swap", postState.pane_id);
+        return result({ operation: "swap", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "swap", postState.pane_id);
       }
       if (params.operation === "zoom") {
         await deps.preflight(activeSignal);
-        const snapshot = await readSnapshot(deps.cli, activeSignal);
-        const target = stateTarget(snapshot, params.target, deps.context);
+        const effective = await contextResolver(activeSignal);
+        const snapshot = effective.snapshot;
+        const target = stateTarget(snapshot, params.target, effective.context);
         const mode = params.mode ?? "toggle";
         await deps.cli.runJson(["pane", "zoom", target.id, `--${mode}`], activeSignal);
         const postState = await readPane(deps.cli, target.id, activeSignal);
-        return result({ operation: "zoom", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "zoom", postState.pane_id);
+        return result({ operation: "zoom", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "zoom", postState.pane_id);
       }
       await deps.preflight(activeSignal);
-      const details = await closePane(deps, params, activeSignal);
+      const effective = await contextResolver(activeSignal);
+      const details = await closePane(deps, params, activeSignal, effective);
       return { content: [{ type: "text", text: formatResult({ operation: "pane", outcome: details.outcome, targetId: details.paneId }) }], details };
     },
     renderCall(args, theme) {

@@ -39,6 +39,14 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function returnedPane(result: unknown): Record<string, unknown> {
+  const root = record(result);
+  const candidate = root.pane ?? record(root.split_result ?? root.move_result).pane;
+  const pane = record(candidate);
+  if (typeof pane.pane_id !== "string" || pane.pane_id.length === 0) throw new Error("integration mutation omitted its pane ID");
+  return pane;
+}
+
 /** The bounded structured evidence block the adapter appends, or the sole JSON block. */
 function evidence(result: ToolResult): Record<string, unknown> {
   const details = result.content.find((block) => block.text.startsWith("herdr-details\n"));
@@ -201,6 +209,19 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const rootPane = fixturePanes.find((pane) => pane.workspace_id === workspaceId);
       if (!rootPane || typeof rootPane.pane_id !== "string" || typeof rootPane.tab_id !== "string") throw new Error("fixture snapshot omitted its root pane context");
 
+      // Reproduce the stale-terminal topology: create a pane, move that same
+      // pane to a new tab, then start MCP with the original tab ID.
+      const contextSplit = record(record(await runNamed(["pane", "split", rootPane.pane_id, "--direction", "right", "--cwd", cwd, "--no-focus"])).result);
+      const splitPane = returnedPane(contextSplit);
+      const originalPaneId = String(splitPane.pane_id);
+      const originalTabId = rootPane.tab_id;
+      const moved = record(record(await runNamed(["pane", "move", String(splitPane.pane_id), "--new-tab", "--workspace", workspaceId, "--label", `${label}-moved`, "--no-focus"])).result);
+      const movedPane = returnedPane(moved);
+      const afterMove = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);
+      const movedRecord = (Array.isArray(afterMove.panes) ? afterMove.panes.map(record) : []).find((pane) => pane.pane_id === movedPane.pane_id);
+      if (!movedRecord || typeof movedRecord.tab_id !== "string" || typeof movedRecord.workspace_id !== "string" || movedRecord.tab_id === originalTabId) throw new Error("pane move did not produce a new authoritative tab context");
+      const movedTabId = movedRecord.tab_id;
+
       // The socket path is the only thing that binds the server to the
       // disposable session; every `herdr` call it makes inherits it.
       const transport = new StdioClientTransport({
@@ -212,8 +233,10 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
           HERDR_ENV: "1",
           HERDR_SOCKET_PATH: socketPath,
           HERDR_WORKSPACE_ID: workspaceId,
-          HERDR_TAB_ID: rootPane.tab_id,
-          HERDR_PANE_ID: rootPane.pane_id,
+          // Deliberately preserve the tab ID captured before the move. The
+          // resolver must rebind it from the live pane without changing pane ID.
+          HERDR_TAB_ID: originalTabId,
+          HERDR_PANE_ID: originalPaneId,
           CLAUDE_PROJECT_DIR: cwd
         },
         stderr: "pipe"
@@ -229,6 +252,16 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         expect(text(result), name).not.toContain(ENVIRONMENT_SENTINEL);
         return result;
       };
+
+      const reboundContext = await call("herdr_inspect", { mode: "context" });
+      expect(reboundContext.isError).toBeUndefined();
+      expect(evidence(reboundContext)).toMatchObject({
+        context: {
+          injected: { workspaceId, tabId: originalTabId, paneId: originalPaneId },
+          effective: { workspaceId, tabId: movedTabId, paneId: String(movedPane.pane_id) },
+          rebound: true
+        }
+      });
 
       const listed = await client.listTools();
       expect(listed.tools.map((tool) => tool.name)).toEqual([...CORE_TOOL_NAMES]);
@@ -319,7 +352,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max" } }
       });
       assertLaunchPhaseTiming(launchEvidence, launchElapsedMs, false);
-      expect(record(launchEvidence.sender).paneId).toBe(rootPane.pane_id);
+      expect(record(launchEvidence.sender).paneId).toBe(String(movedPane.pane_id));
       expect(record(record(launchEvidence.profile).source).kind).toBe("bundled");
 
       const confirmedState = record(launchEvidence.initialPromptObservation).state;
@@ -333,7 +366,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       // interrupt one.
       const communicated = await call("herdr_communicate", { target: workerPaneId, operation: "steer", text: "Also report the current user." });
       expect(communicated.isError, text(communicated)).toBeUndefined();
-      expect(evidence(communicated)).toMatchObject({ operation: "steer", envelope: { version: "v1", kind: "steer" }, sender: { paneId: rootPane.pane_id } });
+      expect(evidence(communicated)).toMatchObject({ operation: "steer", envelope: { version: "v1", kind: "steer" }, sender: { paneId: String(movedPane.pane_id) } });
       const transcript = await call("herdr_inspect", { mode: "target", target: workerPaneId });
       expect(JSON.stringify(evidence(transcript).recentUnwrappedLines)).toContain("[HERDR AGENT MESSAGE v1]");
       const unsupervised = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 31 * 60_000, runInBackground: false });

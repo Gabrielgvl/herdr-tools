@@ -40,6 +40,7 @@ function makeCli(initial: State = "idle", options: { postState?: State } = {}) {
   let state = initial;
   const response = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+    if (argv[0] === "pane" && argv[1] === "current") return response("current", { type: "pane_current", pane: callerPane });
     calls.push(argv);
     if (argv[0] === "api") {
       return response("snapshot-1", { snapshot: { ...baseSnapshot, panes: [{ ...callerPane }, { ...basePane, agent_status: state }], agents: [{ ...baseSnapshot.agents[0]! }, { ...baseSnapshot.agents[1]!, agent_status: state }] }, type: "session_snapshot" });
@@ -157,10 +158,11 @@ describe("herdr_communicate", () => {
   it("fails with unavailable sender before any send when caller is absent", async () => {
     const harness = makeCli();
     harness.exec.mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return stdinResponse("current", { type: "pane_current", pane: callerPane });
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [basePane] } } }), stderr: "", code: 0, killed: false };
       throw new Error(`unexpected mutation: ${argv.join(" ")}`);
     });
-    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "do not send" })).rejects.toMatchObject({ code: "SENDER_IDENTITY_UNAVAILABLE" });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "do not send" })).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
   });
 
@@ -214,13 +216,14 @@ describe("herdr_communicate", () => {
     const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
       calls.push(argv);
       const response = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
-      if (argv[0] === "api") return response("snapshot", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [basePane], agents: [baseSnapshot.agents[1]!] } });
+      if (argv[0] === "pane" && argv[1] === "current") return response("current", { type: "pane_current", pane: callerPane });
+      if (argv[0] === "api") return response("snapshot", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, basePane], agents: [baseSnapshot.agents[0]!, baseSnapshot.agents[1]!] } });
       if (argv[0] === "pane" && argv[1] === "get") return response("pane", { pane: basePane });
       if (argv[0] === "agent" && argv[1] === "send-keys") return response("keys", { ok: true });
       throw new Error(`unexpected argv ${argv.join(" ")}`);
     });
     const result = await execute(new HerdrCli(exec), { target: "reviewer", operation: "keys", keys: ["enter"] });
-    expect(calls).toEqual([["api", "snapshot"], ["pane", "get", "w1:p2"], ["agent", "send-keys", "w1:p2", "enter"], ["pane", "get", "w1:p2"]]);
+    expect(calls).toEqual([["pane", "current", "--current"], ["api", "snapshot"], ["pane", "get", "w1:p2"], ["agent", "send-keys", "w1:p2", "enter"], ["pane", "get", "w1:p2"]]);
     expect(result.details).not.toHaveProperty("sender");
     expect(result.details).not.toHaveProperty("envelope");
   });
@@ -471,6 +474,7 @@ describe("herdr_communicate", () => {
 
     const keysFailure = makeCli();
     keysFailure.exec.mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return stdinResponse("current", { type: "pane_current", pane: callerPane });
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot-1", result: { type: "session_snapshot", snapshot: baseSnapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane") return { stdout: JSON.stringify({ id: "pane-1", result: { pane: { ...basePane, agent_status: "idle" } } }), stderr: "", code: 0, killed: false };
       return { stdout: "", stderr: "keys rejected", code: 1, killed: false };

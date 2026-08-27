@@ -143,10 +143,12 @@ export function callTool(request: {
 `src/mcp/run.ts` performs these checks in order, before connecting the transport. Any failure writes one bounded stderr line and exits non-zero with no tools registered and no CLI call made.
 
 1. `HERDR_ENV === "1"`.
-2. `readInjectedContext(process.env)` reports `idsPresent && idsValid`, giving the authoritative workspace/tab/pane context.
+2. `readInjectedContext(process.env)` reports `idsPresent && idsValid`, providing syntactic bootstrap identity for the workspace, tab, and pane.
 3. `CLAUDE_PROJECT_DIR` is present, absolute (`path.isAbsolute`), and an existing directory (`fs.stat().isDirectory()`).
 
 The resolved `CLAUDE_PROJECT_DIR` is used as both the profile-discovery `projectCwd` and the operational `cwd`. `process.cwd()` is never read, and no path is derived from `import.meta.url` except the bundled profile directory, which keeps its current module-relative resolution.
+
+After startup, each context-dependent tool call reads `herdr pane current --current`, using the injected pane identity as the selection anchor, then verifies the returned effective pane against one authoritative `herdr api snapshot`. A Herdr alias may return a new public pane ID after a move. That changed ID is accepted only when the live and snapshot records carry the same terminal identity. The live tab and workspace IDs are the effective caller context, so stale ancestors after a pane move do not brick the tools. A bounded retry covers a concurrent move read. Missing or malformed injected identity, an unresolved or duplicate caller pane, incoherent relationships, pane replacement, protocol failure, or persistent topology drift fails closed. `herdr_inspect` context details expose injected and effective IDs plus `rebound`; other successful calls expose bounded `contextRebinding` details only when a rebind occurred. Health retains syntactic environment reporting and does not call stale ancestor IDs malformed.
 
 Herdr CLI compatibility is not probed at startup. It stays per-call through the existing `preflightCompatibility` seam, so the health contract, error codes, and fail-closed behavior are identical to the Pi host.
 
@@ -244,6 +246,7 @@ Inside a running session the owner switches with `/model fable`. Server registra
 
 ```text
 src/tool-surface.ts                                   shared construction of the seven tools
+src/context.ts                                        live effective caller-context resolver
 src/mcp/host.ts                                       env gating, cwd resolution, host capability proxy
 src/mcp/adapter.ts                                    descriptors, input validation, result/error mapping
 src/mcp/run.ts                                        stdio server wiring and lifecycle
@@ -302,6 +305,7 @@ No compatibility aliases, no reshaped tool names, no per-host schema variants, a
 - Result mapping: shared text blocks pass through verbatim; the `herdr-details` block is appended and bounded; oversized details truncate before shared blocks; total bytes stay within `MCP_RESULT_MAX_BYTES`.
 - Error mapping: typed codes (`INVALID_INPUT`, `TARGET_NOT_FOUND`, `TARGET_AMBIGUOUS`, `CLI_TIMEOUT`, `CLI_PROTOCOL_ERROR`, `PROFILE_CATALOG_UNAVAILABLE`, `REVIEWER_FAILED`, `ABORTED`, `HOST_CAPABILITY_UNAVAILABLE`) survive to `isError: true` payloads; unknown tool names raise `MethodNotFound`.
 - Host proxy: `cwd` and `signal` reads succeed, symbol reads return `undefined`, `modelRegistry` and any other string read throw `HOST_CAPABILITY_UNAVAILABLE`, and each of the seven tools is exercised against a recording proxy to prove the read set is exactly `cwd` and `signal`.
+- Effective caller context: live `pane current --current` plus snapshot verification rebinds same-workspace and cross-workspace moves, accepts coherent unchanged reads, retries one concurrent topology race, and rejects unresolved, duplicate, incoherent, replacement, malformed, and protocol evidence.
 - Gating: missing/incorrect `HERDR_ENV`, missing or malformed injected IDs, and missing/relative/nonexistent `CLAUDE_PROJECT_DIR` each exit non-zero with no transport connect, no tool registration, and no CLI invocation.
 - Cwd rules: the resolved operational `cwd` equals `CLAUDE_PROJECT_DIR` for launch, pane, and tab argv; `process.cwd()` is never consulted.
 - Wait host limits: a wait beyond the effective cadence fails with `REVIEWER_FAILED` in both foreground and detached form; a wait within cadence needs no reviewer; detached registration returns a job id retrievable through `herdr_jobs`.

@@ -10,6 +10,7 @@ import type { ProfileCatalog } from "./profiles/types.js";
 import type { WaitReviewer } from "./reviewer.js";
 import type { Settings } from "./settings.js";
 import type { CurrentContext } from "./targets.js";
+import { createContextResolver, type ContextResolver } from "./context.js";
 import { createCommunicateTool } from "./tools/communicate.js";
 import { createInspectTool } from "./tools/inspect.js";
 import { createJobsTool } from "./tools/jobs.js";
@@ -99,6 +100,7 @@ export interface HerdrToolDefinition {
 export interface HerdrToolSurfaceDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  contextResolver?: ContextResolver;
   environment: EnvironmentState;
   preflight: CompatibilityPreflight;
   settingsLoader: () => Promise<Settings>;
@@ -130,10 +132,12 @@ export interface HerdrToolSurface {
 
 /** Construct the seven Herdr tools once for every host. */
 export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrToolSurface {
-  const inspect = createInspectTool({ cli: deps.cli, context: deps.context, environment: deps.environment, profiles: deps.profiles });
+  const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
+  const inspect = createInspectTool({ cli: deps.cli, context: deps.context, contextResolver, environment: deps.environment, profiles: deps.profiles });
   const communicate = createCommunicateTool({
     cli: deps.cli,
     context: deps.context,
+    contextResolver,
     preflight: deps.preflight,
     ...(deps.attachments ? { attachments: deps.attachments } : {}),
     ...(deps.recipients ? { recipients: deps.recipients } : {}),
@@ -141,6 +145,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
   const wait = createWaitTool({
     cli: deps.cli,
     context: deps.context,
+    contextResolver,
     settingsLoader: deps.settingsLoader,
     jobRegistry: deps.jobs,
     ...(deps.reviewerFactory ? { reviewerFactory: deps.reviewerFactory } : {}),
@@ -149,6 +154,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
   const launch = createLaunchTool({
     cli: deps.cli,
     context: deps.context,
+    contextResolver,
     cwd: deps.cwd,
     ownership: deps.ownership,
     profiles: deps.profiles,
@@ -159,6 +165,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
   const pane = createPaneTool({
     cli: deps.cli,
     context: deps.context,
+    contextResolver,
     cwd: deps.cwd,
     ownership: deps.ownership,
     preflight: deps.preflight,
@@ -166,6 +173,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
   const tab = createTabTool({
     cli: deps.cli,
     context: deps.context,
+    contextResolver,
     cwd: deps.cwd,
     ownership: deps.ownership,
     preflight: deps.preflight,

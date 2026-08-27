@@ -32,6 +32,7 @@ function fakeCli(): HerdrCli {
   const envelope = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
   const exec: PiExec = async (_command, argv) => {
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
+    if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: snapshot.snapshot.panes[0] });
     if (argv[0] === "api") return envelope("snapshot", snapshot);
     if (argv[0] === "pane" && argv[1] === "get") return envelope("pane", { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: "output", stderr: "", code: 0, killed: false };

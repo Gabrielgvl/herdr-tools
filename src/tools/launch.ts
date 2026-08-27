@@ -1,6 +1,7 @@
 import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
+import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
@@ -9,7 +10,7 @@ import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients
 import { attachmentCapability } from "../profiles/capability.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
-import { assertCurrentContext, parseSnapshotResult, resolveTarget } from "../targets.js";
+import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
@@ -34,6 +35,7 @@ export interface LaunchClock {
 export interface LaunchDependencies {
   cli: LaunchCli;
   context: CurrentContext;
+  contextResolver?: ContextResolver;
   preflight: CompatibilityPreflight;
   cwd?: string;
   ownership?: LaunchResourceRegistry;
@@ -101,6 +103,7 @@ export interface LaunchTimingEvidence {
 export interface LaunchDetails extends LaunchResourceIds {
   operation: "launch";
   outcome: "launched" | "partial";
+  contextRebinding?: ContextResolutionDiagnostics;
   name?: string;
   kind?: string;
   placement?: LaunchPlacement;
@@ -1107,6 +1110,7 @@ async function runPrompt(cli: LaunchCli, paneId: string, envelope: string, signa
 }
 
 export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeof LaunchParamsSchema, LaunchDetails> {
+  const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   return {
     name: "herdr_launch",
     label: "Herdr Launch",
@@ -1136,6 +1140,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let sender: SenderIdentity | undefined;
       let existingTarget: ResolvedTarget | undefined;
       let workspaceId: string | undefined;
+      let contextDiagnostics: ContextResolutionDiagnostics | undefined;
+      let effectiveContext: CurrentContext | undefined;
       let phase: LaunchDetails["phase"] = "validate";
       const created: LaunchResourceIds = {};
       const attempts: LaunchAttemptEvidence[] = [];
@@ -1178,14 +1184,17 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           promptPaths.set(profile.name, promptSource.path);
           buildRuntimeArgv(profile, runtime, promptSource.path, grant.path);
         }
-        const snapshot = snapshotOf(await run(deps.cli, ["api", "snapshot"], abortSignal));
-        sender = params.initialPrompt !== undefined ? resolveSender(snapshot, deps.context.paneId) : undefined;
-        assertCurrentContext(snapshot, deps.context);
+        const effective = await contextResolver(abortSignal);
+        contextDiagnostics = effective.diagnostics;
+        const snapshot = effective.snapshot;
+        effectiveContext = effective.context;
+        const currentContext = effective.context;
+        sender = params.initialPrompt !== undefined ? resolveSender(snapshot, currentContext.paneId) : undefined;
         if (existingAgentNames(snapshot).filter((name) => name === params.name).length > 0) {
           throw new LaunchError("INVALID_INPUT", `Agent name is already in use: ${params.name}`);
         }
-        existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, deps.context) : undefined;
-        workspaceId = placement.mode === "new_tab" ? deps.context.workspaceId! : undefined;
+        existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, currentContext) : undefined;
+        workspaceId = placement.mode === "new_tab" ? currentContext.workspaceId : undefined;
         if (initialPromptDelivery === "attachment") {
           phase = "attachment_publish";
           progress(onUpdate, phase, created);
@@ -1232,7 +1241,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         } else {
           const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...noFocusArgs(), "--cwd", cwd], abortSignal, true));
           paneId = result.paneId;
-          tabId = result.tabId ?? deps.context.tabId!;
+          tabId = result.tabId ?? effectiveContext!.tabId;
           created.paneId = paneId;
           created.tabId = tabId;
           deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId! });
@@ -1358,6 +1367,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         const effective = effectiveDetails(chosenProfile, chosenRuntime);
         const launchDetails: LaunchDetails = {
           operation: "launch", outcome: "launched", name: authoritativeName, kind: chosenRuntime.kind, placement, tabId, paneId: resolvedPaneId,
+          ...contextRebindingDetails(contextDiagnostics!),
           ...(agentId ? { agentId } : {}),
           postState: boundAgentSessionStrings(withoutEnvironment(postState)),
           agentStarted,

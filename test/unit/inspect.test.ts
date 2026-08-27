@@ -19,6 +19,7 @@ function makeCli(readOutput?: string, snapshotValue: HerdrSnapshot = snapshot) {
   const output = readOutput ?? lines.join("\n");
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
     calls.push(argv);
+    if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: snapshotValue.panes.find((item) => item.pane_id === "w1:p1") } }), stderr: "", code: 0, killed: false };
     if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot: snapshotValue, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "get") {
       const pane = snapshotValue.panes.find((item) => item.pane_id === argv[2]) ?? snapshotValue.panes[0];
@@ -41,9 +42,17 @@ describe("herdr_inspect", () => {
   it("returns the default current target with exactly the recent-unwrapped tail of 100 lines", async () => {
     const { cli, calls } = makeCli();
     const result = await execute(cli, {});
-    expect(result.details).toMatchObject({ kind: "target", target: { paneId: "w1:p1" } });
+    expect(result.details).toMatchObject({ kind: "target", target: { paneId: "w1:p1" }, context: { injected: context, effective: context, rebound: false, attempts: 1 } });
     expect(result.details.recentUnwrappedLines).toEqual(Array.from({ length: 100 }, (_, i) => `line-${i + 38}`));
     expect(calls).toContainEqual(["pane", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "100", "--format", "text"]);
+    const healthCli = new HerdrCli(vi.fn<PiExec>().mockResolvedValue({ stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "stopped" } }), stderr: "", code: 0, killed: false }));
+    await expect(createInspectTool({ cli: healthCli, context }).execute("id", { mode: "health" } as never, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { kind: "health" } });
+  });
+
+  it("reports a stale ancestor rebind in context mode", async () => {
+    const { cli } = makeCli();
+    const result = await createInspectTool({ cli, context: { workspaceId: "stale-workspace", tabId: "stale-tab", paneId: "w1:p1" } }).execute("id", { mode: "context" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(result.details).toMatchObject({ context: { injected: { workspaceId: "stale-workspace", tabId: "stale-tab", paneId: "w1:p1" }, effective: context, rebound: true, attempts: 1 } });
   });
 
   it("returns compact collections without reading transcripts", async () => {
@@ -168,6 +177,7 @@ describe("herdr_inspect", () => {
     await expect(execute(cli, {})).resolves.toMatchObject({ details: { recentUnwrappedLines: [] } });
 
     const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { snapshot, type: "session_snapshot" } }), stderr: "", code: 0, killed: false };
       return { stdout: JSON.stringify({ id: "pane", result: { pane: null } }), stderr: "", code: 0, killed: false };
     });

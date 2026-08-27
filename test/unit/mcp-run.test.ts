@@ -80,6 +80,7 @@ function fakeExec(): { exec: PiExec; calls: string[][] } {
   const exec: PiExec = async (_command, argv) => {
     calls.push(argv);
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
+    if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: live.snapshot.panes[0] });
     if (argv[0] === "api") return envelope("snapshot", live);
     if (argv[0] === "pane" && argv[1] === "get") return envelope("pane", { pane: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: "worker output", stderr: "", code: 0, killed: false };

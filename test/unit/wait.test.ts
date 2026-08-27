@@ -18,12 +18,15 @@ const snapshot = {
   }
 };
 
+const currentPane = () => ({ id: "current", result: { type: "pane_current", pane: snapshot.snapshot.panes[0] } });
+
 function fakeCli(outputs: Record<string, string> = { p1: "already done", p2: "still working" }): WaitCli & { calls: string[][] } {
   const calls: string[][] = [];
   return {
     calls,
     async runJson(argv) {
       calls.push(argv);
+      if (argv[0] === "pane" && argv[1] === "current") return { id: "current", result: { type: "pane_current", pane: snapshot.snapshot.panes[0] } };
       if (argv[0] === "api") return { id: "snapshot", result: snapshot };
       const id = argv[2];
       return { id: "pane", result: { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === id) } };
@@ -50,9 +53,20 @@ function execute(cli: WaitCli, params: unknown, extra: Partial<Parameters<typeof
 }
 
 describe("herdr_wait", () => {
+  it("reports a live caller rebind for foreground and detached waits", async () => {
+    const stale = { workspaceId: "old-workspace", tabId: "old-tab", paneId: "p1" };
+    const foreground = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { context: stale, clock: clock() });
+    expect(foreground.details).toMatchObject({ contextRebinding: { injected: stale, effective: context, rebound: true, attempts: 1 } });
+
+    const registry = new JobRegistry({ idFactory: () => "job_rebind" });
+    const detached = await createWaitTool({ cli: fakeCli(), context: stale, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() }).execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    expect(detached.details).toMatchObject({ contextRebinding: { injected: stale, effective: context, rebound: true, attempts: 1 } });
+  });
+
   it("strips environment values from every retained target snapshot at every depth", async () => {
     const leaky: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         return {
           id: "pane",
@@ -136,6 +150,7 @@ describe("herdr_wait", () => {
     let reviewerReleased = false;
     const cli: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         const pane = snapshot.snapshot.panes[0];
         return { id: "pane", result: { pane: { ...pane, agent_status: reviewerReleased ? "idle" : "working" } } };
@@ -157,6 +172,7 @@ describe("herdr_wait", () => {
     let readCount = 0;
     const cli: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         return { id: "pane", result: { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } };
       },
@@ -242,10 +258,10 @@ describe("herdr_wait", () => {
       { targets: ["p1", "one"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }
     ]) await expect(execute(cli, params)).rejects.toMatchObject({ code: params.targets[0] === "missing" ? "TARGET_NOT_FOUND" : "INVALID_INPUT" });
     const ambiguousSnapshot = { ...snapshot, snapshot: { ...snapshot.snapshot, panes: [...snapshot.snapshot.panes, { ...snapshot.snapshot.panes[1], pane_id: "p3", label: "same", agent_name: "same", agent_status: "idle" }], agents: [...snapshot.snapshot.agents, { pane_id: "p3", name: "same", agent_status: "idle" }] } };
-    const alternateCli: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: ambiguousSnapshot }; return { id: "pane", result: { pane: ambiguousSnapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }; }, async runText() { return ""; } };
+    const alternateCli: WaitCli = { async runJson(argv) { if (argv[0] === "pane" && argv[1] === "current") return currentPane(); if (argv[0] === "api") return { id: "snapshot", result: ambiguousSnapshot }; return { id: "pane", result: { pane: ambiguousSnapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }; }, async runText() { return ""; } };
     await expect(execute(alternateCli, { targets: ["same"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).resolves.toMatchObject({ details: { outcome: "success" } });
     const trulyAmbiguous = { ...ambiguousSnapshot, snapshot: { ...ambiguousSnapshot.snapshot, panes: [...ambiguousSnapshot.snapshot.panes.map((pane) => pane.pane_id === "p3" ? { ...pane, agent_name: "same2" } : pane), { ...ambiguousSnapshot.snapshot.panes[0], pane_id: "p4", label: "same", agent_name: "other" }], agents: [...ambiguousSnapshot.snapshot.agents.map((agent) => agent.pane_id === "p3" ? { ...agent, name: "same2" } : agent), { pane_id: "p4", name: "other", agent_status: "idle" }] } };
-    const trulyAmbiguousCli: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: trulyAmbiguous }; return { id: "pane", result: { pane: trulyAmbiguous.snapshot.panes[0] } }; }, async runText() { return ""; } };
+    const trulyAmbiguousCli: WaitCli = { async runJson(argv) { if (argv[0] === "pane" && argv[1] === "current") return currentPane(); if (argv[0] === "api") return { id: "snapshot", result: trulyAmbiguous }; return { id: "pane", result: { pane: trulyAmbiguous.snapshot.panes[0] } }; }, async runText() { return ""; } };
     await expect(execute(trulyAmbiguousCli, { targets: ["same"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "TARGET_AMBIGUOUS" });
     await expect(execute(cli, { targets: ["w:t"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "TARGET_TYPE_MISMATCH" });
     await expect(createWaitTool({ cli, context: {} as typeof context, settingsLoader: async () => settings }).execute("id", { targets: ["current"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
@@ -272,6 +288,7 @@ describe("herdr_wait", () => {
     let paneReads = 0;
     const cli: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         paneReads += 1;
         if (paneReads > 2) now = 60_001;
@@ -296,6 +313,7 @@ describe("herdr_wait", () => {
       calls: [],
       async runJson(argv) {
         this.calls.push(argv);
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         reads += 1;
         const state = reads > 2 ? "working" : "idle";
@@ -349,6 +367,7 @@ describe("herdr_wait", () => {
     let now = 0;
     const cli: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         now = 2;
         return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: "idle" } } };
@@ -370,6 +389,7 @@ describe("herdr_wait", () => {
     let now = 0;
     const cli: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         paneReads += 1;
         if (paneReads > 1) now = 2;
@@ -391,7 +411,7 @@ describe("herdr_wait", () => {
     let calls = 0;
     const deadlineClock: WaitClock = { now: () => ++calls > 1 ? 2 : 0, sleep: async () => undefined };
     let paneReads = 0;
-    const finalCli: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: snapshot }; paneReads += 1; return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: paneReads > 1 ? "idle" : "working" } } }; }, async runText() { return ""; } };
+    const finalCli: WaitCli = { async runJson(argv) { if (argv[0] === "pane" && argv[1] === "current") return currentPane(); if (argv[0] === "api") return { id: "snapshot", result: snapshot }; paneReads += 1; return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: paneReads > 1 ? "idle" : "working" } } }; }, async runText() { return ""; } };
     const finalMatch = await execute(finalCli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: deadlineClock });
     expect(finalMatch.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
     let finalNow = 0;
@@ -415,19 +435,21 @@ describe("herdr_wait", () => {
   it("maps a generic read failure to a structured wait error", async () => {
     const rejected: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         throw new Error("backend down");
       },
       async runText() { return ""; }
     };
     await expect(execute(rejected, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
-    const stringRejected: WaitCli = { async runJson(argv) { if (argv[0] === "api") return { id: "snapshot", result: snapshot }; throw "backend down"; }, async runText() { return ""; } };
+    const stringRejected: WaitCli = { async runJson(argv) { if (argv[0] === "pane" && argv[1] === "current") return currentPane(); if (argv[0] === "api") return { id: "snapshot", result: snapshot }; throw "backend down"; }, async runText() { return ""; } };
     await expect(execute(stringRejected, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
   });
 
   it("preserves read failures as truthful structured errors", async () => {
     const paneFallback: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         return { id: "pane", result: {} };
       },
@@ -436,6 +458,7 @@ describe("herdr_wait", () => {
     await expect(execute(paneFallback, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const malformed: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         return { id: "pane", result: null };
       },
@@ -444,6 +467,7 @@ describe("herdr_wait", () => {
     await expect(execute(malformed, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const rejected: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         throw new Error("backend down");
       },
@@ -452,6 +476,7 @@ describe("herdr_wait", () => {
     await expect(execute(rejected, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const aborted: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         throw Object.assign(new Error("aborted"), { code: "ABORTED" });
       },
@@ -598,6 +623,7 @@ describe("herdr_wait", () => {
     const cli: WaitCli = {
       async runJson(argv, signal) {
         entered.push(signal);
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         await gate;
         return { id: "pane", result: { pane: snapshot.snapshot.panes[0] } };
@@ -618,7 +644,7 @@ describe("herdr_wait", () => {
     expect(registry.get("job_background")).toMatchObject({ status: "completed", outcome: "success" });
     expect(updates).not.toHaveBeenCalled();
     expect(entered.length).toBeGreaterThan(0);
-    expect(entered.slice(1).every((signal) => signal !== initiating.signal)).toBe(true);
+    expect(entered.slice(2).every((signal) => signal !== initiating.signal)).toBe(true);
   });
 
   it.each([
@@ -636,6 +662,7 @@ describe("herdr_wait", () => {
     const registry = new JobRegistry({ idFactory: () => "job_runner_failure" });
     const malformedCli: WaitCli = {
       async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
         if (argv[0] === "api") return { id: "snapshot", result: snapshot };
         return { id: "pane", result: {} };
       },

@@ -1,8 +1,9 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
+import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { parseHealth } from "../health.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
-import { assertCurrentContext, parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
+import { resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { resolveProfile, type Profile, type ProfileCandidate, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
 import { boundedText } from "../job-registry.js";
@@ -17,6 +18,8 @@ interface InspectDetails {
   items?: unknown[];
   profile?: unknown;
   diagnostics?: unknown[];
+  context?: ContextResolutionDiagnostics;
+  contextRebinding?: ContextResolutionDiagnostics;
   truncated?: boolean;
   omittedCount?: number;
   diagnosticOmittedCount?: number;
@@ -32,6 +35,7 @@ interface InspectDetails {
 export interface InspectDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  contextResolver?: ContextResolver;
   environment?: { enabled: boolean; currentIdsPresent: boolean; currentIdsValid: boolean };
   profiles?: { load: () => Promise<ProfileCatalog> };
 }
@@ -54,8 +58,7 @@ function compactCollectionRecord(value: Record<string, unknown>, collection: "pa
   return Object.fromEntries(Object.entries(value).filter(([key, item]) => allowed.has(key) && typeof item === "string"));
 }
 
-function compactCollection(snapshot: HerdrSnapshot, collection: "panes" | "agents" | "tabs", context: CurrentContext): Record<string, unknown>[] {
-  assertCurrentContext(snapshot, context);
+function compactCollection(snapshot: HerdrSnapshot, collection: "panes" | "agents" | "tabs", context: { workspaceId: string; tabId: string }): Record<string, unknown>[] {
   if (collection === "panes") return snapshot.panes.filter((pane) => pane.workspace_id === context.workspaceId && pane.tab_id === context.tabId).map((pane) => compactCollectionRecord(pane, collection));
   if (collection === "tabs") return snapshot.tabs.filter((tab) => tab.workspace_id === context.workspaceId).map((tab) => compactCollectionRecord(tab, collection));
   const currentPaneIds = new Set(snapshot.panes.filter((pane) => pane.workspace_id === context.workspaceId && pane.tab_id === context.tabId).map((pane) => pane.pane_id));
@@ -373,6 +376,7 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
     parameters: InspectParamsSchema,
     async execute(_id, params: InspectParams, signal) {
       const input = params as InspectParams;
+      const activeSignal = signal ?? new AbortController().signal;
       const mode = input.mode ?? "context";
       const profileMode = mode === "profile" || (mode === "collection" && input.collection === "profiles");
       if (profileMode) {
@@ -402,7 +406,7 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       }
       if (mode === "health") {
         if (input.target !== undefined || input.collection !== undefined || input.profile !== undefined) throw Object.assign(new Error("health does not accept target, profile, or collection"), { code: "INVALID_INPUT" });
-        const health = parseHealth(await deps.cli.runText(["status", "--json"], signal!));
+        const health = parseHealth(await deps.cli.runText(["status", "--json"], activeSignal));
         return { content: [{ type: "text", text: "Herdr health inspected" }], details: { operation: "inspect", kind: "health", outcome: "success", environment: deps.environment ?? { enabled: true, currentIdsPresent: Boolean(deps.context.workspaceId && deps.context.tabId && deps.context.paneId), currentIdsValid: true }, ...health } };
       }
       if (mode === "collection") {
@@ -410,16 +414,25 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       } else if (input.collection !== undefined || input.profile !== undefined || (mode === "context" && input.target !== undefined)) {
         throw Object.assign(new Error("collection, profile, and target are only valid in their respective modes"), { code: "INVALID_INPUT" });
       } else if (mode === "target" && input.target === undefined) throw Object.assign(new Error("target mode requires target"), { code: "INVALID_INPUT" });
-      const snapshot = parseSnapshotResult((await deps.cli.runJson(["api", "snapshot"], signal!)).result);
+      const effective = await (deps.contextResolver ?? createContextResolver(deps.cli, deps.context))(activeSignal);
+      const snapshot = effective.snapshot;
       if (mode === "collection") {
-        const items = compactCollection(snapshot, input.collection as "panes" | "agents" | "tabs", deps.context);
-        return { content: [{ type: "text", text: `Inspected ${input.collection}` }], details: { operation: "inspect", kind: "collection", outcome: "success", collection: input.collection, items } };
+        const items = compactCollection(snapshot, input.collection as "panes" | "agents" | "tabs", effective.context);
+        return { content: [{ type: "text", text: `Inspected ${input.collection}` }], details: { operation: "inspect", kind: "collection", outcome: "success", collection: input.collection, items, ...contextRebindingDetails(effective.diagnostics) } };
       }
-      const target = resolvePaneOrAgentTarget(snapshot, input.target ?? "current", deps.context);
-      const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], signal!)).result);
-      const raw = await deps.cli.runText(["pane", "read", target.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal!);
+      const target = resolvePaneOrAgentTarget(snapshot, input.target ?? "current", effective.context);
+      const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal)).result);
+      const raw = await deps.cli.runText(["pane", "read", target.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], activeSignal);
       const recentUnwrappedLines = raw.length === 0 ? [] : raw.split(/\r?\n/).slice(-100);
-      const details: InspectDetails = { operation: "inspect", kind: "target", outcome: "success", target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName }, metadata: withoutEnvironment(pane), recentUnwrappedLines };
+      const details: InspectDetails = {
+        operation: "inspect",
+        kind: "target",
+        outcome: "success",
+        target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName },
+        ...(mode === "context" ? { context: effective.diagnostics } : contextRebindingDetails(effective.diagnostics)),
+        metadata: withoutEnvironment(pane),
+        recentUnwrappedLines
+      };
       return { content: [{ type: "text", text: formatResult({ operation: "inspect", outcome: "success", targetId: target.id }) }], details };
     },
     renderCall(rawArgs, theme) {

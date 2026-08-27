@@ -42,6 +42,7 @@ function makeHarness(): Harness {
   const response = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
     calls.push(argv);
+    if (argv[0] === "pane" && argv[1] === "current") return response("current", { type: "pane_current", pane: snapshot.panes.find((item) => item.pane_id === context.paneId) });
     if (argv[0] === "api" && argv[1] === "snapshot") return response("snapshot", { type: "session_snapshot", snapshot });
     if (argv[0] === "tab" && argv[1] === "create") {
       snapshot.tabs.push({ tab_id: "t3", workspace_id: "w1", label: argv[argv.indexOf("--label") + 1] });
@@ -100,14 +101,12 @@ describe("herdr_tab", () => {
     expect(JSON.stringify(result)).not.toContain("secret-value");
   });
 
-  it("rejects missing labels, unsafe environments, inconsistent context, and fuzzy tab labels before mutation", async () => {
+  it("rejects missing labels and unsafe environments, rebinds stale ancestors, and rejects fuzzy tab labels", async () => {
     const harness = makeHarness();
     await expect(execute(harness, { operation: "create", label: "" })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(execute(harness, { operation: "create", label: "x", env: { BAD: "line\nvalue" } })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(execute(harness, { operation: "rename", target: "secondary", label: "x" })).rejects.toMatchObject({ code: "TARGET_NOT_FOUND" });
-    const before = harness.calls.length;
-    await expect(createTabTool({ cli: harness.cli, context: { workspaceId: "wrong", tabId: "t1", paneId: "p1" } }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
-    expect(harness.calls.slice(before).filter((call) => call[1] === "create" || call[1] === "rename")).toHaveLength(0);
+    await expect(createTabTool({ cli: harness.cli, context: { workspaceId: "wrong", tabId: "t1", paneId: "p1" } }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).resolves.toMatchObject({ details: { workspaceId: "w1" } });
   });
 
   it("renames and focuses exact IDs/current, then closes owned and confirmed tabs", async () => {
@@ -133,6 +132,7 @@ describe("herdr_tab", () => {
   it("accepts authoritative tab shapes and rejects malformed post-state", async () => {
     const harness = makeHarness();
     harness.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: harness.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "tab" && argv[1] === "create") {
         harness.snapshot.tabs.push({ tab_id: "t4", workspace_id: "w1", label: "created" });
@@ -146,6 +146,7 @@ describe("herdr_tab", () => {
     await expect(createTabTool({ cli: harness.cli, context: {} }).execute("id", { operation: "create", label: "x" }, new AbortController().signal, undefined, harness.ctx)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
 
     const invalidCreate = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: fixture().panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: fixture() } }), stderr: "", code: 0, killed: false };
       return { stdout: JSON.stringify({ id: "create", result: { tab: [] } }), stderr: "", code: 0, killed: false };
     }));
@@ -153,6 +154,7 @@ describe("herdr_tab", () => {
 
     const invalidPostSnapshot = fixture();
     const invalidPost = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: invalidPostSnapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: invalidPostSnapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "tab" && argv[1] === "create") {
         invalidPostSnapshot.tabs.push({ tab_id: "t4", workspace_id: "w1", label: "created" });
@@ -165,6 +167,7 @@ describe("herdr_tab", () => {
 
     const invalidObjectSnapshot = fixture();
     const invalidObject = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: invalidObjectSnapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: invalidObjectSnapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "tab" && argv[1] === "create") {
         invalidObjectSnapshot.tabs.push({ tab_id: "t4", workspace_id: "w1", label: "created" });
@@ -177,6 +180,7 @@ describe("herdr_tab", () => {
 
     const directSnapshot = fixture();
     const directTab = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: directSnapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: directSnapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "tab" && argv[1] === "create") {
         directSnapshot.tabs.push({ tab_id: "t5", workspace_id: "w1", label: "direct" });
@@ -207,6 +211,7 @@ describe("herdr_tab", () => {
   it("does not record tab resources before a post-create read succeeds", async () => {
     const harness = makeHarness();
     harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { id: "current", result: { type: "pane_current", pane: harness.snapshot.panes[0] } };
       if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } };
       if (argv[0] === "tab" && argv[1] === "create") {
         harness.snapshot.tabs.push({ tab_id: "t4", workspace_id: "w1", label: "retained" });
@@ -309,6 +314,7 @@ describe("herdr_tab", () => {
     const after = fixture();
     let snapshotReads = 0;
     reusedRoot.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: before.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") {
         snapshotReads += 1;
         const snapshot = snapshotReads === 1 ? before : after;
@@ -361,6 +367,7 @@ describe("herdr_tab", () => {
     const harness = makeHarness();
     const original = harness.cli;
     original.runJson = vi.fn<HerdrCli["runJson"]>(async (argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { id: "current", result: { type: "pane_current", pane: harness.snapshot.panes[0] } };
       if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } };
       if (argv[0] === "tab" && argv[1] === "close") return { id: "close", result: { ok: true } };
       return { id: "other", result: {} };
@@ -372,6 +379,7 @@ describe("herdr_tab", () => {
   it("fails closed when tab creation does not return an opaque ID and renders compact rows", async () => {
     const harness = makeHarness();
     const badExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: harness.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
       return { stdout: JSON.stringify({ id: "create", result: { ok: true } }), stderr: "", code: 0, killed: false };
     });

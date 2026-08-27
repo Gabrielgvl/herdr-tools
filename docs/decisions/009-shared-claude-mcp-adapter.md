@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted; extends ADR-001 with a second host
+Accepted; extends ADR-001 with a second host. Caller-context resolution is
+superseded by [ADR-017](017-mcp-live-caller-context-rebinding.md).
 
 ## Date
 

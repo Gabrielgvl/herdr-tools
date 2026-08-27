@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli, JsonEnvelope } from "../cli.js";
+import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
@@ -8,7 +9,7 @@ import type { AttachmentStore, PublishedAttachment } from "../messages/store.js"
 import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
-import { parseSnapshotResult, resolveTarget, type CurrentContext } from "../targets.js";
+import { resolveTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { executeTurnControl, type TurnControlDetails } from "./turn-control.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
@@ -37,6 +38,7 @@ export interface LegacyCommunicateDetails {
   };
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
   envelope?: { version: "v1"; kind: "prompt" | "steer"; delivery: MessageDelivery };
+  contextRebinding?: ContextResolutionDiagnostics;
   attachment?: { attachmentId: string; path: string; bytes: number; sha256: string; expiresAt: string; recipientPaneId?: string };
 }
 
@@ -45,6 +47,7 @@ export type CommunicateDetails = LegacyCommunicateDetails | TurnControlDetails;
 export interface CommunicateDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  contextResolver?: ContextResolver;
   preflight: CompatibilityPreflight;
   attachments?: AttachmentStore;
   recipients?: RecipientRegistry;
@@ -97,7 +100,7 @@ function agentFrom(value: unknown): Record<string, unknown> {
   return (value as { agent: Record<string, unknown> }).agent;
 }
 
-function snapshotIdentityRecords(snapshot: ReturnType<typeof parseSnapshotResult>, paneId: string): Record<string, unknown>[] {
+function snapshotIdentityRecords(snapshot: HerdrSnapshot, paneId: string): Record<string, unknown>[] {
   const panes = snapshot.panes.filter((pane) => pane.pane_id === paneId);
   const agents = snapshot.agents.filter((agent) => agent.pane_id === paneId);
   if (panes.length !== 1 || agents.length !== 1) {
@@ -135,6 +138,7 @@ function operationId(envelope: JsonEnvelope | undefined): string | undefined {
 }
 
 export function createCommunicateTool(deps: CommunicateDependencies): ToolDefinition<typeof CommunicateParamsSchema, CommunicateDetails> {
+  const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   return {
     name: "herdr_communicate",
     label: "Herdr Communicate",
@@ -144,7 +148,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
     async execute(_id, params: CommunicateParams, signal, _onUpdate, ctx) {
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
       if (params.operation === "cancel" || params.operation === "interrupt") {
-        return executeTurnControl(params, { cli: deps.cli, context: deps.context, preflight: deps.preflight }, activeSignal);
+        return executeTurnControl(params, { cli: deps.cli, context: deps.context, contextResolver, preflight: deps.preflight }, activeSignal);
       }
       // Establish the route before any precondition so every refusal names it.
       const legacyParams = params as Exclude<CommunicateParams, { operation: "cancel" | "interrupt" }>;
@@ -154,7 +158,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       let route: CommunicateRoute | undefined;
       let published: PublishedAttachment | undefined;
       let phase: CommunicatePhase = "validate";
-      let snapshotEnvelope: JsonEnvelope;
+      let snapshotOperationId: string | undefined;
       let target: ReturnType<typeof resolveTarget>;
       let preAgentEnvelope: JsonEnvelope | undefined;
       let preEnvelope: JsonEnvelope;
@@ -167,6 +171,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       let afterState: CommunicateState | undefined;
       let submission: PromptSubmissionEvidence | undefined;
       let observation: PromptObservation | undefined;
+      let contextDiagnostics: ContextResolutionDiagnostics | undefined;
       try {
         if (legacyParams.operation === "keys") {
           if (Object.prototype.hasOwnProperty.call(legacyParams, "delivery")) throw Object.assign(new Error("delivery is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "delivery" } });
@@ -181,13 +186,15 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
 
         phase = "resolve_target";
         await deps.preflight(activeSignal);
-        snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], activeSignal);
-        const snapshot = parseSnapshotResult(snapshotEnvelope.result);
-        sender = legacyParams.operation === "keys" ? undefined : resolveSender(snapshot, deps.context.paneId);
+        const effective = await contextResolver(activeSignal);
+        contextDiagnostics = effective.diagnostics;
+        snapshotOperationId = effective.operationIds.snapshot;
+        const snapshot = effective.snapshot;
+        sender = legacyParams.operation === "keys" ? undefined : resolveSender(snapshot, effective.context.paneId);
         if (sender && (legacyParams.target === "current" || legacyParams.target === sender.paneId)) {
           throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: sender.paneId } });
         }
-        target = resolveTarget(snapshot, legacyParams.target, "agent", deps.context);
+        target = resolveTarget(snapshot, legacyParams.target, "agent", effective.context);
         if (sender && target.paneId === sender.paneId) {
           throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: target.paneId } });
         }
@@ -304,6 +311,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         operation: legacyParams.operation,
         outcome: "sent",
         target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName },
+        ...contextRebindingDetails(contextDiagnostics!),
         ...(delivery ? { delivery } : {}),
         ...(route ? { route } : {}),
         preState: compactPane(before),
@@ -311,7 +319,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         ...(submission ? { submission: compactPromptSubmission(submission) } : {}),
         ...(observation ? { observation } : {}),
         operationIds: {
-          snapshot: operationId(snapshotEnvelope),
+          snapshot: snapshotOperationId!,
           ...(preAgentEnvelope ? { agentGet: operationId(preAgentEnvelope) } : {}),
           preState: operationId(preEnvelope),
           ...(prompt ? { prompt: operationId(prompt) } : {}),

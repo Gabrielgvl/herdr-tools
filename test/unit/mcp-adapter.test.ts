@@ -28,6 +28,7 @@ const snapshot = {
 function realSurface() {
   const exec: PiExec = async (_command, argv) => {
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
+    if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: snapshot.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
     if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: snapshot }), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "pane", result: { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: "caller output", stderr: "", code: 0, killed: false };
@@ -479,6 +480,7 @@ function leakySurface() {
   const envelope = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
   const exec: PiExec = async (_command, argv) => {
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
+    if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: live.snapshot.panes[0] });
     if (argv[0] === "api") return envelope("snapshot", live);
     if (argv[0] === "pane" && argv[1] === "get") return envelope("pane", { pane: panes.find((pane) => pane.pane_id === argv[2]) ?? leakyPane(argv[2]!, "created") });
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: "worker output", stderr: "", code: 0, killed: false };

@@ -1,5 +1,6 @@
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "../cli.js";
+import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver, type EffectiveContext } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { tabCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
@@ -12,6 +13,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 export interface TabDetails {
   operation: TabParams["operation"];
   outcome: "success" | "reconciled";
+  contextRebinding?: ContextResolutionDiagnostics;
   tabId?: string;
   workspaceId?: string;
   rootPaneId?: string;
@@ -25,6 +27,7 @@ export interface TabDetails {
 export interface TabDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  contextResolver?: ContextResolver;
   preflight: CompatibilityPreflight;
   cwd?: string;
   ownership?: RuntimeOwnership;
@@ -103,20 +106,7 @@ async function snapshot(cli: HerdrCli, signal: AbortSignal): Promise<HerdrSnapsh
   return parseSnapshotResult((await cli.runJson(["api", "snapshot"], signal)).result);
 }
 
-function assertContext(snapshotValue: HerdrSnapshot, context: CurrentContext): void {
-  if (!context.workspaceId || !context.tabId || !context.paneId) {
-    throw Object.assign(new Error("CONTEXT_UNAVAILABLE: current Herdr context is unavailable"), { code: "CONTEXT_UNAVAILABLE" });
-  }
-  const workspace = snapshotValue.workspaces.find((item) => item.workspace_id === context.workspaceId);
-  const tab = snapshotValue.tabs.find((item) => item.tab_id === context.tabId);
-  const pane = snapshotValue.panes.find((item) => item.pane_id === context.paneId);
-  if (!workspace || !tab || !pane || tab.workspace_id !== workspace.workspace_id || pane.tab_id !== tab.tab_id || pane.workspace_id !== workspace.workspace_id) {
-    throw Object.assign(new Error("CONTEXT_UNAVAILABLE: injected Herdr context is inconsistent"), { code: "CONTEXT_UNAVAILABLE" });
-  }
-}
-
 function tabTarget(snapshotValue: HerdrSnapshot, ref: string, context: CurrentContext): TabRecord {
-  assertContext(snapshotValue, context);
   assertSafeIdentifier(ref, "target");
   const id = ref === "current" ? context.tabId! : ref;
   const tab = snapshotValue.tabs.find((candidate) => candidate.tab_id === id);
@@ -129,10 +119,10 @@ function envArgs(env: Record<string, string> | undefined): string[] {
   return Object.entries(env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
 }
 
-async function closeTab(deps: TabDependencies, params: Extract<TabParams, { operation: "close" }>, signal: AbortSignal): Promise<TabDetails> {
-  const before = await snapshot(deps.cli, signal);
-  const target = tabTarget(before, params.target, deps.context);
-  const validation = validateClose(tabCloseTopology(before, deps.context), { kind: "tab", id: target.tab_id, parentId: target.workspace_id });
+async function closeTab(deps: TabDependencies, params: Extract<TabParams, { operation: "close" }>, signal: AbortSignal, effective: EffectiveContext): Promise<TabDetails> {
+  const before = effective.snapshot;
+  const target = tabTarget(before, params.target, effective.context);
+  const validation = validateClose(tabCloseTopology(before, effective.context), { kind: "tab", id: target.tab_id, parentId: target.workspace_id });
   if (!validation.allowed) {
     throw Object.assign(new Error(`${validation.code}: tab close is not permitted`), { code: validation.code, details: { resourceIds: validation.resourceIds } });
   }
@@ -156,11 +146,13 @@ async function closeTab(deps: TabDependencies, params: Extract<TabParams, { oper
     ...(closed.mutationResult === undefined ? {} : { mutationResult: closed.mutationResult }),
     ...(closed.reconciled ? { reconciliation: { targetAbsent: true, causality: "absence_proven_only" as const, operationIdAvailable: false } } : {}),
     removedIds,
-    postState: topologySummary(closed.readback)
+    postState: topologySummary(closed.readback),
+    ...contextRebindingDetails(effective.diagnostics)
   };
 }
 
 export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabParamsSchema, TabDetails> {
+  const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   return {
     name: "herdr_tab",
     label: "Herdr Tab",
@@ -174,9 +166,9 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
         await deps.preflight(activeSignal);
         assertSafeIdentifier(params.label, "label");
         assertSafeEnvironment(params.env);
-        const current = await snapshot(deps.cli, activeSignal);
-        assertContext(current, deps.context);
-        const workspaceId = deps.context.workspaceId!;
+        const effective = await contextResolver(activeSignal);
+        const current = effective.snapshot;
+        const workspaceId = effective.context.workspaceId;
         const created = await deps.cli.runJson([
           "tab", "create", "--workspace", workspaceId, "--label", params.label,
           "--cwd", params.cwd ?? deps.cwd ?? ctx.cwd,
@@ -190,23 +182,24 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
         const ledger = deps.ownership ?? runtimeOwnership;
         ledger.record({ kind: "tab", id: authoritative.tab.tab_id, parentId: authoritative.tab.workspace_id });
         ledger.record({ kind: "pane", id: authoritative.rootPaneId, parentId: authoritative.tab.tab_id });
-        return tabResult({ operation: "create", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, rootPaneId: authoritative.rootPaneId, postState: withoutEnvironment(postState) }, "create", postState.tab_id);
+        return tabResult({ operation: "create", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, rootPaneId: authoritative.rootPaneId, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "create", postState.tab_id);
       }
       await deps.preflight(activeSignal);
-      const current = await snapshot(deps.cli, activeSignal);
-      const target = tabTarget(current, params.target, deps.context);
+      const effective = await contextResolver(activeSignal);
+      const current = effective.snapshot;
+      const target = tabTarget(current, params.target, effective.context);
       if (params.operation === "rename") {
         assertSafeIdentifier(params.label, "label");
         await deps.cli.runJson(["tab", "rename", target.tab_id, params.label], activeSignal);
         const postState = postStateTab((await deps.cli.runJson(["tab", "get", target.tab_id], activeSignal)).result, target.tab_id, target.workspace_id);
-        return tabResult({ operation: "rename", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "rename", postState.tab_id);
+        return tabResult({ operation: "rename", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "rename", postState.tab_id);
       }
       if (params.operation === "focus") {
         await deps.cli.runJson(["tab", "focus", target.tab_id], activeSignal);
         const postState = postStateTab((await deps.cli.runJson(["tab", "get", target.tab_id], activeSignal)).result, target.tab_id, target.workspace_id);
-        return tabResult({ operation: "focus", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState) }, "focus", postState.tab_id);
+        return tabResult({ operation: "focus", outcome: "success", tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "focus", postState.tab_id);
       }
-      const details = await closeTab(deps, params, activeSignal);
+      const details = await closeTab(deps, params, activeSignal, effective);
       return { content: [{ type: "text", text: formatResult({ operation: "tab", outcome: details.outcome, targetId: details.tabId }) }], details };
     },
     renderCall(args, theme) {

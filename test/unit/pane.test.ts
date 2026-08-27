@@ -42,6 +42,7 @@ function makeHarness(): Harness {
   const response = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
     calls.push(argv);
+    if (argv[0] === "pane" && argv[1] === "current") return response("current", { type: "pane_current", pane: snapshot.panes.find((item) => item.pane_id === context.paneId) });
     if (argv[0] === "api" && argv[1] === "snapshot") return response("snapshot", { type: "session_snapshot", snapshot });
     if (argv[0] === "pane" && argv[1] === "split") {
       const id = `p${nextPane++}`;
@@ -171,6 +172,7 @@ describe("herdr_pane", () => {
       const harness = makeHarness();
       harness.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
         harness.calls.push(argv);
+        if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: harness.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
         if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
         if (argv[0] === "pane" && argv[1] === "split") return { stdout: JSON.stringify({ id: "split", result: responseShape }), stderr: "", code: 0, killed: false };
         if (argv[0] === "pane" && argv[1] === "rename") return { stdout: JSON.stringify({ id: "rename", result: {} }), stderr: "", code: 0, killed: false };
@@ -234,6 +236,7 @@ describe("herdr_pane", () => {
   it("covers authoritative parser failures and every focus direction", async () => {
     const malformed = makeHarness();
     malformed.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: malformed.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: malformed.snapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane" && argv[1] === "rename") return { stdout: JSON.stringify({ id: "rename", result: {} }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "get", result: null }), stderr: "", code: 0, killed: false };
@@ -242,6 +245,7 @@ describe("herdr_pane", () => {
     await expect(execute(malformed, { operation: "rename", target: "p2", label: "x" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const missingField = makeHarness();
     const missingExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: missingField.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: missingField.snapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane" && argv[1] === "rename") return { stdout: JSON.stringify({ id: "rename", result: {} }), stderr: "", code: 0, killed: false };
       return { stdout: JSON.stringify({ id: "get", result: { pane: { pane_id: "p2", tab_id: "t1" } } }), stderr: "", code: 0, killed: false };
@@ -249,12 +253,14 @@ describe("herdr_pane", () => {
     await expect(createPaneTool({ cli: new HerdrCli(missingExec), context }).execute("id", { operation: "rename", target: "p2", label: "x" } as never, new AbortController().signal, undefined, missingField.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const invalidLayout = makeHarness();
     invalidLayout.cli = new HerdrCli(vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: invalidLayout.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: invalidLayout.snapshot } }), stderr: "", code: 0, killed: false };
       return { stdout: JSON.stringify({ id: "layout", result: null }), stderr: "", code: 0, killed: false };
     }));
     await expect(execute(invalidLayout, { operation: "focus", target: "p2" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const badShape = makeHarness();
     const badShapeExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: badShape.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: badShape.snapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane" && argv[1] === "layout") return { stdout: JSON.stringify({ id: "layout", result: { layout: { tab_id: "t1", focused_pane_id: "p1", panes: [{ pane_id: "p1", rect: null }] } } }), stderr: "", code: 0, killed: false };
       throw new Error(`unexpected argv ${argv.join(" ")}`);
@@ -262,19 +268,22 @@ describe("herdr_pane", () => {
     await expect(createPaneTool({ cli: new HerdrCli(badShapeExec), context }).execute("id", { operation: "focus", target: "p2" } as never, new AbortController().signal, undefined, badShape.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const badLayoutShape = makeHarness();
     const badLayoutExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: badLayoutShape.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: badLayoutShape.snapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane" && argv[1] === "layout") return { stdout: JSON.stringify({ id: "layout", result: { layout: { tab_id: 1, focused_pane_id: "p1", panes: [] } } }), stderr: "", code: 0, killed: false };
       throw new Error(`unexpected argv ${argv.join(" ")}`);
     });
     await expect(createPaneTool({ cli: new HerdrCli(badLayoutExec), context }).execute("id", { operation: "focus", target: "p2" } as never, new AbortController().signal, undefined, badLayoutShape.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const badRectExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: badLayoutShape.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: badLayoutShape.snapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane" && argv[1] === "layout") return { stdout: JSON.stringify({ id: "layout", result: { layout: { tab_id: "t1", focused_pane_id: "p1", panes: [{ pane_id: "p1", rect: { x: "bad", y: 0, width: 1, height: 1 } }] } } }), stderr: "", code: 0, killed: false };
       throw new Error(`unexpected argv ${argv.join(" ")}`);
     });
     await expect(createPaneTool({ cli: new HerdrCli(badRectExec), context }).execute("id", { operation: "focus", target: "p2" } as never, new AbortController().signal, undefined, badLayoutShape.ctx)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     await expect(createPaneTool({ cli: invalidLayout.cli, context: {} }).execute("id", { operation: "split", label: "x" } as never, new AbortController().signal, undefined, invalidLayout.ctx)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
-    await expect(createPaneTool({ cli: invalidLayout.cli, context: { workspaceId: "wrong", tabId: "t1", paneId: "p1" } }).execute("id", { operation: "split", label: "x" } as never, new AbortController().signal, undefined, invalidLayout.ctx)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
+    const staleContext = makeHarness();
+    await expect(createPaneTool({ cli: staleContext.cli, context: { workspaceId: "wrong", tabId: "t1", paneId: "p1" } }).execute("id", { operation: "split", label: "x" } as never, new AbortController().signal, undefined, staleContext.ctx)).resolves.toMatchObject({ details: { workspaceId: "w1" } });
     await expect(execute(invalidLayout, { operation: "move", target: "t1", destination: { kind: "tab", target: "t2" } })).rejects.toMatchObject({ code: "TARGET_TYPE_MISMATCH" });
 
     const focusCase = async (rects: Array<{ pane_id: string; rect: { x: number; y: number; width: number; height: number } }>, expectedFailure = false, differentTab = false) => {
@@ -285,6 +294,7 @@ describe("herdr_pane", () => {
       }
       let focused = "p1";
       const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+        if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: harness.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
         if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
         if (argv[0] === "pane" && argv[1] === "layout") return { stdout: JSON.stringify({ id: "layout", result: { layout: { tab_id: "t1", focused_pane_id: focused, panes: rects } } }), stderr: "", code: 0, killed: false };
         if (argv[0] === "tab" && argv[1] === "focus") return { stdout: JSON.stringify({ id: "tab-focus", result: {} }), stderr: "", code: 0, killed: false };
@@ -355,6 +365,7 @@ describe("herdr_pane", () => {
     await expect(execute(harness, { operation: "close", target: "current" })).rejects.toMatchObject({ code: "PROTECTED_RESOURCE" });
     expect(harness.calls.some((call) => call[1] === "close")).toBe(false);
     const badExec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: harness.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: harness.snapshot } }), stderr: "", code: 0, killed: false };
       return { stdout: JSON.stringify({ id: "split", result: { ok: true } }), stderr: "", code: 0, killed: false };
     });

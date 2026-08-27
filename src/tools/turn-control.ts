@@ -1,4 +1,5 @@
 import type { HerdrCli } from "../cli.js";
+import { contextRebindingDetails, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { formatResult } from "../tui.js";
 import { joinPromptTargetIdentity, type PromptIdentityError, type PromptTargetIdentity } from "../messages/prompt.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext, type HerdrSnapshot, type ResolvedTarget } from "../targets.js";
@@ -123,11 +124,13 @@ export interface TurnControlDetails {
     causality?: "post_dispatch_absence_proven";
   };
   wait?: { outcome: "completed" | "failed"; code?: string };
+  contextRebinding?: ContextResolutionDiagnostics;
 }
 
 export interface TurnControlDependencies {
   cli: HerdrCli;
   context: CurrentContext;
+  contextResolver: ContextResolver;
   preflight: (signal: AbortSignal) => Promise<void>;
 }
 
@@ -677,6 +680,8 @@ export async function executeTurnControl(
   let dispatchError: unknown;
   let finalValidationFailed = false;
   let waitEvidence: { outcome: "completed" | "failed"; code?: string } | undefined;
+  let contextDiagnostics: ContextResolutionDiagnostics | undefined;
+  const contextResolver = deps.contextResolver;
 
   try {
     if (signal.aborted) throw new TurnControlError("ABORTED", "Operation aborted before turn-control dispatch", baseDetails(operation, key, preEvidence, identity, phase, operationIds, false, false, finalEvidence));
@@ -684,10 +689,11 @@ export async function executeTurnControl(
     if (signal.aborted) throw new TurnControlError("ABORTED", "Operation aborted before turn-control dispatch", baseDetails(operation, key, preEvidence, identity, phase, operationIds, false, false, finalEvidence));
 
     phase = "snapshot";
-    const snapshotEnvelope = await deps.cli.runJson(["api", "snapshot"], signal);
-    operationIds.snapshot = boundedOperationId(snapshotEnvelope.id);
-    const snapshot = parseSnapshotResult(snapshotEnvelope.result);
-    const resolved = resolveTarget(snapshot, params.target, "agent", deps.context);
+    const effective = await contextResolver(signal);
+    contextDiagnostics = effective.diagnostics;
+    operationIds.snapshot = boundedOperationId(effective.operationIds.snapshot);
+    const snapshot = effective.snapshot;
+    const resolved = resolveTarget(snapshot, params.target, "agent", effective.context);
     const snapshotRecords = requireSnapshotTargetRecords(snapshot, resolved.paneId!, "pre_state");
 
     phase = "pre_state";
@@ -807,6 +813,7 @@ export async function executeTurnControl(
       if (!dispatchAcknowledged) fail(operation, key, "INTERRUPT_UNCONFIRMED", "Agent-free post-state cannot prove an acknowledged interrupt dispatch", preEvidence, identity, "confirmation", operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence, { wait: waitEvidence!, ...failureEvidence });
       const details = {
         ...baseDetails(operation, key, preEvidence, identity, "confirmed", operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence),
+        ...contextRebindingDetails(contextDiagnostics!),
         outcome: "agent_exited" as const,
         finalState: finalEvidence,
         reason: "post_dispatch_absence_proven",
@@ -854,6 +861,7 @@ export async function executeTurnControl(
 
     const details = {
       ...baseDetails(operation, key, preEvidence, identity, "confirmed", operationIds, dispatchAcknowledged, dispatchAttempted, finalEvidence),
+      ...contextRebindingDetails(contextDiagnostics!),
       outcome: operation === "cancel" ? "cancelled" as const : "interrupted" as const,
       finalState: finalEvidence,
       reason: "same_agent_terminal_state",

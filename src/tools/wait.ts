@@ -1,8 +1,9 @@
 import RE2 from "re2";
 import type { AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CliTextResult, HerdrCli, JsonEnvelope } from "../cli.js";
+import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { loadSettings, type Settings } from "../settings.js";
-import { parseSnapshotResult, resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
+import { resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
 import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams } from "../wait-schema.js";
 import { boundedText, type JobRegistry, type JobRequestSnapshot, type JobRunResult } from "../job-registry.js";
@@ -59,6 +60,7 @@ export interface ReviewerSummary {
 
 export interface ForegroundWaitDetails {
   operation: "wait";
+  contextRebinding?: ContextResolutionDiagnostics;
   outcome: "progress" | "success" | "timeout" | "manager_judgment_required";
   label: string;
   matched: boolean;
@@ -72,6 +74,7 @@ export interface ForegroundWaitDetails {
 export interface BackgroundWaitDetails {
   operation: "wait";
   outcome: "background";
+  contextRebinding?: ContextResolutionDiagnostics;
   jobId: string;
   label: string;
   targets: string[];
@@ -98,6 +101,7 @@ export class WaitError extends Error {
 export interface WaitDependencies {
   cli: WaitCli | HerdrCli;
   context: CurrentContext;
+  contextResolver?: ContextResolver;
   settingsLoader?: () => Promise<Settings>;
   clock?: WaitClock;
   pollIntervalMs?: number;
@@ -107,6 +111,7 @@ export interface WaitDependencies {
 
 export interface PreparedWait {
   readonly params: WaitParams;
+  readonly contextRebinding?: ContextResolutionDiagnostics;
   readonly label: string;
   readonly validation: { regex?: SafeRegex };
   readonly settings: Settings;
@@ -274,8 +279,8 @@ export function boundedBackgroundDetails(jobId: string, label: string, params: W
   };
 }
 
-function resultDetails(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], outcome: ForegroundWaitDetails["outcome"], reason: ForegroundWaitDetails["reason"], reviewerSummaries?: ReviewerSummary[]): ForegroundWaitDetails {
-  return { operation: "wait", outcome, label, matched: outcome === "success", reason, match: params.match, condition: params.condition, targets: snapshots, ...(reviewerSummaries && reviewerSummaries.length > 0 ? { reviewerSummaries } : {}) };
+function resultDetails(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], outcome: ForegroundWaitDetails["outcome"], reason: ForegroundWaitDetails["reason"], reviewerSummaries?: ReviewerSummary[], contextRebinding?: ContextResolutionDiagnostics): ForegroundWaitDetails {
+  return { operation: "wait", outcome, label, matched: outcome === "success", reason, match: params.match, condition: params.condition, targets: snapshots, ...(reviewerSummaries && reviewerSummaries.length > 0 ? { reviewerSummaries } : {}), ...(contextRebinding ? contextRebindingDetails(contextRebinding) : {}) };
 }
 
 function aggregate(params: WaitParams, snapshots: WaitTargetSnapshot[]): boolean {
@@ -289,18 +294,18 @@ function expired(clock: WaitClock, deadline: number, snapshots: WaitTargetSnapsh
   return true;
 }
 
-function timeoutResult(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[]): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } {
-  const details = resultDetails(params, label, snapshots, "timeout", "timeout", reviewerSummaries);
+function timeoutResult(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[], contextRebinding?: ContextResolutionDiagnostics): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } {
+  const details = resultDetails(params, label, snapshots, "timeout", "timeout", reviewerSummaries, contextRebinding);
   return { content: [{ type: "text" as const, text: formatResult({ operation: "wait", outcome: "timeout" }) }], details };
 }
 
-function successResult(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[]): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } {
-  const details = resultDetails(params, label, snapshots, "success", "condition_met", reviewerSummaries);
+function successResult(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[], contextRebinding?: ContextResolutionDiagnostics): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } {
+  const details = resultDetails(params, label, snapshots, "success", "condition_met", reviewerSummaries, contextRebinding);
   return { content: [{ type: "text" as const, text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
 }
 
-function timeoutIfExpired(params: WaitParams, label: string, read: { snapshots: WaitTargetSnapshot[]; expired: boolean }, reviewerSummaries?: ReviewerSummary[]): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } | undefined {
-  return read.expired ? timeoutResult(params, label, read.snapshots, reviewerSummaries) : undefined;
+function timeoutIfExpired(params: WaitParams, label: string, read: { snapshots: WaitTargetSnapshot[]; expired: boolean }, reviewerSummaries?: ReviewerSummary[], contextRebinding?: ContextResolutionDiagnostics): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } | undefined {
+  return read.expired ? timeoutResult(params, label, read.snapshots, reviewerSummaries, contextRebinding) : undefined;
 }
 
 export function mapReviewerFailure(error: unknown): WaitError {
@@ -326,8 +331,10 @@ export async function prepareWait(deps: WaitDependencies, rawParams: unknown, si
     throw new WaitError("INVALID_INPUT", "INVALID_SETTINGS: extension-owned wait settings are invalid", { cause: error instanceof Error ? error.message : String(error) });
   }
   checkAbort(signal);
-  const initial = parseSnapshotResult((await deps.cli.runJson(["api", "snapshot"], signal)).result);
-  const resolved = params.targets.map((ref) => ({ ref, target: resolveTarget(initial, ref, "agent", deps.context) }));
+  const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
+  const effective = await contextResolver(signal);
+  const initial = effective.snapshot;
+  const resolved = params.targets.map((ref) => ({ ref, target: resolveTarget(initial, ref, "agent", effective.context) }));
   const ids = new Set<string>();
   for (const item of resolved) {
     if (ids.has(item.target.id)) throw new WaitError("INVALID_INPUT", "INVALID_INPUT: target references resolve to the same resource", { targetId: item.target.id });
@@ -335,6 +342,7 @@ export async function prepareWait(deps: WaitDependencies, rawParams: unknown, si
   }
   return {
     params: structuredClone(params),
+    ...(effective.diagnostics.rebound ? { contextRebinding: effective.diagnostics } : {}),
     label: deriveWaitLabel(params, resolved),
     validation: { ...(validation.regex ? { regex: validation.regex } : {}) },
     settings: { ...settings },
@@ -361,7 +369,7 @@ export async function runPreparedWait(
   onUpdate: AgentToolUpdateCallback<WaitDetails> | undefined,
   context: ExtensionContext
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails }> {
-  const { params, label, validation, settings, resolved } = prepared;
+  const { params, label, validation, settings, resolved, contextRebinding } = prepared;
   const clock = deps.clock ?? realClock;
   const start = clock.now();
   const deadline = start + params.timeoutMs;
@@ -369,9 +377,9 @@ export async function runPreparedWait(
   const longWait = params.timeoutMs > cadenceMs;
   let read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
   let snapshots = read.snapshots;
-  const initialTimeout = timeoutIfExpired(params, label, read);
+  const initialTimeout = timeoutIfExpired(params, label, read, undefined, contextRebinding);
   if (initialTimeout) return initialTimeout;
-  if (aggregate(params, snapshots)) return successResult(params, label, snapshots);
+  if (aggregate(params, snapshots)) return successResult(params, label, snapshots, undefined, contextRebinding);
   let reviewer: WaitReviewer | undefined;
   if (longWait) {
     try {
@@ -384,24 +392,24 @@ export async function runPreparedWait(
   const sentLines = new Map<string, string[]>();
   let nextReview = start + cadenceMs;
   let lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
-  const progress = (text: string, outcome: ForegroundWaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, label, snapshots, outcome, undefined, reviewerSummaries), text.slice(0, 500));
+  const progress = (text: string, outcome: ForegroundWaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, label, snapshots, outcome, undefined, reviewerSummaries, contextRebinding), text.slice(0, 500));
   progress("waiting");
 
   while (true) {
     checkAbort(signal);
     if (aggregate(params, snapshots)) {
-      const details = resultDetails(params, label, snapshots, "success", "condition_met", reviewerSummaries);
+      const details = resultDetails(params, label, snapshots, "success", "condition_met", reviewerSummaries, contextRebinding);
       return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
     }
     const now = clock.now();
-    if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries);
+    if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries, contextRebinding);
     const untilReview = longWait ? Math.max(0, nextReview - now) : Number.MAX_SAFE_INTEGER;
     await clock.sleep(Math.min(deps.pollIntervalMs ?? 250, deadline - now, untilReview), signal);
     checkAbort(signal);
-    if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries);
+    if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries, contextRebinding);
     read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
     snapshots = read.snapshots;
-    const pollTimeout = timeoutIfExpired(params, label, read, reviewerSummaries);
+    const pollTimeout = timeoutIfExpired(params, label, read, reviewerSummaries, contextRebinding);
     if (pollTimeout) return pollTimeout;
     const newStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
     if (newStates.some((state, index) => state !== lastStates[index])) {
@@ -434,13 +442,13 @@ export async function runPreparedWait(
       progress(`review ${review.targetId}: ${review.classification} ${review.summary}`, terminal ? "manager_judgment_required" : "progress");
     }
     if (managerJudgment) {
-      if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries);
+      if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries, contextRebinding);
       read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
       snapshots = read.snapshots;
-      const refreshTimeout = timeoutIfExpired(params, label, read, reviewerSummaries);
+      const refreshTimeout = timeoutIfExpired(params, label, read, reviewerSummaries, contextRebinding);
       if (refreshTimeout) return refreshTimeout;
-      if (aggregate(params, snapshots)) return successResult(params, label, snapshots, reviewerSummaries);
-      const details = resultDetails(params, label, snapshots, "manager_judgment_required", "manager_judgment_required", reviewerSummaries);
+      if (aggregate(params, snapshots)) return successResult(params, label, snapshots, reviewerSummaries, contextRebinding);
+      const details = resultDetails(params, label, snapshots, "manager_judgment_required", "manager_judgment_required", reviewerSummaries, contextRebinding);
       return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "error", code: "MANAGER_JUDGMENT_REQUIRED" }) }], details };
     }
   }
@@ -481,7 +489,7 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
           generation
         );
         const targetIds = prepared.resolved.map((item) => item.target.id);
-        const details = boundedBackgroundDetails(registered.jobId, prepared.label, prepared.params, targetIds);
+        const details = { ...boundedBackgroundDetails(registered.jobId, prepared.label, prepared.params, targetIds), ...(prepared.contextRebinding ? contextRebindingDetails(prepared.contextRebinding) : {}) };
         return {
           content: [{ type: "text", text: `background wait started · ${details.label} · ${details.jobId}` }],
           details

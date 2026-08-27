@@ -87,7 +87,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
     expect([process.env.HERDR_WORKSPACE_ID, process.env.HERDR_TAB_ID, process.env.HERDR_PANE_ID].every(Boolean)).toBe(true);
 
     let workspaceId: string | undefined;
-    let fixtureCreated = false;
+    let reboundWorkspaceId: string | undefined;
     let sessionStarted = false;
     let server: ChildProcess | undefined;
     let client: Client | undefined;
@@ -202,24 +202,31 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const created = record(record(await runNamed(["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"])).result);
       workspaceId = record(created.workspace ?? created).workspace_id as string;
       if (typeof workspaceId !== "string" || workspaceId.length === 0) throw new Error("workspace create did not return an opaque workspace ID");
-      fixtureCreated = true;
-
       const fixture = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);
       const fixturePanes = Array.isArray(fixture.panes) ? fixture.panes.map(record) : [];
       const rootPane = fixturePanes.find((pane) => pane.workspace_id === workspaceId);
       if (!rootPane || typeof rootPane.pane_id !== "string" || typeof rootPane.tab_id !== "string") throw new Error("fixture snapshot omitted its root pane context");
 
+      const reboundWorkspace = record(record(await runNamed(["workspace", "create", "--cwd", cwd, "--label", `${label}-rebound`, "--no-focus"])).result);
+      reboundWorkspaceId = record(reboundWorkspace.workspace ?? reboundWorkspace).workspace_id as string;
+      if (typeof reboundWorkspaceId !== "string" || reboundWorkspaceId.length === 0 || reboundWorkspaceId === workspaceId) throw new Error("rebound workspace create did not return a distinct opaque workspace ID");
+
       // Reproduce the stale-terminal topology: create a pane, move that same
-      // pane to a new tab, then start MCP with the original tab ID.
+      // pane across workspaces into a new tab, then start MCP with every
+      // original injected ID. The move must allocate a new public pane ID;
+      // only the live terminal identity can make the old pane ID safe to rebind.
       const contextSplit = record(record(await runNamed(["pane", "split", rootPane.pane_id, "--direction", "right", "--cwd", cwd, "--no-focus"])).result);
       const splitPane = returnedPane(contextSplit);
       const originalPaneId = String(splitPane.pane_id);
       const originalTabId = rootPane.tab_id;
-      const moved = record(record(await runNamed(["pane", "move", String(splitPane.pane_id), "--new-tab", "--workspace", workspaceId, "--label", `${label}-moved`, "--no-focus"])).result);
+      const moved = record(record(await runNamed(["pane", "move", originalPaneId, "--new-tab", "--workspace", reboundWorkspaceId, "--label", `${label}-moved`, "--no-focus"])).result);
       const movedPane = returnedPane(moved);
+      expect(String(movedPane.pane_id)).not.toBe(originalPaneId);
       const afterMove = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);
-      const movedRecord = (Array.isArray(afterMove.panes) ? afterMove.panes.map(record) : []).find((pane) => pane.pane_id === movedPane.pane_id);
-      if (!movedRecord || typeof movedRecord.tab_id !== "string" || typeof movedRecord.workspace_id !== "string" || movedRecord.tab_id === originalTabId) throw new Error("pane move did not produce a new authoritative tab context");
+      const afterMovePanes = Array.isArray(afterMove.panes) ? afterMove.panes.map(record) : [];
+      expect(afterMovePanes.some((pane) => pane.pane_id === originalPaneId)).toBe(false);
+      const movedRecord = afterMovePanes.find((pane) => pane.pane_id === movedPane.pane_id);
+      if (!movedRecord || typeof movedRecord.tab_id !== "string" || typeof movedRecord.workspace_id !== "string" || movedRecord.workspace_id !== reboundWorkspaceId || movedRecord.tab_id === originalTabId) throw new Error("cross-workspace pane move did not produce the expected authoritative context");
       const movedTabId = movedRecord.tab_id;
 
       // The socket path is the only thing that binds the server to the
@@ -233,8 +240,9 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
           HERDR_ENV: "1",
           HERDR_SOCKET_PATH: socketPath,
           HERDR_WORKSPACE_ID: workspaceId,
-          // Deliberately preserve the tab ID captured before the move. The
-          // resolver must rebind it from the live pane without changing pane ID.
+          // Deliberately preserve every ID captured before the cross-workspace
+          // move. The resolver must follow the live pane alias and rebind all
+          // three IDs without accepting an unrelated replacement.
           HERDR_TAB_ID: originalTabId,
           HERDR_PANE_ID: originalPaneId,
           CLAUDE_PROJECT_DIR: cwd
@@ -258,7 +266,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(evidence(reboundContext)).toMatchObject({
         context: {
           injected: { workspaceId, tabId: originalTabId, paneId: originalPaneId },
-          effective: { workspaceId, tabId: movedTabId, paneId: String(movedPane.pane_id) },
+          effective: { workspaceId: reboundWorkspaceId, tabId: movedTabId, paneId: String(movedPane.pane_id) },
           rebound: true
         }
       });
@@ -293,11 +301,12 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       ]));
       expect(catalog.diagnostics ?? []).toEqual([]);
 
-      // Create the launch target through this same runtime so existing-pane
-      // recovery can prove ownership instead of treating the pane as external.
-      const split = await call("herdr_pane", { operation: "split", target: rootPane.pane_id, label: "mcp-worker", direction: "right", focus: false, env: { HERDR_TOOLS_IT_SECRET: ENVIRONMENT_SENTINEL } });
-      const workerPaneId = evidence(split).paneId as string;
-      expect(typeof workerPaneId).toBe("string");
+      // Create a disposable pane through this same runtime so the result still
+      // proves environment redaction, then let the launch exercise its default
+      // same-tab placement against the rebound caller pane.
+      const prepared = await call("herdr_pane", { operation: "split", target: String(movedPane.pane_id), label: "mcp-prepared", direction: "right", focus: false, env: { HERDR_TOOLS_IT_SECRET: ENVIRONMENT_SENTINEL } });
+      const preparedPaneId = evidence(prepared).paneId as string;
+      expect(typeof preparedPaneId).toBe("string");
 
       const createdTab = await call("herdr_tab", { operation: "create", label: "mcp-smoke" });
       const createdTabId = evidence(createdTab).tabId as string;
@@ -306,20 +315,25 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(closedTab.isError).toBeUndefined();
 
       const panes = await call("herdr_inspect", { mode: "collection", collection: "panes" });
-      expect(evidence(panes).items).toEqual(expect.arrayContaining([expect.objectContaining({ workspace_id: workspaceId })]));
+      expect(evidence(panes).items).toEqual(expect.arrayContaining([expect.objectContaining({ workspace_id: reboundWorkspaceId })]));
 
       await new Promise((settle) => setTimeout(settle, PANE_SETTLE_MS));
-      const prelaunch = await call("herdr_inspect", { mode: "target", target: workerPaneId });
+      const prelaunch = await call("herdr_inspect", { mode: "target", target: preparedPaneId });
       const prelaunchMetadata = record(evidence(prelaunch).metadata);
-      expect(prelaunchMetadata).toMatchObject({ pane_id: workerPaneId, agent_status: "unknown" });
+      expect(prelaunchMetadata).toMatchObject({ pane_id: preparedPaneId, agent_status: "unknown" });
       expect(prelaunchMetadata).not.toHaveProperty("agent_name");
       expect(prelaunchMetadata).not.toHaveProperty("agent_id");
       expect(prelaunchMetadata).not.toHaveProperty("agent");
       const launchStartedAt = performance.now();
-      const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", placement: { mode: "existing_pane", target: workerPaneId }, initialPrompt: "Use the bash tool to run pwd, then report the working directory." });
+      const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", initialPrompt: "Use the bash tool to run pwd, then report the working directory." });
       const launchElapsedMs = performance.now() - launchStartedAt;
+      const launchFailureEvidence = evidence(launched);
+      let launchFailurePaneId = preparedPaneId;
       if (launched.isError) {
-        await recordLaunchFailureBeforeTeardown(launched, workerPaneId, launchElapsedMs);
+        const launchFailureDetails = record(launchFailureEvidence.details);
+        const launchFailureCreated = launchFailureDetails.created === undefined ? {} : record(launchFailureDetails.created);
+        launchFailurePaneId = typeof launchFailureCreated.paneId === "string" ? launchFailureCreated.paneId : preparedPaneId;
+        await recordLaunchFailureBeforeTeardown(launched, launchFailurePaneId, launchElapsedMs);
         const failure = evidence(launched);
         const details = record(failure.details);
         expect(failure.code).toBe("LAUNCH_FAILED");
@@ -328,7 +342,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
           phase: "prompt_verification",
           promptSubmitted: true,
           promptConsumption: "unconfirmed",
-          initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: workerPaneId },
+          initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: launchFailurePaneId },
           promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100, elapsedMs: expect.any(Number) },
           timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
           created: expect.any(Object)
@@ -339,10 +353,12 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         // assignment whose consumption was not proven.
         return;
       }
-      const launchEvidence = evidence(launched);
+      const launchEvidence = launchFailureEvidence;
+      const workerPaneId = String(launchEvidence.paneId);
       expect(launchEvidence).toMatchObject({
         operation: "launch",
         outcome: "launched",
+        placement: { mode: "same_tab" },
         kind: "pi",
         paneId: workerPaneId,
         initialPromptSent: true,
@@ -354,6 +370,9 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       assertLaunchPhaseTiming(launchEvidence, launchElapsedMs, false);
       expect(record(launchEvidence.sender).paneId).toBe(String(movedPane.pane_id));
       expect(record(record(launchEvidence.profile).source).kind).toBe("bundled");
+      const launchedSnapshot = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);
+      const launchedPane = (Array.isArray(launchedSnapshot.panes) ? launchedSnapshot.panes.map(record) : []).find((pane) => pane.pane_id === workerPaneId);
+      expect(launchedPane).toMatchObject({ pane_id: workerPaneId, tab_id: movedTabId, workspace_id: reboundWorkspaceId });
 
       const confirmedState = record(launchEvidence.initialPromptObservation).state;
       const confirmedWaitState = confirmedState === "working" ? "working" : confirmedState === "blocked" ? "needs_input" : "completed";
@@ -420,8 +439,10 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
     } finally {
       if (failure !== undefined) process.stderr.write("INTEGRATION_FAILURE_RECORDED_BEFORE_TEARDOWN\n");
       await client?.close().catch(() => undefined);
-      if (fixtureCreated && workspaceId) {
-        await runNamed(["workspace", "close", workspaceId]).catch((error: unknown) => process.stderr.write(`INTEGRATION_TEARDOWN_FAILURE ${String(error)}\n`));
+      for (const disposableWorkspaceId of [reboundWorkspaceId, workspaceId]) {
+        if (disposableWorkspaceId) {
+          await runNamed(["workspace", "close", disposableWorkspaceId]).catch((error: unknown) => process.stderr.write(`INTEGRATION_TEARDOWN_FAILURE ${String(error)}\n`));
+        }
       }
       if (sessionStarted) await run("session", "stop", REQUIRED_SESSION, "--json").catch((error: unknown) => process.stderr.write(`INTEGRATION_SESSION_STOP_FAILURE ${String(error)}\n`));
       await stopDisposableServer(server);

@@ -38,6 +38,15 @@ describe("HerdrCli", () => {
     expect(exec).toHaveBeenCalledWith("herdr", ["agent", "start", "worker", "--timeout", "300000"], { signal, timeout: 305_000 });
   });
 
+  it("bounds native agent-wait execution to its requested timeout instead of the default", async () => {
+    const exec = vi.fn<PiExec>().mockResolvedValue(response('{"id":"wait","result":{"type":"wait_matched"}}'));
+    const cli = new HerdrCli(exec);
+    await cli.runJson(["agent", "wait", "w1:p1", "--until", "done", "--timeout", "60000"], signal);
+    expect(exec).toHaveBeenCalledWith("herdr", ["agent", "wait", "w1:p1", "--until", "done", "--timeout", "60000"], { signal, timeout: 61_000 });
+    await cli.runJson(["agent", "wait", "w1:p1", "--until", "done", "--timeout", "1"], signal);
+    expect(exec).toHaveBeenLastCalledWith("herdr", ["agent", "wait", "w1:p1", "--until", "done", "--timeout", "1"], { signal, timeout: 1_001 });
+  });
+
   it("preserves a completed mutation response when abort arrives after execution", async () => {
     const controller = new AbortController();
     const exec = vi.fn<PiExec>().mockImplementation(async () => {

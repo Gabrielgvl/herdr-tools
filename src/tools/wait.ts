@@ -290,6 +290,48 @@ interface ReadTargetInput {
   identity?: WaitTargetIdentity;
 }
 
+function protocolErrorCode(error: unknown): string | undefined {
+  if (errorCode(error) !== "CLI_PROTOCOL_ERROR") return undefined;
+  const details = (error as { details?: unknown }).details;
+  if (typeof details !== "object" || details === null || Array.isArray(details)) return undefined;
+  const envelope = (details as Record<string, unknown>).errorEnvelope;
+  if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) return undefined;
+  const body = (envelope as Record<string, unknown>).error;
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return undefined;
+  const code = (body as Record<string, unknown>).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function isNativePredicateTimeout(error: unknown): boolean {
+  return protocolErrorCode(error) === "timeout";
+}
+
+function isAgentAbsentError(error: unknown): boolean {
+  const code = protocolErrorCode(error);
+  return code === "agent_not_found" || code === "agent_not_running";
+}
+
+function agentRecordFrom(value: unknown): Record<string, unknown> | undefined {
+  const root = asRecord(value, "CLI_PROTOCOL_ERROR: agent response is invalid");
+  if (!Object.prototype.hasOwnProperty.call(root, "agent") || root.agent === null || root.agent === undefined) return undefined;
+  return asRecord(root.agent, "CLI_PROTOCOL_ERROR: agent response is invalid");
+}
+
+async function readFreshAgent(cli: WaitCli, paneId: string, signal: AbortSignal, control?: JobOperationControl): Promise<Record<string, unknown> | undefined> {
+  try {
+    return agentRecordFrom((await guardedCall(() => cli.runJson(["agent", "get", paneId], signal), signal, control)).result);
+  } catch (error) {
+    if (isAgentAbsentError(error)) return undefined;
+    throw error;
+  }
+}
+
+async function readStrictIdentity(cli: WaitCli, pane: Record<string, unknown>, paneId: string, signal: AbortSignal, control?: JobOperationControl): Promise<WaitTargetIdentity> {
+  const agent = await readFreshAgent(cli, paneId, signal, control);
+  if (!agent) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity is unavailable");
+  return waitIdentity([pane, agent], paneId);
+}
+
 async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock, signal: AbortSignal, control?: JobOperationControl, strict = false): Promise<WaitTargetSnapshot> {
   checkAbort(signal);
   const paneId = item.target.paneId!;
@@ -297,7 +339,7 @@ async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock,
     const pane = paneFrom((await guardedCall(() => cli.runJson(["pane", "get", paneId], signal), signal, control)).result, paneId);
     let identityA: WaitTargetIdentity | undefined;
     if (strict) {
-      identityA = waitIdentity([pane], paneId);
+      identityA = await readStrictIdentity(cli, pane, paneId, signal, control);
       if (!item.identity || !sameWaitTargetIdentity(identityA, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity changed");
     }
     const readArgs = ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"];
@@ -306,7 +348,7 @@ async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock,
       : { value: await guardedCall(() => cli.runText(readArgs, signal), signal, control), truncated: false };
     if (strict) {
       const after = paneFrom((await guardedCall(() => cli.runJson(["pane", "get", paneId], signal), signal, control)).result, paneId);
-      const identityB = waitIdentity([after], paneId);
+      const identityB = await readStrictIdentity(cli, after, paneId, signal, control);
       if (!identityA || !sameWaitTargetIdentity(identityA, identityB) || !item.identity || !sameWaitTargetIdentity(identityB, item.identity)) {
         throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity changed");
       }
@@ -320,6 +362,58 @@ async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock,
   }
 }
 
+async function readCurrentStateTarget(
+  cli: WaitCli,
+  item: ReadTargetInput,
+  clock: WaitClock,
+  signal: AbortSignal,
+  condition: Extract<WaitCondition, { kind: "state" }>,
+  control?: JobOperationControl,
+): Promise<WaitTargetSnapshot> {
+  checkAbort(signal);
+  const paneId = item.target.paneId!;
+  try {
+    const pane = paneFrom((await guardedCall(() => cli.runJson(["pane", "get", paneId], signal), signal, control)).result, paneId);
+    const status = rawState(pane);
+    const agent = await readFreshAgent(cli, paneId, signal, control);
+    const agentAbsent = agent === undefined;
+    if (agentAbsent) {
+      if (status !== "unknown") throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity is unavailable");
+    } else {
+      const identity = waitIdentity([pane, agent], paneId);
+      if (!item.identity || !sameWaitTargetIdentity(identity, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity changed");
+    }
+    const observedAtMs = clock.now();
+    return {
+      target: item.ref,
+      targetId: paneId,
+      metadata: metadataWithoutIdentity({ ...pane, agent_status: status }),
+      recentUnwrappedLines: [],
+      observedAtMs,
+      matched: matchesState(status, condition.state),
+      target_evidence: historicalTargetEvidence(agentAbsent ? "agent_absent_observed" : "predicate_observed", observedAtMs, item.targetGenerationRef, "composite_observation")
+    };
+  } catch (error) {
+    if (signal.aborted || errorCode(error) === "ABORTED") abort();
+    if (error instanceof WaitError) throw error;
+    throw new WaitError((errorCode(error) as WaitError["code"] | undefined) ?? "CLI_PROTOCOL_ERROR", `Unable to read target ${item.ref}`, { target: item.ref, targetId: paneId, cause: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function readCurrentState(
+  cli: WaitCli,
+  resolved: ReadonlyArray<ReadTargetInput>,
+  clock: WaitClock,
+  signal: AbortSignal,
+  deadline: number,
+  condition: Extract<WaitCondition, { kind: "state" }>,
+  control?: JobOperationControl,
+): Promise<{ snapshots: WaitTargetSnapshot[]; expired: boolean }> {
+  const snapshots = await Promise.all(resolved.map((item) => readCurrentStateTarget(cli, item, clock, signal, condition, control)));
+  checkAbort(signal);
+  return { snapshots, expired: expired(clock, deadline, snapshots) };
+}
+
 async function readAll(cli: WaitCli, resolved: ReadonlyArray<ReadTargetInput>, clock: WaitClock, signal: AbortSignal, control?: JobOperationControl, strict = false): Promise<WaitTargetSnapshot[]> {
   checkAbort(signal);
   const values = await Promise.all(resolved.map((item) => readTarget(cli, item, clock, signal, control, strict)));
@@ -329,10 +423,14 @@ async function readAll(cli: WaitCli, resolved: ReadonlyArray<ReadTargetInput>, c
 
 async function readAndMatch(cli: WaitCli, resolved: ReadonlyArray<ReadTargetInput>, clock: WaitClock, signal: AbortSignal, deadline: number, condition: WaitCondition, regex?: SafeRegex, control?: JobOperationControl, strict = false): Promise<{ snapshots: WaitTargetSnapshot[]; expired: boolean }> {
   const snapshots = await readAll(cli, resolved, clock, signal, control, strict);
-  if (expired(clock, deadline, snapshots)) return { snapshots, expired: true };
   snapshots.forEach((snapshot, index) => {
+    // A settled timeout still needs to identify the historical observation even
+    // though the late sample cannot satisfy the predicate.
+    snapshot.target_evidence = historicalTargetEvidence("predicate_observed", snapshot.observedAtMs, resolved[index]!.targetGenerationRef, "composite_observation");
+  });
+  if (expired(clock, deadline, snapshots)) return { snapshots, expired: true };
+  snapshots.forEach((snapshot) => {
     snapshot.matched = matches(snapshot, condition, regex);
-    if (snapshot.matched) snapshot.target_evidence = historicalTargetEvidence("predicate_observed", snapshot.observedAtMs, resolved[index]!.targetGenerationRef, "composite_observation");
   });
   return { snapshots, expired: expired(clock, deadline, snapshots) };
 }
@@ -382,6 +480,39 @@ function hasCompleteIdentity(value: Record<string, unknown>, paneId: string): bo
   }
 }
 
+function nativeSnapshot(
+  item: ReadTargetInput,
+  record: Record<string, unknown>,
+  status: string,
+  observedAtMs: number,
+  matched: boolean,
+  agentAbsent = false,
+): WaitTargetSnapshot {
+  const kind = agentAbsent ? "agent_absent_observed" : status === "done" ? "native_done_observed" : "predicate_observed";
+  return {
+    target: item.ref,
+    targetId: item.target.paneId!,
+    metadata: metadataWithoutIdentity({ ...record, agent_status: status }),
+    recentUnwrappedLines: [],
+    observedAtMs,
+    matched,
+    target_evidence: historicalTargetEvidence(kind, observedAtMs, item.targetGenerationRef, "native_agent_wait")
+  };
+}
+
+function nativeTimeoutSnapshot(item: ReadTargetInput, clock: WaitClock): WaitTargetSnapshot {
+  const observedAtMs = clock.now();
+  return {
+    target: item.ref,
+    targetId: item.target.paneId!,
+    metadata: metadataWithoutIdentity(item.target.record),
+    recentUnwrappedLines: [],
+    observedAtMs,
+    matched: false,
+    target_evidence: historicalTargetEvidence("identity_unknown", observedAtMs, item.targetGenerationRef, "native_agent_wait")
+  };
+}
+
 async function readNativeTarget(
   cli: WaitCli,
   item: ReadTargetInput,
@@ -399,8 +530,10 @@ async function readNativeTarget(
     const argv = ["agent", "wait", item.target.paneId!, ...until.flatMap((state) => ["--until", state]), "--timeout", String(timeoutMs)];
     return (await guardedCall(() => cli.runJson(argv, signal), signal, control)).result;
   };
+  let phase: "native_wait" | "verification" = "native_wait";
   try {
     const raw = await run();
+    phase = "verification";
     control?.check();
     checkAbort(signal);
     const { record, status } = nativeAgentRecord(raw, item.target.paneId!);
@@ -408,56 +541,55 @@ async function readNativeTarget(
     // not always the complete occupant identity. In that wire shape, one
     // post-wait agent.get verifies the server-pinned result without rebuilding
     // the predicate with a client-side poll/sandwich.
-    const identityRecord = hasCompleteIdentity(record, item.target.paneId!)
-      ? record
-      : cli.runNativeAgentWait
-        ? record
-        : asRecord((await guardedCall(() => cli.runJson(["agent", "get", item.target.paneId!], signal), signal, control)).result, "CLI_PROTOCOL_ERROR: native agent.get response is invalid").agent ?? record;
-    const identity = waitIdentity([identityRecord], item.target.paneId!);
-    if (!item.identity || !sameWaitTargetIdentity(identity, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target occupant changed");
-    const observedAtMs = clock.now();
-    if (observedAtMs >= deadline) {
-      return {
-        target: item.ref,
-        targetId: item.target.paneId!,
-        metadata: metadataWithoutIdentity(item.target.record),
-        recentUnwrappedLines: [],
-        observedAtMs,
-        matched: false
-      };
+    let agentAbsent = false;
+    let identityValues: unknown[] = [record];
+    if (!hasCompleteIdentity(record, item.target.paneId!)) {
+      if (cli.runNativeAgentWait) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait returned incomplete target identity");
+      const agent = await readFreshAgent(cli, item.target.paneId!, signal, control);
+      if (!agent) {
+        if (status !== "unknown") throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target identity is unavailable");
+        agentAbsent = true;
+      } else {
+        identityValues = [record, agent];
+      }
     }
-    const matched = matchesState(status, condition.state);
-    return {
-      target: item.ref,
-      targetId: item.target.paneId!,
-      metadata: { ...metadataWithoutIdentity(item.target.record), agent_status: status },
-      recentUnwrappedLines: [],
-      observedAtMs,
-      matched,
-      ...(matched ? { target_evidence: historicalTargetEvidence(status === "done" ? "native_done_observed" : "predicate_observed", observedAtMs, item.targetGenerationRef, "native_agent_wait") } : {})
-    };
+    if (!agentAbsent) {
+      const identity = waitIdentity(identityValues, item.target.paneId!);
+      if (!item.identity || !sameWaitTargetIdentity(identity, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target occupant changed");
+    }
+    const observedAtMs = clock.now();
+    const matched = observedAtMs < deadline && matchesState(status, condition.state);
+    return nativeSnapshot(item, record, status, observedAtMs, matched, agentAbsent);
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
-    if (errorCode(error) === "CLI_TIMEOUT") {
-      const observedAtMs = clock.now();
-      return {
-        target: item.ref,
-        targetId: item.target.paneId!,
-        metadata: metadataWithoutIdentity(item.target.record),
-        recentUnwrappedLines: [],
-        observedAtMs,
-        matched: false
-      };
-    }
+    // A typed timeout from the native command means its predicate expired; a
+    // killed subprocess (or a post-match verification timeout) is a failure.
+    if (phase === "native_wait" && isNativePredicateTimeout(error)) return nativeTimeoutSnapshot(item, clock);
+    if (errorCode(error) === "CLI_TIMEOUT") throw new WaitError("CLI_TIMEOUT", "CLI_TIMEOUT: native wait or target verification timed out", { target: item.ref, targetId: item.target.paneId! });
     if (error instanceof WaitError) throw error;
     throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait failed", { target: item.ref });
   }
 }
 
-function linkedSignal(parent: AbortSignal, controller: AbortController): AbortSignal {
+interface LinkedAbortSignal {
+  signal: AbortSignal;
+  dispose(): void;
+}
+
+/** @internal Testable link used only by the native wait fan-out. */
+export function linkedSignal(parent: AbortSignal, controller: AbortController): LinkedAbortSignal {
+  let disposed = false;
+  const onAbort = (): void => controller.abort();
   if (parent.aborted) controller.abort();
-  else parent.addEventListener("abort", () => controller.abort(), { once: true });
-  return controller.signal;
+  else parent.addEventListener("abort", onAbort, { once: true });
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      parent.removeEventListener("abort", onAbort);
+    }
+  };
 }
 
 async function readNative(
@@ -471,14 +603,18 @@ async function readNative(
   control?: JobOperationControl,
   nativeWaitDeadline = deadline,
 ): Promise<{ snapshots: WaitTargetSnapshot[]; expired: boolean }> {
-  const controllers = resolved.map(() => new AbortController());
-  const promises = resolved.map((item, index) => readNativeTarget(cli, item, clock, linkedSignal(signal, controllers[index]!), deadline, condition, control, nativeWaitDeadline));
+  const linked = resolved.map(() => {
+    const controller = new AbortController();
+    return { controller, ...linkedSignal(signal, controller) };
+  });
+  const promises = resolved.map((item, index) => readNativeTarget(cli, item, clock, linked[index]!.signal, deadline, condition, control, nativeWaitDeadline));
+  const cleanup = (): void => linked.forEach(({ controller, dispose }) => { controller.abort(); dispose(); });
   if (match === "all") {
     try {
       const snapshots = await Promise.all(promises);
       return { snapshots, expired: clock.now() >= deadline && !snapshots.every((snapshot) => snapshot.matched) };
     } finally {
-      controllers.forEach((controller) => controller.abort());
+      cleanup();
     }
   }
   const pending = new Set(promises.map((_, index) => index));
@@ -489,14 +625,13 @@ async function readNative(
       pending.delete(next.index);
       observed.push(next.snapshot);
       if (next.snapshot.matched) {
-        controllers.forEach((controller, index) => { if (index !== next.index) controller.abort(); });
         pending.forEach((index) => { void promises[index]!.catch(() => undefined); });
         return { snapshots: observed.sort((left, right) => resolved.findIndex((item) => item.target.paneId === left.targetId) - resolved.findIndex((item) => item.target.paneId === right.targetId)), expired: false };
       }
     }
     return { snapshots: observed.sort((left, right) => resolved.findIndex((item) => item.target.paneId === left.targetId) - resolved.findIndex((item) => item.target.paneId === right.targetId)), expired: clock.now() >= deadline };
   } finally {
-    controllers.forEach((controller) => controller.abort());
+    cleanup();
     pending.forEach((index) => { void promises[index]!.catch(() => undefined); });
   }
 }
@@ -552,7 +687,6 @@ function expired(clock: WaitClock, deadline: number, snapshots: WaitTargetSnapsh
   if (clock.now() < deadline) return false;
   snapshots.forEach((snapshot) => {
     snapshot.matched = false;
-    delete snapshot.target_evidence;
   });
   return true;
 }
@@ -689,12 +823,21 @@ export async function runPreparedWait(
   const nativePredicate = deps.cli.supportsNativeAgentWait === true && params.condition.kind === "state";
   const strictIdentity = deps.requireTargetIdentity === true || deps.cli.supportsNativeAgentWait === true;
   let nextReview = start + cadenceMs;
-  const initialNativeDeadline = nativePredicate && longWait ? Math.min(deadline, start + 1) : deadline;
-  let read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline);
+  const initialNativeDeadline = nativePredicate && longWait ? Math.min(deadline, start + cadenceMs) : deadline;
+  let read = nativePredicate
+    ? await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, control)
+    : await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline);
   let snapshots = read.snapshots;
   const initialTimeout = timeoutIfExpired(read);
   if (initialTimeout) return initialTimeout;
   if (aggregate(params, snapshots)) return conditionMetResult(snapshots);
+  if (nativePredicate) {
+    read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline);
+    snapshots = read.snapshots;
+    const nativeTimeout = timeoutIfExpired(read);
+    if (nativeTimeout) return nativeTimeout;
+    if (aggregate(params, snapshots)) return conditionMetResult(snapshots);
+  }
   let reviewer: WaitReviewer | undefined;
   if (longWait) {
     try {
@@ -738,7 +881,9 @@ export async function runPreparedWait(
       if (reviewerRead.expired) return timedOutResult(reviewerRead.snapshots, reviewerSummaries);
       // This composite refresh is reviewer context only. A native predicate can
       // be satisfied only by the occupant-pinned agent.wait route below.
-      snapshots = reviewerRead.snapshots.map((snapshot) => ({ ...snapshot, matched: false, target_evidence: undefined }));
+      // Keep the reviewer read as historical evidence, but never let its
+      // composite match replace the native predicate result.
+      snapshots = reviewerRead.snapshots.map((snapshot) => ({ ...snapshot, matched: false }));
       lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
     }
     const requests: ReviewerRequest[] = snapshots.map((snapshot) => {

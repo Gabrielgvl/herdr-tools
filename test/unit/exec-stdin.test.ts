@@ -60,4 +60,19 @@ describe("stdin prompt executor", () => {
     expect(result.killed).toBe(true);
     expect(result.code).toBe(137);
   }, 15_000);
+
+  it("records successful SIGKILL delivery during escalation", async () => {
+    const originalKill = ChildProcess.prototype.kill;
+    const kill = vi.spyOn(ChildProcess.prototype, "kill").mockImplementation(function (this: ChildProcess, signal?: NodeJS.Signals | number) {
+      if (signal === "SIGTERM") return false;
+      return originalKill.call(this, signal);
+    });
+    try {
+      const ignoresTerm = "process.on('SIGTERM', () => {}); process.stdin.resume(); setInterval(() => {}, 1000);";
+      const result = await spawnWithStdin(process.execPath, ["-e", ignoresTerm], "input", { timeout: 25, killGraceMs: 50 });
+      expect(result).toMatchObject({ killed: true, killDelivered: true, code: 137 });
+    } finally {
+      kill.mockRestore();
+    }
+  }, 15_000);
 });

@@ -40,6 +40,8 @@ const MAX_EVIDENCE_BYTES = 50_000;
 const MAX_ERROR_FIELD_BYTES = 4_096;
 export const HERDR_AGENT_START_TIMEOUT_MS = 120_000;
 export const HERDR_AGENT_START_EXEC_MARGIN_MS = 5_000;
+/** Native agent.wait must not be capped by the host's ordinary short-command timeout. */
+export const HERDR_AGENT_WAIT_EXEC_MARGIN_MS = 1_000;
 
 /** The one evidence bound every host applies to captured CLI output. */
 export function boundedEvidence(value: string, limit = MAX_EVIDENCE_BYTES): { value: string; content: string; truncated: boolean } {
@@ -162,13 +164,21 @@ function normalizeCompletedStdinResult(result: ExecResult, preserveCompletedMuta
   return result;
 }
 
-function requestedAgentStartTimeout(argv: string[]): number {
+function requestedTimeout(argv: string[], fallback: number): number {
   const timeoutIndex = argv.indexOf("--timeout");
   if (timeoutIndex >= 0) {
     const value = Number(argv[timeoutIndex + 1]);
     if (Number.isSafeInteger(value) && value > 0) return value;
   }
-  return HERDR_AGENT_START_TIMEOUT_MS;
+  return fallback;
+}
+
+function requestedAgentStartTimeout(argv: string[]): number {
+  return requestedTimeout(argv, HERDR_AGENT_START_TIMEOUT_MS);
+}
+
+function requestedAgentWaitTimeout(argv: string[], fallback: number): number {
+  return requestedTimeout(argv, fallback);
 }
 
 export class HerdrCli {
@@ -227,7 +237,9 @@ export class HerdrCli {
     try {
       const timeout = argv[0] === "agent" && argv[1] === "start"
         ? Math.max(this.timeout, requestedAgentStartTimeout(argv) + HERDR_AGENT_START_EXEC_MARGIN_MS)
-        : this.timeout;
+        : argv[0] === "agent" && argv[1] === "wait"
+          ? requestedAgentWaitTimeout(argv, this.timeout) + HERDR_AGENT_WAIT_EXEC_MARGIN_MS
+          : this.timeout;
       const result = input === undefined
         ? await this.exec("herdr", argv, { signal, timeout })
         : await this.stdinExec("herdr", argv, input, { signal, timeout });

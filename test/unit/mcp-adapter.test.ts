@@ -420,7 +420,7 @@ describe("MCP error mapping", () => {
     const messages = [
       "plain failure",
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} {`,
-      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} \"scalar\"`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} "scalar"`,
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, phase: "not-a-phase" })}`,
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, effectCertainty: "not-a-certainty" })}`,
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, recoveryGuidance: "not-guidance" })}`,

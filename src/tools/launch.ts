@@ -15,7 +15,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type RuntimeProfile } from "../profiles/types.js";
-import { withoutEnvironment } from "../redaction.js";
+import { modelSafeJson } from "../redaction.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -160,7 +160,7 @@ const realLaunchClock: LaunchClock = { now: () => performance.now() };
 
 export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
   inspectBeforeRetry: "Inspect the affected pane and agent with herdr_inspect before retrying; do not assume that no agent started.",
-  preserveUnconfirmed: "Do not relaunch or reuse the pane; inspect the existing agent and preserve the acknowledged prompt because it may already be consumed.",
+  preserveUnconfirmed: "An agent exists and the acknowledged prompt may already be consumed; do not relaunch or reuse the pane. Inspect the existing agent before continuing.",
   noEffect: "No launch mutation was dispatched; correct the failure and retry only after validating the request.",
   unknownEffect: "Inspect the affected pane and agent with herdr_inspect before any retry; the launch effect is unknown and must not be assumed absent."
 } as const);
@@ -176,13 +176,24 @@ interface LaunchModelDiagnostic {
   recoveryGuidance: string;
 }
 
+function boundedDiagnosticText(value: string, maxBytes: number): string {
+  let result = "";
+  for (const character of value) {
+    const candidate = `${result}${character}`;
+    if (Buffer.byteLength(candidate, "utf8") > maxBytes) break;
+    result = candidate;
+  }
+  return result;
+}
+
 function safeDiagnosticString(value: unknown, limit = 256): string | undefined {
   if (typeof value !== "string") return undefined;
   const printable = [...value].map((character) => {
     const code = character.charCodeAt(0);
     return code <= 31 || code === 127 ? " " : character;
   }).join("").trim();
-  return printable.length === 0 ? undefined : printable.slice(0, limit);
+  const bounded = boundedDiagnosticText(printable, limit);
+  return bounded.length === 0 ? undefined : bounded;
 }
 
 function safeDiagnosticIds(created: LaunchResourceIds): LaunchResourceIds {
@@ -193,9 +204,9 @@ function safeDiagnosticIds(created: LaunchResourceIds): LaunchResourceIds {
   };
 }
 
-function diagnosticRecovery(effectCertainty: LaunchEffectCertainty, promptSubmitted: boolean): string {
+function diagnosticRecovery(effectCertainty: LaunchEffectCertainty, promptSubmitted: boolean, mutationDispatched: boolean): string {
   if (promptSubmitted) return LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed;
-  if (effectCertainty === "absent") return LAUNCH_RECOVERY_GUIDANCE.noEffect;
+  if (effectCertainty === "absent" && !mutationDispatched) return LAUNCH_RECOVERY_GUIDANCE.noEffect;
   if (effectCertainty === "unknown") return LAUNCH_RECOVERY_GUIDANCE.unknownEffect;
   return LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry;
 }
@@ -210,13 +221,25 @@ function launchDiagnosticMessage(message: string, diagnostic: LaunchModelDiagnos
     recoveryGuidance: safeDiagnosticString(diagnostic.recoveryGuidance, 512) ?? LAUNCH_RECOVERY_GUIDANCE.unknownEffect
   };
   const suffix = `\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`;
-  const available = LAUNCH_DIAGNOSTIC_MAX_BYTES - Buffer.byteLength(suffix, "utf8");
-  if (available <= 0) return `${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`.slice(0, LAUNCH_DIAGNOSTIC_MAX_BYTES);
-  const boundedBase = [...base].reduce((result, character) => {
-    const candidate = `${result}${character}`;
-    return Buffer.byteLength(candidate, "utf8") <= available ? candidate : result;
-  }, "");
-  return `${boundedBase}${suffix}`;
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  if (suffixBytes > LAUNCH_DIAGNOSTIC_MAX_BYTES) {
+    // The normal fixed-shape payload is comfortably below the bound. Keep a
+    // valid, smaller payload if that invariant ever changes instead of slicing
+    // JSON in the middle of a multibyte character or escaped field.
+    const minimal = {
+      code: payload.code,
+      phase: payload.phase,
+      created: {},
+      agentStarted: payload.agentStarted,
+      promptSubmitted: payload.promptSubmitted,
+      recipientRegistered: payload.recipientRegistered,
+      effectCertainty: payload.effectCertainty,
+      recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.unknownEffect
+    } satisfies LaunchModelDiagnostic;
+    return `${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(minimal)}`;
+  }
+  const available = LAUNCH_DIAGNOSTIC_MAX_BYTES - suffixBytes;
+  return `${boundedDiagnosticText(base, available)}${suffix}`;
 }
 
 class LaunchError extends Error {
@@ -379,19 +402,22 @@ function noAgentFromPane(pane: Record<string, unknown>): boolean {
 
 function compactAttemptState(pane: Record<string, unknown>): Record<string, unknown> {
   const result = Object.fromEntries(["pane_id", "tab_id", "workspace_id", "agent_id", "agent_name", "name", "agent_kind", "agent", "kind", "agent_status", "state_change_seq", "status"].flatMap((field): Array<[string, unknown]> => {
+    if (!own(pane, field)) return [];
     const value = pane[field];
-    if (value === undefined) return [];
-    if (typeof value === "string") return [[field, value.slice(0, 256)]];
+    if (typeof value === "string") {
+      const safe = safeDiagnosticString(value);
+      return safe === undefined ? [] : [[field, safe]];
+    }
     if (typeof value === "number" || typeof value === "boolean" || value === null) return [[field, value]];
     return [];
   }));
-  const session = pane.agent_session;
-  if (record(session) && ["source", "agent", "kind", "value"].every((field) => typeof session[field] === "string")) {
+  const session = own(pane, "agent_session") ? pane.agent_session : undefined;
+  if (record(session) && ["source", "agent", "kind", "value"].every((field) => own(session, field) && typeof session[field] === "string")) {
     result.agent_session = {
-      source: (session.source as string).slice(0, 256),
-      agent: (session.agent as string).slice(0, 256),
-      kind: (session.kind as string).slice(0, 256),
-      value: (session.value as string).slice(0, 256)
+      source: safeDiagnosticString(session.source) ?? "",
+      agent: safeDiagnosticString(session.agent) ?? "",
+      kind: safeDiagnosticString(session.kind) ?? "",
+      value: safeDiagnosticString(session.value) ?? ""
     };
   }
   return result;
@@ -428,20 +454,21 @@ async function boundedReconciliationRead<T>(operation: (signal: AbortSignal) => 
 }
 
 function readbackAgentName(agent: Record<string, unknown> | undefined, pane: Record<string, unknown> | undefined): string | undefined {
-  const candidate = agent?.name ?? pane?.agent_name ?? pane?.agent;
+  const candidate = agent && own(agent, "name") ? agent.name : pane && own(pane, "agent_name") ? pane.agent_name : pane && own(pane, "agent") ? pane.agent : undefined;
   return safeDiagnosticString(candidate, 256);
 }
 
 function readbackAgentId(agent: Record<string, unknown> | undefined, pane: Record<string, unknown> | undefined): string | undefined {
-  return safeDiagnosticString(agent?.agent_id ?? agent?.id ?? pane?.agent_id, 256);
+  const candidate = agent && own(agent, "agent_id") ? agent.agent_id : agent && own(agent, "id") ? agent.id : pane && own(pane, "agent_id") ? pane.agent_id : undefined;
+  return safeDiagnosticString(candidate, 256);
 }
 
 function readbackPaneRecord(value: unknown): Record<string, unknown> | undefined {
-  return record(value) && record(value.pane) ? value.pane : undefined;
+  return record(value) && own(value, "pane") && record(value.pane) ? value.pane : undefined;
 }
 
 function readbackAgentRecord(value: unknown): Record<string, unknown> | undefined {
-  return record(value) && record(value.agent) ? value.agent : undefined;
+  return record(value) && own(value, "agent") && record(value.agent) ? value.agent : undefined;
 }
 
 function compactReadbackLines(value: string): { lines: string[]; truncated: boolean } {
@@ -452,17 +479,36 @@ function compactReadbackLines(value: string): { lines: string[]; truncated: bool
   return { lines, truncated: bounded.truncated || lines.length < bounded.content.split(/\r?\n/u).length };
 }
 
-function launchEffectCertainty(input: LaunchReconciliationInput, snapshot: HerdrSnapshot | undefined, pane: Record<string, unknown> | undefined, agent: Record<string, unknown> | undefined): Exclude<LaunchEffectCertainty, "confirmed"> {
-  if (snapshot === undefined && pane === undefined && agent === undefined) return "unknown";
+function launchEffectCertainty(
+  input: LaunchReconciliationInput,
+  snapshot: HerdrSnapshot | undefined,
+  pane: Record<string, unknown> | undefined,
+  agent: Record<string, unknown> | undefined,
+  readFailures: readonly string[]
+): Exclude<LaunchEffectCertainty, "confirmed"> {
   const baselinePaneIds = new Set(input.baseline?.panes.map((item) => item.pane_id) ?? []);
   const baselineTabIds = new Set(input.baseline?.tabs.map((item) => item.tab_id) ?? []);
-  const currentPane = input.paneId === undefined ? undefined : snapshot?.panes.find((item) => item.pane_id === input.paneId);
-  const currentTab = input.tabId === undefined ? undefined : snapshot?.tabs.find((item) => item.tab_id === input.tabId);
+  const candidatePaneId = input.paneId ?? input.created.paneId;
+  const candidateTabId = input.tabId ?? input.created.tabId;
+  const currentPane = candidatePaneId === undefined ? undefined : snapshot?.panes.find((item) => item.pane_id === candidatePaneId);
+  const currentTab = candidateTabId === undefined ? undefined : snapshot?.tabs.find((item) => item.tab_id === candidateTabId);
   const createdPane = currentPane !== undefined && !baselinePaneIds.has(currentPane.pane_id);
   const createdTab = currentTab !== undefined && !baselineTabIds.has(currentTab.tab_id);
+
+  // A live agent or a newly observed pane/tab proves a partial launch effect,
+  // even if another optional read failed. Conversely, a failed read must never
+  // be converted into an "absent" conclusion merely because no record was
+  // returned from the other reads.
   if (agent !== undefined || createdPane || createdTab) return "partial";
+  if (readFailures.length > 0) return "unknown";
   if (input.agentStarted || input.promptSubmitted) return "unknown";
-  return "absent";
+
+  // Absence is only conclusive when the authoritative snapshot actually
+  // identified the requested pane and proved that it is gone. If no candidate
+  // could be identified, the readback is incomplete and remains unknown.
+  const candidateKnown = candidatePaneId !== undefined;
+  if (snapshot !== undefined && candidateKnown && currentPane === undefined) return "absent";
+  return "unknown";
 }
 
 async function reconcileLaunch(input: LaunchReconciliationInput): Promise<LaunchReconciliationEvidence> {
@@ -533,10 +579,10 @@ async function reconcileLaunch(input: LaunchReconciliationInput): Promise<Launch
         : "unknown";
     const agentState: LaunchReconciliationEvidence["agent"] = currentAgent !== undefined
       ? "present"
-      : snapshotAvailable && candidatePaneId !== undefined && paneState === "present" && !snapshot?.agents.some((item) => item.pane_id === candidatePaneId)
+      : snapshotAvailable && candidatePaneId !== undefined && (paneState === "absent" || (paneState === "present" && !snapshot?.agents.some((item) => item.pane_id === candidatePaneId)))
         ? "absent"
         : "unknown";
-    const certainty = launchEffectCertainty(input, snapshot, currentPane, currentAgent);
+    const certainty = launchEffectCertainty(input, snapshot, currentPane, currentAgent, failures);
     return {
       effectCertainty: certainty,
       snapshot: snapshotAvailable ? "present" : "unavailable",
@@ -1302,7 +1348,7 @@ function earlyLaunchFailure(error: unknown, phase: LaunchDetails["phase"]): Laun
     promptSubmitted: false,
     recipientRegistered: false,
     effectCertainty: "absent",
-    recoveryGuidance: diagnosticRecovery("absent", false)
+    recoveryGuidance: diagnosticRecovery("absent", false, false)
   });
 }
 
@@ -1376,7 +1422,7 @@ function partialError(
     promptSubmitted: effects.promptSubmitted,
     recipientRegistered: effects.recipientRegistered,
     effectCertainty,
-    recoveryGuidance: diagnosticRecovery(effectCertainty, effects.promptSubmitted)
+    recoveryGuidance: diagnosticRecovery(effectCertainty, effects.promptSubmitted, effects.mutationDispatched)
   });
 }
 
@@ -1446,6 +1492,14 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let phase: LaunchDetails["phase"] = "validate";
       const created: LaunchResourceIds = {};
       const attempts: LaunchAttemptEvidence[] = [];
+      const dispatchMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
+        // A pre-aborted caller has not dispatched a mutation. Once the signal is
+        // live, mark before invoking the adapter because an in-flight failure can
+        // still have committed a topology or prompt effect.
+        if (abortSignal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
+        topologyMutationDispatched = true;
+        return operation();
+      };
       try {
         validateParams(params);
         initialPromptDelivery = requestedDelivery;
@@ -1530,8 +1584,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           paneId = existingTarget!.paneId!;
           tabId = existingTarget!.tabId;
         } else if (placement.mode === "new_tab") {
-          topologyMutationDispatched = true;
-          const result = tabRefFrom(await run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...noFocusArgs()], abortSignal, true));
+          const result = tabRefFrom(await dispatchMutation(() => run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...noFocusArgs()], abortSignal, true)));
           tabId = result.tabId;
           paneId = result.paneId;
           created.tabId = tabId;
@@ -1543,8 +1596,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           created.paneId = paneId;
           deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
         } else {
-          topologyMutationDispatched = true;
-          const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...noFocusArgs(), "--cwd", cwd], abortSignal, true));
+          const result = paneRefFrom(await dispatchMutation(() => run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...noFocusArgs(), "--cwd", cwd], abortSignal, true)));
           paneId = result.paneId;
           tabId = result.tabId ?? effectiveContext!.tabId;
           created.paneId = paneId;
@@ -1553,8 +1605,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         }
         const resolvedPaneId = paneId!;
         if (placement.mode !== "existing_pane") {
-          topologyMutationDispatched = true;
-          await run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal);
+          await dispatchMutation(() => run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal));
         }
         phase = "agent_start";
         progress(onUpdate, phase, created);
@@ -1567,8 +1618,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path)];
           const attemptStartedAt = clock.now();
           try {
-            topologyMutationDispatched = true;
-            started = await run(deps.cli, startArgs, abortSignal, true);
+            started = await dispatchMutation(() => run(deps.cli, startArgs, abortSignal, true));
             agentStarted = true;
             attempts.push({ profile: profile.name, outcome: "selected" });
             selectedAttemptStartedAt = attemptStartedAt;
@@ -1624,8 +1674,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (params.focus === true) {
           phase = "focus";
           progress(onUpdate, phase, created);
-          topologyMutationDispatched = true;
-          await run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal);
+          await dispatchMutation(() => run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal));
         }
         if (agentId) created.agentId = agentId;
 
@@ -1646,8 +1695,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           progress(onUpdate, phase, created);
           const promptSubmissionStartedAt = clock.now();
           try {
-            topologyMutationDispatched = true;
-            const promptResponse = await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
+            const promptResponse = await dispatchMutation(() => runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal));
             promptSubmitted = true;
             initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity);
           } finally {
@@ -1680,7 +1728,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           operation: "launch", outcome: "launched", name: authoritativeName, kind: chosenRuntime.kind, placement, tabId, paneId: resolvedPaneId,
           ...contextRebindingDetails(contextDiagnostics!),
           ...(agentId ? { agentId } : {}),
-          postState: boundAgentSessionStrings(withoutEnvironment(postState)),
+          postState: boundAgentSessionStrings(modelSafeJson(postState)) as Record<string, unknown>,
           agentStarted,
           initialPromptSent,
           promptSubmitted,

@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
-import { createInspectTool } from "../../src/tools/inspect.js";
+import { createInspectTool, MAX_INSPECT_CONTENT_BYTES } from "../../src/tools/inspect.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
 const snapshot: HerdrSnapshot = {
@@ -38,6 +38,12 @@ function execute(cli: HerdrCli, params: Record<string, unknown>) {
   return createInspectTool({ cli, context }).execute("id", params as never, new AbortController().signal, undefined, extensionContext);
 }
 
+function contentText(result: { content: ReadonlyArray<{ type: string; text?: string }> }): string {
+  const block = result.content[0];
+  if (block?.type !== "text" || typeof block.text !== "string") throw new Error("expected a text content block");
+  return block.text;
+}
+
 describe("herdr_inspect", () => {
   it("returns the default current target with exactly the recent-unwrapped tail of 100 lines", async () => {
     const { cli, calls } = makeCli();
@@ -47,6 +53,38 @@ describe("herdr_inspect", () => {
     expect(calls).toContainEqual(["pane", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "100", "--format", "text"]);
     const healthCli = new HerdrCli(vi.fn<PiExec>().mockResolvedValue({ stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "stopped" } }), stderr: "", code: 0, killed: false }));
     await expect(createInspectTool({ cli: healthCli, context }).execute("id", { mode: "health" } as never, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { kind: "health" } });
+  });
+
+  it("publishes bounded structured model-visible content for target, collection, and health", async () => {
+    const hugeOutput = Array.from({ length: 120 }, (_, index) => `${"x".repeat(900)}-${index}`).join("\\n");
+    const target = await execute(makeCli(hugeOutput).cli, { mode: "target", target: "caller" });
+    const targetContent = JSON.parse(contentText(target)) as Record<string, unknown>;
+    expect(targetContent).toMatchObject({ modelVisible: true, operation: "inspect", kind: "target", target: { paneId: "w1:p1" }, metadata: { pane_id: "w1:p1" } });
+    expect((targetContent.recentUnwrappedLines as string[]).length).toBeLessThanOrEqual(100);
+    expect(Buffer.byteLength(contentText(target), "utf8")).toBeLessThanOrEqual(MAX_INSPECT_CONTENT_BYTES);
+
+    const collectionSnapshot: HerdrSnapshot = {
+      ...snapshot,
+      panes: [snapshot.panes[0]!, ...Array.from({ length: 120 }, (_, index) => ({ pane_id: `w1:p${index + 2}`, tab_id: "w1:t1", workspace_id: "w1", label: `worker-${index}`, agent_status: "idle" }))]
+    };
+    const collection = await execute(makeCli(undefined, collectionSnapshot).cli, { mode: "collection", collection: "panes" });
+    const collectionContent = JSON.parse(contentText(collection)) as Record<string, unknown>;
+    expect(collectionContent).toMatchObject({ modelVisible: true, collection: "panes", truncated: true, omittedCount: 21 });
+    expect(collectionContent.items).toHaveLength(100);
+    expect(Buffer.byteLength(contentText(collection), "utf8")).toBeLessThanOrEqual(MAX_INSPECT_CONTENT_BYTES);
+
+    const healthExec = vi.fn<PiExec>().mockResolvedValue({
+      stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true, socket: "/secret/socket" } }),
+      stderr: "",
+      code: 0,
+      killed: false
+    });
+    const healthResult = await createInspectTool({ cli: new HerdrCli(healthExec), context, environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true, secret: "health-secret" } as never }).execute("id", { mode: "health" } as never, new AbortController().signal, undefined, extensionContext);
+    const healthContent = JSON.parse(contentText(healthResult)) as Record<string, unknown>;
+    expect(healthContent).toMatchObject({ modelVisible: true, kind: "health", client: { protocol: 20 }, server: { status: "running", protocol: 20 }, socketReachable: true, compatible: true, environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true } });
+    expect(JSON.stringify(healthContent)).not.toContain("/secret/socket");
+    expect(JSON.stringify(healthContent)).not.toContain("health-secret");
+    expect(Buffer.byteLength(contentText(healthResult), "utf8")).toBeLessThanOrEqual(MAX_INSPECT_CONTENT_BYTES);
   });
 
   it("reports a stale ancestor rebind in context mode", async () => {

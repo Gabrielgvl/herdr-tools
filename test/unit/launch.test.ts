@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError } from "../../src/cli.js";
-import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
+import { createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
@@ -43,6 +43,15 @@ const startFailure = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "agent pro
 });
 const envelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const PROMPT_ARGV = (paneId: string) => ["agent", "prompt", paneId, "--stdin"];
+
+function launchDiagnostic(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) throw new Error("expected an Error");
+  const prefix = `\n${LAUNCH_DIAGNOSTIC_MARKER} `;
+  const offset = error.message.indexOf(prefix);
+  if (offset < 0) throw new Error(`missing ${LAUNCH_DIAGNOSTIC_MARKER}`);
+  return JSON.parse(error.message.slice(offset + prefix.length)) as Record<string, unknown>;
+}
+
 const TEST_SESSION = { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" };
 const observedAgent = (state: string | undefined, stateChangeSeq: number | undefined, revision = 3): Record<string, unknown> => ({
   name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-0", agent_session: TEST_SESSION,
@@ -523,13 +532,26 @@ describe("herdr_launch profile-only contract", () => {
     }
   });
 
-  it("rejects malformed start-record lifecycle values before readiness", async () => {
+  it("rejects malformed start-record lifecycle values before readiness and reconciles the started pane", async () => {
     const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>);
+    expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
-      details: { phase: "agent_start", causeCode: "TARGET_IDENTITY_UNAVAILABLE", agentStarted: true, promptSubmitted: false }
+      details: { phase: "agent_start", causeCode: "TARGET_IDENTITY_UNAVAILABLE", agentStarted: true, promptSubmitted: false, reconciliation: { snapshot: "present", effectCertainty: "partial" } }
     });
-    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "get")).toHaveLength(0);
+    expect(launchDiagnostic(failure)).toMatchObject({
+      code: "LAUNCH_FAILED",
+      phase: "agent_start",
+      created: { tabId: "w1:t1", paneId: "w1:p2" },
+      agentStarted: true,
+      promptSubmitted: false,
+      recipientRegistered: false,
+      effectCertainty: "partial",
+      recoveryGuidance: expect.stringContaining("herdr_inspect")
+    });
+    expect(Buffer.byteLength(failure.message, "utf8")).toBeLessThanOrEqual(LAUNCH_DIAGNOSTIC_MAX_BYTES);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "get")).toHaveLength(1);
   });
 
   it("validates but does not use stale start-record lifecycle values as the prompt anchor", async () => {
@@ -774,10 +796,16 @@ describe("herdr_launch profile-only contract", () => {
       paneStates: [observedPane("idle", 7), postPane]
     });
     const recipients = new RecipientRegistry();
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "fail closed" }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
+    const failure = await (launch({ name: "worker", profile: "worker", initialPrompt: "fail closed" }, catalog(profile("worker")), harness.cli, undefined, { recipients })
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>);
+    expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason, samples: 1, sourceCode } }
     });
+    expect(launchDiagnostic(failure)).toMatchObject({ effectCertainty: expect.any(String), recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed });
+    expect(failure.message).toContain("An agent exists");
+    expect(failure.message).toContain("may already be consumed");
+    expect(failure.message).toContain("do not relaunch or reuse the pane");
     expect(harness.stdinInputs).toHaveLength(1);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
@@ -856,6 +884,32 @@ describe("herdr_launch profile-only contract", () => {
       });
       expect(harness.stdinInputs).toHaveLength(0);
       expect(recipients.get("w1:p2")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses a fresh live signal for bounded readback after caller abort", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const harness = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
+      configureFreshIdentitySamples(harness, [{ name: "worker", kind: "pi" }]);
+      const base = harness.cli.runJson;
+      const readbackSignals: Array<{ sameAsCaller: boolean; abortedAtDispatch: boolean }> = [];
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (controller.signal.aborted && (argv[0] === "api" || argv[0] === "pane" || argv[0] === "agent")) {
+          readbackSignals.push({ sameAsCaller: signal === controller.signal, abortedAtDispatch: signal.aborted });
+        }
+        return base(argv, signal, preserve);
+      });
+      const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
+      const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "abort" }, controller.signal, undefined, extensionContext);
+      await vi.waitFor(() => expect(harness.calls).toContainEqual(["pane", "get", "w1:p2"]), { timeout: 1_000, interval: 1 });
+      controller.abort();
+      await expect(pending).rejects.toMatchObject({ code: "ABORTED", details: { reconciliation: { snapshot: "present", effectCertainty: "partial" } } });
+      expect(readbackSignals.length).toBeGreaterThan(0);
+      expect(readbackSignals.every((item) => item.sameAsCaller === false && item.abortedAtDispatch === false)).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -1005,7 +1059,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "READY_TIMEOUT",
       details: { causeCode: "READY_TIMEOUT", phase: "ready", agentStarted: true, promptSubmitted: false, readiness: { elapsedMs: 120_000, samples: 0, lastPendingReason: "readiness_budget_exhausted_before_sample" } }
     });
-    expect(harness.calls.filter((call) => call[0] === "api")).toHaveLength(1);
+    expect(harness.calls.filter((call) => call[0] === "api")).toHaveLength(2);
     expect(harness.stdinInputs).toHaveLength(0);
   });
 
@@ -1024,7 +1078,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "READY_TIMEOUT",
       details: { causeCode: "READY_TIMEOUT", phase: "ready", readiness: { elapsedMs: 120_000, samples: 1, baselineRequired: true } }
     });
-    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "get")).toHaveLength(0);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "get")).toHaveLength(1);
     expect(harness.stdinInputs).toHaveLength(0);
   });
 
@@ -1080,6 +1134,67 @@ describe("herdr_launch profile-only contract", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("reports unknown effect and bounded recovery guidance when reconciliation reads fail", async () => {
+    const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
+    const base = harness.cli.runJson;
+    let started = false;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "start") {
+        const result = await base(argv, signal, preserve);
+        started = true;
+        return result;
+      }
+      if (started && (argv[0] === "api" || argv[0] === "pane" || argv[0] === "agent")) throw Object.assign(new Error("reconciliation unavailable"), { code: "CLI_PROTOCOL_ERROR" });
+      return base(argv, signal, preserve);
+    });
+    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>);
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { reconciliation: { effectCertainty: "unknown", snapshot: "unavailable", pane: "unknown", agent: "unknown", readFailures: expect.arrayContaining(["snapshot:CLI_PROTOCOL_ERROR", "pane:CLI_PROTOCOL_ERROR", "agent:CLI_PROTOCOL_ERROR"]) } }
+    });
+    expect(launchDiagnostic(failure)).toMatchObject({ effectCertainty: "unknown", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.unknownEffect });
+    expect(Buffer.byteLength(failure.message, "utf8")).toBeLessThanOrEqual(LAUNCH_DIAGNOSTIC_MAX_BYTES);
+  });
+
+  it("reports an absent effect conservatively and still requires inspection after an attempted mutation", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let startFailed = false;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "start") {
+        startFailed = true;
+        harness.calls.push(argv);
+        throw Object.assign(new Error("start failed"), { code: "agent_start_failed" });
+      }
+      if (startFailed && argv[0] === "api") return ok("reconciled-snapshot", { type: "session_snapshot", snapshot });
+      if (startFailed && argv[0] === "pane" && argv[1] === "get") return ok("reconciled-pane", { pane: null });
+      if (startFailed && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent: null });
+      return base(argv, signal, preserve);
+    });
+    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>);
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { effectCertainty: "absent", reconciliation: { effectCertainty: "absent", pane: "absent", agent: "absent" } }
+    });
+    expect(launchDiagnostic(failure)).toMatchObject({ effectCertainty: "absent", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry });
+    expect(failure.message).not.toContain(LAUNCH_RECOVERY_GUIDANCE.noEffect);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+  });
+
+  it("does not reconcile validation or preflight failures before any mutation", async () => {
+    const validationCalls: string[][] = [];
+    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "x".repeat(16 * 1024 + 1) }, catalog(profile("worker")), makeCli({ calls: validationCalls }).cli)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE_FOR_INLINE" });
+    expect(validationCalls).toHaveLength(0);
+
+    const preflightCalls: string[][] = [];
+    const preflightCli = makeCli({ calls: preflightCalls });
+    const preflightTool = createLaunchTool({ cli: preflightCli.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw Object.assign(new Error("health unavailable"), { code: "BACKEND_UNAVAILABLE" }); } });
+    await expect(preflightTool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "BACKEND_UNAVAILABLE" });
+    expect(preflightCalls).toHaveLength(0);
   });
 
   it.each([
@@ -1190,7 +1305,9 @@ describe("herdr_launch profile-only contract", () => {
         }
       }
     });
-    expect(harness.calls.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    const readinessReads = harness.calls.filter((call) => call[0] === "api" || (call[0] === "agent" && call[1] === "get") || (call[0] === "pane" && call[1] === "get"));
+    expect(readinessReads.slice(-6, -3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["pane", "get"], ["agent", "get"]]);
     expect(harness.stdinInputs).toHaveLength(0);
   });
 
@@ -1361,7 +1478,8 @@ describe("herdr_launch profile-only contract", () => {
       details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 1, baselineRequired: true } }
     });
     const readinessReads = harness.calls.filter((call) => call[0] === "api" || (call[0] === "agent" && call[1] === "get") || (call[0] === "pane" && call[1] === "get"));
-    expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    expect(readinessReads.slice(-6, -3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["pane", "get"], ["agent", "get"]]);
     expect(harness.stdinInputs).toHaveLength(0);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
@@ -1452,7 +1570,8 @@ describe("herdr_launch profile-only contract", () => {
       details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1, records: expect.any(Array) } }
     });
     const readinessReads = harness.calls.filter((call) => call[0] === "api" || (call[0] === "agent" && call[1] === "get") || (call[0] === "pane" && call[1] === "get"));
-    expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    expect(readinessReads.slice(-6, -3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
+    expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["pane", "get"], ["agent", "get"]]);
     expect(harness.stdinInputs).toHaveLength(0);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
   });
@@ -1638,7 +1757,7 @@ describe("herdr_launch profile-only contract", () => {
       const base = harness.cli.runJson;
       harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "agent" && argv[1] === "start" ? ok("start", { agent }) : base(argv, signal, preserve));
       await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
-      expect(harness.calls.some((call) => call[0] === "pane" && call[1] === "get")).toBe(false);
+      expect(harness.calls.filter((call) => call[0] === "pane" && call[1] === "get")).toHaveLength(1);
     }
 
     const terminalOnly = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-worker" } }) });
@@ -2367,8 +2486,10 @@ describe("herdr_launch profile-only contract", () => {
     expect(mismatched.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
 
     const wrongMessage = makeCli({ start: () => { throw Object.assign(new Error("other failure"), { code: "agent_start_failed" }); } });
-    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), wrongMessage.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
-    expect(wrongMessage.calls.some((call) => call[0] === "pane" && call[1] === "get")).toBe(false);
+    const wrongMessageFailure = await launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), wrongMessage.cli).catch((error: unknown) => error as { details: Record<string, unknown> });
+    expect(wrongMessageFailure).toMatchObject({ code: "LAUNCH_FAILED", details: { reconciliation: { snapshot: "present" } } });
+    expect(wrongMessage.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(wrongMessage.calls.filter((call) => call[0] === "pane" && call[1] === "get")).toHaveLength(1);
     const malformedEnvelope = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "failure", { exitCode: 1, killed: false, stderrTruncated: false, stderr: "{" }); } });
     await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), malformedEnvelope.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
 

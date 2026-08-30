@@ -11,6 +11,7 @@ import { AdapterContractError, HERDR_DETAILS_LABEL, MCP_RESULT_MAX_BYTES, callTo
 import { HostCapabilityError } from "../../src/mcp/host.js";
 import { SequentialToolQueue } from "../../src/mcp/queue.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
+import { LAUNCH_DIAGNOSTIC_MARKER } from "../../src/tools/launch.js";
 
 const health = { client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true } };
 const snapshot = {
@@ -364,6 +365,17 @@ describe("MCP error mapping", () => {
       expect(outcome.isError).toBe(true);
       expect(payload(outcome)).toMatchObject({ code, message: `${code}: refused`, details: { target: "w:p2" } });
     }
+  });
+
+  it("preserves the structured launch diagnostic in model-visible error content", async () => {
+    const diagnostic = { code: "LAUNCH_FAILED", phase: "ready", created: { paneId: "w:p2" }, agentStarted: true, promptSubmitted: false, recipientRegistered: false, effectCertainty: "unknown", recoveryGuidance: "Inspect with herdr_inspect before retrying." };
+    const message = `Launch did not complete: readiness failed\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`;
+    const outcome = await call(stub({ execute: async () => { throw Object.assign(new Error(message), { code: "LAUNCH_FAILED", details: { effectCertainty: "unknown" } }); } }));
+    const body = payload(outcome);
+    expect(body.message).toContain(LAUNCH_DIAGNOSTIC_MARKER);
+    const markerOffset = String(body.message).indexOf(LAUNCH_DIAGNOSTIC_MARKER);
+    expect(JSON.parse(String(body.message).slice(markerOffset + LAUNCH_DIAGNOSTIC_MARKER.length + 1))).toEqual(diagnostic);
+    expect(body.details).toEqual({ effectCertainty: "unknown" });
   });
 
   it("reports a denied host capability with its own code", async () => {

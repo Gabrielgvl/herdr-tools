@@ -7,7 +7,7 @@ import { resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } fro
 import { formatCall, renderResultComponent, textComponent } from "../tui.js";
 import { resolveProfile, type Profile, type ProfileCandidate, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
 import { boundedText } from "../job-registry.js";
-import { modelSafeJson, withoutEnvironment } from "../redaction.js";
+import { modelSafeJson } from "../redaction.js";
 
 interface InspectDetails {
   operation: "inspect";
@@ -55,6 +55,14 @@ const COMPACT_COLLECTION_KEYS: Record<"panes" | "agents" | "tabs", readonly stri
 
 const MAX_INSPECT_COLLECTION_ITEMS = 100;
 const MAX_COLLECTION_FIELD_BYTES = 256;
+
+function compactEnvironment(value: InspectDependencies["environment"] | undefined, context: CurrentContext): InspectDetails["environment"] {
+  return {
+    enabled: value?.enabled ?? true,
+    currentIdsPresent: value?.currentIdsPresent ?? Boolean(context.workspaceId && context.tabId && context.paneId),
+    currentIdsValid: value?.currentIdsValid ?? true
+  };
+}
 
 function compactCollectionRecord(value: Record<string, unknown>, collection: "panes" | "agents" | "tabs"): Record<string, unknown> {
   const allowed = new Set(COMPACT_COLLECTION_KEYS[collection]);
@@ -421,7 +429,7 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       if (mode === "health") {
         if (input.target !== undefined || input.collection !== undefined || input.profile !== undefined) throw Object.assign(new Error("health does not accept target, profile, or collection"), { code: "INVALID_INPUT" });
         const health = parseHealth(await deps.cli.runText(["status", "--json"], activeSignal));
-        const environment = deps.environment ?? { enabled: true, currentIdsPresent: Boolean(deps.context.workspaceId && deps.context.tabId && deps.context.paneId), currentIdsValid: true };
+        const environment = compactEnvironment(deps.environment, deps.context);
         const details: InspectDetails = { operation: "inspect", kind: "health", outcome: "success", environment, ...health };
         const bounded = boundedInspectionDetails(details);
         return { content: [{ type: "text", text: modelVisibleInspectionContent(bounded) }], details: bounded };
@@ -451,16 +459,17 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       }
       const target = resolvePaneOrAgentTarget(snapshot, input.target ?? "current", effective.context);
       const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal)).result);
-      const raw = await deps.cli.runText(["pane", "read", target.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], activeSignal);
-      const recentUnwrappedLines = raw.length === 0 ? [] : raw.split(/\r?\n/).slice(-100);
+      const raw = await deps.cli.runTextResult(["pane", "read", target.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], activeSignal);
+      const recentUnwrappedLines = raw.value.length === 0 ? [] : raw.value.split(/\r?\n/).slice(-100);
       const details: InspectDetails = {
         operation: "inspect",
         kind: "target",
         outcome: "success",
         target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName },
         ...(mode === "context" ? { context: effective.diagnostics } : contextRebindingDetails(effective.diagnostics)),
-        metadata: withoutEnvironment(pane),
-        recentUnwrappedLines
+        metadata: modelSafeJson(pane),
+        recentUnwrappedLines,
+        ...(raw.truncated ? { truncated: true } : {})
       };
       const bounded = boundedInspectionDetails(details);
       return { content: [{ type: "text", text: modelVisibleInspectionContent(bounded) }], details: bounded };

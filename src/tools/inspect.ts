@@ -4,10 +4,10 @@ import { contextRebindingDetails, createContextResolver, type ContextResolutionD
 import { parseHealth } from "../health.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
 import { resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
-import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
+import { formatCall, renderResultComponent, textComponent } from "../tui.js";
 import { resolveProfile, type Profile, type ProfileCandidate, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
 import { boundedText } from "../job-registry.js";
-import { withoutEnvironment } from "../redaction.js";
+import { modelSafeJson, withoutEnvironment } from "../redaction.js";
 
 interface InspectDetails {
   operation: "inspect";
@@ -53,9 +53,14 @@ const COMPACT_COLLECTION_KEYS: Record<"panes" | "agents" | "tabs", readonly stri
   tabs: ["tab_id", "workspace_id", "parent_id", "label"]
 };
 
+const MAX_INSPECT_COLLECTION_ITEMS = 100;
+const MAX_COLLECTION_FIELD_BYTES = 256;
+
 function compactCollectionRecord(value: Record<string, unknown>, collection: "panes" | "agents" | "tabs"): Record<string, unknown> {
   const allowed = new Set(COMPACT_COLLECTION_KEYS[collection]);
-  return Object.fromEntries(Object.entries(value).filter(([key, item]) => allowed.has(key) && typeof item === "string"));
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, item]) => allowed.has(key) && typeof item === "string")
+    .map(([key, item]) => [key, boundedText(item as string, MAX_COLLECTION_FIELD_BYTES)]));
 }
 
 function compactCollection(snapshot: HerdrSnapshot, collection: "panes" | "agents" | "tabs", context: { workspaceId: string; tabId: string }): Record<string, unknown>[] {
@@ -256,6 +261,7 @@ function modelVisibleDiagnostics(diagnostics: readonly unknown[]): unknown[] {
   });
 }
 
+export const MAX_INSPECT_CONTENT_BYTES = 50 * 1024;
 const MAX_PROFILE_CONTENT_BYTES = 16_000;
 const OUTPUT_TRUNCATED_DIAGNOSTIC = Object.freeze({ code: "OUTPUT_TRUNCATED", message: "inspection output was truncated to fit the byte limit" });
 
@@ -364,8 +370,16 @@ function fitProfileCollection(value: Record<string, unknown>, totalCount: number
   return candidate!;
 }
 
-function modelVisibleContent(value: Record<string, unknown>): string {
-  return JSON.stringify(fitInspectionValue(value, MAX_PROFILE_CONTENT_BYTES)) as string;
+function modelVisibleContent(value: Record<string, unknown>, maxBytes = MAX_PROFILE_CONTENT_BYTES): string {
+  const safe = modelSafeJson(value);
+  return JSON.stringify(fitInspectionValue(safe, maxBytes)) as string;
+}
+
+function modelVisibleInspectionContent(value: InspectDetails): string {
+  // Keep the model-bound result self-describing. The marker also prevents the
+  // MCP host from mistaking this Pi-facing projection for its authoritative
+  // details block and dropping the latter.
+  return modelVisibleContent({ ...value, modelVisible: true }, MAX_INSPECT_CONTENT_BYTES);
 }
 
 export function createInspectTool(deps: InspectDependencies): ToolDefinition<typeof InspectParamsSchema, InspectDetails> {
@@ -407,7 +421,10 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       if (mode === "health") {
         if (input.target !== undefined || input.collection !== undefined || input.profile !== undefined) throw Object.assign(new Error("health does not accept target, profile, or collection"), { code: "INVALID_INPUT" });
         const health = parseHealth(await deps.cli.runText(["status", "--json"], activeSignal));
-        return { content: [{ type: "text", text: "Herdr health inspected" }], details: { operation: "inspect", kind: "health", outcome: "success", environment: deps.environment ?? { enabled: true, currentIdsPresent: Boolean(deps.context.workspaceId && deps.context.tabId && deps.context.paneId), currentIdsValid: true }, ...health } };
+        const environment = deps.environment ?? { enabled: true, currentIdsPresent: Boolean(deps.context.workspaceId && deps.context.tabId && deps.context.paneId), currentIdsValid: true };
+        const details: InspectDetails = { operation: "inspect", kind: "health", outcome: "success", environment, ...health };
+        const bounded = boundedInspectionDetails(details);
+        return { content: [{ type: "text", text: modelVisibleInspectionContent(bounded) }], details: bounded };
       }
       if (mode === "collection") {
         if (!input.collection || input.target !== undefined || input.profile !== undefined) throw Object.assign(new Error("collection mode requires collection and rejects target/profile"), { code: "INVALID_INPUT" });
@@ -417,8 +434,20 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       const effective = await (deps.contextResolver ?? createContextResolver(deps.cli, deps.context))(activeSignal);
       const snapshot = effective.snapshot;
       if (mode === "collection") {
-        const items = compactCollection(snapshot, input.collection as "panes" | "agents" | "tabs", effective.context);
-        return { content: [{ type: "text", text: `Inspected ${input.collection}` }], details: { operation: "inspect", kind: "collection", outcome: "success", collection: input.collection, items, ...contextRebindingDetails(effective.diagnostics) } };
+        const allItems = compactCollection(snapshot, input.collection as "panes" | "agents" | "tabs", effective.context);
+        const items = allItems.slice(0, MAX_INSPECT_COLLECTION_ITEMS);
+        const omittedCount = allItems.length - items.length;
+        const details: InspectDetails = {
+          operation: "inspect",
+          kind: "collection",
+          outcome: "success",
+          collection: input.collection,
+          items,
+          ...(omittedCount > 0 ? { truncated: true, omittedCount } : {}),
+          ...contextRebindingDetails(effective.diagnostics)
+        };
+        const bounded = boundedInspectionDetails(details);
+        return { content: [{ type: "text", text: modelVisibleInspectionContent(bounded) }], details: bounded };
       }
       const target = resolvePaneOrAgentTarget(snapshot, input.target ?? "current", effective.context);
       const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal)).result);
@@ -433,7 +462,8 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         metadata: withoutEnvironment(pane),
         recentUnwrappedLines
       };
-      return { content: [{ type: "text", text: formatResult({ operation: "inspect", outcome: "success", targetId: target.id }) }], details };
+      const bounded = boundedInspectionDetails(details);
+      return { content: [{ type: "text", text: modelVisibleInspectionContent(bounded) }], details: bounded };
     },
     renderCall(rawArgs, theme) {
       const args = rawArgs as InspectParams;

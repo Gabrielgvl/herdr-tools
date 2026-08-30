@@ -20,6 +20,7 @@ import { withoutEnvironment } from "../redaction.js";
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
   runJsonWithStdin?(argv: string[], input: string, signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
+  runText?(argv: string[], signal: AbortSignal): Promise<string>;
 }
 
 export interface LaunchResourceRegistry {
@@ -100,9 +101,29 @@ export interface LaunchTimingEvidence {
   postAckConfirmationMs?: number;
 }
 
+export type LaunchEffectCertainty = "absent" | "partial" | "unknown" | "confirmed";
+
+export interface LaunchReconciliationEvidence {
+  effectCertainty: Exclude<LaunchEffectCertainty, "confirmed">;
+  snapshot: "present" | "unavailable";
+  pane: "present" | "absent" | "unknown";
+  agent: "present" | "absent" | "unknown";
+  tabId?: string;
+  paneId?: string;
+  agentId?: string;
+  agentName?: string;
+  paneRecord?: Record<string, unknown>;
+  agentRecord?: Record<string, unknown>;
+  recentUnwrappedLines?: string[];
+  readFailures?: string[];
+  truncated?: boolean;
+}
+
 export interface LaunchDetails extends LaunchResourceIds {
   operation: "launch";
   outcome: "launched" | "partial";
+  effectCertainty?: LaunchEffectCertainty;
+  reconciliation?: LaunchReconciliationEvidence;
   contextRebinding?: ContextResolutionDiagnostics;
   name?: string;
   kind?: string;
@@ -132,13 +153,77 @@ export interface LaunchDetails extends LaunchResourceIds {
 const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
 const PROMPT_CONFIRMATION_TIMEOUT_MS = 5_000;
 const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
+const LAUNCH_RECONCILIATION_TIMEOUT_MS = 1_000;
+export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
+export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
 const realLaunchClock: LaunchClock = { now: () => performance.now() };
+
+export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
+  inspectBeforeRetry: "Inspect the affected pane and agent with herdr_inspect before retrying; do not assume that no agent started.",
+  preserveUnconfirmed: "Do not relaunch or reuse the pane; inspect the existing agent and preserve the acknowledged prompt because it may already be consumed.",
+  noEffect: "No launch mutation was dispatched; correct the failure and retry only after validating the request.",
+  unknownEffect: "Inspect the affected pane and agent with herdr_inspect before any retry; the launch effect is unknown and must not be assumed absent."
+} as const);
+
+interface LaunchModelDiagnostic {
+  code: string;
+  phase: string;
+  created: LaunchResourceIds;
+  agentStarted: boolean;
+  promptSubmitted: boolean;
+  recipientRegistered: boolean;
+  effectCertainty: LaunchEffectCertainty;
+  recoveryGuidance: string;
+}
+
+function safeDiagnosticString(value: unknown, limit = 256): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const printable = [...value].map((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127 ? " " : character;
+  }).join("").trim();
+  return printable.length === 0 ? undefined : printable.slice(0, limit);
+}
+
+function safeDiagnosticIds(created: LaunchResourceIds): LaunchResourceIds {
+  return {
+    ...(safeDiagnosticString(created.tabId) === undefined ? {} : { tabId: safeDiagnosticString(created.tabId) }),
+    ...(safeDiagnosticString(created.paneId) === undefined ? {} : { paneId: safeDiagnosticString(created.paneId) }),
+    ...(safeDiagnosticString(created.agentId) === undefined ? {} : { agentId: safeDiagnosticString(created.agentId) })
+  };
+}
+
+function diagnosticRecovery(effectCertainty: LaunchEffectCertainty, promptSubmitted: boolean): string {
+  if (promptSubmitted) return LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed;
+  if (effectCertainty === "absent") return LAUNCH_RECOVERY_GUIDANCE.noEffect;
+  if (effectCertainty === "unknown") return LAUNCH_RECOVERY_GUIDANCE.unknownEffect;
+  return LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry;
+}
+
+function launchDiagnosticMessage(message: string, diagnostic: LaunchModelDiagnostic): string {
+  const base = safeDiagnosticString(message, 1_024) ?? "Launch failed";
+  const payload: LaunchModelDiagnostic = {
+    ...diagnostic,
+    code: safeDiagnosticString(diagnostic.code, 120) ?? "LAUNCH_FAILED",
+    phase: safeDiagnosticString(diagnostic.phase, 64) ?? "unknown",
+    created: safeDiagnosticIds(diagnostic.created),
+    recoveryGuidance: safeDiagnosticString(diagnostic.recoveryGuidance, 512) ?? LAUNCH_RECOVERY_GUIDANCE.unknownEffect
+  };
+  const suffix = `\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`;
+  const available = LAUNCH_DIAGNOSTIC_MAX_BYTES - Buffer.byteLength(suffix, "utf8");
+  if (available <= 0) return `${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`.slice(0, LAUNCH_DIAGNOSTIC_MAX_BYTES);
+  const boundedBase = [...base].reduce((result, character) => {
+    const candidate = `${result}${character}`;
+    return Buffer.byteLength(candidate, "utf8") <= available ? candidate : result;
+  }, "");
+  return `${boundedBase}${suffix}`;
+}
 
 class LaunchError extends Error {
   readonly details: Record<string, unknown>;
 
-  constructor(readonly code: string, message: string, details: Record<string, unknown> = {}) {
-    super(message);
+  constructor(readonly code: string, message: string, details: Record<string, unknown> = {}, diagnostic?: Omit<LaunchModelDiagnostic, "code"> & { code?: string }) {
+    super(diagnostic === undefined ? message : launchDiagnosticMessage(message, { ...diagnostic, code: diagnostic.code ?? code }));
     this.name = "LaunchError";
     this.details = boundAgentSessionStrings(details);
   }
@@ -310,6 +395,166 @@ function compactAttemptState(pane: Record<string, unknown>): Record<string, unkn
     };
   }
   return result;
+}
+
+interface LaunchReconciliationInput {
+  cli: LaunchCli;
+  baseline?: HerdrSnapshot;
+  created: LaunchResourceIds;
+  paneId?: string;
+  tabId?: string;
+  agentStarted: boolean;
+  promptSubmitted: boolean;
+  agentName: string;
+}
+
+function reconciliationFailureCode(error: unknown): string {
+  if (record(error) && typeof error.code === "string") return safeDiagnosticString(error.code, 120) ?? "READ_FAILED";
+  if (error instanceof Error && error.name === "LaunchReconciliationTimeout") return "READ_TIMEOUT";
+  return "READ_FAILED";
+}
+
+async function boundedReconciliationRead<T>(operation: (signal: AbortSignal) => Promise<T>, signal: AbortSignal, deadline: number): Promise<T> {
+  if (signal.aborted || Date.now() >= deadline) throw Object.assign(new Error("readback deadline expired"), { name: "LaunchReconciliationTimeout" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error("readback deadline expired"), { name: "LaunchReconciliationTimeout" })), Math.max(0, deadline - Date.now()));
+  });
+  try {
+    return await Promise.race([operation(signal), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function readbackAgentName(agent: Record<string, unknown> | undefined, pane: Record<string, unknown> | undefined): string | undefined {
+  const candidate = agent?.name ?? pane?.agent_name ?? pane?.agent;
+  return safeDiagnosticString(candidate, 256);
+}
+
+function readbackAgentId(agent: Record<string, unknown> | undefined, pane: Record<string, unknown> | undefined): string | undefined {
+  return safeDiagnosticString(agent?.agent_id ?? agent?.id ?? pane?.agent_id, 256);
+}
+
+function readbackPaneRecord(value: unknown): Record<string, unknown> | undefined {
+  return record(value) && record(value.pane) ? value.pane : undefined;
+}
+
+function readbackAgentRecord(value: unknown): Record<string, unknown> | undefined {
+  return record(value) && record(value.agent) ? value.agent : undefined;
+}
+
+function compactReadbackLines(value: string): { lines: string[]; truncated: boolean } {
+  const bounded = boundedEvidence(value, 8_000);
+  const lines = bounded.content.length === 0
+    ? []
+    : bounded.content.split(/\r?\n/u).slice(-100).map((line) => safeDiagnosticString(line, 512) ?? "");
+  return { lines, truncated: bounded.truncated || lines.length < bounded.content.split(/\r?\n/u).length };
+}
+
+function launchEffectCertainty(input: LaunchReconciliationInput, snapshot: HerdrSnapshot | undefined, pane: Record<string, unknown> | undefined, agent: Record<string, unknown> | undefined): Exclude<LaunchEffectCertainty, "confirmed"> {
+  if (snapshot === undefined && pane === undefined && agent === undefined) return "unknown";
+  const baselinePaneIds = new Set(input.baseline?.panes.map((item) => item.pane_id) ?? []);
+  const baselineTabIds = new Set(input.baseline?.tabs.map((item) => item.tab_id) ?? []);
+  const currentPane = input.paneId === undefined ? undefined : snapshot?.panes.find((item) => item.pane_id === input.paneId);
+  const currentTab = input.tabId === undefined ? undefined : snapshot?.tabs.find((item) => item.tab_id === input.tabId);
+  const createdPane = currentPane !== undefined && !baselinePaneIds.has(currentPane.pane_id);
+  const createdTab = currentTab !== undefined && !baselineTabIds.has(currentTab.tab_id);
+  if (agent !== undefined || createdPane || createdTab) return "partial";
+  if (input.agentStarted || input.promptSubmitted) return "unknown";
+  return "absent";
+}
+
+async function reconcileLaunch(input: LaunchReconciliationInput): Promise<LaunchReconciliationEvidence> {
+  const controller = new AbortController();
+  const deadline = Date.now() + LAUNCH_RECONCILIATION_TIMEOUT_MS;
+  const failures: string[] = [];
+  let snapshot: HerdrSnapshot | undefined;
+  let snapshotAvailable = false;
+  let currentPane: Record<string, unknown> | undefined;
+  let currentAgent: Record<string, unknown> | undefined;
+  let recentUnwrappedLines: string[] | undefined;
+  let outputTruncated = false;
+  try {
+    try {
+      const result = await boundedReconciliationRead((signal) => input.cli.runJson(["api", "snapshot"], signal).then((response) => response.result), controller.signal, deadline);
+      snapshot = snapshotOf(result);
+      snapshotAvailable = true;
+    } catch (error) {
+      failures.push(`snapshot:${reconciliationFailureCode(error)}`);
+    }
+
+    const baselinePaneIds = new Set(input.baseline?.panes.map((item) => item.pane_id) ?? []);
+    const baselineTabIds = new Set(input.baseline?.tabs.map((item) => item.tab_id) ?? []);
+    const newPanes = snapshot?.panes.filter((item) => !baselinePaneIds.has(item.pane_id)) ?? [];
+    const newTabs = snapshot?.tabs.filter((item) => !baselineTabIds.has(item.tab_id)) ?? [];
+    const snapshotPane = input.paneId === undefined
+      ? newPanes.find((item) => item.label === input.agentName) ?? newPanes[0]
+      : snapshot?.panes.find((item) => item.pane_id === input.paneId);
+    const snapshotTab = input.tabId === undefined
+      ? newTabs.find((item) => item.label === input.agentName) ?? newTabs[0]
+      : snapshot?.tabs.find((item) => item.tab_id === input.tabId);
+    const candidatePaneId = input.paneId ?? snapshotPane?.pane_id;
+    const candidateTabId = input.tabId ?? snapshotTab?.tab_id ?? snapshotPane?.tab_id;
+    currentPane = snapshotPane;
+    currentAgent = candidatePaneId === undefined ? undefined : snapshot?.agents.find((item) => item.pane_id === candidatePaneId);
+
+    if (candidatePaneId !== undefined) {
+      try {
+        const result = await boundedReconciliationRead((signal) => input.cli.runJson(["pane", "get", candidatePaneId], signal).then((response) => response.result), controller.signal, deadline);
+        const fetched = readbackPaneRecord(result);
+        if (fetched !== undefined) currentPane = fetched;
+      } catch (error) {
+        failures.push(`pane:${reconciliationFailureCode(error)}`);
+      }
+      try {
+        const result = await boundedReconciliationRead((signal) => input.cli.runJson(["agent", "get", candidatePaneId], signal).then((response) => response.result), controller.signal, deadline);
+        const fetched = readbackAgentRecord(result);
+        if (fetched !== undefined) currentAgent = fetched;
+      } catch (error) {
+        failures.push(`agent:${reconciliationFailureCode(error)}`);
+      }
+      if (input.cli.runText) {
+        try {
+          const output = await boundedReconciliationRead((signal) => input.cli.runText!(["pane", "read", candidatePaneId, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal), controller.signal, deadline);
+          const bounded = compactReadbackLines(output);
+          recentUnwrappedLines = bounded.lines;
+          outputTruncated = bounded.truncated;
+        } catch (error) {
+          failures.push(`output:${reconciliationFailureCode(error)}`);
+        }
+      }
+    }
+
+    const paneState: LaunchReconciliationEvidence["pane"] = currentPane !== undefined
+      ? "present"
+      : snapshotAvailable && candidatePaneId !== undefined && !snapshot?.panes.some((item) => item.pane_id === candidatePaneId)
+        ? "absent"
+        : "unknown";
+    const agentState: LaunchReconciliationEvidence["agent"] = currentAgent !== undefined
+      ? "present"
+      : snapshotAvailable && candidatePaneId !== undefined && paneState === "present" && !snapshot?.agents.some((item) => item.pane_id === candidatePaneId)
+        ? "absent"
+        : "unknown";
+    const certainty = launchEffectCertainty(input, snapshot, currentPane, currentAgent);
+    return {
+      effectCertainty: certainty,
+      snapshot: snapshotAvailable ? "present" : "unavailable",
+      pane: paneState,
+      agent: agentState,
+      ...(candidateTabId === undefined ? {} : { tabId: safeDiagnosticString(candidateTabId) }),
+      ...(candidatePaneId === undefined ? {} : { paneId: safeDiagnosticString(candidatePaneId) }),
+      ...(readbackAgentId(currentAgent, currentPane) === undefined ? {} : { agentId: readbackAgentId(currentAgent, currentPane) }),
+      ...(readbackAgentName(currentAgent, currentPane) === undefined ? {} : { agentName: readbackAgentName(currentAgent, currentPane) }),
+      ...(currentPane === undefined ? {} : { paneRecord: compactAttemptState(currentPane) }),
+      ...(currentAgent === undefined ? {} : { agentRecord: compactAttemptState(currentAgent) }),
+      ...(recentUnwrappedLines === undefined ? {} : { recentUnwrappedLines }),
+      ...(failures.length === 0 ? {} : { readFailures: failures.slice(0, 8) }),
+      ...(outputTruncated ? { truncated: true } : {})
+    };
+  } finally {
+    controller.abort();
+  }
 }
 
 function cliErrorEnvelope(error: unknown): HerdrErrorEnvelope | undefined {
@@ -1024,20 +1269,64 @@ function cliFailureEvidence(error: unknown): Record<string, unknown> | undefined
   });
 }
 
+function launchTransportCode(error: unknown): string {
+  return error instanceof LaunchError
+    ? error.code
+    : error instanceof CliProtocolError
+      ? error.code
+      : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
+}
+
+function earlyLaunchFailure(error: unknown, phase: LaunchDetails["phase"]): LaunchError {
+  const code = launchTransportCode(error);
+  const message = error instanceof Error ? error.message : String(error);
+  const originalDetails = error instanceof LaunchError
+    ? error.details
+    : record(error) && record(error.details) ? error.details : {};
+  const cliFailure = error instanceof LaunchError ? compactCliFailureEvidence(originalDetails.cliFailure) : cliFailureEvidence(error);
+  const details = {
+    ...originalDetails,
+    phase,
+    created: {},
+    causeCode: typeof originalDetails.causeCode === "string" ? originalDetails.causeCode : code,
+    agentStarted: false,
+    promptSubmitted: false,
+    recipientRegistered: false,
+    effectCertainty: "absent" as const,
+    ...(cliFailure === undefined ? {} : { cliFailure })
+  };
+  return new LaunchError(code, message, details, {
+    phase: phase ?? "unknown",
+    created: {},
+    agentStarted: false,
+    promptSubmitted: false,
+    recipientRegistered: false,
+    effectCertainty: "absent",
+    recoveryGuidance: diagnosticRecovery("absent", false)
+  });
+}
+
+function failureEffectCertainty(
+  effects: { agentStarted: boolean; promptSubmitted: boolean },
+  mutationDispatched: boolean,
+  reconciliation: LaunchReconciliationEvidence | undefined
+): LaunchEffectCertainty {
+  if (reconciliation !== undefined) return reconciliation.effectCertainty;
+  if (effects.promptSubmitted || effects.agentStarted || mutationDispatched) return "unknown";
+  return "absent";
+}
+
 function partialError(
   error: unknown,
   created: LaunchResourceIds,
   phase: LaunchDetails["phase"],
   grant: RecipientGrant,
-  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; readiness?: LaunchReadinessEvidence; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
+  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; readiness?: LaunchReadinessEvidence; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
   delivery?: MessageDelivery,
-  published?: PublishedAttachment
+  published?: PublishedAttachment,
+  reconciliation?: LaunchReconciliationEvidence
 ): LaunchError {
-  const transportCode = error instanceof LaunchError
-    ? error.code
-    : error instanceof CliProtocolError
-      ? error.code
-      : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
+  const transportCode = launchTransportCode(error);
   const backend = phase === "agent_start" ? cliErrorEnvelope(error) : undefined;
   const causeCode = error instanceof LaunchError && typeof error.details.causeCode === "string"
     ? error.details.causeCode
@@ -1061,23 +1350,33 @@ function partialError(
   const supplementalDetails = phase === "ready"
     ? compactReadinessErrorMetadata(errorDetails)
     : errorDetails;
-  return new LaunchError(code, `Launch did not complete: ${message}`, {
+  const effectCertainty = failureEffectCertainty(effects, effects.mutationDispatched, reconciliation);
+  const details = {
     ...supplementalDetails,
     phase,
     created: { ...created },
     causeCode,
-    ...(effects.agentStarted ? {
-      agentStarted: true,
-      promptSubmitted: effects.promptSubmitted,
-      recipientRegistered: effects.recipientRegistered
-    } : {}),
+    agentStarted: effects.agentStarted,
+    promptSubmitted: effects.promptSubmitted,
+    recipientRegistered: effects.recipientRegistered,
+    effectCertainty,
     ...(Object.keys(effects.timing).length === 0 ? {} : { timing: effects.timing }),
     ...(effects.attempts.length === 0 ? {} : { attempts: effects.attempts }),
     ...(cliFailure ? { cliFailure } : {}),
     ...(delivery ? { delivery, initialPromptDelivery: delivery } : {}),
     recipientGrant: { path: grant.path },
     ...(published ? { attachmentRetained: true, attachment: { ...published } } : {}),
-    ...(readiness === undefined ? {} : { readiness })
+    ...(readiness === undefined ? {} : { readiness }),
+    ...(reconciliation === undefined ? {} : { reconciliation })
+  };
+  return new LaunchError(code, `Launch did not complete: ${message}`, details, {
+    phase: phase ?? "unknown",
+    created,
+    agentStarted: effects.agentStarted,
+    promptSubmitted: effects.promptSubmitted,
+    recipientRegistered: effects.recipientRegistered,
+    effectCertainty,
+    recoveryGuidance: diagnosticRecovery(effectCertainty, effects.promptSubmitted)
   });
 }
 
@@ -1142,6 +1441,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let workspaceId: string | undefined;
       let contextDiagnostics: ContextResolutionDiagnostics | undefined;
       let effectiveContext: CurrentContext | undefined;
+      let topologyBaseline: HerdrSnapshot | undefined;
+      let topologyMutationDispatched = false;
       let phase: LaunchDetails["phase"] = "validate";
       const created: LaunchResourceIds = {};
       const attempts: LaunchAttemptEvidence[] = [];
@@ -1187,6 +1488,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         const effective = await contextResolver(abortSignal);
         contextDiagnostics = effective.diagnostics;
         const snapshot = effective.snapshot;
+        topologyBaseline = snapshot;
         effectiveContext = effective.context;
         const currentContext = effective.context;
         sender = params.initialPrompt !== undefined ? resolveSender(snapshot, currentContext.paneId) : undefined;
@@ -1209,8 +1511,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           });
         }
       } catch (error) {
+        const failure = withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published });
         await grant?.release();
-        throw withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published });
+        throw earlyLaunchFailure(failure, phase);
       }
       let paneId: string | undefined;
       let tabId: string | undefined;
@@ -1227,6 +1530,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           paneId = existingTarget!.paneId!;
           tabId = existingTarget!.tabId;
         } else if (placement.mode === "new_tab") {
+          topologyMutationDispatched = true;
           const result = tabRefFrom(await run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...noFocusArgs()], abortSignal, true));
           tabId = result.tabId;
           paneId = result.paneId;
@@ -1239,6 +1543,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           created.paneId = paneId;
           deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
         } else {
+          topologyMutationDispatched = true;
           const result = paneRefFrom(await run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...noFocusArgs(), "--cwd", cwd], abortSignal, true));
           paneId = result.paneId;
           tabId = result.tabId ?? effectiveContext!.tabId;
@@ -1247,7 +1552,10 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId! });
         }
         const resolvedPaneId = paneId!;
-        if (placement.mode !== "existing_pane") await run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal);
+        if (placement.mode !== "existing_pane") {
+          topologyMutationDispatched = true;
+          await run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal);
+        }
         phase = "agent_start";
         progress(onUpdate, phase, created);
         let started: unknown;
@@ -1259,6 +1567,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path)];
           const attemptStartedAt = clock.now();
           try {
+            topologyMutationDispatched = true;
             started = await run(deps.cli, startArgs, abortSignal, true);
             agentStarted = true;
             attempts.push({ profile: profile.name, outcome: "selected" });
@@ -1315,6 +1624,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (params.focus === true) {
           phase = "focus";
           progress(onUpdate, phase, created);
+          topologyMutationDispatched = true;
           await run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal);
         }
         if (agentId) created.agentId = agentId;
@@ -1336,6 +1646,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           progress(onUpdate, phase, created);
           const promptSubmissionStartedAt = clock.now();
           try {
+            topologyMutationDispatched = true;
             const promptResponse = await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
             promptSubmitted = true;
             initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity);
@@ -1387,6 +1698,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             ...(published ? { attachment: published } : {})
           } : {}),
           recipient,
+          effectCertainty: "confirmed",
           profile: {
             name: chosenProfile.name, requested: params.profile, selected: chosenProfile.name,
             source: { kind: chosenProfile.source.kind, path: chosenProfile.source.path }, timeoutMinutes: chosenProfile.timeoutMinutes,
@@ -1404,7 +1716,33 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             ? failureReadiness
             : monotonicDurationMs(clock, selectedAttemptStartedAt);
         }
-        throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, ...(readiness === undefined ? {} : { readiness }), timing, attempts }, initialPromptDelivery, published);
+        let reconciliation: LaunchReconciliationEvidence | undefined;
+        if (topologyMutationDispatched) {
+          try {
+            reconciliation = await reconcileLaunch({
+              cli: deps.cli,
+              baseline: topologyBaseline,
+              created,
+              ...(paneId === undefined ? {} : { paneId }),
+              ...(tabId === undefined ? {} : { tabId }),
+              agentStarted,
+              promptSubmitted,
+              agentName: params.name
+            });
+          } catch (readbackError) {
+            reconciliation = {
+              effectCertainty: "unknown",
+              snapshot: "unavailable",
+              pane: "unknown",
+              agent: "unknown",
+              readFailures: [`reconciliation:${reconciliationFailureCode(readbackError)}`]
+            };
+          }
+          if (reconciliation?.tabId !== undefined && created.tabId === undefined) created.tabId = reconciliation.tabId;
+          if (reconciliation?.paneId !== undefined && created.paneId === undefined) created.paneId = reconciliation.paneId;
+          if (reconciliation?.agentId !== undefined && created.agentId === undefined) created.agentId = reconciliation.agentId;
+        }
+        throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, mutationDispatched: topologyMutationDispatched, ...(readiness === undefined ? {} : { readiness }), timing, attempts }, initialPromptDelivery, published, reconciliation);
       } finally {
         // The launch window is over; the directory is kept only by its own content.
         await grant?.release();

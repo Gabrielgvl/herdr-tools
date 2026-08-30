@@ -7,7 +7,7 @@ import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { JobRegistry } from "../../src/job-registry.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
 import { createPreflight, createToolSurface, CORE_TOOL_NAMES, type HerdrToolDefinition } from "../../src/tool-surface.js";
-import { AdapterContractError, HERDR_DETAILS_LABEL, MCP_RESULT_MAX_BYTES, callTool, describeTools, publishedInputSchema, type McpCallOutcome } from "../../src/mcp/adapter.js";
+import { AdapterContractError, HERDR_DETAILS_LABEL, MCP_RESULT_MAX_BYTES, callTool, describeTools, errorOutcome, publishedInputSchema, type McpCallOutcome } from "../../src/mcp/adapter.js";
 import { HostCapabilityError } from "../../src/mcp/host.js";
 import { SequentialToolQueue } from "../../src/mcp/queue.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
@@ -413,6 +413,27 @@ describe("MCP error mapping", () => {
     expect(text).toContain('"created":{"tabId":"w:t2","paneId":"w:p2","agentId":"agent-2"}');
     expect(text).toContain('"effectCertainty":"partial"');
     expect(text).toContain(LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry);
+  });
+
+  it("rejects malformed launch diagnostics instead of publishing arbitrary attached data", () => {
+    const base = { phase: "agent_start", created: {}, agentStarted: true, promptSubmitted: false, recipientRegistered: false, effectCertainty: "partial", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry };
+    const messages = [
+      "plain failure",
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} {`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} \"scalar\"`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, phase: "not-a-phase" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, effectCertainty: "not-a-certainty" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, recoveryGuidance: "not-guidance" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, agentStarted: "yes" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, created: null })}`
+    ];
+    for (const message of messages) {
+      const outcome = errorOutcome("LAUNCH_FAILED", message, { secret: "must-not-publish" }, "herdr_launch");
+      expect(payload(outcome).details).toEqual({ tool: "herdr_launch" });
+      expect(outcome.content[0]!.text).not.toContain("must-not-publish");
+    }
+    const unsafeId = errorOutcome("LAUNCH_FAILED", `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, created: { paneId: "\u0000" } })}`, undefined, "herdr_launch");
+    expect(payload(unsafeId).details).toEqual({ tool: "herdr_launch", diagnostic: { ...base, code: "LAUNCH_FAILED" } });
   });
 
   it("reports a denied host capability with its own code", async () => {

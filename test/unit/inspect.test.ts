@@ -49,6 +49,8 @@ describe("herdr_inspect", () => {
     const { cli, calls } = makeCli();
     const result = await execute(cli, {});
     expect(result.details).toMatchObject({ kind: "target", target: { paneId: "w1:p1" }, context: { injected: context, effective: context, rebound: false, attempts: 1 } });
+    const content = JSON.parse(contentText(result)) as Record<string, unknown>;
+    expect(content).toMatchObject({ modelVisible: true, operation: "inspect", kind: "target", context: { injected: context, effective: context, rebound: false, attempts: 1 } });
     expect(result.details.recentUnwrappedLines).toEqual(Array.from({ length: 100 }, (_, i) => `line-${i + 38}`));
     expect(calls).toContainEqual(["pane", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "100", "--format", "text"]);
     const healthCli = new HerdrCli(vi.fn<PiExec>().mockResolvedValue({ stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "stopped" } }), stderr: "", code: 0, killed: false }));
@@ -59,7 +61,7 @@ describe("herdr_inspect", () => {
     const hugeOutput = Array.from({ length: 120 }, (_, index) => `${"x".repeat(900)}-${index}`).join("\\n");
     const target = await execute(makeCli(hugeOutput).cli, { mode: "target", target: "caller" });
     const targetContent = JSON.parse(contentText(target)) as Record<string, unknown>;
-    expect(targetContent).toMatchObject({ modelVisible: true, operation: "inspect", kind: "target", target: { paneId: "w1:p1" }, metadata: { pane_id: "w1:p1" } });
+    expect(targetContent).toMatchObject({ modelVisible: true, operation: "inspect", kind: "target", target: { paneId: "w1:p1" }, metadata: { pane_id: "w1:p1" }, truncated: true });
     expect((targetContent.recentUnwrappedLines as string[]).length).toBeLessThanOrEqual(100);
     expect(Buffer.byteLength(contentText(target), "utf8")).toBeLessThanOrEqual(MAX_INSPECT_CONTENT_BYTES);
 

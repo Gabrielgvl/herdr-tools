@@ -156,6 +156,18 @@ const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
 const LAUNCH_RECONCILIATION_TIMEOUT_MS = 1_000;
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
+/**
+ * The prose that precedes every structured diagnostic. No cause message is ever
+ * echoed there: `CliProtocolError` adopts the Herdr error envelope's `message`
+ * verbatim, which can quote a command line, an environment value, or a credential,
+ * and this module's own validation messages quote caller-supplied keys and values.
+ * Neither is safe to publish, and a per-cause allowlist would have to be right
+ * about every message on every path, so the summary is fixed and the cause's
+ * bounded prose is kept in details instead.
+ */
+export const LAUNCH_DIAGNOSTIC_SUMMARY = "Launch failed; inspect the structured diagnostic";
+/** Shape of every failure code this module and the CLI transport define. */
+const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const realLaunchClock: LaunchClock = { now: () => performance.now() };
 
 export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
@@ -165,15 +177,18 @@ export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
   unknownEffect: "Inspect the affected pane and agent with herdr_inspect before any retry; the launch effect is unknown and must not be assumed absent."
 } as const);
 
+type LaunchPhase = NonNullable<LaunchDetails["phase"]>;
+type LaunchRecoveryGuidance = typeof LAUNCH_RECOVERY_GUIDANCE[keyof typeof LAUNCH_RECOVERY_GUIDANCE];
+
 interface LaunchModelDiagnostic {
   code: string;
-  phase: string;
+  phase: LaunchPhase;
   created: LaunchResourceIds;
   agentStarted: boolean;
   promptSubmitted: boolean;
   recipientRegistered: boolean;
   effectCertainty: LaunchEffectCertainty;
-  recoveryGuidance: string;
+  recoveryGuidance: LaunchRecoveryGuidance;
 }
 
 function boundedDiagnosticText(value: string, maxBytes: number): string {
@@ -204,21 +219,37 @@ function safeDiagnosticIds(created: LaunchResourceIds): LaunchResourceIds {
   };
 }
 
-function diagnosticRecovery(effectCertainty: LaunchEffectCertainty, promptSubmitted: boolean, mutationDispatched: boolean): string {
+function diagnosticRecovery(effectCertainty: LaunchEffectCertainty, promptSubmitted: boolean, mutationDispatched: boolean): LaunchRecoveryGuidance {
   if (promptSubmitted) return LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed;
   if (effectCertainty === "absent" && !mutationDispatched) return LAUNCH_RECOVERY_GUIDANCE.noEffect;
   if (effectCertainty === "unknown") return LAUNCH_RECOVERY_GUIDANCE.unknownEffect;
   return LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry;
 }
 
-function launchDiagnosticMessage(message: string, diagnostic: LaunchModelDiagnostic): string {
-  const base = safeDiagnosticString(message, 1_024) ?? "Launch failed";
+/**
+ * A failure code reaches the model inside the diagnostic payload, so only a code
+ * this module or the CLI transport defines may appear there. A foreign error can
+ * carry any string on `code`; anything outside the known code shape is untrusted
+ * text and is classified rather than echoed.
+ */
+function safeLaunchCode(code: unknown): string {
+  return typeof code === "string" && LAUNCH_CODE_PATTERN.test(code) ? code : "LAUNCH_FAILED";
+}
+
+/**
+ * Every part of the result is authored here: the prose is fixed, `phase` and
+ * `recoveryGuidance` are typed to module-owned unions, `created` holds identifiers
+ * this module resolved, and `code` is classified above. The model-visible message
+ * is therefore free of cause text by construction rather than by filtering, and it
+ * carries exactly one diagnostic record.
+ */
+function launchDiagnosticMessage(diagnostic: LaunchModelDiagnostic): string {
   const payload: LaunchModelDiagnostic = {
     ...diagnostic,
-    code: safeDiagnosticString(diagnostic.code, 120) ?? "LAUNCH_FAILED",
-    phase: safeDiagnosticString(diagnostic.phase, 64) ?? "unknown",
+    code: safeLaunchCode(diagnostic.code),
+    phase: diagnostic.phase,
     created: safeDiagnosticIds(diagnostic.created),
-    recoveryGuidance: safeDiagnosticString(diagnostic.recoveryGuidance, 512) ?? LAUNCH_RECOVERY_GUIDANCE.unknownEffect
+    recoveryGuidance: diagnostic.recoveryGuidance
   };
   const suffix = `\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`;
   const suffixBytes = Buffer.byteLength(suffix, "utf8");
@@ -239,14 +270,14 @@ function launchDiagnosticMessage(message: string, diagnostic: LaunchModelDiagnos
     return `${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(minimal)}`;
   }
   const available = LAUNCH_DIAGNOSTIC_MAX_BYTES - suffixBytes;
-  return `${boundedDiagnosticText(base, available)}${suffix}`;
+  return `${boundedDiagnosticText(LAUNCH_DIAGNOSTIC_SUMMARY, available)}${suffix}`;
 }
 
 class LaunchError extends Error {
   readonly details: Record<string, unknown>;
 
   constructor(readonly code: string, message: string, details: Record<string, unknown> = {}, diagnostic?: Omit<LaunchModelDiagnostic, "code"> & { code?: string }) {
-    super(diagnostic === undefined ? message : launchDiagnosticMessage(message, { ...diagnostic, code: diagnostic.code ?? code }));
+    super(diagnostic === undefined ? message : launchDiagnosticMessage({ ...diagnostic, code: diagnostic.code ?? code }));
     this.name = "LaunchError";
     this.details = boundAgentSessionStrings(details);
   }
@@ -425,7 +456,7 @@ function compactAttemptState(pane: Record<string, unknown>): Record<string, unkn
 
 interface LaunchReconciliationInput {
   cli: LaunchCli;
-  baseline?: HerdrSnapshot;
+  baseline: HerdrSnapshot;
   created: LaunchResourceIds;
   paneId?: string;
   tabId?: string;
@@ -440,14 +471,31 @@ function reconciliationFailureCode(error: unknown): string {
   return "READ_FAILED";
 }
 
+function reconciliationTimeout(): Error {
+  return Object.assign(new Error("readback deadline expired"), { name: "LaunchReconciliationTimeout" });
+}
+
+/**
+ * Racing a timer alone only stops the caller waiting: the CLI invocation keeps
+ * running and lands its result after reconciliation has already reported. The
+ * read therefore runs on its own signal, derived from the caller's, and that
+ * signal is aborted at the instant the deadline wins — before the race rejects —
+ * so a cooperative read is cancelled rather than abandoned. An operation that
+ * ignores its signal still cannot be stopped; the race bounds the caller either
+ * way, and this function claims nothing more than that.
+ */
 async function boundedReconciliationRead<T>(operation: (signal: AbortSignal) => Promise<T>, signal: AbortSignal, deadline: number): Promise<T> {
-  if (signal.aborted || Date.now() >= deadline) throw Object.assign(new Error("readback deadline expired"), { name: "LaunchReconciliationTimeout" });
+  if (signal.aborted || Date.now() >= deadline) throw reconciliationTimeout();
+  const expiry = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(Object.assign(new Error("readback deadline expired"), { name: "LaunchReconciliationTimeout" })), Math.max(0, deadline - Date.now()));
+    timer = setTimeout(() => {
+      expiry.abort(reconciliationTimeout());
+      reject(reconciliationTimeout());
+    }, Math.max(0, deadline - Date.now()));
   });
   try {
-    return await Promise.race([operation(signal), timeout]);
+    return await Promise.race([operation(AbortSignal.any([signal, expiry.signal])), timeout]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
@@ -463,12 +511,22 @@ function readbackAgentId(agent: Record<string, unknown> | undefined, pane: Recor
   return safeDiagnosticString(candidate, 256);
 }
 
-function readbackPaneRecord(value: unknown): Record<string, unknown> | undefined {
-  return record(value) && own(value, "pane") && record(value.pane) ? value.pane : undefined;
+function malformedReadback(kind: "pane" | "agent"): Error {
+  return Object.assign(new Error(`${kind} readback was malformed`), { code: "READ_MALFORMED" });
 }
 
-function readbackAgentRecord(value: unknown): Record<string, unknown> | undefined {
-  return record(value) && own(value, "agent") && record(value.agent) ? value.agent : undefined;
+function readbackPaneRecord(value: unknown, expectedPaneId: string): Record<string, unknown> | undefined {
+  if (!record(value) || !own(value, "pane")) throw malformedReadback("pane");
+  if (value.pane === null) return undefined;
+  if (!record(value.pane) || !own(value.pane, "pane_id") || value.pane.pane_id !== expectedPaneId) throw malformedReadback("pane");
+  return value.pane;
+}
+
+function readbackAgentRecord(value: unknown, expectedPaneId: string): Record<string, unknown> | undefined {
+  if (!record(value) || !own(value, "agent")) throw malformedReadback("agent");
+  if (value.agent === null) return undefined;
+  if (!record(value.agent) || !own(value.agent, "pane_id") || value.agent.pane_id !== expectedPaneId) throw malformedReadback("agent");
+  return value.agent;
 }
 
 function compactReadbackLines(value: string): { lines: string[]; truncated: boolean } {
@@ -486,14 +544,14 @@ function launchEffectCertainty(
   agent: Record<string, unknown> | undefined,
   readFailures: readonly string[]
 ): Exclude<LaunchEffectCertainty, "confirmed"> {
-  const baselinePaneIds = new Set(input.baseline?.panes.map((item) => item.pane_id) ?? []);
-  const baselineTabIds = new Set(input.baseline?.tabs.map((item) => item.tab_id) ?? []);
-  const candidatePaneId = input.paneId ?? input.created.paneId;
-  const candidateTabId = input.tabId ?? input.created.tabId;
-  const currentPane = candidatePaneId === undefined ? undefined : snapshot?.panes.find((item) => item.pane_id === candidatePaneId);
-  const currentTab = candidateTabId === undefined ? undefined : snapshot?.tabs.find((item) => item.tab_id === candidateTabId);
-  const createdPane = currentPane !== undefined && !baselinePaneIds.has(currentPane.pane_id);
-  const createdTab = currentTab !== undefined && !baselineTabIds.has(currentTab.tab_id);
+  const baselinePaneIds = new Set(input.baseline.panes.map((item) => item.pane_id));
+  const baselineTabIds = new Set(input.baseline.tabs.map((item) => item.tab_id));
+  const observedPaneId = input.paneId ?? input.created.paneId ?? (pane && own(pane, "pane_id") && typeof pane.pane_id === "string" ? pane.pane_id : undefined);
+  const observedTabId = input.tabId ?? input.created.tabId ?? (pane && own(pane, "tab_id") && typeof pane.tab_id === "string" ? pane.tab_id : undefined);
+  const currentPane = observedPaneId === undefined ? undefined : snapshot?.panes.find((item) => item.pane_id === observedPaneId);
+  const currentTab = observedTabId === undefined ? undefined : snapshot?.tabs.find((item) => item.tab_id === observedTabId);
+  const createdPane = (currentPane !== undefined && !baselinePaneIds.has(currentPane.pane_id)) || (pane !== undefined && observedPaneId !== undefined && !baselinePaneIds.has(observedPaneId));
+  const createdTab = (currentTab !== undefined && !baselineTabIds.has(currentTab.tab_id)) || (pane !== undefined && observedTabId !== undefined && !baselineTabIds.has(observedTabId));
 
   // A live agent or a newly observed pane/tab proves a partial launch effect,
   // even if another optional read failed. Conversely, a failed read must never
@@ -503,11 +561,10 @@ function launchEffectCertainty(
   if (readFailures.length > 0) return "unknown";
   if (input.agentStarted || input.promptSubmitted) return "unknown";
 
-  // Absence is only conclusive when the authoritative snapshot actually
-  // identified the requested pane and proved that it is gone. If no candidate
-  // could be identified, the readback is incomplete and remains unknown.
-  const candidateKnown = candidatePaneId !== undefined;
-  if (snapshot !== undefined && candidateKnown && currentPane === undefined) return "absent";
+  // Absence is only conclusive when the authoritative snapshot identified the
+  // candidate pane and proved that it is gone. If no candidate could be
+  // identified, the readback is incomplete and remains unknown.
+  if (snapshot !== undefined && observedPaneId !== undefined && currentPane === undefined) return "absent";
   return "unknown";
 }
 
@@ -530,8 +587,8 @@ async function reconcileLaunch(input: LaunchReconciliationInput): Promise<Launch
       failures.push(`snapshot:${reconciliationFailureCode(error)}`);
     }
 
-    const baselinePaneIds = new Set(input.baseline?.panes.map((item) => item.pane_id) ?? []);
-    const baselineTabIds = new Set(input.baseline?.tabs.map((item) => item.tab_id) ?? []);
+    const baselinePaneIds = new Set(input.baseline.panes.map((item) => item.pane_id));
+    const baselineTabIds = new Set(input.baseline.tabs.map((item) => item.tab_id));
     const newPanes = snapshot?.panes.filter((item) => !baselinePaneIds.has(item.pane_id)) ?? [];
     const newTabs = snapshot?.tabs.filter((item) => !baselineTabIds.has(item.tab_id)) ?? [];
     const snapshotPane = input.paneId === undefined
@@ -548,14 +605,14 @@ async function reconcileLaunch(input: LaunchReconciliationInput): Promise<Launch
     if (candidatePaneId !== undefined) {
       try {
         const result = await boundedReconciliationRead((signal) => input.cli.runJson(["pane", "get", candidatePaneId], signal).then((response) => response.result), controller.signal, deadline);
-        const fetched = readbackPaneRecord(result);
+        const fetched = readbackPaneRecord(result, candidatePaneId);
         if (fetched !== undefined) currentPane = fetched;
       } catch (error) {
         failures.push(`pane:${reconciliationFailureCode(error)}`);
       }
       try {
         const result = await boundedReconciliationRead((signal) => input.cli.runJson(["agent", "get", candidatePaneId], signal).then((response) => response.result), controller.signal, deadline);
-        const fetched = readbackAgentRecord(result);
+        const fetched = readbackAgentRecord(result, candidatePaneId);
         if (fetched !== undefined) currentAgent = fetched;
       } catch (error) {
         failures.push(`agent:${reconciliationFailureCode(error)}`);
@@ -1323,9 +1380,19 @@ function launchTransportCode(error: unknown): string {
       : error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : "CLI_PROTOCOL_ERROR";
 }
 
-function earlyLaunchFailure(error: unknown, phase: LaunchDetails["phase"]): LaunchError {
-  const code = launchTransportCode(error);
-  const message = error instanceof Error ? error.message : String(error);
+/**
+ * The cause's own prose, bounded for details. It is retained only here: it may
+ * hold backend text or caller-supplied input, so it never reaches the fixed
+ * model-visible summary.
+ */
+function causeMessage(error: unknown): string | undefined {
+  return safeDiagnosticString(error instanceof Error ? error.message : String(error), 1_024);
+}
+
+function earlyLaunchFailure(error: unknown, phase: LaunchPhase): LaunchError {
+  const transportCode = launchTransportCode(error);
+  const code = safeLaunchCode(transportCode);
+  const message = causeMessage(error);
   const originalDetails = error instanceof LaunchError
     ? error.details
     : record(error) && record(error.details) ? error.details : {};
@@ -1334,15 +1401,16 @@ function earlyLaunchFailure(error: unknown, phase: LaunchDetails["phase"]): Laun
     ...originalDetails,
     phase,
     created: {},
-    causeCode: typeof originalDetails.causeCode === "string" ? originalDetails.causeCode : code,
+    causeCode: typeof originalDetails.causeCode === "string" ? originalDetails.causeCode : safeDiagnosticString(transportCode, 120) ?? code,
+    ...(message === undefined ? {} : { causeMessage: message }),
     agentStarted: false,
     promptSubmitted: false,
     recipientRegistered: false,
     effectCertainty: "absent" as const,
     ...(cliFailure === undefined ? {} : { cliFailure })
   };
-  return new LaunchError(code, message, details, {
-    phase: phase ?? "unknown",
+  return new LaunchError(code, LAUNCH_DIAGNOSTIC_SUMMARY, details, {
+    phase,
     created: {},
     agentStarted: false,
     promptSubmitted: false,
@@ -1365,7 +1433,7 @@ function failureEffectCertainty(
 function partialError(
   error: unknown,
   created: LaunchResourceIds,
-  phase: LaunchDetails["phase"],
+  phase: LaunchPhase,
   grant: RecipientGrant,
   effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; readiness?: LaunchReadinessEvidence; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
   delivery?: MessageDelivery,
@@ -1377,7 +1445,7 @@ function partialError(
   const causeCode = error instanceof LaunchError && typeof error.details.causeCode === "string"
     ? error.details.causeCode
     : backend?.id === "cli:agent:start" ? backend.error.code : transportCode;
-  const message = error instanceof Error ? error.message : String(error);
+  const message = causeMessage(error);
   const code = error instanceof LaunchError && error.code === "POSTSTATE_UNAVAILABLE"
     ? "POSTSTATE_UNAVAILABLE"
     : transportCode === "ABORTED"
@@ -1402,6 +1470,7 @@ function partialError(
     phase,
     created: { ...created },
     causeCode,
+    ...(message === undefined ? {} : { causeMessage: message }),
     agentStarted: effects.agentStarted,
     promptSubmitted: effects.promptSubmitted,
     recipientRegistered: effects.recipientRegistered,
@@ -1415,8 +1484,8 @@ function partialError(
     ...(readiness === undefined ? {} : { readiness }),
     ...(reconciliation === undefined ? {} : { reconciliation })
   };
-  return new LaunchError(code, `Launch did not complete: ${message}`, details, {
-    phase: phase ?? "unknown",
+  return new LaunchError(code, LAUNCH_DIAGNOSTIC_SUMMARY, details, {
+    phase,
     created,
     agentStarted: effects.agentStarted,
     promptSubmitted: effects.promptSubmitted,
@@ -1489,7 +1558,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let effectiveContext: CurrentContext | undefined;
       let topologyBaseline: HerdrSnapshot | undefined;
       let topologyMutationDispatched = false;
-      let phase: LaunchDetails["phase"] = "validate";
+      let phase: LaunchPhase = "validate";
       const created: LaunchResourceIds = {};
       const attempts: LaunchAttemptEvidence[] = [];
       const dispatchMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -1769,7 +1838,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           try {
             reconciliation = await reconcileLaunch({
               cli: deps.cli,
-              baseline: topologyBaseline,
+              baseline: topologyBaseline!,
               created,
               ...(paneId === undefined ? {} : { paneId }),
               ...(tabId === undefined ? {} : { tabId }),

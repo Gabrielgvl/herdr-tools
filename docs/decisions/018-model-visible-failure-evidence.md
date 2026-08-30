@@ -6,7 +6,7 @@ Accepted
 
 ## Date
 
-2026-08-27
+2026-08-30
 
 ## Context
 
@@ -37,12 +37,30 @@ contains the error code, failed phase, known created IDs, agent/prompt/recipient
 effect flags, effect certainty, and safe recovery guidance. Rich bounded details
 remain attached for TUI and MCP consumers; they are not the sole model contract.
 
+Every field of that model-visible text is authored by Tools, and no cause message
+reaches it. `CliProtocolError` adopts the Herdr error envelope's `message`
+verbatim, and a backend message can quote a command line, an environment value,
+or a credential; Tools' own validation messages quote caller-supplied keys and
+values, which would let a caller forge a second diagnostic record ahead of the
+real one. Control-stripping and a byte bound make neither publishable, and a
+per-cause allowlist would have to be right about every message on every path. So
+whenever a structured diagnostic is attached the prose is one fixed summary; the
+failed phase and recovery guidance are module-owned unions; and a failure code is
+published only when it matches the code shape Tools and the CLI transport define.
+The cause's own bounded prose is retained as `details.causeMessage`, alongside the
+bounded backend envelope under `details.cliFailure`, for the TUI and manual
+recovery. Distinct recovery advice stays in the diagnostic's `recoveryGuidance`.
+
 A launch error or caller abort triggers reconciliation only after a topology or
 other launch mutation has been dispatched (or a genuinely partial launch effect
 is already known). Preflight, validation, profile resolution, and other no-effect
 failures do not receive extra reads. Reconciliation uses a fresh
 `AbortController`, rather than an already-aborted caller signal, and has a short
-absolute deadline. It performs read-only snapshot, pane/agent state, and recent
+absolute deadline. Each read runs on a signal derived from that controller, and
+the derived signal is aborted the instant the deadline wins, so a read that lost
+the race is cancelled rather than left running behind a reconciliation that has
+already reported; a read that ignores its signal is still only bounded, never
+stopped. It performs read-only snapshot, pane/agent state, and recent
 output reads when possible. The evidence is compacted to fixed fields and bounded
 lines. It classifies the observed effect as `absent`, `partial`, or `unknown`;
 any failed read prevents an absent conclusion unless authoritative evidence still

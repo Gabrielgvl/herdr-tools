@@ -4,9 +4,16 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
 import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
-import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, type LaunchDependencies } from "../../src/tools/launch.js";
+import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE, type LaunchDependencies } from "../../src/tools/launch.js";
 import { createRuntime } from "../../index.js";
 import type { HerdrCli } from "../../src/cli.js";
+
+function launchDiagnostic(error: Error): Record<string, unknown> {
+  const prefix = `\n${LAUNCH_DIAGNOSTIC_MARKER} `;
+  const offset = error.message.indexOf(prefix);
+  if (offset < 0) throw new Error(`missing ${LAUNCH_DIAGNOSTIC_MARKER}`);
+  return JSON.parse(error.message.slice(offset + prefix.length)) as Record<string, unknown>;
+}
 
 function source(root: string, name: string) { return profileSource("project", join(root, `${name}.md`), root); }
 function profileText(name: string, runtime = "pi", extra = "", fallbackProfiles = "[]") {
@@ -330,10 +337,16 @@ describe("profile catalog", () => {
 
     const storeFailure = new Error("prompt cache unavailable");
     const callsBeforeFailure = calls.length;
-    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toBe(storeFailure);
+    // The store failure is a foreign error, so the launch boundary rethrows a
+    // typed LaunchError instead of the original: the model contract is the code,
+    // the failed phase, and the no-effect diagnostic, never the store's own text.
+    const storeRejection = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never).then(() => undefined, (error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(storeRejection).toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "resolve_profile", causeCode: "CLI_PROTOCOL_ERROR", effectCertainty: "absent", agentStarted: false, promptSubmitted: false, recipientRegistered: false } });
+    expect(launchDiagnostic(storeRejection!)).toEqual({ code: "CLI_PROTOCOL_ERROR", phase: "resolve_profile", created: {}, agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.noEffect });
+    expect(storeRejection!.message).not.toContain(storeFailure.message);
     expect(calls).toHaveLength(callsBeforeFailure);
     const invalidPathCalls = calls.length;
-    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => ({ path: "/tmp/invalid\nprofile.md" }) }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-3", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toThrow(/prompt file path/);
+    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => ({ path: "/tmp/invalid\nprofile.md" }) }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-3", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE", details: { causeCode: "INVALID_PROFILE_OVERRIDE" } });
     expect(calls).toHaveLength(invalidPathCalls);
   });
 

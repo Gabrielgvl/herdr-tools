@@ -11,7 +11,7 @@ import { AdapterContractError, HERDR_DETAILS_LABEL, MCP_RESULT_MAX_BYTES, callTo
 import { HostCapabilityError } from "../../src/mcp/host.js";
 import { SequentialToolQueue } from "../../src/mcp/queue.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
-import { LAUNCH_DIAGNOSTIC_MARKER } from "../../src/tools/launch.js";
+import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE } from "../../src/tools/launch.js";
 
 const health = { client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true } };
 const snapshot = {
@@ -376,6 +376,43 @@ describe("MCP error mapping", () => {
     const markerOffset = String(body.message).indexOf(LAUNCH_DIAGNOSTIC_MARKER);
     expect(JSON.parse(String(body.message).slice(markerOffset + LAUNCH_DIAGNOSTIC_MARKER.length + 1))).toEqual(diagnostic);
     expect(body.details).toEqual({ effectCertainty: "unknown" });
+  });
+
+  it("projects launch failures from the fixed diagnostic and never publishes attached cause evidence", async () => {
+    const diagnostic = {
+      code: "LAUNCH_FAILED",
+      phase: "agent_start",
+      created: { tabId: "w:t2", paneId: "w:p2", agentId: "agent-2" },
+      agentStarted: true,
+      promptSubmitted: false,
+      recipientRegistered: false,
+      effectCertainty: "partial",
+      recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry
+    };
+    const hostile = ["cause-secret", "cli-secret", "stderr-secret", "envelope-secret", "environment-secret", "nested-secret"];
+    const outcome = await call(stub({
+      name: "herdr_launch",
+      execute: async () => {
+        throw Object.assign(new Error(`Launch failed\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`), {
+          code: "LAUNCH_FAILED",
+          details: {
+            causeMessage: hostile[0],
+            cliFailure: { message: hostile[1], details: { stderr: hostile[2], errorEnvelope: { error: { message: hostile[3] } } } },
+            environment: { SECRET: hostile[4] },
+            nested: { details: { secret: hostile[5] } }
+          }
+        });
+      }
+    }), {}, "herdr_launch");
+    expect(outcome.isError).toBe(true);
+    const body = payload(outcome);
+    expect(body.details).toEqual({ tool: "herdr_launch", diagnostic });
+    const text = outcome.content.map((block) => block.text).join("\n");
+    for (const secret of hostile) expect(text).not.toContain(secret);
+    expect(text).toContain('"phase":"agent_start"');
+    expect(text).toContain('"created":{"tabId":"w:t2","paneId":"w:p2","agentId":"agent-2"}');
+    expect(text).toContain('"effectCertainty":"partial"');
+    expect(text).toContain(LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry);
   });
 
   it("reports a denied host capability with its own code", async () => {

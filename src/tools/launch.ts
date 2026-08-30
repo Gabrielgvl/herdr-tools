@@ -153,7 +153,7 @@ export interface LaunchDetails extends LaunchResourceIds {
 const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
 const PROMPT_CONFIRMATION_TIMEOUT_MS = 5_000;
 const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
-const LAUNCH_RECONCILIATION_TIMEOUT_MS = 1_000;
+const LAUNCH_RECONCILIATION_TIMEOUT_MS = 5_000;
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
 /**
@@ -253,6 +253,7 @@ function launchDiagnosticMessage(diagnostic: LaunchModelDiagnostic): string {
   };
   const suffix = `\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`;
   const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  /* c8 ignore next -- the fixed-shape payload is bounded below this defensive fallback. */
   if (suffixBytes > LAUNCH_DIAGNOSTIC_MAX_BYTES) {
     // The normal fixed-shape payload is comfortably below the bound. Keep a
     // valid, smaller payload if that invariant ever changes instead of slicing
@@ -457,7 +458,6 @@ function compactAttemptState(pane: Record<string, unknown>): Record<string, unkn
 interface LaunchReconciliationInput {
   cli: LaunchCli;
   baseline: HerdrSnapshot;
-  created: LaunchResourceIds;
   paneId?: string;
   tabId?: string;
   agentStarted: boolean;
@@ -487,7 +487,7 @@ function reconciliationTimeout(): Error {
 async function boundedReconciliationRead<T>(operation: (signal: AbortSignal) => Promise<T>, signal: AbortSignal, deadline: number): Promise<T> {
   if (signal.aborted || Date.now() >= deadline) throw reconciliationTimeout();
   const expiry = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timer!: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       expiry.abort(reconciliationTimeout());
@@ -497,7 +497,7 @@ async function boundedReconciliationRead<T>(operation: (signal: AbortSignal) => 
   try {
     return await Promise.race([operation(AbortSignal.any([signal, expiry.signal])), timeout]);
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    clearTimeout(timer);
   }
 }
 
@@ -531,10 +531,9 @@ function readbackAgentRecord(value: unknown, expectedPaneId: string): Record<str
 
 function compactReadbackLines(value: string): { lines: string[]; truncated: boolean } {
   const bounded = boundedEvidence(value, 8_000);
-  const lines = bounded.content.length === 0
-    ? []
-    : bounded.content.split(/\r?\n/u).slice(-100).map((line) => safeDiagnosticString(line, 512) ?? "");
-  return { lines, truncated: bounded.truncated || lines.length < bounded.content.split(/\r?\n/u).length };
+  const sourceLines = bounded.content.length === 0 ? [] : bounded.content.split(/\r?\n/u);
+  const lines = sourceLines.slice(-100).map((line) => safeDiagnosticString(line, 512) ?? "");
+  return { lines, truncated: bounded.truncated || lines.length < sourceLines.length };
 }
 
 function launchEffectCertainty(
@@ -542,16 +541,16 @@ function launchEffectCertainty(
   snapshot: HerdrSnapshot | undefined,
   pane: Record<string, unknown> | undefined,
   agent: Record<string, unknown> | undefined,
-  readFailures: readonly string[]
+  readFailures: readonly string[],
+  candidatePaneId: string | undefined,
+  candidateTabId: string | undefined
 ): Exclude<LaunchEffectCertainty, "confirmed"> {
   const baselinePaneIds = new Set(input.baseline.panes.map((item) => item.pane_id));
   const baselineTabIds = new Set(input.baseline.tabs.map((item) => item.tab_id));
-  const observedPaneId = input.paneId ?? input.created.paneId ?? (pane && own(pane, "pane_id") && typeof pane.pane_id === "string" ? pane.pane_id : undefined);
-  const observedTabId = input.tabId ?? input.created.tabId ?? (pane && own(pane, "tab_id") && typeof pane.tab_id === "string" ? pane.tab_id : undefined);
-  const currentPane = observedPaneId === undefined ? undefined : snapshot?.panes.find((item) => item.pane_id === observedPaneId);
-  const currentTab = observedTabId === undefined ? undefined : snapshot?.tabs.find((item) => item.tab_id === observedTabId);
-  const createdPane = (currentPane !== undefined && !baselinePaneIds.has(currentPane.pane_id)) || (pane !== undefined && observedPaneId !== undefined && !baselinePaneIds.has(observedPaneId));
-  const createdTab = (currentTab !== undefined && !baselineTabIds.has(currentTab.tab_id)) || (pane !== undefined && observedTabId !== undefined && !baselineTabIds.has(observedTabId));
+  const currentPane = candidatePaneId === undefined ? undefined : snapshot?.panes.find((item) => item.pane_id === candidatePaneId);
+  const currentTab = candidateTabId === undefined ? undefined : snapshot?.tabs.find((item) => item.tab_id === candidateTabId);
+  const createdPane = (currentPane !== undefined && !baselinePaneIds.has(currentPane.pane_id)) || (pane !== undefined && candidatePaneId !== undefined && !baselinePaneIds.has(candidatePaneId));
+  const createdTab = (currentTab !== undefined && !baselineTabIds.has(currentTab.tab_id)) || (pane !== undefined && candidateTabId !== undefined && !baselineTabIds.has(candidateTabId));
 
   // A live agent or a newly observed pane/tab proves a partial launch effect,
   // even if another optional read failed. Conversely, a failed read must never
@@ -559,12 +558,13 @@ function launchEffectCertainty(
   // returned from the other reads.
   if (agent !== undefined || createdPane || createdTab) return "partial";
   if (readFailures.length > 0) return "unknown";
+  /* c8 ignore next -- an agent or prompt effect always has a resolved candidate pane. */
   if (input.agentStarted || input.promptSubmitted) return "unknown";
 
   // Absence is only conclusive when the authoritative snapshot identified the
   // candidate pane and proved that it is gone. If no candidate could be
   // identified, the readback is incomplete and remains unknown.
-  if (snapshot !== undefined && observedPaneId !== undefined && currentPane === undefined) return "absent";
+  if (snapshot !== undefined && candidatePaneId !== undefined && currentPane === undefined) return "absent";
   return "unknown";
 }
 
@@ -639,7 +639,7 @@ async function reconcileLaunch(input: LaunchReconciliationInput): Promise<Launch
       : snapshotAvailable && candidatePaneId !== undefined && (paneState === "absent" || (paneState === "present" && !snapshot?.agents.some((item) => item.pane_id === candidatePaneId)))
         ? "absent"
         : "unknown";
-    const certainty = launchEffectCertainty(input, snapshot, currentPane, currentAgent, failures);
+    const certainty = launchEffectCertainty(input, snapshot, currentPane, currentAgent, failures, candidatePaneId, candidateTabId);
     return {
       effectCertainty: certainty,
       snapshot: snapshotAvailable ? "present" : "unavailable",
@@ -1426,6 +1426,7 @@ function failureEffectCertainty(
   reconciliation: LaunchReconciliationEvidence | undefined
 ): LaunchEffectCertainty {
   if (reconciliation !== undefined) return reconciliation.effectCertainty;
+  /* c8 ignore next -- current launch control always reconciles after a dispatched effect. */
   if (effects.promptSubmitted || effects.agentStarted || mutationDispatched) return "unknown";
   return "absent";
 }
@@ -1839,7 +1840,6 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             reconciliation = await reconcileLaunch({
               cli: deps.cli,
               baseline: topologyBaseline!,
-              created,
               ...(paneId === undefined ? {} : { paneId }),
               ...(tabId === undefined ? {} : { tabId }),
               agentStarted,

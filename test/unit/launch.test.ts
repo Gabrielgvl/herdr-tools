@@ -1195,8 +1195,8 @@ describe("herdr_launch profile-only contract", () => {
 
   it("keeps reconciliation records bounded when optional identity fields are malformed", async () => {
     const controlSession = { source: "\u0001", agent: "\u007f", kind: "\u0002", value: "\u0003" };
-    const pane = { pane_id: "w1:p2", agent_name: "worker", agent_session: controlSession };
-    const agent = { pane_id: "w1:p2", agent_session: controlSession };
+    const pane = { pane_id: "w1:p2", agent_name: "worker", status: "\u0001", agent_session: controlSession };
+    const agent = { pane_id: "w1:p2", status: "\u0001", agent_session: controlSession };
     const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
     const base = harness.cli.runJson;
     let started = false;
@@ -1250,12 +1250,56 @@ describe("herdr_launch profile-only contract", () => {
     }
   });
 
+  it("uses bounded coded readback failures instead of dropping their evidence", async () => {
+    const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
+    const base = harness.cli.runJson;
+    let started = false;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "start") {
+        const result = await base(argv, signal, preserve);
+        started = true;
+        return result;
+      }
+      if (started && argv[0] === "agent" && argv[1] === "focus") throw new Error("focus failed");
+      if (started && argv[0] === "pane" && argv[1] === "get") return ok("malformed-pane", { pane: "invalid" });
+      return base(argv, signal, preserve);
+    });
+    const failure = await (launch({ name: "worker", profile: "worker", focus: true }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "partial", readFailures: expect.arrayContaining(["pane:READ_MALFORMED"]) } });
+  });
+
   it("keeps primitive output readback failures visible as unknown evidence", async () => {
     const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
     harness.cli.runText = vi.fn(async () => { throw "output readback unavailable"; });
-    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "partial", readFailures: expect.arrayContaining(["output:READ_FAILED"]) } });
+
+    const codedHarness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
+    codedHarness.cli.runText = vi.fn(async () => { throw { code: "OUTPUT_READ_FAILED" }; });
+    const codedFailure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), codedHarness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(codedFailure.details).toMatchObject({ reconciliation: { readFailures: expect.arrayContaining(["output:OUTPUT_READ_FAILED"]) } });
+
+    const unsafeCodeHarness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
+    unsafeCodeHarness.cli.runText = vi.fn(async () => { throw { code: "\u0000" }; });
+    const unsafeCodeFailure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), unsafeCodeHarness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(unsafeCodeFailure.details).toMatchObject({ reconciliation: { readFailures: expect.arrayContaining(["output:READ_FAILED"]) } });
+
+    const emptyHarness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
+    emptyHarness.cli.runText = vi.fn(async () => "");
+    const emptyFailure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), emptyHarness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(emptyFailure.details).toMatchObject({ reconciliation: { recentUnwrappedLines: [] } });
+    expect((emptyFailure.details.reconciliation as Record<string, unknown>).truncated).toBeUndefined();
+  });
+
+  it("falls back to the extension working directory when launch cwd is omitted", async () => {
+    const tool = createLaunchTool({ cli: makeCli().cli, context, profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
+    const result = await tool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, { cwd: "/context-cwd" } as ExtensionContext);
+    expect(result.details).toMatchObject({ outcome: "launched", paneId: "w1:p2" });
   });
 
   it("reports a present pane and absent agent separately during reconciliation", async () => {
@@ -1297,6 +1341,31 @@ describe("herdr_launch profile-only contract", () => {
     expect(harness.calls.some((call) => call[0] === "pane" && call[1] === "get")).toBe(false);
   });
 
+  it("discovers pane and tab candidates when a committed placement response has no ids", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let placementAttempted = false;
+    const postSnapshot: HerdrSnapshot = {
+      ...snapshot,
+      tabs: [...snapshot.tabs, { tab_id: "w1:t2", workspace_id: "w1", label: "worker" }],
+      panes: [...snapshot.panes, { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1", label: "worker", agent_status: "idle" }],
+      agents: [{ pane_id: "w1:p3", name: "worker", agent: "pi", agent_status: "idle" }]
+    };
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "tab" && argv[1] === "create") {
+        placementAttempted = true;
+        return ok("tab-created-without-ids", {});
+      }
+      if (placementAttempted && argv[0] === "api") return ok("reconciled-snapshot", { type: "session_snapshot", snapshot: postSnapshot });
+      if (placementAttempted && argv[0] === "pane" && argv[1] === "get") return ok("reconciled-pane", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1" } });
+      if (placementAttempted && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent: { pane_id: "w1:p3", name: "worker" } });
+      return base(argv, signal, preserve);
+    });
+    const failure = await launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(failure.details).toMatchObject({ phase: "placement", reconciliation: { effectCertainty: "partial", snapshot: "present", pane: "present", agent: "present", paneId: "w1:p3", tabId: "w1:t2" } });
+  });
+
   it("resolves a missing tab identity from the post-mutation pane when available", async () => {
     const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
     const base = harness.cli.runJson;
@@ -1326,7 +1395,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       const pending = launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli);
       const failurePromise = pending.catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(5_000);
       const failure = await failurePromise;
       expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "unknown", snapshot: "unavailable", readFailures: expect.arrayContaining(["snapshot:READ_TIMEOUT", "pane:READ_TIMEOUT", "agent:READ_TIMEOUT"]) } });
     } finally {
@@ -1341,7 +1410,7 @@ describe("herdr_launch profile-only contract", () => {
     harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
       if (argv[0] === "agent" && argv[1] === "focus") {
         focusFailed = true;
-        throw new Error("focus failed");
+        throw new Error("\u0001");
       }
       if (focusFailed && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent: { ...observedAgent("idle", 7), agent_id: "post-agent" } });
       return base(argv, signal, preserve);
@@ -1434,7 +1503,7 @@ describe("herdr_launch profile-only contract", () => {
         .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
       await vi.waitFor(() => expect(readSignals).toHaveLength(1), { timeout: 1_000, interval: 1 });
       expect(readSignals[0]!.aborted).toBe(false);
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(5_000);
       // The read that lost the race is cancelled, not merely abandoned: its own
       // signal is aborted, so the CLI invocation stops instead of outliving the
       // reconciliation that already reported without it.
@@ -1446,6 +1515,14 @@ describe("herdr_launch profile-only contract", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("preserves unknown evidence when a reconciliation adapter read throws", async () => {
+    const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
+    Object.defineProperty(harness.cli, "runText", { configurable: true, get: () => { throw new Error("adapter read unavailable"); } });
+    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "unknown", snapshot: "unavailable", readFailures: ["reconciliation:READ_FAILED"] } });
   });
 
   it("reports an absent effect conservatively and still requires inspection after an attempted mutation", async () => {
@@ -2510,25 +2587,34 @@ describe("herdr_launch profile-only contract", () => {
   });
 
   it("preserves acknowledged effect evidence when abort cancels an in-flight confirmation read", async () => {
-    const controller = new AbortController();
-    const harness = makeCli();
-    const base = harness.cli.runJson;
-    let agentReads = 0;
-    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-      if (argv[0] === "agent" && argv[1] === "get" && agentReads++ > 0) return new Promise<never>(() => undefined);
-      return base(argv, signal, preserve);
-    });
-    const recipients = new RecipientRegistry();
-    const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
-    const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "abort read" }, controller.signal, undefined, extensionContext);
-    await vi.waitFor(() => expect(agentReads).toBe(2), { timeout: 1_000, interval: 1 });
-    controller.abort();
-    await expect(pending).rejects.toMatchObject({
-      code: "LAUNCH_FAILED",
-      details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED", samples: 1 } }
-    });
-    expect(harness.stdinInputs).toHaveLength(1);
-    expect(recipients.get("w1:p2")).toBeUndefined();
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const harness = makeCli();
+      const base = harness.cli.runJson;
+      let agentReads = 0;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        if (argv[0] === "agent" && argv[1] === "get" && agentReads++ > 0) return new Promise<never>(() => undefined);
+        return base(argv, signal, preserve);
+      });
+      const recipients = new RecipientRegistry();
+      const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
+      const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "abort read" }, controller.signal, undefined, extensionContext)
+        .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+      await vi.waitFor(() => expect(agentReads).toBe(2), { timeout: 1_000, interval: 1 });
+      controller.abort();
+      await vi.waitFor(() => expect(agentReads).toBe(3), { timeout: 1_000, interval: 1 });
+      await vi.advanceTimersByTimeAsync(5_000);
+      const failure = await pending;
+      expect(failure).toMatchObject({
+        code: "LAUNCH_FAILED",
+        details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED", samples: 1 } }
+      });
+      expect(harness.stdinInputs).toHaveLength(1);
+      expect(recipients.get("w1:p2")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("falls back to the context signal and then to a fresh signal", async () => {

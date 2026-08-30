@@ -3,6 +3,7 @@ import { Value } from "typebox/value";
 import { modelSafeJson } from "../redaction.js";
 import type { HerdrToolDefinition, HerdrToolSurface } from "../tool-surface.js";
 import { hostContext, type HerdrToolHost } from "./host.js";
+import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE } from "../tools/launch.js";
 import type { QueueRefusal, SequentialToolQueue } from "./queue.js";
 
 /** Total response bound for one MCP tool result. */
@@ -21,6 +22,9 @@ const MAX_ERROR_MESSAGE_CHARS = 2_000;
 const MAX_CODE_CHARS = 120;
 const MAX_TOOL_NAME_CHARS = 120;
 const MAX_VALIDATION_ERRORS = 3;
+const LAUNCH_DIAGNOSTIC_PHASES = new Set(["validate", "resolve_profile", "attachment_publish", "placement", "agent_start", "ready", "focus", "prompt_verification"]);
+const LAUNCH_EFFECT_CERTAINTIES = new Set(["absent", "partial", "unknown", "confirmed"]);
+const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 
 export class AdapterContractError extends Error {
   readonly code = "ADAPTER_CONTRACT_VIOLATION" as const;
@@ -242,6 +246,39 @@ function errorDetails(error: unknown): unknown {
   return typeof details === "object" && details !== null ? details : undefined;
 }
 
+function launchDiagnosticId(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && !/[\0\r\n]/u.test(value) ? singleLine(value, 256) : undefined;
+}
+
+function launchDiagnosticPayload(message: string): Record<string, unknown> | undefined {
+  const marker = `\n${LAUNCH_DIAGNOSTIC_MARKER} `;
+  const offset = message.lastIndexOf(marker);
+  if (offset < 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(message.slice(offset + marker.length));
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const value = parsed as Record<string, unknown>;
+  const phase = value.phase;
+  const effectCertainty = value.effectCertainty;
+  const recoveryGuidance = value.recoveryGuidance;
+  if (typeof phase !== "string" || !LAUNCH_DIAGNOSTIC_PHASES.has(phase)) return undefined;
+  if (typeof effectCertainty !== "string" || !LAUNCH_EFFECT_CERTAINTIES.has(effectCertainty)) return undefined;
+  if (typeof recoveryGuidance !== "string" || !Object.values(LAUNCH_RECOVERY_GUIDANCE).includes(recoveryGuidance as typeof LAUNCH_RECOVERY_GUIDANCE[keyof typeof LAUNCH_RECOVERY_GUIDANCE])) return undefined;
+  if (typeof value.agentStarted !== "boolean" || typeof value.promptSubmitted !== "boolean" || typeof value.recipientRegistered !== "boolean") return undefined;
+  const createdValue = value.created;
+  if (typeof createdValue !== "object" || createdValue === null || Array.isArray(createdValue)) return undefined;
+  const created = Object.fromEntries(["tabId", "paneId", "agentId"].flatMap((field) => {
+    const id = launchDiagnosticId((createdValue as Record<string, unknown>)[field]);
+    return id === undefined ? [] : [[field, id] as const];
+  }));
+  const code = typeof value.code === "string" && LAUNCH_CODE_PATTERN.test(value.code) ? value.code : "LAUNCH_FAILED";
+  return { code, phase, created, agentStarted: value.agentStarted, promptSubmitted: value.promptSubmitted, recipientRegistered: value.recipientRegistered, effectCertainty, recoveryGuidance };
+}
+
 /**
  * Typed tool failures are model-visible tool results, never protocol errors.
  *
@@ -251,8 +288,16 @@ function errorDetails(error: unknown): unknown {
  * printable characters cannot exceed roughly 9 KiB even fully escaped — so the
  * evidence always keeps more than `MIN_DETAILS_BYTES` of room.
  */
-export function errorOutcome(code: string, message: string, details?: unknown): McpCallOutcome {
+export function errorOutcome(code: string, message: string, details?: unknown, toolName?: string): McpCallOutcome {
   const head = { code, message: singleLine(message, MAX_ERROR_MESSAGE_CHARS) };
+  if (toolName === "herdr_launch") {
+    // Launch keeps rich details for Pi/TUI recovery, but its Error.message also
+    // carries the sole fixed-shape model diagnostic. Never forward the attached
+    // details: they include raw cause and backend evidence by design.
+    const diagnostic = launchDiagnosticPayload(message);
+    const launchDetails = { tool: toolName, ...(diagnostic === undefined ? {} : { diagnostic }) };
+    return { content: [{ type: "text", text: JSON.stringify({ ...head, details: launchDetails }) }], isError: true };
+  }
   const safeDetails = modelSafeJson(details);
   const payload = safeDetails === undefined
     ? head
@@ -299,7 +344,7 @@ export async function callTool(request: McpCallRequest): Promise<McpCallOutcome>
       const result = await definition.execute(request.callId, args, request.host.signal, undefined, hostContext(request.host));
       return successOutcome(result);
     } catch (error) {
-      return errorOutcome(errorCode(error), error instanceof Error ? error.message : String(error), errorDetails(error));
+      return errorOutcome(errorCode(error), error instanceof Error ? error.message : String(error), errorDetails(error), definition.name);
     }
   };
   if (definition.executionMode !== "sequential") return invoke();

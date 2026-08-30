@@ -35,7 +35,10 @@ boundary includes a bounded, stable `HERDR_LAUNCH_DIAGNOSTIC` JSON record in
 `Error.message`, because that is the field Pi exposes to the model. The record
 contains the error code, failed phase, known created IDs, agent/prompt/recipient
 effect flags, effect certainty, and safe recovery guidance. Rich bounded details
-remain attached for TUI and MCP consumers; they are not the sole model contract.
+remain attached for Pi/TUI rendering and manual recovery; they are not serialized
+to MCP. At the MCP boundary, `herdr_launch` parses only the existing
+`HERDR_LAUNCH_DIAGNOSTIC` JSON from `Error.message` and publishes that fixed
+payload with the tool name. Raw cause evidence is never model-visible.
 
 Every field of that model-visible text is authored by Tools, and no cause message
 reaches it. `CliProtocolError` adopts the Herdr error envelope's `message`
@@ -48,8 +51,10 @@ whenever a structured diagnostic is attached the prose is one fixed summary; the
 failed phase and recovery guidance are module-owned unions; and a failure code is
 published only when it matches the code shape Tools and the CLI transport define.
 The cause's own bounded prose is retained as `details.causeMessage`, alongside the
-bounded backend envelope under `details.cliFailure`, for the TUI and manual
-recovery. Distinct recovery advice stays in the diagnostic's `recoveryGuidance`.
+bounded backend envelope under `details.cliFailure`, for Pi/TUI rendering and
+manual recovery only. The MCP adapter never serializes those details, including
+nested backend messages, stderr/stdout, environment, or recent output. Distinct
+recovery advice stays in the diagnostic's `recoveryGuidance`.
 
 A launch error or caller abort triggers reconciliation only after a topology or
 other launch mutation has been dispatched (or a genuinely partial launch effect
@@ -60,7 +65,9 @@ absolute deadline. Each read runs on a signal derived from that controller, and
 the derived signal is aborted the instant the deadline wins, so a read that lost
 the race is cancelled rather than left running behind a reconciliation that has
 already reported; a read that ignores its signal is still only bounded, never
-stopped. It performs read-only snapshot, pane/agent state, and recent
+stopped. The reconciliation deadline is five seconds, preserving bounded
+readback while allowing normal MCP/coverage load. It performs read-only snapshot,
+pane/agent state, and recent
 output reads when possible. The evidence is compacted to fixed fields and bounded
 lines. It classifies the observed effect as `absent`, `partial`, or `unknown`;
 any failed read prevents an absent conclusion unless authoritative evidence still
@@ -104,8 +111,10 @@ perspective. A retry could duplicate an assignment or create a second agent.
 
 ## Consequences
 
-- Models receive parseable, bounded inspection results and structured launch
-  diagnostics without relying on host-specific detail preservation.
+- Models receive parseable, bounded inspection results and the fixed structured
+  launch diagnostic without relying on host-specific detail preservation.
+- Pi/TUI retains rich launch details for render-only/manual recovery, while MCP
+  uses the fixed diagnostic projection and never exposes raw cause evidence.
 - Partial resources and recent failure evidence remain visible for manual recovery.
 - Readback adds at most a short read-only reconciliation after a dispatched
   mutation; no-effect failures retain their previous zero-extra-read behavior.

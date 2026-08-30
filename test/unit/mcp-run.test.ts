@@ -255,9 +255,10 @@ describe("MCP server startup", () => {
     const profiles = await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "profiles" } });
     expect(profiles.isError).toBeUndefined();
     expect(textOf(profiles)).toContain("manager-pi");
-    const beyondDefaultCadence = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 600_000, runInBackground: false } });
-    expect(beyondDefaultCadence.isError).toBe(true);
-    expect(textOf(beyondDefaultCadence)).toContain("REVIEWER_FAILED");
+    const beyondDefaultCadence = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 600_000 } });
+    expect(beyondDefaultCadence.isError).toBeUndefined();
+    const jobId = (JSON.parse(textOf(beyondDefaultCadence).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ status: "failed", error: { code: "REVIEWER_FAILED" } }));
     expect(readFileMock).toHaveBeenCalled();
     await harness.handle.shutdown();
   });
@@ -314,7 +315,7 @@ describe("MCP tool serving", () => {
       await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "panes" } }),
       await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } })
     ];
-    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000, runInBackground: true } });
+    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
     const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
     await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.status).toBe("completed"));
     results.push(detached, await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "get", jobId } }));
@@ -368,34 +369,35 @@ describe("MCP tool serving", () => {
     await harness.handle.shutdown();
   });
 
-  it("cancels a running tool call through the request signal", async () => {
+  it("does not cancel a detached job through the request signal after registration", async () => {
     const harness = await start();
     const controller = new AbortController();
-    const pending = harness.client.callTool(
+    const result = await harness.client.callTool(
       { name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } },
       undefined,
       { signal: controller.signal }
-    ).catch((error: unknown) => error);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    );
+    expect(result.isError).toBeUndefined();
+    const jobId = (JSON.parse(textOf(result).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
     controller.abort(new Error("manager cancelled"));
-    expect(await pending).toBeInstanceOf(Error);
+    expect(harness.handle.jobs.get(jobId)?.status).toBe("running");
     await harness.handle.shutdown();
   });
 });
 
 describe("MCP wait and job semantics", () => {
-  it("fails closed for a foreground wait beyond the review cadence", async () => {
+  it("records a reviewer failure in the detached job beyond the review cadence", async () => {
     const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
-    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000, runInBackground: false } });
-    expect(outcome.isError).toBe(true);
-    expect(textOf(outcome)).toContain("REVIEWER_FAILED");
-    expect(textOf(outcome)).toContain("model-backed wait review is unavailable on the MCP host");
+    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
+    expect(outcome.isError).toBeUndefined();
+    const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ status: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("model-backed wait review is unavailable on the MCP host") } }));
     await harness.handle.shutdown();
   });
 
   it("registers a detached wait that is polled through herdr_jobs and fails closed beyond the cadence", async () => {
     const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
-    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000, runInBackground: true } });
+    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(detached.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
     expect(jobId.startsWith("job_")).toBe(true);
@@ -411,11 +413,12 @@ describe("MCP wait and job semantics", () => {
     await harness.handle.shutdown();
   });
 
-  it("keeps a wait within the cadence free of any reviewer", async () => {
+  it("detaches a wait within the cadence without starting a reviewer", async () => {
     const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
     expect(outcome.isError).toBeUndefined();
-    expect(textOf(outcome)).toContain("success");
+    const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ status: "completed", outcome: "success" }));
     await harness.handle.shutdown();
   });
 });
@@ -423,7 +426,7 @@ describe("MCP wait and job semantics", () => {
 describe("MCP server lifecycle", () => {
   it("marks jobs shut down, resets ownership, and exits zero exactly once", async () => {
     const harness = await start();
-    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000, runInBackground: true } });
+    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } });
     const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
     harness.handle.ownership.record({ kind: "pane", id: "w:p9" });
     await harness.handle.shutdown();

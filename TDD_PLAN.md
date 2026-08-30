@@ -902,9 +902,11 @@ and concerns for the reviewer, as required by the source TDD skill.
 ## Approved detached wait-job amendment
 
 The detached wait contract is now part of this plan. Add red/green coverage for
-strict `runInBackground`, preflight-before-ID, fresh-signal execution, frozen
-settings/target resolution, shared wait-runner outcome mapping, and unused
-initiating progress callbacks. Add registry tests for first-wins transitions,
+strict rejection of the removed `runInBackground` field, preflight-before-ID,
+fresh-signal execution, frozen settings/target resolution, shared wait-runner
+outcome mapping, and unused initiating progress callbacks. Every public
+`herdr_wait` call must register a job and return immediately; wait progress is
+stored on the job rather than streamed through the initiating call. Add registry tests for first-wins transitions,
 newest-first filtered pagination, uncapped starts, latest-progress replacement,
 immutable views, cancellation races, generation/shutdown staleness, and terminal
 retention. Add `herdr_jobs` tool tests for strict list/get/cancel input, structured
@@ -918,8 +920,8 @@ blocker if unavailable; no test may weaken the 100% repository threshold.
 
 Add red/green schema tests for optional bounded printable single-line labels and
 derivation tests covering state, literal-output, regex-output, resolved display
-names, and multiple targets. Foreground call rows must show supplied labels;
-foreground results and background rows must show the effective post-preflight
+names, and multiple targets. Detached call rows must show supplied labels, and
+detached acknowledgements and job rows must show the effective post-preflight
 label. Registry/tool projections preserve it or explicitly mark aggregate
 compaction through bounded detail/list forms.
 

@@ -3,7 +3,7 @@ import type { MessageDelivery } from "./messages/limits.js";
 
 export interface CompactResult {
   operation: string;
-  outcome: "success" | "reconciled" | "error" | "timeout" | "aborted" | "partial" | "cancelled" | "interrupted" | "agent_exited";
+  outcome: "success" | "reconciled" | "error" | "partial" | "cancelled" | "interrupted" | "agent_exited";
   targetId?: string;
   delivery?: MessageDelivery;
   code?: string;
@@ -62,7 +62,7 @@ export function resultForRender(
 ): { text: string; tone: "success" | "warning" | "error" | "muted" } {
   if (options.isPartial) return { text: `partial · ${operation}`, tone: "warning" };
   const details = result.details as { outcome?: unknown; reason?: unknown; code?: unknown; delivery?: unknown; postState?: { agent_status?: string }; finalState?: { agent_status?: string }; paneId?: string; tabId?: string; jobId?: string } | undefined;
-  if (details?.outcome === "partial" || details?.outcome === "progress") return { text: `partial${targetId ? ` · ${targetId}` : ""}`, tone: "warning" };
+  if (details?.outcome === "partial") return { text: `partial${targetId ? ` · ${targetId}` : ""}`, tone: "warning" };
   if (details?.outcome === "background") return { text: `background${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "success" };
   if (result.isError) {
     const code = typeof details?.code === "string" ? details.code : "UNKNOWN";
@@ -70,9 +70,6 @@ export function resultForRender(
     return { text: formatResult({ operation, outcome: "error", code, delivery, targetId }), tone: "error" };
   }
   if (!details || typeof details.outcome !== "string") return { text: formatResult({ operation, outcome: "error", code: "UNKNOWN", targetId }), tone: "error" };
-  if (details.outcome === "timeout") return { text: "timeout", tone: "warning" };
-  if (details.outcome === "manager_judgment_required") return { text: "error MANAGER_JUDGMENT_REQUIRED", tone: "error" };
-  if (details.outcome === "aborted") return { text: `aborted${targetId ? ` · ${targetId}` : ""}`, tone: "warning" };
   if (details.outcome === "cancelled" || details.outcome === "interrupted" || details.outcome === "agent_exited") {
     return { text: formatResult({ operation, outcome: details.outcome, targetId, postState: details.postState ?? details.finalState }), tone: details.outcome === "agent_exited" ? "warning" : "success" };
   }

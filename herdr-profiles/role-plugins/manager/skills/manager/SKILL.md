@@ -31,7 +31,7 @@ Read every inbound `[HERDR AGENT MESSAGE v1]` envelope before acting on its payl
 
 ## Waiting and cleanup
 
-Keep foreground waits bounded and at or below the configured review cadence. For anything longer, start the wait with `runInBackground: true` and poll it with `herdr_jobs` `list` and `get`; nothing pushes completion into this session. Cancel detached waits that are no longer needed with `herdr_jobs` `cancel`.
+Every `herdr_wait` call is detached: it validates and preflights the exact targets, registers a background job, and returns immediately. Poll the returned job ID with `herdr_jobs` `list` and `get`; completion is never a synchronous wait result. Cancel jobs that are no longer needed only with `herdr_jobs` `cancel`. The Pi host may also show its existing terminal notification and active-wait UI.
 
 Close only panes and tabs this session created and still owns. Never close the owner's pane, the manager's own pane, or a resource another session owns. Use authoritative post-state after mutations and report uncertainty rather than guessing. Hand off before context exhaustion, including exact IDs, profile identity, evidence, blockers, and cleanup state.
 

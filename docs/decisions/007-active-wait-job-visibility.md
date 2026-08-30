@@ -24,11 +24,11 @@ interactive job manager or consuming editor space by default.
 ## Decision
 
 - Add an optional printable single-line `label` to `herdr_wait`, valid for
-  foreground and background waits. When omitted, derive a bounded effective label
-  from resolved target names plus the requested condition. Store that effective
-  label in job request/detail/summary projections. Supplied foreground labels show
-  in call and result rows; labels derived after asynchronous preflight show in the
-  result row because the call row has already rendered.
+  every detached wait. When omitted, derive a bounded effective label from
+  resolved target names plus the requested condition. Store that effective label
+  in job request/detail/summary projections. Supplied labels show in the call row
+  and detached acknowledgement; labels derived after asynchronous preflight show
+  in the acknowledgement because the call row has already rendered.
 - While one or more detached waits are running, show a session-scoped Pi footer
   status with an animated spinner, the exact active count, the elapsed time of
   the oldest active wait, and the `/herdr-waits` command hint. Refresh once per

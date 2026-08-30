@@ -162,6 +162,8 @@ describe("MCP published schema parity", () => {
       ["herdr_tab", { operation: "focus", target: "w:t" }, true],
       ["herdr_tab", { operation: "focus", target: "w:t", label: "review" }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5 }, true],
+      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: true }, false],
+      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }, false],
       ["herdr_launch", { name: "worker", profile: "worker-pi" }, true],
       ["herdr_launch", { name: "worker", profile: "worker-pi", extra: true }, false]
@@ -513,10 +515,19 @@ describe("MCP model-boundary redaction", () => {
     for (const [name, args] of calls) {
       const outcome = await callTool({ surface, name, args, host, callId: "c", queue });
       expect(outcome.isError, name).toBeUndefined();
-      const text = outcome.content.map((block) => block.text).join("\n");
+      let text = outcome.content.map((block) => block.text).join("\n");
       for (const sentinel of SENTINELS) expect(text, `${name} ${sentinel}`).not.toContain(sentinel);
       // The environment keys themselves are gone, not just their values.
       expect(text, name).not.toContain("environment_overrides");
+      if (name === "herdr_wait") {
+        const jobId = (detailsOf(outcome) as { jobId: string }).jobId;
+        let job: McpCallOutcome | undefined;
+        await vi.waitFor(async () => {
+          job = await callTool({ surface, name: "herdr_jobs", args: { operation: "get", jobId }, host, callId: "job", queue });
+          expect(job!.content.map((block) => block.text).join("\n")).toContain("agent_status");
+        });
+        text = job!.content.map((block) => block.text).join("\n");
+      }
       // The typed evidence a manager needs survives the redaction.
       expect(text, name).toContain("agent_status");
       expect(text, name).toMatch(/w:p[23]/);

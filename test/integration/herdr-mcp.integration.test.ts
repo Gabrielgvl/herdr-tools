@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { HerdrCli } from "../../src/cli.js";
 import { JobRegistry } from "../../src/job-registry.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
@@ -376,9 +376,13 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
 
       const confirmedState = record(launchEvidence.initialPromptObservation).state;
       const confirmedWaitState = confirmedState === "working" ? "working" : confirmedState === "blocked" ? "needs_input" : "completed";
-      const foreground = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: confirmedWaitState }, timeoutMs: 10_000 });
-      expect(foreground.isError, text(foreground)).toBeUndefined();
-      expect(evidence(foreground)).toMatchObject({ operation: "wait", outcome: "success" });
+      const shortWait = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: confirmedWaitState }, timeoutMs: 10_000 });
+      expect(shortWait.isError, text(shortWait)).toBeUndefined();
+      const shortWaitJobId = evidence(shortWait).jobId as string;
+      await vi.waitFor(async () => {
+        const job = await call("herdr_jobs", { operation: "get", jobId: shortWaitJobId });
+        expect(evidence(job)).toMatchObject({ operation: "jobs", kind: "job", jobId: shortWaitJobId, status: "completed", outcome: "success" });
+      }, { timeout: 20_000, interval: 100 });
 
       // `steer` is the provenance-preserving operation for a target that is
       // already working on its assignment; `prompt` correctly refuses to
@@ -388,11 +392,15 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(evidence(communicated)).toMatchObject({ operation: "steer", envelope: { version: "v1", kind: "steer" }, sender: { paneId: String(movedPane.pane_id) } });
       const transcript = await call("herdr_inspect", { mode: "target", target: workerPaneId });
       expect(JSON.stringify(evidence(transcript).recentUnwrappedLines)).toContain("[HERDR AGENT MESSAGE v1]");
-      const unsupervised = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 31 * 60_000, runInBackground: false });
-      expect(unsupervised.isError).toBe(true);
-      expect(text(unsupervised)).toContain("REVIEWER_FAILED");
+      const unsupervised = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 31 * 60_000 });
+      expect(unsupervised.isError, text(unsupervised)).toBeUndefined();
+      const unsupervisedJobId = evidence(unsupervised).jobId as string;
+      await vi.waitFor(async () => {
+        const job = await call("herdr_jobs", { operation: "get", jobId: unsupervisedJobId });
+        expect(text(job)).toContain("REVIEWER_FAILED");
+      }, { timeout: 20_000, interval: 100 });
 
-      const detached = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 20_000, label: "mcp detached", runInBackground: true });
+      const detached = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 20_000, label: "mcp detached" });
       const jobId = evidence(detached).jobId as string;
       expect(jobId.startsWith("job_")).toBe(true);
       const jobs = await call("herdr_jobs", { operation: "list" });

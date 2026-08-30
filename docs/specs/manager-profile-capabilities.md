@@ -97,7 +97,7 @@ Common extension-backed navigation tools are selected by name but still supplied
 
 | Profile | Active tools |
 |---|---|
-| `manager-pi` | `read`, `grep`, `find`, `ls`, `herdr_inspect`, `herdr_launch`, `herdr_communicate`, `herdr_wait`, `herdr_pane`, `herdr_tab` | Generic advisory manager; no direct Bash/Edit/Write. |
+| `manager-pi` | `read`, `grep`, `find`, `ls`, `herdr_inspect`, `herdr_launch`, `herdr_communicate`, `herdr_wait`, `herdr_jobs`, `herdr_pane`, `herdr_tab` | Generic advisory manager; no direct Bash/Edit/Write. |
 | `manager-claude` | `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `AskUserQuestion`, `Skill`, `ToolSearch`, `mcp__plugin_herdr-tools_herdr` | Claude `default`; only `Task` is disallowed. Bash/Edit/Write remain owner-gated and are omitted from both lists. |
 | `scout-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ffgrep`, `fffind`, `ctx_execute`, `ctx_execute_file`, `ctx_search` |
 | `planner-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content` |

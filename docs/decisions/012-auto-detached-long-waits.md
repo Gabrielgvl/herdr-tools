@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted; supersedes the foreground-default portion of ADR-002.
+Superseded by ADR-018: detached-only `herdr_wait` API.
 
 ## Context
 

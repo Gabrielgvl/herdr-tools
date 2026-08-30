@@ -9,7 +9,9 @@ describe("herdr_wait schema and runtime validation", () => {
     expect(Value.Check(WaitParamsSchema, { targets: ["w1:p1"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 3_600_000 })).toBe(true);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "done" } }, timeoutMs: 1, reviewerModel: "bad" })).toBe(false);
     expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "bad" }, timeoutMs: 1 })).toBe(false);
-    expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, label: "review worker", runInBackground: true })).toBe(true);
+    expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, label: "review worker" })).toBe(true);
+    expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true })).toBe(false);
+    expect(Value.Check(WaitParamsSchema, { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: false })).toBe(false);
     expect(validateWaitParams({ targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, label: "review worker" }).params.label).toBe("review worker");
     const emojiLabel = "😀".repeat(120);
     const emojiInput = { targets: ["p"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, label: emojiLabel };
@@ -77,7 +79,8 @@ describe("herdr_wait schema and runtime validation", () => {
     for (const label of ["bad\u0085label", "bad\u202elabel", "bad\u2028label", "bad\u2029label", "bad\u2066label"]) {
       expect(Value.Check(WaitParamsSchema, { ...valid, label })).toBe(false);
     }
-    expect(validateWaitParams({ ...valid, runInBackground: false }).params.runInBackground).toBe(false);
+    expect(() => validateWaitParams({ ...valid, runInBackground: true })).toThrowError("unknown wait fields");
+    expect(() => validateWaitParams({ ...valid, runInBackground: false })).toThrowError("unknown wait fields");
   });
 
   it("covers state helpers and schema duplicate rejection", () => {

@@ -42,8 +42,8 @@ Model-visible content is bounded and redacted at the boundary: `details` and typ
 
 Two host differences are deliberate:
 
-- **Waits are polled, not pushed.** Nothing notifies the manager session when a detached wait finishes. Start long waits with `runInBackground: true` and read them with `herdr_jobs` `list` and `get`.
-- **No model-backed wait review.** The MCP host has no model registry, so a wait whose timeout exceeds `wait.reviewCadenceMinutes` fails closed with `REVIEWER_FAILED` in both foreground and detached form. Use repeated bounded waits, or raise the cadence (maximum 30) in `config.json`.
+- **Waits are detached and polled.** Every `herdr_wait` call performs its validation and target/context preflight, registers a session-scoped background job, and returns immediately with an opaque ID. Poll jobs with `herdr_jobs` `list` and `get`; cancel only through `herdr_jobs` `cancel`. Pi retains its existing terminal notification and active-wait UI, while the MCP host has no push notification.
+- **No model-backed wait review on MCP.** The MCP host has no model registry, so a job whose timeout exceeds `wait.reviewCadenceMinutes` fails closed with `REVIEWER_FAILED` in its `herdr_jobs` result. Use repeated bounded waits, or raise the cadence (maximum 30) in `config.json`.
 
 For refreshes, rebuild main, update the user-installed plugin, and restart Claude:
 
@@ -79,7 +79,7 @@ herdr_communicate({"target":"worker-id","operation":"prompt","text":"Continue th
 herdr_communicate({"target":"worker-id","operation":"cancel"})
 herdr_communicate({"target":"worker-id","operation":"interrupt"})
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000})
-herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000,"label":"worker review","runInBackground":true})
+herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000,"label":"worker review"})
 herdr_jobs({"operation":"list","status":"running"})
 herdr_launch({"name":"reviewer","profile":"reviewer-pi","initialPrompt":"Inspect the current changes"})
 herdr_pane({"operation":"split","label":"worker","direction":"right"})

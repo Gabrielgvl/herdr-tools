@@ -1,5 +1,5 @@
 import RE2 from "re2";
-import type { AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CliTextResult, HerdrCli, JsonEnvelope } from "../cli.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { loadSettings, type Settings } from "../settings.js";
@@ -8,7 +8,7 @@ import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type Revi
 import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams } from "../wait-schema.js";
 import { boundedText, type JobRegistry, type JobRequestSnapshot, type JobRunResult } from "../job-registry.js";
 import { withoutEnvironment } from "../redaction.js";
-import { formatCall, formatResult, resultForRender, textComponent } from "../tui.js";
+import { formatCall, resultForRender, textComponent } from "../tui.js";
 
 export interface WaitClock {
   now(): number;
@@ -58,13 +58,13 @@ export interface ReviewerSummary {
   summary: string;
 }
 
-export interface ForegroundWaitDetails {
+interface WaitJobProgressDetails {
   operation: "wait";
   contextRebinding?: ContextResolutionDiagnostics;
-  outcome: "progress" | "success" | "timeout" | "manager_judgment_required";
+  outcome: "progress" | "manager_judgment_required";
   label: string;
   matched: boolean;
-  reason?: "condition_met" | "timeout" | "manager_judgment_required";
+  reason?: "manager_judgment_required";
   match: WaitParams["match"];
   condition: WaitCondition;
   targets: WaitTargetSnapshot[];
@@ -89,7 +89,7 @@ export interface BackgroundWaitDetails {
   };
 }
 
-export type WaitDetails = ForegroundWaitDetails | BackgroundWaitDetails;
+export type WaitDetails = BackgroundWaitDetails;
 
 export class WaitError extends Error {
   constructor(readonly code: "INVALID_INPUT" | "ABORTED" | "REVIEWER_FAILED" | "CLI_PROTOCOL_ERROR" | "CLI_TIMEOUT" | "TARGET_NOT_FOUND" | "TARGET_AMBIGUOUS" | "TARGET_TYPE_MISMATCH" | "CONTEXT_UNAVAILABLE" | "SESSION_REPLACED", message: string, readonly details: Record<string, unknown> = {}) {
@@ -106,7 +106,7 @@ export interface WaitDependencies {
   clock?: WaitClock;
   pollIntervalMs?: number;
   reviewerFactory?: (settings: Settings, context: ExtensionContext) => WaitReviewer;
-  jobRegistry?: JobRegistry;
+  jobRegistry: JobRegistry;
 }
 
 export interface PreparedWait {
@@ -223,10 +223,6 @@ export function compactMetadata(metadata: Record<string, unknown>): Record<strin
   return Object.fromEntries(COMPACT_METADATA_KEYS.filter((key) => metadata[key] !== undefined).map((key) => [key, metadata[key]]));
 }
 
-function emitUpdate(onUpdate: AgentToolUpdateCallback<WaitDetails> | undefined, details: WaitDetails, text: string): void {
-  onUpdate?.({ content: [{ type: "text", text }], details });
-}
-
 async function readTarget(cli: WaitCli, resolved: ResolvedTarget, ref: string, clock: WaitClock, signal: AbortSignal): Promise<WaitTargetSnapshot> {
   checkAbort(signal);
   try {
@@ -279,10 +275,6 @@ export function boundedBackgroundDetails(jobId: string, label: string, params: W
   };
 }
 
-function resultDetails(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], outcome: ForegroundWaitDetails["outcome"], reason: ForegroundWaitDetails["reason"], reviewerSummaries?: ReviewerSummary[], contextRebinding?: ContextResolutionDiagnostics): ForegroundWaitDetails {
-  return { operation: "wait", outcome, label, matched: outcome === "success", reason, match: params.match, condition: params.condition, targets: snapshots, ...(reviewerSummaries && reviewerSummaries.length > 0 ? { reviewerSummaries } : {}), ...(contextRebinding ? contextRebindingDetails(contextRebinding) : {}) };
-}
-
 function aggregate(params: WaitParams, snapshots: WaitTargetSnapshot[]): boolean {
   const count = snapshots.filter((snapshot) => snapshot.matched).length;
   return params.match === "any" ? count > 0 : count === snapshots.length;
@@ -294,18 +286,32 @@ function expired(clock: WaitClock, deadline: number, snapshots: WaitTargetSnapsh
   return true;
 }
 
-function timeoutResult(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[], contextRebinding?: ContextResolutionDiagnostics): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } {
-  const details = resultDetails(params, label, snapshots, "timeout", "timeout", reviewerSummaries, contextRebinding);
-  return { content: [{ type: "text" as const, text: formatResult({ operation: "wait", outcome: "timeout" }) }], details };
+function reviewerResult(reviewerSummaries: ReviewerSummary[]): Pick<JobRunResult, "reviewerSummaries"> {
+  return reviewerSummaries.length > 0 ? { reviewerSummaries } : {};
 }
 
-function successResult(params: WaitParams, label: string, snapshots: WaitTargetSnapshot[], reviewerSummaries?: ReviewerSummary[], contextRebinding?: ContextResolutionDiagnostics): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } {
-  const details = resultDetails(params, label, snapshots, "success", "condition_met", reviewerSummaries, contextRebinding);
-  return { content: [{ type: "text" as const, text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
+function timeoutResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[] = []): JobRunResult {
+  return { outcome: "timeout", matched: false, reason: "timeout", targets: snapshots, ...reviewerResult(reviewerSummaries) };
 }
 
-function timeoutIfExpired(params: WaitParams, label: string, read: { snapshots: WaitTargetSnapshot[]; expired: boolean }, reviewerSummaries?: ReviewerSummary[], contextRebinding?: ContextResolutionDiagnostics): { content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails } | undefined {
-  return read.expired ? timeoutResult(params, label, read.snapshots, reviewerSummaries, contextRebinding) : undefined;
+function successResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[] = []): JobRunResult {
+  const matchedTargets = snapshots.filter((snapshot) => snapshot.matched).map((snapshot) => ({ target: snapshot.target, targetId: snapshot.targetId }));
+  return {
+    outcome: "success",
+    matched: true,
+    matchedTargetCount: matchedTargets.length,
+    matchedTargets,
+    targets: snapshots,
+    ...reviewerResult(reviewerSummaries)
+  };
+}
+
+function managerJudgmentResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[]): JobRunResult {
+  return { outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required", targets: snapshots, ...reviewerResult(reviewerSummaries) };
+}
+
+function timeoutIfExpired(read: { snapshots: WaitTargetSnapshot[]; expired: boolean }, reviewerSummaries: ReviewerSummary[] = []): JobRunResult | undefined {
+  return read.expired ? timeoutResult(read.snapshots, reviewerSummaries) : undefined;
 }
 
 export function mapReviewerFailure(error: unknown): WaitError {
@@ -362,13 +368,35 @@ export function jobRequestFromPrepared(prepared: PreparedWait): JobRequestSnapsh
   };
 }
 
+function progressDetails(
+  params: WaitParams,
+  label: string,
+  snapshots: WaitTargetSnapshot[],
+  reviewerSummaries: ReviewerSummary[],
+  contextRebinding: ContextResolutionDiagnostics | undefined,
+  outcome: WaitJobProgressDetails["outcome"] = "progress"
+): WaitJobProgressDetails {
+  return {
+    operation: "wait",
+    outcome,
+    label,
+    matched: false,
+    ...(outcome === "manager_judgment_required" ? { reason: "manager_judgment_required" as const } : {}),
+    match: params.match,
+    condition: params.condition,
+    targets: snapshots,
+    ...(reviewerSummaries.length > 0 ? { reviewerSummaries } : {}),
+    ...(contextRebinding ? contextRebindingDetails(contextRebinding) : {})
+  };
+}
+
 export async function runPreparedWait(
   deps: WaitDependencies,
   prepared: PreparedWait,
   signal: AbortSignal,
-  onUpdate: AgentToolUpdateCallback<WaitDetails> | undefined,
+  update: (text: string, details?: unknown) => void,
   context: ExtensionContext
-): Promise<{ content: Array<{ type: "text"; text: string }>; details: ForegroundWaitDetails }> {
+): Promise<JobRunResult> {
   const { params, label, validation, settings, resolved, contextRebinding } = prepared;
   const clock = deps.clock ?? realClock;
   const start = clock.now();
@@ -377,9 +405,9 @@ export async function runPreparedWait(
   const longWait = params.timeoutMs > cadenceMs;
   let read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
   let snapshots = read.snapshots;
-  const initialTimeout = timeoutIfExpired(params, label, read, undefined, contextRebinding);
+  const initialTimeout = timeoutIfExpired(read);
   if (initialTimeout) return initialTimeout;
-  if (aggregate(params, snapshots)) return successResult(params, label, snapshots, undefined, contextRebinding);
+  if (aggregate(params, snapshots)) return successResult(snapshots);
   let reviewer: WaitReviewer | undefined;
   if (longWait) {
     try {
@@ -392,24 +420,21 @@ export async function runPreparedWait(
   const sentLines = new Map<string, string[]>();
   let nextReview = start + cadenceMs;
   let lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
-  const progress = (text: string, outcome: ForegroundWaitDetails["outcome"] = "progress") => emitUpdate(onUpdate, resultDetails(params, label, snapshots, outcome, undefined, reviewerSummaries, contextRebinding), text.slice(0, 500));
+  const progress = (text: string, outcome: WaitJobProgressDetails["outcome"] = "progress") => update(text.slice(0, 500), progressDetails(params, label, snapshots, reviewerSummaries, contextRebinding, outcome));
   progress("waiting");
 
   while (true) {
     checkAbort(signal);
-    if (aggregate(params, snapshots)) {
-      const details = resultDetails(params, label, snapshots, "success", "condition_met", reviewerSummaries, contextRebinding);
-      return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "success", targetId: snapshots.find((snapshot) => snapshot.matched)?.targetId }) }], details };
-    }
+    if (aggregate(params, snapshots)) return successResult(snapshots, reviewerSummaries);
     const now = clock.now();
-    if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries, contextRebinding);
+    if (expired(clock, deadline, snapshots)) return timeoutResult(snapshots, reviewerSummaries);
     const untilReview = longWait ? Math.max(0, nextReview - now) : Number.MAX_SAFE_INTEGER;
     await clock.sleep(Math.min(deps.pollIntervalMs ?? 250, deadline - now, untilReview), signal);
     checkAbort(signal);
-    if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries, contextRebinding);
+    if (expired(clock, deadline, snapshots)) return timeoutResult(snapshots, reviewerSummaries);
     read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
     snapshots = read.snapshots;
-    const pollTimeout = timeoutIfExpired(params, label, read, reviewerSummaries, contextRebinding);
+    const pollTimeout = timeoutIfExpired(read, reviewerSummaries);
     if (pollTimeout) return pollTimeout;
     const newStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
     if (newStates.some((state, index) => state !== lastStates[index])) {
@@ -442,14 +467,13 @@ export async function runPreparedWait(
       progress(`review ${review.targetId}: ${review.classification} ${review.summary}`, terminal ? "manager_judgment_required" : "progress");
     }
     if (managerJudgment) {
-      if (expired(clock, deadline, snapshots)) return timeoutResult(params, label, snapshots, reviewerSummaries, contextRebinding);
+      if (expired(clock, deadline, snapshots)) return timeoutResult(snapshots, reviewerSummaries);
       read = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex);
       snapshots = read.snapshots;
-      const refreshTimeout = timeoutIfExpired(params, label, read, reviewerSummaries, contextRebinding);
+      const refreshTimeout = timeoutIfExpired(read, reviewerSummaries);
       if (refreshTimeout) return refreshTimeout;
-      if (aggregate(params, snapshots)) return successResult(params, label, snapshots, reviewerSummaries, contextRebinding);
-      const details = resultDetails(params, label, snapshots, "manager_judgment_required", "manager_judgment_required", reviewerSummaries, contextRebinding);
-      return { content: [{ type: "text", text: formatResult({ operation: "wait", outcome: "error", code: "MANAGER_JUDGMENT_REQUIRED" }) }], details };
+      if (aggregate(params, snapshots)) return successResult(snapshots, reviewerSummaries);
+      return managerJudgmentResult(snapshots, reviewerSummaries);
     }
   }
 }
@@ -459,43 +483,25 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
   return {
     name: "herdr_wait",
     label: "Herdr Wait",
-    description: "MCP wait for exact Herdr agent targets to satisfy an authoritative raw state (idle, working, blocked, done, unknown), semantic state (started, completed, needs_input, terminal), or pane-output condition; omitted long waits automatically detach unless runInBackground is false; distinct from the CLI agent wait readiness command.",
+    description: "MCP wait for exact Herdr agent targets to satisfy an authoritative raw state (idle, working, blocked, done, unknown), semantic state (started, completed, needs_input, terminal), or pane-output condition; every call preflights, registers a detached job, and returns immediately for polling through herdr_jobs; distinct from the CLI agent wait readiness command.",
     parameters: WaitParamsSchema,
-    async execute(_id, rawParams, signal, onUpdate, context) {
+    async execute(_id, rawParams, signal, _onUpdate, context) {
       const activeSignal = signal ?? new AbortController().signal;
       checkAbort(activeSignal);
-      const generation = deps.jobRegistry?.captureGeneration();
+      const generation = deps.jobRegistry.captureGeneration();
       const prepared = await prepareWait({ ...deps, settingsLoader }, rawParams, activeSignal);
-      const explicitlyBackground = prepared.params.runInBackground === true;
-      const automaticallyBackground = prepared.params.runInBackground === undefined
-        && deps.jobRegistry !== undefined
-        && prepared.params.timeoutMs > prepared.settings.reviewCadenceMinutes * 60_000;
-      const runInBackground = explicitlyBackground || automaticallyBackground;
-      if (runInBackground && !deps.jobRegistry) throw new WaitError("INVALID_INPUT", "INVALID_INPUT: background waits are unavailable in this runtime");
-      if (runInBackground) {
-        if (!generation || !deps.jobRegistry!.isCurrent(generation)) throw new WaitError("SESSION_REPLACED", "SESSION_REPLACED: wait session was replaced before registration");
-        const registered = deps.jobRegistry!.register(
-          jobRequestFromPrepared(prepared),
-          async (jobSignal, update): Promise<JobRunResult> => {
-            const result = await runPreparedWait({ ...deps, settingsLoader }, prepared, jobSignal, (next) => update((next.content[0] as { type: "text"; text: string }).text, next.details), context);
-            return {
-              outcome: result.details.outcome as JobRunResult["outcome"],
-              matched: result.details.matched,
-              reason: result.details.reason,
-              targets: result.details.targets,
-              reviewerSummaries: result.details.reviewerSummaries
-            };
-          },
-          generation
-        );
-        const targetIds = prepared.resolved.map((item) => item.target.id);
-        const details = { ...boundedBackgroundDetails(registered.jobId, prepared.label, prepared.params, targetIds), ...(prepared.contextRebinding ? contextRebindingDetails(prepared.contextRebinding) : {}) };
-        return {
-          content: [{ type: "text", text: `background wait started · ${details.label} · ${details.jobId}` }],
-          details
-        };
-      }
-      return runPreparedWait({ ...deps, settingsLoader }, prepared, activeSignal, onUpdate, context);
+      if (!deps.jobRegistry.isCurrent(generation)) throw new WaitError("SESSION_REPLACED", "SESSION_REPLACED: wait session was replaced before registration");
+      const registered = deps.jobRegistry.register(
+        jobRequestFromPrepared(prepared),
+        async (jobSignal, update): Promise<JobRunResult> => runPreparedWait({ ...deps, settingsLoader }, prepared, jobSignal, update, context),
+        generation
+      );
+      const targetIds = prepared.resolved.map((item) => item.target.id);
+      const details = { ...boundedBackgroundDetails(registered.jobId, prepared.label, prepared.params, targetIds), ...(prepared.contextRebinding ? contextRebindingDetails(prepared.contextRebinding) : {}) };
+      return {
+        content: [{ type: "text", text: `background wait started · ${details.label} · ${details.jobId}` }],
+        details
+      };
     },
     renderCall(rawArgs, theme) {
       const args = rawArgs as WaitParams;

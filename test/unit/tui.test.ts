@@ -20,13 +20,12 @@ describe("compact tool rows", () => {
     component.invalidate();
   });
 
-  it("renders partial, timeout, aborted, and error states truthfully", () => {
-    expect(resultForRender("wait", { details: { outcome: "progress" } }, {}, "p1")).toEqual({ text: "partial · p1", tone: "warning" });
-    expect(resultForRender("wait", { details: { outcome: "timeout" } })).toEqual({ text: "timeout", tone: "warning" });
-    expect(resultForRender("wait", { details: { outcome: "aborted" } })).toEqual({ text: "aborted", tone: "warning" });
-    expect(resultForRender("wait", { details: { outcome: "aborted" } }, {}, "p1")).toEqual({ text: "aborted · p1", tone: "warning" });
+  it("renders detached, partial, and error states truthfully", () => {
+    expect(resultForRender("launch", { details: { outcome: "partial" } }, {}, "p1")).toEqual({ text: "partial · p1", tone: "warning" });
+    expect(resultForRender("launch", { details: { outcome: "partial" } })).toEqual({ text: "partial", tone: "warning" });
     expect(resultForRender("wait", { details: { outcome: "background" } })).toEqual({ text: "background", tone: "success" });
-    expect(resultForRender("wait", { details: { outcome: "progress" } }, { isPartial: true })).toEqual({ text: "partial · wait", tone: "warning" });
+    expect(resultForRender("wait", { details: { outcome: "background", jobId: "job_1" } })).toEqual({ text: "background · job_1", tone: "success" });
+    expect(resultForRender("wait", { details: { outcome: "background" } }, { isPartial: true })).toEqual({ text: "partial · wait", tone: "warning" });
     expect(resultForRender("wait", {}, {})).toEqual({ text: "error UNKNOWN", tone: "error" });
     expect(resultForRender("wait", { isError: true, details: { code: "REVIEWER_FAILED" } })).toEqual({ text: "error REVIEWER_FAILED", tone: "error" });
     expect(resultForRender("communicate", { details: { outcome: "success", delivery: "attachment" } })).toEqual({ text: "sent · attachment", tone: "success" });
@@ -42,8 +41,6 @@ describe("compact tool rows", () => {
   it("keeps rows compact for omitted targets and every non-success outcome", () => {
     expect(formatCall("herdr_wait", "waiting")).toBe("herdr_wait · waiting");
     expect(formatResult({ operation: "communicate", outcome: "error" })).toBe("error UNKNOWN");
-    expect(formatResult({ operation: "wait", outcome: "timeout" })).toBe("timeout");
-    expect(formatResult({ operation: "wait", outcome: "aborted", targetId: "p" })).toBe("aborted · p");
     expect(formatResult({ operation: "wait", outcome: "partial" })).toBe("partial");
     expect(formatResult({ operation: "other", outcome: "success" })).toBe("other");
   });

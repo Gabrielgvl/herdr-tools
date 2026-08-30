@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { ReviewerFailure, type WaitReviewer } from "../../src/reviewer.js";
-import { WaitError, boundedBackgroundDetails, createWaitTool, deltaLines, deriveWaitLabel, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
+import { WaitError, boundedBackgroundDetails, createWaitTool, deltaLines, deriveWaitLabel, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, runPreparedWait, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
 import { JobRegistry } from "../../src/job-registry.js";
 
 const snapshot = {
@@ -47,19 +47,18 @@ const context = { workspaceId: "w", tabId: "w:t", paneId: "p1" };
 const extensionContext = { modelRegistry: {} } as ExtensionContext;
 const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const };
 
-function execute(cli: WaitCli, params: unknown, extra: Partial<Parameters<typeof createWaitTool>[0]> = {}) {
-  const tool = createWaitTool({ cli, context, settingsLoader: async () => settings, ...extra });
-  return tool.execute("id", params as never, new AbortController().signal, undefined, extensionContext);
+async function execute(cli: WaitCli, params: unknown, extra: Partial<Parameters<typeof createWaitTool>[0]> = {}) {
+  const { jobRegistry = new JobRegistry(), ...rest } = extra;
+  const deps = { cli, context, settingsLoader: async () => settings, jobRegistry, ...rest } as Parameters<typeof prepareWait>[0];
+  const prepared = await prepareWait(deps, params, new AbortController().signal);
+  return runPreparedWait(deps, prepared, new AbortController().signal, () => undefined, extensionContext);
 }
 
 describe("herdr_wait", () => {
-  it("reports a live caller rebind for foreground and detached waits", async () => {
+  it("reports a live caller rebind in the detached acknowledgement", async () => {
     const stale = { workspaceId: "old-workspace", tabId: "old-tab", paneId: "p1" };
-    const foreground = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { context: stale, clock: clock() });
-    expect(foreground.details).toMatchObject({ contextRebinding: { injected: stale, effective: context, rebound: true, attempts: 1 } });
-
     const registry = new JobRegistry({ idFactory: () => "job_rebind" });
-    const detached = await createWaitTool({ cli: fakeCli(), context: stale, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() }).execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    const detached = await createWaitTool({ cli: fakeCli(), context: stale, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() }).execute("id", { targets: ["p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 } as never, new AbortController().signal, undefined, extensionContext);
     expect(detached.details).toMatchObject({ contextRebinding: { injected: stale, effective: context, rebound: true, attempts: 1 } });
   });
 
@@ -83,8 +82,8 @@ describe("herdr_wait", () => {
       async runText() { return "still working"; }
     };
     const result = await execute(leaky, { targets: ["p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1 }, { clock: clock() });
-    expect(result.details).toMatchObject({ outcome: "success", matched: true });
-    const targets = (result.details as { targets: Array<{ metadata: Record<string, unknown> }> }).targets;
+    expect(result).toMatchObject({ outcome: "success", matched: true });
+    const targets = (result as { targets: Array<{ metadata: Record<string, unknown> }> }).targets;
     expect(targets[0]!.metadata).toEqual({ pane_id: "p2", tab_id: "w:t", workspace_id: "w", label: "two", agent_name: "two", agent_status: "working", history: [{}, { child: {} }] });
     expect(JSON.stringify(result)).not.toContain("secret");
   });
@@ -92,20 +91,20 @@ describe("herdr_wait", () => {
   it("matches existing literal output immediately and does not treat literal as regex", async () => {
     const cli = fakeCli({ p1: "already done", p2: "x" });
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: ".*" } }, timeoutMs: 1 }, { clock: clock() });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false });
     expect(cli.calls.filter((call) => call[1] === "read")).toEqual([
       ["pane", "read", "p1", "--source", "recent-unwrapped", "--lines", "100", "--format", "text"]
     ]);
     const regex = await execute(fakeCli({ p1: "already done", p2: "x" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "regex", value: "done" } }, timeoutMs: 1 }, { clock: clock() });
-    expect(regex.details).toMatchObject({ outcome: "success", matched: true });
+    expect(regex).toMatchObject({ outcome: "success", matched: true });
   });
 
   it("implements semantic states and any/all aggregation", async () => {
     const any = await execute(fakeCli(), { targets: ["p1", "p2"], match: "any", condition: { kind: "state", state: "completed" }, timeoutMs: 1 }, { clock: clock() });
-    expect(any.details).toMatchObject({ outcome: "success", matched: true });
+    expect(any).toMatchObject({ outcome: "success", matched: true });
     const all = await execute(fakeCli(), { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "completed" }, timeoutMs: 1 }, { clock: clock() });
-    expect(all.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
-    expect(all.details.targets).toHaveLength(2);
+    expect(all).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(all.targets).toHaveLength(2);
   });
 
   it("matches terminal to idle, blocked, and done only", () => {
@@ -120,20 +119,20 @@ describe("herdr_wait", () => {
   });
 
   it("describes the terminal semantic state", () => {
-    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings });
+    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: new JobRegistry() });
     expect(tool.description).toContain("terminal");
   });
 
   it("rejects target aliases that resolve to one resource and preserves timeout snapshots", async () => {
     await expect(execute(fakeCli(), { targets: ["p1", "one"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     const controller = new AbortController(); controller.abort();
-    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings });
+    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: new JobRegistry() });
     await expect(tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
   });
 
   it("does not require reviewer setup when a long wait is already satisfied", async () => {
     const failingFactory = () => { throw new Error("reviewer must not start"); };
-    await expect(execute(fakeCli({ p1: "done" }), { targets: ["p1"], match: "any", condition: { kind: "state", state: "completed" }, timeoutMs: 3_600_000 }, { reviewerFactory: failingFactory })).resolves.toMatchObject({ details: { outcome: "success", matched: true } });
+    await expect(execute(fakeCli({ p1: "done" }), { targets: ["p1"], match: "any", condition: { kind: "state", state: "completed" }, timeoutMs: 3_600_000 }, { reviewerFactory: failingFactory })).resolves.toMatchObject({ outcome: "success", matched: true });
   });
 
   it("runs uncapped reviewers concurrently and ends on manager judgment", async () => {
@@ -142,8 +141,8 @@ describe("herdr_wait", () => {
     const reviewer: WaitReviewer = { review: async ({ targetId }) => { entered.push(targetId); return { targetId, classification: "blocked", summary: "needs attention" }; } };
     const result = await execute(cli, { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
     expect(entered).toEqual(["p1", "p2"]);
-    expect(result.details).toMatchObject({ outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" });
-    expect((result.details as { reviewerSummaries?: unknown[] }).reviewerSummaries).toHaveLength(2);
+    expect(result).toMatchObject({ outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" });
+    expect((result as { reviewerSummaries?: unknown[] }).reviewerSummaries).toHaveLength(2);
   });
 
   it("honors an authoritative condition that becomes true during reviewer refresh", async () => {
@@ -164,7 +163,7 @@ describe("herdr_wait", () => {
       }
     };
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 120_001 }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
-    expect(result.details).toMatchObject({ outcome: "success", matched: true, reason: "condition_met" });
+    expect(result).toMatchObject({ outcome: "success", matched: true });
   });
 
   it("reviews each target concurrently with bounded transcript deltas", async () => {
@@ -193,7 +192,7 @@ describe("herdr_wait", () => {
       return { targetId: request.targetId, classification: "progress", summary: "still progressing" };
     } };
     const result = await execute(cli, { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reviewerSummaries: expect.any(Array) });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reviewerSummaries: expect.any(Array) });
     expect(requests).toHaveLength(4);
     expect(requests[0].transcriptDelta).toEqual(["old"]);
     expect(requests[2].transcriptDelta).toEqual(["new"]);
@@ -206,7 +205,7 @@ describe("herdr_wait", () => {
   it.each(["stalled", "blocked", "risk", "unknown"] as const)("ends with manager judgment for %s reviewer findings", async (classification) => {
     const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification, summary: "attention" }) };
     const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
-    expect(result.details).toMatchObject({ outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" });
+    expect(result).toMatchObject({ outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" });
   });
 
   it("covers all wait predicates and bounded transcript helpers", () => {
@@ -259,18 +258,18 @@ describe("herdr_wait", () => {
     ]) await expect(execute(cli, params)).rejects.toMatchObject({ code: params.targets[0] === "missing" ? "TARGET_NOT_FOUND" : "INVALID_INPUT" });
     const ambiguousSnapshot = { ...snapshot, snapshot: { ...snapshot.snapshot, panes: [...snapshot.snapshot.panes, { ...snapshot.snapshot.panes[1], pane_id: "p3", label: "same", agent_name: "same", agent_status: "idle" }], agents: [...snapshot.snapshot.agents, { pane_id: "p3", name: "same", agent_status: "idle" }] } };
     const alternateCli: WaitCli = { async runJson(argv) { if (argv[0] === "pane" && argv[1] === "current") return currentPane(); if (argv[0] === "api") return { id: "snapshot", result: ambiguousSnapshot }; return { id: "pane", result: { pane: ambiguousSnapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }; }, async runText() { return ""; } };
-    await expect(execute(alternateCli, { targets: ["same"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).resolves.toMatchObject({ details: { outcome: "success" } });
+    await expect(execute(alternateCli, { targets: ["same"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).resolves.toMatchObject({ outcome: "success" });
     const trulyAmbiguous = { ...ambiguousSnapshot, snapshot: { ...ambiguousSnapshot.snapshot, panes: [...ambiguousSnapshot.snapshot.panes.map((pane) => pane.pane_id === "p3" ? { ...pane, agent_name: "same2" } : pane), { ...ambiguousSnapshot.snapshot.panes[0], pane_id: "p4", label: "same", agent_name: "other" }], agents: [...ambiguousSnapshot.snapshot.agents.map((agent) => agent.pane_id === "p3" ? { ...agent, name: "same2" } : agent), { pane_id: "p4", name: "other", agent_status: "idle" }] } };
     const trulyAmbiguousCli: WaitCli = { async runJson(argv) { if (argv[0] === "pane" && argv[1] === "current") return currentPane(); if (argv[0] === "api") return { id: "snapshot", result: trulyAmbiguous }; return { id: "pane", result: { pane: trulyAmbiguous.snapshot.panes[0] } }; }, async runText() { return ""; } };
     await expect(execute(trulyAmbiguousCli, { targets: ["same"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "TARGET_AMBIGUOUS" });
     await expect(execute(cli, { targets: ["w:t"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 })).rejects.toMatchObject({ code: "TARGET_TYPE_MISMATCH" });
-    await expect(createWaitTool({ cli, context: {} as typeof context, settingsLoader: async () => settings }).execute("id", { targets: ["current"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
+    await expect(createWaitTool({ cli, context: {} as typeof context, settingsLoader: async () => settings, jobRegistry: new JobRegistry() }).execute("id", { targets: ["current"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CONTEXT_UNAVAILABLE" });
     const settingsError = Object.assign(new Error("bad config"), { code: "INVALID_SETTINGS" });
     await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { settingsLoader: async () => { throw settingsError; } })).rejects.toBe(settingsError);
     await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { settingsLoader: async () => { throw "bad config"; } })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { settingsLoader: async () => { throw new Error("settings down"); } })).rejects.toMatchObject({ code: "INVALID_INPUT" });
-    const defaultLoader = createWaitTool({ cli, context, clock: clock() });
-    await expect(defaultLoader.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { outcome: "success" } });
+    const defaultLoader = createWaitTool({ cli, context, clock: clock(), jobRegistry: new JobRegistry() });
+    await expect(defaultLoader.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { outcome: "background" } });
     const reviewerError: WaitReviewer = { review: async () => { throw new Error("model down"); } };
     await expect(execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewerError })).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { cause: "model down" } });
     await expect(execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000 })).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
@@ -280,7 +279,7 @@ describe("herdr_wait", () => {
     let now = 0;
     const reviewer: WaitReviewer = { review: async () => { now = 60_001; return { targetId: "p1", classification: "blocked", summary: "deadline" }; } };
     const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("returns timeout when the reviewer refresh read reaches the deadline", async () => {
@@ -298,16 +297,16 @@ describe("herdr_wait", () => {
     };
     const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification: "blocked", summary: "refresh deadline" }) };
     const result = await execute(cli, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("preserves an unknown reviewer target in the manager summary", async () => {
     const reviewer: WaitReviewer = { review: async () => ({ targetId: "external", classification: "blocked", summary: "attention" }) };
     const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
-    expect((result.details as { reviewerSummaries?: Array<{ target?: string }> }).reviewerSummaries?.[0]?.target).toBe("external");
+    expect((result as { reviewerSummaries?: Array<{ target?: string }> }).reviewerSummaries?.[0]?.target).toBe("external");
   });
 
-  it("polls authoritatively, streams bounded progress, and supports renderers", async () => {
+  it("detaches short waits, preserves job progress, and renders the detached acknowledgement", async () => {
     let reads = 0;
     const cli: WaitCli & { calls: string[][] } = {
       calls: [],
@@ -324,11 +323,13 @@ describe("herdr_wait", () => {
         return reads > 2 ? "matched" : "not yet";
       }
     };
-    const updates: string[] = [];
-    const tool = createWaitTool({ cli, context, settingsLoader: async () => settings, clock: clock(), pollIntervalMs: 1 });
-    const result = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "matched" } }, timeoutMs: 10 } as never, new AbortController().signal, (update) => updates.push(update.content[0]?.type === "text" ? update.content[0].text : ""), extensionContext);
-    expect(result.details).toMatchObject({ outcome: "success", matched: true });
-    expect(updates[0]).toBe("waiting");
+    const registry = new JobRegistry({ idFactory: () => "job_render" });
+    const updates = vi.fn(() => { throw new Error("initiating progress must not be called"); });
+    const tool = createWaitTool({ cli, context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock(), pollIntervalMs: 1 });
+    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "matched" } }, timeoutMs: 10 } as never, new AbortController().signal, updates, extensionContext);
+    expect(started.details).toMatchObject({ outcome: "background", jobId: "job_render" });
+    await vi.waitFor(() => expect(registry.get("job_render")).toMatchObject({ status: "completed", outcome: "success", progress: { text: expect.any(String), details: expect.anything() } }));
+    expect(updates).not.toHaveBeenCalled();
     expect(cli.calls.filter((call) => call[1] === "read").length).toBeGreaterThan(1);
     const call = tool.renderCall?.({ targets: ["p1"], match: "any" } as never, {} as never, {} as never);
     expect(call?.render(80)).toEqual(["herdr_wait · any · p1"]);
@@ -339,28 +340,19 @@ describe("herdr_wait", () => {
     const labeledCall = tool.renderCall?.({ targets: ["p1"], label: "release gate" } as never, {} as never, {} as never);
     expect(labeledCall?.render(80)).toEqual(["herdr_wait · wait · release gate · p1"]);
     labeledCall?.invalidate();
-    const rendered = tool.renderResult?.({ content: [], details: result.details, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(rendered?.render(80)).toEqual(['wait · one → contains "matched"']);
+    const rendered = tool.renderResult?.(started as never, { expanded: false, isPartial: false } as never, {} as never, {} as never);
+    expect(rendered?.render(80)).toEqual(["background · job_render · one → contains \"matched\""]);
     rendered?.invalidate();
-    const partialRendered = tool.renderResult?.({ content: [], details: { ...result.details, outcome: "progress", matched: false }, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(partialRendered?.render(80)).toEqual(['partial · one → contains "matched"']);
-    partialRendered?.invalidate();
     const emptyRendered = tool.renderResult?.({ content: [], isError: true } as never, {} as never, {} as never, {} as never);
     expect(emptyRendered?.render(80)).toEqual(["error UNKNOWN"]);
     emptyRendered?.invalidate();
-    const timeoutRendered = tool.renderResult?.({ content: [], details: { ...result.details, outcome: "timeout", matched: false, reason: "timeout" }, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(timeoutRendered?.render(80)).toEqual(['timeout · one → contains "matched"']);
-    timeoutRendered?.invalidate();
-    const managerRendered = tool.renderResult?.({ content: [], details: { ...result.details, outcome: "manager_judgment_required", matched: false, reason: "manager_judgment_required" }, isError: false } as never, {} as never, {} as never, {} as never);
-    expect(managerRendered?.render(80)).toEqual(['error MANAGER_JUDGMENT_REQUIRED · one → contains "matched"']);
-    managerRendered?.invalidate();
   });
 
   it("returns the final authoritative timeout branch when the deadline is observed before sleeping", async () => {
     const cli = fakeCli({ p1: "not done" });
     let nowCalls = 0;
     const final = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 1 }, { clock: { now: () => nowCalls++ === 0 ? 0 : 2, sleep: async () => undefined } });
-    expect(final.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(final).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("does not accept a read that completes after the deadline", async () => {
@@ -375,13 +367,13 @@ describe("herdr_wait", () => {
       async runText() { return ""; }
     };
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: { now: () => now, sleep: async () => undefined } });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("rejects a match if the deadline passes while evaluating the read", async () => {
     let calls = 0;
     const result = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: { now: () => ++calls === 4 ? 2 : 0, sleep: async () => undefined } });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("returns a timeout when a polling read finishes after the deadline", async () => {
@@ -398,13 +390,13 @@ describe("herdr_wait", () => {
       async runText() { return ""; }
     };
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: { now: () => now, sleep: async () => undefined } });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("checks the deadline before starting another poll", async () => {
     let calls = 0;
     const result = await execute(fakeCli({ p1: "not yet" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 1 }, { clock: { now: () => ++calls > 4 ? 2 : 0, sleep: async () => undefined } });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
   });
 
   it("covers deadline final reads and polling continuation", async () => {
@@ -413,12 +405,12 @@ describe("herdr_wait", () => {
     let paneReads = 0;
     const finalCli: WaitCli = { async runJson(argv) { if (argv[0] === "pane" && argv[1] === "current") return currentPane(); if (argv[0] === "api") return { id: "snapshot", result: snapshot }; paneReads += 1; return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: paneReads > 1 ? "idle" : "working" } } }; }, async runText() { return ""; } };
     const finalMatch = await execute(finalCli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: deadlineClock });
-    expect(finalMatch.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(finalMatch).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
     let finalNow = 0;
     const finalTimeout = await execute(fakeCli({ p1: "not done" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 1 }, { clock: { now: () => finalNow, sleep: async () => { finalNow = 2; } } });
-    expect(finalTimeout.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
+    expect(finalTimeout).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
     const noMatch = await execute(fakeCli({ p1: "not done" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 2 }, { clock: clock(), pollIntervalMs: 1 });
-    expect(noMatch.details).toMatchObject({ outcome: "timeout", reason: "timeout" });
+    expect(noMatch).toMatchObject({ outcome: "timeout", reason: "timeout" });
   });
 
   it("exercises the real abortable clock seam", async () => {
@@ -484,7 +476,7 @@ describe("herdr_wait", () => {
     };
     await expect(execute(aborted, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "ABORTED" });
     const throwingSettings = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() });
-    expect(throwingSettings.details.outcome).toBe("success");
+    expect(throwingSettings.outcome).toBe("success");
   });
 
   it("cannot finish after cancellation while a reviewer is pending", async () => {
@@ -495,8 +487,9 @@ describe("herdr_wait", () => {
       signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { code: "ABORTED" })), { once: true });
       controller.abort();
     }) };
-    const tool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
-    await expect(tool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 } as never, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+    const deps = { cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: new JobRegistry(), clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer } as Parameters<typeof prepareWait>[0];
+    const prepared = await prepareWait(deps, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, new AbortController().signal);
+    await expect(runPreparedWait(deps, prepared, controller.signal, () => undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
     expect(entered).toBe(true);
   });
 
@@ -504,10 +497,9 @@ describe("herdr_wait", () => {
     const cli = fakeCli({ p1: "actual output" });
     cli.runTextResult = async () => ({ value: "actual output\n[output truncated]", truncated: true });
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "[output truncated]" } }, timeoutMs: 1 }, { clock: clock(), pollIntervalMs: 1 });
-    expect(result.details).toMatchObject({
+    expect(result).toMatchObject({
       outcome: "success",
       matched: true,
-      reason: "condition_met",
       targets: [{ recentUnwrappedLines: ["actual output", "[output truncated]"], outputTruncated: true, matched: true }]
     });
   });
@@ -517,20 +509,23 @@ describe("herdr_wait", () => {
     cli.runText = async () => "actual output\n[output truncated]";
     cli.runTextResult = async () => ({ value: "actual output", truncated: true });
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "[output truncated]" } }, timeoutMs: 1 }, { clock: clock(), pollIntervalMs: 1 });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout", targets: [{ recentUnwrappedLines: ["actual output"], outputTruncated: true }] });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout", targets: [{ recentUnwrappedLines: ["actual output"], outputTruncated: true }] });
   });
 
   it("returns timeout snapshots and keeps abort distinct from timeout", async () => {
     const result = await execute(fakeCli({ p1: "no match" }), { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 1 }, { clock: clock(), pollIntervalMs: 1 });
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout", targets: [{ targetId: "p1", matched: false }] });
+    expect(result).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout", targets: [{ targetId: "p1", matched: false }] });
     const controller = new AbortController();
     const pending: WaitClock = { now: () => 0, sleep: async (_ms, signal) => { signal.addEventListener("abort", () => undefined); controller.abort(); throw Object.assign(new Error("cancel"), { code: "ABORTED" }); } };
-    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, clock: pending });
-    await expect(tool.execute("id", { targets: ["p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 } as never, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+    const registry = new JobRegistry({ idFactory: () => "job_abort" });
+    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: registry, clock: pending });
+    const started = await tool.execute("id", { targets: ["p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 } as never, controller.signal, undefined, extensionContext);
+    expect(started.details).toMatchObject({ outcome: "background", jobId: "job_abort" });
+    await vi.waitFor(() => expect(registry.get("job_abort")).toMatchObject({ status: "failed", error: { code: "ABORTED" } }));
   });
 
   it("derives bounded effective labels from resolved targets and conditions", async () => {
-    const state = await prepareWait({ cli: fakeCli(), context, settingsLoader: async () => settings }, { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "completed" }, timeoutMs: 1 }, new AbortController().signal);
+    const state = await prepareWait({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: new JobRegistry() }, { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "completed" }, timeoutMs: 1 }, new AbortController().signal);
     expect(state.label).toBe("one +1 → completed");
     expect(deriveWaitLabel({ ...state.params, label: undefined, condition: { kind: "output", match: { kind: "literal", value: "done\nnow" } } }, state.resolved)).toBe('one +1 → contains "done now"');
     expect(deriveWaitLabel({ ...state.params, label: undefined, condition: { kind: "output", match: { kind: "regex", value: "done.*" } } }, state.resolved)).toBe("one +1 → matches /done.*/");
@@ -544,22 +539,22 @@ describe("herdr_wait", () => {
   });
 
   it("uses the default settings loader during direct preflight", async () => {
-    const prepared = await prepareWait({ cli: fakeCli(), context }, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, new AbortController().signal);
+    const prepared = await prepareWait({ cli: fakeCli(), context, jobRegistry: new JobRegistry() }, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, new AbortController().signal);
     expect(prepared.params.targets).toEqual(["p1"]);
     expect(prepared.settings.reviewerThinking).toBe("low");
   });
 
-  it("keeps an omitted wait at exactly the review cadence in the foreground", async () => {
+  it("detaches a wait at exactly the review cadence without reviewer supervision", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_exact_cadence" });
     const reviewerFactory = vi.fn(() => { throw new Error("exact-cadence waits must not start review supervision"); });
     const tool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock(), pollIntervalMs: 100_000, reviewerFactory });
-    const result = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } as never, new AbortController().signal, undefined, extensionContext);
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reason: "timeout" });
-    expect(registry.size()).toBe(0);
+    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } as never, new AbortController().signal, undefined, extensionContext);
+    expect(started.details).toMatchObject({ outcome: "background", jobId: "job_exact_cadence" });
+    await vi.waitFor(() => expect(registry.get("job_exact_cadence")).toMatchObject({ status: "completed", outcome: "timeout" }));
     expect(reviewerFactory).not.toHaveBeenCalled();
   });
 
-  it("automatically detaches omitted long waits while retaining the watcher model", async () => {
+  it("detaches long waits while retaining the watcher model", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_auto_background" });
     const reviewed: string[] = [];
     const tool = createWaitTool({
@@ -578,40 +573,17 @@ describe("herdr_wait", () => {
     expect(registry.get("job_auto_background")).toMatchObject({ status: "completed", outcome: "timeout", result: { reviewerSummaries: [{ targetId: "p1", classification: "progress" }] } });
   });
 
-  it("keeps an explicit synchronous long wait foreground with its watcher", async () => {
-    const registry = new JobRegistry({ idFactory: () => "job_sync_opt_out" });
-    const reviewed: string[] = [];
-    const tool = createWaitTool({
-      cli: fakeCli({ p1: "working" }),
-      context,
-      settingsLoader: async () => settings,
-      jobRegistry: registry,
-      clock: clock(),
-      pollIntervalMs: 100_000,
-      reviewerFactory: () => ({ review: async ({ targetId }) => { reviewed.push(targetId); return { targetId, classification: "progress", summary: "still progressing" }; } })
-    });
-    const result = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_001, runInBackground: false } as never, new AbortController().signal, undefined, extensionContext);
-    expect(result.details).toMatchObject({ outcome: "timeout", matched: false, reviewerSummaries: [{ targetId: "p1", classification: "progress" }] });
-    expect(reviewed).toEqual(["p1"]);
-    expect(registry.size()).toBe(0);
-  });
-
-  it("rejects background waits when the registry is unavailable", async () => {
-    const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings });
-    await expect(tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT", message: "INVALID_INPUT: background waits are unavailable in this runtime" });
-  });
-
   it("preflights background waits before creating an ID and rejects stale sessions", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_preflight" });
     const tool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
-    await expect(tool.execute("id", { targets: ["missing"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "TARGET_NOT_FOUND" });
+    await expect(tool.execute("id", { targets: ["missing"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10 } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "TARGET_NOT_FOUND" });
     expect(registry.size()).toBe(0);
     const staleGeneration = registry.captureGeneration();
     const staleTool = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => { registry.beginSession(); return settings; }, jobRegistry: registry });
-    await expect(staleTool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "SESSION_REPLACED" });
+    await expect(staleTool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10 } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "SESSION_REPLACED" });
     expect(registry.isCurrent(staleGeneration)).toBe(false);
     const invalid = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: registry });
-    await expect(invalid.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, snake_case: true, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(invalid.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, snake_case: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     expect(registry.size()).toBe(0);
   });
 
@@ -633,7 +605,7 @@ describe("herdr_wait", () => {
     const initiating = new AbortController();
     const updates = vi.fn(() => { throw new Error("initiating update used"); });
     const tool = createWaitTool({ cli, context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
-    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 100, runInBackground: true } as never, initiating.signal, updates, extensionContext);
+    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "done" } }, timeoutMs: 100 } as never, initiating.signal, updates, extensionContext);
     expect(started).toMatchObject({ content: [{ type: "text", text: "background wait started · one → contains \"done\" · job_background" }], details: { operation: "wait", outcome: "background", jobId: "job_background", label: "one → contains \"done\"", targets: ["p1"], targetIds: ["p1"] } });
     const backgroundRendered = tool.renderResult?.(started as never, { expanded: false, isPartial: false }, {} as never, {} as never);
     expect(backgroundRendered?.render(80)).toEqual(["background · job_background · one → contains \"done\""]);
@@ -653,7 +625,7 @@ describe("herdr_wait", () => {
   ] as const)("maps background %s outcomes", async (_name, output, condition, expected) => {
     const registry = new JobRegistry({ idFactory: () => `job_${expected}` });
     const tool = createWaitTool({ cli: fakeCli({ p1: output }), context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock(), pollIntervalMs: 1 });
-    await tool.execute("id", { targets: ["p1"], match: "any", condition, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    await tool.execute("id", { targets: ["p1"], match: "any", condition, timeoutMs: 1 } as never, new AbortController().signal, undefined, extensionContext);
     for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     expect(registry.get(`job_${expected}`)).toMatchObject({ status: "completed", outcome: expected });
   });
@@ -669,7 +641,7 @@ describe("herdr_wait", () => {
       async runText() { return ""; }
     };
     const tool = createWaitTool({ cli: malformedCli, context, settingsLoader: async () => settings, jobRegistry: registry, clock: clock() });
-    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, new AbortController().signal, undefined, extensionContext);
     expect(started.details).toMatchObject({ outcome: "background", jobId: "job_runner_failure" });
     for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     expect(registry.get("job_runner_failure")).toMatchObject({ status: "failed", error: { code: "CLI_PROTOCOL_ERROR" } });
@@ -697,12 +669,12 @@ describe("herdr_wait", () => {
     const failureRegistry = new JobRegistry({ idFactory: () => "job_failure_bg" });
     const failing: WaitReviewer = { review: async () => { throw new Error("review down"); } };
     const failingTool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: failureRegistry, clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => failing });
-    await failingTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    await failingTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 } as never, new AbortController().signal, undefined, extensionContext);
     for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     expect(failureRegistry.get("job_failure_bg")).toMatchObject({ status: "failed", error: { code: "REVIEWER_FAILED" } });
     const managerRegistry = new JobRegistry({ idFactory: () => "job_manager_bg" });
     const managerTool = createWaitTool({ cli: fakeCli({ p1: "working" }), context, settingsLoader: async () => settings, jobRegistry: managerRegistry, clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => ({ review: async ({ targetId }) => ({ targetId, classification: "blocked", summary: "manual" }) }) });
-    await managerTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001, runInBackground: true } as never, new AbortController().signal, undefined, extensionContext);
+    await managerTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 } as never, new AbortController().signal, undefined, extensionContext);
     for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     expect(managerRegistry.get("job_manager_bg")).toMatchObject({ status: "completed", outcome: "manager_judgment_required" });
   });

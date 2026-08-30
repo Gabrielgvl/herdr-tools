@@ -43,7 +43,7 @@ Startup is fail-closed and ordered: `HERDR_ENV=1`; injected `HERDR_WORKSPACE_ID`
 
 Detached waits keep the in-memory job registry and are polled through `herdr_jobs`. The MCP host installs no terminal notification, no wait-job UI, no steering, and no turn injection, so the adapter never communicates with its own session. Ownership stays memory-only and scoped to the MCP process; shutdown marks jobs `shutdown` and resets the ledger without closing any Herdr resource.
 
-Model-backed wait review remains a Pi capability. The MCP host injects a `reviewerFactory` that throws, so a wait whose timeout exceeds the configured review cadence fails closed with `REVIEWER_FAILED` in both foreground and detached form. The existing 1..30 minute `wait.reviewCadenceMinutes` setting is the only supervision knob; no unsupervised long wait is allowed.
+Model-backed wait review remains a Pi capability. The MCP host injects a `reviewerFactory` that throws, so a detached wait job whose timeout exceeds the configured review cadence fails closed with `REVIEWER_FAILED`. The existing 1..30 minute `wait.reviewCadenceMinutes` setting is the only supervision knob; no unsupervised long wait is allowed. ADR-018 defines the detached-only wait API.
 
 `@modelcontextprotocol/sdk` is the only new runtime dependency. The stdio entry lives at `src/mcp-server.ts` so typecheck, lint, and emit all cover it, and is compiled by `tsconfig.build.json` to `dist/src/mcp-server.js` because it runs under plain `node` without Pi's TypeScript loader. It carries no logic beyond an argument-free call into the run module, so it is the single `coverage.exclude` entry and is verified by the disposable-session integration run instead. No untyped root shim is introduced.
 

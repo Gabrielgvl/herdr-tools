@@ -16,6 +16,7 @@ runtime:
     - herdr_launch
     - herdr_communicate
     - herdr_wait
+    - herdr_jobs
     - herdr_pane
     - herdr_tab
   extensions: []

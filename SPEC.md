@@ -208,8 +208,7 @@ Abort before key dispatch is `ABORTED`. After dispatch, the dispatch evidence is
     { kind: "state", state: AgentState | SemanticState }
     | { kind: "output", match: { kind: "literal" | "regex", value: string } },
   timeoutMs: integer,          // required, 1 through 3,600,000 inclusive
-  label?: string,              // optional single-line display label
-  runInBackground?: boolean    // optional; omitted auto-detaches long waits
+  label?: string               // optional single-line display label
 }
 ```
 
@@ -220,8 +219,8 @@ Rules:
 - Raw states are `idle`, `working`, `blocked`, `done`, and `unknown`.
 - Semantic `started` matches `working`; `completed` matches `idle` or `done`; `needs_input` matches `blocked`.
 - Output conditions search the target's recent unwrapped output through the installed CLI. Literal and regex are mutually exclusive. Invalid regex syntax is a structured input failure. Existing output is eligible, so a condition already satisfied completes immediately.
-- A timeout is not an exception. It returns structured `matched: false`, `reason: "timeout"`, and final authoritative snapshots for every target. It never returns an unbounded wait or silently changes the requested timeout.
-- A caller abort is distinct from a timeout and ends the operation with `ABORTED`.
+- A timeout is not an exception. The registered job records structured `matched: false`, `reason: "timeout"`, and final authoritative snapshots for every target. It never returns an unbounded wait or silently changes the requested timeout.
+- An abort during validation or target/context preflight is distinct from a timeout and ends the tool call with `ABORTED`. Once registration succeeds, the initiating signal is no longer used; inspect or cancel the job through `herdr_jobs`.
 
 #### Long-wait review supervision
 
@@ -235,15 +234,15 @@ Long waits use mandatory in-process, tool-less reviewer calls:
 - Reviewer calls are not Herdr panes, are invisible in Herdr topology, receive no tools, and cannot mutate or communicate.
 - Each reviewer receives only bounded transcript deltas since the previous review plus compact authoritative metadata. The bounded transcript input is at most the same 100 recent unwrapped lines used by single-target inspection; unchanged lines must not be resent when a smaller delta is available.
 - A reviewer may summarize/classify only `progress`, `stalled`, `blocked`, `risk`, `completed`, or `unknown` and may provide a bounded summary.
-- A reviewer result that says manager judgment is required ends the wait early with `matched: false`, `reason: "manager_judgment_required"`, final snapshots, and reviewer summaries.
-- Reviewer/model failure ends the wait immediately with `REVIEWER_FAILED`; there is no fallback model, pane, or silent continuation.
-- Reviewer summaries appear in streamed progress and final tool details. The reviewer never changes the authoritative wait condition: only Herdr state/output can satisfy it.
+- A reviewer result that says manager judgment is required ends the job early with `matched: false`, `reason: "manager_judgment_required"`, final snapshots, and reviewer summaries.
+- Reviewer/model failure ends the job immediately with `REVIEWER_FAILED`; there is no fallback model, pane, or silent continuation.
+- Reviewer summaries appear in detached job progress and final `herdr_jobs` details. The reviewer never changes the authoritative wait condition: only Herdr state/output can satisfy it.
 
 ### Detached wait jobs and `herdr_jobs`
 
-`herdr_wait` accepts an optional camelCase `runInBackground` boolean. Its schema is strict: `true` explicitly detaches, `false` explicitly retains blocking behavior, and an omitted value automatically detaches waits whose timeout exceeds the configured review cadence. Snake_case and unknown fields are rejected. Background mode performs parameter validation, extension-owned settings loading, one authoritative snapshot read, exact target resolution, and duplicate resolved-resource rejection before registering anything. These preflight steps use the initiating tool signal and throw directly on failure without creating a job.
+`herdr_wait` has no execution-mode field. Its schema is strict: `runInBackground: true`, `runInBackground: false`, snake_case, and every other unknown field are rejected. Every call performs parameter validation, extension-owned settings loading, one authoritative snapshot read, exact target resolution, and duplicate resolved-resource rejection before registering anything. These preflight steps use the initiating tool signal and throw directly on failure without creating a job.
 
-After preflight, the extension registers a stable opaque `job_${randomUUID()}` identifier and runs the same prepared wait engine used by foreground waits under a fresh per-job `AbortController`. Automatically detached long waits retain the mandatory in-process watcher model, and its terminal notification wakes the initiating Pi agent through the normal steer queue. The prepared params, settings, and resolved IDs are copied at registration. Timeout starts after preflight. The initiating signal and call-scoped update callback are never used by post-registration work. A session generation/token check prevents stale preflight from registering into a replacement session.
+After preflight, the extension always registers a stable opaque `job_${randomUUID()}` identifier and runs the prepared wait engine under a fresh per-job `AbortController`. The mandatory in-process watcher model applies to long waits, and terminal notifications wake the initiating Pi agent through the normal steer queue. The prepared params, settings, and resolved IDs are copied at registration. Timeout starts after registration. The initiating signal, call-scoped update callback, and synchronous result path are never used by post-registration work. A session generation/token check prevents stale preflight from registering into a replacement session. The tool returns the job acknowledgement immediately; completion, timeout, reviewer failure, and manager judgment are read through `herdr_jobs`.
 
 The in-memory, session-wide registry has no concurrency cap and retains terminal jobs until shutdown. Generic job status is `running`, `completed`, `failed`, or `cancelled`; wait outcome is separately `success`, `timeout`, or `manager_judgment_required`. Only latest bounded progress is stored. Terminal transitions are first-wins. `herdr_jobs` is the sole public registry view and is strict:
 
@@ -257,7 +256,7 @@ All model-visible content, list summaries, completion notifications, and rendere
 
 #### Active wait visibility
 
-`label` is valid for both foreground and detached waits. A supplied label is a bounded non-empty printable single-line value. When omitted, preflight derives one bounded effective label from resolved target names plus the requested state/output condition (for example, `worker-pi +2 → completed`). A supplied foreground label appears in both call and result rows. An omitted label cannot be derived until asynchronous target preflight finishes, so it appears in the result row but not the already-rendered call row. Detached jobs store the effective label in request details and list summaries, so `herdr_jobs` and the TUI expose the same identity unless an aggregate projection explicitly marks the label truncated; duplicate labels are allowed because exact actions continue to use `jobId`.
+`label` is valid for every detached wait. A supplied label is a bounded non-empty printable single-line value. When omitted, preflight derives one bounded effective label from resolved target names plus the requested state/output condition (for example, `worker-pi +2 → completed`). A supplied label appears in the call row and detached acknowledgement. An omitted label cannot be derived until asynchronous target preflight finishes, so it appears in the acknowledgement rather than the already-rendered call row. Detached jobs store the effective label in request details and list summaries, so `herdr_jobs` and the TUI expose the same identity unless an aggregate projection explicitly marks the label truncated; duplicate labels are allowed because exact actions continue to use `jobId`.
 
 While detached jobs are running, the extension owns one session-scoped Pi footer status. It renders an animated spinner, the exact active count, the elapsed time of the oldest active job, and the `/herdr-waits` hint, refreshing once per second. The timer starts only when an active job exists and stops immediately when none remain. Status/UI failures never alter registry state.
 
@@ -470,7 +469,7 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `CANCEL_UNCONFIRMED`: one Escape was dispatched but cancel was not proven; target disappearance is never cancel success.
 - `INTERRUPT_UNCONFIRMED`: one Ctrl-C was dispatched but same-agent termination or the strict agent-exited proof was not established.
 
-`herdr_wait` timeout is a normal structured result with `matched: false`, not `CLI_TIMEOUT`. No error path may substitute a guessed ID, focused pane, fallback model, generic success, or automatic cleanup.
+A detached `herdr_wait` timeout is a normal structured job result with `matched: false`, not `CLI_TIMEOUT`. No error path may substitute a guessed ID, focused pane, fallback model, generic success, or automatic cleanup.
 
 ## Security and safety boundaries
 
@@ -496,7 +495,7 @@ Each tool has a compact custom call/result row using Pi's extension renderer API
 - Call rows show the tool name, operation, and resolved human-readable target label/name when known.
 - Result rows show a short status such as inspected, sent, waiting, launched, updated, or closed, plus IDs/statuses needed for the next action.
 - `working`, `blocked`, `idle`/`done`, timeout, reviewer failure, protected, reconciled, and uncertain states use distinct semantic styling.
-- `herdr_wait` and `herdr_launch` stream bounded progress through `onUpdate`. Wait progress includes target state changes and reviewer summaries; launch progress includes placement, readiness, explicit focus when requested, and prompt verification.
+- `herdr_launch` streams bounded progress through `onUpdate` for placement, readiness, explicit focus when requested, and prompt verification. `herdr_wait` stores bounded target-state and reviewer progress on the detached job for `herdr_jobs` inspection instead of using the initiating update callback.
 - Default output never prints full transcripts, environment values, raw CLI JSON, or reviewer prompts. Expanded details may show the fixed bounded transcript and structured metadata.
 - Errors render their stable code and concise reason. They do not look like successful operations.
 - TUI-specific rendering is guarded by Pi mode capabilities; RPC receives structured results, and close operations never require interactive UI confirmation.

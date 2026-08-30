@@ -125,12 +125,16 @@ describe("shared tool surface", () => {
 
   it("forwards an injected reviewer factory and otherwise keeps the Pi model reviewer", async () => {
     const reviewerFactory = vi.fn(() => { throw Object.assign(new Error("no reviewer"), { code: "REVIEWER_FAILED" }); });
-    const longWait = { targets: ["w:p2"], match: "any" as const, condition: { kind: "state" as const, state: "blocked" as const }, timeoutMs: 120_000, runInBackground: false };
+    const longWait = { targets: ["w:p2"], match: "any" as const, condition: { kind: "state" as const, state: "blocked" as const }, timeoutMs: 120_000 };
     const injected = surfaceFor({ reviewerFactory });
-    await expect(injected.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
+    const injectedStarted = await injected.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext);
+    expect(injectedStarted.details).toMatchObject({ outcome: "background" });
+    await vi.waitFor(() => expect(injected.deps.jobs.list("failed").total).toBe(1));
     expect(reviewerFactory).toHaveBeenCalledTimes(1);
     const piHost = surfaceFor();
-    await expect(piHost.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
+    const piStarted = await piHost.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext);
+    expect(piStarted.details).toMatchObject({ outcome: "background" });
+    await vi.waitFor(() => expect(piHost.deps.jobs.list("failed").total).toBe(1));
   });
 
   it("keeps the shared per-call compatibility preflight and injected context reader", async () => {

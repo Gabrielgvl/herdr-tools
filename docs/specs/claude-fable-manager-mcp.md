@@ -17,7 +17,7 @@ The manager is a normal interactive Claude session in a Herdr pane, not a native
 - Pi and Claude hosts execute one shared tool implementation and one shared profile resolver/catalog. Policy, schemas, bounds, and provenance exist once.
 - `@modelcontextprotocol/sdk` is the only planned new runtime dependency.
 - Fail-closed health/context gating, in-memory ownership, exact targeting, bounded results, durable prompt sources, and mandatory v1 sender provenance are preserved unchanged.
-- Claude detached waits are polled through `herdr_jobs`. The adapter performs no self-communication and no automatic turn injection.
+- All Claude waits are detached and polled through `herdr_jobs`. The adapter performs no self-communication and no automatic turn injection.
 - Profile discovery behavior is unchanged for this slice. The MCP runtime uses the manager session's authoritative project directory, never a plugin installation directory and never a directory derived from the module path. The `manager-claude` profile and the interactive plugin use the same manager plugin and shared skill.
 - The manager plugin is self-contained under `herdr-profiles/role-plugins/manager/`: stable `herdr-tools` manifest and `herdr` server identity, the local MCP registration, and the shared manager skill. The `manager-claude` profile keeps `default` permission mode, pre-approves only its core/research/Herdr namespace, disallows only `Task`, and leaves Bash/Edit/Write owner-gated.
 - Primary model selection stays a launch/user configuration concern: the manager is started with `--model claude-fable-5` or switched with `/model fable`. The skill reports a mismatch and stops; it never claims enforcement.
@@ -31,7 +31,7 @@ This slice is the Claude-to-Herdr control bridge and the manager plugin consolid
 - ADR-006 and ADR-008 stay authoritative for profiles: `herdr-tools` owns the catalog, launch is profile-only with typed overrides and bounded fallback, and prompt sources are prepared before topology mutation. The adapter adds no launch input and removes none.
 - ADR-005 stays authoritative: every prompt, steer, and assignment keeps the mandatory `[HERDR AGENT MESSAGE v1]` envelope with a sender resolved from the authoritative snapshot.
 - ADR-007 (role-scoped capabilities) and ADR-010 retain their historical rationale for the original release. ADR-011 supersedes only their narrow rejection of a `manager-claude` profile and separate manager package: parity is now provided by the shared manager plugin, while delegated Claude workers still do not receive Herdr lifecycle tools.
-- ADR-002 stays authoritative for detached waits. The MCP host keeps the in-memory job registry and drops only the Pi-specific notification and TUI surfaces.
+- ADR-018 supersedes ADR-012 for the detached-only wait API. The MCP host keeps the in-memory job registry and drops only the Pi-specific notification and TUI surfaces.
 
 ## Assumptions
 
@@ -43,7 +43,7 @@ This slice is the Claude-to-Herdr control bridge and the manager plugin consolid
 6. The shared tool modules can be imported in a plain Node process. They already import `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` for `truncateTail` and the compact renderers.
 7. MCP client tool timeouts and the primary model are launch/user configuration. The adapter does not read, set, or claim to enforce either.
 8. `config.json` stays the single shared settings file at `/home/gabriel/.pi/agent/extensions/herdr-tools/config.json` with its existing 1..30 minute `wait.reviewCadenceMinutes` and reviewer model fields.
-9. Model-backed wait review is a Pi host capability. The MCP host has no model registry, so a wait longer than the effective review cadence fails closed instead of running unsupervised.
+9. Model-backed wait review is a Pi host capability. The MCP host has no model registry, so a wait job longer than the effective review cadence fails closed instead of running unsupervised.
 
 ## Architecture
 
@@ -170,10 +170,9 @@ Any failure that escapes startup entirely is written by `src/mcp-server.ts` thro
 
 ### Wait and jobs semantics under Claude
 
-- `runInBackground: true` registers a detached job in the MCP process. Results are read with `herdr_jobs` `list`, `job`, and `cancel`. There is no `sendMessage`, no steer, no `triggerTurn`, and no self-communication path.
-- Foreground waits run to their `timeoutMs` inside one tool call and are subject to the MCP client's tool timeout, which is user configuration.
-- Model-backed review needs a model registry the MCP host does not have. The adapter injects a `reviewerFactory` that throws `ReviewerFailure`, which the shared code maps to `REVIEWER_FAILED`. A wait therefore fails closed as soon as `timeoutMs` exceeds `reviewCadenceMinutes * 60000`, foreground or detached.
-- The supported manager pattern is bounded waits at or below the configured cadence, repeated as needed, or detached jobs polled with `herdr_jobs`. The owner may raise `wait.reviewCadenceMinutes` up to 30 in `config.json`; that is the existing supervision knob, not a new one.
+- Every `herdr_wait` call validates and preflights its exact targets/context, registers a detached job in the MCP process, and returns immediately. Results are read with `herdr_jobs` `list`, `get`, and `cancel`. There is no synchronous result, `sendMessage`, steer, `triggerTurn`, or self-communication path.
+- Model-backed review needs a model registry the MCP host does not have. The adapter injects a `reviewerFactory` that throws `ReviewerFailure`, which the shared code maps to `REVIEWER_FAILED` in the registered job when `timeoutMs` exceeds `reviewCadenceMinutes * 60000`.
+- The supported manager pattern is detached jobs polled with `herdr_jobs`. The owner may raise `wait.reviewCadenceMinutes` up to 30 in `config.json`; that is the existing supervision knob, not a new one.
 
 ### Claude package
 
@@ -308,7 +307,7 @@ No compatibility aliases, no reshaped tool names, no per-host schema variants, a
 - Effective caller context: live `pane current --current` plus snapshot verification rebinds same-workspace and cross-workspace moves, accepts coherent unchanged reads, retries one concurrent topology race, and rejects unresolved, duplicate, incoherent, replacement, malformed, and protocol evidence.
 - Gating: missing/incorrect `HERDR_ENV`, missing or malformed injected IDs, and missing/relative/nonexistent `CLAUDE_PROJECT_DIR` each exit non-zero with no transport connect, no tool registration, and no CLI invocation.
 - Cwd rules: the resolved operational `cwd` equals `CLAUDE_PROJECT_DIR` for launch, pane, and tab argv; `process.cwd()` is never consulted.
-- Wait host limits: a wait beyond the effective cadence fails with `REVIEWER_FAILED` in both foreground and detached form; a wait within cadence needs no reviewer; detached registration returns a job id retrievable through `herdr_jobs`.
+- Wait host limits: every wait returns a job ID retrievable through `herdr_jobs`; a job beyond the effective cadence fails with `REVIEWER_FAILED`, while a wait within cadence needs no reviewer.
 - Lifecycle: shutdown marks jobs `shutdown`, resets ownership, closes no Herdr resource, and exits 0; no notification, steer, or turn-injection call path exists in the MCP host.
 - Coverage thresholds stay at 100% statements, branches, functions, and lines for the included sources, with `src/mcp-server.ts` the only `coverage.exclude` entry.
 
@@ -465,7 +464,7 @@ Independently re-verified here: no global installation and no configuration writ
 - [x] Startup refuses to serve without `HERDR_ENV=1`, valid injected IDs, and a valid absolute existing `CLAUDE_PROJECT_DIR`, and never falls back to subprocess or module paths.
 - [x] Profile discovery, prompt sources, bounded fallback, ownership, and v1 provenance behave identically across hosts.
 - [x] Detached waits are created and polled through `herdr_jobs`, with no self-communication and no automatic turn injection.
-- [x] Waits beyond the effective review cadence fail closed with a typed reviewer error in both foreground and detached form.
+- [x] Every wait is detached and polled through `herdr_jobs`; jobs beyond the effective review cadence fail closed with a typed reviewer error.
 - [x] The manager plugin adds only packaging, the shared manager skill, and the MCP registration; the `manager-claude` profile owns explicit runtime policy, model selection remains launch/user configuration, and mismatch is reported rather than enforced.
 - [x] The package loads from this repository with `--plugin-dir` and its tools resolve as `mcp__plugin_herdr-tools_herdr__*`; marketplace publication is documented as blocked rather than half-supported. The dogfood run called all seven published names from a live session, confirming the naming derived from the `plugin:herdr-tools:herdr` server id.
 - [x] Unit coverage stays at 100% for included sources with `src/mcp-server.ts` the only exclusion; the entry is typechecked, linted, built, and exercised by integration.
@@ -489,7 +488,7 @@ Stop and report instead of improvising when:
 
 1. Wait supervision on the MCP host. A wait longer than `wait.reviewCadenceMinutes` fails closed because there is no model registry. The owner decides between raising the cadence to at most 30 minutes, repeated bounded waits, or authorizing a headless reviewer in a later slice.
 2. ~~Whether `CLAUDE_PROJECT_DIR` arrives in the MCP subprocess environment by default or needs an explicit expansion entry in the server map.~~ Resolved in Phase 4: it arrives by default, documented and observed, so no entry is carried.
-3. Whether the MCP client tool timeout in the manager session is long enough for the intended bounded foreground waits, or whether the manager should use detached jobs exclusively. This stays launch/user configuration either way.
+3. Whether MCP clients should add richer job polling helpers around the existing `herdr_jobs` API. The wait tool itself remains detached-only; no client timeout is needed for wait execution after registration.
 4. Whether `structuredContent` with a published `outputSchema` is worth adding once the details shapes are stable; the union-heavy shapes make a schema a duplication risk today.
 5. Whether the manager session should later get a Herdr-visible identity distinct from its pane label for provenance display, which is a Herdr core concern rather than an adapter concern.
 6. Whether the package should later become self-contained for marketplace installation. That needs a bundled server build and its own dependency copy inside the package, because a cached marketplace install loses the parent repository that `${CLAUDE_PLUGIN_ROOT}/..` resolves to. This slice stays local-only.

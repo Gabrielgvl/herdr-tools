@@ -62,10 +62,13 @@ const snapshot = {
     // Pane records carry owner-supplied environment values; no model-visible
     // block this host publishes may echo one.
     panes: [
-      { pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "manager", agent_name: "manager", agent_status: "idle", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] },
-      { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent_status: "working", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] }
+      { pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "manager", agent_name: "manager", agent: "pi", terminal_id: "term-manager", agent_session: { source: "pi", agent: "pi", kind: "id", value: "manager-session" }, agent_status: "idle", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] },
+      { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent: "pi", terminal_id: "term-worker", agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" }, agent_status: "working", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] }
     ],
-    agents: [{ pane_id: "w:p", name: "manager", agent_status: "idle" }, { pane_id: "w:p2", name: "worker", agent_status: "working" }]
+    agents: [
+      { pane_id: "w:p", name: "manager", agent: "pi", terminal_id: "term-manager", agent_session: { source: "pi", agent: "pi", kind: "id", value: "manager-session" }, agent_status: "idle" },
+      { pane_id: "w:p2", name: "worker", agent: "pi", terminal_id: "term-worker", agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" }, agent_status: "working" }
+    ]
   }
 };
 
@@ -82,11 +85,13 @@ function fakeExec(): { exec: PiExec; calls: string[][] } {
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: live.snapshot.panes[0] });
     if (argv[0] === "api") return envelope("snapshot", live);
+    if (argv[0] === "agent" && argv[1] === "wait") return envelope("agent-wait", { agent: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
+    if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
     if (argv[0] === "pane" && argv[1] === "get") return envelope("pane", { pane: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: "worker output", stderr: "", code: 0, killed: false };
     if (argv[0] === "tab" && argv[1] === "create") {
       live.snapshot.tabs.push({ tab_id: "w:t2", workspace_id: "w", label: argv[argv.indexOf("--label") + 1]! });
-      live.snapshot.panes.push({ pane_id: "w:p9", tab_id: "w:t2", workspace_id: "w", label: "root", agent_name: "root", agent_status: "idle", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] });
+      live.snapshot.panes.push({ pane_id: "w:p9", tab_id: "w:t2", workspace_id: "w", label: "root", agent_name: "root", agent: "pi", terminal_id: "term-root", agent_session: { source: "pi", agent: "pi", kind: "id", value: "root-session" }, agent_status: "idle", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] });
       return envelope("create", { tab: { tab_id: "w:t2" }, root_pane: { pane_id: "w:p9" } });
     }
     if (argv[0] === "tab" && argv[1] === "get") return envelope("get", { tab: live.snapshot.tabs.find((tab) => tab.tab_id === argv[2]) });
@@ -258,7 +263,7 @@ describe("MCP server startup", () => {
     const beyondDefaultCadence = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 600_000 } });
     expect(beyondDefaultCadence.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(beyondDefaultCadence).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ status: "failed", error: { code: "REVIEWER_FAILED" } }));
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED" } }));
     expect(readFileMock).toHaveBeenCalled();
     await harness.handle.shutdown();
   });
@@ -317,7 +322,7 @@ describe("MCP tool serving", () => {
     ];
     const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
     const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.status).toBe("completed"));
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.operation_phase).toBe("settled"));
     results.push(detached, await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "get", jobId } }));
     for (const result of results) {
       expect(result.isError, textOf(result)).toBeUndefined();
@@ -380,7 +385,7 @@ describe("MCP tool serving", () => {
     expect(result.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(result).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
     controller.abort(new Error("manager cancelled"));
-    expect(harness.handle.jobs.get(jobId)?.status).toBe("running");
+    expect(harness.handle.jobs.get(jobId)?.operation_phase).not.toBe("settled");
     await harness.handle.shutdown();
   });
 });
@@ -391,7 +396,7 @@ describe("MCP wait and job semantics", () => {
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ status: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("model-backed wait review is unavailable on the MCP host") } }));
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("model-backed wait review is unavailable on the MCP host") } }));
     await harness.handle.shutdown();
   });
 
@@ -403,8 +408,7 @@ describe("MCP wait and job semantics", () => {
     expect(jobId.startsWith("job_")).toBe(true);
     const listed = await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "list" } });
     expect(textOf(listed)).toContain(jobId);
-    await harness.handle.jobs.get(jobId)?.status;
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.status).toBe("failed"));
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.wait_result).toBe("failed"));
     const job = await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "get", jobId } });
     expect(textOf(job)).toContain("REVIEWER_FAILED");
     const cancelled = await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "cancel", jobId: "job_missing" } });
@@ -418,7 +422,7 @@ describe("MCP wait and job semantics", () => {
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ status: "completed", outcome: "success" }));
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "condition_met" }));
     await harness.handle.shutdown();
   });
 });

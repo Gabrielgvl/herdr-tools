@@ -23,9 +23,20 @@ describe("compact tool rows", () => {
   it("renders detached, partial, and error states truthfully", () => {
     expect(resultForRender("launch", { details: { outcome: "partial" } }, {}, "p1")).toEqual({ text: "partial · p1", tone: "warning" });
     expect(resultForRender("launch", { details: { outcome: "partial" } })).toEqual({ text: "partial", tone: "warning" });
-    expect(resultForRender("wait", { details: { outcome: "background" } })).toEqual({ text: "background", tone: "success" });
-    expect(resultForRender("wait", { details: { outcome: "background", jobId: "job_1" } })).toEqual({ text: "background · job_1", tone: "success" });
-    expect(resultForRender("wait", { details: { outcome: "background" } }, { isPartial: true })).toEqual({ text: "partial · wait", tone: "warning" });
+    expect(resultForRender("wait", { details: { operation_phase: "accepted" } })).toEqual({ text: "accepted", tone: "muted" });
+    expect(resultForRender("wait", { details: { operation_phase: "accepted", jobId: "job_1" } })).toEqual({ text: "accepted · job_1", tone: "muted" });
+    expect(resultForRender("wait", { details: { operation_phase: "accepted" } }, { isPartial: true })).toEqual({ text: "partial · wait", tone: "warning" });
+    expect(resultForRender("wait", { details: { operation_phase: "running", jobId: "job_1" } })).toEqual({ text: "running · job_1", tone: "muted" });
+    expect(resultForRender("wait", { details: { operation_phase: "running" } })).toEqual({ text: "running", tone: "muted" });
+    expect(resultForRender("wait", { details: { operation_phase: "cancel_requested", jobId: "job_1" } })).toEqual({ text: "cancel_requested · job_1", tone: "warning" });
+    expect(resultForRender("wait", { details: { operation_phase: "cancel_requested" } }, {}, "p1")).toEqual({ text: "cancel_requested", tone: "warning" });
+    expect(resultForRender("wait", { details: { operation_phase: "settled", wait_result: "condition_met" } })).toEqual({ text: "settled · condition_met", tone: "muted" });
+    expect(resultForRender("wait", { details: { operation_phase: "settled", wait_result: "timed_out" } }, {}, "p1")).toEqual({ text: "settled · timed_out · p1", tone: "muted" });
+    expect(resultForRender("wait", { details: { operation_phase: "settled", wait_result: "failed" } })).toEqual({ text: "settled · failed", tone: "error" });
+    expect(resultForRender("wait", { details: { operation_phase: "settled", wait_result: "manager_judgment_required" } })).toEqual({ text: "settled · manager_judgment_required", tone: "warning" });
+    expect(resultForRender("wait", { details: { operation_phase: "settled", wait_result: "cancelled" } })).toEqual({ text: "settled · cancelled", tone: "warning" });
+    expect(resultForRender("wait", { details: { operation_phase: "settled", wait_result: "unknown" } })).toEqual({ text: "settled · unknown", tone: "warning" });
+    expect(resultForRender("wait", { details: { operation_phase: "settled" } })).toEqual({ text: "settled · unknown", tone: "warning" });
     expect(resultForRender("wait", {}, {})).toEqual({ text: "error UNKNOWN", tone: "error" });
     expect(resultForRender("wait", { isError: true, details: { code: "REVIEWER_FAILED" } })).toEqual({ text: "error REVIEWER_FAILED", tone: "error" });
     expect(resultForRender("communicate", { details: { outcome: "success", delivery: "attachment" } })).toEqual({ text: "sent · attachment", tone: "success" });

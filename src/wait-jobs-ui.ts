@@ -110,7 +110,7 @@ export class WaitJobsUi {
       return;
     }
     const visibleJobs = overview.total > overview.jobs.length ? overview.jobs.slice(0, MAX_WIDGET_LINES - 1) : overview.jobs;
-    const rows = visibleJobs.map((job) => `${job.label} · ${formatElapsed(now - job.startedAtMs!)} · ${job.jobId}`);
+    const rows = visibleJobs.map((job) => `${job.label} · ${formatElapsed(now - (job.startedAtMs ?? job.createdAtMs))} · ${job.jobId}`);
     if (overview.total > visibleJobs.length) rows.push(`… ${overview.total - visibleJobs.length} more active waits`);
     this.safeSetWidget(rows);
   }

@@ -172,6 +172,9 @@ function requestedAgentStartTimeout(argv: string[]): number {
 }
 
 export class HerdrCli {
+  /** Current Herdr exposes occupant-pinned `agent wait` for state predicates. */
+  readonly supportsNativeAgentWait = true;
+
   constructor(
     private readonly exec: PiExec,
     private readonly timeout = 10_000,

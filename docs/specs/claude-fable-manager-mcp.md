@@ -308,7 +308,7 @@ No compatibility aliases, no reshaped tool names, no per-host schema variants, a
 - Gating: missing/incorrect `HERDR_ENV`, missing or malformed injected IDs, and missing/relative/nonexistent `CLAUDE_PROJECT_DIR` each exit non-zero with no transport connect, no tool registration, and no CLI invocation.
 - Cwd rules: the resolved operational `cwd` equals `CLAUDE_PROJECT_DIR` for launch, pane, and tab argv; `process.cwd()` is never consulted.
 - Wait host limits: every wait returns a job ID retrievable through `herdr_jobs`; a job beyond the effective cadence fails with `REVIEWER_FAILED`, while a wait within cadence needs no reviewer.
-- Lifecycle: shutdown marks jobs `shutdown`, resets ownership, closes no Herdr resource, and exits 0; no notification, steer, or turn-injection call path exists in the MCP host.
+- Lifecycle: shutdown fences and aborts active jobs, discards the in-memory registry, resets ownership, closes no Herdr resource, and exits 0; no notification, steer, or turn-injection call path exists in the MCP host.
 - Coverage thresholds stay at 100% statements, branches, functions, and lines for the included sources, with `src/mcp-server.ts` the only `coverage.exclude` entry.
 
 ### Integration

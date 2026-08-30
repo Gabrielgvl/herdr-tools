@@ -1,15 +1,15 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import type { Static } from "typebox";
-import { JOB_STATUSES } from "./job-registry.js";
+import { OPERATION_PHASES } from "./job-registry.js";
 
 const JobId = Type.String({ minLength: 5, pattern: "^job_[^\\u0000\\r\\n]+$" });
-const Status = StringEnum(JOB_STATUSES);
+const OperationPhase = StringEnum(OPERATION_PHASES);
 
 export const JobsParamsSchema = Type.Union([
   Type.Object({
     operation: Type.Literal("list"),
-    status: Type.Optional(Status),
+    operation_phase: Type.Optional(OperationPhase),
     offset: Type.Optional(Type.Integer({ minimum: 0 })),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 }))
   }, { additionalProperties: false }),
@@ -39,8 +39,8 @@ function validJobId(value: unknown): value is string {
 export function validateJobsParams(value: unknown): JobsParams {
   const input = object(value);
   if (input.operation === "list") {
-    strictKeys(input, ["operation", "status", "offset", "limit"]);
-    if (input.status !== undefined && !(JOB_STATUSES as readonly string[]).includes(input.status as string)) invalid("INVALID_INPUT: status is invalid");
+    strictKeys(input, ["operation", "operation_phase", "offset", "limit"]);
+    if (input.operation_phase !== undefined && !(OPERATION_PHASES as readonly string[]).includes(input.operation_phase as string)) invalid("INVALID_INPUT: operation_phase is invalid");
     if (input.offset !== undefined && (!Number.isInteger(input.offset) || (input.offset as number) < 0)) invalid("INVALID_INPUT: offset must be a non-negative integer");
     if (input.limit !== undefined && (!Number.isInteger(input.limit) || (input.limit as number) < 1 || (input.limit as number) > 100)) invalid("INVALID_INPUT: limit must be an integer from 1 through 100");
     return input as JobsParams;

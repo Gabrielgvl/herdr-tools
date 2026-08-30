@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { boundedList, fitsPublic, JobRegistry, jobDetailContent, publicDetail, type JobDetail, type JobListResult, type JobRequestSnapshot, type JobRunResult } from "../../src/job-registry.js";
+import { boundedList, fitsPublic, JobRegistry, jobDetailContent, publicDetail, type JobDetail, type JobListResult, type JobRequestSnapshot, type JobRunResult, type JobOperationControl } from "../../src/job-registry.js";
+import { historicalTargetEvidence } from "../../src/wait-target-evidence.js";
 
 const request: JobRequestSnapshot = {
   label: "wait for one",
@@ -18,7 +19,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-const success: JobRunResult = { outcome: "success", matched: true, reason: "condition_met", targets: [{ target: "one", targetId: "p1", metadata: { agent_status: "done" }, recentUnwrappedLines: ["done"], observedAtMs: 1, matched: true }] };
+const success: JobRunResult = { wait_result: "condition_met", matched: true, reason: "condition_met", targets: [{ target: "one", targetId: "p1", metadata: { agent_status: "done" }, recentUnwrappedLines: ["done"], observedAtMs: 1, matched: true }] };
 
 describe("JobRegistry", () => {
   it("starts jobs without a cap and retains only the latest bounded progress", async () => {
@@ -28,14 +29,15 @@ describe("JobRegistry", () => {
     const second = deferred<JobRunResult>();
     const one = registry.register(request, async (_signal, update) => { update("a".repeat(10_000), { sequence: 1 }); return first.promise; });
     const two = registry.register({ ...request, targets: ["two"], targetIds: ["p2"] }, async (_signal, update) => { update("latest"); return second.promise; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(registry.size()).toBe(2);
     expect(registry.get(one.jobId)?.progress?.text.length).toBeLessThan(10_000);
     expect(registry.get(two.jobId)?.progress?.text).toBe("latest");
     first.resolve(success);
-    second.resolve({ outcome: "timeout", matched: false, reason: "timeout" });
+    second.resolve({ wait_result: "timed_out", matched: false, reason: "timeout" });
     await Promise.all([one.promise, two.promise]);
-    expect(registry.get(one.jobId)).toMatchObject({ status: "completed", outcome: "success" });
-    expect(registry.get(two.jobId)).toMatchObject({ status: "completed", outcome: "timeout" });
+    expect(registry.get(one.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "condition_met" });
+    expect(registry.get(two.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "timed_out" });
   });
 
   it("orders newest first, filters before pagination, and returns immutable views", async () => {
@@ -45,7 +47,7 @@ describe("JobRegistry", () => {
     const handles = [0, 1, 2].map(() => registry.register(request, async () => success));
     registry.update(handles[0]!.jobId, "still running");
     await Promise.all(handles.map((handle) => handle.promise));
-    const page = registry.list("completed", 1, 1);
+    const page = registry.list("settled", 1, 1);
     expect(page.total).toBe(3);
     expect(page.nextOffset).toBe(2);
     expect(page.jobs[0]?.jobId).toBe("job_2");
@@ -67,15 +69,104 @@ describe("JobRegistry", () => {
       });
       return pending.promise;
     });
-    const cancelled = registry.cancel(handle.jobId)!;
-    expect(cancelled).toMatchObject({ status: "cancelled", cancelReason: "cancelled" });
-    expect(registry.cancel(handle.jobId)).toMatchObject({ status: "cancelled" });
+    const cancelled = await registry.cancel(handle.jobId);
+    expect(cancelled).toMatchObject({ operation_phase: "settled", wait_result: "cancelled", cancelReason: "cancelled" });
+    expect(await registry.cancel(handle.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "cancelled" });
     pending.resolve(success);
     await handle.promise;
-    expect(registry.get(handle.jobId)).toMatchObject({ status: "cancelled" });
-    expect(registry.list().jobs[0]).toMatchObject({ status: "cancelled", reason: "cancelled" });
+    expect(registry.get(handle.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "cancelled" });
+    expect(registry.list().jobs[0]).toMatchObject({ operation_phase: "settled", wait_result: "cancelled", reason: "cancelled" });
     expect(terminal).not.toHaveBeenCalled();
-    expect(registry.cancel("job_missing")).toBeUndefined();
+    await expect(registry.cancel("job_missing")).resolves.toBeUndefined();
+  });
+
+  it("fences cancellation, drains activities, and records conservative late settlements", async () => {
+    const gate = deferred<JobRunResult>();
+    const activityStarted = deferred<void>();
+    let control!: JobOperationControl;
+    const registry = new JobRegistry({ idFactory: () => "job_unknown_cancel", quiescenceMs: 10, clock: { now: () => 2 } });
+    const handle = registry.register(request, async (_signal, _update, operationControl) => {
+      control = operationControl;
+      const release = control.beginActivity();
+      activityStarted.resolve();
+      const result = await gate.promise;
+      release();
+      release();
+      return result;
+    });
+    await activityStarted.promise;
+    expect(control.isOpen()).toBe(true);
+    expect(control.fence).toBe(0);
+    const firstCancel = registry.cancel(handle.jobId);
+    const secondCancel = registry.cancel(handle.jobId);
+    const observedBeforeSettlement = await new Promise<JobDetail>((resolve) => setImmediate(() => resolve(registry.get(handle.jobId)!)));
+    expect(observedBeforeSettlement.cancelReason).toBe("cancelled");
+    expect(control.isOpen()).toBe(false);
+    expect(control.fence).toBe(1);
+    expect(() => control.check()).toThrow(/operation fence is closed/);
+    expect(() => control.beginActivity()).toThrow(/operation fence is closed/);
+    const first = await firstCancel;
+    const second = await secondCancel;
+    expect(first).toMatchObject({ operation_phase: "settled", wait_result: "unknown", error: { code: "CANCELLATION_UNCERTAIN" } });
+    expect(second).toMatchObject({ operation_phase: "settled", wait_result: "unknown" });
+    gate.resolve(success);
+    await handle.promise;
+    expect(registry.get(handle.jobId)).toMatchObject({ late_settlement_observed: { kind: "fulfilled", observedAtMs: 2 } });
+    const internals = registry as unknown as {
+      jobs: Map<string, unknown>;
+      late(record: unknown, kind: "fulfilled" | "rejected"): void;
+      settleLocked(record: unknown, waitResult: "failed"): boolean;
+      waitForDrain(record: unknown): Promise<boolean>;
+    };
+    const record = internals.jobs.get(handle.jobId)!;
+    internals.late(record, "rejected");
+    expect(registry.get(handle.jobId)).toMatchObject({ late_settlement_observed: { kind: "fulfilled" } });
+    expect(internals.settleLocked(record, "failed")).toBe(false);
+    await expect(internals.waitForDrain(record)).resolves.toBe(true);
+
+    const rejectedGate = deferred<JobRunResult>();
+    const rejectedStarted = deferred<void>();
+    const rejectedRegistry = new JobRegistry({ idFactory: () => "job_rejected_late", quiescenceMs: 0 });
+    const rejected = rejectedRegistry.register(request, async () => { rejectedStarted.resolve(); return rejectedGate.promise; });
+    await rejectedStarted.promise;
+    const rejectedCancel = rejectedRegistry.cancel(rejected.jobId);
+    await rejectedCancel;
+    rejectedGate.reject(new Error("late rejection"));
+    await rejected.promise;
+    expect(rejectedRegistry.get(rejected.jobId)).toMatchObject({ late_settlement_observed: { kind: "rejected" } });
+  });
+
+  it("handles cancellation before execution starts and validates bounded constructor settings", async () => {
+    const early = new JobRegistry({ idFactory: () => "job_early_cancel", quiescenceMs: 0 });
+    const handle = early.register(request, async (signal) => new Promise<never>((_resolve, reject) => {
+      if (signal.aborted) reject(Object.assign(new Error("aborted"), { code: "ABORTED" }));
+      signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { code: "ABORTED" })), { once: true });
+    }));
+    const cancellation = await early.cancel(handle.jobId);
+    expect(cancellation).toMatchObject({ operation_phase: "settled", wait_result: "cancelled" });
+    await handle.promise;
+    expect(early.get(handle.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "cancelled" });
+    expect(new JobRegistry({ quiescenceMs: -1 }).runningOverview()).toEqual({ jobs: [], total: 0 });
+    expect(new JobRegistry({ quiescenceMs: Number.NaN }).runningOverview()).toEqual({ jobs: [], total: 0 });
+  });
+
+  it("projects valid and invalid historical evidence without claiming current state", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_evidence" });
+    const evidence = historicalTargetEvidence("native_done_observed", 10, "target_generation_opaque", "native_agent_wait");
+    const longEvidence = { ...evidence, targetGenerationRef: "target_generation_" + "x".repeat(1_000) };
+    const handle = registry.register(request, async () => ({
+      wait_result: "condition_met",
+      matched: true,
+      targets: [
+        { target: "one", targetId: "p1", metadata: {}, recentUnwrappedLines: [], observedAtMs: 10, matched: true, target_evidence: longEvidence },
+        { target: "two", targetId: "p2", metadata: {}, recentUnwrappedLines: [], observedAtMs: 11, matched: false, target_evidence: { ...evidence, currency: "current" } as never }
+      ]
+    }));
+    await handle.promise;
+    const projected = registry.get(handle.jobId)!;
+    expect(projected.result?.targets?.[0]?.target_evidence).toMatchObject({ currency: "historical_non_current", source: "native_agent_wait" });
+    expect(projected.result?.targets?.[0]?.target_evidence?.targetGenerationRef.length).toBeLessThan(1_000);
+    expect(projected.truncation).toMatchObject({ resultTargetEvidence: 1, resultTargetGenerationRefsClipped: 1 });
   });
 
   it("maps failures and protects generation and shutdown", async () => {
@@ -83,14 +174,14 @@ describe("JobRegistry", () => {
     const registry = new JobRegistry({ idFactory: () => `job_failure_${++failureId}`, clock: { now: () => 1 } });
     const failure = registry.register(request, async () => { throw Object.assign(new Error("broken"), { code: "BROKEN", details: { safe: true } }); });
     await failure.promise;
-    expect(registry.get(failure.jobId)).toMatchObject({ status: "failed", error: { code: "BROKEN", message: "broken" } });
+    expect(registry.get(failure.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "BROKEN", message: "broken" } });
     const stringFailure = registry.register({ ...request, targetIds: ["p2"] }, async () => { throw "string failure"; });
     await stringFailure.promise;
-    expect(registry.get(stringFailure.jobId)).toMatchObject({ status: "failed", error: { message: "string failure" } });
+    expect(registry.get(stringFailure.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { message: "string failure" } });
     const oversizedFailure = registry.register(request, async () => { throw Object.assign(new Error("large failure"), { details: { evidence: "x".repeat(100_000) } }); });
     await oversizedFailure.promise;
     expect(registry.get(oversizedFailure.jobId)).toMatchObject({ truncation: { errorDetails: true }, error: { details: { truncated: true } } });
-    expect(registry.list("failed").jobs).toEqual(expect.arrayContaining([expect.objectContaining({ error: { code: "BROKEN", message: "broken" } }), expect.objectContaining({ error: { message: "string failure" } })]));
+    expect(registry.list("settled").jobs).toEqual(expect.arrayContaining([expect.objectContaining({ wait_result: "failed", error: { code: "BROKEN", message: "broken" } }), expect.objectContaining({ wait_result: "failed", error: { message: "string failure" } })]));
     const generation = registry.captureGeneration();
     registry.shutdown();
     expect(registry.isCurrent(generation)).toBe(false);
@@ -117,7 +208,7 @@ describe("JobRegistry", () => {
     expect(() => valid.update("job_missing", "progress")).toThrow(/JOB_NOT_FOUND/);
     const cancelled = valid.register(request, async () => success);
     valid.cancel(cancelled.jobId);
-    expect(valid.update(cancelled.jobId, "late")).toMatchObject({ status: "cancelled" });
+    expect(valid.update(cancelled.jobId, "late")).toMatchObject({ operation_phase: "accepted" });
   });
 
   it("handles already-terminal records when beginning a session", async () => {
@@ -129,9 +220,10 @@ describe("JobRegistry", () => {
     expect(registry.size()).toBe(0);
   });
 
-  it("bounds uncloneable and oversized progress details", () => {
+  it("bounds uncloneable and oversized progress details", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_details" });
     const handle = registry.register(request, async (_signal, update) => { update("progress", () => undefined); return new Promise(() => undefined); });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(registry.get(handle.jobId)?.progress?.details).toMatchObject({ truncated: true, content: "[details unavailable]" });
     const oversized = { text: "x".repeat(100_000) };
     registry.update(handle.jobId, "progress", oversized);
@@ -161,13 +253,13 @@ describe("JobRegistry", () => {
   it("copies optional result fields and keeps small public details untruncated", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_optional" });
     const handle = registry.register(request, async () => ({
-      outcome: "success",
+      wait_result: "condition_met",
       matched: true,
       targets: [{ target: "one", targetId: "p1", metadata: { agent_status: "done" }, recentUnwrappedLines: ["done"], outputTruncated: true, observedAtMs: 1, matched: true }]
     }));
     await handle.promise;
     const detail = registry.get(handle.jobId)!;
-    expect(detail.result).toMatchObject({ outcome: "success", targets: [{ outputTruncated: true }] });
+    expect(detail.result).toMatchObject({ wait_result: "condition_met", targets: [{ outputTruncated: true }] });
     expect(detail.result?.reason).toBeUndefined();
     expect(jobDetailContent(detail)).not.toContain("[output truncated]");
   });
@@ -182,7 +274,7 @@ describe("JobRegistry", () => {
       observedAtMs: index,
       matched: index === 6
     }));
-    const handle = registry.register({ ...request, targets: targets.map((target) => target.target), targetIds: targets.map((target) => target.targetId) }, async () => ({ outcome: "success", matched: true, reason: "condition_met", matchedTargetCount: 1, matchedTargets: [{ target: "target-7", targetId: "p7" }], targets }));
+    const handle = registry.register({ ...request, targets: targets.map((target) => target.target), targetIds: targets.map((target) => target.targetId) }, async () => ({ wait_result: "condition_met", matched: true, reason: "condition_met", matchedTargetCount: 1, matchedTargets: [{ target: "target-7", targetId: "p7" }], targets }));
     await handle.promise;
     const detail = registry.get(handle.jobId)!;
     expect(detail.result).toMatchObject({ matchedTargetCount: 1, matchedTargets: [{ target: "target-7", targetId: "p7" }] });
@@ -200,7 +292,7 @@ describe("JobRegistry", () => {
       observedAtMs: index,
       matched: index === 100
     }));
-    const handle = registry.register({ ...request, targets: targets.map((target) => target.target), targetIds: targets.map((target) => target.targetId) }, async () => ({ outcome: "success", matched: true, targets }));
+    const handle = registry.register({ ...request, targets: targets.map((target) => target.target), targetIds: targets.map((target) => target.targetId) }, async () => ({ wait_result: "condition_met", matched: true, targets }));
     await handle.promise;
     const detail = registry.get(handle.jobId)!;
     expect(detail.result).toMatchObject({ matchedTargetCount: 1, matchedTargets: [{ targetId: "p101" }] });
@@ -219,7 +311,7 @@ describe("JobRegistry", () => {
       targetIds: ["request-id-" + "i".repeat(2_000)],
       settings: { ...request.settings, reviewerModel: "model-" + "m".repeat(2_000) }
     }, async () => ({
-      outcome: "success",
+      wait_result: "condition_met",
       matched: true,
       targets: [{ target: "result-" + "r".repeat(2_000), targetId: "result-id-" + "d".repeat(2_000), metadata: { evidence: long }, recentUnwrappedLines: ["line-" + "l".repeat(2_000)], observedAtMs: 1, matched: true }],
       reviewerSummaries: [{ target: "review-" + "v".repeat(2_000), targetId: "review-id-" + "q".repeat(2_000), classification: "classification-" + "c".repeat(2_000), summary: "summary-" + "s".repeat(2_000) }]
@@ -250,13 +342,14 @@ describe("JobRegistry", () => {
   it("degrades oversized public detail and list projections without invalid JSON", () => {
     const detail = publicDetail({
       jobId: "job_" + "j".repeat(2_000),
-      status: "cancelled",
+      operation_phase: "settled",
+      wait_result: "cancelled",
       sequence: 1,
       createdAtMs: 1,
       request,
       progress: { text: "progress", atMs: 1, details: { evidence: "e".repeat(100_000) } },
       result: {
-        outcome: "timeout",
+        wait_result: "timed_out",
         matched: false,
         targets: [{ target: "target", targetId: "p1", metadata: { evidence: "m".repeat(100_000) }, recentUnwrappedLines: ["line"], observedAtMs: 1, matched: false }],
         reviewerSummaries: [{ target: "target", targetId: "p1", classification: "blocked", summary: "review" }]
@@ -264,7 +357,8 @@ describe("JobRegistry", () => {
       cancelReason: "cancelled",
       truncation: { padding: "x".repeat(100_000) } as unknown as JobDetail["truncation"]
     });
-    expect(detail.status).toBe("cancelled");
+    expect(detail.operation_phase).toBe("settled");
+    expect(detail.wait_result).toBe("cancelled");
     expect(detail.truncation).toMatchObject({ jobIdClipped: true, resultTargetMetadata: 1 });
     expect(Buffer.byteLength(jobDetailContent(detail), "utf8")).toBeLessThan(50_000);
     expect(() => JSON.parse(jobDetailContent(detail))).not.toThrow();
@@ -272,75 +366,91 @@ describe("JobRegistry", () => {
     expect(forced.truncation).toMatchObject({ publicEvidenceOmitted: true, progressTextClipped: true });
     const manyMatches = publicDetail({
       jobId: "job_many_matches",
-      status: "completed",
+      operation_phase: "settled",
+      wait_result: "condition_met",
       sequence: 1,
       createdAtMs: 1,
       request,
-      result: { outcome: "success", matched: true, targets: Array.from({ length: 7 }, (_, index) => ({ target: `target-${index}`, targetId: `p${index}`, metadata: {}, recentUnwrappedLines: [], observedAtMs: index, matched: true })) }
+      result: { wait_result: "condition_met", matched: true, targets: Array.from({ length: 7 }, (_, index) => ({ target: `target-${index}`, targetId: `p${index}`, metadata: {}, recentUnwrappedLines: [], observedAtMs: index, matched: true })) }
     });
     expect(manyMatches.truncation).toMatchObject({ resultMatchedTargets: 1 });
 
-    const invalidProjection = publicDetail({ jobId: "job_invalid", status: "running", sequence: 1, createdAtMs: 1, request, truncation: { bad: 1n } as unknown as JobDetail["truncation"] });
+    const lateProjection = publicDetail({ jobId: "job_late_projection", operation_phase: "settled", wait_result: "unknown", sequence: 1, createdAtMs: 1, request, late_settlement_observed: { kind: "fulfilled", observedAtMs: 2 } });
+    expect(lateProjection).toMatchObject({ late_settlement_observed: { kind: "fulfilled", observedAtMs: 2 } });
+    const invalidProjection = publicDetail({ jobId: "job_invalid", operation_phase: "running", sequence: 1, createdAtMs: 1, request, truncation: { bad: 1n } as unknown as JobDetail["truncation"] });
     expect(invalidProjection.truncation ?? {}).not.toHaveProperty("bad");
     expect(fitsPublic(1n)).toBe(false);
-    const malformedCondition = publicDetail({ jobId: "job_condition", status: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: (() => undefined) as unknown as JobRequestSnapshot["condition"] } });
+    const malformedCondition = publicDetail({ jobId: "job_condition", operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: (() => undefined) as unknown as JobRequestSnapshot["condition"] } });
     expect(malformedCondition.truncation).toMatchObject({ requestCondition: true });
-    const clippedCondition = publicDetail({ jobId: "job_condition_clip", status: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: { kind: "output", match: { kind: "literal", value: "x".repeat(10_000) } } } });
+    const clippedCondition = publicDetail({ jobId: "job_condition_clip", operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: { kind: "output", match: { kind: "literal", value: "x".repeat(10_000) } } } });
     expect(clippedCondition.truncation).toMatchObject({ requestCondition: true, requestConditionClipped: true });
-    const unclippedCondition = publicDetail({ jobId: "job_condition_extra", status: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: { kind: "output", match: { kind: "literal", value: "short" }, extra: "x".repeat(10_000) } as unknown as JobRequestSnapshot["condition"] } });
+    const unclippedCondition = publicDetail({ jobId: "job_condition_extra", operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: { kind: "output", match: { kind: "literal", value: "short" }, extra: "x".repeat(10_000) } as unknown as JobRequestSnapshot["condition"] } });
     expect(unclippedCondition.truncation).toMatchObject({ requestCondition: true });
     expect(unclippedCondition.truncation?.requestConditionClipped).toBeUndefined();
-    const clippedError = publicDetail({ jobId: "job_error", status: "failed", sequence: 1, createdAtMs: 1, request, error: { code: "c".repeat(2_000), message: "m".repeat(2_000) } });
+    const clippedError = publicDetail({ jobId: "job_error", operation_phase: "settled", wait_result: "failed", sequence: 1, createdAtMs: 1, request, error: { code: "c".repeat(2_000), message: "m".repeat(2_000) } });
     expect(clippedError.truncation).toMatchObject({ errorCodeClipped: true, errorMessageClipped: true });
 
+    const lateCompacted = publicDetail({
+      jobId: "job_late_compact",
+      operation_phase: "settled",
+      wait_result: "unknown",
+      sequence: 1,
+      createdAtMs: 1,
+      request,
+      late_settlement_observed: { kind: "fulfilled", observedAtMs: 2 },
+      result: { wait_result: "unknown", matched: false, targets: [{ target: "target", targetId: "p1", metadata: { evidence: "x" }, recentUnwrappedLines: ["line"], observedAtMs: 1, matched: false }] }
+    }, 1);
+    expect(lateCompacted).toMatchObject({ late_settlement_observed: { kind: "fulfilled" } });
     const compacted = publicDetail({
       jobId: "job_compact",
-      status: "completed",
+      operation_phase: "settled",
+      wait_result: "condition_met",
       sequence: 1,
       createdAtMs: 1,
       request,
       progress: { text: "progress", atMs: 1, details: { evidence: "x" } },
-      result: { outcome: "success", matched: true, targets: [{ target: "target", targetId: "p1", metadata: {}, recentUnwrappedLines: ["line"], observedAtMs: 1, matched: true }], reviewerSummaries: [{ target: "target", targetId: "p1", classification: "blocked", summary: "review" }] }
+      result: { wait_result: "condition_met", matched: true, targets: [{ target: "target", targetId: "p1", metadata: {}, recentUnwrappedLines: ["line"], observedAtMs: 1, matched: true }], reviewerSummaries: [{ target: "target", targetId: "p1", classification: "blocked", summary: "review" }] }
     }, 1);
     expect(compacted.truncation).toMatchObject({ publicEvidenceOmitted: true });
     const minimalWithMatch = publicDetail({
       jobId: "job_compact_match",
-      status: "cancelled",
+      operation_phase: "settled",
+      wait_result: "cancelled",
       sequence: 1,
       createdAtMs: 1,
       startedAtMs: 1,
       finishedAtMs: 2,
       request,
-      outcome: "success",
       cancelReason: "cancelled",
-      result: { outcome: "success", matched: true, matchedTargetCount: 2, matchedTargets: [{ target: "target", targetId: "p1" }] }
+      result: { wait_result: "condition_met", matched: true, matchedTargetCount: 2, matchedTargets: [{ target: "target", targetId: "p1" }] }
     }, 1);
     expect(minimalWithMatch.result).toMatchObject({ matchedTargetCount: 2, matchedTargets: [{ targetId: "p1" }] });
-    const noResult = publicDetail({ jobId: "job_no_result", status: "running", sequence: 1, createdAtMs: 1, request }, 1);
+    const noResult = publicDetail({ jobId: "job_no_result", operation_phase: "running", sequence: 1, createdAtMs: 1, request }, 1);
     expect(noResult.result).toBeUndefined();
     const noLines = publicDetail({
       jobId: "job_no_lines",
-      status: "completed",
+      operation_phase: "settled",
+      wait_result: "condition_met",
       sequence: 1,
       createdAtMs: 1,
       request,
-      result: { outcome: "success", matched: true, targets: [{ target: "target", targetId: "p1", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: true }] }
+      result: { wait_result: "condition_met", matched: true, targets: [{ target: "target", targetId: "p1", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: true }] }
     }, 1);
     expect(noLines.truncation).toMatchObject({ publicEvidenceOmitted: true });
-    const untouched = publicDetail({ jobId: "job_untouched", status: "running", sequence: 1, createdAtMs: 1, request }, 1);
-    expect(untouched.status).toBe("running");
+    const untouched = publicDetail({ jobId: "job_untouched", operation_phase: "running", sequence: 1, createdAtMs: 1, request }, 1);
+    expect(untouched.operation_phase).toBe("running");
 
     const jobs = Array.from({ length: 100 }, (_, index) => ({
       jobId: index === 0 ? "job_" + "z".repeat(1_000) : `job_${index}`,
       label: index === 0 ? "label-" + "q".repeat(1_000) : `wait ${index}`,
-      status: "running" as const,
+      operation_phase: "running" as const,
       sequence: index,
       createdAtMs: index,
       startedAtMs: index === 0 ? index : undefined,
       finishedAtMs: index === 0 ? index : undefined,
       targetIds: [`p${index}`],
       targets: [`target-${index}`],
-      ...(index === 0 ? { outcome: "success" as const, reason: "condition_met", error: { code: "CODE", message: "message" } } : index === 1 ? { error: { message: "message" } } : {}),
+      ...(index === 0 ? { wait_result: "condition_met" as const, reason: "condition_met", error: { code: "CODE", message: "message" } } : index === 1 ? { error: { message: "message" } } : {}),
       ...(index === 0 ? { progress: { text: "progress", atMs: index } } : {}),
       ...(index === 0 ? { truncation: { jobIdClipped: true } } : {})
     }));
@@ -379,11 +489,11 @@ describe("JobRegistry", () => {
     const registry = new JobRegistry({ idFactory: () => "job_notify", onTerminal: () => { throw new Error("ui down"); } });
     const handle = registry.register(request, async () => success);
     await expect(handle.promise).resolves.toBeUndefined();
-    expect(registry.get(handle.jobId)).toMatchObject({ status: "completed" });
+    expect(registry.get(handle.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "condition_met" });
 
     const rejected = new JobRegistry({ idFactory: () => "job_notify_async", onTerminal: async () => { throw new Error("async ui down"); } });
     const asyncHandle = rejected.register(request, async () => success);
     await expect(asyncHandle.promise).resolves.toBeUndefined();
-    expect(rejected.get(asyncHandle.jobId)).toMatchObject({ status: "completed" });
+    expect(rejected.get(asyncHandle.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "condition_met" });
   });
 });

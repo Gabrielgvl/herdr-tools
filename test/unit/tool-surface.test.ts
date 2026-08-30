@@ -25,10 +25,13 @@ const snapshot = {
     workspaces: [{ workspace_id: "w", label: "w" }],
     tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
     panes: [
-      { pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "caller", agent_name: "caller", agent_status: "idle" },
-      { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent_status: "working" }
+      { pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "caller", agent_name: "caller", agent: "pi", terminal_id: "term-caller", agent_session: { source: "pi", agent: "pi", kind: "id", value: "caller-session" }, agent_status: "idle" },
+      { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent: "pi", terminal_id: "term-worker", agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" }, agent_status: "working" }
     ],
-    agents: [{ pane_id: "w:p", name: "caller", agent_status: "idle" }, { pane_id: "w:p2", name: "worker", agent_status: "working" }]
+    agents: [
+      { pane_id: "w:p", name: "caller", agent: "pi", terminal_id: "term-caller", agent_session: { source: "pi", agent: "pi", kind: "id", value: "caller-session" }, agent_status: "idle" },
+      { pane_id: "w:p2", name: "worker", agent: "pi", terminal_id: "term-worker", agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" }, agent_status: "working" }
+    ]
   }
 };
 
@@ -44,6 +47,8 @@ function fakeExec(): { exec: PiExec; calls: string[][] } {
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: snapshot.snapshot.panes[0] });
     if (argv[0] === "api") return envelope("snapshot", snapshot);
+    if (argv[0] === "agent" && argv[1] === "wait") return envelope("agent-wait", { agent: snapshot.snapshot.panes.find((item) => item.pane_id === argv[2]) });
+    if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: snapshot.snapshot.panes.find((item) => item.pane_id === argv[2]) });
     if (argv[0] === "pane" && argv[1] === "get") {
       const pane = snapshot.snapshot.panes.find((item) => item.pane_id === argv[2]) ?? { pane_id: argv[2], tab_id: "w:t", workspace_id: "w", label: "created", agent_status: "idle" };
       return envelope("pane", { pane });
@@ -128,13 +133,13 @@ describe("shared tool surface", () => {
     const longWait = { targets: ["w:p2"], match: "any" as const, condition: { kind: "state" as const, state: "blocked" as const }, timeoutMs: 120_000 };
     const injected = surfaceFor({ reviewerFactory });
     const injectedStarted = await injected.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext);
-    expect(injectedStarted.details).toMatchObject({ outcome: "background" });
-    await vi.waitFor(() => expect(injected.deps.jobs.list("failed").total).toBe(1));
+    expect(injectedStarted.details).toMatchObject({ operation_phase: "accepted" });
+    await vi.waitFor(() => expect(injected.deps.jobs.list("settled").total).toBe(1));
     expect(reviewerFactory).toHaveBeenCalledTimes(1);
     const piHost = surfaceFor();
     const piStarted = await piHost.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext);
-    expect(piStarted.details).toMatchObject({ outcome: "background" });
-    await vi.waitFor(() => expect(piHost.deps.jobs.list("failed").total).toBe(1));
+    expect(piStarted.details).toMatchObject({ operation_phase: "accepted" });
+    await vi.waitFor(() => expect(piHost.deps.jobs.list("settled").total).toBe(1));
   });
 
   it("keeps the shared per-call compatibility preflight and injected context reader", async () => {

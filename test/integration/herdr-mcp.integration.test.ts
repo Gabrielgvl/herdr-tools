@@ -381,7 +381,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const shortWaitJobId = evidence(shortWait).jobId as string;
       await vi.waitFor(async () => {
         const job = await call("herdr_jobs", { operation: "get", jobId: shortWaitJobId });
-        expect(evidence(job)).toMatchObject({ operation: "jobs", kind: "job", jobId: shortWaitJobId, status: "completed", outcome: "success" });
+        expect(evidence(job)).toMatchObject({ operation: "jobs", kind: "job", jobId: shortWaitJobId, operation_phase: "settled", wait_result: "condition_met" });
       }, { timeout: 20_000, interval: 100 });
 
       // `steer` is the provenance-preserving operation for a target that is

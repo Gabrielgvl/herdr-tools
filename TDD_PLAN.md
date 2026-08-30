@@ -108,11 +108,12 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Explicit turn control is strict and identity-bound | `turn_control_schema_is_strict`; `turn_control_requires_working_snapshot_and_agent_get`; `turn_control_requires_exact_stable_identity`; `turn_control_dispatches_exactly_one_control_key`; `turn_control_waits_fixed_window_and_always_final_snapshots`; `turn_control_confirms_advanced_same_agent_state`; `cancel_disappearance_is_unconfirmed`; `interrupt_agent_exit_requires_strict_absence_proof`; `turn_control_abort_before_dispatch_is_aborted`; `turn_control_abort_after_dispatch_preserves_evidence`; `turn_control_errors_are_stable`; `turn_control_mcp_schema_and_fifo_parity`; `turn_control_rendering_and_redaction_are_bounded`; `turn_control_disposable_integration` | `cancel` sends exactly one `esc`; `interrupt` sends exactly one `ctrl+c` only after both authoritative reads prove the same working pane/terminal/full session identity. A fixed 5,000 ms wait and independent final snapshot confirm a terminal same agent or the narrowly proven interrupt `agent_exited` state. | No extra fields, retries, escalation, fallback, focus, synthetic causality, cancel-on-disappearance, or generic success is possible. Abort before dispatch is `ABORTED`; after dispatch, independent bounded verification retains evidence.
 | Communicate uses named keys and no confirmation | `communicate_uses_named_keys_only`; `communicate_never_calls_confirmation_ui` | Only caller-requested validated named keys are sent. | No synthesized Escape, raw control bytes, arbitrary key bytes, or UI confirmation is sent. |
 | Wait supports single and multi-target any/all | `wait_supports_single_target`; `wait_multi_target_any_returns_first_match`; `wait_multi_target_all_waits_for_every_match` | The matching target set and snapshots are returned. | Any does not wait for unrelated targets; all does not return before every target matches. |
-| Wait supports semantic and raw conditions | `wait_matches_semantic_condition`; `wait_matches_raw_literal`; `wait_matches_raw_regex`; `wait_combines_raw_and_semantic_conditions` | A condition is satisfied only by the requested predicate. | Status is not inferred from text, and literal matching is not accidentally regex matching. |
-| Wait timeout is explicit and capped | `wait_requires_explicit_timeout`; `wait_accepts_timeout_of_3600_seconds`; `wait_rejects_timeout_above_3600_seconds` | Valid timeout starts bounded polling. | Missing, zero/invalid, or over-limit timeout starts no poll or reviewer. |
-| Timeout includes structured snapshots | `wait_timeout_returns_structured_outcome_with_latest_snapshots` | Result has `outcome: "timeout"`, elapsed/deadline data, and latest per-target snapshots. | Timeout is never represented as a successful match or an empty generic error. |
-| Wait cancellation is truthful | `wait_cancellation_aborts_polling_and_returns_cancelled`; `wait_cancellation_cannot_apply_late_result` | In-flight work observes abort and result says cancelled. | No later poll, reviewer, focus, mutation, or false success occurs after cancellation. |
-| Waits over the configured interval require review | `wait_over_configured_interval_starts_reviewers`; `wait_under_configured_interval_starts_no_review` | One reviewer per target starts after the configured threshold. | A per-call threshold cannot bypass or change the configured gate. |
+| Wait supports semantic and raw conditions | `wait_matches_semantic_condition`; `wait_matches_raw_literal`; `wait_matches_raw_regex`; `wait_combines_raw_and_semantic_conditions` | A condition is satisfied only by the requested predicate. | Raw state is not inferred from text, and literal matching is not accidentally regex matching. |
+| Wait timeout is explicit and capped | `wait_requires_explicit_timeout`; `wait_accepts_timeout_of_3600_seconds`; `wait_rejects_timeout_above_3600_seconds` | Valid timeout starts a bounded detached operation. | Missing, zero/invalid, or over-limit timeout starts no poll or reviewer. |
+| Wait operation vocabulary is explicit | `wait_acknowledges_accepted_phase`; `wait_settles_with_terminal_wait_result`; `wait_rejects_legacy_job_fields` | Jobs expose only `accepted|running|cancel_requested|settled`; terminal jobs expose one `wait_result` from the replacement enum. | No generic job field or completion-overloaded alias is published, and `wait_result` is absent before settlement. |
+| Timeout includes structured snapshots | `wait_timeout_returns_structured_timed_out_result` | The settled job has `wait_result: "timed_out"`, `matched: false`, and latest bounded per-target snapshots. | Timeout is never represented as `condition_met` or an empty generic error. |
+| Wait cancellation is truthful | `wait_cancellation_aborts_polling_and_returns_cancelled`; `wait_cancellation_cannot_apply_late_result`; `wait_cancellation_reports_unknown_when_drain_is_unproven` | In-flight work observes the fence and only observed quiescence yields `wait_result: "cancelled"`; uncertainty yields `unknown`. | No later poll, reviewer, focus, mutation, or false condition match occurs after cancellation. |
+| Waits over the configured interval require review | `wait_over_configured_interval_starts_reviewers`; `wait_over_native_wait_uses_composite_reviewer_refresh`; `wait_under_configured_interval_starts_no_review` | One reviewer per target starts after the configured threshold; native waits are segmented so review supervision is not bypassed. | A per-call threshold cannot bypass or change the configured gate, and reviewer observations cannot satisfy a native predicate. |
 | Reviewer config defaults and bounds are fixed | `review_interval_defaults_to_five_minutes`; `review_interval_accepts_only_one_to_thirty_minutes`; `review_interval_is_not_a_wait_argument`; `review_model_defaults_to_luna_low_and_is_not_a_wait_argument` | Extension-owned config supplies the reviewer cadence and model. | Tool input cannot override interval, model, or thinking; out-of-range config fails before waiting. |
 | Extension-owned config path is authoritative | `settings_read_only_from_extension_owned_config`; `settings_do_not_read_pi_or_project_config`; `settings_do_not_read_tool_override_fields`; `project_config_override_is_absent`; `tool_settings_override_is_absent` | The loader reads only `/home/gabriel/.pi/agent/extensions/herdr-tools/config.json`. | Pi settings, project config, environment fallback, and tool arguments cannot supply or override these settings. |
 | Absent config uses defaults | `absent_config_uses_default_cadence_and_reviewer_model` | Missing `config.json` yields cadence `5` minutes and model `luna` with fixed thinking `low`. | No file is created, no warning is converted into a mutation, and no per-call override is accepted. |
@@ -124,7 +125,7 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Reviewers are independent, concurrent, and uncapped | `starts_one_toolless_reviewer_per_target`; `starts_all_reviewers_concurrently`; `reviewer_target_count_has_no_artificial_cap` | Every target gets one independent in-process review, including a large fixture set. | No reviewer pane, Herdr agent, serial target bottleneck, or arbitrary target cap is introduced. |
 | Reviewer input is bounded and delta-based | `reviewer_receives_bounded_metadata_and_transcript_delta`; `reviewer_delta_excludes_prior_transcript`; `reviewer_input_contains_no_tools_or_actions` | Only the specified bounded current metadata and new transcript delta are passed. | Full scrollback, unrelated panes, tool definitions, UI handles, and action methods are absent. |
 | Reviewer terminal findings end a wait | `reviewer_stalled_ends_wait_early`; `reviewer_blocked_ends_wait_early`; `reviewer_risk_ends_wait_early`; `reviewer_unknown_ends_wait_early`; `reviewer_failure_ends_wait_early` | Wait ends with the finding/failure and latest snapshots. | No further poll, prompt, pane, focus, or automatic remediation follows. |
-| Reviewer healthy result continues normally | `healthy_reviewer_does_not_fake_completion` | Ordinary polling continues until match or timeout. | A healthy review is not returned as a target match and does not create a pane. |
+| Reviewer healthy result continues normally | `healthy_reviewer_does_not_fake_a_predicate_match` | Ordinary polling continues until the authoritative predicate matches or times out. | An advisory review is not returned as a target match and does not create a pane.
 | Launch is profile-only | `launch_rejects_raw_kind_argv_and_env_schema`; `launch_accepts_arbitrary_valid_named_profile`; `launch_validates_agent_and_profile_name_patterns` | A valid named Pi/Claude profile starts in the selected Herdr pane. | Raw kind, argv, and env launch fields cannot bypass the profile contract. |
 | Launch requires a unique name | `launch_requires_nonempty_name`; `launch_rejects_duplicate_exact_name_before_creation`; `launch_rejects_ambiguous_name_before_creation` | A unique named launch is allowed. | Duplicate/ambiguous names do not create a tab, pane, process, or focus change. |
 | Launch defaults label/name and placement safely | `launch_defaults_label_to_name`; `launch_defaults_right_no_focus_and_current_cwd` | Defaults are included in creation argv. | Default launch never focuses, changes cwd, or selects a different direction. |
@@ -140,7 +141,7 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Exact pane/tab close is autonomous after protected-topology validation | `pane_close_unowned_without_ui`; `tab_close_unowned_without_ui`; `close_protects_caller_resources`; `close_rejects_malformed_topology` | Any exact non-caller target may close after fresh topology validation, with Herdr-returned operation IDs and compact post-state. | No modal confirmation or ownership gate exists; caller resources and malformed topology remain protected. |
 | Close preserves completed mutations and reconciles uncertain responses | `close_preserves_completed_mutation_after_abort`; `close_reconciles_lost_response_when_absent`; `close_uncertain_when_present_or_readback_fails` | Fresh independent post-read proves absence or returns `MUTATION_UNCERTAIN` with bounded evidence. | No generic success, blind retry, or `No result provided` terminal result is returned. |
 | Current Courier resources are protected | `ownership_cannot_claim_current_courier_resource`; `integration_cleanup_never_targets_current_courier_tree` | Only disposable test IDs may be cleaned by explicit test teardown. | Current workspace/tab/pane IDs remain byte-for-byte unchanged. |
-| Results, renderers, cancellation, and partial failures are truthful | `results_include_structured_details_and_compact_text`; `renderers_are_compact_by_default`; `partial_results_preserve_each_target_truth`; `renderers_show_timeout_cancel_and_error_states`; `all_late_races_are_non_mutating` | Each result exposes operation/outcome/IDs/snapshots/errors suitable for the LLM and renderer. | No raw JSON dump, swallowed per-target error, false all-success, or late side effect is shown. |
+| Results, renderers, cancellation, and partial failures are truthful | `results_include_structured_details_and_compact_text`; `renderers_are_compact_by_default`; `partial_results_preserve_each_target_truth`; `renderers_show_wait_settlements_and_error_states`; `all_late_races_are_non_mutating` | Each result exposes its operation phase, terminal wait result when settled, IDs, snapshots, and errors suitable for the LLM and renderer. | No raw JSON dump, swallowed per-target error, false condition match, or late side effect is shown. |
 | Unit and integration safety gates exist | `unit_harness_uses_fakes_only`; `integration_uses_disposable_named_session_not_current_courier`; `coverage_gate_requires_changed_files_at_100_percent` | Disposable integration state is created and explicitly torn down by the test harness. | Unit tests never control real Herdr; integration never creates in the Courier workspace. |
 
 ## Extension-owned global configuration
@@ -352,7 +353,7 @@ no ID may be derived from `w9`, `p27`, or display order.
       "tools": null
     }
   ],
-  "results": [{"target": "w9:p27", "status": "stalled", "reason": "no progress"}]
+  "results": [{"target": "w9:p27", "classification": "stalled", "reason": "no progress"}]
 }
 ```
 
@@ -364,18 +365,19 @@ the request.
 
 ```json
 {
-  "outcome": "partial",
+  "operation_phase": "settled",
+  "wait_result": "failed",
   "targets": [
-    {"target": "w9:p27", "outcome": "success", "snapshot_revision": 52},
-    {"target": "w9:p28", "outcome": "error", "error": {"code": "CLI_FAILED", "message": "read failed"}}
+    {"target": "w9:p27", "target_evidence": {"kind": "identity_unknown", "observedAtMs": 52, "targetGenerationRef": "target_generation_opaque", "currency": "historical_non_current", "source": "composite_observation"}},
+    {"target": "w9:p28", "error": {"code": "CLI_FAILED", "message": "read failed"}}
   ]
 }
 ```
 
 ```json
 {
-  "outcome": "timeout",
-  "timeout_seconds": 30,
+  "operation_phase": "settled",
+  "wait_result": "timed_out",
   "latest_snapshots": [{"target": "w9:p27", "agent_status": "working", "revision": 52}],
   "matched": false
 }
@@ -523,7 +525,7 @@ operation key call count must remain exactly one in every dispatched case.
 - `wait_supports_single_target`
 - `wait_multi_target_any_returns_first_match`
 - `wait_multi_target_all_waits_for_every_match`
-- `wait_matches_semantic_status_condition`
+- `wait_matches_semantic_state_condition`
 - `wait_matches_raw_literal_output`
 - `wait_matches_raw_regex_output`
 - `wait_combines_raw_and_semantic_conditions`
@@ -533,16 +535,23 @@ operation key call count must remain exactly one in every dispatched case.
 - `wait_accepts_timeout_of_3600_seconds`
 - `wait_rejects_timeout_above_3600_seconds`
 - `wait_rejects_nonpositive_or_nonfinite_timeout`
-- `wait_returns_structured_timeout_with_latest_snapshots`
-- `wait_timeout_does_not_report_success`
+- `wait_returns_structured_timed_out_result_with_latest_snapshots`
+- `wait_timed_out_result_does_not_report_condition_met`
+- `wait_acknowledges_accepted_operation_phase`
+- `wait_settles_with_terminal_wait_result`
+- `wait_rejects_legacy_job_fields`
 - `wait_cancellation_aborts_polling_and_returns_cancelled`
 - `wait_cancellation_cannot_apply_late_result`
+- `wait_cancellation_reports_unknown_when_drain_is_unproven`
 - `wait_polling_uses_authoritative_reads`
 - `wait_missing_target_fails_before_polling`
 - `wait_ambiguous_target_fails_before_polling`
 - `wait_partial_target_failures_preserve_per_target_truth`
 - `wait_and_timeout_same_tick_follow_documented_precedence`
-- `wait_reviewer_and_match_race_returns_one_terminal_outcome`
+- `wait_reviewer_and_match_race_returns_one_terminal_settlement`
+- `wait_native_predicates_use_occupant_pinned_agent_wait`
+- `wait_native_reviewer_refresh_is_composite_only`
+- `wait_target_evidence_is_historical_and_generation_bound`
 
 ### `reviewer.test.ts` / mandatory wait reviewer
 
@@ -567,7 +576,7 @@ operation key call count must remain exactly one in every dispatched case.
 - `reviewer_risk_ends_wait_early`
 - `reviewer_unknown_ends_wait_early`
 - `reviewer_failure_ends_wait_early`
-- `healthy_reviewer_does_not_fake_completion`
+- `healthy_reviewer_does_not_fake_a_predicate_match`
 - `reviewer_is_not_rendered_as_or_launched_in_a_pane`
 - `reviewer_cancellation_cannot_finish_after_wait_cancellation`
 
@@ -753,17 +762,17 @@ commit a red test, broken build, or unreported deviation.
 
 The fake clock and runner must cover these deterministic orderings:
 
-- abort before target resolution: zero CLI calls and a cancelled result;
+- abort before target resolution: zero CLI calls and no job registration;
 - abort while a read is pending: runner sees the signal, polling stops, and no
-  result from the late read is applied;
+  late observation is applied;
 - abort while reviewers are behind a barrier: every reviewer sees abort and none
   can terminate the wait after cancellation;
 - condition match immediately before deadline: match is returned;
 - deadline before condition read completes: timeout with latest completed snapshot;
 - condition and timeout in one scheduler turn: follow one documented precedence,
-  test both sides, and never emit two terminal outcomes;
-- reviewer terminal finding racing with condition match: exactly one outcome is
-  selected, with a snapshot and reason for the losing observation;
+  test both sides, and never emit two settled wait results;
+- reviewer terminal finding racing with condition match: exactly one settled
+  `wait_result` is selected, with a snapshot and reason for the losing observation;
 - cancellation between create/start and post-read: never claim a fully verified
   resource and never issue compensating close;
 - prompt/steer post-read racing with state transition: report the observed state,
@@ -772,8 +781,9 @@ The fake clock and runner must cover these deterministic orderings:
   preserves completed mutation evidence;
 - close response loss with absent/present/unavailable readback: reconcile only
   proven absence and otherwise return typed uncertainty;
-- one target failing in a multi-target operation: preserve successful target
-  results and failed target error, without converting the whole result to success.
+- one target failing in a multi-target operation: preserve each target's
+  evidence and failed-target error, without converting the whole wait to
+  `condition_met`.
 
 ## Ownership and cleanup contract
 
@@ -902,7 +912,7 @@ and concerns for the reviewer, as required by the source TDD skill.
 ## Approved detached wait-job amendment
 
 The detached wait contract is now part of this plan. Add red/green coverage for
-strict rejection of the removed `runInBackground` field, preflight-before-ID,
+strict rejection of removed execution-mode fields, preflight-before-ID,
 fresh-signal execution, frozen settings/target resolution, shared wait-runner
 outcome mapping, and unused initiating progress callbacks. Every public
 `herdr_wait` call must register a job and return immediately; wait progress is

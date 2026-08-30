@@ -1,7 +1,7 @@
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { Api, AssistantMessage, Context, Model, ProviderStreamOptions, TextContent } from "@earendil-works/pi-ai";
 
-export const REVIEW_CLASSIFICATIONS = ["progress", "stalled", "blocked", "risk", "completed", "unknown"] as const;
+export const REVIEW_CLASSIFICATIONS = ["progress", "stalled", "blocked", "risk", "appears_complete", "unknown"] as const;
 export type ReviewClassification = (typeof REVIEW_CLASSIFICATIONS)[number];
 
 export interface ReviewerRequest {
@@ -77,7 +77,7 @@ function promptFor(request: ReviewerRequest): string {
   const prompt = [
     "Classify the current Herdr target using only the supplied evidence.",
     "Return exactly one JSON object with only these keys: classification and summary.",
-    "classification must be one of progress, stalled, blocked, risk, completed, unknown.",
+    "classification must be one of progress, stalled, blocked, risk, appears_complete, unknown.",
     JSON.stringify({ targetId: request.targetId, metadata: request.metadata, transcriptDelta: request.transcriptDelta })
   ].join("\n");
   return prompt.slice(0, MAX_PROMPT_BYTES);

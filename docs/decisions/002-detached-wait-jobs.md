@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by ADR-018: detached-only `herdr_wait` API.
 
 ## Context
 
@@ -14,27 +14,29 @@ second wait implementation.
 
 ## Decision
 
-- Keep one strict `herdr_wait` schema and add only the camelCase
-  `runInBackground` boolean. Foreground execution remains blocking.
-- Split waiting into a preflight phase and a prepared shared runner. Background
-  preflight uses the initiating signal, but registration creates a fresh
-  per-job `AbortController`, copies all prepared inputs, and starts the timeout
-  only after registration.
+- Use one strict `herdr_wait` schema and a prepared shared runner. The current
+  API is detached-only; callers receive an opaque job ID and inspect the job
+  through `herdr_jobs`.
+- Split waiting into a preflight phase and a prepared shared runner. Preflight
+  uses the initiating signal, but registration creates a fresh per-job
+  `AbortController`, copies all prepared inputs, and starts the timeout only
+  after registration.
 - Own one in-memory job registry per extension runtime/session. It uses opaque
   `job_${randomUUID()}` IDs, insertion sequence ordering, no concurrency cap,
   latest-progress replacement, first-wins terminal transitions, and terminal
-  retention until shutdown. Generic job status is separate from wait outcome.
+  retention until shutdown. Operation phase is separate from terminal wait
+  result.
 - Expose only Herdr-owned jobs through strict `herdr_jobs` list/get/cancel
   operations. Views clone mutable data and truncate model-visible content at the
   existing Pi 50KB/2,000-line bounds.
 - Capture a session generation and suppress stale registration, notifications,
-  and shutdown races. Shutdown disables delivery first, marks/aborts running
+  and shutdown races. Shutdown disables delivery first, fences/aborts active
   jobs, then resets ownership. `/tree` and unrelated lifecycle events do not
   cancel jobs.
 - Notify the active branch with Pi's normal queue using a visible custom steer
-  message after background success, timeout, failure, or manager judgment.
-  Manager judgment has the explicit high-priority prefix/details; explicit
-  cancel and shutdown cancellation do not notify. Notification failures are
+  message after terminal settlement for eligible wait results. Manager
+  judgment has the explicit high-priority prefix/details; explicit cancellation
+  and shutdown cancellation do not notify. Notification failures are
   best-effort and cannot escape as unhandled rejections.
 
 ## Alternatives considered
@@ -57,9 +59,8 @@ session shutdown.
 
 ## Consequences
 
-Short waits retain the existing synchronous contract. Background waits return
-quickly with an opaque ID while preserving the exact established wait engine.
-Operators can inspect and cancel jobs without gaining access to unrelated state.
-The registry and notification path require explicit lifecycle and race tests, and
-notifications are intentionally best-effort because a dying Pi session cannot
-reliably deliver them.
+All waits return quickly with an opaque ID while preserving the exact prepared
+wait engine. Operators can inspect and cancel jobs without gaining access to
+unrelated state. The registry and notification path require explicit lifecycle
+and race tests, and notifications are intentionally best-effort because a dying
+Pi session cannot reliably deliver them.

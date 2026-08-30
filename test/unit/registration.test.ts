@@ -128,13 +128,13 @@ describe("global extension registration", () => {
   it("pushes bounded terminal notifications with queue and priority semantics", async () => {
     const detail = {
       jobId: "job_notify",
-      status: "completed" as const,
+      operation_phase: "settled" as const,
+      wait_result: "manager_judgment_required" as const,
       sequence: 1,
       createdAtMs: 0,
       finishedAtMs: 1,
       request: { label: "wait for worker", targets: ["worker\\n<untrusted>"], targetIds: ["p1"], match: "any" as const, condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const } },
-      outcome: "manager_judgment_required" as const,
-      result: { outcome: "manager_judgment_required" as const, matched: false, reason: "manager_judgment_required", reviewerSummaries: [{ target: "worker", targetId: "p1", classification: "blocked", summary: "review\nsummary" }] }
+      result: { wait_result: "manager_judgment_required" as const, matched: false, reason: "manager_judgment_required", reviewerSummaries: [{ target: "worker", targetId: "p1", classification: "blocked", summary: "review\nsummary" }] }
     };
     const notification = notificationForJob(detail);
     expect(notification.content).toContain("HIGH PRIORITY: MANAGER JUDGMENT REQUIRED");
@@ -146,26 +146,28 @@ describe("global extension registration", () => {
     const unicodeNotification = notificationForJob({ ...detail, request: { ...detail.request, label: unicodeLabel } });
     expect(unicodeNotification.details.label).toBe(unicodeLabel);
     expect(unicodeNotification.content).toContain(unicodeLabel);
+    const controlNotification = notificationForJob({ ...detail, request: { ...detail.request, targetIds: [`p1${String.fromCharCode(127)}`] } });
+    expect(controlNotification.content).toContain("p1 ");
     const successAny = notificationForJob({
       ...detail,
-      outcome: "success",
+      wait_result: "condition_met",
       result: {
-        outcome: "success",
+        wait_result: "condition_met",
         matched: true,
         targets: [
           { target: "first", targetId: "p1", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: false },
-          { target: "second", targetId: "p2", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: true }
+          { target: "second", targetId: "p2", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: true, target_evidence: { kind: "native_done_observed", observedAtMs: 1, targetGenerationRef: "target_generation_opaque", currency: "historical_non_current", source: "native_agent_wait" } }
         ]
       }
     });
     expect(successAny.content).toContain("matchedTargets=second (p2)");
     expect(successAny.content).not.toContain("matchedTargets=first");
-    expect(successAny.details).toMatchObject({ action: "wait", matchedTargets: ["p2"], matchedTargetCount: 1 });
+    expect(successAny.details).toMatchObject({ action: "wait", matchedTargets: ["p2"], matchedTargetCount: 1, target_evidence_kinds: ["native_done_observed"] });
     const successBeyondEvidence = notificationForJob({
       ...detail,
-      outcome: "success",
+      wait_result: "condition_met",
       result: {
-        outcome: "success",
+        wait_result: "condition_met",
         matched: true,
         targets: Array.from({ length: 101 }, (_, index) => ({ target: `target-${index + 1}`, targetId: `p${index + 1}`, metadata: {}, recentUnwrappedLines: [], observedAtMs: index, matched: index === 100 }))
       }
@@ -175,55 +177,55 @@ describe("global extension registration", () => {
     const boundedSuccess = notificationForJob({
       ...detail,
       request: { ...detail.request, targets: Array.from({ length: 20 }, (_, index) => `target-${index}`), targetIds: Array.from({ length: 20 }, (_, index) => `p${index}`) },
-      outcome: "success",
-      result: { outcome: "success", matched: true, matchedTargetCount: 20, matchedTargets: [{ target: "target-1", targetId: "p1" }] },
+      wait_result: "condition_met",
+      result: { wait_result: "condition_met", matched: true, matchedTargetCount: 20, matchedTargets: [{ target: "target-1", targetId: "p1" }] },
       truncation: { resultMatchedTargets: 19 }
     });
     expect(boundedSuccess.content).toContain("matchedTargetsOmitted=19");
     expect(boundedSuccess.details).toMatchObject({ matchedTargetCount: 20, matchedTargetsOmitted: 19, requestedTargetsOmitted: 4 });
     const timeoutWithMatchedSnapshot = notificationForJob({
       ...detail,
-      outcome: "timeout",
+      wait_result: "timed_out",
       result: {
-        outcome: "timeout",
+        wait_result: "timed_out",
         matched: false,
         targets: [{ target: "second", targetId: "p2", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: true }]
       }
     });
     expect(timeoutWithMatchedSnapshot.content).toContain("matchedTargets=none");
     expect(timeoutWithMatchedSnapshot.details).toMatchObject({ matchedTargets: [] });
-    const fallback = notificationForJob({ ...detail, jobId: 123 as never, status: "completed", outcome: undefined, result: undefined, request: { ...detail.request, targets: ["target"], targetIds: [] } });
-    expect(fallback).toMatchObject({ details: { outcome: "completed", reason: "completed", priority: "normal" } });
+    const fallback = notificationForJob({ ...detail, jobId: 123 as never, operation_phase: "accepted", wait_result: undefined, result: undefined, request: { ...detail.request, targets: ["target"], targetIds: [] } });
+    expect(fallback).toMatchObject({ details: { operation_phase: "accepted", reason: "awaiting_settlement", priority: "normal" } });
     expect(fallback.content).toContain("target (unknown)");
-    const cancelled = notificationForJob({ ...detail, status: "cancelled", outcome: undefined, result: undefined, cancelReason: "cancelled" });
-    expect(cancelled).toMatchObject({ details: { outcome: "cancelled", reason: "cancelled", priority: "normal" } });
-    const codedFailure = notificationForJob({ ...detail, status: "failed", outcome: undefined, result: undefined, error: { code: "BROKEN", message: "backend down" } });
+    const cancelled = notificationForJob({ ...detail, operation_phase: "settled", wait_result: "cancelled", result: undefined, cancelReason: "cancelled" });
+    expect(cancelled).toMatchObject({ details: { operation_phase: "settled", wait_result: "cancelled", reason: "cancelled", priority: "normal" } });
+    const codedFailure = notificationForJob({ ...detail, operation_phase: "settled", wait_result: "failed", result: undefined, error: { code: "BROKEN", message: "backend down" } });
     expect(codedFailure.content).toContain("reason=BROKEN");
     expect(codedFailure.content).toContain("error=BROKEN: backend down");
-    const uncodedFailure = notificationForJob({ ...detail, status: "failed", outcome: undefined, result: undefined, error: { message: "backend down" } });
+    const uncodedFailure = notificationForJob({ ...detail, operation_phase: "settled", wait_result: "failed", result: undefined, error: { message: "backend down" } });
     expect(uncodedFailure.content).toContain("reason=backend down");
     expect(uncodedFailure.content).toContain("error=error: backend down");
     enable();
     const { pi } = fakePi();
     const runtime = createRuntime(pi, process.env);
-    const handle = runtime.jobs.register({ ...detail.request, condition: { kind: "state", state: "done" } }, async () => ({ outcome: "success", matched: true, reason: "condition_met" }));
+    const handle = runtime.jobs.register({ ...detail.request, condition: { kind: "state", state: "done" } }, async () => ({ wait_result: "condition_met", matched: true, reason: "condition_met" }));
     await handle.promise;
     expect((pi.sendMessage as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(expect.objectContaining({ customType: "herdr-wait-job", display: true }), { deliverAs: "steer", triggerTurn: true });
     const sentContent = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]?.content as string;
-    expect(sentContent).toContain("outcome=success");
+    expect(sentContent).toContain("wait_result=condition_met");
 
     const noNotifier = createRuntime({ exec: vi.fn() }, process.env);
-    const noNotifierHandle = noNotifier.jobs.register(detail.request, async () => ({ outcome: "success", matched: true }));
+    const noNotifierHandle = noNotifier.jobs.register(detail.request, async () => ({ wait_result: "condition_met", matched: true }));
     await noNotifierHandle.promise;
 
     const syncThrow = vi.fn(() => { throw new Error("Pi is shutting down"); });
     const throwingRuntime = createRuntime({ exec: vi.fn(), sendMessage: syncThrow }, process.env);
-    const throwingHandle = throwingRuntime.jobs.register(detail.request, async () => ({ outcome: "success", matched: true }));
+    const throwingHandle = throwingRuntime.jobs.register(detail.request, async () => ({ wait_result: "condition_met", matched: true }));
     await throwingHandle.promise;
     expect(syncThrow).toHaveBeenCalledTimes(1);
     const asyncReject = vi.fn().mockRejectedValue(new Error("Pi is unavailable"));
     const rejectingRuntime = createRuntime({ exec: vi.fn(), sendMessage: asyncReject }, process.env);
-    const rejectingHandle = rejectingRuntime.jobs.register(detail.request, async () => ({ outcome: "success", matched: true }));
+    const rejectingHandle = rejectingRuntime.jobs.register(detail.request, async () => ({ wait_result: "condition_met", matched: true }));
     await rejectingHandle.promise;
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(asyncReject).toHaveBeenCalledTimes(1);

@@ -21,8 +21,8 @@ const snapshot = {
     protocol: 1,
     workspaces: [{ workspace_id: "w", label: "w" }],
     tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
-    panes: [{ pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "caller", agent_name: "caller", agent_status: "idle" }],
-    agents: [{ pane_id: "w:p", name: "caller", agent_status: "idle" }]
+    panes: [{ pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "caller", agent_name: "caller", agent: "pi", terminal_id: "term-caller", agent_session: { source: "pi", agent: "pi", kind: "id", value: "caller-session" }, agent_status: "idle" }],
+    agents: [{ pane_id: "w:p", name: "caller", agent: "pi", terminal_id: "term-caller", agent_session: { source: "pi", agent: "pi", kind: "id", value: "caller-session" }, agent_status: "idle" }]
   }
 };
 
@@ -31,6 +31,8 @@ function realSurface() {
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: snapshot.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
     if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: snapshot }), stderr: "", code: 0, killed: false };
+    if (argv[0] === "agent" && argv[1] === "wait") return { stdout: JSON.stringify({ id: "agent-wait", result: { agent: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }), stderr: "", code: 0, killed: false };
+    if (argv[0] === "agent" && argv[1] === "get") return { stdout: JSON.stringify({ id: "agent-get", result: { agent: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "pane", result: { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: "caller output", stderr: "", code: 0, killed: false };
     return { stdout: JSON.stringify({ id: "other", result: { ok: true } }), stderr: "", code: 0, killed: false };
@@ -249,7 +251,7 @@ describe("MCP result mapping", () => {
   });
 
   it("omits a details block that a shared block already publishes in full", async () => {
-    const details = { operation: "jobs", outcome: "success", jobs: [{ jobId: "job_1", status: "running" }] };
+    const details = { operation: "jobs", kind: "list", operation_phase: "running", jobs: [{ jobId: "job_1", operation_phase: "running" }] };
     const identical = await call(stub({ execute: async () => ({ content: [{ type: "text", text: JSON.stringify(details) }], details }) }));
     expect(identical.content).toEqual([{ type: "text", text: JSON.stringify(details) }]);
     const prettyPrinted = await call(stub({ execute: async () => ({ content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details }) }));
@@ -518,13 +520,14 @@ describe("MCP error mapping", () => {
  */
 const SENTINELS = ["pane-secret", "upper-secret", "env-secret", "vars-secret", "variables-secret", "overrides-secret", "array-secret", "deep-secret"];
 
-function leakyPane(paneId: string, label: string, status = "idle"): Record<string, unknown> {
+function leakyPane(paneId: string, label: string, status = "idle", withIdentity = false): Record<string, unknown> {
   return {
     pane_id: paneId,
     tab_id: "w:t",
     workspace_id: "w",
     label,
     agent_name: label,
+    ...(withIdentity ? { agent: "pi", terminal_id: `term-${paneId}`, agent_session: { source: "pi", agent: "pi", kind: "id", value: `${paneId}-session` } } : {}),
     agent_status: status,
     environment: { SECRET: "pane-secret" },
     ENVIRONMENT: { SECRET: "upper-secret" },
@@ -537,7 +540,7 @@ function leakyPane(paneId: string, label: string, status = "idle"): Record<strin
 }
 
 function leakySurface() {
-  const panes = [leakyPane("w:p", "caller"), leakyPane("w:p2", "worker")];
+  const panes = [leakyPane("w:p", "caller", "idle", true), leakyPane("w:p2", "worker", "idle", true)];
   const live = {
     type: "session_snapshot",
     snapshot: {
@@ -546,7 +549,7 @@ function leakySurface() {
       workspaces: [{ workspace_id: "w", label: "w" }],
       tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
       panes,
-      agents: [{ pane_id: "w:p", name: "caller", agent_status: "idle" }, { pane_id: "w:p2", name: "worker", agent_status: "idle" }]
+      agents: [{ pane_id: "w:p", name: "caller", agent: "pi", terminal_id: "term-w:p", agent_session: { source: "pi", agent: "pi", kind: "id", value: "w:p-session" }, agent_status: "idle" }, { pane_id: "w:p2", name: "worker", agent: "pi", terminal_id: "term-w:p2", agent_session: { source: "pi", agent: "pi", kind: "id", value: "w:p2-session" }, agent_status: "idle" }]
     }
   };
   const envelope = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
@@ -554,6 +557,8 @@ function leakySurface() {
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: live.snapshot.panes[0] });
     if (argv[0] === "api") return envelope("snapshot", live);
+    if (argv[0] === "agent" && argv[1] === "wait") return envelope("agent-wait", { agent: panes.find((pane) => pane.pane_id === argv[2]) ?? leakyPane(argv[2]!, "created") });
+    if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: panes.find((pane) => pane.pane_id === argv[2]) ?? leakyPane(argv[2]!, "created") });
     if (argv[0] === "pane" && argv[1] === "get") return envelope("pane", { pane: panes.find((pane) => pane.pane_id === argv[2]) ?? leakyPane(argv[2]!, "created") });
     if (argv[0] === "pane" && argv[1] === "read") return { stdout: "worker output", stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "split") return envelope("split", { pane: leakyPane("w:p3", "created") });

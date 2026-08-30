@@ -55,8 +55,10 @@ describe("Pi production reviewer adapter", () => {
     await expect(failing.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { cause: "provider down" } });
     const stringFailing = new PiModelReviewer(registry(), "luna", async () => { throw "provider down"; });
     await expect(stringFailing.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { cause: "provider down" } });
-    const stopped = new PiModelReviewer(registry(), "luna", async () => ({ ...message(JSON.stringify({ classification: "completed", summary: "done" })), stopReason: "aborted" }));
+    const stopped = new PiModelReviewer(registry(), "luna", async () => ({ ...message(JSON.stringify({ classification: "appears_complete", summary: "done" })), stopReason: "aborted" }));
     await expect(stopped.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { code: "ABORTED" } });
+    const legacy = new PiModelReviewer(registry(), "luna", async () => message(JSON.stringify({ classification: "completed", summary: "done" })));
+    await expect(legacy.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
   });
 
   it("bounds reviewer prompts and summaries while preserving only text content", async () => {

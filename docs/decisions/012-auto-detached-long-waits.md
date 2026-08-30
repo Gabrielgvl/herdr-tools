@@ -14,17 +14,15 @@ agent so the result is actionable without polling.
 
 ## Decision
 
-- If `runInBackground` is omitted and the timeout exceeds the configured review
-  cadence, `herdr_wait` automatically registers a session-scoped background job.
-- `runInBackground: true` continues to force detachment for any timeout.
-- `runInBackground: false` is an explicit synchronous opt-out for callers that
-  need the blocking result.
-- Both automatic and explicit background waits use the existing shared wait
-  runner and mandatory in-process watcher model. The watcher remains tool-less
-  and authoritative state/output still decides whether the condition matches.
-- Terminal background outcomes use the existing visible Pi steer notification
-  with `triggerTurn: true`, waking the initiating agent. Explicit cancel and
-  session-shutdown cancellation remain silent.
+- A wait whose timeout exceeds the configured review cadence is registered as
+  a session-scoped detached job, and the current API applies the same detached
+  lifecycle to every timeout.
+- Detached waits use the existing shared wait runner and mandatory in-process
+  watcher model. The watcher remains tool-less and authoritative state/output
+  still decides whether the condition matches.
+- Terminal detached results use the existing visible Pi steer notification
+  with `triggerTurn: true`, waking the initiating agent. Explicit cancellation
+  and session-shutdown cancellation remain silent.
 
 ## Alternatives considered
 
@@ -45,7 +43,6 @@ act on the completed wait.
 
 ## Consequences
 
-Long waits return an opaque job ID after authoritative preflight, while callers
-that explicitly request synchronous execution retain the existing foreground
-result and watcher behavior. Existing `herdr_jobs` inspection, cancellation,
-active-wait UI, and bounded terminal notifications apply unchanged.
+Long waits return an opaque job ID after authoritative preflight. Existing
+`herdr_jobs` inspection, cancellation, active-wait UI, and bounded terminal
+notifications apply unchanged.

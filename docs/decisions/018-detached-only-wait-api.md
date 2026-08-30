@@ -12,9 +12,9 @@ Accepted; supersedes ADR-012 and the synchronous execution portion of ADR-002.
 
 `herdr_wait` previously exposed two public execution modes. A caller could keep
 its tool turn occupied with a synchronous wait or register a session-scoped
-background job. That split duplicated the public contract around completion,
-progress, cancellation, and rendering, while all durable wait lifecycle state
-already belonged in the job registry.
+background job. That split duplicated the public contract around settlement,
+progress, cancellation, and rendering, while all wait lifecycle state already
+belonged in the job registry.
 
 The wait engine still needs to retain authoritative target polling, reviewer
 cadence, bounded progress, terminal evidence, Pi notifications, active-wait UI,
@@ -23,9 +23,9 @@ than allowing a caller to accidentally hold a tool turn open.
 
 ## Decision
 
-- `WaitParamsSchema` contains no execution-mode field. `runInBackground` is not
-  a supported or deprecated input: both `true` and `false` are rejected as
-  unknown fields, as are all other unknown fields. No compatibility parser or
+- `WaitParamsSchema` contains no execution-mode field. Any execution-mode field,
+  including both boolean spellings used by earlier revisions, is rejected as an
+  unknown field along with every other unknown field. No compatibility parser or
   fallback is provided.
 - Every `herdr_wait` call first validates parameters, loads extension-owned
   settings, resolves the live caller context and exact targets, and rejects
@@ -34,12 +34,18 @@ than allowing a caller to accidentally hold a tool turn open.
 - After successful preflight, every call registers one session-scoped job with
   copied request/settings/target evidence, a fresh per-job cancellation signal,
   and the existing prepared wait engine. The tool returns the bounded detached
-  acknowledgement immediately. Timeout, success, reviewer failure, manager
-  judgment, progress, and cancellation are observed through `herdr_jobs`.
+  acknowledgement immediately. Operation phase and terminal wait result,
+  reviewer findings, progress, and cancellation evidence are observed through
+  `herdr_jobs`.
+- The public job vocabulary is deliberately narrow: operation phase is one of
+  `accepted`, `running`, `cancel_requested`, or `settled`; `wait_result` is
+  absent before settlement and then is one of `condition_met`, `timed_out`,
+  `manager_judgment_required`, `failed`, `cancelled`, or `unknown`.
 - The prepared wait engine remains internal to detached jobs. It retains the
-  authoritative polling and reviewer-cadence behavior, and sends bounded state
-  and reviewer progress to the registry. The initiating `onUpdate` callback is
-  never used after registration, and no foreground result shape is exposed.
+  authoritative native/composite observation and reviewer-cadence behavior,
+  and sends bounded state and reviewer progress to the registry. The initiating
+  `onUpdate` callback is never used after registration, and no foreground result
+  shape is exposed.
 - The wait tool keeps only its compact call renderer and detached
   acknowledgement/error result renderer. Foreground execution-specific result
   and progress rendering paths are removed. Pi terminal notifications and the
@@ -53,11 +59,11 @@ than allowing a caller to accidentally hold a tool turn open.
 
 Rejected: an opt-out would preserve the split lifecycle and keep callers
 responsible for choosing between a tool-turn result and a job result. The job
-registry is already the single owner of wait completion and cancellation.
+registry is already the single owner of wait settlement and cancellation.
 
-### Silently treat `runInBackground` as always true
+### Silently accept an obsolete execution-mode field
 
-Rejected: accepting the obsolete field would be a compatibility layer and would
+Rejected: accepting an obsolete field would be a compatibility layer and would
 hide a caller contract error. Strict schema and runtime rejection make the new
 API unambiguous.
 
@@ -76,11 +82,13 @@ reads, reviewer handling, and terminal evidence.
 
 ## Consequences
 
-Every caller receives a job ID and must use `herdr_jobs` for completion and
+Every caller receives a job ID and must use `herdr_jobs` for settlement and
 cancellation. Short waits detach just like long waits, so MCP clients no longer
 need a tool-call timeout for wait execution and Pi callers cannot receive a
 synchronous wait result. Preflight remains fail-closed and does not allocate a
-job when validation, settings, context, or target resolution fails.
+job when validation, settings, context, or target resolution fails. Historical
+`target_evidence` is explicitly marked `currency: "historical_non_current"`
+and cannot be used as current target truth.
 
 The registry, notification, active-wait UI, and bounded evidence tests remain
 the authoritative wait observability gates. Existing ADR-002 and ADR-012 files

@@ -53,7 +53,7 @@ describe("WaitJobsUi", () => {
     expect(formatElapsed(3_661_000)).toBe("1h01m");
   });
 
-  it("uses the real clock scheduler defaults without leaking a timer", () => {
+  it("uses the real clock scheduler defaults without leaking a timer", async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(20_000);
@@ -67,14 +67,14 @@ describe("WaitJobsUi", () => {
       expect(vi.getTimerCount()).toBe(1);
       vi.advanceTimersByTime(1_000);
       expect(rendered.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠙ Herdr waits: 1 · oldest 1s · /herdr-waits");
-      registry.cancel(job.jobId);
+      await registry.cancel(job.jobId);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("starts one live footer timer and clears it when the active set empties", () => {
+  it("starts one live footer timer and clears it when the active set empties", async () => {
     const h = harness();
     const job = h.registry.register(request, pending);
     expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠋ Herdr waits: 1 · oldest 0s · /herdr-waits");
@@ -83,17 +83,17 @@ describe("WaitJobsUi", () => {
     h.tick();
     expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠙ Herdr waits: 1 · oldest 2s · /herdr-waits");
     expect(h.scheduler.setInterval).toHaveBeenCalledTimes(1);
-    h.registry.cancel(job.jobId);
+    await h.registry.cancel(job.jobId);
     expect(h.scheduler.clearInterval).toHaveBeenCalledWith("timer");
     expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", undefined);
   });
 
-  it("toggles a read-only active list and remembers it across an empty active set", () => {
+  it("toggles a read-only active list and remembers it across an empty active set", async () => {
     const h = harness();
     expect(h.ui.toggle(h.context)).toBe(true);
     const first = h.registry.register(request, pending);
     expect(h.setWidget).toHaveBeenLastCalledWith("herdr-waits", ["review worker · 0s · job_1"], { placement: "aboveEditor" });
-    h.registry.cancel(first.jobId);
+    await h.registry.cancel(first.jobId);
     expect(h.setWidget).toHaveBeenLastCalledWith("herdr-waits", undefined, { placement: "aboveEditor" });
     h.setNow(15_000);
     h.registry.register({ ...request, label: "test worker" }, pending);

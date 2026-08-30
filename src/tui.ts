@@ -61,9 +61,16 @@ export function resultForRender(
   targetId?: string,
 ): { text: string; tone: "success" | "warning" | "error" | "muted" } {
   if (options.isPartial) return { text: `partial · ${operation}`, tone: "warning" };
-  const details = result.details as { outcome?: unknown; reason?: unknown; code?: unknown; delivery?: unknown; postState?: { agent_status?: string }; finalState?: { agent_status?: string }; paneId?: string; tabId?: string; jobId?: string } | undefined;
+  const details = result.details as { outcome?: unknown; operation_phase?: unknown; wait_result?: unknown; reason?: unknown; code?: unknown; delivery?: unknown; postState?: { agent_status?: string }; finalState?: { agent_status?: string }; paneId?: string; tabId?: string; jobId?: string } | undefined;
+  if (operation === "wait" && details?.operation_phase === "accepted") return { text: `accepted${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "muted" };
+  if (operation === "wait" && details?.operation_phase === "running") return { text: `running${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "muted" };
+  if (operation === "wait" && details?.operation_phase === "cancel_requested") return { text: `cancel_requested${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "warning" };
+  if (operation === "wait" && details?.operation_phase === "settled") {
+    const waitResult = typeof details.wait_result === "string" ? details.wait_result : "unknown";
+    const tone = waitResult === "failed" ? "error" : waitResult === "manager_judgment_required" || waitResult === "cancelled" || waitResult === "unknown" ? "warning" : "muted";
+    return { text: `settled · ${waitResult}${targetId ? ` · ${targetId}` : ""}`, tone };
+  }
   if (details?.outcome === "partial") return { text: `partial${targetId ? ` · ${targetId}` : ""}`, tone: "warning" };
-  if (details?.outcome === "background") return { text: `background${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "success" };
   if (result.isError) {
     const code = typeof details?.code === "string" ? details.code : "UNKNOWN";
     const delivery = details?.delivery === "inline" || details?.delivery === "attachment" ? details.delivery : undefined;

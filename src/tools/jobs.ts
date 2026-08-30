@@ -48,13 +48,13 @@ export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof Job
         throw new JobsError("INVALID_INPUT", error instanceof Error ? error.message : String(error));
       }
       if (params.operation === "list") {
-        const page = registry.list(params.status, params.offset ?? 0, params.limit ?? 20);
+        const page = registry.list(params.operation_phase, params.offset ?? 0, params.limit ?? 20);
         return resultFor({ operation: "jobs", kind: "list", ...page });
       }
       const job = registry.get(params.jobId);
       if (!job) throw new JobsError("JOB_NOT_FOUND", `JOB_NOT_FOUND: unknown Herdr job ${params.jobId}`, { jobId: params.jobId });
       if (params.operation === "cancel") {
-        const cancelled = registry.cancel(params.jobId);
+        const cancelled = await registry.cancel(params.jobId);
         if (!cancelled) throw new JobsError("JOB_NOT_FOUND", `JOB_NOT_FOUND: unknown Herdr job ${params.jobId}`, { jobId: params.jobId });
         return resultFor({ operation: "jobs", kind: "job", ...cancelled });
       }
@@ -73,8 +73,12 @@ export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof Job
       }
       const details = result.details as JobsDetails | undefined;
       if (!details || details.operation !== "jobs") return textComponent("error UNKNOWN", theme, "error");
-      if (details.kind === "list") return textComponent(`jobs · ${details.jobs.length}/${details.total}`, theme, "success");
-      return textComponent(`job · ${details.status}`, theme, details.status === "failed" ? "error" : details.status === "cancelled" ? "warning" : "success");
+      if (details.kind === "list") return textComponent(`jobs · ${details.jobs.length}/${details.total}`, theme, "muted");
+      const phase = details.operation_phase;
+      const waitResult = details.wait_result;
+      const state = phase === "settled" && waitResult ? `settled · ${waitResult}` : phase;
+      const tone = waitResult === "failed" ? "error" : waitResult === "manager_judgment_required" || waitResult === "unknown" || waitResult === "cancelled" ? "warning" : "muted";
+      return textComponent(`job · ${state}`, theme, tone);
     }
   };
 }

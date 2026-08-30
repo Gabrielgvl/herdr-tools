@@ -31,7 +31,7 @@ Read every inbound `[HERDR AGENT MESSAGE v1]` envelope before acting on its payl
 
 ## Waiting and cleanup
 
-Every `herdr_wait` call is detached: it validates and preflights the exact targets, registers a background job, and returns immediately. Poll the returned job ID with `herdr_jobs` `list` and `get`; completion is never a synchronous wait result. Cancel jobs that are no longer needed only with `herdr_jobs` `cancel`. The Pi host may also show its existing terminal notification and active-wait UI.
+Every `herdr_wait` call is detached: it validates and preflights the exact targets, registers a job, and returns immediately with an `accepted` operation phase and opaque job ID. Poll the returned job ID with `herdr_jobs` `list` and `get`; the job moves through `accepted`, `running`, `cancel_requested`, and `settled`, and only a settled job has a `wait_result` (`condition_met`, `timed_out`, `manager_judgment_required`, `failed`, `cancelled`, or `unknown`). Cancel jobs that are no longer needed only with `herdr_jobs` `cancel`; cancellation is `cancelled` only after observed quiescence and otherwise `unknown`. The Pi host may also show its existing terminal notification and active-wait UI. Historical target evidence is marked `currency: "historical_non_current"` and is never current target truth.
 
 Close only panes and tabs this session created and still owns. Never close the owner's pane, the manager's own pane, or a resource another session owns. Use authoritative post-state after mutations and report uncertainty rather than guessing. Hand off before context exhaustion, including exact IDs, profile identity, evidence, blockers, and cleanup state.
 

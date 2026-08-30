@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import { WAIT_LABEL_MAX_BYTES } from "./wait-schema.js";
+import { isTargetEvidence, type TargetEvidence } from "./wait-target-evidence.js";
 
-export const JOB_STATUSES = ["running", "completed", "failed", "cancelled"] as const;
-export type JobStatus = (typeof JOB_STATUSES)[number];
-export const WAIT_OUTCOMES = ["success", "timeout", "manager_judgment_required"] as const;
-export type WaitOutcome = (typeof WAIT_OUTCOMES)[number];
+export const OPERATION_PHASES = ["accepted", "running", "cancel_requested", "settled"] as const;
+export type OperationPhase = (typeof OPERATION_PHASES)[number];
+
+export const WAIT_RESULTS = ["condition_met", "timed_out", "manager_judgment_required", "failed", "cancelled", "unknown"] as const;
+export type WaitResult = (typeof WAIT_RESULTS)[number];
 
 const MAX_TEXT_BYTES = 50_000;
 const MAX_TEXT_LINES = 2_000;
@@ -18,6 +20,7 @@ const PUBLIC_REVIEWER_SUMMARIES = 6;
 const PUBLIC_LIST_JOBS = 100;
 const PUBLIC_SUMMARY_ITEMS = 2;
 const PUBLIC_FIELD_BYTES = 256;
+type LateSettlementKind = "fulfilled" | "rejected";
 
 export interface TruncatedDetails {
   truncated: true;
@@ -38,6 +41,7 @@ export interface JobRequestSnapshot {
   label: string;
   targets: string[];
   targetIds: string[];
+  target_generation_refs?: string[];
   match: "any" | "all";
   condition: unknown;
   timeoutMs: number;
@@ -54,22 +58,25 @@ export interface JobProgress {
   details?: unknown;
 }
 
+export interface JobResultTargetSnapshot {
+  target: string;
+  targetId: string;
+  metadata: PublicDetails;
+  recentUnwrappedLines: string[];
+  outputTruncated?: boolean;
+  observedAtMs: number;
+  matched: boolean;
+  target_evidence?: TargetEvidence;
+}
+
 export interface JobResultSnapshot {
-  outcome: WaitOutcome;
+  wait_result: WaitResult;
   matched: boolean;
   reason?: string;
   /** Exact match facts are independent from the bounded evidence window. */
   matchedTargetCount?: number;
   matchedTargets?: Array<{ target: string; targetId: string }>;
-  targets?: Array<{
-    target: string;
-    targetId: string;
-    metadata: PublicDetails;
-    recentUnwrappedLines: string[];
-    outputTruncated?: boolean;
-    observedAtMs: number;
-    matched: boolean;
-  }>;
+  targets?: JobResultTargetSnapshot[];
   reviewerSummaries?: Array<{
     target: string;
     targetId: string;
@@ -89,6 +96,8 @@ export interface JobTruncation {
   requestTargetsClipped?: number;
   requestTargetIds?: number;
   requestTargetIdsClipped?: number;
+  requestTargetGenerationRefs?: number;
+  requestTargetGenerationRefsClipped?: number;
   requestCondition?: boolean;
   requestConditionClipped?: boolean;
   requestLabelClipped?: boolean;
@@ -100,48 +109,57 @@ export interface JobTruncation {
   resultMatchedTargets?: number;
   resultTargetValuesClipped?: number;
   resultTargetIdsClipped?: number;
+  resultTargetGenerationRefsClipped?: number;
   resultTargetLines?: number;
   resultTargetLinesClipped?: number;
   resultTargetMetadata?: number;
+  resultTargetEvidence?: number;
   reviewerSummaries?: number;
   reviewerFieldsClipped?: number;
   errorDetails?: boolean;
   errorCodeClipped?: boolean;
   errorMessageClipped?: boolean;
   publicEvidenceOmitted?: boolean;
+  lateSettlementClipped?: boolean;
+}
+
+export interface LateSettlementObservation {
+  kind: LateSettlementKind;
+  observedAtMs: number;
 }
 
 export interface JobDetail {
   jobId: string;
-  status: JobStatus;
+  operation_phase: OperationPhase;
   sequence: number;
   createdAtMs: number;
   startedAtMs?: number;
   finishedAtMs?: number;
   request: JobRequestSnapshot;
   progress?: JobProgress;
-  outcome?: WaitOutcome;
+  wait_result?: WaitResult;
   result?: JobResultSnapshot;
   error?: JobErrorSnapshot;
   cancelReason?: "cancelled" | "shutdown";
+  late_settlement_observed?: LateSettlementObservation;
   truncation?: JobTruncation;
 }
 
 export interface JobSummary {
   jobId: string;
   label: string;
-  status: JobStatus;
+  operation_phase: OperationPhase;
   sequence: number;
   createdAtMs: number;
   startedAtMs?: number;
   finishedAtMs?: number;
   targetIds: string[];
   targets: string[];
-  outcome?: WaitOutcome;
+  wait_result?: WaitResult;
   reason?: string;
   progress?: { text: string; atMs: number };
   error?: { code?: string; message: string };
-  truncation?: { targetIds?: number; targetIdsClipped?: number; targets?: number; targetsClipped?: number; progress?: boolean; jobIdClipped?: boolean; labelClipped?: boolean };
+  truncation?: { targetIds?: number; targetIdsClipped?: number; targets?: number; targetsClipped?: number; targetGenerationRefs?: number; targetGenerationRefsClipped?: number; progress?: boolean; jobIdClipped?: boolean; labelClipped?: boolean };
 }
 
 export interface RunningJobOverview {
@@ -167,8 +185,15 @@ export interface JobGeneration {
   readonly generation: number;
 }
 
+export interface JobOperationControl {
+  readonly fence: number;
+  readonly isOpen: () => boolean;
+  readonly check: () => void;
+  readonly beginActivity: () => () => void;
+}
+
 export interface JobRunResult {
-  outcome: WaitOutcome;
+  wait_result: WaitResult;
   matched: boolean;
   reason?: string;
   matchedTargetCount?: number;
@@ -188,6 +213,8 @@ export interface JobRegistryOptions {
   clock?: JobClock;
   onTerminal?: (detail: JobDetail) => void | Promise<void>;
   onChange?: () => void | Promise<void>;
+  /** Maximum time allowed to observe runner/callback quiescence after cancellation. */
+  quiescenceMs?: number;
 }
 
 export interface RegisteredJob {
@@ -198,10 +225,35 @@ export interface RegisteredJob {
   promise: Promise<void>;
 }
 
+interface TransitionLock {
+  runExclusive<T>(operation: () => T | Promise<T>): Promise<T>;
+}
+
+function transitionLock(): TransitionLock {
+  let tail = Promise.resolve();
+  return {
+    runExclusive<T>(operation: () => T | Promise<T>): Promise<T> {
+      const previous = tail;
+      let release!: () => void;
+      tail = new Promise<void>((resolve) => { release = resolve; });
+      return previous.then(operation).finally(release);
+    }
+  };
+}
+
 interface JobRecord {
   detail: JobDetail;
   controller: AbortController;
   generation: JobGeneration;
+  lock: TransitionLock;
+  control: JobOperationControl;
+  gateOpen: boolean;
+  fenceValue: number;
+  runnerStarted: boolean;
+  runnerDone: boolean;
+  activityCount: number;
+  executionPromise: Promise<void>;
+  resolveDrain: Array<() => void>;
 }
 
 function clone<T>(value: T): T {
@@ -282,7 +334,13 @@ function boundedCondition(value: unknown, truncation: JobTruncation, maxBytes = 
   return { kind: "output", match: { kind: condition.match.kind, value: valueText } };
 }
 
-function boundedStrings(values: string[], limit: number, truncation: JobTruncation, key: "requestTargets" | "requestTargetIds", clippedKey: "requestTargetsClipped" | "requestTargetIdsClipped"): string[] {
+function boundedStrings(
+  values: string[],
+  limit: number,
+  truncation: JobTruncation,
+  key: "requestTargets" | "requestTargetIds" | "requestTargetGenerationRefs",
+  clippedKey: "requestTargetsClipped" | "requestTargetIdsClipped" | "requestTargetGenerationRefsClipped"
+): string[] {
   const selected = values.slice(0, limit);
   const copied = selected.map((value) => boundedText(value, PUBLIC_FIELD_BYTES));
   const omitted = values.length - copied.length;
@@ -297,10 +355,14 @@ function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): Jo
   if (label !== request.label) truncation.requestLabelClipped = true;
   const reviewerModel = boundedText(request.settings.reviewerModel, PUBLIC_FIELD_BYTES);
   if (reviewerModel !== request.settings.reviewerModel) truncation.requestReviewerModelClipped = true;
+  const refs = request.target_generation_refs === undefined
+    ? undefined
+    : boundedStrings(request.target_generation_refs, PUBLIC_REQUEST_ITEMS, truncation, "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped");
   return {
     label,
     targets: boundedStrings(request.targets, PUBLIC_REQUEST_ITEMS, truncation, "requestTargets", "requestTargetsClipped"),
     targetIds: boundedStrings(request.targetIds, PUBLIC_REQUEST_ITEMS, truncation, "requestTargetIds", "requestTargetIdsClipped"),
+    ...(refs === undefined ? {} : { target_generation_refs: refs }),
     match: request.match,
     condition: boundedCondition(request.condition, truncation),
     timeoutMs: request.timeoutMs,
@@ -312,11 +374,27 @@ function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): Jo
   };
 }
 
+function copyEvidence(value: unknown, truncation: JobTruncation): TargetEvidence | undefined {
+  if (!isTargetEvidence(value)) {
+    truncation.resultTargetEvidence = (truncation.resultTargetEvidence ?? 0) + 1;
+    return undefined;
+  }
+  const targetGenerationRef = boundedText(value.targetGenerationRef, PUBLIC_FIELD_BYTES);
+  if (targetGenerationRef !== value.targetGenerationRef) truncation.resultTargetGenerationRefsClipped = (truncation.resultTargetGenerationRefsClipped ?? 0) + 1;
+  return {
+    kind: value.kind,
+    observedAtMs: value.observedAtMs,
+    targetGenerationRef,
+    currency: "historical_non_current",
+    source: value.source
+  };
+}
+
 function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit = PUBLIC_RESULT_TARGETS, lineLimit = PUBLIC_TARGET_LINES, reviewerLimit = PUBLIC_REVIEWER_SUMMARIES): JobResultSnapshot {
   const sourceTargets = result.targets ?? [];
-  const matchedSourceTargets = result.outcome === "success" ? sourceTargets.filter((target) => target.matched) : [];
-  const matchedSourceRefs = result.outcome === "success" ? result.matchedTargets ?? matchedSourceTargets.map((target) => ({ target: target.target, targetId: target.targetId })) : [];
-  const matchedTargetCount = result.outcome === "success" ? result.matchedTargetCount ?? matchedSourceTargets.length : 0;
+  const matchedSourceTargets = result.wait_result === "condition_met" ? sourceTargets.filter((target) => target.matched) : [];
+  const matchedSourceRefs = result.wait_result === "condition_met" ? result.matchedTargets ?? matchedSourceTargets.map((target) => ({ target: target.target, targetId: target.targetId })) : [];
+  const matchedTargetCount = result.wait_result === "condition_met" ? result.matchedTargetCount ?? matchedSourceTargets.length : 0;
   const selectedTargets = [...matchedSourceTargets, ...sourceTargets.filter((target) => !target.matched)].slice(0, targetLimit);
   const targets = selectedTargets.map((target) => {
     const lines = target.recentUnwrappedLines.slice(-lineLimit);
@@ -330,6 +408,7 @@ function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit
       if (bounded !== line) truncation.resultTargetLinesClipped = (truncation.resultTargetLinesClipped ?? 0) + 1;
       return bounded;
     });
+    const targetEvidence = target.target_evidence === undefined ? undefined : copyEvidence(target.target_evidence, truncation);
     return {
       target: targetValue,
       targetId,
@@ -337,7 +416,8 @@ function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit
       recentUnwrappedLines,
       ...(target.outputTruncated === undefined ? {} : { outputTruncated: target.outputTruncated }),
       observedAtMs: target.observedAtMs,
-      matched: target.matched
+      matched: target.matched,
+      ...(targetEvidence === undefined ? {} : { target_evidence: targetEvidence })
     };
   });
   if (sourceTargets.length > targets.length) truncation.resultTargets = sourceTargets.length - targets.length;
@@ -359,7 +439,7 @@ function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit
   });
   if (sourceReviews.length > reviewerSummaries.length) truncation.reviewerSummaries = sourceReviews.length - reviewerSummaries.length;
   return {
-    outcome: result.outcome,
+    wait_result: result.wait_result,
     matched: result.matched,
     ...(matchedTargetCount > 0 ? { matchedTargetCount, matchedTargets } : {}),
     ...(result.reason ? { reason: boundedText(result.reason) } : {}),
@@ -379,7 +459,7 @@ function copyProgress(progress: JobProgress, truncation: JobTruncation): JobProg
 }
 
 const TRUNCATION_KEYS = [
-  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestCondition", "requestConditionClipped", "requestLabelClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "reviewerSummaries", "reviewerFieldsClipped", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted"
+  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped", "requestCondition", "requestConditionClipped", "requestLabelClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetGenerationRefsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "resultTargetEvidence", "reviewerSummaries", "reviewerFieldsClipped", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted", "lateSettlementClipped"
 ] as const;
 
 function boundedTruncation(value: JobTruncation | undefined): JobTruncation {
@@ -424,7 +504,7 @@ function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
   truncation.publicEvidenceOmitted = true;
   return {
     jobId: boundedText(copy.jobId, 128),
-    status: copy.status,
+    operation_phase: copy.operation_phase,
     sequence: copy.sequence,
     createdAtMs: copy.createdAtMs,
     ...(copy.startedAtMs === undefined ? {} : { startedAtMs: copy.startedAtMs }),
@@ -438,9 +518,10 @@ function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
       timeoutMs: copy.request.timeoutMs,
       settings: copy.request.settings
     },
-    ...(copy.outcome ? { outcome: copy.outcome } : {}),
-    ...(copy.result ? { result: { outcome: copy.result.outcome, matched: copy.result.matched, ...(copy.result.matchedTargetCount === undefined ? {} : { matchedTargetCount: copy.result.matchedTargetCount }), ...(copy.result.matchedTargets ? { matchedTargets: copy.result.matchedTargets.slice(0, 1) } : {}) } } : {}),
+    ...(copy.operation_phase === "settled" && copy.wait_result ? { wait_result: copy.wait_result } : {}),
+    ...(copy.result ? { result: { wait_result: copy.result.wait_result, matched: copy.result.matched, ...(copy.result.matchedTargetCount === undefined ? {} : { matchedTargetCount: copy.result.matchedTargetCount }), ...(copy.result.matchedTargets ? { matchedTargets: copy.result.matchedTargets.slice(0, 1) } : {}) } } : {}),
     ...(copy.cancelReason ? { cancelReason: copy.cancelReason } : {}),
+    ...(copy.late_settlement_observed ? { late_settlement_observed: copy.late_settlement_observed } : {}),
     truncation
   };
 }
@@ -449,17 +530,26 @@ export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): Jo
   const truncation: JobTruncation = boundedTruncation(detail.truncation);
   const jobId = boundedText(detail.jobId, PUBLIC_FIELD_BYTES);
   if (jobId !== detail.jobId) truncation.jobIdClipped = true;
+  const terminal = detail.operation_phase === "settled";
   const copy: JobDetail = {
     jobId,
-    status: detail.status,
+    operation_phase: detail.operation_phase,
     sequence: detail.sequence,
     createdAtMs: detail.createdAtMs,
-    startedAtMs: detail.startedAtMs,
-    finishedAtMs: detail.finishedAtMs,
+    ...(detail.startedAtMs === undefined ? {} : { startedAtMs: detail.startedAtMs }),
+    ...(detail.finishedAtMs === undefined ? {} : { finishedAtMs: detail.finishedAtMs }),
     request: copyRequest(detail.request, truncation),
     ...(detail.progress ? { progress: copyProgress(detail.progress, truncation) } : {}),
-    ...(detail.outcome ? { outcome: detail.outcome } : {}),
-    ...(detail.result ? { result: copyResult(detail.result, truncation) } : {}),
+    ...(terminal && detail.wait_result ? { wait_result: detail.wait_result } : {}),
+    ...(terminal && detail.result ? { result: copyResult({
+      wait_result: detail.result.wait_result,
+      matched: detail.result.matched,
+      ...(detail.result.reason ? { reason: detail.result.reason } : {}),
+      ...(detail.result.matchedTargetCount === undefined ? {} : { matchedTargetCount: detail.result.matchedTargetCount }),
+      ...(detail.result.matchedTargets ? { matchedTargets: detail.result.matchedTargets } : {}),
+      ...(detail.result.targets ? { targets: detail.result.targets } : {}),
+      ...(detail.result.reviewerSummaries ? { reviewerSummaries: detail.result.reviewerSummaries } : {})
+    }, truncation) } : {}),
     ...(detail.error ? {
       error: {
         ...(detail.error.code ? { code: boundedText(detail.error.code, PUBLIC_FIELD_BYTES) } : {}),
@@ -467,7 +557,8 @@ export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): Jo
         ...(detail.error.details === undefined ? {} : { details: boundedDetails(detail.error.details) })
       }
     } : {}),
-    ...(detail.cancelReason ? { cancelReason: detail.cancelReason } : {})
+    ...(detail.cancelReason ? { cancelReason: detail.cancelReason } : {}),
+    ...(detail.late_settlement_observed ? { late_settlement_observed: detail.late_settlement_observed } : {})
   };
   if (detail.error?.code && boundedText(detail.error.code, PUBLIC_FIELD_BYTES) !== detail.error.code) truncation.errorCodeClipped = true;
   if (detail.error && boundedText(detail.error.message) !== detail.error.message) truncation.errorMessageClipped = true;
@@ -487,10 +578,15 @@ function summary(detail: JobDetail): JobSummary {
   const targets = detail.request.targets.slice(0, PUBLIC_SUMMARY_ITEMS).map((value) => boundedText(value, 48));
   if (detail.request.targetIds.length > targetIds.length) truncation.targetIds = detail.request.targetIds.length - targetIds.length;
   if (detail.request.targets.length > targets.length) truncation.targets = detail.request.targets.length - targets.length;
+  const sourceRefs = detail.request.target_generation_refs;
+  const refs = sourceRefs === undefined ? undefined : sourceRefs.slice(0, PUBLIC_SUMMARY_ITEMS).map((value) => boundedText(value, 48));
+  if (refs !== undefined && refs.length < sourceRefs!.length) truncation.targetGenerationRefs = sourceRefs!.length - refs.length;
   const clippedTargetIds = detail.request.targetIds.slice(0, targetIds.length).filter((value, index) => targetIds[index] !== value).length;
   const clippedTargets = detail.request.targets.slice(0, targets.length).filter((value, index) => targets[index] !== value).length;
+  const clippedRefs = refs === undefined ? 0 : refs.filter((value, index) => value !== sourceRefs![index]).length;
   if (clippedTargetIds > 0) truncation.targetIdsClipped = clippedTargetIds;
   if (clippedTargets > 0) truncation.targetsClipped = clippedTargets;
+  if (clippedRefs > 0) truncation.targetGenerationRefsClipped = clippedRefs;
   const progress = detail.progress ? { text: boundedText(detail.progress.text, 128), atMs: detail.progress.atMs } : undefined;
   if (detail.progress && progress && progress.text !== detail.progress.text) truncation.progress = true;
   const jobId = boundedText(detail.jobId, 64);
@@ -498,14 +594,15 @@ function summary(detail: JobDetail): JobSummary {
   return clone({
     jobId,
     label,
-    status: detail.status,
+    operation_phase: detail.operation_phase,
     sequence: detail.sequence,
     createdAtMs: detail.createdAtMs,
-    startedAtMs: detail.startedAtMs,
-    finishedAtMs: detail.finishedAtMs,
+    ...(detail.startedAtMs === undefined ? {} : { startedAtMs: detail.startedAtMs }),
+    ...(detail.finishedAtMs === undefined ? {} : { finishedAtMs: detail.finishedAtMs }),
     targetIds,
     targets,
-    ...(detail.outcome ? { outcome: detail.outcome } : {}),
+    ...(refs === undefined ? {} : { target_generation_refs: refs }),
+    ...(detail.operation_phase === "settled" && detail.wait_result ? { wait_result: detail.wait_result } : {}),
     ...(detail.result?.reason ? { reason: boundedText(detail.result.reason, 128) } : {}),
     ...(detail.cancelReason ? { reason: detail.cancelReason } : {}),
     ...(progress ? { progress } : {}),
@@ -523,14 +620,14 @@ function compactSummaryForList(value: JobSummary): JobSummary {
   return {
     jobId,
     label,
-    status: value.status,
+    operation_phase: value.operation_phase,
     sequence: value.sequence,
     createdAtMs: value.createdAtMs,
-    startedAtMs: value.startedAtMs,
-    finishedAtMs: value.finishedAtMs,
+    ...(value.startedAtMs === undefined ? {} : { startedAtMs: value.startedAtMs }),
+    ...(value.finishedAtMs === undefined ? {} : { finishedAtMs: value.finishedAtMs }),
     targetIds: [],
     targets: [],
-    ...(value.outcome ? { outcome: value.outcome } : {}),
+    ...(value.wait_result ? { wait_result: value.wait_result } : {}),
     ...(value.reason ? { reason: boundedText(value.reason, 64) } : {}),
     ...(value.progress ? { progress: { text: boundedText(value.progress.text, 64), atMs: value.progress.atMs } } : {}),
     ...(value.error ? { error: { ...(value.error.code ? { code: boundedText(value.error.code, 32) } : {}), message: boundedText(value.error.message, 64) } } : {}),
@@ -548,12 +645,12 @@ export function boundedList(result: JobListResult): JobListResult {
     return {
       jobId,
       label,
-      status: job.status,
+      operation_phase: job.operation_phase,
       sequence: job.sequence,
       createdAtMs: job.createdAtMs,
       ...(job.startedAtMs === undefined ? {} : { startedAtMs: job.startedAtMs }),
       ...(job.finishedAtMs === undefined ? {} : { finishedAtMs: job.finishedAtMs }),
-      ...(job.outcome ? { outcome: job.outcome } : {}),
+      ...(job.wait_result ? { wait_result: job.wait_result } : {}),
       targetIds: [],
       targets: [],
       truncation: { ...(job.truncation ?? {}), jobIdClipped: true, ...(label !== job.label || job.truncation?.labelClipped === true ? { labelClipped: true } : {}) }
@@ -572,6 +669,7 @@ export class JobRegistry {
   private readonly clock: JobClock;
   private readonly onTerminal?: (detail: JobDetail) => void | Promise<void>;
   private readonly onChange?: () => void | Promise<void>;
+  private readonly quiescenceMs: number;
   private sequence = 0;
   private generationValue = 0;
   private accepting = true;
@@ -581,6 +679,8 @@ export class JobRegistry {
     this.clock = options.clock ?? { now: () => Date.now() };
     this.onTerminal = options.onTerminal;
     this.onChange = options.onChange;
+    const quiescenceMs = options.quiescenceMs;
+    this.quiescenceMs = typeof quiescenceMs === "number" && Number.isFinite(quiescenceMs) && quiescenceMs >= 0 ? quiescenceMs : 1_000;
   }
 
   private notifyChange(): void {
@@ -588,7 +688,7 @@ export class JobRegistry {
     try {
       void Promise.resolve(this.onChange()).catch(() => undefined);
     } catch {
-      // TUI rendering is best effort and cannot affect job state.
+      // TUI rendering is best effort and cannot affect operation state.
     }
   }
 
@@ -604,57 +704,36 @@ export class JobRegistry {
     return this.accepting && generation.generation === this.generationValue;
   }
 
-  beginSession(): JobGeneration {
-    this.accepting = false;
-    for (const record of this.jobs.values()) {
-      if (record.detail.status !== "running") continue;
-      record.detail.status = "cancelled";
-      record.detail.cancelReason = "shutdown";
-      record.detail.finishedAtMs = this.clock.now();
-      record.controller.abort();
-    }
-    this.jobs.clear();
-    this.generationValue += 1;
-    this.accepting = true;
-    this.notifyChange();
-    return this.generation;
+  private isDrained(record: Pick<JobRecord, "runnerDone" | "activityCount">): boolean {
+    return record.runnerDone && record.activityCount === 0;
   }
 
-  register(
-    request: JobRequestSnapshot,
-    run: (signal: AbortSignal, update: (text: string, details?: unknown) => void) => Promise<JobRunResult>,
-    generation: JobGeneration = this.generation
-  ): RegisteredJob {
-    if (!this.isCurrent(generation)) throw new Error("SESSION_REPLACED: wait session was replaced before registration");
-    const jobId = this.idFactory();
-    if (!jobId.startsWith("job_") || jobId.length <= 4 || jobId.includes(String.fromCharCode(0)) || jobId.includes("\r") || jobId.includes("\n") || this.jobs.has(jobId)) throw new Error("JOB_ID_INVALID: job ID factory returned an invalid or duplicate ID");
-    const controller = new AbortController();
-    const detail: JobDetail = {
-      jobId,
-      status: "running",
-      sequence: ++this.sequence,
-      createdAtMs: this.clock.now(),
-      request: clone(request)
-    };
-    const record: JobRecord = { detail, controller, generation };
-    this.jobs.set(jobId, record);
-    const promise = this.execute(record, run);
-    this.notifyChange();
-    return { jobId, generation, signal: controller.signal, detail: publicDetail(detail), promise };
+  private signalDrain(record: Pick<JobRecord, "runnerDone" | "activityCount" | "resolveDrain">): void {
+    if (!this.isDrained(record)) return;
+    const waiters = record.resolveDrain.splice(0);
+    waiters.forEach((resolve) => resolve());
   }
 
-  private async execute(record: JobRecord, run: (signal: AbortSignal, update: (text: string, details?: unknown) => void) => Promise<JobRunResult>): Promise<void> {
-    record.detail.startedAtMs = this.clock.now();
-    try {
-      const result = await run(record.controller.signal, (text, details) => this.update(record.detail.jobId, text, details));
-      if (record.detail.status !== "running") return;
-      record.detail.status = "completed";
-      record.detail.outcome = result.outcome;
-      // Keep the authoritative terminal snapshots intact. Every public read performs
-      // one bounded projection from this original result, so match facts cannot be
-      // changed by an intermediate evidence window.
+  private closeGate(record: JobRecord): void {
+    record.gateOpen = false;
+    record.fenceValue += 1;
+  }
+
+  private late(record: JobRecord, kind: LateSettlementKind): void {
+    if (record.detail.late_settlement_observed) return;
+    record.detail.late_settlement_observed = { kind, observedAtMs: this.clock.now() };
+    this.notifyChange();
+  }
+
+  private settleLocked(record: JobRecord, waitResult: WaitResult, result?: JobRunResult, error?: JobErrorSnapshot): boolean {
+    if (record.detail.operation_phase === "settled") return false;
+    // Fence first: no terminal authority is published while the gate remains open.
+    this.closeGate(record);
+    record.detail.operation_phase = "settled";
+    record.detail.wait_result = waitResult;
+    if (result) {
       record.detail.result = clone({
-        outcome: result.outcome,
+        wait_result: result.wait_result,
         matched: result.matched,
         ...(result.reason ? { reason: result.reason } : {}),
         ...(result.matchedTargetCount === undefined ? {} : { matchedTargetCount: result.matchedTargetCount }),
@@ -662,22 +741,14 @@ export class JobRegistry {
         ...(result.targets ? { targets: result.targets } : {}),
         ...(result.reviewerSummaries ? { reviewerSummaries: result.reviewerSummaries } : {})
       });
-      record.detail.finishedAtMs = this.clock.now();
-      this.notifyChange();
-      this.notifyTerminal(record);
-    } catch (error) {
-      if (record.detail.status !== "running") return;
-      const mapped: JobErrorSnapshot = {
-        ...(typeof error === "object" && error !== null && "code" in error && typeof (error as { code?: unknown }).code === "string" ? { code: (error as { code: string }).code } : {}),
-        message: error instanceof Error ? error.message : String(error),
-        ...(typeof error === "object" && error !== null && "details" in error ? { details: (error as { details?: unknown }).details } : {})
-      };
-      record.detail.status = "failed";
-      record.detail.error = mapped;
-      record.detail.finishedAtMs = this.clock.now();
-      this.notifyChange();
-      this.notifyTerminal(record);
+    } else {
+      record.detail.result = { wait_result: waitResult, matched: false, reason: error?.code ?? "unknown" };
     }
+    if (error) record.detail.error = error;
+    record.detail.finishedAtMs = this.clock.now();
+    this.notifyChange();
+    if (record.detail.cancelReason === undefined && waitResult !== "cancelled") this.notifyTerminal(record);
+    return true;
   }
 
   private notifyTerminal(record: JobRecord): void {
@@ -689,12 +760,125 @@ export class JobRegistry {
     }
   }
 
+  private createControl(record: Pick<JobRecord, "gateOpen" | "fenceValue" | "runnerDone" | "activityCount" | "resolveDrain">): JobOperationControl {
+    return {
+      get fence() { return record.fenceValue; },
+      isOpen: () => record.gateOpen,
+      check: () => {
+        if (!record.gateOpen) throw Object.assign(new Error("ABORTED: operation fence is closed"), { code: "ABORTED" });
+      },
+      beginActivity: () => {
+        if (!record.gateOpen) throw Object.assign(new Error("ABORTED: operation fence is closed"), { code: "ABORTED" });
+        record.activityCount += 1;
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          record.activityCount -= 1;
+          this.signalDrain(record);
+        };
+      }
+    };
+  }
+
+  register(
+    request: JobRequestSnapshot,
+    run: (signal: AbortSignal, update: (text: string, details?: unknown) => void, control: JobOperationControl) => Promise<JobRunResult>,
+    generation: JobGeneration = this.generation
+  ): RegisteredJob {
+    if (!this.isCurrent(generation)) throw new Error("SESSION_REPLACED: wait session was replaced before registration");
+    const jobId = this.idFactory();
+    if (!jobId.startsWith("job_") || jobId.length <= 4 || jobId.includes(String.fromCharCode(0)) || jobId.includes("\r") || jobId.includes("\n") || this.jobs.has(jobId)) throw new Error("JOB_ID_INVALID: job ID factory returned an invalid or duplicate ID");
+    const controller = new AbortController();
+    const detail: JobDetail = {
+      jobId,
+      operation_phase: "accepted",
+      sequence: ++this.sequence,
+      createdAtMs: this.clock.now(),
+      request: clone(request)
+    };
+    const partial = {
+      detail,
+      controller,
+      generation,
+      lock: transitionLock(),
+      gateOpen: true,
+      fenceValue: 0,
+      runnerStarted: false,
+      runnerDone: false,
+      activityCount: 0,
+      executionPromise: Promise.resolve(),
+      resolveDrain: [] as Array<() => void>
+    };
+    const record = partial as JobRecord;
+    record.control = this.createControl(partial);
+    this.jobs.set(jobId, record);
+    let resolveExecution!: () => void;
+    record.executionPromise = new Promise<void>((resolve) => { resolveExecution = resolve; });
+    // Registration is the accepted boundary. Start the runner in a later turn so
+    // callers can observe accepted rather than a completion-shaped acknowledgement.
+    queueMicrotask(() => {
+      void this.execute(record, run).finally(resolveExecution);
+    });
+    this.notifyChange();
+    return { jobId, generation, signal: controller.signal, detail: publicDetail(detail), promise: record.executionPromise };
+  }
+
+  private async execute(record: JobRecord, run: (signal: AbortSignal, update: (text: string, details?: unknown) => void, control: JobOperationControl) => Promise<JobRunResult>): Promise<void> {
+    const started = await record.lock.runExclusive(() => {
+      if (record.detail.operation_phase !== "accepted" || !record.gateOpen) return false;
+      record.detail.operation_phase = "running";
+      record.runnerStarted = true;
+      record.detail.startedAtMs = this.clock.now();
+      this.notifyChange();
+      return true;
+    });
+    if (!started) {
+      record.runnerDone = true;
+      this.signalDrain(record);
+      return;
+    }
+    try {
+      const result = await run(record.controller.signal, (text, details) => this.update(record.detail.jobId, text, details), record.control);
+      record.runnerDone = true;
+      this.signalDrain(record);
+      await record.lock.runExclusive(() => {
+        if (record.detail.operation_phase !== "running") {
+          this.late(record, "fulfilled");
+          return;
+        }
+        this.settleLocked(record, result.wait_result, result);
+      });
+    } catch (error) {
+      record.runnerDone = true;
+      this.signalDrain(record);
+      await record.lock.runExclusive(() => {
+        if (record.detail.operation_phase !== "running") {
+          this.late(record, "rejected");
+          return;
+        }
+        const mapped: JobErrorSnapshot = {
+          ...(typeof error === "object" && error !== null && "code" in error && typeof (error as { code?: unknown }).code === "string" ? { code: (error as { code: string }).code } : {}),
+          message: error instanceof Error ? error.message : String(error),
+          ...(typeof error === "object" && error !== null && "details" in error ? { details: (error as { details?: unknown }).details } : {})
+        };
+        this.settleLocked(record, "failed", undefined, mapped);
+      });
+    }
+  }
+
   update(jobId: string, text: string, details?: unknown): JobDetail {
     const record = this.jobs.get(jobId);
     if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
-    if (record.detail.status !== "running") return publicDetail(record.detail);
-    record.detail.progress = { text: boundedText(text), atMs: this.clock.now(), ...(details === undefined ? {} : { details: boundedDetails(details) }) };
-    this.notifyChange();
+    if (record.detail.operation_phase !== "running" || !record.gateOpen) return publicDetail(record.detail);
+    record.activityCount += 1;
+    try {
+      record.detail.progress = { text: boundedText(text), atMs: this.clock.now(), ...(details === undefined ? {} : { details: boundedDetails(details) }) };
+      this.notifyChange();
+    } finally {
+      record.activityCount -= 1;
+      this.signalDrain(record);
+    }
     return publicDetail(record.detail);
   }
 
@@ -703,9 +887,9 @@ export class JobRegistry {
     return record ? publicDetail(record.detail) : undefined;
   }
 
-  list(status?: JobStatus, offset = 0, limit = 20): JobListResult {
+  list(operationPhase?: OperationPhase, offset = 0, limit = 20): JobListResult {
     const filtered = [...this.jobs.values()]
-      .filter((record) => status === undefined || record.detail.status === status)
+      .filter((record) => operationPhase === undefined || record.detail.operation_phase === operationPhase)
       .sort((left, right) => right.detail.sequence - left.detail.sequence);
     const pageLimit = Math.min(Math.max(1, limit), PUBLIC_LIST_JOBS);
     const jobs = filtered.slice(offset, offset + pageLimit).map((record) => summary(record.detail));
@@ -721,9 +905,9 @@ export class JobRegistry {
 
   runningOverview(limit = 20): RunningJobOverview {
     const running = [...this.jobs.values()]
-      .filter((record) => record.detail.status === "running")
+      .filter((record) => record.detail.operation_phase !== "settled")
       .sort((left, right) => right.detail.sequence - left.detail.sequence);
-    const starts = running.map((record) => record.detail.startedAtMs!);
+    const starts = running.map((record) => record.detail.startedAtMs ?? record.detail.createdAtMs);
     return {
       jobs: running.slice(0, Math.max(0, limit)).map((record) => summary(record.detail)),
       total: running.length,
@@ -731,27 +915,71 @@ export class JobRegistry {
     };
   }
 
-  cancel(jobId: string): JobDetail | undefined {
+  private async waitForDrain(record: JobRecord): Promise<boolean> {
+    if (this.isDrained(record)) return true;
+    const drained = new Promise<void>((resolve) => { record.resolveDrain.push(resolve); });
+    let resolveBounded!: () => void;
+    const bounded = new Promise<false>((resolve) => { resolveBounded = () => resolve(false); });
+    const timeout = setTimeout(resolveBounded, this.quiescenceMs);
+    await Promise.race([drained.then(() => true as const), bounded]);
+    clearTimeout(timeout);
+    return this.isDrained(record);
+  }
+
+  async cancel(jobId: string): Promise<JobDetail | undefined> {
     const record = this.jobs.get(jobId);
     if (!record) return undefined;
-    if (record.detail.status !== "running") return publicDetail(record.detail);
-    record.detail.status = "cancelled";
-    record.detail.cancelReason = "cancelled";
-    record.detail.finishedAtMs = this.clock.now();
-    record.controller.abort();
+    const request = await record.lock.runExclusive(() => {
+      if (record.detail.operation_phase === "settled") return false;
+      if (record.detail.operation_phase === "cancel_requested") return true;
+      // The gate/fence closes before the cancellation request becomes visible.
+      this.closeGate(record);
+      record.detail.operation_phase = "cancel_requested";
+      record.detail.cancelReason = "cancelled";
+      try { record.controller.abort(); } catch { /* AbortController.abort is normally infallible. */ }
+      this.notifyChange();
+      return true;
+    });
+    if (!request) return publicDetail(record.detail);
+    const drained = await this.waitForDrain(record);
+    return record.lock.runExclusive(() => {
+      if (record.detail.operation_phase === "settled") return publicDetail(record.detail);
+      const waitResult: WaitResult = drained ? "cancelled" : "unknown";
+      const error = drained ? undefined : { code: "CANCELLATION_UNCERTAIN", message: "Cancellation quiescence was not observed" };
+      this.settleLocked(record, waitResult, undefined, error);
+      return publicDetail(record.detail);
+    });
+  }
+
+  beginSession(): JobGeneration {
+    this.accepting = false;
+    for (const record of this.jobs.values()) {
+      if (record.detail.operation_phase === "settled") continue;
+      this.closeGate(record);
+      record.detail.operation_phase = "cancel_requested";
+      record.detail.cancelReason = "shutdown";
+      record.controller.abort();
+      record.runnerDone = true;
+      this.signalDrain(record);
+    }
+    this.jobs.clear();
+    this.generationValue += 1;
+    this.accepting = true;
     this.notifyChange();
-    return publicDetail(record.detail);
+    return this.generation;
   }
 
   shutdown(): void {
     this.accepting = false;
     this.generationValue += 1;
     for (const record of this.jobs.values()) {
-      if (record.detail.status !== "running") continue;
-      record.detail.status = "cancelled";
+      if (record.detail.operation_phase === "settled") continue;
+      this.closeGate(record);
+      record.detail.operation_phase = "cancel_requested";
       record.detail.cancelReason = "shutdown";
-      record.detail.finishedAtMs = this.clock.now();
       record.controller.abort();
+      record.runnerDone = true;
+      this.signalDrain(record);
     }
     this.jobs.clear();
     this.notifyChange();

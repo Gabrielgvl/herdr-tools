@@ -299,6 +299,7 @@ function successResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: Revie
   return {
     outcome: "success",
     matched: true,
+    reason: "condition_met",
     matchedTargetCount: matchedTargets.length,
     matchedTargets,
     targets: snapshots,
@@ -490,6 +491,7 @@ export function createWaitTool(deps: WaitDependencies): ToolDefinition<typeof Wa
       checkAbort(activeSignal);
       const generation = deps.jobRegistry.captureGeneration();
       const prepared = await prepareWait({ ...deps, settingsLoader }, rawParams, activeSignal);
+      checkAbort(activeSignal);
       if (!deps.jobRegistry.isCurrent(generation)) throw new WaitError("SESSION_REPLACED", "SESSION_REPLACED: wait session was replaced before registration");
       const registered = deps.jobRegistry.register(
         jobRequestFromPrepared(prepared),

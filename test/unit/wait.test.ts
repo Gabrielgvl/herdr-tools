@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { ReviewerFailure, type WaitReviewer } from "../../src/reviewer.js";
+import { createJobsTool } from "../../src/tools/jobs.js";
 import { WaitError, boundedBackgroundDetails, createWaitTool, deltaLines, deriveWaitLabel, errorCode, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, runPreparedWait, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
 import { JobRegistry } from "../../src/job-registry.js";
 
@@ -329,6 +330,8 @@ describe("herdr_wait", () => {
     const started = await tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "matched" } }, timeoutMs: 10 } as never, new AbortController().signal, updates, extensionContext);
     expect(started.details).toMatchObject({ outcome: "background", jobId: "job_render" });
     await vi.waitFor(() => expect(registry.get("job_render")).toMatchObject({ status: "completed", outcome: "success", progress: { text: expect.any(String), details: expect.anything() } }));
+    const jobDetail = await createJobsTool(registry).execute("id", { operation: "get", jobId: "job_render" } as never, undefined, undefined, extensionContext);
+    expect(jobDetail.details).toMatchObject({ operation: "jobs", kind: "job", status: "completed", result: { outcome: "success", reason: "condition_met" } });
     expect(updates).not.toHaveBeenCalled();
     expect(cli.calls.filter((call) => call[1] === "read").length).toBeGreaterThan(1);
     const call = tool.renderCall?.({ targets: ["p1"], match: "any" } as never, {} as never, {} as never);
@@ -584,6 +587,32 @@ describe("herdr_wait", () => {
     expect(registry.isCurrent(staleGeneration)).toBe(false);
     const invalid = createWaitTool({ cli: fakeCli(), context, settingsLoader: async () => settings, jobRegistry: registry });
     await expect(invalid.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10, snake_case: true } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(registry.size()).toBe(0);
+  });
+
+  it("rejects cancellation during final context resolution before registering a job", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_boundary" });
+    const controller = new AbortController();
+    let resolved = false;
+    const tool = createWaitTool({
+      cli: fakeCli(),
+      context,
+      settingsLoader: async () => settings,
+      jobRegistry: registry,
+      contextResolver: async () => {
+        await Promise.resolve();
+        controller.abort();
+        resolved = true;
+        return {
+          context,
+          snapshot: snapshot.snapshot,
+          diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+          operationIds: { current: "current", snapshot: "snapshot" }
+        };
+      }
+    });
+    await expect(tool.execute("id", { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 } as never, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+    expect(resolved).toBe(true);
     expect(registry.size()).toBe(0);
   });
 

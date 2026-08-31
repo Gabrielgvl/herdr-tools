@@ -6,7 +6,7 @@ import { loadSettings, type Settings } from "../settings.js";
 import { resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
 import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams, type WaitRawState, type WaitSemanticState } from "../wait-schema.js";
-import { boundedText, type JobOperationControl, type JobRegistry, type JobRequestSnapshot, type JobRunResult } from "../job-registry.js";
+import { boundedText, type JobOperationControl, type JobRegistry, type JobRequestSnapshot, type JobRunResult, type JobTargetError } from "../job-registry.js";
 import { createTargetGenerationRef, historicalTargetEvidence, requireWaitTargetIdentity, sameWaitTargetIdentity, type TargetEvidence, type WaitTargetIdentity } from "../wait-target-evidence.js";
 import { withoutEnvironment } from "../redaction.js";
 import { formatCall, resultForRender, textComponent } from "../tui.js";
@@ -45,6 +45,8 @@ export interface WaitCli {
   /** Optional test/host seam for the native command; the default uses runJson. */
   runNativeAgentWait?(targetId: string, until: string[], timeoutMs: number, signal: AbortSignal): Promise<unknown>;
 }
+
+export type WaitTargetError = JobTargetError;
 
 export interface WaitTargetSnapshot {
   target: string;
@@ -96,7 +98,7 @@ export interface BackgroundWaitDetails {
 export type WaitDetails = BackgroundWaitDetails;
 
 export class WaitError extends Error {
-  constructor(readonly code: "INVALID_INPUT" | "ABORTED" | "REVIEWER_FAILED" | "CLI_PROTOCOL_ERROR" | "CLI_TIMEOUT" | "TARGET_NOT_FOUND" | "TARGET_AMBIGUOUS" | "TARGET_TYPE_MISMATCH" | "CONTEXT_UNAVAILABLE" | "SESSION_REPLACED", message: string, readonly details: Record<string, unknown> = {}) {
+  constructor(readonly code: "INVALID_INPUT" | "ABORTED" | "REVIEWER_FAILED" | "CLI_PROTOCOL_ERROR" | "CLI_TIMEOUT" | "TARGET_NOT_FOUND" | "TARGET_AMBIGUOUS" | "TARGET_TYPE_MISMATCH" | "CONTEXT_UNAVAILABLE" | "SESSION_REPLACED", message: string, readonly details: Record<string, unknown> = {}, readonly result?: JobRunResult) {
     super(message);
     this.name = "WaitError";
   }
@@ -156,9 +158,18 @@ export function boundedLines(output: string): string[] {
   return output.split(/\r?\n/).slice(-100);
 }
 
+const KNOWN_WAIT_STATES = new Set<WaitRawState>(["idle", "working", "blocked", "done", "unknown"]);
+
 function rawState(metadata: Record<string, unknown>): string {
   const value = metadata.agent_status;
   return typeof value === "string" ? value : "unknown";
+}
+
+function explicitState(metadata: Record<string, unknown>, source: string): string | undefined {
+  const value = metadata.agent_status;
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || !KNOWN_WAIT_STATES.has(value as WaitRawState)) throw new WaitError("CLI_PROTOCOL_ERROR", `CLI_PROTOCOL_ERROR: ${source} response contains an invalid state`);
+  return value;
 }
 
 export function matchesState(state: string, requested: string): boolean {
@@ -290,6 +301,12 @@ interface ReadTargetInput {
   identity?: WaitTargetIdentity;
 }
 
+interface WaitObservation {
+  snapshots: WaitTargetSnapshot[];
+  targetErrors: WaitTargetError[];
+  expired: boolean;
+}
+
 function protocolErrorCode(error: unknown): string | undefined {
   if (errorCode(error) !== "CLI_PROTOCOL_ERROR") return undefined;
   const details = (error as { details?: unknown }).details;
@@ -324,17 +341,30 @@ function sameAgentFreePaneIdentity(pane: Record<string, unknown>, item: ReadTarg
   for (const [field, expected] of [["agent_id", expectedRecord.agent_id], ["agent_process_id", expectedRecord.agent_process_id], ["agent_terminal_id", expectedRecord.agent_terminal_id]] as const) {
     if (Object.prototype.hasOwnProperty.call(pane, field) && pane[field] !== expected) return false;
   }
+
+  let sessionEvidence = false;
   const session = pane.agent_session;
   if (session !== undefined) {
     if (session === null || typeof session !== "object" || Array.isArray(session)) return false;
     const candidate = session as Record<string, unknown>;
+    if (!["source", "agent", "kind", "value"].every((field) => typeof candidate[field] === "string" && (candidate[field] as string).length > 0)) return false;
     if (candidate.source !== identity.agentSession.source || candidate.agent !== identity.agentSession.agent || candidate.kind !== identity.agentSession.kind || candidate.value !== identity.agentSession.value) return false;
+    sessionEvidence = true;
   }
-  for (const [field, expected] of [["agent_session_source", identity.agentSession.source], ["agent_session_agent", identity.agentSession.agent], ["agent_session_kind", identity.agentSession.kind], ["agent_session_value", identity.agentSession.value], ["session_source", identity.agentSession.source], ["session_agent", identity.agentSession.agent], ["session_kind", identity.agentSession.kind], ["session_value", identity.agentSession.value]] as const) {
-    if (Object.prototype.hasOwnProperty.call(pane, field) && pane[field] !== expected) return false;
+  for (const fields of [
+    ["agent_session_source", "agent_session_agent", "agent_session_kind", "agent_session_value"],
+    ["session_source", "session_agent", "session_kind", "session_value"]
+  ] as const) {
+    const supplied = fields.some((field) => pane[field] !== undefined);
+    if (!supplied) continue;
+    if (!fields.every((field) => typeof pane[field] === "string" && (pane[field] as string).length > 0)) return false;
+    if (pane[fields[0]] !== identity.agentSession.source || pane[fields[1]] !== identity.agentSession.agent || pane[fields[2]] !== identity.agentSession.kind || pane[fields[3]] !== identity.agentSession.value) return false;
+    sessionEvidence = true;
   }
+  if (!sessionEvidence) return false;
+
   for (const [field, expected] of [["agent_name", identity.agentName], ["name", identity.agentName], ["agent", identity.agentKind], ["agent_kind", identity.agentKind], ["kind", identity.agentKind]] as const) {
-    if (Object.prototype.hasOwnProperty.call(pane, field) && pane[field] !== expected) return false;
+    if (Object.prototype.hasOwnProperty.call(pane, field) && pane[field] !== undefined && pane[field] !== expected) return false;
   }
   return true;
 }
@@ -384,7 +414,9 @@ async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock,
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;
-    throw new WaitError((errorCode(error) as WaitError["code"] | undefined) ?? "CLI_PROTOCOL_ERROR", `Unable to read target ${item.ref}`, { target: item.ref, targetId: paneId, cause: error instanceof Error ? error.message : String(error) });
+    // Keep unknown target failures raw until fan-out aggregation can attach the
+    // target identity and preserve successful sibling observations.
+    throw error;
   }
 }
 
@@ -393,6 +425,7 @@ async function readCurrentStateTarget(
   item: ReadTargetInput,
   clock: WaitClock,
   signal: AbortSignal,
+  deadline: number,
   condition: Extract<WaitCondition, { kind: "state" }>,
   control?: JobOperationControl,
 ): Promise<WaitTargetSnapshot> {
@@ -400,30 +433,107 @@ async function readCurrentStateTarget(
   const paneId = item.target.paneId!;
   try {
     const pane = await readFreshPane(cli, paneId, signal, control);
-    const status = rawState(pane);
+    const paneStatus = explicitState(pane, "pane");
     const agent = await readFreshAgent(cli, paneId, signal, control);
     const agentAbsent = agent === undefined;
+    let status: string;
+    let metadata: Record<string, unknown>;
     if (agentAbsent) {
-      if (status !== "unknown") throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity is unavailable");
+      if (paneStatus !== "unknown") throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity is unavailable");
       if (!sameAgentFreePaneIdentity(pane, item)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity changed");
+      status = "unknown";
+      metadata = { ...pane, agent_status: status };
     } else {
+      const agentStatus = explicitState(agent, "agent");
+      if (agentStatus === undefined) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: agent response omitted its authoritative state");
       const identity = waitIdentity([pane, agent], paneId);
       if (!item.identity || !sameWaitTargetIdentity(identity, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity changed");
+      // Agent-get owns lifecycle state. Pane state is continuity/metadata only;
+      // an omitted or stale pane status cannot turn a live agent into unknown.
+      status = agentStatus;
+      metadata = targetMetadata(item, agent, pane, { agent_status: status });
     }
     const observedAtMs = clock.now();
     return {
       target: item.ref,
       targetId: paneId,
-      metadata: metadataWithoutIdentity({ ...pane, agent_status: status }),
+      metadata: metadataWithoutIdentity(metadata),
       recentUnwrappedLines: [],
       observedAtMs,
-      matched: matchesState(status, condition.state),
+      matched: observedAtMs < deadline && matchesState(status, condition.state),
       target_evidence: historicalTargetEvidence(agentAbsent ? "agent_absent_observed" : "predicate_observed", observedAtMs, item.targetGenerationRef, "composite_observation")
     };
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;
     throw new WaitError((errorCode(error) as WaitError["code"] | undefined) ?? "CLI_PROTOCOL_ERROR", `Unable to read target ${item.ref}`, { target: item.ref, targetId: paneId, cause: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+type TargetOutcome<T> = { index: number; value: T } | { index: number; error: unknown };
+
+function targetMetadata(item: ReadTargetInput, ...records: Record<string, unknown>[]): Record<string, unknown> {
+  return {
+    ...item.target.record,
+    ...(item.target.label !== undefined ? { label: item.target.label } : {}),
+    ...(item.target.agentName !== undefined ? { agent_name: item.target.agentName } : {}),
+    ...records.reduce((merged, record) => ({ ...merged, ...record }), {})
+  };
+}
+
+function targetError(item: ReadTargetInput, error: unknown): WaitTargetError {
+  const code = error instanceof WaitError ? error.code : errorCode(error) ?? "CLI_PROTOCOL_ERROR";
+  const message = error instanceof Error ? error.message : String(error);
+  return { target: item.ref, targetId: item.target.paneId!, code, message: boundedText(message, 500) };
+}
+
+function orderedSnapshots(values: Array<{ index: number; value: WaitTargetSnapshot }>): WaitTargetSnapshot[] {
+  return values.sort((left, right) => left.index - right.index).map(({ value }) => value);
+}
+
+function orderedTargetErrors(values: Array<{ index: number; error: unknown }>, resolved: ReadonlyArray<ReadTargetInput>): WaitTargetError[] {
+  return values.sort((left, right) => left.index - right.index).map(({ index, error }) => targetError(resolved[index]!, error));
+}
+
+async function fanOutTargets<T>(
+  resolved: ReadonlyArray<ReadTargetInput>,
+  signal: AbortSignal,
+  match: WaitParams["match"],
+  operation: (item: ReadTargetInput, signal: AbortSignal) => Promise<T>,
+  isMatch?: (value: T, index: number) => boolean,
+): Promise<{ values: Array<{ index: number; value: T }>; errors: Array<{ index: number; error: unknown }> }> {
+  checkAbort(signal);
+  const linked = resolved.map(() => {
+    const controller = new AbortController();
+    return { controller, ...linkedSignal(signal, controller) };
+  });
+  const promises = resolved.map((item, index) => operation(item, linked[index]!.signal).then(
+    (value): TargetOutcome<T> => ({ index, value }),
+    (error): TargetOutcome<T> => ({ index, error })
+  ));
+  const pending = new Set(promises.map((_, index) => index));
+  const values: Array<{ index: number; value: T }> = [];
+  const errors: Array<{ index: number; error: unknown }> = [];
+  const cleanup = (): void => linked.forEach(({ controller, dispose }) => { controller.abort(); dispose(); });
+  try {
+    while (pending.size > 0) {
+      const outcome = await Promise.race([...pending].map((index) => promises[index]!));
+      pending.delete(outcome.index);
+      if ("value" in outcome) {
+        values.push({ index: outcome.index, value: outcome.value });
+        if (match === "any" && isMatch?.(outcome.value, outcome.index)) return { values, errors };
+      } else {
+        if (signal.aborted || errorCode(outcome.error) === "ABORTED") abort();
+        errors.push({ index: outcome.index, error: outcome.error });
+      }
+    }
+    return { values, errors };
+  } finally {
+    cleanup();
+    // A match or a definitive all-target failure must not wait for unrelated
+    // commands. Promise wrappers already capture late rejections; allSettled
+    // drains their handlers without giving them terminal authority.
+    if (pending.size > 0) void Promise.allSettled([...pending].map((index) => promises[index]!));
   }
 }
 
@@ -434,32 +544,31 @@ async function readCurrentState(
   signal: AbortSignal,
   deadline: number,
   condition: Extract<WaitCondition, { kind: "state" }>,
+  match: WaitParams["match"],
   control?: JobOperationControl,
-): Promise<{ snapshots: WaitTargetSnapshot[]; expired: boolean }> {
-  const snapshots = await Promise.all(resolved.map((item) => readCurrentStateTarget(cli, item, clock, signal, condition, control)));
-  checkAbort(signal);
-  return { snapshots, expired: expired(clock, deadline, snapshots) };
+): Promise<WaitObservation> {
+  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readCurrentStateTarget(cli, item, clock, targetSignal, deadline, condition, control), (snapshot) => snapshot.matched && clock.now() < deadline);
+  const snapshots = orderedSnapshots(fanout.values as Array<{ index: number; value: WaitTargetSnapshot }>);
+  const targetErrors = orderedTargetErrors(fanout.errors, resolved);
+  return { snapshots, targetErrors, expired: expired(clock, deadline, snapshots) };
 }
 
-async function readAll(cli: WaitCli, resolved: ReadonlyArray<ReadTargetInput>, clock: WaitClock, signal: AbortSignal, control?: JobOperationControl, strict = false): Promise<WaitTargetSnapshot[]> {
-  checkAbort(signal);
-  const values = await Promise.all(resolved.map((item) => readTarget(cli, item, clock, signal, control, strict)));
-  checkAbort(signal);
-  return values;
+function observeOutput(snapshot: WaitTargetSnapshot, item: ReadTargetInput, clock: WaitClock, deadline: number, condition: WaitCondition, regex?: SafeRegex): boolean {
+  snapshot.target_evidence = historicalTargetEvidence("predicate_observed", snapshot.observedAtMs, item.targetGenerationRef, "composite_observation");
+  if (clock.now() >= deadline) {
+    snapshot.matched = false;
+    return false;
+  }
+  snapshot.matched = matches(snapshot, condition, regex) && clock.now() < deadline;
+  return snapshot.matched;
 }
 
-async function readAndMatch(cli: WaitCli, resolved: ReadonlyArray<ReadTargetInput>, clock: WaitClock, signal: AbortSignal, deadline: number, condition: WaitCondition, regex?: SafeRegex, control?: JobOperationControl, strict = false): Promise<{ snapshots: WaitTargetSnapshot[]; expired: boolean }> {
-  const snapshots = await readAll(cli, resolved, clock, signal, control, strict);
-  snapshots.forEach((snapshot, index) => {
-    // A settled timeout still needs to identify the historical observation even
-    // though the late sample cannot satisfy the predicate.
-    snapshot.target_evidence = historicalTargetEvidence("predicate_observed", snapshot.observedAtMs, resolved[index]!.targetGenerationRef, "composite_observation");
-  });
-  if (expired(clock, deadline, snapshots)) return { snapshots, expired: true };
-  snapshots.forEach((snapshot) => {
-    snapshot.matched = matches(snapshot, condition, regex);
-  });
-  return { snapshots, expired: expired(clock, deadline, snapshots) };
+async function readAndMatch(cli: WaitCli, resolved: ReadonlyArray<ReadTargetInput>, clock: WaitClock, signal: AbortSignal, deadline: number, condition: WaitCondition, match: WaitParams["match"], regex?: SafeRegex, control?: JobOperationControl, strict = false): Promise<WaitObservation> {
+  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readTarget(cli, item, clock, targetSignal, control, strict), (snapshot, index) => observeOutput(snapshot, resolved[index]!, clock, deadline, condition, regex));
+  const snapshots = orderedSnapshots(fanout.values as Array<{ index: number; value: WaitTargetSnapshot }>);
+  if (match === "all") snapshots.forEach((snapshot) => observeOutput(snapshot, resolved.find((item) => item.target.paneId === snapshot.targetId)!, clock, deadline, condition, regex));
+  const targetErrors = orderedTargetErrors(fanout.errors, resolved);
+  return { snapshots, targetErrors, expired: expired(clock, deadline, snapshots) };
 }
 
 const NATIVE_UNTIL: Record<WaitRawState | WaitSemanticState, string[]> = {
@@ -496,15 +605,6 @@ function nativeAgentRecord(value: unknown, paneId: string): { record: Record<str
   const state = candidate.agent_status ?? candidate.status ?? candidate.state;
   if (typeof state !== "string" || !["idle", "working", "blocked", "done", "unknown"].includes(state)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait omitted a valid state");
   return { record: candidate, status: state };
-}
-
-function hasCompleteIdentity(value: Record<string, unknown>, paneId: string): boolean {
-  try {
-    requireWaitTargetIdentity([value], paneId);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function nativeSnapshot(
@@ -552,32 +652,32 @@ async function readNativeTarget(
     checkAbort(signal);
     const { record, status } = nativeAgentRecord(raw, item.target.paneId!);
     // Herdr protocol 20's wait_matched event carries the matched pane/status but
-    // not always the complete occupant identity. Verify every native result with
-    // fresh pane/agent records so partial events cannot discard resolved metadata
-    // or make registration-time fields look current.
-    if (!hasCompleteIdentity(record, item.target.paneId!) && cli.runNativeAgentWait) {
-      throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait returned incomplete target identity");
-    }
+    // not always the complete occupant identity. Fresh pane/agent records supply
+    // the resolved metadata and bind partial events to the captured occupant.
     const pane = await readFreshPane(cli, item.target.paneId!, signal, control);
     const agent = await readFreshAgent(cli, item.target.paneId!, signal, control);
     const agentAbsent = agent === undefined;
     if (agentAbsent) {
-      if (status !== "unknown" || rawState(pane) !== "unknown") throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target identity is unavailable");
+      if (status !== "unknown" || explicitState(pane, "pane") !== "unknown") throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target identity is unavailable");
       if (!sameAgentFreePaneIdentity(pane, item)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target occupant changed");
     } else {
+      if (explicitState(agent, "agent") === undefined) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait omitted the authoritative state");
       const identity = waitIdentity([record, pane, agent], item.target.paneId!);
       if (!item.identity || !sameWaitTargetIdentity(identity, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target occupant changed");
     }
     const observedAtMs = clock.now();
     const matched = observedAtMs < deadline && matchesState(status, condition.state);
-    const metadata = agentAbsent ? pane : { ...pane, ...agent };
+    const metadata = agentAbsent ? pane : targetMetadata(item, record, agent, pane);
     return nativeSnapshot(item, metadata, status, observedAtMs, matched, agentAbsent);
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     // A typed timeout from the native command means its predicate expired; a
     // killed subprocess (or a post-match verification timeout) is a failure.
-    if (phase === "native_wait" && isNativePredicateTimeout(error)) return readCurrentStateTarget(cli, item, clock, signal, condition, control);
-    if (errorCode(error) === "CLI_TIMEOUT") throw new WaitError("CLI_TIMEOUT", "CLI_TIMEOUT: native wait or target verification timed out", { target: item.ref, targetId: item.target.paneId! });
+    if (phase === "native_wait" && isNativePredicateTimeout(error)) return readCurrentStateTarget(cli, item, clock, signal, deadline, condition, control);
+    if (errorCode(error) === "CLI_TIMEOUT") {
+      if (clock.now() >= deadline) return readCurrentStateTarget(cli, item, clock, signal, deadline, condition, control);
+      throw new WaitError("CLI_TIMEOUT", "CLI_TIMEOUT: native wait or target verification timed out", { target: item.ref, targetId: item.target.paneId! });
+    }
     if (error instanceof WaitError) throw error;
     throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait failed", { target: item.ref });
   }
@@ -614,38 +714,11 @@ async function readNative(
   match: WaitParams["match"],
   control?: JobOperationControl,
   nativeWaitDeadline = deadline,
-): Promise<{ snapshots: WaitTargetSnapshot[]; expired: boolean }> {
-  const linked = resolved.map(() => {
-    const controller = new AbortController();
-    return { controller, ...linkedSignal(signal, controller) };
-  });
-  const promises = resolved.map((item, index) => readNativeTarget(cli, item, clock, linked[index]!.signal, deadline, condition, control, nativeWaitDeadline));
-  const cleanup = (): void => linked.forEach(({ controller, dispose }) => { controller.abort(); dispose(); });
-  if (match === "all") {
-    try {
-      const snapshots = await Promise.all(promises);
-      return { snapshots, expired: clock.now() >= deadline && !snapshots.every((snapshot) => snapshot.matched) };
-    } finally {
-      cleanup();
-    }
-  }
-  const pending = new Set(promises.map((_, index) => index));
-  const observed: WaitTargetSnapshot[] = [];
-  try {
-    while (pending.size > 0) {
-      const next = await Promise.race([...pending].map((index) => promises[index]!.then((snapshot) => ({ index, snapshot }))));
-      pending.delete(next.index);
-      observed.push(next.snapshot);
-      if (next.snapshot.matched) {
-        pending.forEach((index) => { void promises[index]!.catch(() => undefined); });
-        return { snapshots: observed.sort((left, right) => resolved.findIndex((item) => item.target.paneId === left.targetId) - resolved.findIndex((item) => item.target.paneId === right.targetId)), expired: false };
-      }
-    }
-    return { snapshots: observed.sort((left, right) => resolved.findIndex((item) => item.target.paneId === left.targetId) - resolved.findIndex((item) => item.target.paneId === right.targetId)), expired: clock.now() >= deadline };
-  } finally {
-    cleanup();
-    pending.forEach((index) => { void promises[index]!.catch(() => undefined); });
-  }
+): Promise<WaitObservation> {
+  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readNativeTarget(cli, item, clock, targetSignal, deadline, condition, control, nativeWaitDeadline), (snapshot) => snapshot.matched && clock.now() < deadline);
+  const snapshots = orderedSnapshots(fanout.values as Array<{ index: number; value: WaitTargetSnapshot }>);
+  const targetErrors = orderedTargetErrors(fanout.errors, resolved);
+  return { snapshots, targetErrors, expired: expired(clock, deadline, snapshots) };
 }
 
 async function readInitialObservation(
@@ -660,11 +733,11 @@ async function readInitialObservation(
   control?: JobOperationControl,
   strict = false,
   nativeWaitDeadline = deadline,
-): Promise<{ snapshots: WaitTargetSnapshot[]; expired: boolean }> {
+): Promise<WaitObservation> {
   const native = cli.supportsNativeAgentWait === true && condition.kind === "state";
   return native
     ? readNative(cli, resolved, clock, signal, deadline, condition, match, control, nativeWaitDeadline)
-    : readAndMatch(cli, resolved, clock, signal, deadline, condition, regex, control, strict);
+    : readAndMatch(cli, resolved, clock, signal, deadline, condition, match, regex, control, strict);
 }
 
 export function boundedBackgroundDetails(jobId: string, label: string, params: WaitParams, targetIds: string[]): BackgroundWaitDetails {
@@ -691,6 +764,7 @@ export function boundedBackgroundDetails(jobId: string, label: string, params: W
 }
 
 function aggregate(params: WaitParams, snapshots: WaitTargetSnapshot[]): boolean {
+  if (snapshots.length === 0) return false;
   const count = snapshots.filter((snapshot) => snapshot.matched).length;
   return params.match === "any" ? count > 0 : count === snapshots.length;
 }
@@ -707,11 +781,15 @@ function reviewerResult(reviewerSummaries: ReviewerSummary[]): Pick<JobRunResult
   return reviewerSummaries.length > 0 ? { reviewerSummaries } : {};
 }
 
-function timedOutResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[] = []): JobRunResult {
-  return { wait_result: "timed_out", matched: false, reason: "timeout", targets: snapshots, ...reviewerResult(reviewerSummaries) };
+function targetErrorResult(targetErrors: WaitTargetError[]): Pick<JobRunResult, "targetErrors"> {
+  return targetErrors.length > 0 ? { targetErrors } : {};
 }
 
-function conditionMetResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[] = []): JobRunResult {
+function timedOutResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[] = [], targetErrors: WaitTargetError[] = []): JobRunResult {
+  return { wait_result: "timed_out", matched: false, reason: "timeout", targets: snapshots, ...targetErrorResult(targetErrors), ...reviewerResult(reviewerSummaries) };
+}
+
+function conditionMetResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[] = [], targetErrors: WaitTargetError[] = []): JobRunResult {
   const matchedTargets = snapshots.filter((snapshot) => snapshot.matched).map((snapshot) => ({ target: snapshot.target, targetId: snapshot.targetId }));
   return {
     wait_result: "condition_met",
@@ -720,22 +798,116 @@ function conditionMetResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: 
     matchedTargetCount: matchedTargets.length,
     matchedTargets,
     targets: snapshots,
+    ...targetErrorResult(targetErrors),
     ...reviewerResult(reviewerSummaries)
   };
 }
 
-function managerJudgmentResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[]): JobRunResult {
-  return { wait_result: "manager_judgment_required", matched: false, reason: "manager_judgment_required", targets: snapshots, ...reviewerResult(reviewerSummaries) };
+function managerJudgmentResult(snapshots: WaitTargetSnapshot[], reviewerSummaries: ReviewerSummary[], targetErrors: WaitTargetError[] = []): JobRunResult {
+  return { wait_result: "manager_judgment_required", matched: false, reason: "manager_judgment_required", targets: snapshots, ...targetErrorResult(targetErrors), ...reviewerResult(reviewerSummaries) };
 }
 
-function timeoutIfExpired(read: { snapshots: WaitTargetSnapshot[]; expired: boolean }, reviewerSummaries: ReviewerSummary[] = []): JobRunResult | undefined {
-  return read.expired ? timedOutResult(read.snapshots, reviewerSummaries) : undefined;
+function targetReadFailureResult(read: WaitObservation, reviewerSummaries: ReviewerSummary[] = []): JobRunResult {
+  return { wait_result: "failed", matched: false, reason: "target_read_failed", targets: read.snapshots, targetErrors: read.targetErrors, ...reviewerResult(reviewerSummaries) };
+}
+
+function timeoutIfExpired(read: WaitObservation, reviewerSummaries: ReviewerSummary[] = []): JobRunResult | undefined {
+  return read.expired ? timedOutResult(read.snapshots, reviewerSummaries, read.targetErrors) : undefined;
+}
+
+function throwTargetReadFailure(read: WaitObservation, reviewerSummaries: ReviewerSummary[] = []): never {
+  const result = targetReadFailureResult(read, reviewerSummaries);
+  const firstCode = read.targetErrors[0]?.code;
+  const sameCode = firstCode !== undefined && read.targetErrors.every((error) => error.code === firstCode);
+  const knownCodes: WaitError["code"][] = ["INVALID_INPUT", "ABORTED", "REVIEWER_FAILED", "CLI_PROTOCOL_ERROR", "CLI_TIMEOUT", "TARGET_NOT_FOUND", "TARGET_AMBIGUOUS", "TARGET_TYPE_MISMATCH", "CONTEXT_UNAVAILABLE", "SESSION_REPLACED"];
+  const code = sameCode && knownCodes.includes(firstCode as WaitError["code"]) ? firstCode as WaitError["code"] : "CLI_PROTOCOL_ERROR";
+  throw new WaitError(code, `${code}: one or more wait targets could not be observed`, { targetErrors: read.targetErrors }, result);
+}
+
+function observationResult(params: WaitParams, read: WaitObservation, reviewerSummaries: ReviewerSummary[] = []): JobRunResult | undefined {
+  const timeout = timeoutIfExpired(read, reviewerSummaries);
+  if (timeout) return timeout;
+  if (aggregate(params, read.snapshots)) return conditionMetResult(read.snapshots, reviewerSummaries, read.targetErrors);
+  if (read.targetErrors.length > 0) throwTargetReadFailure(read, reviewerSummaries);
+  return undefined;
 }
 
 export function mapReviewerFailure(error: unknown): WaitError {
   if (error instanceof WaitError) return error;
   if (error instanceof ReviewerFailure) return new WaitError("REVIEWER_FAILED", `REVIEWER_FAILED: ${error.message}`, error.details);
   return new WaitError("REVIEWER_FAILED", "REVIEWER_FAILED: reviewer call failed", { cause: error instanceof Error ? error.message : String(error) });
+}
+
+type ReviewerRun = { kind: "completed"; reviews: ReviewerResult[] } | { kind: "timed_out" };
+
+async function runReviewersWithDeadline(
+  reviewer: WaitReviewer,
+  requests: ReviewerRequest[],
+  signal: AbortSignal,
+  deadline: number,
+  clock: WaitClock,
+  control?: JobOperationControl,
+): Promise<ReviewerRun> {
+  checkAbort(signal);
+  const remaining = deadline - clock.now();
+  checkAbort(signal);
+  if (remaining <= 0) return { kind: "timed_out" };
+  const controller = new AbortController();
+  const linked = linkedSignal(signal, controller);
+  let deadlineReached = false;
+  let timer!: ReturnType<typeof setTimeout>;
+  let resolveDeadline!: () => void;
+  const deadlinePromise = new Promise<"deadline">((resolve) => {
+    resolveDeadline = () => {
+      deadlineReached = true;
+      resolve("deadline");
+    };
+    timer = setTimeout(() => {
+      controller.abort();
+      resolveDeadline();
+    }, Math.min(Math.max(1, remaining), 2_147_483_647));
+  });
+  let removeAbortListener!: () => void;
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    const onAbort = () => reject(Object.assign(new Error("ABORTED: reviewer operation was cancelled"), { code: "ABORTED" }));
+    signal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+  });
+  const reviewsPromise = Promise.all(requests.map(async (request) => {
+    const release = control?.beginActivity();
+    try {
+      const review = await reviewer.review(request, linked.signal);
+      control?.check();
+      return review;
+    } finally {
+      release?.();
+    }
+  }));
+  try {
+    const outcome = await Promise.race([
+      reviewsPromise.then((reviews): ReviewerRun => ({ kind: "completed", reviews })),
+      deadlinePromise.then((): ReviewerRun => ({ kind: "timed_out" })),
+      abortPromise
+    ]);
+    if (outcome.kind === "timed_out" || clock.now() >= deadline) {
+      controller.abort();
+      void reviewsPromise.catch(() => undefined);
+      return { kind: "timed_out" };
+    }
+    return outcome;
+  } catch (error) {
+    if (deadlineReached || clock.now() >= deadline) {
+      controller.abort();
+      void reviewsPromise.catch(() => undefined);
+      return { kind: "timed_out" };
+    }
+    if (signal.aborted || errorCode(error) === "ABORTED") abort();
+    throw mapReviewerFailure(error);
+  } finally {
+    clearTimeout(timer);
+    removeAbortListener();
+    linked.dispose();
+  }
 }
 
 export async function prepareWait(deps: WaitDependencies, rawParams: unknown, signal: AbortSignal): Promise<PreparedWait> {
@@ -837,18 +1009,18 @@ export async function runPreparedWait(
   let nextReview = start + cadenceMs;
   const initialNativeDeadline = nativePredicate && longWait ? Math.min(deadline, start + cadenceMs) : deadline;
   let read = nativePredicate
-    ? await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, control)
+    ? await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control)
     : await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline);
   let snapshots = read.snapshots;
-  const initialTimeout = timeoutIfExpired(read);
-  if (initialTimeout) return initialTimeout;
-  if (aggregate(params, snapshots)) return conditionMetResult(snapshots);
+  let targetErrors = read.targetErrors;
+  let settled = observationResult(params, read);
+  if (settled) return settled;
   if (nativePredicate) {
     read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline);
     snapshots = read.snapshots;
-    const nativeTimeout = timeoutIfExpired(read);
-    if (nativeTimeout) return nativeTimeout;
-    if (aggregate(params, snapshots)) return conditionMetResult(snapshots);
+    targetErrors = read.targetErrors;
+    settled = observationResult(params, read);
+    if (settled) return settled;
   }
   let reviewer: WaitReviewer | undefined;
   if (longWait) {
@@ -866,45 +1038,50 @@ export async function runPreparedWait(
 
   while (true) {
     checkAbort(signal);
-    if (aggregate(params, snapshots)) return conditionMetResult(snapshots, reviewerSummaries);
     const now = clock.now();
-    if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries);
+    if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries, targetErrors);
     const untilReview = longWait ? Math.max(0, nextReview - now) : Number.MAX_SAFE_INTEGER;
     control?.check();
     await clock.sleep(Math.min(deps.pollIntervalMs ?? 250, deadline - now, untilReview), signal);
     control?.check();
     checkAbort(signal);
-    if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries);
+    if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries, targetErrors);
     if (nativePredicate) {
-      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, control);
-      if (fresh.expired) return timedOutResult(fresh.snapshots, reviewerSummaries);
-      if (aggregate(params, fresh.snapshots)) return conditionMetResult(fresh.snapshots, reviewerSummaries);
+      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
+      snapshots = fresh.snapshots;
+      targetErrors = fresh.targetErrors;
+      settled = observationResult(params, fresh, reviewerSummaries);
+      if (settled) return settled;
     }
     const nativePollDeadline = nativePredicate && longWait ? Math.min(deadline, nextReview) : deadline;
     read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, nativePollDeadline);
     snapshots = read.snapshots;
-    const pollTimeout = timeoutIfExpired(read, reviewerSummaries);
-    if (pollTimeout) return pollTimeout;
+    targetErrors = read.targetErrors;
+    settled = observationResult(params, read, reviewerSummaries);
+    if (settled) return settled;
     const newStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
     if (newStates.some((state, index) => state !== lastStates[index])) {
       progress(`state changed: ${newStates.join(", ")}`);
       lastStates = newStates;
     }
-    if (aggregate(params, snapshots)) continue;
     if (!longWait || clock.now() < nextReview) continue;
     nextReview += cadenceMs;
     if (nativePredicate) {
-      const reviewerRead = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, validation.regex, control, strictIdentity);
-      if (reviewerRead.expired) return timedOutResult(reviewerRead.snapshots, reviewerSummaries);
+      const reviewerRead = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity);
+      if (reviewerRead.expired) return timedOutResult(reviewerRead.snapshots, reviewerSummaries, reviewerRead.targetErrors);
+      if (reviewerRead.targetErrors.length > 0) throwTargetReadFailure(reviewerRead, reviewerSummaries);
       // This composite refresh is reviewer context only. A native predicate can
       // be satisfied only by the occupant-pinned agent.wait route below.
       // Keep the reviewer read as historical evidence, but never let its
       // composite match replace the native predicate result.
       snapshots = reviewerRead.snapshots.map((snapshot) => ({ ...snapshot, matched: false }));
+      targetErrors = reviewerRead.targetErrors;
       lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
-      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, control);
-      if (fresh.expired) return timedOutResult(fresh.snapshots, reviewerSummaries);
-      if (aggregate(params, fresh.snapshots)) return conditionMetResult(fresh.snapshots, reviewerSummaries);
+      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
+      snapshots = fresh.snapshots;
+      targetErrors = fresh.targetErrors;
+      settled = observationResult(params, fresh, reviewerSummaries);
+      if (settled) return settled;
     }
     const requests: ReviewerRequest[] = snapshots.map((snapshot) => {
       const previous = sentLines.get(snapshot.targetId) ?? [];
@@ -915,25 +1092,20 @@ export async function runPreparedWait(
     let reviews: ReviewerResult[];
     try {
       control?.check();
-      reviews = await Promise.all(requests.map(async (request) => {
-        const release = control?.beginActivity();
-        try {
-          const review = await reviewer!.review(request, signal);
-          control?.check();
-          return review;
-        } finally {
-          release?.();
-        }
-      }));
+      const reviewerRun = await runReviewersWithDeadline(reviewer!, requests, signal, deadline, clock, control);
+      if (reviewerRun.kind === "timed_out") return timedOutResult(snapshots, reviewerSummaries, targetErrors);
+      reviews = reviewerRun.reviews;
       checkAbort(signal);
     } catch (error) {
       if (signal.aborted || errorCode(error) === "ABORTED") abort();
       throw mapReviewerFailure(error);
     }
     if (nativePredicate) {
-      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, control);
-      if (fresh.expired) return timedOutResult(fresh.snapshots, reviewerSummaries);
-      if (aggregate(params, fresh.snapshots)) return conditionMetResult(fresh.snapshots, reviewerSummaries);
+      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
+      snapshots = fresh.snapshots;
+      targetErrors = fresh.targetErrors;
+      settled = observationResult(params, fresh, reviewerSummaries);
+      if (settled) return settled;
     }
     let managerJudgment = false;
     for (const review of reviews) {
@@ -944,19 +1116,21 @@ export async function runPreparedWait(
       progress(`review ${review.targetId}: ${review.classification} ${review.summary}`);
     }
     if (managerJudgment) {
-      if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries);
+      if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries, targetErrors);
       if (nativePredicate) {
-        const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, control);
-        if (fresh.expired) return timedOutResult(fresh.snapshots, reviewerSummaries);
-        if (aggregate(params, fresh.snapshots)) return conditionMetResult(fresh.snapshots, reviewerSummaries);
+        const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
+        snapshots = fresh.snapshots;
+        targetErrors = fresh.targetErrors;
+        settled = observationResult(params, fresh, reviewerSummaries);
+        if (settled) return settled;
       }
       const nativeReviewDeadline = nativePredicate ? Math.min(deadline, clock.now() + 1) : deadline;
       read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, nativeReviewDeadline);
       snapshots = read.snapshots;
-      const refreshTimeout = timeoutIfExpired(read, reviewerSummaries);
-      if (refreshTimeout) return refreshTimeout;
-      if (aggregate(params, snapshots)) return conditionMetResult(snapshots, reviewerSummaries);
-      return managerJudgmentResult(snapshots, reviewerSummaries);
+      targetErrors = read.targetErrors;
+      settled = observationResult(params, read, reviewerSummaries);
+      if (settled) return settled;
+      return managerJudgmentResult(snapshots, reviewerSummaries, targetErrors);
     }
   }
 }

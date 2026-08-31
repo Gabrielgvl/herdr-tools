@@ -87,7 +87,7 @@ function nativeCli(options: { statuses?: Record<string, string>; currentStatuses
         if (options.complete) return { id: "wait", result: { agent: value } };
         return { id: "wait", result: { type: "wait_matched", event: { event: "pane_agent_status_changed", data: { pane_id: value.pane_id, workspace_id: "w", agent_status: value.agent_status } } } };
       }
-      if (argv[0] === "agent" && argv[1] === "get") return { id: "agent", result: { agent: pane(argv[2]!) } };
+      if (argv[0] === "agent" && argv[1] === "get") return { id: "agent", result: { agent: currentPane(argv[2]!) } };
       return { id: "pane", result: { pane: currentPane(argv[2]!) } };
     },
     async runText(argv) {
@@ -167,6 +167,51 @@ describe("herdr_wait", () => {
     }
   });
 
+  it("uses the authoritative fresh agent lifecycle state over stale pane state", async () => {
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "idle" } });
+    const original = cli.runJson.bind(cli);
+    cli.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane: nativeSnapshot({ p1: "idle" }).snapshot.panes[0] } };
+      if (argv[0] === "agent" && argv[1] === "get") return { id: "agent", result: { agent: nativeSnapshot({ p1: "working" }).snapshot.agents[0] } };
+      return original(argv, signal);
+    };
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 10 }, { clock: clock() })).resolves.toMatchObject({ wait_result: "timed_out", matched: false });
+  });
+
+  it("rejects missing and malformed fresh lifecycle fields", async () => {
+    const missingPaneState = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const missingPaneStateOriginal = missingPaneState.runJson.bind(missingPaneState);
+    missingPaneState.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get") {
+        const pane = { ...nativeSnapshot({ p1: "working" }).snapshot.panes[0] } as Record<string, unknown>;
+        delete pane.agent_status;
+        return { id: "pane", result: { pane } };
+      }
+      return missingPaneStateOriginal(argv, signal);
+    };
+    await expect(execute(missingPaneState, { targets: ["p1"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 10 }, { clock: clock() })).resolves.toMatchObject({ wait_result: "condition_met" });
+
+    const malformedPaneState = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const malformedPaneStateOriginal = malformedPaneState.runJson.bind(malformedPaneState);
+    malformedPaneState.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane: { ...nativeSnapshot({ p1: "working" }).snapshot.panes[0], agent_status: "malformed" } } };
+      return malformedPaneStateOriginal(argv, signal);
+    };
+    await expect(execute(malformedPaneState, { targets: ["p1"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 10 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+
+    const missingAgentState = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const missingAgentStateOriginal = missingAgentState.runJson.bind(missingAgentState);
+    missingAgentState.runJson = async (argv, signal) => {
+      if (argv[0] === "agent" && argv[1] === "get") {
+        const agent = { ...nativeSnapshot({ p1: "working" }).snapshot.agents[0] } as Record<string, unknown>;
+        delete agent.agent_status;
+        return { id: "agent", result: { agent } };
+      }
+      return missingAgentStateOriginal(argv, signal);
+    };
+    await expect(execute(missingAgentState, { targets: ["p1"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 10 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+  });
+
   it("fresh-checks an already-satisfied state before invoking transition-oriented native wait", async () => {
     const cli = nativeCli({ statuses: { p1: "idle" } });
     const fresh = nativeSnapshot({ p1: "working" });
@@ -231,6 +276,20 @@ describe("herdr_wait", () => {
       targets: [{ metadata: { pane_id: "p1", tab_id: "w:t", workspace_id: "w", label: "one", agent_name: "one", agent: "pi", agent_status: "done" } }]
     });
     expect(incomplete.calls.map((call) => call.slice(0, 2))).toContainEqual(["agent", "get"]);
+
+    const sparse = nativeSnapshot({ p1: "working" });
+    delete (sparse.snapshot.panes[0] as Record<string, unknown>).label;
+    delete (sparse.snapshot.panes[0] as Record<string, unknown>).agent_name;
+    const sparseResult = await execute(nativeCli({ statuses: { p1: "done" }, currentStatuses: { p1: "working" } }), { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10 }, {
+      contextResolver: async () => ({
+        context: { workspaceId: "w", tabId: "w:t", paneId: "p1" },
+        snapshot: sparse.snapshot,
+        diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+        operationIds: { current: "current", snapshot: "snapshot" }
+      })
+    });
+    expect(sparseResult).toMatchObject({ wait_result: "condition_met", targets: [{ metadata: { pane_id: "p1", label: "one", agent_name: "one" } }] });
+
     const mismatch = nativeCli({ statuses: { p1: "done" }, currentStatuses: { p1: "working" }, mismatch: true });
     await expect(execute(mismatch, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const replacedNative = nativeCli({ statuses: { p1: "done" }, currentStatuses: { p1: "working" } });
@@ -254,6 +313,15 @@ describe("herdr_wait", () => {
     } };
     await expect(execute(malformed, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     await expect(execute(nativeCli({ timeout: true }), { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_TIMEOUT" });
+    const missingNativeAgentState = nativeCli({ statuses: { p1: "done" }, currentStatuses: { p1: "working" } });
+    const missingNativeAgentStateOriginal = missingNativeAgentState.runJson.bind(missingNativeAgentState);
+    let missingNativeAgentGets = 0;
+    missingNativeAgentState.runJson = async (argv, signal) => {
+      if (argv[0] === "agent" && argv[1] === "get" && ++missingNativeAgentGets > 1) return { id: "agent", result: { agent: { pane_id: "p1" } } };
+      return missingNativeAgentStateOriginal(argv, signal);
+    };
+    await expect(execute(missingNativeAgentState, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+
     const predicateExpired = nativeCli({ statuses: { p1: "working" } });
     const originalPredicateExpired = predicateExpired.runJson.bind(predicateExpired);
     predicateExpired.runJson = async (argv, signal) => argv[0] === "agent" && argv[1] === "wait" ? Promise.reject(nativePredicateTimeout()) : originalPredicateExpired(argv, signal);
@@ -262,6 +330,19 @@ describe("herdr_wait", () => {
     const originalVerificationTimeout = verificationTimeout.runJson.bind(verificationTimeout);
     verificationTimeout.runJson = async (argv, signal) => argv[0] === "agent" && argv[1] === "get" ? Promise.reject(Object.assign(new Error("agent verification hung"), { code: "CLI_TIMEOUT" })) : originalVerificationTimeout(argv, signal);
     await expect(execute(verificationTimeout, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_TIMEOUT" });
+  });
+
+  it("rejects agent-free unknown when the replacement has no session continuity evidence", async () => {
+    const noSession = { ...nativeSnapshot({ p1: "unknown" }).snapshot.panes[0] } as Record<string, unknown>;
+    for (const field of ["agent_session", "agent_session_source", "agent_session_agent", "agent_session_kind", "agent_session_value", "session_source", "session_agent", "session_kind", "session_value"] as const) delete noSession[field];
+    const cli = nativeCli({ statuses: { p1: "unknown" }, currentStatuses: { p1: "working" } });
+    const original = cli.runJson.bind(cli);
+    cli.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane: noSession } };
+      if (argv[0] === "agent" && argv[1] === "get") return Promise.reject(new CliProtocolError("CLI_PROTOCOL_ERROR", "agent not found", { errorEnvelope: { error: { code: "agent_not_found", message: "agent is absent" } } }));
+      return original(argv, signal);
+    };
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 10 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
   });
 
   it("accepts an agent-free raw unknown transition with historical absence evidence", async () => {
@@ -331,6 +412,8 @@ describe("herdr_wait", () => {
     };
     await expect(runAgentFree()).resolves.toMatchObject({ wait_result: "condition_met" });
     await expect(runAgentFree({ agent_session: undefined })).resolves.toMatchObject({ wait_result: "condition_met" });
+    await expect(runAgentFree({ agent_session: { source: "pi" } })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    await expect(runAgentFree({ agent_session_value: undefined })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     for (const field of ["source", "agent", "kind", "value"] as const) {
       const session = { source: "pi", agent: "pi", kind: "id", value: "p1-session" };
       session[field] = `replacement-${field}`;
@@ -366,6 +449,41 @@ describe("herdr_wait", () => {
       return brokenOriginal(argv, signal);
     };
     await expect(execute(broken, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+  });
+
+  it("rejects a matching native timeout fallback observed at the outer deadline", async () => {
+    let now = 0;
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const done = nativeSnapshot({ p1: "done" });
+    const original = cli.runJson.bind(cli);
+    let timedOut = false;
+    cli.runJson = async (argv, signal) => {
+      if (argv[0] === "agent" && argv[1] === "wait") {
+        timedOut = true;
+        now = 10;
+        throw nativePredicateTimeout();
+      }
+      if (timedOut && argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane: done.snapshot.panes[0] } };
+      if (timedOut && argv[0] === "agent" && argv[1] === "get") return { id: "agent", result: { agent: done.snapshot.agents[0] } };
+      return original(argv, signal);
+    };
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10 }, { clock: { now: () => now, sleep: async () => undefined } })).resolves.toMatchObject({ wait_result: "timed_out", matched: false, targets: [{ metadata: { agent_status: "done" }, observedAtMs: 10 }] });
+
+    now = 0;
+    let commandTimedOut = false;
+    const commandTimeoutCli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const commandTimeoutOriginal = commandTimeoutCli.runJson.bind(commandTimeoutCli);
+    commandTimeoutCli.runJson = async (argv, signal) => {
+      if (argv[0] === "agent" && argv[1] === "wait") {
+        commandTimedOut = true;
+        now = 10;
+        throw Object.assign(new Error("native command timed out"), { code: "CLI_TIMEOUT" });
+      }
+      if (commandTimedOut && argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane: done.snapshot.panes[0] } };
+      if (commandTimedOut && argv[0] === "agent" && argv[1] === "get") return { id: "agent", result: { agent: done.snapshot.agents[0] } };
+      return commandTimeoutOriginal(argv, signal);
+    };
+    await expect(execute(commandTimeoutCli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10 }, { clock: { now: () => now, sleep: async () => undefined } })).resolves.toMatchObject({ wait_result: "timed_out", matched: false, targets: [{ metadata: { agent_status: "done" }, observedAtMs: 10 }] });
   });
 
   it("fails closed on malformed native protocol diagnostics", async () => {
@@ -430,7 +548,7 @@ describe("herdr_wait", () => {
     releaseOrdered();
     expect(await orderedWait).toMatchObject({ wait_result: "condition_met", matched: true, targets: [expect.objectContaining({ targetId: "p1" }), expect.objectContaining({ targetId: "p2" })] });
     let allNowCalls = 0;
-    const all = await execute(nativeCli({ statuses: { p1: "done", p2: "done" }, currentStatuses: { p1: "working", p2: "working" } }), { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: { now: () => allNowCalls++ < 8 ? 0 : 1, sleep: async () => undefined } });
+    const all = await execute(nativeCli({ statuses: { p1: "done", p2: "done" }, currentStatuses: { p1: "working", p2: "working" } }), { targets: ["p1", "p2"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: { now: () => allNowCalls++ < 50 ? 0 : 1, sleep: async () => undefined } });
     expect(all).toMatchObject({ wait_result: "condition_met", matched: true });
     await expect(execute(nativeCli({ statuses: { p1: "working" }, timeout: true }), { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_TIMEOUT" });
     const unmatched = await execute(nativeCli({ statuses: { p1: "working" } }), { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() });
@@ -450,7 +568,14 @@ describe("herdr_wait", () => {
     await expect(execute(missing, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const badSeam = nativeCli({ statuses: { p1: "working" } });
     badSeam.runNativeAgentWait = async () => ({ type: "wait_matched", event: { event: "pane_agent_status_changed", data: { pane_id: "p1", agent_status: "working" } } });
-    await expect(execute(badSeam, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    await expect(execute(badSeam, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).resolves.toMatchObject({ wait_result: "timed_out", matched: false });
+
+    const partial = nativeCli({ statuses: { p1: "done" }, currentStatuses: { p1: "working" } });
+    partial.runNativeAgentWait = async () => ({ type: "wait_matched", event: { event: "pane_agent_status_changed", data: { pane_id: "p1", workspace_id: "w", agent_status: "done" } } });
+    await expect(execute(partial, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10 }, { clock: clock() })).resolves.toMatchObject({
+      wait_result: "condition_met",
+      targets: [{ metadata: { pane_id: "p1", tab_id: "w:t", workspace_id: "w", label: "one", agent_name: "one", agent_status: "done" } }]
+    });
     const fallbackIdentity = nativeCli({ statuses: { p1: "working" } });
     const fallbackRunJson = fallbackIdentity.runJson.bind(fallbackIdentity);
     fallbackIdentity.runJson = async (argv, signal) => argv[0] === "agent" && argv[1] === "get" ? { id: "agent", result: {} } : fallbackRunJson(argv, signal);
@@ -490,9 +615,10 @@ describe("herdr_wait", () => {
     const deps = { cli, context, settingsLoader: async () => settings, jobRegistry: new JobRegistry(), clock: clock() } as Parameters<typeof prepareWait>[0];
     const prepared = await prepareWait(deps, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, new AbortController().signal);
     await expect(runPreparedWait(deps, prepared, parent.signal, () => undefined, extensionContext)).resolves.toMatchObject({ wait_result: "condition_met" });
-    expect(add.mock.calls.filter(([event]) => event === "abort")).toHaveLength(1);
-    expect(remove.mock.calls.filter(([event]) => event === "abort")).toHaveLength(1);
+    expect(add.mock.calls.filter(([event]) => event === "abort")).toHaveLength(2);
+    expect(remove.mock.calls.filter(([event]) => event === "abort")).toHaveLength(2);
     expect(remove.mock.calls[0]?.[1]).toBe(add.mock.calls[0]?.[1]);
+    expect(remove.mock.calls[1]?.[1]).toBe(add.mock.calls[1]?.[1]);
     const alreadyAborted = new AbortController();
     alreadyAborted.abort();
     const linked = linkedSignal(alreadyAborted.signal, new AbortController());
@@ -619,6 +745,21 @@ describe("herdr_wait", () => {
     expect(cli.calls.filter((call) => call[0] === "agent" && call[1] === "wait").length).toBeGreaterThan(1);
   });
 
+  it("fails with partial target errors when native reviewer refresh cannot read a target", async () => {
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const originalRunText = cli.runText.bind(cli);
+    let reads = 0;
+    cli.runText = async (...args) => {
+      if (++reads === 1) throw new Error("review refresh unavailable");
+      return originalRunText(...args);
+    };
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification: "progress", summary: "not reached" }) };
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer })).rejects.toMatchObject({
+      code: "CLI_PROTOCOL_ERROR",
+      result: { wait_result: "failed", targetErrors: [{ targetId: "p1", code: "CLI_PROTOCOL_ERROR" }] }
+    });
+  });
+
   it("returns timed_out when a native review refresh reaches the deadline", async () => {
     let now = 0;
     const cli = nativeCli({ statuses: { p1: "working" } });
@@ -742,6 +883,27 @@ describe("herdr_wait", () => {
     await expect(runPreparedWait({ cli: strictCli, context, settingsLoader: async () => settings, jobRegistry: new JobRegistry(), requireTargetIdentity: true, clock: clock() }, replacement, new AbortController().signal, () => undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
   });
 
+  it("retains context rebinding in running progress details", async () => {
+    const rebound = { workspaceId: "old-workspace", tabId: "old-tab", paneId: "p1" };
+    const deps = {
+      cli: fakeCli({ p1: "not done" }),
+      context: rebound,
+      settingsLoader: async () => settings,
+      jobRegistry: new JobRegistry(),
+      clock: clock(),
+      contextResolver: async () => ({
+        context,
+        snapshot: snapshot.snapshot,
+        diagnostics: { injected: rebound, effective: context, rebound: true, attempts: 1 },
+        operationIds: { current: "current", snapshot: "snapshot" }
+      })
+    } as Parameters<typeof prepareWait>[0];
+    const prepared = await prepareWait(deps, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, new AbortController().signal);
+    const progress: unknown[] = [];
+    await runPreparedWait(deps, prepared, new AbortController().signal, (_text, details) => progress.push(details), extensionContext);
+    expect(progress[0]).toMatchObject({ contextRebinding: { rebound: true } });
+  });
+
   it("reports a live caller rebind in the detached acknowledgement", async () => {
     const stale = { workspaceId: "old-workspace", tabId: "old-tab", paneId: "p1" };
     const registry = new JobRegistry({ idFactory: () => "job_rebind" });
@@ -773,6 +935,65 @@ describe("herdr_wait", () => {
     const targets = (result as { targets: Array<{ metadata: Record<string, unknown> }> }).targets;
     expect(targets[0]!.metadata).toEqual({ pane_id: "p2", tab_id: "w:t", workspace_id: "w", label: "two", agent_name: "two", agent_status: "working", history: [{}, { child: {} }] });
     expect(JSON.stringify(result)).not.toContain("secret");
+  });
+
+  it("returns on the first matching output target without waiting for unrelated reads", async () => {
+    let releaseSlow!: (value: string) => void;
+    const slow = new Promise<string>((resolve) => { releaseSlow = resolve; });
+    const cli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        return { id: "pane", result: { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } };
+      },
+      async runText(argv) {
+        if (argv[2] === "p1") {
+          setImmediate(() => releaseSlow("unrelated"));
+          return "needle";
+        }
+        return slow;
+      }
+    };
+    const result = await execute(cli, { targets: ["p1", "p2"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "needle" } }, timeoutMs: 100 }, { clock: clock() });
+    expect(result).toMatchObject({ wait_result: "condition_met", matched: true, targets: [{ targetId: "p1", matched: true }] });
+    expect((result.targets ?? []).length).toBe(1);
+  });
+
+  it("returns a matching output target with earlier target errors", async () => {
+    const cli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        if (argv[2] === "p1") throw new Error("p1 unavailable");
+        return { id: "pane", result: { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } };
+      },
+      async runText() { return "needle"; }
+    };
+    const result = await execute(cli, { targets: ["p1", "p2"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "needle" } }, timeoutMs: 100 }, { clock: clock() });
+    expect(result).toMatchObject({ wait_result: "condition_met", matched: true, targetErrors: [{ targetId: "p1", code: "CLI_PROTOCOL_ERROR" }] });
+  });
+
+  it("preserves successful target evidence and structured failures for a partial read", async () => {
+    const cli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        if (argv[2] === "p2") throw new Error("p2 unavailable");
+        return { id: "pane", result: { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } };
+      },
+      async runText(argv) {
+        if (argv[2] === "p2") throw new Error("p2 unavailable");
+        return "not the requested output";
+      }
+    };
+    await expect(execute(cli, { targets: ["p1", "p2"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "needle" } }, timeoutMs: 100 }, { clock: clock() })).rejects.toMatchObject({
+      code: "CLI_PROTOCOL_ERROR",
+      result: {
+        wait_result: "failed",
+        targets: [{ targetId: "p1", target_evidence: { currency: "historical_non_current", targetGenerationRef: expect.stringMatching(/^target_generation_/) } }],
+        targetErrors: [{ targetId: "p2", code: "CLI_PROTOCOL_ERROR" }]
+      }
+    });
   });
 
   it("matches existing literal output immediately and does not treat literal as regex", async () => {
@@ -820,6 +1041,96 @@ describe("herdr_wait", () => {
   it("does not require reviewer setup when a long wait is already satisfied", async () => {
     const failingFactory = () => { throw new Error("reviewer must not start"); };
     await expect(execute(fakeCli({ p1: "done" }), { targets: ["p1"], match: "any", condition: { kind: "state", state: "completed" }, timeoutMs: 3_600_000 }, { reviewerFactory: failingFactory })).resolves.toMatchObject({ wait_result: "condition_met", matched: true });
+  });
+
+  it("aborts reviewer calls at the remaining wait deadline", async () => {
+    const pending = execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, {
+      settingsLoader: async () => ({ ...settings, reviewCadenceMinutes: 0 }),
+      clock: clock(),
+      pollIntervalMs: 0,
+      reviewerFactory: () => ({ review: async () => new Promise<never>(() => undefined) })
+    });
+    const outcome = await Promise.race([
+      pending,
+      new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 100))
+    ]);
+    expect(outcome).not.toBe("hung");
+    expect(outcome).toMatchObject({ wait_result: "timed_out", matched: false, reason: "timeout" });
+  });
+
+  it("settles a reviewer rejection that arrives at the wait deadline as timeout", async () => {
+    let now = 0;
+    const reviewer: WaitReviewer = { review: async () => {
+      now = 60_001;
+      throw new Error("reviewer finished at the deadline");
+    } };
+    const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, {
+      clock: { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } },
+      pollIntervalMs: 60_000,
+      reviewerFactory: () => reviewer
+    });
+    expect(result).toMatchObject({ wait_result: "timed_out", matched: false, reason: "timeout" });
+  });
+
+  it("reports state changes observed between wait polls", async () => {
+    let paneGets = 0;
+    let now = 0;
+    const cli: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        const status = paneGets++ === 0 ? "working" : "blocked";
+        return { id: "pane", result: { pane: { ...snapshot.snapshot.panes[0], agent_status: status } } };
+      },
+      async runText() { return ""; }
+    };
+    const result = await execute(cli, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 2 }, {
+      settingsLoader: async () => ({ ...settings, reviewCadenceMinutes: 0 }),
+      clock: { now: () => now, sleep: async () => { now += 1; } },
+      pollIntervalMs: 0,
+      reviewerFactory: () => ({ review: async ({ targetId }) => ({ targetId, classification: "progress", summary: "state changed" }) })
+    });
+    expect(result).toMatchObject({ wait_result: "timed_out", matched: false });
+  });
+
+  it("settles immediately when the reviewer window has no remaining time", async () => {
+    let afterSleep = false;
+    let reviewWindowReads = 0;
+    const clockForWindow: WaitClock = {
+      now: () => {
+        if (!afterSleep) return 0;
+        reviewWindowReads += 1;
+        return reviewWindowReads <= 5 ? 60_000 : 60_001;
+      },
+      sleep: async () => { afterSleep = true; }
+    };
+    let reviewerEntered = false;
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => { reviewerEntered = true; return { targetId, classification: "progress", summary: "not reached" }; } };
+    const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, {
+      clock: clockForWindow,
+      pollIntervalMs: 60_000,
+      reviewerFactory: () => reviewer
+    });
+    expect(result).toMatchObject({ wait_result: "timed_out", matched: false, reason: "timeout" });
+    expect(reviewerEntered).toBe(false);
+  });
+
+  it("drains a reviewer rejection after the deadline race settles", async () => {
+    let aborted = false;
+    const reviewer: WaitReviewer = { review: async (_request, signal) => new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(new Error("reviewer stopped at deadline"));
+      }, { once: true });
+    }) };
+    const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, {
+      settingsLoader: async () => ({ ...settings, reviewCadenceMinutes: 0 }),
+      clock: clock(),
+      pollIntervalMs: 0,
+      reviewerFactory: () => reviewer
+    });
+    expect(result).toMatchObject({ wait_result: "timed_out", matched: false, reason: "timeout" });
+    expect(aborted).toBe(true);
   });
 
   it("runs uncapped reviewers concurrently and ends on manager judgment", async () => {
@@ -888,8 +1199,19 @@ describe("herdr_wait", () => {
     expect(requests[2].transcriptDelta).toEqual(["new"]);
     expect(requests.every((request) => request.metadata.pane_id || request.metadata.agent_status)).toBe(true);
     expect(requests.every((request) => !("ignored" in request.metadata))).toBe(true);
-    expect(requests.every((request) => request.signal === requests[0].signal)).toBe(true);
+    expect(requests[0]?.signal).toBe(requests[1]?.signal);
+    expect(requests[2]?.signal).toBe(requests[3]?.signal);
+    expect(requests[0]?.signal).not.toBe(requests[2]?.signal);
     expect(maximumActive).toBeGreaterThan(1);
+  });
+
+  it("settles manager judgment as timeout when review progress reaches the deadline", async () => {
+    let now = 0;
+    const cli = fakeCli({ p1: "working" });
+    const deps = { cli, context, settingsLoader: async () => settings, jobRegistry: new JobRegistry(), clock: { now: () => now, sleep: async (milliseconds: number) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => ({ review: async ({ targetId }) => ({ targetId, classification: "blocked" as const, summary: "deadline" }) }) } as Parameters<typeof prepareWait>[0];
+    const prepared = await prepareWait(deps, { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, new AbortController().signal);
+    const result = await runPreparedWait(deps, prepared, new AbortController().signal, (text) => { if (text.startsWith("review")) now = 60_001; }, extensionContext);
+    expect(result).toMatchObject({ wait_result: "timed_out", matched: false, reason: "timeout" });
   });
 
   it.each(["stalled", "blocked", "risk", "unknown"] as const)("ends with manager judgment for %s reviewer findings", async (classification) => {
@@ -1064,7 +1386,7 @@ describe("herdr_wait", () => {
 
   it("rejects a match if the deadline passes while evaluating the read", async () => {
     let calls = 0;
-    const result = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: { now: () => ++calls === 4 ? 2 : 0, sleep: async () => undefined } });
+    const result = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: { now: () => ++calls >= 4 ? 2 : 0, sleep: async () => undefined } });
     expect(result).toMatchObject({ wait_result: "timed_out", matched: false, reason: "timeout" });
   });
 
@@ -1167,6 +1489,16 @@ describe("herdr_wait", () => {
       async runText() { return ""; }
     };
     await expect(execute(aborted, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "ABORTED" });
+    const codedTargetFailure: WaitCli = {
+      async runJson(argv) {
+        if (argv[0] === "pane" && argv[1] === "current") return currentPane();
+        if (argv[0] === "api") return { id: "snapshot", result: snapshot };
+        throw Object.assign(new Error("coded target failure"), { code: "BROKEN" });
+      },
+      async runText() { return ""; }
+    };
+    await expect(execute(codedTargetFailure, { targets: ["p1"], match: "any", condition: { kind: "output", match: { kind: "literal", value: "missing" } }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", result: { targetErrors: [{ code: "BROKEN" }] } });
+
     const throwingSettings = await execute(fakeCli(), { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, { clock: clock() });
     expect(throwingSettings.wait_result).toBe("condition_met");
   });

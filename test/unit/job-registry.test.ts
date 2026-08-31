@@ -197,6 +197,27 @@ describe("JobRegistry", () => {
     expect(registry.size()).toBe(0);
   });
 
+  it("retains bounded per-target failures in a public failed result", async () => {
+    const targetErrors = Array.from({ length: 7 }, (_, index) => ({
+      target: `target-${index}`,
+      targetId: `pane-${index}`,
+      code: "CLI_PROTOCOL_ERROR",
+      message: `target ${index} could not be observed`
+    }));
+    const registry = new JobRegistry({ idFactory: () => "job_partial_result" });
+    const handle = registry.register(request, async () => {
+      throw Object.assign(new Error("partial target read"), {
+        code: "CLI_PROTOCOL_ERROR",
+        result: { wait_result: "failed", matched: false, reason: "target_read_failed", targetErrors }
+      });
+    });
+    await handle.promise;
+    const detail = registry.get(handle.jobId)!;
+    expect(detail.result).toMatchObject({ wait_result: "failed", targetErrors: targetErrors.slice(0, 6) });
+    expect(detail.truncation).toMatchObject({ resultTargetErrors: 1 });
+    expect(detail.error).toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+  });
+
   it("rejects invalid and duplicate generated IDs and handles missing updates", () => {
     const invalid = new JobRegistry({ idFactory: () => "bad" });
     expect(() => invalid.register(request, async () => success)).toThrow(/JOB_ID_INVALID/);

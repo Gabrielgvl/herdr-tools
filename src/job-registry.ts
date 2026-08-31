@@ -37,6 +37,14 @@ export interface JobTargetRef {
   targetId: string;
 }
 
+/** A bounded failure for one target in a partial multi-target observation. */
+export interface JobTargetError {
+  target: string;
+  targetId: string;
+  code: string;
+  message: string;
+}
+
 export interface JobRequestSnapshot {
   label: string;
   targets: string[];
@@ -76,6 +84,7 @@ export interface JobResultSnapshot {
   /** Exact match facts are independent from the bounded evidence window. */
   matchedTargetCount?: number;
   matchedTargets?: Array<{ target: string; targetId: string }>;
+  targetErrors?: JobTargetError[];
   targets?: JobResultTargetSnapshot[];
   reviewerSummaries?: Array<{
     target: string;
@@ -114,6 +123,7 @@ export interface JobTruncation {
   resultTargetLinesClipped?: number;
   resultTargetMetadata?: number;
   resultTargetEvidence?: number;
+  resultTargetErrors?: number;
   reviewerSummaries?: number;
   reviewerFieldsClipped?: number;
   errorDetails?: boolean;
@@ -198,6 +208,7 @@ export interface JobRunResult {
   reason?: string;
   matchedTargetCount?: number;
   matchedTargets?: JobResultSnapshot["matchedTargets"];
+  targetErrors?: JobResultSnapshot["targetErrors"];
   targets?: JobResultSnapshot["targets"];
   reviewerSummaries?: JobResultSnapshot["reviewerSummaries"];
 }
@@ -428,6 +439,15 @@ function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit
   }));
   if (matchedTargetCount > matchedTargets.length) truncation.resultMatchedTargets = Math.max(truncation.resultMatchedTargets ?? 0, matchedTargetCount - matchedTargets.length);
 
+  const sourceTargetErrors = result.targetErrors ?? [];
+  const targetErrors = sourceTargetErrors.slice(0, targetLimit).map((error) => ({
+    target: boundedText(error.target, PUBLIC_FIELD_BYTES),
+    targetId: boundedText(error.targetId, PUBLIC_FIELD_BYTES),
+    code: boundedText(error.code, PUBLIC_FIELD_BYTES),
+    message: boundedText(error.message, PUBLIC_FIELD_BYTES)
+  }));
+  if (sourceTargetErrors.length > targetErrors.length) truncation.resultTargetErrors = sourceTargetErrors.length - targetErrors.length;
+
   const sourceReviews = result.reviewerSummaries ?? [];
   const reviewerSummaries = sourceReviews.slice(0, reviewerLimit).map((summary) => {
     const target = boundedText(summary.target, PUBLIC_FIELD_BYTES);
@@ -442,6 +462,7 @@ function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit
     wait_result: result.wait_result,
     matched: result.matched,
     ...(matchedTargetCount > 0 ? { matchedTargetCount, matchedTargets } : {}),
+    ...(sourceTargetErrors.length > 0 ? { targetErrors } : {}),
     ...(result.reason ? { reason: boundedText(result.reason) } : {}),
     ...(sourceTargets.length > 0 ? { targets } : {}),
     ...(sourceReviews.length > 0 ? { reviewerSummaries } : {})
@@ -459,7 +480,7 @@ function copyProgress(progress: JobProgress, truncation: JobTruncation): JobProg
 }
 
 const TRUNCATION_KEYS = [
-  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped", "requestCondition", "requestConditionClipped", "requestLabelClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetGenerationRefsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "resultTargetEvidence", "reviewerSummaries", "reviewerFieldsClipped", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted", "lateSettlementClipped"
+  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped", "requestCondition", "requestConditionClipped", "requestLabelClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetGenerationRefsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "resultTargetEvidence", "resultTargetErrors", "reviewerSummaries", "reviewerFieldsClipped", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted", "lateSettlementClipped"
 ] as const;
 
 function boundedTruncation(value: JobTruncation | undefined): JobTruncation {
@@ -547,6 +568,7 @@ export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): Jo
       ...(detail.result.reason ? { reason: detail.result.reason } : {}),
       ...(detail.result.matchedTargetCount === undefined ? {} : { matchedTargetCount: detail.result.matchedTargetCount }),
       ...(detail.result.matchedTargets ? { matchedTargets: detail.result.matchedTargets } : {}),
+      ...(detail.result.targetErrors ? { targetErrors: detail.result.targetErrors } : {}),
       ...(detail.result.targets ? { targets: detail.result.targets } : {}),
       ...(detail.result.reviewerSummaries ? { reviewerSummaries: detail.result.reviewerSummaries } : {})
     }, truncation) } : {}),
@@ -738,6 +760,7 @@ export class JobRegistry {
         ...(result.reason ? { reason: result.reason } : {}),
         ...(result.matchedTargetCount === undefined ? {} : { matchedTargetCount: result.matchedTargetCount }),
         ...(result.matchedTargets ? { matchedTargets: result.matchedTargets } : {}),
+        ...(result.targetErrors ? { targetErrors: result.targetErrors } : {}),
         ...(result.targets ? { targets: result.targets } : {}),
         ...(result.reviewerSummaries ? { reviewerSummaries: result.reviewerSummaries } : {})
       });
@@ -862,7 +885,10 @@ export class JobRegistry {
           message: error instanceof Error ? error.message : String(error),
           ...(typeof error === "object" && error !== null && "details" in error ? { details: (error as { details?: unknown }).details } : {})
         };
-        this.settleLocked(record, "failed", undefined, mapped);
+        const partialResult = typeof error === "object" && error !== null && "result" in error && typeof (error as { result?: unknown }).result === "object" && (error as { result?: { wait_result?: unknown } }).result?.wait_result === "failed"
+          ? (error as { result: JobRunResult }).result
+          : undefined;
+        this.settleLocked(record, "failed", partialResult, mapped);
       });
     }
   }

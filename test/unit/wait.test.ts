@@ -225,10 +225,27 @@ describe("herdr_wait", () => {
 
   it("uses native identity evidence, fails closed on replacement, and handles timeout/malformed responses", async () => {
     const incomplete = nativeCli({ statuses: { p1: "done" }, currentStatuses: { p1: "working" } });
-    await expect(execute(incomplete, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).resolves.toMatchObject({ wait_result: "condition_met" });
+    const incompleteResult = await execute(incomplete, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() });
+    expect(incompleteResult).toMatchObject({
+      wait_result: "condition_met",
+      targets: [{ metadata: { pane_id: "p1", tab_id: "w:t", workspace_id: "w", label: "one", agent_name: "one", agent: "pi", agent_status: "done" } }]
+    });
     expect(incomplete.calls.map((call) => call.slice(0, 2))).toContainEqual(["agent", "get"]);
     const mismatch = nativeCli({ statuses: { p1: "done" }, currentStatuses: { p1: "working" }, mismatch: true });
     await expect(execute(mismatch, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    const replacedNative = nativeCli({ statuses: { p1: "done" }, currentStatuses: { p1: "working" } });
+    const replacedPane = { ...nativeSnapshot({ p1: "done" }).snapshot.panes[0], terminal_id: "replaced-terminal" };
+    const replacedAgent = { ...nativeSnapshot({ p1: "done" }).snapshot.agents[0], terminal_id: "replaced-terminal" };
+    const replacedOriginal = replacedNative.runJson.bind(replacedNative);
+    let replacedPaneGets = 0;
+    let replacedAgentGets = 0;
+    replacedNative.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get" && ++replacedPaneGets > 1) return { id: "pane", result: { pane: replacedPane } };
+      if (argv[0] === "agent" && argv[1] === "get" && ++replacedAgentGets > 1) return { id: "agent", result: { agent: replacedAgent } };
+      if (argv[0] === "agent" && argv[1] === "wait") return { id: "wait", result: { type: "wait_matched", event: { event: "pane_agent_status_changed", data: { pane_id: "p1", workspace_id: "w", agent_status: "done" } } } };
+      return replacedOriginal(argv, signal);
+    };
+    await expect(execute(replacedNative, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
     const malformed: WaitCli = { ...nativeCli({ statuses: { p1: "done" } }), async runJson(argv) {
       if (argv[0] === "pane" && argv[1] === "current") return currentPane();
       if (argv[0] === "api") return { id: "snapshot", result: nativeSnapshot({ p1: "working" }) };
@@ -250,10 +267,13 @@ describe("herdr_wait", () => {
   it("accepts an agent-free raw unknown transition with historical absence evidence", async () => {
     const cli = nativeCli({ statuses: { p1: "unknown" }, currentStatuses: { p1: "working" } });
     const originalRunJson = cli.runJson.bind(cli);
+    let paneGets = 0;
     let agentGets = 0;
-    cli.runJson = async (argv, signal) => argv[0] === "agent" && argv[1] === "get" && ++agentGets > 1
-      ? Promise.reject(new CliProtocolError("CLI_PROTOCOL_ERROR", "agent not found", { errorEnvelope: { error: { code: "agent_not_found", message: "agent is absent" } } }))
-      : originalRunJson(argv, signal);
+    cli.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get" && ++paneGets > 1) return { id: "pane", result: { pane: { ...nativeSnapshot({ p1: "unknown" }).snapshot.panes[0], agent_status: "unknown" } } };
+      if (argv[0] === "agent" && argv[1] === "get" && ++agentGets > 1) return Promise.reject(new CliProtocolError("CLI_PROTOCOL_ERROR", "agent not found", { errorEnvelope: { error: { code: "agent_not_found", message: "agent is absent" } } }));
+      return originalRunJson(argv, signal);
+    };
     const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 1 }, { clock: clock() });
     expect(result).toMatchObject({
       wait_result: "condition_met",
@@ -267,6 +287,85 @@ describe("herdr_wait", () => {
       ? Promise.resolve({ id: "agent", result: {} })
       : absentForWorkingRunJson(argv, signal);
     await expect(execute(absentForWorking, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+  });
+
+  it("fails closed when an agent-free unknown pane is reused in current and native paths", async () => {
+    const absentError = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "agent not found", { errorEnvelope: { error: { code: "agent_not_found", message: "agent is absent" } } });
+    const replacementPane = { ...nativeSnapshot({ p1: "unknown" }).snapshot.panes[0] } as Record<string, unknown>;
+    replacementPane.terminal_id = "replacement-terminal";
+    delete replacementPane.agent_name;
+    delete replacementPane.agent;
+    delete replacementPane.agent_session;
+    delete replacementPane.agent_id;
+    const currentPath = nativeCli({ statuses: { p1: "unknown" }, currentStatuses: { p1: "unknown" } });
+    const currentOriginal = currentPath.runJson.bind(currentPath);
+    currentPath.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane: replacementPane } };
+      if (argv[0] === "agent" && argv[1] === "get") return Promise.reject(absentError());
+      return currentOriginal(argv, signal);
+    };
+    await expect(execute(currentPath, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 10 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+
+    const nativePath = nativeCli({ statuses: { p1: "unknown" }, currentStatuses: { p1: "working" } });
+    const nativeOriginal = nativePath.runJson.bind(nativePath);
+    let paneGets = 0;
+    let agentGets = 0;
+    nativePath.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get" && ++paneGets > 1) return { id: "pane", result: { pane: replacementPane } };
+      if (argv[0] === "agent" && argv[1] === "get" && ++agentGets > 1) return Promise.reject(absentError());
+      return nativeOriginal(argv, signal);
+    };
+    await expect(execute(nativePath, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 10 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+
+    const stablePane = { ...nativeSnapshot({ p1: "unknown" }).snapshot.panes[0], agent_id: undefined, agent_process_id: undefined, agent_terminal_id: undefined, agent_session_source: "pi", agent_session_agent: "pi", agent_session_kind: "id", agent_session_value: "p1-session", session_source: "pi", session_agent: "pi", session_kind: "id", session_value: "p1-session", name: "one", agent_kind: "pi", kind: "pi" } as Record<string, unknown>;
+    const runAgentFree = async (extra: Record<string, unknown> = {}) => {
+      const cli = nativeCli({ statuses: { p1: "unknown" }, currentStatuses: { p1: "unknown" } });
+      const original = cli.runJson.bind(cli);
+      const pane = { ...stablePane, ...extra };
+      cli.runJson = async (argv, signal) => {
+        if (argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane } };
+        if (argv[0] === "agent" && argv[1] === "get") return Promise.reject(absentError());
+        return original(argv, signal);
+      };
+      return execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "unknown" }, timeoutMs: 10 }, { clock: clock() });
+    };
+    await expect(runAgentFree()).resolves.toMatchObject({ wait_result: "condition_met" });
+    await expect(runAgentFree({ agent_session: undefined })).resolves.toMatchObject({ wait_result: "condition_met" });
+    for (const field of ["source", "agent", "kind", "value"] as const) {
+      const session = { source: "pi", agent: "pi", kind: "id", value: "p1-session" };
+      session[field] = `replacement-${field}`;
+      await expect(runAgentFree({ agent_session: session })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+    }
+    for (const [field, value] of [
+      ["agent_id", "replacement-agent"], ["agent_process_id", "replacement-process"], ["agent_terminal_id", "replacement-agent-terminal"],
+      ["agent_session", []], ["agent_session", null], ["agent_session_source", "replacement-source"], ["agent_session_agent", "replacement-agent-kind"], ["agent_session_kind", "replacement-kind"], ["agent_session_value", "replacement-session"],
+      ["session_source", "replacement-source"], ["session_agent", "replacement-agent-kind"], ["session_kind", "replacement-kind"], ["session_value", "replacement-session"],
+      ["agent_name", "replacement-name"], ["name", "replacement-name"], ["agent", "replacement-agent-kind"], ["agent_kind", "replacement-kind"], ["kind", "replacement-kind"]
+    ] as const) await expect(runAgentFree({ [field]: value })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+  });
+
+  it("refreshes native predicate-expiry snapshots and fails when refresh cannot be verified", async () => {
+    const freshPane = { ...nativeSnapshot({ p1: "working" }).snapshot.panes[0], label: "fresh-label" };
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const originalRunJson = cli.runJson.bind(cli);
+    let paneGets = 0;
+    cli.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get" && ++paneGets > 1) return { id: "pane", result: { pane: freshPane } };
+      if (argv[0] === "agent" && argv[1] === "wait") return Promise.reject(nativePredicateTimeout());
+      return originalRunJson(argv, signal);
+    };
+    const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10 }, { clock: clock() });
+    expect(result).toMatchObject({ wait_result: "timed_out", targets: [{ metadata: { label: "fresh-label" }, target_evidence: { source: "composite_observation", currency: "historical_non_current" } }] });
+
+    const broken = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const brokenOriginal = broken.runJson.bind(broken);
+    let brokenPaneGets = 0;
+    broken.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get" && ++brokenPaneGets > 1) return Promise.reject(new Error("fresh verification failed"));
+      if (argv[0] === "agent" && argv[1] === "wait") return Promise.reject(nativePredicateTimeout());
+      return brokenOriginal(argv, signal);
+    };
+    await expect(execute(broken, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10 }, { clock: clock() })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
   });
 
   it("fails closed on malformed native protocol diagnostics", async () => {
@@ -400,6 +499,108 @@ describe("herdr_wait", () => {
     expect(linked.signal.aborted).toBe(true);
     linked.dispose();
     linked.dispose();
+  });
+
+  it("fresh-checks native state after reviewer windows before another native wait", async () => {
+    let released = false;
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const done = nativeSnapshot({ p1: "done" });
+    const originalRunJson = cli.runJson.bind(cli);
+    cli.runJson = async (argv, signal) => {
+      if (released && argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane: done.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } };
+      if (released && argv[0] === "agent" && argv[1] === "get") return { id: "agent", result: { agent: done.snapshot.agents.find((agent) => agent.pane_id === argv[2]) } };
+      return originalRunJson(argv, signal);
+    };
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => { released = true; return { targetId, classification: "progress", summary: "review completed" }; } };
+    const result = await execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
+    expect(result).toMatchObject({ wait_result: "condition_met", matched: true });
+  });
+
+  it("fresh-checks segmented native waits before invoking the transition predicate", async () => {
+    const done = nativeSnapshot({ p1: "done" });
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const originalRunJson = cli.runJson.bind(cli);
+    let paneGets = 0;
+    cli.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get" && ++paneGets > 2) return { id: "pane", result: { pane: done.snapshot.panes[0] } };
+      if (argv[0] === "agent" && argv[1] === "get" && paneGets > 2) return { id: "agent", result: { agent: done.snapshot.agents[0] } };
+      return originalRunJson(argv, signal);
+    };
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification: "progress", summary: "not reached" }) };
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer })).resolves.toMatchObject({ wait_result: "condition_met", matched: true });
+
+    let now = 0;
+    let deadlinePaneGets = 0;
+    const deadlineCli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const deadlineOriginal = deadlineCli.runJson.bind(deadlineCli);
+    deadlineCli.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get" && ++deadlinePaneGets === 3) now = 120_001;
+      return deadlineOriginal(argv, signal);
+    };
+    await expect(execute(deadlineCli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, { clock: { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => reviewer })).resolves.toMatchObject({ wait_result: "timed_out", matched: false });
+  });
+
+  it("settles timeout from the fresh check after a reviewer refresh reaches the deadline", async () => {
+    let now = 0;
+    let paneGets = 0;
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const originalRunJson = cli.runJson.bind(cli);
+    cli.runJson = async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "get" && ++paneGets === 7) now = 120_001;
+      return originalRunJson(argv, signal);
+    };
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification: "progress", summary: "refresh deadline" }) };
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, { clock: { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => reviewer })).resolves.toMatchObject({ wait_result: "timed_out", matched: false });
+  });
+
+  it("settles timeout from the post-review fresh check when review consumes the deadline", async () => {
+    let now = 0;
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => { now = 120_001; return { targetId, classification: "progress", summary: "review deadline" }; } };
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, { clock: { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => reviewer })).resolves.toMatchObject({ wait_result: "timed_out", matched: false });
+  });
+
+  it("uses a fresh reviewer-window state check before running another native wait", async () => {
+    let released = false;
+    const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+    const done = nativeSnapshot({ p1: "done" });
+    const originalRunJson = cli.runJson.bind(cli);
+    cli.runJson = async (argv, signal) => {
+      if (released && argv[0] === "pane" && argv[1] === "get") return { id: "pane", result: { pane: done.snapshot.panes[0] } };
+      if (released && argv[0] === "agent" && argv[1] === "get") return { id: "agent", result: { agent: done.snapshot.agents[0] } };
+      return originalRunJson(argv, signal);
+    };
+    const originalRunText = cli.runText.bind(cli);
+    cli.runText = async (...args) => {
+      released = true;
+      return originalRunText(...args);
+    };
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification: "progress", summary: "reviewed" }) };
+    await expect(execute(cli, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer })).resolves.toMatchObject({ wait_result: "condition_met", matched: true });
+  });
+
+  it("fresh-checks manager judgment before the final segmented native wait", async () => {
+    const runManagerRefresh = async (mode: "match" | "timeout") => {
+      let managerRefresh = false;
+      let now = 0;
+      const cli = nativeCli({ statuses: { p1: "working" }, currentStatuses: { p1: "working" } });
+      const done = nativeSnapshot({ p1: "done" });
+      const originalRunJson = cli.runJson.bind(cli);
+      cli.runJson = async (argv, signal) => {
+        if (managerRefresh && argv[0] === "pane" && argv[1] === "get") {
+          if (mode === "timeout") now = 120_001;
+          return { id: "pane", result: { pane: mode === "match" ? done.snapshot.panes[0] : nativeSnapshot({ p1: "working" }).snapshot.panes[0] } };
+        }
+        if (managerRefresh && argv[0] === "agent" && argv[1] === "get" && mode === "match") return { id: "agent", result: { agent: done.snapshot.agents[0] } };
+        return originalRunJson(argv, signal);
+      };
+      const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification: "blocked", summary: "manager judgment" }) };
+      const deps = { cli, context, settingsLoader: async () => settings, jobRegistry: new JobRegistry(), clock: { now: () => now, sleep: async (milliseconds: number) => { now += milliseconds; } }, pollIntervalMs: 60_000, reviewerFactory: () => reviewer } as Parameters<typeof prepareWait>[0];
+      const prepared = await prepareWait(deps, { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 }, new AbortController().signal);
+      return runPreparedWait(deps, prepared, new AbortController().signal, (text) => { if (text.startsWith("review")) managerRefresh = true; }, extensionContext);
+    };
+    await expect(runManagerRefresh("match")).resolves.toMatchObject({ wait_result: "condition_met", matched: true });
+    await expect(runManagerRefresh("timeout")).resolves.toMatchObject({ wait_result: "timed_out", matched: false });
   });
 
   it("keeps reviewer refreshes composite and never lets them satisfy a native predicate", async () => {

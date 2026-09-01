@@ -45,6 +45,7 @@ type ToolResult = { content: Array<{ type: string; text: string }>; isError?: bo
 
 /** Every field `herdr_launch` publishes to the model on failure, and nothing else. */
 const LAUNCH_DIAGNOSTIC_FIELDS = ["agentStarted", "code", "created", "effectCertainty", "phase", "promptSubmitted", "recipientRegistered", "recoveryGuidance"];
+const LAUNCH_UNCONFIRMED_DIAGNOSTIC_FIELDS = [...LAUNCH_DIAGNOSTIC_FIELDS, "assignmentState", "paneId", "supervisorJobId"];
 const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 /** The identifier fields the diagnostic's `created` block may carry. */
 const LAUNCH_CREATED_FIELDS = ["tabId", "paneId", "agentId"];
@@ -153,7 +154,12 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(Object.keys(details).sort()).toEqual(["diagnostic", "tool"]);
       expect(details.tool).toBe("herdr_launch");
       const diagnostic = record(details.diagnostic);
-      expect(Object.keys(diagnostic).sort()).toEqual(LAUNCH_DIAGNOSTIC_FIELDS);
+      const assignmentUnconfirmed = diagnostic.assignmentState === "unconfirmed";
+      expect(Object.keys(diagnostic).sort()).toEqual([...(assignmentUnconfirmed ? LAUNCH_UNCONFIRMED_DIAGNOSTIC_FIELDS : LAUNCH_DIAGNOSTIC_FIELDS)].sort());
+      if (assignmentUnconfirmed) {
+        expect(typeof diagnostic.paneId).toBe("string");
+        expect(typeof diagnostic.supervisorJobId).toBe("string");
+      }
       expect(String(diagnostic.code)).toMatch(LAUNCH_CODE_PATTERN);
       expect(typeof diagnostic.phase).toBe("string");
       for (const flag of ["agentStarted", "promptSubmitted", "recipientRegistered"]) {
@@ -381,12 +387,10 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
 
       await new Promise((settle) => setTimeout(settle, PANE_SETTLE_MS));
 
-      // The reviewer-refusal contract gets its own target, because it must not
-      // depend on the prompt-bearing launch below: that launch legitimately
-      // fails closed when prompt consumption cannot be proven, is never retried,
-      // and ends the run early. This launch carries no initial prompt, so it has
-      // no consumption to confirm and no prompt phase to fail in, and its pane is
-      // closed again immediately after the contract is proven.
+      // A launched child is covered by its exact supervisor before this wait
+      // starts. The MCP host has no explicit wait-review model service, so a
+      // redundant reviewer would fail the job; remaining live proves the
+      // supervisor retained sole semantic-review ownership.
       const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "worker-pi" });
       expect(reviewerTargetLaunch.isError, text(reviewerTargetLaunch)).toBeUndefined();
       const reviewerTargetEvidence = evidence(reviewerTargetLaunch);
@@ -396,38 +400,44 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         placement: { mode: "same_tab" },
         kind: "pi",
         initialPromptSent: false,
-        promptSubmitted: false
+        promptSubmitted: false,
+        supervision: { jobId: expect.any(String), state: "active" }
       });
       const reviewerPaneId = String(reviewerTargetEvidence.paneId);
-      // A wait longer than the review cadence must build a reviewer, and the MCP
-      // host has none: model-backed review is unavailable there, so the reviewer
-      // factory refuses and the detached job must settle fail-closed rather than
-      // wait on unsupervised. The condition is a non-native pane-output literal
-      // that can never appear, so the initial observation completes at once and
-      // the wait reaches the long-wait reviewer factory without sleeping through
-      // the fixed review cadence; the timeout still exceeds that cadence, which
-      // is what makes this a long wait. Neither the cadence nor the explicit
-      // wait's own reviewer settings are altered to make this reachable.
-      const unsupervised = await call("herdr_wait", {
+      const supervisorJobId = String(record(reviewerTargetEvidence.supervision).jobId);
+      const supervisedWait = await call("herdr_wait", {
         targets: [reviewerPaneId],
         match: "any",
         condition: { kind: "output", match: { kind: "literal", value: IMPOSSIBLE_OUTPUT_LITERAL } },
         timeoutMs: 31 * 60_000,
-        label: "mcp long wait"
+        label: "mcp supervised long wait"
       });
-      expect(unsupervised.isError, text(unsupervised)).toBeUndefined();
-      const unsupervisedJobId = evidence(unsupervised).jobId as string;
+      expect(supervisedWait.isError, text(supervisedWait)).toBeUndefined();
+      const supervisedWaitJobId = evidence(supervisedWait).jobId as string;
       await vi.waitFor(async () => {
-        const job = await call("herdr_jobs", { operation: "get", jobId: unsupervisedJobId });
-        expect(evidence(job)).toMatchObject({
+        const job = await call("herdr_jobs", { operation: "get", jobId: supervisedWaitJobId });
+        const jobEvidence = evidence(job);
+        expect(jobEvidence).toMatchObject({
           operation: "jobs",
           view: "job",
-          jobId: unsupervisedJobId,
-          operation_phase: "settled",
-          wait_result: "failed",
-          error: { code: "REVIEWER_FAILED" }
+          jobId: supervisedWaitJobId,
+          operation_phase: "running"
         });
+        expect(jobEvidence).not.toHaveProperty("wait_result");
+        expect(jobEvidence).not.toHaveProperty("error");
       }, { timeout: 20_000, interval: 100 });
+      const supervisor = evidence(await call("herdr_jobs", { operation: "get", jobId: supervisorJobId }));
+      expect(supervisor).toMatchObject({
+        operation: "jobs",
+        view: "job",
+        jobId: supervisorJobId,
+        operation_phase: "running",
+        request: { targetIds: [reviewerPaneId] },
+        supervision: { state: expect.stringMatching(/^(?:active|degraded)$/u), child: { paneId: reviewerPaneId } }
+      });
+      const cancelledSupervisedWait = await call("herdr_jobs", { operation: "cancel", jobId: supervisedWaitJobId });
+      expect(cancelledSupervisedWait.isError, text(cancelledSupervisedWait)).toBeUndefined();
+      expect(evidence(cancelledSupervisedWait)).toMatchObject({ operation_phase: "settled", wait_result: "cancelled" });
       const closedReviewerPane = await call("herdr_pane", { operation: "close", target: reviewerPaneId });
       expect(closedReviewerPane.isError, text(closedReviewerPane)).toBeUndefined();
 
@@ -455,8 +465,11 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
           phase: "prompt_verification",
           agentStarted: true,
           promptSubmitted: true,
-          // Binding, and with it recipient registration, is only reached after
-          // consumption is confirmed.
+          assignmentState: "unconfirmed",
+          paneId: expect.any(String),
+          supervisorJobId: expect.any(String),
+          // Recipient registration remains gated on consumption confirmation;
+          // the exact supervisor was already bound before prompt dispatch.
           recipientRegistered: false,
           recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
         });

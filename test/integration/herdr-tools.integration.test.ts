@@ -43,9 +43,13 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     handlers: string[];
     cliCalls: string[][];
     stdinCalls: Array<{ args: string[]; input: string }>;
+    toolCalls: Array<{ name: string; id: string }>;
     profilePromptContent: string;
     attachmentPaths: string[];
-  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], stdinCalls: [], profilePromptContent: "", attachmentPaths: [] };
+    forceNextPromptConfirmationFailure: boolean;
+    promptConfirmationFailurePaneId?: string;
+    unconfirmedRecoveries: Array<{ paneId: string; supervisorJobId: string }>;
+  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], stdinCalls: [], toolCalls: [], profilePromptContent: "", attachmentPaths: [], forceNextPromptConfirmationFailure: false, unconfirmedRecoveries: [] };
 
   const run = async (...args: string[]): Promise<unknown> => {
     // The suite sets HERDR_SOCKET_PATH so the extension's supervision monitor
@@ -175,11 +179,121 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     }
   };
 
+  const assertUnconfirmedRecovery = async (
+    label: string,
+    details: Record<string, unknown>,
+    promptCanary: string,
+    stdinStart: number,
+    cliStart: number,
+    toolCallStart: number
+  ): Promise<void> => {
+    expect(details).toMatchObject({
+      assignmentState: "unconfirmed",
+      recipientRegistered: false,
+      paneId: expect.any(String),
+      supervisorJobId: expect.any(String),
+      supervision: {
+        jobId: expect.any(String),
+        state: "active",
+        child: {
+          agentName: expect.any(String),
+          agentKind: expect.any(String),
+          paneId: expect.any(String),
+          terminalId: expect.any(String),
+          profileName: expect.any(String)
+        }
+      }
+    });
+    const paneId = details.paneId;
+    const supervisorJobId = details.supervisorJobId;
+    if (typeof paneId !== "string" || typeof supervisorJobId !== "string") throw new Error("unconfirmed launch omitted exact recovery IDs");
+    const launchSupervision = resultObject(details.supervision);
+    const launchChild = resultObject(launchSupervision.child);
+    expect(launchSupervision.jobId).toBe(supervisorJobId);
+    expect(launchChild.paneId).toBe(paneId);
+
+    const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
+    expect(promptCalls).toHaveLength(1);
+    expect(promptCalls[0]!.args).toEqual(["agent", "prompt", paneId, "--stdin"]);
+    expect(state.toolCalls.slice(toolCallStart).map(({ name }) => name).filter((name) => name === "herdr_wait" || name === "herdr_communicate")).toEqual([]);
+
+    const launchCliCalls = state.cliCalls.slice(cliStart);
+    const cleanupCalls = launchCliCalls.filter((args) =>
+      (["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? ""))
+      || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? ""))
+    );
+    expect(cleanupCalls).toEqual([]);
+
+    const liveResult = resultObject(resultObject(await runNamed(["agent", "get", paneId])).result);
+    const liveAgent = resultObject(liveResult.agent ?? liveResult);
+    const expectedSession = resultObject(resultObject(details.initialPromptSubmission).agentSession);
+    expect({
+      paneId: liveAgent.pane_id,
+      terminalId: liveAgent.terminal_id,
+      agentName: liveAgent.name ?? liveAgent.agent_name,
+      agentKind: liveAgent.agent,
+      agentSession: liveAgent.agent_session
+    }).toEqual({
+      paneId,
+      terminalId: launchChild.terminalId,
+      agentName: launchChild.agentName,
+      agentKind: launchChild.agentKind,
+      agentSession: expectedSession
+    });
+
+    const jobResult = await tool("herdr_jobs").execute(`${label}-supervisor`, { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext());
+    const job = resultObject(jobResult.details);
+    expect(job).toMatchObject({
+      operation: "jobs",
+      view: "job",
+      jobId: supervisorJobId,
+      kind: "supervisor",
+      request: { kind: "supervisor", targetIds: [paneId] },
+      supervision: {
+        state: expect.stringMatching(/^(?:active|degraded)$/u),
+        child: {
+          agentName: launchChild.agentName,
+          agentKind: launchChild.agentKind,
+          paneId,
+          terminalId: launchChild.terminalId,
+          profileName: launchChild.profileName
+        },
+        monitor: {
+          reconciliation: {
+            intervalMs: 30_000,
+            degraded: expect.any(Boolean),
+            consecutiveFailures: expect.any(Number)
+          }
+        }
+      }
+    });
+    expect(["accepted", "running"]).toContain(job.operation_phase);
+    expect(job).not.toHaveProperty("supervision_result");
+
+    const supervision = resultObject(job.supervision);
+    const monitor = resultObject(supervision.monitor);
+    const reconciliation = resultObject(monitor.reconciliation);
+    const healthKeys = new Set(["intervalMs", "degraded", "consecutiveFailures", "lastAttemptAtMs", "lastSuccessAtMs", "lastFailureAtMs", "lastFailureReason"]);
+    expect(Object.keys(reconciliation).every((key) => healthKeys.has(key))).toBe(true);
+    expect(Number.isSafeInteger(reconciliation.consecutiveFailures)).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(reconciliation), "utf8")).toBeLessThanOrEqual(512);
+    const jobEvidence = JSON.stringify(job);
+    expect(jobEvidence.includes(promptCanary), "the supervisor job exposed the assignment prompt canary").toBe(false);
+    expect(jobEvidence).not.toContain(String(expectedSession.value));
+    if (!state.unconfirmedRecoveries.some((entry) => entry.paneId === paneId && entry.supervisorJobId === supervisorJobId)) {
+      state.unconfirmedRecoveries.push({ paneId, supervisorJobId });
+    }
+    process.stderr.write(`INTEGRATION_UNCONFIRMED_RECOVERY ${label} ${JSON.stringify({ paneId, supervisorJobId, operation_phase: job.operation_phase, supervisionState: supervision.state, reconciliation })}\n`);
+    expect(JSON.stringify(details).includes(promptCanary), "rich launch failure details exposed the assignment prompt canary").toBe(false);
+  };
+
   type LaunchDelivery = { confirmed: true; details: Record<string, unknown> } | { confirmed: false; details: Record<string, unknown> };
 
-  const deliverLaunch = async (label: string, call: () => Promise<{ details?: Record<string, unknown> }>): Promise<LaunchDelivery> => {
+  const deliverLaunch = async (label: string, promptCanary: string, call: () => Promise<{ details?: Record<string, unknown> }>): Promise<LaunchDelivery> => {
     const startedAt = performance.now();
     const stdinStart = state.stdinCalls.length;
+    const cliStart = state.cliCalls.length;
+    const toolCallStart = state.toolCalls.length;
     try {
       const result = await call();
       const wallElapsedMs = performance.now() - startedAt;
@@ -218,8 +332,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       });
       expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
       assertLaunchPhaseTiming(failure.details, elapsedMs, resultObject(failure.details.promptConfirmation).reason === "timeout");
-      // An exact fail-closed uncertainty is a valid live outcome. The prompt may
-      // have been consumed, so callers must not retry or run dependent assertions.
+      await assertUnconfirmedRecovery(label, failure.details, promptCanary, stdinStart, cliStart, toolCallStart);
+      // The helper performed only read-only recovery diagnostics. Callers return
+      // immediately, so no marker, wait, communication, retry, or cleanup follows.
       return { confirmed: false, details: failure.details };
     }
   };
@@ -227,11 +342,34 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   const tool = (name: string): ExecutableTool => {
     const found = state.registered.get(name);
     if (!found) throw new Error(`integration harness did not register ${name}`);
-    return found;
+    return {
+      name: found.name,
+      execute(id, params, abortSignal, onUpdate, context) {
+        state.toolCalls.push({ name, id });
+        return found.execute(id, params, abortSignal, onUpdate, context);
+      }
+    };
   };
 
   const toolContext = () => ({ cwd: state.cwd, hasUI: false }) as ExtensionContext;
   const signal = () => new AbortController().signal;
+
+  const closeConfirmedFixturePane = async (label: string, details: Record<string, unknown>): Promise<void> => {
+    const paneId = details.paneId;
+    if (typeof paneId !== "string") throw new Error(`${label} omitted its pane ID before harness cleanup`);
+    await runNamed(["pane", "close", paneId]);
+    const deadline = performance.now() + 10_000;
+    while (performance.now() < deadline) {
+      try {
+        await runNamed(["agent", "get", paneId]);
+      } catch {
+        process.stderr.write(`INTEGRATION_HARNESS_PANE_CLOSED ${label} ${paneId}\n`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`${label} agent remained visible after harness pane cleanup`);
+  };
 
   const waitForMarker = async (path: string, nonce: string, deadlineMs: number): Promise<boolean> => {
     const deadline = performance.now() + deadlineMs;
@@ -298,6 +436,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
           const promptFlag = args.indexOf("--append-system-prompt");
           if (promptFlag >= 0 && typeof args[promptFlag + 1] === "string") state.profilePromptContent = await readFile(args[promptFlag + 1]!, "utf8");
         }
+        if (args[0] === "agent" && args[1] === "get" && args[2] === state.promptConfirmationFailurePaneId) {
+          state.promptConfirmationFailurePaneId = undefined;
+          return { stdout: "", stderr: "forced disposable confirmation read failure", code: 1, killed: false };
+        }
         try {
           const result = await execFileAsync(command, ["--session", REQUIRED_SESSION, ...args], {
             cwd: state.cwd,
@@ -324,7 +466,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         expect(command).toBe("herdr");
         state.cliCalls.push([...args]);
         state.stdinCalls.push({ args: [...args], input });
-        return spawnWithStdin(command, ["--session", REQUIRED_SESSION, ...args], input, { signal: options?.signal, timeout: options?.timeout });
+        const result = await spawnWithStdin(command, ["--session", REQUIRED_SESSION, ...args], input, { signal: options?.signal, timeout: options?.timeout });
+        if (state.forceNextPromptConfirmationFailure && args[0] === "agent" && args[1] === "prompt" && typeof args[2] === "string") {
+          state.forceNextPromptConfirmationFailure = false;
+          state.promptConfirmationFailurePaneId = args[2];
+        }
+        return result;
       },
       registerTool(registered: unknown) {
         const executable = registered as ExecutableTool;
@@ -362,6 +509,14 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     // monitor; restore the ambient value now that the suite is done with it.
     if (state.savedSocketPath === undefined) delete process.env.HERDR_SOCKET_PATH;
     else process.env.HERDR_SOCKET_PATH = state.savedSocketPath;
+    if (state.unconfirmedRecoveries.length > 0) {
+      const snapshot = resultObject(resultObject(resultObject(await runNamed(["api", "snapshot"])).result).snapshot);
+      const panes = Array.isArray(snapshot.panes) ? snapshot.panes.map(resultObject) : [];
+      for (const recovery of state.unconfirmedRecoveries) {
+        expect(panes).toEqual(expect.arrayContaining([expect.objectContaining({ pane_id: recovery.paneId })]));
+      }
+      process.stderr.write(`INTEGRATION_UNCONFIRMED_RETAINED_UNTIL_HARNESS_TEARDOWN ${JSON.stringify(state.unconfirmedRecoveries)}\n`);
+    }
     if (state.fixtureCreated && state.workspaceId) {
       await runNamed(["workspace", "close", state.workspaceId]).catch((error) => process.stderr.write(`INTEGRATION_TEARDOWN_FAILURE ${String(error)}\n`));
     }
@@ -409,12 +564,29 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(topologyIds(defaultAfter)).toEqual(state.baseline);
   }, 120_000);
 
+  it("retains exact supervision after deterministic assignment-confirmation uncertainty", async () => {
+    const canary = `unconfirmed-assignment-${randomUUID()}`;
+    state.forceNextPromptConfirmationFailure = true;
+    const launched = await deliverLaunch("unconfirmed-recovery-launch", canary, () => tool("herdr_launch").execute("unconfirmed-recovery-launch", {
+      name: `integration-unconfirmed-${process.pid}`,
+      profile: "worker-pi",
+      placement: { mode: "new_tab", tabLabel: "unconfirmed-recovery" },
+      initialPrompt: `Recovery integration canary: ${canary}. Do not close or move this pane.`
+    }, signal(), undefined, toolContext()));
+    expect(launched.confirmed).toBe(false);
+    if (launched.confirmed) throw new Error("forced confirmation uncertainty unexpectedly returned launch success");
+    expect(state.promptConfirmationFailurePaneId).toBeUndefined();
+    expect(state.unconfirmedRecoveries).toEqual(expect.arrayContaining([
+      { paneId: launched.details.paneId, supervisorJobId: launched.details.supervisorJobId }
+    ]));
+  }, 120_000);
+
   it("fails closed for a deterministic Bash-tool interrupt in the disposable session", async () => {
     const turnMarker = `turn-control-${randomUUID()}`;
     const turnMarkerPath = join(state.cwd, "turn-control-started.txt");
     const turnScriptPath = join(state.cwd, "turn-control.sh");
     await writeFile(turnScriptPath, `printf '%s' '${turnMarker}' > '${turnMarkerPath}'\nsleep 120\n`, { mode: 0o700 });
-    const launched = await deliverLaunch("turn-control-launch", () => tool("herdr_launch").execute("turn-control-launch", {
+    const launched = await deliverLaunch("turn-control-launch", turnMarker, () => tool("herdr_launch").execute("turn-control-launch", {
       name: `integration-turn-control-${process.pid}`,
       profile: "worker-pi",
       placement: { mode: "new_tab", tabLabel: "turn-control" },
@@ -455,6 +627,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     });
     const controls = state.cliCalls.filter((args) => args[0] === "agent" && args[1] === "send-keys" && args[2] === paneId);
     expect(controls).toEqual([["agent", "send-keys", paneId, "ctrl+c"]]);
+    await closeConfirmedFixturePane("turn-control-launch", details);
   }, 180_000);
 
   // The unprofiled-launch refusal this suite used to cover has no reachable path left:
@@ -467,8 +640,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    * acceptance tests below own that claim.
    */
   it("routes wrapped text over the session-bound stdin transport and publishes exact artifacts", async () => {
+    if (state.unconfirmedRecoveries.length >= 2) return;
     const inlineBody = ["integration assignment", ...Array.from({ length: 320 }, (_value, index) => `long assignment line ${index}`)].join("\n");
-    const inline = await deliverLaunch("pi-inline-launch", () => tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: inlineBody }, signal(), undefined, toolContext()));
+    const inline = await deliverLaunch("pi-inline-launch", "integration assignment", () => tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: inlineBody }, signal(), undefined, toolContext()));
     if (!inline.confirmed) return;
     expect(inline.details).toMatchObject({ initialPromptDelivery: "inline", initialPromptSubmission: { confirmed: true } });
     const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
@@ -483,9 +657,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(inlineDelivery!.input).toContain("authority: agent; not user/owner");
     expect(inlineDelivery!.input).toContain("delivery: inline");
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("integration assignment")))).toBe(false);
+    await closeConfirmedFixturePane("pi-inline-launch", inline.details);
 
     const body = `Transport smoke body.\n${"detail line\n".repeat(200)}`;
-    const attachmentLaunch = await deliverLaunch("pi-attachment-launch", () => tool("herdr_launch").execute("launch-pi-attachment", { name: "integration-pi-attach", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "pi-attachment" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
+    const attachmentLaunch = await deliverLaunch("pi-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-pi-attachment", { name: "integration-pi-attach", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "pi-attachment" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
     if (!attachmentLaunch.confirmed) return;
     const attachment = resultObject(attachmentLaunch.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
@@ -500,6 +675,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(envelope!.input).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
     expect(envelope!.input).not.toContain("detail line");
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("detail line")))).toBe(false);
+    await closeConfirmedFixturePane("pi-attachment-launch", attachmentLaunch.details);
   }, 240_000);
 
   /**
@@ -508,6 +684,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    * returns before marker assertions because the prompt was possibly consumed.
    */
   it("accepts Pi recipient readback only with agent-produced evidence", async () => {
+    if (state.unconfirmedRecoveries.length >= 2) return;
     const nonce = randomUUID();
     const markerPath = join(state.cwd, "readback-pi.txt");
     const body = [
@@ -517,16 +694,18 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       "Then stop. Do not change anything else and do not reply."
     ].join("\n");
 
-    const launched = await deliverLaunch("pi-acceptance-launch", () => tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "accept-pi" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
+    const launched = await deliverLaunch("pi-acceptance-launch", nonce, () => tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "accept-pi" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
     if (!launched.confirmed) return;
     const attachment = resultObject(launched.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
     expect(await readFile(String(attachment.path), "utf8")).toContain(nonce);
     const produced = await waitForMarker(markerPath, nonce, ACCEPTANCE_DEADLINE_MS);
     expect(produced, `Pi recipient did not produce ${markerPath} containing the attachment token`).toBe(true);
+    await closeConfirmedFixturePane("pi-acceptance-launch", launched.details);
   }, 300_000);
 
   it("accepts Claude recipient readback only with agent-produced evidence", async () => {
+    if (state.unconfirmedRecoveries.length >= 2) return;
     const nonce = randomUUID();
     const markerPath = join(state.cwd, "readback-claude.txt");
     const body = [
@@ -551,5 +730,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(await readFile(String(attachment.path), "utf8")).toContain(nonce);
     const produced = await waitForMarker(markerPath, nonce, ACCEPTANCE_DEADLINE_MS);
     expect(produced, `Claude recipient did not produce ${markerPath} containing the attachment token`).toBe(true);
+    await closeConfirmedFixturePane("claude-acceptance-launch", details);
   }, 300_000);
 });

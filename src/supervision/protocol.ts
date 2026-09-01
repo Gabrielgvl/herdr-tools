@@ -11,13 +11,15 @@ export const SUPERVISION_AGENT_STATUSES = ["idle", "working", "blocked", "done",
 export type SupervisionAgentStatus = (typeof SUPERVISION_AGENT_STATUSES)[number];
 
 /**
- * The fixed global subscription set. It cannot be extended after
- * `events.subscribe` is acknowledged, because a second subscribe on the same
- * connection makes Herdr 0.8.2 drop it, so every supervisor is served from
- * exactly this set.
+ * The fixed global subscription set. Herdr 0.8.2 serves one request per
+ * connection, so a connection that has subscribed can never subscribe again and
+ * every supervisor is served from exactly this set.
+ *
+ * `pane.created` is deliberately absent: a supervisor binds to a pane that
+ * already exists, so a creation event for it can only ever be historical, and
+ * subscribing to it would only add replay volume.
  */
 export const SUPERVISION_SUBSCRIPTIONS = [
-  "pane.created",
   "pane.updated",
   "pane.closed",
   "pane.exited",
@@ -27,7 +29,6 @@ export const SUPERVISION_SUBSCRIPTIONS = [
 
 /** Event kinds this monitor accepts; anything else on the stream is ignored. */
 export const SUPERVISION_EVENT_KINDS = [
-  "pane_created",
   "pane_updated",
   "pane_closed",
   "pane_exited",
@@ -37,7 +38,7 @@ export const SUPERVISION_EVENT_KINDS = [
 export type SupervisionEventKind = (typeof SUPERVISION_EVENT_KINDS)[number];
 
 /** Event kinds that carry a full `PaneInfo` and can therefore be revision-anchored. */
-export const PANE_RECORD_EVENT_KINDS = ["pane_created", "pane_updated", "pane_moved"] as const;
+export const PANE_RECORD_EVENT_KINDS = ["pane_updated", "pane_moved"] as const;
 
 /** The longest single NDJSON line this client will accept from the server. */
 export const SUPERVISION_MAX_LINE_BYTES = 262_144;

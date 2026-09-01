@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { JobRegistry, SupervisionActiveError } from "../../src/job-registry.js";
 import { SessionEventMonitor } from "../../src/supervision/monitor.js";
 import { SupervisionRegistry } from "../../src/supervision/registry.js";
-import type { SupervisionStream } from "../../src/supervision/socket.js";
+import { scriptedServer } from "./supervision-peer.js";
 import type { SupervisionReviewer } from "../../src/supervision/reviewer.js";
 import type { SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
@@ -18,27 +18,6 @@ function snapshotResult(panes: Array<Record<string, unknown>>): unknown {
   return { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents: [{ pane_id: "p1", name: "worker" }] } };
 }
 
-/** A scripted socket peer that answers snapshots from a queue. */
-function peer(results: unknown[]): { stream: SupervisionStream; push(line: string): void } {
-  let onData: (chunk: Buffer) => void = () => undefined;
-  const queue = [...results];
-  return {
-    stream: {
-      write: (line) => {
-        const request = JSON.parse(line) as { id: string; method: string };
-        queueMicrotask(() => {
-          const result = request.method === "session.snapshot" ? (queue.shift() ?? snapshotResult([pane])) : { type: "subscription_started" };
-          onData(Buffer.from(`${JSON.stringify({ id: request.id, result })}\n`, "utf8"));
-        });
-      },
-      destroy: () => undefined,
-      onData: (handler) => { onData = handler; },
-      onClose: () => undefined,
-    },
-    push: (line) => onData(Buffer.from(line, "utf8")),
-  };
-}
-
 interface Fixture {
   jobs: JobRegistry;
   supervision: SupervisionRegistry;
@@ -47,7 +26,7 @@ interface Fixture {
 }
 
 function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[] } = {}): Fixture {
-  const server = peer(options.snapshots ?? []);
+  const server = scriptedServer({ snapshots: options.snapshots ?? [snapshotResult([pane])] });
   const jobs = new JobRegistry();
   const wakes: SupervisionWake[] = [];
   const notifier: ManagerNotifier = { wake: (wake) => { wakes.push(wake); } };
@@ -56,7 +35,7 @@ function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[
     settingsLoader: async () => settings,
     readTranscript: async () => ["line"],
     notifier,
-    monitor: new SessionEventMonitor({ connect: async () => server.stream, env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
+    monitor: new SessionEventMonitor({ connect: () => server.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
     ...(options.reviewer ? { reviewerFactory: () => options.reviewer! } : {}),
     scheduler: { setTimer: () => "timer", clearTimer: () => undefined },
     idFactory: (() => { let id = 0; return () => `fixture-${++id}`; })(),

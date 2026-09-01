@@ -1,11 +1,20 @@
 /**
  * The single session-level event connection, multiplexed across supervisors.
  *
- * Herdr 0.8.2 drops a connection that issues a second `events.subscribe`, so a
- * per-supervisor subscription is impossible: this monitor subscribes once to the
- * fixed global set and fans events out by pane id. Bootstrap is always
- * `session.snapshot` first and `events.subscribe` second; the subscription's
- * durable replay covers the window between them, so that order has no gap.
+ * Herdr 0.8.2 serves exactly one request per socket connection: after the first
+ * request the connection either closes or, once it has been upgraded to a
+ * subscription stream, is reset. Two consequences follow, and both were
+ * established against a live named server rather than assumed:
+ *
+ * - the long-lived connection carries `events.subscribe` and nothing else, so a
+ *   per-supervisor subscription is impossible and the monitor subscribes once to
+ *   the fixed global set and fans events out by pane id;
+ * - every `session.snapshot` — bootstrap and reconciliation alike — is a unary
+ *   read on its own short-lived connection.
+ *
+ * Bootstrap is always the snapshot first and the subscription second; the
+ * subscription's durable replay covers the window between them, so that order
+ * has no gap.
  */
 
 import { parseSnapshotResult, type HerdrSnapshot } from "../targets.js";
@@ -104,39 +113,46 @@ export class SessionEventMonitor {
   }
 
   /**
-   * Connect, bootstrap, and subscribe. Concurrent callers share one attempt so a
-   * burst of launches cannot open competing connections.
+   * Ensure the session's event subscription is live. Concurrent callers share one
+   * attempt so a burst of launches cannot open competing connections, and a live
+   * subscription costs nothing: no snapshot is taken for its own sake, because
+   * every read is a separate connection on this protocol.
    */
-  async ensureStarted(): Promise<HerdrSnapshot> {
+  async ensureStarted(): Promise<void> {
     if (this.stopped) throw new SupervisionSocketError("SUPERVISION_SOCKET_CLOSED", "The supervision monitor has been shut down");
-    if (this.socket && !this.socket.isClosed()) return this.snapshot();
+    if (this.socket && !this.socket.isClosed()) return;
     this.starting ??= this.bootstrap().finally(() => { this.starting = undefined; });
-    return this.starting;
+    await this.starting;
   }
 
   private async bootstrap(): Promise<HerdrSnapshot> {
-    const socketPath = resolveSocketPath(this.env);
-    const stream = await this.connect(socketPath);
-    const socket = new SupervisionSocket(stream, this.requestTimeoutMs);
+    const snapshot = await this.snapshot();
+    const socket = new SupervisionSocket(await this.connect(resolveSocketPath(this.env)), this.requestTimeoutMs);
     try {
-      const snapshot = parseSnapshotResult(await socket.request("session.snapshot", {}));
       await socket.subscribe();
-      this.socket = socket;
-      this.generationValue += 1;
-      socket.onEvent((event) => { void this.dispatch(event); });
-      socket.onClose(() => { void this.onSocketClosed(); });
-      return snapshot;
     } catch (error) {
       socket.close();
       throw error;
     }
+    this.socket = socket;
+    this.generationValue += 1;
+    socket.onEvent((event) => { void this.dispatch(event); });
+    socket.onClose(() => { void this.onSocketClosed(); });
+    return snapshot;
   }
 
-  /** A fresh authoritative reconciliation read on the live connection. */
+  /**
+   * A fresh authoritative read. It is unary by protocol: the server answers one
+   * request per connection, so this never shares the subscription's connection.
+   */
   async snapshot(): Promise<HerdrSnapshot> {
-    const socket = this.socket;
-    if (!socket || socket.isClosed()) throw new SupervisionSocketError("SUPERVISION_SOCKET_CLOSED", "The supervision monitor has no live connection");
-    return parseSnapshotResult(await socket.request("session.snapshot", {}));
+    if (this.stopped) throw new SupervisionSocketError("SUPERVISION_SOCKET_CLOSED", "The supervision monitor has been shut down");
+    const socket = new SupervisionSocket(await this.connect(resolveSocketPath(this.env)), this.requestTimeoutMs);
+    try {
+      return parseSnapshotResult(await socket.request("session.snapshot", {}));
+    } finally {
+      socket.close();
+    }
   }
 
   private async dispatch(event: SupervisionSocketEvent): Promise<void> {

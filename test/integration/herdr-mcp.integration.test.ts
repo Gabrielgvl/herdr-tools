@@ -383,7 +383,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const shortWaitJobId = evidence(shortWait).jobId as string;
       await vi.waitFor(async () => {
         const job = await call("herdr_jobs", { operation: "get", jobId: shortWaitJobId });
-        expect(evidence(job)).toMatchObject({ operation: "jobs", kind: "job", jobId: shortWaitJobId, operation_phase: "settled", wait_result: "condition_met" });
+        expect(evidence(job)).toMatchObject({ operation: "jobs", view: "job", jobId: shortWaitJobId, operation_phase: "settled", wait_result: "condition_met" });
       }, { timeout: 20_000, interval: 100 });
 
       // `steer` is the provenance-preserving operation for a target that is
@@ -409,7 +409,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(jobs.content).toHaveLength(1);
       expect(text(jobs)).toContain(jobId);
       const job = await call("herdr_jobs", { operation: "get", jobId });
-      expect(evidence(job)).toMatchObject({ operation: "jobs", kind: "job", jobId });
+      expect(evidence(job)).toMatchObject({ operation: "jobs", view: "job", jobId });
       const cancelled = await call("herdr_jobs", { operation: "cancel", jobId });
       expect(cancelled.isError).toBeUndefined();
 

@@ -34,6 +34,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     rootTabId?: string;
     server?: ChildProcess;
     sessionStarted: boolean;
+    socketPath?: string;
+    savedSocketPath?: string;
     fixtureCreated: boolean;
     baseline?: { workspaces: string[]; tabs: string[]; panes: string[] };
     registered: Map<string, ExecutableTool>;
@@ -46,7 +48,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], stdinCalls: [], profilePromptContent: "", attachmentPaths: [] };
 
   const run = async (...args: string[]): Promise<unknown> => {
-    const result = await execFileAsync("herdr", args, { cwd: state.cwd, maxBuffer: 2_000_000 });
+    // The suite sets HERDR_SOCKET_PATH so the extension's supervision monitor
+    // observes the disposable session. This helper predates it and selects its
+    // session explicitly, so it must keep the ambient routing it always had.
+    const ambient = { ...process.env };
+    delete ambient.HERDR_SOCKET_PATH;
+    const result = await execFileAsync("herdr", args, { cwd: state.cwd, maxBuffer: 2_000_000, env: ambient });
     return JSON.parse(result.stdout);
   };
   const runNamed = (args: string[]) => run("--session", REQUIRED_SESSION, ...args);
@@ -254,11 +261,15 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     while (performance.now() < startupDeadline) {
       if (state.server.exitCode !== null) throw new Error(`named Herdr server exited during startup: ${startupError}`);
       const listed = resultObject(await run("session", "list", "--json"));
-      state.sessionStarted = Array.isArray(listed.sessions) && listed.sessions.some((session) => {
-        const value = resultObject(session);
-        return value.name === REQUIRED_SESSION && value.running === true;
-      });
-      if (state.sessionStarted) break;
+      const started = Array.isArray(listed.sessions) ? listed.sessions.map(resultObject).find((value) => value.name === REQUIRED_SESSION && value.running === true) : undefined;
+      state.sessionStarted = started !== undefined;
+      if (started !== undefined) {
+        // Supervision observes the same disposable session the CLI targets, so the
+        // harness injects that session's socket exactly as Herdr injects a pane's.
+        expect(typeof started.socket_path).toBe("string");
+        state.socketPath = String(started.socket_path);
+        break;
+      }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     if (!state.sessionStarted) throw new Error(`named Herdr server did not become ready: ${startupError}`);
@@ -327,11 +338,14 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       }
     } as unknown as ExtensionAPI;
 
-    const saved = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, tab: process.env.HERDR_TAB_ID, pane: process.env.HERDR_PANE_ID };
+    const saved = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, tab: process.env.HERDR_TAB_ID, pane: process.env.HERDR_PANE_ID, socket: process.env.HERDR_SOCKET_PATH };
     process.env.HERDR_ENV = "1";
     process.env.HERDR_WORKSPACE_ID = state.workspaceId;
     process.env.HERDR_TAB_ID = state.rootTabId;
     process.env.HERDR_PANE_ID = state.rootPaneId;
+    // The supervision monitor reads this lazily on its first reservation, so the
+    // disposable session's socket stays set for the life of the suite.
+    process.env.HERDR_SOCKET_PATH = state.socketPath;
     try {
       extension(pi);
     } finally {
@@ -339,11 +353,15 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
-
+      state.savedSocketPath = saved.socket;
     }
   }, 120_000);
 
   afterAll(async () => {
+    // The disposable session's socket path was left set for the supervision
+    // monitor; restore the ambient value now that the suite is done with it.
+    if (state.savedSocketPath === undefined) delete process.env.HERDR_SOCKET_PATH;
+    else process.env.HERDR_SOCKET_PATH = state.savedSocketPath;
     if (state.fixtureCreated && state.workspaceId) {
       await runNamed(["workspace", "close", state.workspaceId]).catch((error) => process.stderr.write(`INTEGRATION_TEARDOWN_FAILURE ${String(error)}\n`));
     }

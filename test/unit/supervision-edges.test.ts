@@ -5,7 +5,7 @@ import { SupervisionRegistry } from "../../src/supervision/registry.js";
 import { Supervisor, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
 import type { SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { SupervisionSocketEvent } from "../../src/supervision/protocol.js";
-import type { SupervisionStream } from "../../src/supervision/socket.js";
+import { scriptedServer } from "./supervision-peer.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 
 const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
@@ -224,20 +224,10 @@ describe("supervisor-aware job summaries", () => {
 
 describe("monitor and registry seams", () => {
   it("labels an untyped socket failure and ignores an event with no pane identity", async () => {
-    let onData: (chunk: Buffer) => void = () => undefined;
-    let onClose: () => void = () => undefined;
-    const stream: SupervisionStream = {
-      write: (line) => {
-        const req = JSON.parse(line) as { id: string; method: string };
-        queueMicrotask(() => onData(Buffer.from(`${JSON.stringify({ id: req.id, result: req.method === "session.snapshot" ? { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes: [], agents: [] } } : { type: "subscription_started" } })}\n`, "utf8")));
-      },
-      destroy: () => undefined,
-      onData: (handler) => { onData = handler; },
-      onClose: (handler) => { onClose = () => handler(); },
-    };
+    const peer = scriptedServer();
     const seen: string[] = [];
     const monitor = new SessionEventMonitor({
-      connect: async () => { if (seen.length > 0) throw "a bare string with no code"; seen.push("connected"); return stream; },
+      connect: async () => { if (peer.connects >= 2 && seen.length > 0) throw "a bare string with no code"; seen.push("connected"); return peer.connect(); },
       env: { HERDR_SOCKET_PATH: "/tmp/s.sock" },
       // Two failed attempts prove that only the first one reports degradation.
       clock: { now: () => 0, sleep: async () => { if (seen.length > 2) monitor.stop(); seen.push("retry"); } },
@@ -255,10 +245,10 @@ describe("monitor and registry seams", () => {
     });
     await monitor.ensureStarted();
     // An event carrying neither a pane id nor a pane record reaches no observer.
-    onData(Buffer.from(`${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { revision: 1 } } })}\n`, "utf8"));
+    peer.push(`${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { revision: 1 } } })}\n`);
     await Promise.resolve();
     expect(matched).toEqual([]);
-    onClose();
+    peer.closeSubscription();
     await vi.waitFor(() => expect(degraded).toEqual(["SUPERVISION_SOCKET_CLOSED"]));
     monitor.stop();
   });

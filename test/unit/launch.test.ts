@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError } from "../../src/cli.js";
+import { errorOutcome } from "../../src/mcp/adapter.js";
 import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
 import { parseProfile, profileSource, type ProfileCatalog } from "../../src/profiles/index.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
+import { resultForRender } from "../../src/tui.js";
 import { stubSupervision, type StubSupervision } from "./supervision-fixtures.js";
 import { SupervisionBindError } from "../../src/supervision/supervisor.js";
 
@@ -1179,22 +1181,68 @@ describe("herdr_launch profile-only contract", () => {
     expect(Buffer.byteLength(failure.message, "utf8")).toBeLessThanOrEqual(LAUNCH_DIAGNOSTIC_MAX_BYTES);
   });
 
-  it("keeps reconciliation output fixed-shape and bounded", async () => {
-    const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
-    const output = Array.from({ length: 200 }, (_, index) => `${"o".repeat(1_000)}-${index}`).join("\n");
-    harness.cli.runText = vi.fn(async (argv) => {
-      if (argv[0] === "pane" && argv[1] === "read") return output;
-      throw new Error(`unexpected readback argv: ${argv.join(" ")}`);
+  it("projects fixed reconciliation metadata without reading transcript or output content", async () => {
+    const canaries = [
+      "private-prompt-canary",
+      "environment-value-canary",
+      "backend-message-canary",
+      "terminal-output-canary",
+      "profile-body-canary",
+      "agent-session-canary"
+    ];
+    const harness = makeCli();
+    const runJson = harness.cli.runJson;
+    const runJsonWithStdin = harness.cli.runJsonWithStdin!;
+    let promptAcknowledged = false;
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+      const result = await runJsonWithStdin(argv, input, signal, preserve);
+      promptAcknowledged = true;
+      return result;
     });
-    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (promptAcknowledged && argv[0] === "agent" && argv[1] === "get") {
+        throw Object.assign(new Error(canaries[2]), {
+          code: "CLI_PROTOCOL_ERROR",
+          details: { environment: canaries[1], output: canaries[3], profile: canaries[4], agentSession: canaries[5] }
+        });
+      }
+      return runJson(argv, signal, preserve);
+    });
+    const outputRead = vi.fn(async () => canaries.join("\n"));
+    Object.defineProperty(harness.cli, "runText", { configurable: true, value: outputRead });
+    const supervision = stubSupervision({ jobId: "job_output_redacted" });
+    const failure = await (launch({ name: "worker", profile: "worker", initialPrompt: canaries[0] }, catalog(profile("worker")), harness.cli, undefined, { supervision }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    const reconciliation = failure.details.reconciliation as { recentUnwrappedLines?: string[]; truncated?: boolean; paneRecord?: Record<string, unknown>; agentRecord?: Record<string, unknown> };
-    expect(failure).toMatchObject({ code: "LAUNCH_FAILED", details: { reconciliation: { effectCertainty: "partial", snapshot: "present", pane: "present", agent: "present", truncated: true } } });
-    expect(reconciliation.recentUnwrappedLines?.length).toBeLessThanOrEqual(100);
-    expect(reconciliation.recentUnwrappedLines?.every((line) => line.length <= 512)).toBe(true);
-    expect(reconciliation.paneRecord).toMatchObject({ pane_id: "w1:p2" });
-    expect(reconciliation.agentRecord).toMatchObject({ pane_id: "w1:p2" });
-    expect(JSON.stringify(failure.details).length).toBeLessThan(5_000);
+
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        causeCode: "PROMPT_UNCONFIRMED",
+        assignmentState: "unconfirmed",
+        paneId: "w1:p2",
+        supervisorJobId: supervision.jobId,
+        reconciliation: {
+          effectCertainty: "partial",
+          snapshot: "present",
+          pane: "present",
+          agent: "present",
+          readFailures: ["agent:CLI_PROTOCOL_ERROR"]
+        }
+      }
+    });
+    const reconciliation = failure.details.reconciliation as Record<string, unknown>;
+    expect(Object.keys(reconciliation).sort()).toEqual(["agent", "agentName", "effectCertainty", "pane", "paneId", "readFailures", "snapshot", "tabId"].sort());
+    expect(outputRead).not.toHaveBeenCalled();
+
+    const diagnostic = launchDiagnostic(failure);
+    const mcp = errorOutcome(failure.code, failure.message, failure.details, "herdr_launch");
+    const tui = resultForRender("launch", { isError: true, details: failure.details }, {}, "w1:p2");
+    expect(tui).toEqual({ text: `error LAUNCH_FAILED · assignment unconfirmed · w1:p2 · supervisor ${supervision.jobId}`, tone: "error" });
+    const serializedSurfaces = [JSON.stringify(failure.details), failure.message, JSON.stringify(diagnostic), JSON.stringify(mcp), JSON.stringify(tui)];
+    for (const canary of canaries) {
+      expect(serializedSurfaces.every((surface) => !surface.includes(canary))).toBe(true);
+    }
+    expect(Buffer.byteLength(failure.message, "utf8")).toBeLessThanOrEqual(LAUNCH_DIAGNOSTIC_MAX_BYTES);
   });
 
   it("sanitizes diagnostic fallback fields without exposing malformed preflight errors", async () => {
@@ -1213,10 +1261,12 @@ describe("herdr_launch profile-only contract", () => {
     expect(launchDiagnostic(rawFailure)).toMatchObject({ code: "CLI_PROTOCOL_ERROR", phase: "validate", effectCertainty: "absent" });
   });
 
-  it("keeps reconciliation records bounded when optional identity fields are malformed", async () => {
-    const controlSession = { source: "\u0001", agent: "\u007f", kind: "\u0002", value: "\u0003" };
-    const pane = { pane_id: "w1:p2", agent_name: "worker", status: "\u0001", agent_session: controlSession };
-    const agent = { pane_id: "w1:p2", status: "\u0001", agent_session: controlSession };
+  it("does not copy reconciliation records or session fields into thrown details", async () => {
+    const sessionCanary = "reconciliation-session-canary";
+    const recordCanary = "reconciliation-record-canary";
+    const agentSession = { source: "herdr:pi", agent: "pi", kind: "id", value: sessionCanary };
+    const pane = { pane_id: "w1:p2", agent_name: "worker", terminal_id: "terminal-reconciled", agent_session: agentSession, environment: recordCanary };
+    const agent = { pane_id: "w1:p2", name: "worker", agent: "pi", terminal_id: "terminal-reconciled", agent_session: agentSession, backend: recordCanary };
     const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
     const base = harness.cli.runJson;
     let started = false;
@@ -1231,16 +1281,16 @@ describe("herdr_launch profile-only contract", () => {
       if (started && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent });
       return base(argv, signal, preserve);
     });
-    const output = Array.from({ length: 101 }, (_, index) => index === 100 ? "\u0001" : "x").join("\n");
-    harness.cli.runText = vi.fn(async () => output);
     const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    const reconciliation = failure.details.reconciliation as { recentUnwrappedLines?: string[]; paneRecord?: Record<string, unknown>; agentRecord?: Record<string, unknown> };
-    expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "partial", pane: "present", agent: "present", truncated: true } });
-    expect(reconciliation.recentUnwrappedLines).toHaveLength(100);
-    expect(reconciliation.recentUnwrappedLines?.at(-1)).toBe("");
-    expect(reconciliation.paneRecord).toMatchObject({ pane_id: "w1:p2", agent_name: "worker", agent_session: { source: "", agent: "", kind: "", value: "" } });
-    expect(reconciliation.agentRecord).toMatchObject({ pane_id: "w1:p2", agent_session: { source: "", agent: "", kind: "", value: "" } });
+    const reconciliation = failure.details.reconciliation as Record<string, unknown>;
+    expect(reconciliation).toMatchObject({ effectCertainty: "partial", pane: "present", agent: "present", paneId: "w1:p2", agentName: "worker" });
+    expect(reconciliation).not.toHaveProperty("paneRecord");
+    expect(reconciliation).not.toHaveProperty("agentRecord");
+    expect(reconciliation).not.toHaveProperty("recentUnwrappedLines");
+    expect(reconciliation).not.toHaveProperty("truncated");
+    expect(JSON.stringify(failure.details)).not.toContain(sessionCanary);
+    expect(JSON.stringify(failure.details)).not.toContain(recordCanary);
   });
 
   it("uses agent and pane identity fallbacks and carries a reconciled agent id", async () => {
@@ -1287,33 +1337,6 @@ describe("herdr_launch profile-only contract", () => {
     const failure = await (launch({ name: "worker", profile: "worker", focus: true }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "partial", readFailures: expect.arrayContaining(["pane:READ_MALFORMED"]) } });
-  });
-
-  it("keeps primitive output readback failures visible as unknown evidence", async () => {
-    const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
-    harness.cli.runText = vi.fn(async () => { throw "output readback unavailable"; });
-    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
-      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "partial", readFailures: expect.arrayContaining(["output:READ_FAILED"]) } });
-
-    const codedHarness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
-    codedHarness.cli.runText = vi.fn(async () => { throw { code: "OUTPUT_READ_FAILED" }; });
-    const codedFailure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), codedHarness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
-      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    expect(codedFailure.details).toMatchObject({ reconciliation: { readFailures: expect.arrayContaining(["output:OUTPUT_READ_FAILED"]) } });
-
-    const unsafeCodeHarness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
-    unsafeCodeHarness.cli.runText = vi.fn(async () => { throw { code: "\u0000" }; });
-    const unsafeCodeFailure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), unsafeCodeHarness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
-      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    expect(unsafeCodeFailure.details).toMatchObject({ reconciliation: { readFailures: expect.arrayContaining(["output:READ_FAILED"]) } });
-
-    const emptyHarness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
-    emptyHarness.cli.runText = vi.fn(async () => "");
-    const emptyFailure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), emptyHarness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
-      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    expect(emptyFailure.details).toMatchObject({ reconciliation: { recentUnwrappedLines: [] } });
-    expect((emptyFailure.details.reconciliation as Record<string, unknown>).truncated).toBeUndefined();
   });
 
   it("falls back to the extension working directory when launch cwd is omitted", async () => {
@@ -1535,14 +1558,6 @@ describe("herdr_launch profile-only contract", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("preserves unknown evidence when a reconciliation adapter read throws", async () => {
-    const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
-    Object.defineProperty(harness.cli, "runText", { configurable: true, get: () => { throw new Error("adapter read unavailable"); } });
-    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
-      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "unknown", snapshot: "unavailable", readFailures: ["reconciliation:READ_FAILED"] } });
   });
 
   it("reports an absent effect conservatively and still requires inspection after an attempted mutation", async () => {

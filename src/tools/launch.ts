@@ -22,7 +22,6 @@ import { SupervisionBindError } from "../supervision/supervisor.js";
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
   runJsonWithStdin?(argv: string[], input: string, signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
-  runText?(argv: string[], signal: AbortSignal): Promise<string>;
 }
 
 export interface LaunchResourceRegistry {
@@ -119,11 +118,7 @@ export interface LaunchReconciliationEvidence {
   paneId?: string;
   agentId?: string;
   agentName?: string;
-  paneRecord?: Record<string, unknown>;
-  agentRecord?: Record<string, unknown>;
-  recentUnwrappedLines?: string[];
   readFailures?: string[];
-  truncated?: boolean;
 }
 
 export interface LaunchDetails extends LaunchResourceIds {
@@ -556,13 +551,6 @@ function readbackAgentRecord(value: unknown, expectedPaneId: string): Record<str
   return value.agent;
 }
 
-function compactReadbackLines(value: string): { lines: string[]; truncated: boolean } {
-  const bounded = boundedEvidence(value, 8_000);
-  const sourceLines = bounded.content.length === 0 ? [] : bounded.content.split(/\r?\n/u);
-  const lines = sourceLines.slice(-100).map((line) => safeDiagnosticString(line, 512) ?? "");
-  return { lines, truncated: bounded.truncated || lines.length < sourceLines.length };
-}
-
 function launchEffectCertainty(
   input: LaunchReconciliationInput,
   snapshot: HerdrSnapshot | undefined,
@@ -603,8 +591,6 @@ async function reconcileLaunch(input: LaunchReconciliationInput): Promise<Launch
   let snapshotAvailable = false;
   let currentPane: Record<string, unknown> | undefined;
   let currentAgent: Record<string, unknown> | undefined;
-  let recentUnwrappedLines: string[] | undefined;
-  let outputTruncated = false;
   try {
     try {
       const result = await boundedReconciliationRead((signal) => input.cli.runJson(["api", "snapshot"], signal).then((response) => response.result), controller.signal, deadline);
@@ -629,6 +615,9 @@ async function reconcileLaunch(input: LaunchReconciliationInput): Promise<Launch
     currentPane = snapshotPane;
     currentAgent = candidatePaneId === undefined ? undefined : snapshot?.agents.find((item) => item.pane_id === candidatePaneId);
 
+    // Reconciliation is structured state only. Terminal readback can contain the
+    // submitted assignment, environment values, backend text, or session secrets,
+    // so no transcript/output channel is part of LaunchError evidence.
     if (candidatePaneId !== undefined) {
       try {
         const result = await boundedReconciliationRead((signal) => input.cli.runJson(["pane", "get", candidatePaneId], signal).then((response) => response.result), controller.signal, deadline);
@@ -643,16 +632,6 @@ async function reconcileLaunch(input: LaunchReconciliationInput): Promise<Launch
         if (fetched !== undefined) currentAgent = fetched;
       } catch (error) {
         failures.push(`agent:${reconciliationFailureCode(error)}`);
-      }
-      if (input.cli.runText) {
-        try {
-          const output = await boundedReconciliationRead((signal) => input.cli.runText!(["pane", "read", candidatePaneId, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal), controller.signal, deadline);
-          const bounded = compactReadbackLines(output);
-          recentUnwrappedLines = bounded.lines;
-          outputTruncated = bounded.truncated;
-        } catch (error) {
-          failures.push(`output:${reconciliationFailureCode(error)}`);
-        }
       }
     }
 
@@ -676,11 +655,7 @@ async function reconcileLaunch(input: LaunchReconciliationInput): Promise<Launch
       ...(candidatePaneId === undefined ? {} : { paneId: safeDiagnosticString(candidatePaneId) }),
       ...(readbackAgentId(currentAgent, currentPane) === undefined ? {} : { agentId: readbackAgentId(currentAgent, currentPane) }),
       ...(readbackAgentName(currentAgent, currentPane) === undefined ? {} : { agentName: readbackAgentName(currentAgent, currentPane) }),
-      ...(currentPane === undefined ? {} : { paneRecord: compactAttemptState(currentPane) }),
-      ...(currentAgent === undefined ? {} : { agentRecord: compactAttemptState(currentAgent) }),
-      ...(recentUnwrappedLines === undefined ? {} : { recentUnwrappedLines }),
-      ...(failures.length === 0 ? {} : { readFailures: failures.slice(0, 8) }),
-      ...(outputTruncated ? { truncated: true } : {})
+      ...(failures.length === 0 ? {} : { readFailures: failures.slice(0, 8) })
     };
   } finally {
     controller.abort();

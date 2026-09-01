@@ -65,6 +65,8 @@ interface Harness {
   fireClearedTimer(): void;
   timerArmed(): boolean;
   reviews: number;
+  /** The pane of every review that actually reached the model, in order. */
+  reviewedPanes: string[];
   observers: number;
   degradeMonitor(): void;
   recoverMonitor(): void;
@@ -91,9 +93,11 @@ function harness(options: HarnessOptions = {}): Harness {
     clearTimer: () => { timer = undefined; },
   };
   const notifier: ManagerNotifier = { wake: (wake) => { wakes.push(wake); } };
+  const reviewedPanes: string[] = [];
   const reviewer: SupervisionReviewer = {
-    review: async () => {
+    review: async (request) => {
       reviews += 1;
+      reviewedPanes.push(request.paneId);
       if (!options.review) return { classification: "progress", summary: "moving" };
       return options.review(reviews);
     },
@@ -132,6 +136,7 @@ function harness(options: HarnessOptions = {}): Harness {
     fireClearedTimer: () => dispatched?.(),
     timerArmed: () => timer !== undefined,
     get reviews() { return reviews; },
+    reviewedPanes,
     get observers() { return observers; },
     degradeMonitor: () => { degraded = true; },
     recoverMonitor: () => { degraded = false; },
@@ -1029,6 +1034,83 @@ describe("supervisor review cadence", () => {
     expect(h.reviews).toBe(0);
     expect(h.supervisor.view().reviewer).toMatchObject({ degraded: false, reviews: [] });
     expect(h.timerArmed()).toBe(true);
+  });
+
+  /**
+   * Read p1's transcript behind a gate, so a move can land while the read is in
+   * flight, and let every later read return immediately.
+   */
+  function gatedTranscript(reads: string[]): { transcript: (paneId: string) => Promise<string[]>; release(): void } {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    return {
+      transcript: async (paneId) => {
+        reads.push(paneId);
+        if (reads.length === 1) await gate;
+        return [`${paneId} line`];
+      },
+      release: () => { release(); },
+    };
+  }
+
+  it("abandons an in-flight review when a move is proven outright mid-read", async () => {
+    // The destination is valid on its first read, so the move is adopted at once
+    // and never becomes pending. The child stays `working`, so the run does not
+    // change either: only the pane identity did, and that alone must discard the
+    // origin pane's transcript rather than submit it labelled as p2.
+    const reads: string[] = [];
+    const gated = gatedTranscript(reads);
+    const h = await working({
+      snapshots: [snapshot([paneRecord({ paneId: "p2", revision: 1, status: "working" })], [{ pane_id: "p2", name: "worker" }])],
+      transcript: gated.transcript,
+    });
+    const inFlight = (h.supervisor as unknown as { review(): Promise<void> }).review();
+    await vi.waitFor(() => expect(reads).toEqual(["p1"]));
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "working" }), { previous_pane_id: "p1" }));
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p2" } });
+
+    gated.release();
+    await inFlight;
+    expect(h.reviews).toBe(0);
+    expect(h.reviewedPanes).toEqual([]);
+    expect(h.supervisor.view().reviewer).toMatchObject({ degraded: false, reviews: [] });
+
+    // The cadence survives the discarded review and reads only the new pane.
+    expect(h.timerArmed()).toBe(true);
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(reads).toEqual(["p1", "p2"]);
+    expect(h.reviewedPanes).toEqual(["p2"]);
+  });
+
+  it("abandons an in-flight review when a retained move destination resolves mid-read", async () => {
+    // The destination's first read is invalid, so the move is retained, and the
+    // read that resolves it adopts p2 — all while p1's transcript is still being
+    // read. `pendingMoveDestination` is clear again by the time the read
+    // completes, so only the pane identity token can still refuse it.
+    const reads: string[] = [];
+    const gated = gatedTranscript(reads);
+    const resolved = snapshot([paneRecord({ paneId: "p2", revision: 1, status: "working" })], [{ pane_id: "p2", name: "worker" }]);
+    const h = await working({ snapshots: [invalidDestination(), resolved], transcript: gated.transcript });
+    const inFlight = (h.supervisor as unknown as { review(): Promise<void> }).review();
+    await vi.waitFor(() => expect(reads).toEqual(["p1"]));
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "working" }), { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ paneId: "p2", revision: 1, status: "working" })));
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p2" } });
+
+    gated.release();
+    await inFlight;
+    expect(h.reviews).toBe(0);
+    expect(h.reviewedPanes).toEqual([]);
+    expect(h.supervisor.view().reviewer).toMatchObject({ degraded: false, reviews: [] });
+
+    expect(h.timerArmed()).toBe(true);
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(reads).toEqual(["p1", "p2"]);
+    expect(h.reviewedPanes).toEqual(["p2"]);
   });
 
   it("clears the cadence when the child leaves the working state", async () => {

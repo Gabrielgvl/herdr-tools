@@ -153,6 +153,17 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * until one is valid enough to follow or to settle on.
    */
   private pendingMoveDestination: SupervisionPaneRecord | undefined;
+  /**
+   * Advances on every change to the pane this supervisor believes holds the
+   * child — a retained move destination as well as an adopted one. A review
+   * captures it before reading a transcript and must still hold it to dispatch
+   * or store: `pendingMoveDestination` alone cannot express a move that is
+   * proven immediately, nor one whose retained destination resolves, while a
+   * read is in flight. Both leave the origin pane's transcript in hand with a
+   * new pane bound, and Herdr reuses pane ids, so submitting it would review a
+   * stranger's output under this child's new identity.
+   */
+  private paneIdentityGeneration = 0;
   private evidenceGaps = 0;
   private eventStreamDegraded = false;
   private reconciliationDegraded = false;
@@ -496,6 +507,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // unusable. Retaining the destination is what keeps the origin pane's
       // absence — which this very move caused — from later reading as a closure.
       this.pendingMoveDestination = pane;
+      this.paneIdentityGeneration += 1;
       this.markReconciliationFailure(target.reason);
       return;
     }
@@ -521,6 +533,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    */
   private adoptMove(next: SupervisedIdentity, occupant: AuthoritativeOccupant): void {
     this.pendingMoveDestination = undefined;
+    this.paneIdentityGeneration += 1;
     this.identity = next;
     this.paneId = next.paneId;
     this.lastRevision = occupant.pane.revision;
@@ -736,25 +749,31 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (!this.reviewable()) return;
     this.reviewing = true;
     const run = this.workingRun;
+    // The exact pane this review is about, pinned before the read. Everything
+    // downstream reads the pinned identity, so the transcript can never be
+    // relabelled with a pane the child moved to while it was being read.
+    const paneIdentity = this.paneIdentityGeneration;
+    const reviewed = this.identity!;
     const workingSinceMs = this.workingSinceMs!;
     try {
-      const transcript = await this.deps.readTranscript(this.identity!.paneId, this.abort.signal);
-      // The child may have finished its work cycle while the read was in flight.
-      // A review of a run that is over is not evidence about anything, so it is
-      // abandoned before the model call rather than stored or announced. The
+      const transcript = await this.deps.readTranscript(reviewed.paneId, this.abort.signal);
+      // The child may have finished its work cycle — or left this very pane —
+      // while the read was in flight. A review of a run that is over, or of a
+      // pane the child no longer occupies, is not evidence about anything, so it
+      // is abandoned before the model call rather than stored or announced. The
       // transcript cursor does not advance: those lines were never reviewed.
-      if (!this.reviewable(run)) return;
+      if (!this.reviewable(run, paneIdentity)) return;
       const result = await this.deps.reviewer.review({
-        paneId: this.identity!.paneId,
-        agentName: this.identity!.agentName,
+        paneId: reviewed.paneId,
+        agentName: reviewed.agentName,
         workingForMs: Math.max(0, this.deps.clock.now() - workingSinceMs),
-        metadata: { agentKind: this.identity!.agentKind, status: this.status, revision: this.lastRevision },
+        metadata: { agentKind: reviewed.agentKind, status: this.status, revision: this.lastRevision },
         // Only what is new since the previous completed review. Handing the whole
         // window back every cadence would let stale output keep reading as fresh
         // progress from a stalled child.
         transcriptDelta: deltaLines(this.reviewedTranscript, transcript),
       }, this.abort.signal);
-      if (!this.reviewable(run)) return;
+      if (!this.reviewable(run, paneIdentity)) return;
       this.reviewedTranscript = transcript;
       this.lastReviewAtMs = this.deps.clock.now();
       this.reviews.push({ atMs: this.lastReviewAtMs, classification: result.classification, summary: result.summary });
@@ -769,10 +788,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         this.publish(`review ${result.classification}: ${result.summary}`);
       }
     } catch (error) {
-      // A failure that belongs to a run which has already ended is not evidence
-      // about anything either: it must not degrade the reviewer, wake anyone, or
-      // publish, exactly as an obsolete success must not.
-      if (!this.reviewable(run)) return;
+      // A failure that belongs to a run which has already ended, or to a pane the
+      // child has left, is not evidence about anything either: it must not
+      // degrade the reviewer, wake anyone, or publish, exactly as an obsolete
+      // success must not.
+      if (!this.reviewable(run, paneIdentity)) return;
       if (!this.reviewerDegraded) {
         this.reviewerDegraded = true;
         this.emit("reviewer_degraded", `the supervision reviewer failed (${reviewerReason(error)}) and will retry at the next cadence`, { reason: reviewerReason(error) });
@@ -799,12 +819,16 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   /**
-   * A review may actually read and dispatch: its run is live *and* the child's
-   * exact pane is proven. A pending move fails this closed at every checkpoint,
-   * so a move landing mid-review discards the result instead of reviewing a pane
-   * the child has left.
+   * A review may actually read and dispatch: its run is live, the child's exact
+   * pane is proven, and it is still the pane the review pinned. A pending move
+   * and a changed pane identity each fail this closed at every checkpoint, so a
+   * move landing mid-review discards the result — whether it stays unresolved,
+   * resolves, or was proven outright — instead of reviewing a pane the child has
+   * left. Re-arming deliberately does not consult this: the run keeps its
+   * cadence and the next review reads the pane the child now occupies.
    */
-  private reviewable(run?: number): boolean {
+  private reviewable(run?: number, paneIdentity?: number): boolean {
+    if (paneIdentity !== undefined && paneIdentity !== this.paneIdentityGeneration) return false;
     return this.pendingMoveDestination === undefined && this.reviewRunLive(run);
   }
 

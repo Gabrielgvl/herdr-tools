@@ -1342,7 +1342,7 @@ describe("herdr_wait", () => {
     expect(started.details).toMatchObject({ operation_phase: "accepted", jobId: "job_render" });
     await vi.waitFor(() => expect(registry.get("job_render")).toMatchObject({ operation_phase: "settled", wait_result: "condition_met", progress: { text: expect.any(String), details: expect.anything() } }));
     const jobDetail = await createJobsTool(registry).execute("id", { operation: "get", jobId: "job_render" } as never, undefined, undefined, extensionContext);
-    expect(jobDetail.details).toMatchObject({ operation: "jobs", kind: "job", operation_phase: "settled", wait_result: "condition_met", result: { wait_result: "condition_met", reason: "condition_met" } });
+    expect(jobDetail.details).toMatchObject({ operation: "jobs", view: "job", kind: "wait", operation_phase: "settled", wait_result: "condition_met", result: { wait_result: "condition_met", reason: "condition_met" } });
     expect(updates).not.toHaveBeenCalled();
     expect(cli.calls.filter((call) => call[1] === "read").length).toBeGreaterThan(1);
     const call = tool.renderCall?.({ targets: ["p1"], match: "any" } as never, {} as never, {} as never);

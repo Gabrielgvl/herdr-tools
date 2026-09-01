@@ -73,7 +73,8 @@ export interface SupervisionChildRequest {
 /** What binding proves. Every field comes from the launch's own readiness evidence. */
 export interface SupervisionBinding {
   identity: SupervisedIdentity;
-  stateChangeSeq: number;
+  /** Present only where the authoritative agent record supplied one. */
+  stateChangeSeq?: number;
 }
 
 export interface SupervisorDependencies {
@@ -182,7 +183,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       throw new SupervisionBindError("Supervision binding could not prove the launched identity", this.bindEvidence(binding, { cause: "identity_mismatch", observedStatus: occupant.pane.agentStatus }));
     }
     this.identity = binding.identity;
-    this.anchor = { revision: occupant.pane.revision, stateChangeSeq: binding.stateChangeSeq, status: occupant.pane.agentStatus };
+    this.anchor = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, ...(binding.stateChangeSeq === undefined ? {} : { stateChangeSeq: binding.stateChangeSeq }) };
     this.status = occupant.pane.agentStatus;
     this.lastRevision = occupant.pane.revision;
     this.state = "active";
@@ -477,7 +478,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.publish(`${type}: ${summary}`);
     this.deps.notifier.wake({
       jobId: this.deps.jobId,
-      child: { agentName: this.deps.child.agentName, agentKind: this.deps.child.agentKind, paneId: this.identity?.paneId ?? this.paneId ?? "" },
+      child: {
+        agentName: this.identity?.agentName ?? this.deps.child.agentName,
+        // The bound identity is authoritative once binding proved it; before that
+        // only the requested profile's kind exists.
+        agentKind: this.identity?.agentKind ?? this.deps.child.agentKind,
+        paneId: this.identity?.paneId ?? this.paneId ?? "",
+      },
       event,
     });
     return event;

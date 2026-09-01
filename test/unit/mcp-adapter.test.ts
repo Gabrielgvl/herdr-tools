@@ -12,6 +12,7 @@ import { HostCapabilityError } from "../../src/mcp/host.js";
 import { SequentialToolQueue } from "../../src/mcp/queue.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
 import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE } from "../../src/tools/launch.js";
+import { stubSupervision } from "./supervision-fixtures.js";
 
 const health = { client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true } };
 const snapshot = {
@@ -47,6 +48,7 @@ function realSurface() {
     jobs: new JobRegistry(),
     profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
     ownership: new RuntimeOwnership(),
+    supervision: stubSupervision(),
     cwd: "/project"
   });
 }
@@ -273,7 +275,7 @@ describe("MCP result mapping", () => {
     const outcome = await callTool({ surface, name: "herdr_jobs", args: { operation: "list" }, host, callId: "c", queue: new SequentialToolQueue() });
     expect(outcome.content).toHaveLength(1);
     expect(outcome.content[0]!.text).not.toContain(HERDR_DETAILS_LABEL);
-    expect(JSON.parse(outcome.content[0]!.text)).toMatchObject({ operation: "jobs", kind: "list" });
+    expect(JSON.parse(outcome.content[0]!.text)).toMatchObject({ operation: "jobs", view: "list" });
   });
 
   it("bounds oversized details to a parseable truncation envelope inside the response bound", async () => {
@@ -574,6 +576,7 @@ function leakySurface() {
     jobs: new JobRegistry(),
     profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
     ownership: new RuntimeOwnership(),
+    supervision: stubSupervision(),
     cwd: "/project"
   });
 }

@@ -70,6 +70,15 @@ function permissionArgs(mode: ClaudePermissionMode): string[] {
   return mode === "bypassPermissions" ? ["--allow-dangerously-skip-permissions", "--permission-mode", mode] : ["--permission-mode", mode];
 }
 
+/**
+ * The local Channels research-preview opt-in. Both flags are variadic on Claude
+ * 2.1.252, and each is followed only by tagged entries, so the flags that come
+ * after them are unaffected.
+ */
+function channelArgs(entries: string[]): string[] {
+  return entries.length === 0 ? [] : ["--dangerously-load-development-channels", ...entries];
+}
+
 function promptFileArg(flag: string, path: string | undefined): string[] {
   if (path === undefined) return [];
   if (path.length === 0 || /[\0\r\n]/.test(path)) throw new ProfileAdapterError("prompt file path must be a non-empty single-line string");
@@ -104,7 +113,8 @@ export function resolveClaudeRuntime(profile: Extract<Profile["runtime"], { kind
     allowedTools: values(overrides.allowedTools, profile.allowedTools),
     disallowedTools: values(overrides.disallowedTools, profile.disallowedTools),
     addDirs: scopedValues(overrides.addDirs, profile.addDirs, "overrides.addDirs", scopeRoot),
-    pluginDirs: scopedValues(overrides.pluginDirs, profile.pluginDirs, "overrides.pluginDirs", scopeRoot)
+    pluginDirs: scopedValues(overrides.pluginDirs, profile.pluginDirs, "overrides.pluginDirs", scopeRoot),
+    developmentChannels: [...profile.developmentChannels]
   };
 }
 
@@ -123,7 +133,7 @@ export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>
 export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string, attachmentDirectory?: string): string[] {
   if (!sessionPersistence) throw new ProfileAdapterError("Claude profiles must set sessionPersistence to true for interactive launches");
   const effective = resolveClaudeRuntime(profile, overrides, scopeRoot);
-  const args = ["--model", effective.model, "--effort", effective.effort, ...permissionArgs(effective.permissionMode), ...repeated("--allowed-tools", effective.allowedTools), ...repeated("--disallowed-tools", effective.disallowedTools), ...repeated("--add-dir", effective.addDirs), ...repeated("--plugin-dir", effective.pluginDirs), ...attachmentDirectoryArg(attachmentDirectory)];
+  const args = ["--model", effective.model, "--effort", effective.effort, ...permissionArgs(effective.permissionMode), ...repeated("--allowed-tools", effective.allowedTools), ...repeated("--disallowed-tools", effective.disallowedTools), ...repeated("--add-dir", effective.addDirs), ...repeated("--plugin-dir", effective.pluginDirs), ...channelArgs(effective.developmentChannels), ...attachmentDirectoryArg(attachmentDirectory)];
   return [...args, ...promptFileArg("--append-system-prompt-file", promptFilePath)];
 }
 

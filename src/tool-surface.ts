@@ -9,6 +9,7 @@ import type { RuntimeOwnership } from "./ownership.js";
 import type { ProfileCatalog } from "./profiles/types.js";
 import type { WaitReviewer } from "./reviewer.js";
 import type { Settings } from "./settings.js";
+import type { SupervisionCoordinator } from "./supervision/registry.js";
 import type { CurrentContext } from "./targets.js";
 import { createContextResolver, type ContextResolver } from "./context.js";
 import { createCommunicateTool } from "./tools/communicate.js";
@@ -116,6 +117,11 @@ export interface HerdrToolSurfaceDependencies {
    */
   attachments?: AttachmentStore;
   recipients?: RecipientRegistry;
+  /**
+   * Required. Every successful `herdr_launch` creates supervision, so a host
+   * that cannot supervise cannot construct a launch tool. See ADR-019.
+   */
+  supervision: SupervisionCoordinator;
 }
 
 export interface HerdrToolSurface {
@@ -159,6 +165,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     ownership: deps.ownership,
     profiles: deps.profiles,
     preflight: deps.preflight,
+    supervision: deps.supervision,
     ...(deps.attachments ? { attachments: deps.attachments } : {}),
     ...(deps.recipients ? { recipients: deps.recipients } : {}),
   });

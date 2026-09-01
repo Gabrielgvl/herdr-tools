@@ -11,6 +11,9 @@ import { resetOwnership, RuntimeOwnership } from "../ownership.js";
 import { discoverProfiles } from "../profiles/discovery.js";
 import type { ProfileCatalog } from "../profiles/types.js";
 import { ReviewerFailure } from "../reviewer.js";
+import { SupervisionRegistry } from "../supervision/registry.js";
+import { CLAUDE_CHANNEL_CAPABILITY, createChannelSupervisionNotifier } from "../supervision/notify.js";
+import { createBuiltinModelService } from "../supervision/model-service.js";
 import { loadSettings, type Settings } from "../settings.js";
 import type { CurrentContext } from "../targets.js";
 import { createPreflight, createToolSurface, type HerdrToolSurface } from "../tool-surface.js";
@@ -40,6 +43,7 @@ export interface HerdrMcpServer {
   readonly server: Server;
   readonly surface: HerdrToolSurface;
   readonly jobs: JobRegistry;
+  readonly supervision: SupervisionRegistry;
   readonly ownership: RuntimeOwnership;
   readonly context: CurrentContext;
   readonly projectDir: string;
@@ -118,6 +122,22 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   const cli = new HerdrCli(deps.exec ?? createNodeExec({ cwd: startup.projectDir }));
   const ownership = new RuntimeOwnership();
   const jobs = new JobRegistry();
+  // The Channels research preview has no delivery acknowledgement, so the
+  // notifier is wired before the transport and every send stays best effort.
+  const channel = { current: undefined as ((notification: { method: string; params: { content: string; meta: Record<string, unknown> } }) => Promise<void>) | undefined };
+  const supervision = new SupervisionRegistry({
+    jobs,
+    settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
+    readTranscript: (paneId, signal) => cli
+      .runText(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal)
+      .then((output) => (output.length === 0 ? [] : output.split(/\r?\n/u).slice(-100))),
+    notifier: createChannelSupervisionNotifier((notification) => channel.current?.(notification)),
+    // The MCP host has no Pi model registry, and `hostContext` deliberately
+    // still throws for `context.modelRegistry`. It resolves the supervisor's
+    // reviewer model through its own host-independent service instead.
+    models: () => createBuiltinModelService(),
+    monitorOptions: { ...(deps.env ? { env: deps.env } : {}) },
+  });
   const surface = createToolSurface({
     cli,
     context: startup.context,
@@ -128,8 +148,10 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     profiles: deps.profiles ?? { load: () => discoverProfiles({ bundledDir: join(root, BUNDLED_PROFILES_DIRECTORY), bundledScopeRoot: root, projectCwd: startup.projectDir }) },
     ownership,
     cwd: startup.projectDir,
+    supervision,
     // Model-backed wait review is a Pi capability. Failing closed here keeps a
     // wait beyond the configured review cadence from running unsupervised.
+    // Supervision review is separate and does run here, through its own service.
     reviewerFactory: () => { throw new ReviewerFailure("model-backed wait review is unavailable on the MCP host"); }
   });
 
@@ -142,7 +164,10 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     return undefined;
   }
 
-  const server = new Server({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }, { capabilities: { tools: {} } });
+  // The documented Claude Code Channels research-preview capability, advertised
+  // alongside tools by the same server that serves them.
+  const server = new Server({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }, { capabilities: { tools: {}, experimental: { [CLAUDE_CHANNEL_CAPABILITY]: {} } } });
+  channel.current = (notification) => server.notification(notification);
   // One queue per server, so the sequential tools are serialized across every
   // concurrent `tools/call` this session issues.
   const queue = new SequentialToolQueue();
@@ -169,6 +194,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     // Closed before the registry and the transport, so a call still waiting for
     // its turn is refused instead of mutating during teardown.
     queue.close();
+    supervision.shutdown();
     jobs.shutdown();
     resetOwnership(ownership);
     await server.close();
@@ -181,5 +207,5 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   onSignal("SIGTERM", () => { void shutdown(); });
 
   await server.connect(deps.transport ?? new StdioServerTransport());
-  return { server, surface, jobs, ownership, context: startup.context, projectDir: startup.projectDir, shutdown };
+  return { server, surface, jobs, supervision, ownership, context: startup.context, projectDir: startup.projectDir, shutdown };
 }

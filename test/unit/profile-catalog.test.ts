@@ -7,6 +7,7 @@ import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.j
 import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE, type LaunchDependencies } from "../../src/tools/launch.js";
 import { createRuntime } from "../../index.js";
 import type { HerdrCli } from "../../src/cli.js";
+import { stubSupervision } from "./supervision-fixtures.js";
 
 function launchDiagnostic(error: Error): Record<string, unknown> {
   const prefix = `\n${LAUNCH_DIAGNOSTIC_MARKER} `;
@@ -25,7 +26,7 @@ function profileText(name: string, runtime = "pi", extra = "", fallbackProfiles 
 }
 
 const testPreflight = async () => undefined;
-const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight"> & Partial<Pick<LaunchDependencies, "preflight">>) => createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
+const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight" | "supervision"> & Partial<Pick<LaunchDependencies, "preflight" | "supervision">>) => createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight, supervision: deps.supervision ?? stubSupervision() });
 
 const noCli = { runJson: async () => { throw new Error("CLI must not be called"); }, runText: async () => { throw new Error("CLI must not be called"); } } as unknown as HerdrCli;
 
@@ -525,13 +526,13 @@ describe("profile catalog", () => {
     expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual([]);
     const managerClaude = catalog.effective.get("manager-claude")!;
     const managerClaudeTools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "mcp__plugin_herdr-tools_herdr"];
-    expect(managerClaude.runtime).toEqual({ kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: managerClaudeTools, disallowedTools: ["Task"], addDirs: [], pluginDirs: [join(rolePluginRoot, "manager")] });
+    expect(managerClaude.runtime).toEqual({ kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: managerClaudeTools, disallowedTools: ["Task"], addDirs: [], pluginDirs: [join(rolePluginRoot, "manager")], developmentChannels: ["server:herdr"] });
     expect(managerClaude.sessionPersistence).toBe(true);
     expect(managerClaude.timeoutMinutes).toBe(30);
     expect(managerClaude.fallbackProfiles).toEqual([]);
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.allowedTools).not.toEqual(expect.arrayContaining(["Bash", "Edit", "Write", "NotebookEdit"]));
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.disallowedTools).toEqual(["Task"]);
-    expect(buildProfileArgv(managerClaude)).toEqual(["--model", "claude-fable-5", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "manager")]);
+    expect(buildProfileArgv(managerClaude)).toEqual(["--model", "claude-fable-5", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "manager"), "--dangerously-load-development-channels", "server:herdr"]);
     expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
     expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-claude"]);
 
@@ -544,7 +545,7 @@ describe("profile catalog", () => {
     } as const;
     for (const role of ["scout", "planner", "worker", "reviewer", "researcher"] as const) {
       const profile = catalog.effective.get(`${role}-claude`)!;
-      expect(profile.runtime).toEqual({ kind: "claude", model: expect.any(String), effort: expect.any(String), permissionMode: claudeTools[role].permissionMode, allowedTools: [...claudeTools[role].allowedTools], disallowedTools: [...claudeTools[role].disallowedTools], addDirs: [], pluginDirs: [join(rolePluginRoot, role)] });
+      expect(profile.runtime).toEqual({ kind: "claude", model: expect.any(String), effort: expect.any(String), permissionMode: claudeTools[role].permissionMode, allowedTools: [...claudeTools[role].allowedTools], disallowedTools: [...claudeTools[role].disallowedTools], addDirs: [], pluginDirs: [join(rolePluginRoot, role)], developmentChannels: [] });
       expect(profile.runtime.kind === "claude" && profile.runtime.disallowedTools).toContain("Task");
     }
 

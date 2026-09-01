@@ -16,6 +16,8 @@ import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "..
 import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
+import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
+import { SupervisionBindError } from "../supervision/supervisor.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -45,6 +47,11 @@ export interface LaunchDependencies {
   attachments?: AttachmentStore;
   recipients?: RecipientRegistry;
   clock?: LaunchClock;
+  /**
+   * Required. Every successful launch creates supervision, so a host that
+   * cannot supervise cannot launch. See ADR-019.
+   */
+  supervision: SupervisionCoordinator;
 }
 
 export interface LaunchResourceIds {
@@ -140,7 +147,8 @@ export interface LaunchDetails extends LaunchResourceIds {
   readiness?: LaunchReadinessEvidence;
   promptConfirmation?: PromptConfirmationEvidence;
   timing?: LaunchTimingEvidence;
-  phase?: "validate" | "resolve_profile" | "attachment_publish" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification";
+  phase?: "validate" | "resolve_profile" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification" | "supervision_bind";
+  supervision?: { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; profileName: string } };
   created?: LaunchResourceIds;
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
@@ -1200,6 +1208,16 @@ async function waitForLaunchReadiness(
   }
 }
 
+/**
+ * The authoritative agent record's lifecycle counter, where it supplied one. A
+ * launch with no `initialPrompt` has no readiness baseline, so this is the only
+ * source, and an absent counter is recorded as absent rather than defaulted.
+ */
+function readinessStateChangeSeq(agent: Record<string, unknown>): number | undefined {
+  const candidate = agent.state_change_seq;
+  return typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : undefined;
+}
+
 function compactConfirmationObservation(observation: PromptObservation | undefined): PromptConfirmationEvidence["last"] | undefined {
   if (!observation) return undefined;
   return {
@@ -1559,6 +1577,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let effectiveContext: CurrentContext | undefined;
       let topologyBaseline: HerdrSnapshot | undefined;
       let topologyMutationDispatched = false;
+      let reservation: SupervisionReservation | undefined;
       let phase: LaunchPhase = "validate";
       const created: LaunchResourceIds = {};
       const attempts: LaunchAttemptEvidence[] = [];
@@ -1634,9 +1653,22 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             operation: "assignment"
           });
         }
+        // Supervision is reserved before the first topology mutation, so a host
+        // that cannot supervise refuses the launch with no effect at all rather
+        // than leaving a child nobody is watching.
+        phase = "supervision_reserve";
+        progress(onUpdate, phase, created);
+        try {
+          reservation = await deps.supervision.reserve({ child: { agentName: params.name, agentKind: profiles[0]!.runtime.kind, profileName: profiles[0]!.name } });
+        } catch (error) {
+          throw new LaunchError("SUPERVISION_UNAVAILABLE", "Automatic child supervision could not be reserved", {
+            causeCode: safeDiagnosticString(record(error) && typeof error.code === "string" ? error.code : undefined, 120) ?? "SUPERVISION_UNAVAILABLE"
+          });
+        }
       } catch (error) {
         const failure = withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published });
         await grant?.release();
+        reservation?.release("launch_precondition_failed");
         throw earlyLaunchFailure(failure, phase);
       }
       let paneId: string | undefined;
@@ -1788,6 +1820,24 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           initialPromptSent = true;
           if (agentId) created.agentId = agentId;
         }
+        // Binding is the last precondition of a successful launch. It runs only
+        // after the exact launch identity is proven and, when a prompt was sent,
+        // after its consumption is confirmed.
+        phase = "supervision_bind";
+        progress(onUpdate, phase, created);
+        const stateChangeSeq = ready.baseline?.stateChangeSeq ?? readinessStateChangeSeq(ready.agent);
+        try {
+          await reservation!.bind({ identity: capturedIdentity, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) });
+        } catch (error) {
+          if (!(error instanceof SupervisionBindError)) throw error;
+          // Partial effect: the child exists and may already be working. Nothing
+          // is retried and nothing is cleaned up.
+          throw new LaunchError("SUPERVISION_UNCONFIRMED", "Automatic child supervision could not be bound to the launched agent", {
+            causeCode: "SUPERVISION_UNCONFIRMED",
+            supervisionJobId: reservation!.jobId,
+            supervisionEvidence: boundAgentSessionStrings(error.details)
+          });
+        }
         const authoritativeName = capturedIdentity.agentName;
         const capability = capabilities.get(chosenProfile.name)!;
         const recipient = { recipientKey: recipientKey!, paneId: resolvedPaneId, agentName: authoritativeName, ...(agentId ? { agentId } : {}), profileName: chosenProfile.name, kind: capability.kind, capable: capability.capable, reason: capability.reason };
@@ -1817,6 +1867,11 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           } : {}),
           recipient,
           effectCertainty: "confirmed",
+          supervision: {
+            jobId: reservation!.jobId,
+            state: "active",
+            child: { agentName: authoritativeName, agentKind: capturedIdentity.agentKind, paneId: resolvedPaneId, terminalId: capturedIdentity.terminalId, profileName: chosenProfile.name }
+          },
           profile: {
             name: chosenProfile.name, requested: params.profile, selected: chosenProfile.name,
             source: { kind: chosenProfile.source.kind, path: chosenProfile.source.path }, timeoutMinutes: chosenProfile.timeoutMinutes,
@@ -1824,7 +1879,10 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             fallbackProfiles: [...profileResolution!.fallbackProfiles], reachableNames: [...profileResolution!.reachableNames], sessionPersistence: chosenProfile.sessionPersistence
           }
         };
-        return { content: [{ type: "text", text: formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: initialPromptDelivery }) }], details: launchDetails };
+        return {
+          content: [{ type: "text", text: `${formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: initialPromptDelivery })} · supervisor ${reservation!.jobId}` }],
+          details: launchDetails
+        };
       } catch (error) {
         if (agentStarted && selectedAttemptStartedAt !== undefined && timing.selectedStartReadinessMs === undefined) {
           const failureReadiness = error instanceof LaunchError && record(error.details.readiness)
@@ -1859,6 +1917,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           if (reconciliation?.paneId !== undefined && created.paneId === undefined) created.paneId = reconciliation.paneId;
           if (reconciliation?.agentId !== undefined && created.agentId === undefined) created.agentId = reconciliation.agentId;
         }
+        // Releasing an unbound reservation settles its job; it is never child cleanup.
+        reservation?.release(`launch_failed_${phase}`);
         throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, mutationDispatched: topologyMutationDispatched, ...(readiness === undefined ? {} : { readiness }), timing, attempts }, initialPromptDelivery, published, reconciliation);
       } finally {
         // The launch window is over; the directory is kept only by its own content.

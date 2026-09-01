@@ -14,6 +14,7 @@ import { RuntimeOwnership } from "../../src/ownership.js";
 import { publishedInputSchema } from "../../src/mcp/adapter.js";
 import { createPreflight, createToolSurface, CORE_TOOL_NAMES } from "../../src/tool-surface.js";
 import { stopDisposableServer } from "./disposable-session.js";
+import { stubSupervision } from "../unit/supervision-fixtures.js";
 
 const execFileAsync = promisify(execFile);
 const REQUIRED_SESSION = "herdr-tools-integration";
@@ -76,6 +77,7 @@ function schemaReferenceSurface() {
     jobs: new JobRegistry(),
     profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
     ownership: new RuntimeOwnership(),
+    supervision: stubSupervision(),
     cwd: "/reference"
   });
 }

@@ -16,6 +16,7 @@ import { createLaunchTool } from "../../src/tools/launch.js";
 import { createPaneTool } from "../../src/tools/pane.js";
 import { createTabTool } from "../../src/tools/tab.js";
 import { createWaitTool } from "../../src/tools/wait.js";
+import { stubSupervision } from "./supervision-fixtures.js";
 
 const snapshot = {
   type: "session_snapshot",
@@ -73,6 +74,7 @@ function surfaceFor(overrides: Partial<HerdrToolSurfaceDependencies> = {}) {
     jobs: new JobRegistry(),
     profiles: { load: async () => { throw new Error("profiles must not load in this test"); } },
     ownership: new RuntimeOwnership(),
+    supervision: stubSupervision(),
     cwd: "/project",
     ...overrides
   };
@@ -111,7 +113,7 @@ describe("shared tool surface", () => {
       createCommunicateTool({ cli: deps.cli, context, preflight: deps.preflight }),
       createWaitTool({ cli: deps.cli, context, settingsLoader: deps.settingsLoader, jobRegistry: deps.jobs }),
       createJobsTool(deps.jobs),
-      createLaunchTool({ cli: deps.cli, context, cwd: deps.cwd, ownership: deps.ownership, profiles: deps.profiles, preflight: deps.preflight }),
+      createLaunchTool({ cli: deps.cli, context, cwd: deps.cwd, ownership: deps.ownership, profiles: deps.profiles, preflight: deps.preflight, supervision: deps.supervision }),
       createPaneTool({ cli: deps.cli, context, cwd: deps.cwd, ownership: deps.ownership, preflight: deps.preflight }),
       createTabTool({ cli: deps.cli, context, cwd: deps.cwd, ownership: deps.ownership, preflight: deps.preflight })
     ];

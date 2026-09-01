@@ -9,6 +9,7 @@ import { createPreflight, createToolSurface } from "../../src/tool-surface.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import { createLaunchTool } from "../../src/tools/launch.js";
 import { EXEC_FORCE_KILL_MS, EXEC_IDLE_GRACE_MS, EXEC_MAX_OUTPUT_BYTES, HOST_FIELDS, HostCapabilityError, StartupRefusal, createNodeExec, hostContext, resolveStartup, type ChildProcessLike, type SpawnLike } from "../../src/mcp/host.js";
+import { stubSupervision } from "./supervision-fixtures.js";
 
 const snapshot = {
   type: "session_snapshot",
@@ -137,6 +138,7 @@ describe("MCP host capability proxy", () => {
       jobs: new JobRegistry(),
       profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
       ownership: new RuntimeOwnership(),
+      supervision: stubSupervision(),
       cwd: "/project",
       reviewerFactory: () => { throw new Error("unused"); }
     });
@@ -157,7 +159,7 @@ describe("MCP host capability proxy", () => {
     // The proxy must still serve both fields when a tool falls back to the host.
     const fallbackCommunicate = createCommunicateTool({ cli, context, preflight: createPreflight(cli) });
     await fallbackCommunicate.execute("id", { target: "w:p2", operation: "keys", keys: ["enter"] } as never, undefined, undefined, hostContext(host));
-    const fallbackLaunch = createLaunchTool({ cli, context, preflight: createPreflight(cli) });
+    const fallbackLaunch = createLaunchTool({ cli, context, preflight: createPreflight(cli), supervision: stubSupervision() });
     await fallbackLaunch.execute("id", { name: "worker", profile: "worker-pi" } as never, signal, undefined, hostContext(host)).catch(() => undefined);
     expect([...new Set(reads)].sort()).toEqual(["cwd", "signal"]);
   });

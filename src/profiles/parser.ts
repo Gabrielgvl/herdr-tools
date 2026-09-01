@@ -65,6 +65,20 @@ export function normalizeScopedResourcePath(value: string, field: string, scopeR
   return resolved;
 }
 
+/**
+ * A Claude channel entry must be tagged, exactly as `--channels` requires:
+ * `server:<name>` for a configured MCP server, `plugin:<name>@<marketplace>`
+ * for a plugin-provided one. An untagged entry is refused rather than guessed.
+ */
+function channelEntries(value: unknown): string[] {
+  return stringArray(value, "runtime.developmentChannels").map((item) => {
+    if (!/^(?:server:[A-Za-z0-9._-]+|plugin:[A-Za-z0-9._-]+@[A-Za-z0-9._-]+)$/.test(item)) {
+      fail("runtime.developmentChannels entries must be server:<name> or plugin:<name>@<marketplace>", { field: "runtime.developmentChannels" });
+    }
+    return item;
+  });
+}
+
 function resourcePaths(value: unknown, field: string, scopeRoot: string): string[] {
   return stringArray(value, field).map((item) => normalizeScopedResourcePath(item, field, scopeRoot));
 }
@@ -77,11 +91,11 @@ function parseRuntime(value: unknown, scopeRoot: string): RuntimeProfile {
     if (!THINKING_LEVELS.includes(value.thinking as ThinkingLevel)) fail("runtime.thinking is invalid");
     return { kind: "pi", model: stringField(value.model, "runtime.model"), thinking: value.thinking as ThinkingLevel, tools: stringArray(value.tools, "runtime.tools"), extensions: resourcePaths(value.extensions, "runtime.extensions", scopeRoot), skills: resourcePaths(value.skills, "runtime.skills", scopeRoot) };
   }
-  exactKeys(value, ["kind", "model", "effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"], "runtime");
+  exactKeys(value, ["kind", "model", "effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs", "developmentChannels"], "runtime");
   if (!CLAUDE_EFFORTS.includes(value.effort as ClaudeEffort)) fail("runtime.effort is invalid");
   const mode = value.permissionMode ?? "default";
   if (!CLAUDE_PERMISSION_MODES.includes(mode as ClaudePermissionMode)) fail("runtime.permissionMode is invalid");
-  return { kind: "claude", model: stringField(value.model, "runtime.model"), effort: value.effort as ClaudeEffort, permissionMode: mode as ClaudePermissionMode, allowedTools: stringArray(value.allowedTools, "runtime.allowedTools"), disallowedTools: stringArray(value.disallowedTools, "runtime.disallowedTools"), addDirs: resourcePaths(value.addDirs, "runtime.addDirs", scopeRoot), pluginDirs: resourcePaths(value.pluginDirs, "runtime.pluginDirs", scopeRoot) };
+  return { kind: "claude", model: stringField(value.model, "runtime.model"), effort: value.effort as ClaudeEffort, permissionMode: mode as ClaudePermissionMode, allowedTools: stringArray(value.allowedTools, "runtime.allowedTools"), disallowedTools: stringArray(value.disallowedTools, "runtime.disallowedTools"), addDirs: resourcePaths(value.addDirs, "runtime.addDirs", scopeRoot), pluginDirs: resourcePaths(value.pluginDirs, "runtime.pluginDirs", scopeRoot), developmentChannels: channelEntries(value.developmentChannels) };
 }
 
 function rejectYamlAliases(node: Node | null): void {

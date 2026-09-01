@@ -22,8 +22,9 @@ export interface SupervisedIdentity {
 export interface SupervisionAnchor {
   /** Pane revision at bind. Events below it are historical replay. */
   revision: number;
-  stateChangeSeq: number;
   status: SupervisionAgentStatus;
+  /** Recorded when the authoritative agent record supplied one. */
+  stateChangeSeq?: number;
 }
 
 /**

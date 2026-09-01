@@ -31,8 +31,11 @@ export interface SupervisionRegistryDependencies {
   notifier?: ManagerNotifier;
   monitor?: SessionEventMonitor;
   monitorOptions?: SupervisionMonitorDependencies;
-  /** Absent on a host with no model service; the reviewer then degrades visibly. */
-  models?: SupervisionModelService;
+  /**
+   * Resolved lazily: the Pi host only learns its model registry when a session
+   * context exists. Returning undefined keeps the reviewer visibly degraded.
+   */
+  models?: () => SupervisionModelService | undefined;
   reviewerFactory?: () => SupervisionReviewer;
   clock?: { now(): number };
   scheduler?: SupervisionScheduler;
@@ -90,7 +93,8 @@ export class SupervisionRegistry implements SupervisionCoordinator {
 
   private reviewer(): SupervisionReviewer {
     if (this.deps.reviewerFactory) return this.deps.reviewerFactory();
-    return this.deps.models ? new ModelSupervisionReviewer(this.deps.models) : new UnavailableReviewer();
+    const models = this.deps.models?.();
+    return models ? new ModelSupervisionReviewer(models) : new UnavailableReviewer();
   }
 
   /**

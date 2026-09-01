@@ -7,9 +7,14 @@ import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
 import { parseProfile, profileSource, type ProfileCatalog } from "../../src/profiles/index.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
+import { stubSupervision, type StubSupervision } from "./supervision-fixtures.js";
 
 const testPreflight = async () => undefined;
-const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight"> & Partial<Pick<LaunchDependencies, "preflight">>) => createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
+let lastSupervision: StubSupervision;
+const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight" | "supervision"> & Partial<Pick<LaunchDependencies, "preflight" | "supervision">>) => {
+  lastSupervision = (deps.supervision as StubSupervision | undefined) ?? stubSupervision();
+  return createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight, supervision: lastSupervision });
+};
 const GRANT_PATH = "/cache/recipient";
 const fakeGrant = () => ({ path: GRANT_PATH, token: "grant-recipient", renew: async () => undefined, release: async () => undefined });
 const publishedAttachment = { attachmentId: "attachment-1", path: "/cache/recipient/attachment-1/body.txt", bytes: 4, sha256: "b".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" };

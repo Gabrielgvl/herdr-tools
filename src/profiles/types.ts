@@ -36,6 +36,12 @@ export interface ClaudeRuntimeProfile {
   disallowedTools: string[];
   addDirs: string[];
   pluginDirs: string[];
+  /**
+   * Claude Code Channels research-preview opt-in, as tagged entries such as
+   * `server:herdr`. Profile-only by design: a launch override must not be able
+   * to open an inbound message channel the profile did not declare.
+   */
+  developmentChannels: string[];
 }
 
 export type RuntimeProfile = PiRuntimeProfile | ClaudeRuntimeProfile;

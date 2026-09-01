@@ -5,6 +5,10 @@ import type { StdinExec } from "./src/exec-stdin.js";
 import { defaultAttachmentStore, type AttachmentStore } from "./src/messages/store.js";
 import { RecipientRegistry } from "./src/messages/recipients.js";
 import { boundedText, JobRegistry, type JobDetail } from "./src/job-registry.js";
+import { SupervisionRegistry } from "./src/supervision/registry.js";
+import { createPiSupervisionNotifier } from "./src/supervision/notify.js";
+import { createRegistryModelService, type SupervisionModelService } from "./src/supervision/model-service.js";
+import type { ModelRegistrySeam } from "./src/reviewer.js";
 import { WaitJobsUi } from "./src/wait-jobs-ui.js";
 import { WAIT_LABEL_MAX_BYTES } from "./src/wait-schema.js";
 import { RuntimeOwnership, resetOwnership, type OwnedResource } from "./src/ownership.js";
@@ -26,6 +30,9 @@ export interface ExtensionRuntime {
   context: CurrentContext;
   ownership: RuntimeOwnership;
   jobs: JobRegistry;
+  supervision: SupervisionRegistry;
+  /** Bound when a Pi session context first exists; before that review degrades visibly. */
+  bindModelRegistry: (registry: ModelRegistrySeam) => void;
   waitJobsUi: WaitJobsUi;
   attachments: AttachmentStore;
   recipients: RecipientRegistry;
@@ -44,6 +51,11 @@ function safeNotificationPart(value: unknown, limit = 500): string {
   return boundedText(safe, limit);
 }
 
+/**
+ * The wait-job terminal notification. Supervisor jobs never reach it: their
+ * wakes are material events delivered by the supervision notifier, and their
+ * settlement is one of those events.
+ */
 export function notificationForJob(detail: JobDetail): { content: string; details: Record<string, unknown> } {
   const waitResult = detail.wait_result;
   const manager = waitResult === "manager_judgment_required";
@@ -95,7 +107,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   const jobs = new JobRegistry({
     onChange: () => uiRef.current?.refresh(),
     onTerminal: (detail) => {
-      if (!pi.sendMessage) return;
+      if (!pi.sendMessage || detail.kind !== "wait") return;
       const notification = notificationForJob(detail);
       try {
         void Promise.resolve(pi.sendMessage({ customType: "herdr-wait-job", content: notification.content, display: true, details: notification.details }, { deliverAs: "steer", triggerTurn: true })).catch(() => undefined);
@@ -106,11 +118,28 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   });
   const waitJobsUi = new WaitJobsUi(jobs);
   uiRef.current = waitJobsUi;
+  const cli = new HerdrCli(pi.exec.bind(pi), 10_000, 50_000, options.stdinExecutor ?? pi.execStdin);
+  // The Pi host only learns its model registry once a session context exists, so
+  // the supervision reviewer resolves through this holder rather than a
+  // construction-time value.
+  const models: { current?: SupervisionModelService } = {};
+  const supervision = new SupervisionRegistry({
+    jobs,
+    settingsLoader: () => loadSettings(),
+    readTranscript: (paneId, signal) => cli
+      .runText(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal)
+      .then((output) => (output.length === 0 ? [] : output.split(/\r?\n/u).slice(-100))),
+    ...(pi.sendMessage ? { notifier: createPiSupervisionNotifier((message, deliveryOptions) => pi.sendMessage!(message, deliveryOptions)) } : {}),
+    models: () => models.current,
+    monitorOptions: { env },
+  });
   return {
-    cli: new HerdrCli(pi.exec.bind(pi), 10_000, 50_000, options.stdinExecutor ?? pi.execStdin),
+    cli,
     context: injected.context,
     ownership: new RuntimeOwnership(),
     jobs,
+    supervision,
+    bindModelRegistry: (registry) => { models.current = createRegistryModelService(registry); },
     waitJobsUi,
     attachments: options.attachments ?? defaultAttachmentStore,
     recipients: options.recipients ?? new RecipientRegistry(),
@@ -133,11 +162,13 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     runtime.waitJobsUi.endSession();
+    runtime.supervision.shutdown();
     runtime.jobs.shutdown();
     runtime.recipients.reset();
     resetOwnership(runtime.ownership);
   });
   pi.on("session_start", async (_event, context) => {
+    runtime.bindModelRegistry(context.modelRegistry);
     runtime.jobs.beginSession();
     runtime.waitJobsUi.beginSession(context);
     runtime.recipients.reset();
@@ -164,6 +195,7 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     cwd: process.cwd(),
     attachments: runtime.attachments,
     recipients: runtime.recipients,
+    supervision: runtime.supervision,
   });
   pi.registerTool(surface.inspect);
   pi.registerTool(surface.communicate);

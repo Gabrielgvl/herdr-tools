@@ -38,21 +38,23 @@ Finally, a wait reviewer classification of `unknown` currently causes manager-ju
 
 `herdr_launch` keeps reserving supervision before its first topology mutation. After startup readiness proves the complete pane, terminal, name, kind, and agent-session identity, launch binds the supervisor immediately. Binding occurs before optional focus and before prompt dispatch.
 
-If binding fails, launch returns `SUPERVISION_UNCONFIRMED` and performs no focus, prompt, recipient registration, retry, or child cleanup. It releases only the unbound reservation.
+Binding is a two-phase internal transaction. The supervisor validates its authoritative bind snapshot and drains queued pre-bind evidence without publishing `active` or `degraded`; the public view remains `reserved` unless that evidence settles it. Bind rejects if closure, release, replacement, identity loss, or another queued outcome settles the supervisor during that drain. Launch cannot focus or dispatch a prompt until the drain completes and the supervisor still proves the same live exact child.
+
+The successful commit synchronously records the selected profile, selected kind, and `request.targetIds: [identity.paneId]`, then publishes bound `active` or `degraded` state. No asynchronous work separates request publication from bound-state publication. On any bind failure, provisional request values are rolled back to the reserved snapshot with `targetIds: []` before the error is observable. Launch returns `SUPERVISION_UNCONFIRMED`, performs no focus, prompt, recipient registration, retry, or child cleanup, and releases only the unbound reservation.
 
 After binding succeeds, launch never releases or cancels that supervisor because a later launch phase failed. The supervisor remains governed by its own exact-child lifecycle and manager-session shutdown rules. It can settle only from its existing release, replacement, identity-loss, pane-close, or shutdown evidence.
 
-Binding atomically records `request.targetIds: [identity.paneId]` with the selected profile and kind before active state is observable. A reservation may have no pane before identity exists. A bound active supervisor may not retain an empty target ID array.
-
 ### Reconcile every live supervisor periodically
 
-The event stream remains the low-latency channel, but it is no longer the sole steady-state correctness source. `SessionEventMonitor` takes one shared authoritative `session.snapshot` every fixed 30 seconds while at least one supervisor observer exists. The existing 10-second request timeout bounds each read. Reads never overlap, the timer stops with no observers or at session shutdown, and one snapshot fans out to every live supervisor through the ordered dispatch chain.
+The event stream remains the low-latency channel, but it is no longer the sole steady-state correctness source. `SessionEventMonitor` takes one shared authoritative `session.snapshot` every fixed 30 seconds while at least one supervisor observer exists. Attempts use monotonic due times 30 seconds apart rather than sleeping 30 seconds after completion; delayed ticks skip catch-up bursts. Opening the unary socket has a 5-second connect bound, followed by the separate 10-second request bound. Connect-plus-request attempts never overlap, the timer stops with no observers or at session shutdown, and one snapshot fans out to every live supervisor through the ordered dispatch chain. A transition omitted at one scheduled attempt boundary therefore has a proven 45-second end-to-end convergence bound while attempts succeed.
 
-Each supervisor reconciles only its complete bound pane, terminal, name, kind, and agent-session identity. Equal revision and equal status confirms currency. Equal revision with changed status emits one high-priority `evidence_gap` and adopts the authoritative status because the supervisor must not remain stale when Herdr's expected revision invariant is itself contradicted. A higher revision emits one gap, adopts the snapshot revision and status, and records any endpoint status transition from source `snapshot`. The gap is emitted even if endpoint status is unchanged because an omitted transition may have returned to the same state. Missing, released, and replaced occupants retain the existing settlement rules. A lower revision is contradictory and is never adopted.
+Revision gaps are detected on both channels. For a same-pane full event, watermark plus one is expected, a jump above that emits one source-`event` `evidence_gap` with the omitted intermediate count before adopting the endpoint, and an exact duplicate stays silent. A same-revision status contradiction also emits one gap and adopts the status. Pane-move destinations rebase their pane-local revision and are not compared with the origin watermark. For a valid continuous snapshot, any higher revision means the stream failed to fold at least one authoritative revision and emits one source-`snapshot` gap before adoption. A gap remains visible even when endpoint status is unchanged.
 
-The first failed or contradictory periodic reconciliation in an episode emits `reconciliation_degraded`, exposes bounded attempt, success, and failure evidence on the supervisor job, and retries on the next interval. The first later success emits `reconciliation_recovered`. Reconciliation degradation does not start CLI polling or another reviewer and does not surrender semantic review ownership.
+Snapshot evidence is target-locally typed as unique, absent, or invalid. Duplicate bound-pane records, duplicate target-local agent records, contradictory local identity, or malformed required local fields are invalid, not absence. Globally malformed or target-locally invalid evidence preserves the last live projection, degrades reconciliation, and cannot settle the supervisor. Only valid unique or absent evidence can prove continuity, release, replacement, or pane absence. A lower revision is contradictory and is never adopted.
 
-This is one session-level periodic correctness guard, not one polling loop per child and not a replacement for the stream. Under the default bounds, a missed stream transition converges within 40 seconds while authoritative snapshots remain available.
+The first failed shared read, invalid target-local result, or contradictory lower revision in an episode emits `reconciliation_degraded` and exposes bounded attempt, valid-success, and failure timestamps, a saturated counter, and a fixed failure-reason literal on the supervisor job. Raw backend and protocol cause text is excluded. The first later valid target-local reconciliation emits `reconciliation_recovered`. Reconciliation degradation does not start CLI polling or another reviewer and does not surrender semantic review ownership.
+
+This is one session-level periodic correctness guard, not one polling loop per child and not a replacement for the stream.
 
 ### Keep assignment as a separate success gate
 
@@ -76,15 +78,17 @@ Coverage is recomputed at each cadence. Reserved and settled supervisors, incomp
 
 The wait continues to poll and settle only from its own authoritative condition, timeout, target failures, reviewer judgment for unsupervised targets, or cancellation. Supervisor events and reviewer findings remain on the supervisor job and never become wait predicate evidence.
 
+The latest cadence partition is exposed through a dedicated bounded `JobDetail.semanticReview` field written through the job operation control. It is not stored only in `progress.details`, whose 256-byte bound can replace details with an opaque truncation envelope. The structured field retains explicit supervisor-covered entries, explicit reviewer target IDs, and omission counts under a 4,096-byte cap.
+
 ### Do not let reviewer `unknown` override working state
 
 Reviewer classifications remain advisory until the existing post-review authoritative refresh establishes settlement precedence. `stalled`, `blocked`, and `risk` retain manager-judgment behavior. `progress` and `appears_complete` remain non-terminal.
 
-An `unknown` result is stored, but it does not settle the wait when the exact target's fresh authoritative state is `working`. It can still require manager judgment when the target is unmapped or the fresh state is not working and the requested condition remains unmet. Another qualifying classification in the same review window can still settle the wait.
+An `unknown` result is stored, but it does not settle the wait only when an exact authoritative agent read performed after the review proves the captured occupant is `working`. State-condition logic may reuse its post-review exact agent read. Output-condition composite or pane metadata is insufficient; the strict output read must retain authoritative status from its final post-output identity-validation agent record, or perform a dedicated bounded `agent get` when that proof is unavailable. Missing, malformed, timed-out, or identity-contradictory reads cannot suppress `unknown` and retain existing target-read and deadline precedence. Another qualifying classification in the same review window can still settle the wait.
 
 ### Remove the old behavior
 
-There is one launch order, one periodic reconciliation rule, and one review-ownership rule. No stream-only mode, empty target ID on a bound job, compatibility field, old diagnostic key, delayed-bind mode, unconditional release path, duplicate reviewer path, or fallback parser is retained.
+There is one launch order, one revision-gap rule per evidence source, one periodic reconciliation rule, and one review-ownership rule. No stream-only mode, unreported event jump, absence inference from invalid records, successful bind after queued settlement, stale provisional target ID, progress-only ownership projection, empty target ID on a bound job, compatibility field, old diagnostic key, delayed-bind mode, unconditional release path, duplicate reviewer path, or fallback parser is retained.
 
 ## Alternatives considered
 
@@ -104,9 +108,17 @@ Rejected. Prompt delivery is not idempotent and may already have been consumed. 
 
 Rejected. A settled reservation is not active supervision. Publishing a stale handle would describe observability that no longer exists.
 
+### Publish bound state before queued evidence finishes
+
+Rejected. Queued closure or replacement evidence can settle the supervisor during bind. Launch must not dispatch a prompt from a bind call that returns after its supervisor already settled. Request target fields and bound state are committed only after that drain and are rolled back together on failure.
+
 ### Trust the event stream unless it reconnects
 
 Rejected by direct evidence. A live subscription and exact bound job stayed idle while authoritative state showed the child working. Reconnect-only reconciliation cannot repair a transition that is silently omitted without a disconnect.
+
+### Detect gaps only when snapshots advance
+
+Rejected. A higher event currently advances the same watermark snapshots use. If an event jumps over revisions and the supervisor silently adopts it, every later snapshot at that revision looks current and the omitted evidence is hidden permanently.
 
 ### Run one periodic snapshot timer per supervisor
 
@@ -120,6 +132,14 @@ Rejected. Review cadence can be 30 minutes and is itself triggered by projected 
 
 Rejected. The observed defect was a healthy stream with stale state. A failed correctness read must make reconciliation health visibly degraded and retry, even while the subscription remains connected.
 
+### Treat non-unique target-local evidence as pane absence
+
+Rejected. Duplicate or malformed records do not prove that the exact pane is absent. Settling a live supervisor from ambiguous topology would turn an evidence-quality failure into a false lifecycle conclusion.
+
+### Publish review ownership only in progress details
+
+Rejected. Public progress details are bounded to 256 bytes and can become an opaque truncation envelope. Ownership must remain a typed, bounded field even when ordinary progress is large.
+
 ### Let every long wait keep its reviewer
 
 Rejected. The supervisor already owns continuous semantic review for the same exact child. A second reviewer adds cost and conflicting judgments without strengthening the authoritative wait predicate.
@@ -128,6 +148,10 @@ Rejected. The supervisor already owns continuous semantic review for the same ex
 
 Rejected. That is a hidden fallback. It conceals reduced supervisor evidence, changes reviewer model and thinking level under failure, and recreates two ownership rules.
 
+### Suppress output-wait `unknown` from pane metadata
+
+Rejected. Composite output observations can contain stale or non-authoritative agent status. Suppression requires a fresh identity-pinned agent record after the review, either retained from the strict output read or obtained separately.
+
 ### Treat every reviewer `unknown` as manager judgment
 
 Rejected. A model's inability to classify does not outweigh fresh authoritative evidence that the child is still working. The summary remains visible and stronger evidence can still settle later.
@@ -135,16 +159,18 @@ Rejected. A model's inability to classify does not outweigh fresh authoritative 
 ## Consequences
 
 - A failed prompt launch can truthfully leave a healthy active supervisor job. Managers must retain and inspect that job rather than relaunch the child.
-- Binding failure happens before assignment, so a child whose supervision cannot be proven receives no initial work from Tools.
-- Every bound supervisor request exposes its exact bind pane ID instead of an empty target array.
+- Binding failure happens before assignment, so a child whose supervision cannot be proven receives no initial work from Tools. Queued settlement cannot be mistaken for bind success.
+- Every successfully bound supervisor request exposes its exact bind pane ID instead of an empty target array. Failed binding restores the reserved empty target rather than leaving a provisional pane.
 - Supervision adds one fixed session-level snapshot read every 30 seconds while children are observed. The load is constant with child count.
-- A successful periodic snapshot repairs a missed stream transition within the default 40-second bound. Failed reads make reconciliation visibly degraded and keep retrying.
-- A revision-only advance can produce a conservative evidence gap even when endpoint status is unchanged. This is preferred to silently assuming that no transition occurred.
+- A successful periodic attempt repairs a missed stream transition within the default 45-second end-to-end bound, including socket connection and request time. Failed or invalid reads make reconciliation visibly degraded and keep retrying.
+- Event and snapshot revision advances can produce conservative evidence gaps even when endpoint status is unchanged. This is preferred to silently assuming that no transition occurred.
+- Malformed or duplicate target-local records preserve the last live projection and degrade health instead of falsely settling the supervisor.
 - Prompt-unconfirmed diagnostics expose the two safe recovery handles while preserving the existing secret boundary.
 - All-covered long waits no longer require the wait reviewer model service. Unsupervised targets still fail closed if their required reviewer is unavailable.
+- Wait details gain one typed, independently bounded semantic-review ownership field because ordinary progress truncation cannot carry the contract.
 - Supervisor review and wait settlement remain separate. A supervisor can wake the manager while the wait continues toward its authoritative condition.
 - A degraded supervisor remains visibly degraded instead of silently borrowing another reviewer.
-- An `unknown` review can extend a wait to a later condition match or timeout. This is deliberate because authoritative working state is stronger evidence.
+- An `unknown` review can extend a wait to a later condition match or timeout. Output waits retain the authoritative state from their final post-output exact agent record, or perform a dedicated read when unavailable. This is deliberate because authoritative working state is stronger evidence.
 - Coverage is sampled immediately before each reviewer dispatch. A supervisor that settles just after the sample can defer explicit review until the next cadence, while target polling and supervisor settlement evidence remain active.
 
 The implementation contract and exact acceptance criteria are in [the identity-bound supervision and wait review spec](../specs/identity-bound-supervision-and-wait-review.md).

@@ -1048,8 +1048,6 @@ threshold:
 - a subscription whose socket died before adoption is refused;
 - events reach observers strictly in stream order even when one suspends on a snapshot, and
   an observer that throws does not break the chain;
-- ordinals count every accepted event, not only routed ones, so replay deduplication holds
-  across a proven pane move;
 - every malformed known lifecycle event is refused at the protocol boundary rather than
   routed nowhere;
 - consecutive reviews receive only the newly produced transcript lines;
@@ -1058,3 +1056,31 @@ threshold:
 - a fallback-selected profile is bound and published, with the reserved profile kept beside it
   only when the two differ;
 - the reviewer prompt bound holds for multibyte output and never splits a code point.
+
+### Second review-round remediation coverage
+
+The second round replaced ordinal-based deduplication with the pane revision and added these
+required regressions, all inside the same enforced 100% threshold:
+
+- events delivered inside the acknowledgement's own chunk still reach observers, so the
+  monitor's handlers must be installed before `events.subscribe` is issued;
+- a monitor stopped while a bootstrap is awaiting refuses to adopt that connection, adopts no
+  generation, and shares the abandoned attempt with nobody;
+- an event and a reconnect bootstrap reach every matching observer even when an earlier
+  observer fails on routing, folding, bootstrap, degradation, or recovery, including a failure
+  thrown before the first await;
+- replay deduplication holds across a proven pane move and the replayed move is discarded on
+  its own revision without costing a snapshot;
+- a move that arrived while binding advances the same watermark, so its replay cannot settle a
+  live supervisor `identity_lost`;
+- a move whose previous pane is not this supervisor's, or whose record does not prove this
+  occupant, reconciles: it stays active where authoritative state proves the child, and
+  settles `identity_replaced` only where that state proves the loss;
+- a reconnect whose outage transitions have scrolled out of the retained log adopts the
+  snapshot's status and revision alongside the `evidence_gap`, and does not refold below it;
+- a reviewer rejection belonging to a finished work cycle degrades nothing, wakes nobody, and
+  re-arms nothing, while a cadence firing during an obsolete review re-arms for the live run
+  and a cadence firing after the child left `working` re-arms nothing;
+- binding re-points the supervisor job's request as well as the supervision view at the
+  profile and kind that actually started the child, and `bindSupervisionChild` refuses an
+  unknown job and a non-supervisor job.

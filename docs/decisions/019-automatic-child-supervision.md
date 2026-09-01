@@ -79,16 +79,25 @@ bind snapshot observed and ignores `PaneInfo`-bearing events below it; everythin
 above it is checked for `terminal_id` and `agent_session` continuity before it is folded.
 Thin events that carry only a pane ID are treated as reconciliation triggers — a fresh
 `session.snapshot` decides — because pane IDs are reused and a replayed `pane_closed` for a
-recycled ID would otherwise settle a live supervisor.
+recycled ID would otherwise settle a live supervisor. The same reasoning governs a
+`pane_moved` that does not leave the supervisor's own pane or whose record does not prove its
+own occupant: it reconciles rather than concluding. `revision` is also the *whole*
+deduplication mechanism, not merely a floor. It is monotonic per pane occupancy and a move is
+followed only on proof the occupancy is unchanged, so one watermark stays meaningful across a
+move — where a count of routed events would not, and where a position in the retained log
+would not either, since that log drops entries from its head.
 
-**5. Reconnect refolds; it does not guess.** The replay is durable, so a reconnect
-re-delivers everything emitted during the outage. The supervisor refolds from its anchor and
-processes every transition it had not already processed. Resuming silently is permitted only
-when the refold proves nothing was missed. If the sequence advanced, or if the anchor is no
-longer present in the retained log while the pane has advanced past the last folded
-revision, exactly one high-priority `evidence_gap` is emitted and supervision continues. If
-the socket cannot be reconnected the supervisor stays **visibly** degraded and retries with
-bounded backoff. There is no hidden polling fallback.
+**5. Reconnect refolds where it can and resynchronises where it cannot.** The replay
+re-delivers what the retained log still holds, which is usually everything emitted during the
+outage but not always: the log is a ring buffer. So the reconnect snapshot, not the replay, is
+the authority. The supervisor refolds every transition above its watermark, and when the
+snapshot's revision has advanced past that watermark it emits exactly one high-priority
+`evidence_gap` **and adopts the snapshot's status and revision**. Adopting is what makes the
+decision correct whether or not the outage is still replayable; reporting the gap alone would
+leave supervision reporting a stale status indefinitely. Resuming silently is permitted only
+when the snapshot proves nothing advanced. If the socket cannot be reconnected the supervisor
+stays **visibly** degraded and retries with bounded backoff. There is no hidden polling
+fallback.
 
 **6. A continuously working child is reviewed on cadence by an exact model.** Every
 `reviewCadenceMinutes` of continuous `working`, a supervisor-specific reviewer classifies the

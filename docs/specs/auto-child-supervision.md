@@ -66,10 +66,12 @@ never identify a child.
 - **C2.** Supervision anchors on `revision` plus exact agent identity, not on stream
   position, so the unmarked replay boundary (**F5**) needs no heuristic and no quiescence
   timer.
-- **C3.** Reconnect is **lossless**: the replay re-delivers everything emitted during the
-  outage. Reconnect therefore refolds rather than guesses. A refold that yields transitions
-  the supervisor had not already processed proves the sequence advanced, which is exactly
-  the `evidence_gap` condition in requirement 7.
+- **C3.** Reconnect refolds rather than guesses, but the replay is **not** unconditionally
+  lossless: the retained log is a ring buffer and can drop entries from its head (**R3**), so an
+  old-enough outage is no longer replayable. The reconnect `session.snapshot` is therefore the
+  authority, and the supervisor both reports the gap and adopts the state that snapshot
+  proves. This is the `evidence_gap` condition in requirement 7, and it is correct whether or
+  not the outage is still in the log.
 - **C4.** Thin events (`pane_closed`, `pane_exited`, `pane_agent_detected`) carry only a
   pane ID, and **F6** makes a pane ID untrustworthy. They are treated as *reconciliation
   triggers*, never as conclusions: the monitor takes a fresh `session.snapshot` and the
@@ -81,10 +83,19 @@ never identify a child.
   not atomic is a protocol violation, not an unproven move, so it never reaches a supervisor.
 - **C6.** The subscription acknowledgement is validated and takes effect inside the socket's
   ingest loop, because the transport may deliver it and the first replay event in one chunk.
-  The monitor never adopts a socket that closed before adoption.
+  For the same reason the monitor installs its event and close handlers **before** it issues
+  `events.subscribe`: a handler installed after the acknowledgement resolved would drop the
+  head of the replay into an undefined callback, silently. The monitor never adopts a socket
+  that closed before adoption, and never adopts one at all if the session stopped while the
+  bootstrap was still awaiting.
 - **C7.** Events reach observers through one ordered chain. Without it, a thin event awaiting
   its reconciliation snapshot could be overtaken by a later full update and then revert the
-  status that update had already applied.
+  status that update had already applied. Every observer call on that chain — routing,
+  folding, bootstrap, degradation, recovery — is isolated per observer, wrapping the call
+  rather than its returned promise so a failure thrown before the first await is caught too.
+  A supervisor that fails must not deprive its siblings of an event they could never be given
+  again. Both chain units are therefore total, so the chain itself carries no blanket catch:
+  swallowing a monitor defect silently is the failure mode this rule exists to remove.
 
 ## 4. Fixed subscription set
 
@@ -134,38 +145,57 @@ the bound value. A field the server omits is not evidence of change; a field it 
 with a different value is. `agent_session` is compared on all four components.
 
 **Move (requirement 6).** A `pane_moved` event is followed only when *all* of the
-following hold, otherwise the supervisor settles `identity_lost` and wakes:
+following hold:
 
 1. the event is atomic — it carries `previous_pane_id` and a complete `pane` record;
-2. the event's `pane` record proves `terminal_id` and `agent_session` continuity;
-3. a **fresh** `session.snapshot` taken after the event still shows exactly one pane with
+2. `previous_pane_id` is the pane this supervisor is currently bound to;
+3. the event's `pane` record proves `terminal_id` and `agent_session` continuity;
+4. a **fresh** `session.snapshot` taken after the event still shows exactly one pane with
    the new `pane_id` whose `terminal_id`, `agent_session`, `agent`, and name match;
-4. the snapshot's `revision` is greater than or equal to the last folded revision.
+5. the snapshot's `revision` is greater than or equal to the last folded revision.
 
 Only then is the bound `paneId` rewritten. Nothing else may rewrite it.
+
+Failing **2** or **3** is not a lost identity and does not settle. The monitor routes a move
+by its destination as well as its origin, and **F6** makes pane IDs reusable, so such an
+event is either a replay of a move this supervisor already followed or a *different*
+occupant's move out of a recycled ID. Concluding `identity_lost` from either would settle a
+live supervisor on somebody else's evidence, so both are treated as reconciliation triggers
+(**C4**) and authoritative state decides. Only a move that is provably this occupant's but
+whose destination cannot be confirmed — failing **4** or **5** — settles `identity_lost` and
+wakes.
 
 ## 7. Anchoring, folding, and gaps
 
 A supervisor stores `anchor = { paneId, revision, stateChangeSeq, status }` captured at
 bind, and a bounded ordered `transitions` list.
 
+It also stores `lastRevision`, the highest pane `revision` it has folded, initialised from
+the bind snapshot.
+
 For each event on the shared stream:
 
 - **not our pane id** → ignored (no work, no reconciliation);
-- **`PaneInfo`-bearing and `revision < anchor.revision`** → historical replay, ignored;
-- **`PaneInfo`-bearing and `revision >= anchor.revision`** → continuity checked, then
-  folded; a status change becomes a transition;
+- **`PaneInfo`-bearing and `revision < lastRevision`** → already reflected here, ignored;
+- **`PaneInfo`-bearing and `revision >= lastRevision`** → continuity checked, then folded; a
+  status change becomes a transition;
 - **thin event** → a coalesced reconciliation (`session.snapshot`) is requested; at most one
   reconciliation per supervisor is in flight, and a request while one is in flight sets a
   re-run flag rather than queueing.
 
-Deduplication is by **connection stream ordinal**, not by the supervisor's own count of
-routed events. The monitor numbers every accepted event on a connection, so ordinal *n*
-names the same durable log entry on every connection, and a supervisor skips everything at
-or below the highest ordinal it has folded. Counting only routed events would break the
-moment a proven move rewrote the routing key: old-pane history would stop contributing while
-the watermark still included it, and the supervisor would go silently blind for as many
-events as the difference.
+Deduplication is `lastRevision` and nothing else. No stream position is used, because
+**F5**'s retained log drops entries from its head: after truncation the same position names a
+different entry, so a supervisor keyed on position would skip transitions it had never seen.
+No count of routed events is used either, because a proven move rewrites the routing key.
+`revision` has neither problem. It is monotonic per pane *occupancy* (**F7**), and a move is
+followed only on proof that the occupancy is unchanged, so the one watermark keeps meaning
+across a move: this is why a replayed move is discarded on its own revision without costing a
+snapshot, and why the destination's revision is comparable with the origin's.
+
+Events that arrive between adding the observer and proving the anchor are queued and then
+folded in arrival order against that same watermark, so a queued event advances it exactly as
+a live one does. A supervisor added to a monitor that has already replayed history therefore
+needs no cursor of its own: its bind revision discards everything before it.
 
 `transitions` is bounded to `SUPERVISION_MAX_TRANSITIONS = 64` with a `truncatedTransitions`
 count, matching the repository's bounded-evidence rule.
@@ -174,18 +204,20 @@ count, matching the repository's bounded-evidence rule.
 (`session.snapshot`, then `events.subscribe`, then the replay). Each supervisor then does
 exactly two things, and neither of them tries to locate the replay boundary:
 
-- **Gap decision, from the bootstrap snapshot alone.** If the fresh snapshot cannot prove the
-  bound occupant is still there, the supervisor settles `identity_lost`. If it can, and the
-  pane's `revision` is greater than the last folded revision, the lifecycle sequence advanced
-  while the socket was down: exactly one high-priority `evidence_gap` is emitted. If the
-  revision is unchanged, the supervisor resumes **silently**. This is a single authoritative
-  comparison, not an inference about which replayed events were missed, so it is correct
-  whether the retained log can still replay the outage or has scrolled past it.
-- **Replay dedupe, by stream ordinal.** The replay is deterministic and ordinals restart at
-  one on each connection, so ordinal *n* is the same log entry every time. The supervisor
-  skips every event at or below the highest ordinal it has already folded; everything beyond
-  it is folded, whether it happened during the outage or after it. This holds across a pane
-  move, because the ordinal counts log position rather than this supervisor's own routing.
+- **Gap decision and resynchronisation, from the bootstrap snapshot alone.** If the fresh
+  snapshot cannot prove the bound occupant is still there, the supervisor settles
+  `identity_lost`. If it can, and the pane's `revision` is greater than `lastRevision`, the
+  lifecycle sequence advanced while the socket was down: exactly one high-priority
+  `evidence_gap` is emitted, **and the snapshot's own status and revision are adopted**. The
+  individual outage transitions are not always recoverable — the retained log may have
+  scrolled past them — so reporting the gap without adopting the state it proves would leave
+  supervision reporting a stale status indefinitely. If the revision is unchanged, the
+  supervisor resumes **silently**. This is a single authoritative comparison, not an
+  inference about which replayed events were missed.
+- **Replay dedupe, by the adopted revision.** The snapshot's revision is the new watermark,
+  so the replay contributes only what that authoritative state does not already cover:
+  everything at or below it is history, and everything above it is folded whether it happened
+  during the outage or after it. This holds across a pane move for the reason given above.
 
 If reconnect is not available the supervisor is **visibly degraded** — job progress records
 it, one `monitor_degraded` wake is emitted, and reconnection is retried with bounded
@@ -384,5 +416,9 @@ operation. No compatibility shim preserves the old wording.
   prompt consumption in the disposable integration session, which is why reads are now
   strictly on demand.
 - **R3 — retained-log truncation.** If Herdr's retained log is a ring buffer, a long outage
-  can scroll the anchor out. That case is detected in §7 and reported as `evidence_gap`
-  rather than assumed benign.
+  can scroll the anchor out. That case is detected in §7 from the reconnect snapshot alone,
+  reported as `evidence_gap` rather than assumed benign, and resynchronised from that
+  snapshot's own status and revision. What is *not* recoverable is the individual transitions
+  inside the scrolled window: the child's exact path through the outage is lost, only its
+  endpoint is known, and the gap event is what says so. This is also why no stream position is
+  used for deduplication — after truncation, position *n* names a different entry.

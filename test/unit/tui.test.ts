@@ -101,11 +101,17 @@ describe("compact tool rows", () => {
     // Before the prompt phase is even entered, while supervision is already bound.
     expect(row({ ...unconfirmed, promptSubmitted: false, phase: "supervision_bind", causeCode: "ENVELOPE_TOO_LARGE" }))
       .toEqual({ text: `error LAUNCH_FAILED · ${handles}`, tone: "error" });
-    // Acknowledged, then a non-PROMPT_UNCONFIRMED transport failure carrying its own code.
+    // Acknowledged, then a non-PROMPT_UNCONFIRMED transport failure carrying its own
+    // code: that code is a cause, never the row prefix, so the handles stay put.
     expect(row({ ...unconfirmed, promptSubmitted: true, code: "ABORTED", causeCode: "ABORTED" }))
-      .toEqual({ text: `error ABORTED · ${handles}`, tone: "error" });
+      .toEqual({ text: `error LAUNCH_FAILED · ${handles}`, tone: "error" });
     expect(row({ ...unconfirmed, promptSubmitted: true, code: "POSTSTATE_UNAVAILABLE", promptConsumption: "unconfirmed" }))
-      .toEqual({ text: `error POSTSTATE_UNAVAILABLE · ${handles}`, tone: "error" });
+      .toEqual({ text: `error LAUNCH_FAILED · ${handles}`, tone: "error" });
+    // An untrusted or non-string code neither reaches the prefix nor costs the handles.
+    expect(row({ ...unconfirmed, promptSubmitted: true, code: "launch failed\u0007" }))
+      .toEqual({ text: `error LAUNCH_FAILED · ${handles}`, tone: "error" });
+    expect(row({ ...unconfirmed, promptSubmitted: true, code: 7 }))
+      .toEqual({ text: `error LAUNCH_FAILED · ${handles}`, tone: "error" });
   });
 
   it("falls back to the generic error row for malformed or contradictory unconfirmed details", () => {
@@ -135,11 +141,9 @@ describe("compact tool rows", () => {
     expect(row({ supervision: { ...details.supervision, jobId: "job supervisor" } })).toEqual(generic);
     expect(row({ paneId: " w1:p2" })).toEqual(generic);
     expect(row({ paneId: "w".repeat(257) })).toEqual({ text: "error LAUNCH_FAILED · w1:p2", tone: "error" });
-    // A code that is not a module-authored token is untrusted text, never a row prefix.
-    expect(resultForRender("launch", { isError: true, details: { ...details, code: "launch failed" } }, {}, "w1:p2"))
-      .toEqual({ text: "error launch failed · w1:p2", tone: "error" });
-    expect(resultForRender("launch", { isError: true, details: { ...details, code: 7 } }, {}, "w1:p2"))
-      .toEqual({ text: "error UNKNOWN · w1:p2", tone: "error" });
+    // Generic launch rows keep their existing code behavior, untrusted text included.
+    expect(row({ agentStarted: false, code: "launch failed\u0007" })).toEqual({ text: "error launch failed\u0007 · w1:p2", tone: "error" });
+    expect(row({ agentStarted: false, code: 7 })).toEqual({ text: "error UNKNOWN · w1:p2", tone: "error" });
   });
 
   it("keeps rows compact for omitted targets and every non-success outcome", () => {

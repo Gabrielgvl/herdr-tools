@@ -16,11 +16,13 @@ import {
   SupervisionEventLog,
   SUPERVISION_MAX_REVIEWS,
   SUPERVISION_MAX_TRANSITIONS,
+  type ReconciliationFailureReason,
   type SupervisionEvent,
   type SupervisionEventType,
   type SupervisionTransition,
 } from "./events.js";
 import {
+  classifySnapshotTarget,
   movedIdentity,
   occupantContinuity,
   paneContinuity,
@@ -28,11 +30,10 @@ import {
   type SupervisedIdentity,
   type SupervisionAnchor,
 } from "./identity.js";
-import type { SessionEventMonitor, SupervisionObserver } from "./monitor.js";
+import { SUPERVISION_RECONCILIATION_INTERVAL_MS, type SessionEventMonitor, type SupervisionObserver } from "./monitor.js";
 import type { ManagerNotifier } from "./notify.js";
 import {
   isPaneRecordEvent,
-  parsePaneRecord,
   type SupervisionAgentStatus,
   type SupervisionPaneRecord,
   type SupervisionSocketEvent,
@@ -110,22 +111,6 @@ interface Settlement {
   reason: string;
 }
 
-/** Find the authoritative occupant of one pane in a snapshot. */
-export function snapshotOccupant(snapshot: HerdrSnapshot, paneId: string): AuthoritativeOccupant | undefined {
-  const panes = snapshot.panes.filter((item) => item.pane_id === paneId);
-  if (panes.length !== 1) return undefined;
-  let pane: SupervisionPaneRecord;
-  try {
-    pane = parsePaneRecord(panes[0]);
-  } catch {
-    return undefined;
-  }
-  const agents = snapshot.agents.filter((item) => item.pane_id === paneId);
-  if (agents.length > 1) return undefined;
-  const name = agents[0]?.name;
-  return { pane, ...(typeof name === "string" ? { agentName: name } : {}) };
-}
-
 export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private readonly log: SupervisionEventLog;
   private readonly transitions = new BoundedHistory<SupervisionTransition>(SUPERVISION_MAX_TRANSITIONS);
@@ -147,6 +132,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    */
   private lastRevision = 0;
   private evidenceGaps = 0;
+  private eventStreamDegraded = false;
+  private reconciliationDegraded = false;
+  private reconciliationConsecutiveFailures = 0;
+  private reconciliationLastAttemptAtMs: number | undefined;
+  private reconciliationLastSuccessAtMs: number | undefined;
+  private reconciliationLastFailureAtMs: number | undefined;
+  private reconciliationLastFailureReason: ReconciliationFailureReason | undefined;
   private reviewerDegraded = false;
   private lastReviewAtMs: number | undefined;
   private workingSinceMs: number | undefined;
@@ -186,11 +178,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       this.deps.monitor.removeObserver(this);
       throw new SupervisionBindError("Supervision binding could not read authoritative state", this.bindEvidence(binding, { cause: reasonOf(error) }));
     }
-    const occupant = snapshotOccupant(snapshot, binding.identity.paneId);
-    if (!occupant) {
+    const target = classifySnapshotTarget(snapshot, binding.identity.paneId);
+    if (target.kind !== "unique" || !target.occupant.agentPresent) {
       this.deps.monitor.removeObserver(this);
-      throw new SupervisionBindError("Supervision binding found no unique authoritative occupant", this.bindEvidence(binding, { cause: "occupant_not_unique" }));
+      const cause = target.kind === "invalid" ? target.reason : target.kind === "absent" ? "occupant_absent" : "agent_absent";
+      throw new SupervisionBindError("Supervision binding found no valid unique authoritative occupant", this.bindEvidence(binding, { cause }));
     }
+    const occupant = target.occupant;
     if (occupantContinuity(binding.identity, occupant) !== "continuous") {
       this.deps.monitor.removeObserver(this);
       throw new SupervisionBindError("Supervision binding could not prove the launched identity", this.bindEvidence(binding, { cause: "identity_mismatch", observedStatus: occupant.pane.agentStatus }));
@@ -201,6 +195,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.status = occupant.pane.agentStatus;
     this.lastRevision = occupant.pane.revision;
     this.state = "active";
+    this.refreshActiveState();
     this.enterStatus(occupant.pane.agentStatus);
     this.publish(`supervising ${this.deps.child.agentName}`);
     await this.drainQueued();
@@ -240,48 +235,34 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     await this.fold(event);
   }
 
-  /**
-   * Resynchronise from authoritative state, then let the replay contribute only
-   * what that state does not already cover.
-   *
-   * The retained log can drop entries from its head, so no position in it is a
-   * stable identity and none is used. The fresh snapshot is the truth: its
-   * revision becomes the deduplication watermark, and its status is applied, so
-   * a supervisor can never resume silently stale.
-   */
+  /** Reconnect snapshots use the same identity, validity, and revision rules as periodic snapshots. */
   async onBootstrap(snapshot: HerdrSnapshot, _generation: number, reconnected: boolean): Promise<void> {
-    if (this.stopped || this.identity === undefined || this.anchor === undefined) return;
-    if (!reconnected) return;
-    const occupant = snapshotOccupant(snapshot, this.identity.paneId);
-    if (!occupant || occupantContinuity(this.identity, occupant) !== "continuous") {
-      await this.settle("identity_lost", "reconnect_identity_unproven");
-      return;
-    }
-    // Requirement 7: resume silently only when nothing advanced. A revision past
-    // the last folded one proves the lifecycle sequence moved while the socket
-    // was down, and those individual transitions are not recoverable from the
-    // log alone, so the gap is reported and the current state is adopted.
-    if (occupant.pane.revision > this.lastRevision) {
-      this.evidenceGaps += 1;
-      this.emit("evidence_gap", `supervision reconnected with the child's lifecycle already advanced (revision ${this.lastRevision} to ${occupant.pane.revision})`, {
-        lastFoldedRevision: this.lastRevision,
-        observedRevision: occupant.pane.revision,
-      });
-      this.lastRevision = occupant.pane.revision;
-      this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
-    }
+    if (this.stopped || this.identity === undefined || this.anchor === undefined || !reconnected) return;
+    await this.applyAuthoritativeSnapshot(snapshot, "reconnect", "identity_lost");
+  }
+
+  async onReconciliationSnapshot(snapshot: HerdrSnapshot): Promise<void> {
+    if (this.stopped || this.identity === undefined || this.anchor === undefined || this.isSettled()) return;
+    await this.applyAuthoritativeSnapshot(snapshot, "periodic_snapshot", "released");
+  }
+
+  onReconciliationFailure(reason: ReconciliationFailureReason): void {
+    if (this.stopped || this.identity === undefined || this.isSettled()) return;
+    this.markReconciliationFailure(reason);
   }
 
   onMonitorDegraded(reason: string): void {
     // A reservation is not yet supervising anything, so it has no health to report.
-    if (this.stopped || this.identity === undefined || this.isSettled()) return;
-    this.state = "degraded";
+    if (this.stopped || this.identity === undefined || this.isSettled() || this.eventStreamDegraded) return;
+    this.eventStreamDegraded = true;
+    this.refreshActiveState();
     this.emit("monitor_degraded", `supervision lost its Herdr event connection (${reason}) and is retrying`, { reason });
   }
 
   onMonitorRecovered(): void {
-    if (this.stopped || this.identity === undefined || this.isSettled()) return;
-    this.state = "active";
+    if (this.stopped || this.identity === undefined || this.isSettled() || !this.eventStreamDegraded) return;
+    this.eventStreamDegraded = false;
+    this.refreshActiveState();
     this.emit("monitor_recovered", "supervision restored its Herdr event connection");
   }
 
@@ -312,14 +293,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // The protocol boundary refused every malformed known event, so a
     // `PaneInfo`-bearing kind always carries its validated record.
     const pane = event.pane!;
-    // The revision gate comes first, and applies to a move as well: a replayed
-    // or queued historical move must never be re-followed, because its previous
-    // pane no longer matches the identity it already moved.
-    if (pane.revision < this.lastRevision) return;
+    // Destination revisions are pane-local. A move proves and rebases the new
+    // pane before any revision comparison with later destination evidence.
     if (event.event === "pane_moved") {
       await this.followMove(event, pane);
       return;
     }
+    if (pane.revision < this.lastRevision) return;
     const verdict = paneContinuity(this.identity!, pane);
     if (verdict === "replaced") {
       await this.reconcile("event:continuity_broken");
@@ -329,8 +309,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       await this.reconcile("event:continuity_unproven");
       return;
     }
-    this.lastRevision = Math.max(this.lastRevision, pane.revision);
-    this.applyStatus(pane.agentStatus, pane.revision, "event");
+    this.applyEventRevision(pane);
   }
 
   /**
@@ -362,21 +341,31 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       await this.settle("identity_lost", "move_reconciliation_unavailable");
       return;
     }
-    const occupant = snapshotOccupant(snapshot, pane.paneId);
-    const next = occupant === undefined ? undefined : movedIdentity(this.identity!, pane, occupant, this.lastRevision);
+    const target = classifySnapshotTarget(snapshot, pane.paneId);
+    if (target.kind === "invalid") {
+      this.markReconciliationFailure(target.reason);
+      return;
+    }
+    if (target.kind === "absent" || !target.occupant.agentPresent) {
+      await this.settle("identity_lost", "move_continuity_unproven");
+      return;
+    }
+    const occupant = target.occupant;
+    const next = movedIdentity(this.identity!, pane, occupant);
     if (next === undefined) {
       await this.settle("identity_lost", "move_continuity_unproven");
       return;
     }
+    this.markReconciliationSuccess();
     this.identity = next;
     this.paneId = next.paneId;
     // Revisions are per pane, so the watermark and the anchor are re-based on the
     // destination's own numbering. Keeping the old pane's higher revision would
     // discard every later event on the new pane.
-    this.lastRevision = occupant!.pane.revision;
-    this.anchor = { ...this.anchor!, revision: occupant!.pane.revision, status: occupant!.pane.agentStatus };
+    this.lastRevision = occupant.pane.revision;
+    this.anchor = { ...this.anchor!, revision: occupant.pane.revision, status: occupant.pane.agentStatus };
     this.publish(`child moved to pane ${next.paneId}`);
-    this.applyStatus(occupant!.pane.agentStatus, occupant!.pane.revision, "snapshot");
+    this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
   }
 
   /** One coalesced authoritative reconciliation. Concurrent triggers collapse into a re-run. */
@@ -395,29 +384,122 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         try {
           snapshot = await this.deps.monitor.snapshot();
         } catch (error) {
-          this.publish(`reconciliation unavailable (${trigger}: ${reasonOf(error)})`);
+          this.markReconciliationFailure(reconciliationFailureReason(error));
           return;
         }
-        const occupant = snapshotOccupant(snapshot, this.identity!.paneId);
-        if (occupant === undefined) {
-          await this.settleWithEvent("pane_closed", "released", trigger, `the child's pane is no longer present (${trigger})`);
-          return;
-        }
-        const verdict = occupantContinuity(this.identity!, occupant);
-        if (verdict === "replaced") {
-          await this.settleWithEvent("identity_replaced", "identity_replaced", trigger, `the child's pane is now occupied by a different agent (${trigger})`);
-          return;
-        }
-        if (verdict === "unproven") {
-          await this.settleWithEvent("released", "released", trigger, `the child agent is no longer present in its pane (${trigger})`);
-          return;
-        }
-        this.lastRevision = Math.max(this.lastRevision, occupant.pane.revision);
-        this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
+        await this.applyAuthoritativeSnapshot(snapshot, trigger, "released");
       } while (this.reconcileAgain && !this.isSettled());
     } finally {
       this.reconciling = false;
     }
+  }
+
+  private applyEventRevision(pane: SupervisionPaneRecord): void {
+    const previousRevision = this.lastRevision;
+    if (pane.revision === previousRevision) {
+      if (pane.agentStatus === this.status) return;
+      this.recordEvidenceGap("event", "status_changed_without_revision", previousRevision, pane.revision);
+      this.applyStatus(pane.agentStatus, pane.revision, "event");
+      return;
+    }
+    if (pane.revision > previousRevision + 1) {
+      this.recordEvidenceGap("event", "revision_jump", previousRevision, pane.revision, pane.revision - previousRevision - 1);
+    }
+    this.lastRevision = pane.revision;
+    this.applyStatus(pane.agentStatus, pane.revision, "event");
+  }
+
+  private async applyAuthoritativeSnapshot(snapshot: HerdrSnapshot, trigger: string, missingOutcome: "identity_lost" | "released"): Promise<void> {
+    const target = classifySnapshotTarget(snapshot, this.identity!.paneId);
+    if (target.kind === "invalid") {
+      this.markReconciliationFailure(target.reason);
+      return;
+    }
+    if (target.kind === "absent") {
+      this.markReconciliationSuccess();
+      if (missingOutcome === "identity_lost") await this.settle("identity_lost", "reconnect_identity_unproven");
+      else await this.settleWithEvent("pane_closed", "released", trigger, `the child's pane is no longer present (${trigger})`);
+      return;
+    }
+    const occupant = target.occupant;
+    if (!occupant.agentPresent) {
+      this.markReconciliationSuccess();
+      await this.settleWithEvent("released", "released", trigger, `the child agent is no longer present in its pane (${trigger})`);
+      return;
+    }
+    const verdict = occupantContinuity(this.identity!, occupant);
+    if (verdict === "replaced") {
+      this.markReconciliationSuccess();
+      await this.settleWithEvent("identity_replaced", "identity_replaced", trigger, `the child's pane is now occupied by a different agent (${trigger})`);
+      return;
+    }
+    if (verdict === "unproven") {
+      this.markReconciliationSuccess();
+      await this.settleWithEvent("released", "released", trigger, `the child agent is no longer present in its pane (${trigger})`);
+      return;
+    }
+    if (occupant.pane.revision < this.lastRevision) {
+      this.markReconciliationFailure("revision_regressed");
+      return;
+    }
+    this.markReconciliationSuccess();
+    this.applySnapshotRevision(occupant);
+  }
+
+  private applySnapshotRevision(occupant: AuthoritativeOccupant): void {
+    const previousRevision = this.lastRevision;
+    if (occupant.pane.revision === previousRevision) {
+      if (occupant.pane.agentStatus === this.status) return;
+      this.recordEvidenceGap("snapshot", "status_changed_without_revision", previousRevision, occupant.pane.revision);
+      this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
+      return;
+    }
+    this.recordEvidenceGap("snapshot", "revision_jump", previousRevision, occupant.pane.revision);
+    this.lastRevision = occupant.pane.revision;
+    this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
+  }
+
+  private recordEvidenceGap(source: SupervisionTransition["source"], reason: "revision_jump" | "status_changed_without_revision", previousRevision: number, observedRevision: number, omittedRevisions?: number): void {
+    this.evidenceGaps = Math.min(Number.MAX_SAFE_INTEGER, this.evidenceGaps + 1);
+    this.emit("evidence_gap", `supervision observed incomplete ${source} revision evidence (${previousRevision} to ${observedRevision})`, {
+      source,
+      reason,
+      previousRevision,
+      observedRevision,
+      ...(omittedRevisions === undefined ? {} : { omittedRevisions }),
+    });
+  }
+
+  private markReconciliationFailure(reason: ReconciliationFailureReason): void {
+    const now = this.deps.clock.now();
+    this.reconciliationLastAttemptAtMs = now;
+    this.reconciliationLastFailureAtMs = now;
+    this.reconciliationLastFailureReason = reason;
+    this.reconciliationConsecutiveFailures = Math.min(Number.MAX_SAFE_INTEGER, this.reconciliationConsecutiveFailures + 1);
+    if (this.reconciliationDegraded) {
+      this.publish(`authoritative reconciliation remains degraded (${reason})`);
+      return;
+    }
+    this.reconciliationDegraded = true;
+    this.refreshActiveState();
+    this.emit("reconciliation_degraded", "authoritative supervision reconciliation is degraded and will retry", { reason });
+  }
+
+  private markReconciliationSuccess(): void {
+    const now = this.deps.clock.now();
+    this.reconciliationLastAttemptAtMs = now;
+    this.reconciliationLastSuccessAtMs = now;
+    this.reconciliationConsecutiveFailures = 0;
+    this.reconciliationLastFailureReason = undefined;
+    if (!this.reconciliationDegraded) return;
+    this.reconciliationDegraded = false;
+    this.refreshActiveState();
+    this.emit("reconciliation_recovered", "authoritative supervision reconciliation recovered");
+  }
+
+  private refreshActiveState(): void {
+    if (this.identity === undefined || this.isSettled()) return;
+    this.state = this.eventStreamDegraded || this.reconciliationDegraded ? "degraded" : "active";
   }
 
   // --------------------------------------------------------------- transitions
@@ -583,13 +665,27 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   // ----------------------------------------------------------------- job port
 
   view(): SupervisionJobView {
+    const streamDegraded = this.eventStreamDegraded || this.deps.monitor.isDegraded();
+    const monitorDegraded = streamDegraded || this.reconciliationDegraded;
+    const projectedState = this.identity !== undefined && !this.isSettled()
+      ? monitorDegraded ? "degraded" : "active"
+      : this.state;
     return {
-      state: this.state,
+      state: projectedState,
       monitor: {
-        connected: !this.deps.monitor.isDegraded(),
-        degraded: this.deps.monitor.isDegraded(),
+        connected: !streamDegraded,
+        degraded: monitorDegraded,
         generation: this.deps.monitor.generation,
         evidenceGaps: this.evidenceGaps,
+        reconciliation: {
+          intervalMs: SUPERVISION_RECONCILIATION_INTERVAL_MS,
+          degraded: this.reconciliationDegraded,
+          consecutiveFailures: this.reconciliationConsecutiveFailures,
+          ...(this.reconciliationLastAttemptAtMs === undefined ? {} : { lastAttemptAtMs: this.reconciliationLastAttemptAtMs }),
+          ...(this.reconciliationLastSuccessAtMs === undefined ? {} : { lastSuccessAtMs: this.reconciliationLastSuccessAtMs }),
+          ...(this.reconciliationLastFailureAtMs === undefined ? {} : { lastFailureAtMs: this.reconciliationLastFailureAtMs }),
+          ...(this.reconciliationLastFailureReason === undefined ? {} : { lastFailureReason: this.reconciliationLastFailureReason }),
+        },
       },
       reviewer: {
         model: SUPERVISION_REVIEWER_MODEL,
@@ -667,6 +763,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 function reasonOf(error: unknown): string {
   const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
   return typeof code === "string" ? code : "UNKNOWN";
+}
+
+function reconciliationFailureReason(error: unknown): ReconciliationFailureReason {
+  const code = reasonOf(error);
+  if (code === "SUPERVISION_SOCKET_UNAVAILABLE") return "connect_failed";
+  if (code === "CLI_PROTOCOL_ERROR" || code === "SUPERVISION_PROTOCOL_ERROR") return "snapshot_protocol_invalid";
+  return "request_failed";
 }
 
 function reviewerReason(error: unknown): string {

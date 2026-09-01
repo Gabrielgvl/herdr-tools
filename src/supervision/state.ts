@@ -7,7 +7,7 @@
  * this seam.
  */
 
-import type { SupervisionEvent, SupervisionTransition } from "./events.js";
+import type { ReconciliationFailureReason, SupervisionEvent, SupervisionTransition } from "./events.js";
 import type { SupervisionAgentStatus } from "./protocol.js";
 import type { ReviewClassification } from "../reviewer.js";
 
@@ -26,11 +26,25 @@ export interface SupervisionChildView {
   requestedAgentKind?: string;
 }
 
+export interface SupervisionReconciliationView {
+  intervalMs: number;
+  degraded: boolean;
+  consecutiveFailures: number;
+  lastAttemptAtMs?: number;
+  lastSuccessAtMs?: number;
+  lastFailureAtMs?: number;
+  lastFailureReason?: ReconciliationFailureReason;
+}
+
 export interface SupervisionMonitorView {
+  /** Subscription connection only. */
   connected: boolean;
+  /** Aggregate of subscription and authoritative reconciliation health. */
   degraded: boolean;
   generation: number;
   evidenceGaps: number;
+  /** Present on every runtime Supervisor view; optional only for structural test ports. */
+  reconciliation?: SupervisionReconciliationView;
 }
 
 export interface SupervisionReviewView {

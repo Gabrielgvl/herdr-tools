@@ -693,6 +693,31 @@ describe("herdr_launch profile-only contract", () => {
     expect(harness.stdinInputs).toHaveLength(1);
   });
 
+  it("rethrows a non-PROMPT_UNCONFIRMED post-ack confirmation failure", async () => {
+    const harness = makeCli();
+    const confirmationError = Object.assign(new Error("post-ack cleanup failed"), {
+      code: "POST_ACK_CONFIRMATION_FAILED",
+      details: { promptConfirmation: { elapsedMs: 11 } }
+    });
+    let removals = 0;
+    const signal = {
+      aborted: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(() => {
+        removals += 1;
+        if (removals === 2) throw confirmationError;
+      })
+    } as unknown as AbortSignal;
+    const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments() });
+    const failure = await tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "confirm once" }, signal, undefined, extensionContext)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: { phase: "prompt_verification", causeCode: "POST_ACK_CONFIRMATION_FAILED", causeMessage: "post-ack cleanup failed", promptSubmitted: true, assignmentState: "unconfirmed", timing: { postAckConfirmationMs: 11 } }
+    });
+    expect(removals).toBe(2);
+  });
+
   it.each([
     ["missing sequence", observedAgent("idle", undefined), "agent_get_state_change_seq_missing"],
     ["working state", observedAgent("working", 7), "agent_get_not_idle:working"],
@@ -1181,6 +1206,85 @@ describe("herdr_launch profile-only contract", () => {
     expect(Buffer.byteLength(failure.message, "utf8")).toBeLessThanOrEqual(LAUNCH_DIAGNOSTIC_MAX_BYTES);
   });
 
+  it("reports unknown reconciliation when the readback operation itself throws", async () => {
+    const baseline = structuredClone(snapshot);
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "start") {
+        const result = await base(argv, signal, preserve);
+        Object.defineProperty(baseline, "panes", {
+          configurable: true,
+          get: () => { throw Object.assign(new Error("baseline readback failed"), { code: "READ_MALFORMED" }); }
+        });
+        return result;
+      }
+      if (argv[0] === "agent" && argv[1] === "focus") throw Object.assign(new Error("focus failed"), { code: "CLI_TIMEOUT" });
+      return base(argv, signal, preserve);
+    });
+    const tool = createLaunchTool({
+      cli: harness.cli,
+      context,
+      cwd: "/repo",
+      contextResolver: async () => ({
+        context,
+        snapshot: baseline,
+        diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+        operationIds: { current: "current", snapshot: "snapshot" }
+      }),
+      profiles: { load: async () => catalog(profile("worker")) },
+      attachments: fakeAttachments()
+    });
+    const failure = await tool.execute("id", { name: "worker", profile: "worker", focus: true }, new AbortController().signal, undefined, extensionContext)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        phase: "focus",
+        causeCode: "CLI_TIMEOUT",
+        reconciliation: {
+          effectCertainty: "unknown",
+          snapshot: "unavailable",
+          pane: "unknown",
+          agent: "unknown",
+          readFailures: ["reconciliation:READ_MALFORMED"]
+        }
+      }
+    });
+
+    const fallbackBaseline = structuredClone(snapshot);
+    const fallbackHarness = makeCli();
+    const fallbackBase = fallbackHarness.cli.runJson;
+    fallbackHarness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "start") {
+        const result = await fallbackBase(argv, signal, preserve);
+        Object.defineProperty(fallbackBaseline, "panes", {
+          configurable: true,
+          get: () => { throw Object.assign(new Error("baseline readback failed"), { code: "\u0000" }); }
+        });
+        return result;
+      }
+      if (argv[0] === "agent" && argv[1] === "focus") throw Object.assign(new Error("focus failed"), { code: "CLI_TIMEOUT" });
+      return fallbackBase(argv, signal, preserve);
+    });
+    const fallbackTool = createLaunchTool({
+      cli: fallbackHarness.cli,
+      context,
+      cwd: "/repo",
+      contextResolver: async () => ({
+        context,
+        snapshot: fallbackBaseline,
+        diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+        operationIds: { current: "current", snapshot: "snapshot" }
+      }),
+      profiles: { load: async () => catalog(profile("worker")) },
+      attachments: fakeAttachments()
+    });
+    const fallbackFailure = await fallbackTool.execute("id", { name: "worker", profile: "worker", focus: true }, new AbortController().signal, undefined, extensionContext)
+      .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    expect((fallbackFailure.details.reconciliation as Record<string, unknown>).readFailures).toEqual(["reconciliation:READ_FAILED"]);
+  });
+
   it("projects fixed reconciliation metadata without reading transcript or output content", async () => {
     const canaries = [
       "private-prompt-canary",
@@ -1295,11 +1399,12 @@ describe("herdr_launch profile-only contract", () => {
 
   it("uses agent and pane identity fallbacks and carries a reconciled agent id", async () => {
     const cases = [
-      { pane: { pane_id: "w1:p2", agent: "pi" }, agent: { pane_id: "w1:p2", agent_id: "agent-direct" }, expected: "agent-direct" },
-      { pane: { pane_id: "w1:p2", agent: "pi" }, agent: { pane_id: "w1:p2", id: "agent-alias" }, expected: "agent-alias" },
-      { pane: { pane_id: "w1:p2", agent_id: "agent-pane" }, agent: { pane_id: "w1:p2" }, expected: "agent-pane" }
+      { pane: { pane_id: "w1:p2", agent_name: "pane-name", agent: "pane-agent" }, agent: { pane_id: "w1:p2", name: "agent-name", agent_id: "agent-direct" }, expected: "agent-direct", expectedName: "agent-name" },
+      { pane: { pane_id: "w1:p2", agent_name: "pane-name", agent: "pane-agent" }, agent: { pane_id: "w1:p2", id: "agent-alias" }, expected: "agent-alias", expectedName: "pane-name" },
+      { pane: { pane_id: "w1:p2", agent: "pane-agent", agent_id: "agent-pane" }, agent: { pane_id: "w1:p2" }, expected: "agent-pane", expectedName: "pane-agent" },
+      { pane: { pane_id: "w1:p2", agent_id: "agent-undefined" }, agent: { pane_id: "w1:p2" }, expected: "agent-undefined", expectedName: undefined }
     ];
-    for (const { pane, agent, expected } of cases) {
+    for (const { pane, agent, expected, expectedName } of cases) {
       const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
       const base = harness.cli.runJson;
       let started = false;
@@ -1317,6 +1422,9 @@ describe("herdr_launch profile-only contract", () => {
       const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
         .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
       expect(failure.details).toMatchObject({ created: { agentId: expected }, reconciliation: { effectCertainty: "partial", agentId: expected } });
+      const reconciliation = failure.details.reconciliation as Record<string, unknown>;
+      if (expectedName === undefined) expect(reconciliation).not.toHaveProperty("agentName");
+      else expect(reconciliation).toHaveProperty("agentName", expectedName);
     }
   });
 
@@ -1503,7 +1611,7 @@ describe("herdr_launch profile-only contract", () => {
   });
 
   it("classifies a hostile transport code instead of echoing it into the diagnostic", async () => {
-    const HOSTILE_CODE = "sk-live-DEADBEEFCAFE";
+    const HOSTILE_CODE = "😀".repeat(40);
     const harness = makeCli();
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw Object.assign(new Error(`preflight refused for token ${HOSTILE_CODE}`), { code: HOSTILE_CODE }); } });
     const failure = await (tool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
@@ -1512,7 +1620,10 @@ describe("herdr_launch profile-only contract", () => {
     expect(failure.message).not.toContain(HOSTILE_CODE);
     expect(JSON.stringify(launchDiagnostic(failure))).not.toContain(HOSTILE_CODE);
     expect(launchDiagnostic(failure)).toMatchObject({ code: "LAUNCH_FAILED", phase: "validate", effectCertainty: "absent", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.noEffect });
-    expect(failure.details).toMatchObject({ causeCode: HOSTILE_CODE });
+    expect(failure.details).toMatchObject({ causeCode: "😀".repeat(30) });
+    expect(failure.details.causeCode).toBe("😀".repeat(30));
+    expect(Buffer.byteLength(failure.message, "utf8")).toBeLessThanOrEqual(LAUNCH_DIAGNOSTIC_MAX_BYTES);
+    expect(Buffer.from(failure.details.causeCode as string, "utf8").toString("utf8")).toBe(failure.details.causeCode);
 
     // A cause with neither a usable code nor prose contributes neither field.
     const blankTool = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw Object.assign(new Error(""), { code: "" }); } });
@@ -2913,8 +3024,17 @@ describe("herdr_launch profile-only contract", () => {
   it("refuses fallback for mismatched errors, uncertain post-state, or an occupied pane", async () => {
     const primary = profile("primary", "pi", ["fallback"]);
     const fallback = profile("fallback", "pi");
-    const mismatched = makeCli({ start: () => { throw startFailure(); }, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_session: { source: "pi", agent: "pi", kind: "managed", value: "session" }, agent_status: "working" }] });
-    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), mismatched.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_start_failed" } });
+    const mismatched = makeCli({ start: () => { throw startFailure(); }, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_session: { source: "\u0000", agent: "\u0001", kind: "\u0002", value: "\u0003" }, agent_status: "working", status: "\u0000" }] });
+    const mismatchedFailure = await launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), mismatched.cli)
+      .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
+    expect(mismatchedFailure).toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_start_failed" } });
+    expect((((mismatchedFailure.details as Record<string, unknown>).attempts as Array<Record<string, unknown>>)[0]!).postState).toEqual({
+      pane_id: "w1:p2",
+      tab_id: "w1:t1",
+      agent: "pi",
+      agent_status: "working",
+      agent_session: { source: "", agent: "", kind: "", value: "" }
+    });
     expect(mismatched.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
 
     const wrongMessage = makeCli({ start: () => { throw Object.assign(new Error("other failure"), { code: "agent_start_failed" }); } });

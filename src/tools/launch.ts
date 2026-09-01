@@ -494,18 +494,25 @@ function reconciliationTimeout(): Error {
  */
 async function boundedReconciliationRead<T>(operation: (signal: AbortSignal) => Promise<T>, signal: AbortSignal, deadline: number): Promise<T> {
   if (signal.aborted || Date.now() >= deadline) throw reconciliationTimeout();
-  const expiry = new AbortController();
+  // The read's signal is aborted here with the typed deadline reason rather than
+  // derived through `AbortSignal.any`, whose composite-reason propagation is not
+  // stable across Node versions: a read must be able to tell a deadline from an
+  // ordinary caller abort by inspecting `signal.reason`.
+  const readController = new AbortController();
+  const onCallerAbort = (): void => readController.abort(signal.reason);
+  signal.addEventListener("abort", onCallerAbort, { once: true });
   let timer!: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
-      expiry.abort(reconciliationTimeout());
+      readController.abort(reconciliationTimeout());
       reject(reconciliationTimeout());
     }, Math.max(0, deadline - Date.now()));
   });
   try {
-    return await Promise.race([operation(AbortSignal.any([signal, expiry.signal])), timeout]);
+    return await Promise.race([operation(readController.signal), timeout]);
   } finally {
     clearTimeout(timer);
+    signal.removeEventListener("abort", onCallerAbort);
   }
 }
 

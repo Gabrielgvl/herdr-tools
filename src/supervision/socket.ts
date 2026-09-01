@@ -63,9 +63,25 @@ export function resolveSocketPath(env: NodeJS.ProcessEnv = process.env): string 
   return value;
 }
 
-export function createNodeSupervisionConnect(connectTimeoutMs = SUPERVISION_CONNECT_TIMEOUT_MS): SupervisionConnect {
+/** The `node:net` seam, mirroring the `SpawnLike` seam the MCP host exec uses. */
+export interface SupervisionSocketLike {
+  once(event: "error", listener: (error: Error) => void): unknown;
+  once(event: "connect", listener: () => void): unknown;
+  on(event: "data", listener: (chunk: Buffer) => void): unknown;
+  on(event: "error", listener: (error: Error) => void): unknown;
+  on(event: "close", listener: () => void): unknown;
+  setNoDelay(value: boolean): unknown;
+  write(data: string): unknown;
+  destroy(): unknown;
+}
+
+export type SupervisionSocketFactory = (socketPath: string) => SupervisionSocketLike;
+
+const nodeSocketFactory: SupervisionSocketFactory = (socketPath) => createConnection({ path: socketPath }) as unknown as SupervisionSocketLike;
+
+export function createNodeSupervisionConnect(connectTimeoutMs = SUPERVISION_CONNECT_TIMEOUT_MS, createSocket: SupervisionSocketFactory = nodeSocketFactory): SupervisionConnect {
   return (socketPath: string) => new Promise<SupervisionStream>((resolve, reject) => {
-    const socket = createConnection({ path: socketPath });
+    const socket = createSocket(socketPath);
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
@@ -81,7 +97,6 @@ export function createNodeSupervisionConnect(connectTimeoutMs = SUPERVISION_CONN
       reject(new SupervisionSocketError("SUPERVISION_SOCKET_UNAVAILABLE", "Herdr socket could not be opened", { cause: error.message }));
     });
     socket.once("connect", () => {
-      /* c8 ignore next -- connect after settle is impossible; the timer destroys the socket first. */
       if (settled) return;
       settled = true;
       clearTimeout(timer);

@@ -8,6 +8,7 @@ import type { AttachmentStore } from "../../src/messages/store.js";
 import { parseProfile, profileSource, type ProfileCatalog } from "../../src/profiles/index.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { stubSupervision, type StubSupervision } from "./supervision-fixtures.js";
+import { SupervisionBindError } from "../../src/supervision/supervisor.js";
 
 const testPreflight = async () => undefined;
 let lastSupervision: StubSupervision;
@@ -259,7 +260,7 @@ function launch(
   profiles: ProfileCatalog,
   cli = makeCli().cli,
   promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) },
-  extras: { attachments?: AttachmentStore; recipients?: RecipientRegistry; clock?: LaunchClock } = {}
+  extras: { attachments?: AttachmentStore; recipients?: RecipientRegistry; clock?: LaunchClock; supervision?: StubSupervision } = {}
 ) {
   const tool = createLaunchTool({
     cli,
@@ -269,6 +270,7 @@ function launch(
     promptSources,
     attachments: extras.attachments ?? fakeAttachments(),
     recipients: extras.recipients ?? new RecipientRegistry(),
+    ...(extras.supervision === undefined ? {} : { supervision: extras.supervision }),
     ...(extras.clock === undefined ? {} : { clock: extras.clock })
   });
   return tool.execute("id", params, new AbortController().signal, undefined, extensionContext);
@@ -2970,5 +2972,96 @@ describe("herdr_launch profile-only contract", () => {
     expect(inlineCall?.render(80)).toEqual(["herdr_launch · worker · inline · worker"]);
     const attachmentCall = tool.renderCall?.({ name: "worker", profile: "worker", initialPrompt: "go", initialPromptDelivery: "attachment" } as never, {} as never, {} as never);
     expect(attachmentCall?.render(80)).toEqual(["herdr_launch · worker · attachment · worker"]);
+  });
+});
+
+type LaunchFailure = Error & { code: string; details: Record<string, unknown> };
+
+describe("herdr_launch automatic child supervision", () => {
+  it("reserves before any topology mutation and returns the stable supervisor job id", async () => {
+    const supervision = stubSupervision({ jobId: "job_sup_1" });
+    const harness = makeCli();
+    const result = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision });
+    expect(supervision.reserved).toEqual([{ agentName: "worker", agentKind: "pi", profileName: "worker" }]);
+    expect(supervision.bound).toHaveLength(1);
+    expect(supervision.bound[0]!.identity).toMatchObject({ paneId: "w1:p2", agentName: "worker", agentKind: "pi" });
+    expect(supervision.released).toEqual([]);
+    expect(result.details).toMatchObject({
+      outcome: "launched",
+      supervision: { jobId: "job_sup_1", state: "active", child: { agentName: "worker", agentKind: "pi", paneId: "w1:p2", profileName: "worker" } }
+    });
+    expect((result.content[0] as { text: string }).text).toContain("supervisor job_sup_1");
+  });
+
+  it("supervises a launch with no initialPrompt and one into an existing pane", async () => {
+    const noPrompt = stubSupervision();
+    await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: noPrompt });
+    expect(noPrompt.bound).toHaveLength(1);
+    // No prompt means no readiness baseline, so the anchor takes the agent record's counter.
+    expect(noPrompt.bound[0]!.stateChangeSeq).toBe(7);
+
+    // An existing-pane launch is supervised on the same contract.
+    const existing = stubSupervision();
+    const reused = makeCli();
+    const reusedBase = reused.cli.runJson;
+    let started = false;
+    const reusedIdentity = { terminal_id: "terminal-existing", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-existing" } };
+    reused.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signalValue, preserve) => {
+      if (argv[0] === "api" && started) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, agent_name: "worker", agent: "pi", ...reusedIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...reusedIdentity }] } });
+      if (argv[0] === "agent" && argv[1] === "start") { started = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...reusedIdentity } }); }
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...reusedIdentity, agent_status: "idle", state_change_seq: 7, revision: 3 } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...reusedIdentity, agent_status: "idle", state_change_seq: 7, revision: 3 } });
+      return reusedBase(argv, signalValue, preserve);
+    });
+    await launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" } }, catalog(profile("worker")), reused.cli, undefined, { supervision: existing });
+    expect(existing.bound).toHaveLength(1);
+    expect(existing.bound[0]!.identity.paneId).toBe("w1:p1");
+  });
+
+  it("refuses the launch with no effect when supervision cannot be reserved", async () => {
+    const supervision = stubSupervision({ reserveError: Object.assign(new Error("no socket"), { code: "SUPERVISION_SOCKET_UNAVAILABLE" }) });
+    const harness = makeCli();
+    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    expect(failure.code).toBe("SUPERVISION_UNAVAILABLE");
+    expect(failure.details).toMatchObject({ phase: "supervision_reserve", effectCertainty: "absent", agentStarted: false, causeCode: "SUPERVISION_SOCKET_UNAVAILABLE" });
+    // No topology command ran at all.
+    expect(harness.calls.some((call) => call[0] === "pane" && call[1] === "split")).toBe(false);
+    expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "start")).toBe(false);
+  });
+
+  it("reports SUPERVISION_UNCONFIRMED as a partial effect and neither retries nor cleans up", async () => {
+    const supervision = stubSupervision({ bindError: new SupervisionBindError("binding could not be proven", { cause: "identity_mismatch" }) });
+    const harness = makeCli();
+    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    expect(failure.details).toMatchObject({
+      phase: "supervision_bind",
+      causeCode: "SUPERVISION_UNCONFIRMED",
+      agentStarted: true,
+      supervisionEvidence: { cause: "identity_mismatch" },
+      reconciliation: { effectCertainty: "partial" }
+    });
+    // The reservation settles so its job does not leak; the child is untouched.
+    expect(supervision.released).toEqual(["launch_failed_supervision_bind"]);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
+  });
+
+  it("releases the reservation when the launch fails after reserving", async () => {
+    const supervision = stubSupervision();
+    const harness = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 2, killed: false }); } });
+    await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch(() => undefined);
+    expect(supervision.released).toEqual(["launch_failed_agent_start"]);
+    expect(supervision.bound).toEqual([]);
+  });
+
+  it("binds only after the prompt was submitted and its consumption confirmed", async () => {
+    const supervision = stubSupervision();
+    const harness = makeCli();
+    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), harness.cli, undefined, { supervision });
+    expect(result.details).toMatchObject({ promptConsumption: "confirmed", supervision: { jobId: supervision.jobId } });
+    expect(harness.stdinInputs).toHaveLength(1);
+    expect(supervision.bound).toHaveLength(1);
+    // The baseline the readiness sample captured, not a later or defaulted value.
+    expect(supervision.bound[0]!.stateChangeSeq).toBe(7);
   });
 });

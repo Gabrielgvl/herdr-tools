@@ -177,20 +177,27 @@ describe("the node socket connector", () => {
     socket.close();
   });
 
-  it("reports an unopenable socket and a connect that never completes", async () => {
+  it("reports an unopenable socket", async () => {
     await expect(createNodeSupervisionConnect()(join(tmpdir(), "herdr-missing.sock"))).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
-    const directory = mkdtempSync(join(tmpdir(), "herdr-supervision-"));
-    directories.push(directory);
-    const path = join(directory, "slow.sock");
-    // A listener that never accepts still lets connect() hang, which the bound catches.
-    const server = createServer();
-    servers.push(server);
-    await new Promise<void>((resolve) => server.listen(path, () => resolve()));
-    const connect = createNodeSupervisionConnect(1);
-    await expect(Promise.race([
-      connect(path).then(() => "connected" as const),
-      new Promise((resolve) => setTimeout(() => resolve("slow"), 500)),
-    ])).resolves.toBeDefined();
+  });
+
+  it("bounds a connect that never completes and ignores a late connect or error", async () => {
+    const listeners = new Map<string, Array<(value?: unknown) => void>>();
+    let destroyed = 0;
+    const silent = {
+      once: (event: string, listener: (value?: unknown) => void) => { listeners.set(event, [...(listeners.get(event) ?? []), listener]); },
+      on: (event: string, listener: (value?: unknown) => void) => { listeners.set(event, [...(listeners.get(event) ?? []), listener]); },
+      setNoDelay: () => undefined,
+      write: () => undefined,
+      destroy: () => { destroyed += 1; },
+    };
+    const connect = createNodeSupervisionConnect(1, () => silent as never);
+    await expect(connect("/tmp/never.sock")).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
+    expect(destroyed).toBe(1);
+    // A connect or error that lands after the bound already rejected is ignored.
+    for (const listener of listeners.get("connect") ?? []) listener();
+    for (const listener of listeners.get("error") ?? []) listener(new Error("late"));
+    expect(destroyed).toBe(1);
   });
 
   it("surfaces a peer reset through onClose", async () => {

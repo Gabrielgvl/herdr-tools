@@ -253,13 +253,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   onMonitorDegraded(reason: string): void {
-    if (this.stopped || this.state === "settled") return;
+    // A reservation is not yet supervising anything, so it has no health to report.
+    if (this.stopped || this.identity === undefined || this.isSettled()) return;
     this.state = "degraded";
     this.emit("monitor_degraded", `supervision lost its Herdr event connection (${reason}) and is retrying`, { reason });
   }
 
   onMonitorRecovered(): void {
-    if (this.stopped || this.state === "settled") return;
+    if (this.stopped || this.identity === undefined || this.isSettled()) return;
     this.state = "active";
     this.emit("monitor_recovered", "supervision restored its Herdr event connection");
   }

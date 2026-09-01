@@ -7,10 +7,12 @@
 ## 1. Objective
 
 Every successful `herdr_launch` now produces a live, first-class **supervisor** that watches
-the exact child agent it launched for the whole life of that child, wakes the launching
-manager on material events only, and reports. Supervision is observation and notification.
-It never mutates the child, never gates the child's work, and never becomes an eighth
-public tool.
+the exact child agent it launched for the whole life of that child, binding as soon as the
+exact launch identity is proven, before optional focus or assignment. Assignment
+confirmation remains a separate launch-success gate. If assignment consumption is not
+proven, launch fails while retaining the active supervisor so the child remains observable.
+Supervision is observation and notification. It never mutates the child, never gates the
+child's work, and never becomes an eighth public tool.
 
 The seven public tools are unchanged: `herdr_inspect`, `herdr_communicate`, `herdr_wait`,
 `herdr_jobs`, `herdr_launch`, `herdr_pane`, `herdr_tab`.
@@ -60,9 +62,10 @@ never identify a child.
 
 - **C1.** The session monitor holds **one** long-lived connection carrying a **fixed global**
   subscription and nothing else, multiplexed across all supervisors (requirement 14). Adding
-  a supervisor never resubscribes and never risks the connection. Reads are separate,
-  short-lived connections, and a launch whose subscription is already live opens none: a
-  redundant per-launch snapshot measurably disturbed the observed session.
+  a supervisor never resubscribes and never risks the connection. The bind snapshot and
+  periodic reconciliation snapshots are separate, short-lived unary reads. A launch takes
+  only its required bind read, not an extra snapshot merely because the subscription is
+  already live.
 - **C2.** Supervision anchors on `revision` plus exact agent identity, not on stream
   position, so the unmarked replay boundary (**F5**) needs no heuristic and no quiescence
   timer.
@@ -151,10 +154,11 @@ following hold:
 2. `previous_pane_id` is the pane this supervisor is currently bound to;
 3. the event's `pane` record proves `terminal_id` and `agent_session` continuity;
 4. a **fresh** `session.snapshot` taken after the event still shows exactly one pane with
-   the new `pane_id` whose `terminal_id`, `agent_session`, `agent`, and name match;
-5. the snapshot's `revision` is greater than or equal to the last folded revision.
+   the new `pane_id` whose `terminal_id`, `agent_session`, `agent`, and name match.
 
-Only then is the bound `paneId` rewritten. Nothing else may rewrite it.
+Only then is the bound `paneId` rewritten. The destination revision is pane-local and is
+rebased as the new watermark after this proof; it is never compared with the origin pane's
+watermark. Nothing else may rewrite the bound pane ID.
 
 Failing **2** or **3** is not a lost identity and does not settle. The monitor routes a move
 by its destination as well as its origin, and **F6** makes pane IDs reusable, so such an
@@ -162,35 +166,37 @@ event is either a replay of a move this supervisor already followed or a *differ
 occupant's move out of a recycled ID. Concluding `identity_lost` from either would settle a
 live supervisor on somebody else's evidence, so both are treated as reconciliation triggers
 (**C4**) and authoritative state decides. Only a move that is provably this occupant's but
-whose destination cannot be confirmed — failing **4** or **5** — settles `identity_lost` and
+whose destination cannot be confirmed in the fresh snapshot settles `identity_lost` and
 wakes.
 
-## 7. Anchoring, folding, and gaps
+## 7. Anchoring, folding, gaps, and periodic reconciliation
 
 A supervisor stores `anchor = { paneId, revision, stateChangeSeq, status }` captured at
-bind, and a bounded ordered `transitions` list.
-
-It also stores `lastRevision`, the highest pane `revision` it has folded, initialised from
-the bind snapshot.
+bind, a bounded ordered `transitions` list, and `lastRevision`, the highest revision folded
+for the pane currently bound to the exact child. Revisions are the deduplication watermark,
+not stream positions. Herdr's retained event log can drop its head, and a proven pane move
+rebases the watermark to the destination pane's own numbering.
 
 For each event on the shared stream:
 
-- **not our pane id** → ignored (no work, no reconciliation);
-- **`PaneInfo`-bearing and `revision < lastRevision`** → already reflected here, ignored;
-- **`PaneInfo`-bearing and `revision >= lastRevision`** → continuity checked, then folded; a
-  status change becomes a transition;
-- **thin event** → a coalesced reconciliation (`session.snapshot`) is requested; at most one
-  reconciliation per supervisor is in flight, and a request while one is in flight sets a
-  re-run flag rather than queueing.
+- an unrelated pane ID is ignored;
+- a full same-pane event below `lastRevision` is historical and ignored;
+- an event at `lastRevision` with the same status is a duplicate and stays silent;
+- an event at `lastRevision` with a changed status emits one high-priority `evidence_gap`
+  with `source: "event"` and `reason: "status_changed_without_revision"`, then adopts the
+  status;
+- an event exactly one revision above the watermark advances normally;
+- an event more than one revision above the watermark emits one high-priority
+  `evidence_gap` with `source: "event"`, `reason: "revision_jump"`, the previous and
+  observed revisions, and the positive omitted-revision count, then adopts its endpoint;
+- a thin event requests coalesced authoritative reconciliation. At most one event-triggered
+  read per supervisor is in flight, and another trigger sets a rerun flag.
 
 Deduplication is `lastRevision` and nothing else. No stream position is used, because
 **F5**'s retained log drops entries from its head: after truncation the same position names a
 different entry, so a supervisor keyed on position would skip transitions it had never seen.
-No count of routed events is used either, because a proven move rewrites the routing key.
-`revision` has neither problem. It is monotonic per pane *occupancy* (**F7**), and a move is
-followed only on proof that the occupancy is unchanged, so the one watermark keeps meaning
-across a move: this is why a replayed move is discarded on its own revision without costing a
-snapshot, and why the destination's revision is comparable with the origin's.
+A proven move changes the routing key, so the destination pane's own revision becomes the new
+watermark only after exact occupant proof. Origin and destination revisions are never compared.
 
 Events that arrive between adding the observer and proving the anchor are queued and then
 folded in arrival order against that same watermark, so a queued event advances it exactly as
@@ -200,28 +206,60 @@ needs no cursor of its own: its bind revision discards everything before it.
 `transitions` is bounded to `SUPERVISION_MAX_TRANSITIONS = 64` with a `truncatedTransitions`
 count, matching the repository's bounded-evidence rule.
 
+### Shared periodic authoritative reconciliation
+
+`SessionEventMonitor` owns one periodic `session.snapshot` loop for the manager session. It
+starts with the first supervisor observer, stops when the last observer is removed or the
+session shuts down, and fans each successful snapshot through the existing ordered observer
+chain. The fixed contract is:
+
+- `SUPERVISION_RECONCILIATION_INTERVAL_MS = 30_000`;
+- one snapshot attempt per due interval for the whole session, never one per child;
+- monotonic due times 30 seconds apart from the first observer, with delayed ticks skipping
+  elapsed due times instead of creating a catch-up burst;
+- at most one connect-plus-request attempt in flight, with the timer unrefed where supported;
+- a 5-second connect bound and a separate 10-second `session.snapshot` request bound;
+- no periodic attempt when there are no observers.
+
+A successful attempt is ordered with socket events and each live supervisor evaluates it against
+its complete bound identity. With the socket service available, a transition omitted at one
+scheduled boundary is corrected by the next successful snapshot. The fixed 30-second interval
+plus the 5-second connect and 10-second request bounds gives a proven 45-second maximum stale
+status window for successful-attempt convergence. This is a correctness bound, not a promise
+when attempts fail.
+
+Snapshot extraction is target-local and typed. A result is `unique` only when exactly one
+bound-pane record and at most one coherent target-local agent record have valid required fields.
+It is `absent` only when neither record exists. Duplicate pane or agent records, an orphan
+agent, contradictory identity, or malformed required target-local data is `invalid`, not
+absence. A globally malformed snapshot fails the shared attempt. Invalid or lower-revision
+evidence preserves the last identity, revision, and status, cannot settle a live supervisor,
+and enters visible reconciliation degradation. Only a later valid target-local result can
+recover the episode.
+
+For a valid continuous snapshot occupant, equal revision and status is silent. Equal revision
+with a changed status emits one source-`snapshot` `evidence_gap` with reason
+`status_changed_without_revision` and adopts the status. Any higher revision emits one
+source-`snapshot` `evidence_gap` with reason `revision_jump`, even when the endpoint status is
+unchanged, then adopts the snapshot revision and status. A lower revision is never adopted.
+A gap remains visible because an endpoint can hide a transition that changed and returned.
+
+Reconciliation failures expose bounded `intervalMs`, degraded state, consecutive failure
+count, last-attempt, last-success, and last-failure timestamps, and one fixed failure reason.
+The first failure in an episode emits `reconciliation_degraded`; the first later valid exact
+reconciliation emits `reconciliation_recovered`. These events do not settle the supervisor or
+transfer review ownership. Event-stream and periodic health are aggregated, so either one can
+keep a live supervisor visibly `degraded`. No CLI polling or hidden reviewer fallback starts.
+
 **Reconnect (requirement 7).** On reconnect the monitor re-runs bootstrap
-(`session.snapshot`, then `events.subscribe`, then the replay). Each supervisor then does
-exactly two things, and neither of them tries to locate the replay boundary:
-
-- **Gap decision and resynchronisation, from the bootstrap snapshot alone.** If the fresh
-  snapshot cannot prove the bound occupant is still there, the supervisor settles
-  `identity_lost`. If it can, and the pane's `revision` is greater than `lastRevision`, the
-  lifecycle sequence advanced while the socket was down: exactly one high-priority
-  `evidence_gap` is emitted, **and the snapshot's own status and revision are adopted**. The
-  individual outage transitions are not always recoverable — the retained log may have
-  scrolled past them — so reporting the gap without adopting the state it proves would leave
-  supervision reporting a stale status indefinitely. If the revision is unchanged, the
-  supervisor resumes **silently**. This is a single authoritative comparison, not an
-  inference about which replayed events were missed.
-- **Replay dedupe, by the adopted revision.** The snapshot's revision is the new watermark,
-  so the replay contributes only what that authoritative state does not already cover:
-  everything at or below it is history, and everything above it is folded whether it happened
-  during the outage or after it. This holds across a pane move for the reason given above.
-
-If reconnect is not available the supervisor is **visibly degraded** — job progress records
-it, one `monitor_degraded` wake is emitted, and reconnection is retried with bounded
-exponential backoff (250 ms → 8 s, full jitter). There is no polling fallback of any kind.
+(`session.snapshot`, then `events.subscribe`, then the replay). The bootstrap snapshot uses the
+same exact-identity, target-local validity, and revision rules as periodic reconciliation. If
+it proves the child is present at a higher revision, one high-priority `evidence_gap` is emitted
+and the snapshot's status and revision are adopted. If the revision is unchanged, resume is
+silent. If the child cannot be proven present, existing identity-loss rules decide. Replayed
+events at or below the adopted revision are history; higher events are folded normally. If the
+socket cannot be restored, the supervisor is visibly degraded, emits one `monitor_degraded`
+wake, and retries with bounded exponential backoff (250 ms to 8 s, full jitter).
 
 ## 8. Material events
 
@@ -242,7 +280,8 @@ Material wakes, each with an opaque `eventId`:
 | `released` | agent released / `pane_exited` confirmed by snapshot | normal |
 | `pane_closed` | pane absent from a fresh snapshot | normal |
 | `monitor_degraded` / `monitor_recovered` | socket unavailable / restored | normal |
-| `evidence_gap` | see §7 | high |
+| `reconciliation_degraded` / `reconciliation_recovered` | periodic authoritative snapshot failure / recovery | normal |
+| `evidence_gap` | event or snapshot revision evidence is incomplete | high |
 
 `identity_replaced`, `identity_lost`, `released`, and `pane_closed` are **settling**: the
 supervisor job settles immediately after the wake.
@@ -284,6 +323,36 @@ supervisor job settles immediately after the wake.
 Unresolvable model or unavailable auth is a reviewer failure (degraded episode), never a
 supervisor failure and never a substitute model.
 
+### Explicit wait review ownership
+
+A long explicit wait evaluates coverage after its latest authoritative target observation and
+immediately before each review dispatch. The active supervisor is the sole semantic-review
+owner for a target only when it is bound, live, non-settled, and matches the target's complete
+pane, terminal, agent, kind, and four-part `agent_session` identity. Reserved or settled
+supervisors, supervisors that cannot prove a live exact child, and pane-only, name-only, or
+incomplete matches do not provide coverage. Degradation alone does not remove coverage while
+the exact child remains live.
+
+Covered targets are omitted from the explicit wait reviewer. Uncovered targets receive the
+existing concurrent low-thinking reviewer, one request per target. Reviewer construction is
+lazy, so an all-covered wait does not resolve or authenticate a wait reviewer. A degraded but
+live supervisor retains ownership; the wait reviewer is never a hidden fallback. Coverage is
+recomputed at every cadence, and a target that loses coverage is reviewed at the next cadence.
+Supervisor reviewer summaries and degradation stay on the supervisor job and never become wait
+predicate evidence.
+
+Each cadence publishes a bounded typed `JobDetail.semanticReview` projection with the covered
+entries, explicit reviewer target IDs, and omission counts independently from truncatable
+progress details. The projection is absent before the first cadence and on supervisor jobs.
+
+Reviewer `unknown` is retained but does not require manager judgment only after a fresh exact
+authoritative agent read performed after that review proves the captured occupant is `working`.
+State waits may reuse their post-review exact read. Output waits must retain the authoritative
+state from their final post-output exact agent record or perform a dedicated bounded read;
+output metadata alone is insufficient. Missing, malformed, timed-out, contradictory, or
+non-working evidence cannot suppress `unknown`, so it retains manager-judgment behavior when
+the condition remains unmet. Supervisor events and reviews never settle `wait_result`.
+
 ## 10. Job model (requirement 3)
 
 `JobRequestSnapshot` becomes a discriminated union on `kind`:
@@ -294,17 +363,22 @@ type JobRequestSnapshot = WaitJobRequestSnapshot | SupervisorJobRequestSnapshot;
 
 `WaitJobRequestSnapshot` is the existing shape plus `kind: "wait"`.
 `SupervisorJobRequestSnapshot` carries `kind: "supervisor"`, `label`, `targets`
-(`[agentName]`), `targetIds` (`[paneId]`), `target_generation_refs`, a bounded `child`
-descriptor, and `settings` with `reviewerThinking: "max"`.
+(`[agentName]`), `targetIds` (`[paneId]` after bind), `target_generation_refs`, a bounded
+`child` descriptor, and `settings` with `reviewerThinking: "max"`. A reserved supervisor has
+no pane identity and starts with `targetIds: []`; a successful bind publishes the exact pane
+ID as a one-item target array.
 
 `JobDetail` gains:
 
 - `kind: JobKind` (mirrors `request.kind`);
-- `supervision_result?: "released" | "identity_lost" | "failed" | "cancelled" | "unknown"`
+- `supervision_result?: "released" | "identity_lost" | "identity_replaced" | "failed" | "cancelled" | "unknown"`
   — the supervisor terminal field. `wait_result` remains wait-only and is never populated
   for a supervisor job;
 - `supervision?: { child, state, monitor, reviewer, events, truncation }` — the bounded
   supervision view;
+- `semanticReview?: { observedAtMs, supervisorCovered, explicitReviewerTargetIds,
+  omittedSupervisorCovered, omittedExplicitReviewerTargetIds }` — a wait-only bounded
+  ownership projection, independent from progress details;
 - `pending_events?: SupervisionEventView[]` — soft receipts, `herdr_jobs get` only;
 - `unobservedEvents?: number` — on both detail and summary.
 
@@ -323,26 +397,41 @@ unobserved counts. Event history is bounded to `SUPERVISION_MAX_EVENTS = 48` wit
 
 ## 11. Launch integration (requirements 1 and 4)
 
-`LaunchDependencies.supervision` is **required**. Two new phases join `LaunchDetails.phase`:
+`LaunchDependencies.supervision` is **required**. The two supervision phases are ordered as
+follows:
 
-1. `supervision_reserve` — runs **before any topology mutation**, immediately after the
+1. `supervision_reserve` runs **before any topology mutation**, immediately after the
    pre-flight/profile/attachment block. It ensures the session monitor is connected,
    bootstrapped, and subscribed, and registers the supervisor job in `accepted`, returning a
    stable job ID. A failure here is an ordinary early failure with `effectCertainty:
    "absent"` and code `SUPERVISION_UNAVAILABLE`.
-2. `supervision_bind` — runs **after** readiness has proven the exact launch identity and,
-   when an `initialPrompt` was sent, after prompt consumption is confirmed. Binding requires
-   a fresh `session.snapshot` that shows exactly one pane carrying the launched identity, an
-   agent record matching it, and a `revision`/`state_change_seq` anchor. If binding cannot be
-   proven the launch throws `SUPERVISION_UNCONFIRMED` as a **partial-effect** failure with
-   child evidence. There is no retry and no cleanup of the child.
+2. `supervision_bind` runs immediately after readiness proves the exact launch identity and
+   before optional focus or any initial-prompt dispatch. Binding validates a fresh
+   `session.snapshot`, drains all queued pre-bind evidence while the public view remains
+   `reserved`, and succeeds only when the exact child is still live and the supervisor is not
+   settled. Its commit publishes the selected profile, selected kind, and
+   `request.targetIds: [exactPaneId]` before publishing bound `active` or `degraded` state.
+
+Queued closure, release, replacement, or identity-loss evidence during bind makes the bind
+reject. Any bind failure throws `SUPERVISION_UNCONFIRMED` as a partial-effect failure, sends
+no focus or prompt, registers no recipient, performs no retry or child cleanup, and releases
+only the unbound reservation. A failed bind rolls any provisional request fields back to the
+reserved snapshot with `targetIds: []`. The real child and failed binding evidence remain
+available for manual inspection.
 
 Profile fallback stays strictly inside `agent_start`, before assignment and before binding,
-so the fallback chain is unchanged.
+so the fallback chain is unchanged. After a successful bind, no later launch failure releases,
+cancels, or shuts down the supervisor. The supervisor remains session-scoped and follows its
+own exact-child lifecycle rules.
 
-On any launch failure between reserve and bind the reservation is released and its job
-settles (`supervision_result: "failed"`, reason naming the launch phase). Releasing a
-reservation is not child cleanup.
+Initial-prompt confirmation remains a separate launch-success gate. The prompt is submitted at
+most once. An acknowledged prompt whose semantic consumption is not proven throws
+`LAUNCH_FAILED` with `causeCode: "PROMPT_UNCONFIRMED"`, `assignmentState: "unconfirmed"`,
+`promptSubmitted: true`, the exact pane ID, the retained active supervisor job ID, and bounded
+recovery evidence. The confirmation path never auto-sends Enter, retries assignment or start,
+focuses again, closes or reuses the pane, registers a recipient, or authorizes dependent work.
+The fixed recovery instruction tells the manager to inspect the existing child with
+`herdr_inspect` and the supervisor with `herdr_jobs get`.
 
 On success `LaunchDetails.supervision = { jobId, state: "active", child, monitor }` and the
 model-visible content line names the job ID:
@@ -410,11 +499,11 @@ operation. No compatibility shim preserves the old wording.
 - **R2 — replay volume and observer load.** A long-lived Herdr session replays a large log
   on every connect and reconnect, and `pane.updated` fires on output changes for every pane
   in the session. The monitor parses each line under a per-line bound and discards
-  non-matching events immediately, but the parse itself is unavoidable. A manager observing
-  a very busy session pays for it. This is measurable: a redundant per-launch snapshot
-  connection was enough to disturb a clientless headless Herdr server badly enough to break
-  prompt consumption in the disposable integration session, which is why reads are now
-  strictly on demand.
+  non-matching events immediately, but the parse itself is unavoidable. One shared periodic
+  snapshot every 30 seconds adds fixed session-level socket load rather than one read per
+  child. A manager observing a very busy session pays for both channels. The required bind
+  read and periodic correctness read are retained; no redundant per-launch snapshot or CLI
+  polling fallback is added.
 - **R3 — retained-log truncation.** If Herdr's retained log is a ring buffer, a long outage
   can scroll the anchor out. That case is detected in §7 from the reconnect snapshot alone,
   reported as `evidence_gap` rather than assumed benign, and resynchronised from that

@@ -31,14 +31,13 @@ import {
 import type { SessionEventMonitor, SupervisionObserver } from "./monitor.js";
 import type { ManagerNotifier } from "./notify.js";
 import {
-  eventPaneRecord,
   isPaneRecordEvent,
-  movePreviousPaneId,
   parsePaneRecord,
   type SupervisionAgentStatus,
   type SupervisionPaneRecord,
   type SupervisionSocketEvent,
 } from "./protocol.js";
+import { deltaLines } from "../transcript-delta.js";
 import { needsManagerAttention, SUPERVISION_REVIEWER_MODEL, type SupervisionReviewer } from "./reviewer.js";
 import type {
   SupervisionChildView,
@@ -72,6 +71,12 @@ export interface SupervisionChildRequest {
 /** What binding proves. Every field comes from the launch's own readiness evidence. */
 export interface SupervisionBinding {
   identity: SupervisedIdentity;
+  /**
+   * The profile that actually started the child. Fallback selection happens
+   * after the reservation, so the reserved profile can name a different one and
+   * the supervisor must publish the profile it is really watching.
+   */
+  profileName: string;
   /** Present only where the authoritative agent record supplied one. */
   stateChangeSeq?: number;
 }
@@ -135,17 +140,27 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private anchor: SupervisionAnchor | undefined;
   private status: SupervisionAgentStatus | undefined;
   private lastRevision = 0;
-  private foldCursor = 0;
-  private replayCursor = 0;
+  /**
+   * The highest connection-stream ordinal this supervisor has folded. The monitor
+   * counts every accepted event, not only routed ones, so the ordinal names the
+   * same log entry on every connection and survives a pane move rewriting the
+   * routing key.
+   */
+  private foldedThrough = 0;
   private evidenceGaps = 0;
   private reviewerDegraded = false;
   private lastReviewAtMs: number | undefined;
   private workingSinceMs: number | undefined;
+  /** Increments on each entry into `working`, so a review can prove it is still reviewing its own run. */
+  private workingRun = 0;
+  /** The transcript window the previous completed review consumed. */
+  private reviewedTranscript: string[] = [];
   private reviewTimer: unknown;
   private reviewing = false;
   private reconciling = false;
   private reconcileAgain = false;
   private settlement: Settlement | undefined;
+  private selectedProfileName: string | undefined;
   private stopped = false;
   private readonly abort = new AbortController();
 
@@ -182,6 +197,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       throw new SupervisionBindError("Supervision binding could not prove the launched identity", this.bindEvidence(binding, { cause: "identity_mismatch", observedStatus: occupant.pane.agentStatus }));
     }
     this.identity = binding.identity;
+    this.selectedProfileName = binding.profileName;
     this.anchor = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, ...(binding.stateChangeSeq === undefined ? {} : { stateChangeSeq: binding.stateChangeSeq }) };
     this.status = occupant.pane.agentStatus;
     this.lastRevision = occupant.pane.revision;
@@ -216,23 +232,19 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     return !this.stopped && this.paneId === paneId;
   }
 
-  async onEvent(event: SupervisionSocketEvent): Promise<void> {
+  async onEvent(event: SupervisionSocketEvent, ordinal: number): Promise<void> {
     if (this.stopped) return;
     if (this.identity === undefined) {
       this.queued.push(event);
       return;
     }
-    this.replayCursor += 1;
-    if (this.replayCursor <= this.foldCursor) return;
-    this.foldCursor = this.replayCursor;
+    if (ordinal <= this.foldedThrough) return;
+    this.foldedThrough = ordinal;
     await this.fold(event);
   }
 
   async onBootstrap(snapshot: HerdrSnapshot, _generation: number, reconnected: boolean): Promise<void> {
     if (this.stopped || this.identity === undefined || this.anchor === undefined) return;
-    // The replay is deterministic, so the index of a relevant event is stable and
-    // the fold cursor can be replayed from zero without double-processing.
-    this.replayCursor = 0;
     if (!reconnected) return;
     const occupant = snapshotOccupant(snapshot, this.identity.paneId);
     if (!occupant || occupantContinuity(this.identity, occupant) !== "continuous") {
@@ -266,12 +278,15 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   // -------------------------------------------------------------------- folding
 
+  /**
+   * Events that arrived between adding the observer and proving the anchor. Their
+   * ordinals were assigned by the monitor before binding completed, so they are
+   * folded in arrival order and the watermark advances with them.
+   */
   private async drainQueued(): Promise<void> {
     const pending = this.queued.splice(0);
     for (const event of pending) {
       if (this.stopped) return;
-      this.replayCursor += 1;
-      this.foldCursor = this.replayCursor;
       await this.fold(event);
     }
   }
@@ -284,15 +299,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       await this.reconcile(`event:${event.event}`);
       return;
     }
-    let pane: SupervisionPaneRecord;
-    try {
-      pane = eventPaneRecord(event);
-    } catch {
-      // `parsePaneRecord` refuses rather than guesses, so a malformed record is
-      // a reconciliation trigger like any other unprovable observation.
-      await this.reconcile("event:malformed_pane_record");
-      return;
-    }
+    // The protocol boundary refused every malformed known event, so a
+    // `PaneInfo`-bearing kind always carries its validated record.
+    const pane = event.pane!;
     if (event.event === "pane_moved") {
       await this.followMove(event, pane);
       return;
@@ -316,14 +325,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * authoritative occupant both prove terminal and agent-session continuity.
    */
   private async followMove(event: SupervisionSocketEvent, pane: SupervisionPaneRecord): Promise<void> {
-    let previous: string;
-    try {
-      previous = movePreviousPaneId(event);
-    } catch {
-      await this.settle("identity_lost", "move_not_atomic");
-      return;
-    }
-    if (previous !== this.identity!.paneId) {
+    // Atomicity is a protocol-boundary guarantee: a `pane_moved` without a
+    // previous pane id never reaches a supervisor.
+    if (event.previousPaneId! !== this.identity!.paneId) {
       await this.settle("identity_lost", "move_previous_pane_mismatch");
       return;
     }
@@ -413,6 +417,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       return;
     }
     this.workingSinceMs = this.deps.clock.now();
+    this.workingRun += 1;
     this.armReview(this.deps.cadenceMs);
   }
 
@@ -436,17 +441,29 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * either way.
    */
   private async review(): Promise<void> {
-    if (this.stopped || this.state === "settled" || this.status !== "working" || this.reviewing) return;
+    if (!this.reviewable()) return;
     this.reviewing = true;
+    const run = this.workingRun;
+    const workingSinceMs = this.workingSinceMs!;
     try {
-      const transcriptDelta = await this.deps.readTranscript(this.identity!.paneId, this.abort.signal);
+      const transcript = await this.deps.readTranscript(this.identity!.paneId, this.abort.signal);
+      // The child may have finished its work cycle while the read was in flight.
+      // A review of a run that is over is not evidence about anything, so it is
+      // abandoned before the model call rather than stored or announced. The
+      // transcript cursor does not advance: those lines were never reviewed.
+      if (!this.reviewable(run)) return;
       const result = await this.deps.reviewer.review({
         paneId: this.identity!.paneId,
         agentName: this.identity!.agentName,
-        workingForMs: Math.max(0, this.deps.clock.now() - this.workingSinceMs!),
+        workingForMs: Math.max(0, this.deps.clock.now() - workingSinceMs),
         metadata: { agentKind: this.identity!.agentKind, status: this.status, revision: this.lastRevision },
-        transcriptDelta,
+        // Only what is new since the previous completed review. Handing the whole
+        // window back every cadence would let stale output keep reading as fresh
+        // progress from a stalled child.
+        transcriptDelta: deltaLines(this.reviewedTranscript, transcript),
       }, this.abort.signal);
+      if (!this.reviewable(run)) return;
+      this.reviewedTranscript = transcript;
       this.lastReviewAtMs = this.deps.clock.now();
       this.reviews.push({ atMs: this.lastReviewAtMs, classification: result.classification, summary: result.summary });
       if (this.reviewerDegraded) {
@@ -470,6 +487,15 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       this.reviewing = false;
       if (!this.stopped && !this.isSettled() && this.status === "working") this.armReview(this.deps.cadenceMs);
     }
+  }
+
+  /**
+   * A review is only meaningful while the child is still inside the same
+   * continuous working run it was started for.
+   */
+  private reviewable(run?: number): boolean {
+    if (this.stopped || this.isSettled() || this.status !== "working") return false;
+    return run === undefined ? !this.reviewing : this.workingRun === run;
   }
 
   // -------------------------------------------------------------------- events
@@ -545,12 +571,18 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private childView(identity: SupervisedIdentity): SupervisionChildView {
+    // The bound profile is the one that actually started this child; binding sets
+    // it alongside the identity this view already requires. The reserved profile
+    // is kept beside it only when fallback selection changed it, so the two never
+    // silently contradict each other.
+    const profileName = this.selectedProfileName!;
     return {
       agentName: identity.agentName,
       agentKind: identity.agentKind,
       paneId: identity.paneId,
       terminalId: identity.terminalId,
-      profileName: this.deps.child.profileName,
+      profileName,
+      ...(profileName === this.deps.child.profileName ? {} : { requestedProfileName: this.deps.child.profileName }),
     };
   }
 

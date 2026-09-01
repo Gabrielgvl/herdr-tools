@@ -4,9 +4,13 @@ import { SessionEventMonitor } from "../../src/supervision/monitor.js";
 import { SupervisionRegistry } from "../../src/supervision/registry.js";
 import { Supervisor, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
 import type { SupervisedIdentity } from "../../src/supervision/identity.js";
-import type { SupervisionSocketEvent } from "../../src/supervision/protocol.js";
+import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervision/protocol.js";
+import type { SupervisionReviewRequest } from "../../src/supervision/reviewer.js";
+import type { SupervisionWake } from "../../src/supervision/notify.js";
 import { scriptedServer } from "./supervision-peer.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
+
+const types = (wakes: SupervisionWake[]): string[] => wakes.map((wake) => wake.event.type);
 
 const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
@@ -29,17 +33,32 @@ function snapshot(panes: Array<Record<string, unknown>>, agents: Array<Record<st
   return parseSnapshotResult({ type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents } });
 }
 
+let ordinal = 0;
+
+/** Events reach a supervisor already validated by the protocol boundary. */
 function paneEvent(kind: string, pane: Record<string, unknown>, extra: Record<string, unknown> = {}): SupervisionSocketEvent {
-  return { kind: "event", event: kind as SupervisionSocketEvent["event"], data: { type: kind, pane, ...extra } };
+  return parseSocketLine(JSON.stringify({ event: kind, data: { type: kind, pane, ...extra } })) as SupervisionSocketEvent;
+}
+
+function thinEvent(kind: string, paneId = "p1"): SupervisionSocketEvent {
+  return parseSocketLine(JSON.stringify({ event: kind, data: { type: kind, pane_id: paneId, workspace_id: "w1" } })) as SupervisionSocketEvent;
 }
 
 interface EdgeHarness {
   supervisor: Supervisor;
+  wakes: SupervisionWake[];
   reviews: number;
   releaseReview(): void;
 }
 
-function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: { scheduler?: boolean } = {}): EdgeHarness {
+interface EdgeOptions {
+  scheduler?: boolean;
+  transcript?: () => Promise<string[]>;
+  onReview?: (request: SupervisionReviewRequest) => void;
+}
+
+function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: EdgeOptions = {}): EdgeHarness {
+  const wakes: SupervisionWake[] = [];
   const queue = [...snapshots];
   let reviews = 0;
   let release!: () => void;
@@ -58,29 +77,36 @@ function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: { sche
       generation: 1,
       isDegraded: () => false,
     },
-    notifier: { wake: () => undefined },
-    reviewer: { review: async () => { reviews += 1; await pending; return { classification: "progress", summary: "moving" }; } },
+    notifier: { wake: (wake) => { wakes.push(wake); } },
+    reviewer: {
+      review: async (request) => {
+        reviews += 1;
+        options.onReview?.(request);
+        if (options.onReview === undefined) await pending;
+        return { classification: "progress", summary: "moving" };
+      },
+    },
     cadenceMs: 1_000,
     clock: { now: () => 0 },
     // Omitting the scheduler exercises the real-timer default.
     ...(options.scheduler === false ? {} : { scheduler: { setTimer: () => "timer", clearTimer: () => undefined } }),
-    readTranscript: async () => [],
+    readTranscript: options.transcript ?? (async () => []),
     update: () => undefined,
   };
   const supervisor = new Supervisor(deps);
-  return { supervisor, get reviews() { return reviews; }, releaseReview: release } as EdgeHarness;
+  return { supervisor, wakes, get reviews() { return reviews; }, releaseReview: release } as EdgeHarness;
 }
 
 describe("supervisor guards after settlement", () => {
   it("ignores every stream path once the supervisor has settled", async () => {
     const h = edgeSupervisor([snapshot([paneRecord()]), snapshot([])]);
-    await h.supervisor.bind({ identity });
-    await h.supervisor.onEvent({ kind: "event", event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    await h.supervisor.onEvent(thinEvent("pane_closed", "p1"), ++ordinal);
     expect(await h.supervisor.run()).toMatchObject({ outcome: "released" });
 
     // Folding, reconciling and settling again are all no-ops on a settled supervisor.
-    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord("blocked", 9)));
-    await h.supervisor.onEvent({ kind: "event", event: "pane_exited", data: { type: "pane_exited", pane_id: "p1", workspace_id: "w1" } });
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord("blocked", 9)), ++ordinal);
+    await h.supervisor.onEvent(thinEvent("pane_exited", "p1"), ++ordinal);
     expect(h.supervisor.view().status).toBe("working");
     expect(await h.supervisor.run()).toMatchObject({ outcome: "released" });
   });
@@ -103,9 +129,9 @@ describe("supervisor guards after settlement", () => {
     };
     const supervisor = new Supervisor(deps);
     stopper.current = () => supervisor.shutdown();
-    const binding = supervisor.bind({ identity });
+    const binding = supervisor.bind({ identity, profileName: "worker-pi" });
     // Both events are queued synchronously, before binding can set the anchor.
-    const queued = [supervisor.onEvent(paneEvent("pane_updated", paneRecord("blocked", 6))), supervisor.onEvent(paneEvent("pane_updated", paneRecord("idle", 7)))];
+    const queued = [supervisor.onEvent(paneEvent("pane_updated", paneRecord("blocked", 6)), ++ordinal), supervisor.onEvent(paneEvent("pane_updated", paneRecord("idle", 7)), ++ordinal)];
     await binding;
     await Promise.all(queued);
     expect(supervisor.view().transitions.map((transition) => transition.to)).toEqual(["blocked"]);
@@ -133,32 +159,37 @@ describe("supervisor guards after settlement", () => {
     (supervisor as unknown as { paneId: string }).paneId = "p1";
     (supervisor as unknown as { state: string }).state = "active";
     stopper.current = () => supervisor.shutdown();
-    await supervisor.onEvent({ kind: "event", event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } });
+    await supervisor.onEvent(thinEvent("pane_closed", "p1"), ++ordinal);
     expect(await supervisor.run()).toEqual({ outcome: "cancelled", reason: "manager_session_shutdown" });
   });
 
   it("settles identity_lost when a move names a pane no snapshot can show", async () => {
     const h = edgeSupervisor([snapshot([paneRecord()]), snapshot([])]);
-    await h.supervisor.bind({ identity });
-    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord("working", 6, "p2"), { previous_pane_id: "p1" }));
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord("working", 6, "p2"), { previous_pane_id: "p1" }), ++ordinal);
     expect(await h.supervisor.run()).toMatchObject({ reason: "move_continuity_unproven" });
   });
 
-  it("does not re-arm the cadence for a child that stopped working mid-review", async () => {
+  it("discards a review whose work cycle ended while the model call was in flight", async () => {
     const h = edgeSupervisor([snapshot([paneRecord("working")]), snapshot([paneRecord("idle", 6)])], { scheduler: false });
-    await h.supervisor.bind({ identity });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
     const review = (h.supervisor as unknown as { review(): Promise<void> }).review();
     // The child leaves the working state while the review is still in flight.
-    await h.supervisor.onEvent({ kind: "event", event: "pane_exited", data: { type: "pane_exited", pane_id: "p1", workspace_id: "w1" } });
+    await h.supervisor.onEvent(thinEvent("pane_exited", "p1"), ++ordinal);
     h.releaseReview();
     await review;
     expect(h.supervisor.view().status).toBe("idle");
-    expect(h.supervisor.view().reviewer.reviews).toHaveLength(1);
+    // The result describes a run that is already over, so it is neither stored
+    // nor announced, and the cadence is not re-armed.
+    expect(h.supervisor.view().reviewer.reviews).toEqual([]);
+    expect(h.supervisor.view().reviewer.lastReviewAtMs).toBeUndefined();
+    // The settling wake for the ended cycle is expected; no reviewer wake is.
+    expect(types(h.wakes).filter((type) => type.startsWith("reviewer_"))).toEqual([]);
   });
 
   it("never runs two reviews at once", async () => {
     const h = edgeSupervisor([snapshot([paneRecord("working")])], { scheduler: false });
-    await h.supervisor.bind({ identity });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
     const first = (h.supervisor as unknown as { review(): Promise<void> }).review();
     const second = (h.supervisor as unknown as { review(): Promise<void> }).review();
     h.releaseReview();
@@ -273,5 +304,106 @@ describe("monitor and registry seams", () => {
       if (previous !== undefined) process.env.HERDR_SOCKET_PATH = previous;
     }
     supervision.shutdown();
+  });
+});
+
+describe("review-round remediations", () => {
+  it("recreates the supervision monitor for each manager session", async () => {
+    // A session that follows a shutdown must still be able to reserve: the
+    // previous session's monitor is stopped for good, so a new one replaces it.
+    const monitors: SessionEventMonitor[] = [];
+    const jobs = new JobRegistry();
+    const supervision = new SupervisionRegistry({
+      jobs,
+      settingsLoader: async () => settings,
+      readTranscript: async () => [],
+      monitorFactory: () => {
+        const peer = scriptedServer();
+        const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } });
+        monitors.push(monitor);
+        return monitor;
+      },
+    });
+    const first = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    expect(first.jobId).toBeDefined();
+
+    supervision.shutdown();
+    await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
+
+    supervision.beginSession();
+    const second = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    expect(second.jobId).not.toBe(first.jobId);
+    expect(monitors).toHaveLength(2);
+    // The replaced monitor stays stopped; it never serves the new session.
+    await expect(monitors[0]!.ensureStarted()).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
+    supervision.shutdown();
+  });
+
+  it("keeps replay deduplication correct across a pane move", async () => {
+    // Ordinals count every accepted event, not only the routed ones, so a move
+    // that rewrites the routing key cannot desynchronise the watermark.
+    const moved = paneRecord("working", 6, "p2");
+    const h = edgeSupervisor([
+      snapshot([paneRecord("working")]),
+      snapshot([moved], [{ pane_id: "p2", name: "worker" }]),
+      snapshot([paneRecord("working", 9, "p2")], [{ pane_id: "p2", name: "worker" }]),
+    ]);
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+
+    // Two old-pane events, then the move at ordinal 3.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord("working", 5)), 1);
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord("working", 5)), 2);
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }), 3);
+    expect(h.supervisor.view().child?.paneId).toBe("p2");
+
+    // On reconnect the replay restarts at ordinal 1 and the old-pane events no
+    // longer route here, but ordinals still name the same log entries.
+    await h.supervisor.onBootstrap(snapshot([paneRecord("working", 9, "p2")], [{ pane_id: "p2", name: "worker" }]), 2, true);
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }), 3);
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord("blocked", 10, "p2")), 4);
+    expect(types(h.wakes)).toEqual(["evidence_gap", "blocked"]);
+  });
+
+  it("sends only what is new since the previous completed review", async () => {
+    const windows = [["a", "b"], ["a", "b", "c"], ["a", "b", "c"]];
+    let read = 0;
+    const deltas: string[][] = [];
+    const h = edgeSupervisor([snapshot([paneRecord("working")])], {
+      scheduler: false,
+      transcript: async () => windows[Math.min(read++, windows.length - 1)]!,
+      onReview: (request) => { deltas.push(request.transcriptDelta); },
+    });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    const first = (h.supervisor as unknown as { review(): Promise<void> }).review();
+    h.releaseReview();
+    await first;
+    await (h.supervisor as unknown as { review(): Promise<void> }).review();
+    await (h.supervisor as unknown as { review(): Promise<void> }).review();
+    expect(deltas).toEqual([["a", "b"], ["c"], []]);
+  });
+
+  it("abandons a review before the model call when the read outlives the work cycle", async () => {
+    const h = edgeSupervisor([snapshot([paneRecord("working")]), snapshot([paneRecord("idle", 6)])], {
+      scheduler: false,
+      transcript: async () => {
+        // The child finishes its cycle while the transcript read is in flight.
+        await h.supervisor.onEvent(thinEvent("pane_exited", "p1"), ++ordinal);
+        return ["line"];
+      },
+    });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    await (h.supervisor as unknown as { review(): Promise<void> }).review();
+    expect(h.reviews).toBe(0);
+    expect(h.supervisor.view().reviewer.reviews).toEqual([]);
+  });
+
+  it("publishes the profile that actually started the child", async () => {
+    const h = edgeSupervisor([snapshot([paneRecord()])]);
+    await h.supervisor.bind({ identity, profileName: "worker-claude" });
+    expect(h.supervisor.view().child).toMatchObject({ profileName: "worker-claude", requestedProfileName: "worker-pi" });
+
+    const same = edgeSupervisor([snapshot([paneRecord()])]);
+    await same.supervisor.bind({ identity, profileName: "worker-pi" });
+    expect(same.supervisor.view().child).not.toHaveProperty("requestedProfileName");
   });
 });

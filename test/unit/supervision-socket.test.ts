@@ -208,3 +208,44 @@ describe("the node socket connector", () => {
     await expect(pending).rejects.toBeDefined();
   });
 });
+
+describe("subscription acknowledgement atomicity", () => {
+  it("accepts an acknowledgement and its first replay event delivered in one chunk", async () => {
+    const stream = fakeStream();
+    const socket = new SupervisionSocket(stream, 1_000);
+    const events: unknown[] = [];
+    const closed: Error[] = [];
+    socket.onEvent((event) => events.push(event));
+    socket.onClose((error) => closed.push(error));
+    const subscribing = socket.subscribe();
+    // The transport is free to coalesce these; the acknowledgement must take
+    // effect before the next line in the same chunk is consumed.
+    stream.push([
+      JSON.stringify({ id: "herdr-tools-1", result: { type: "subscription_started" } }),
+      JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } }),
+      "",
+    ].join("\n"));
+    await expect(subscribing).resolves.toBeUndefined();
+    expect(events).toHaveLength(1);
+    expect(closed).toEqual([]);
+    expect(socket.isClosed()).toBe(false);
+    socket.close();
+  });
+
+  it("rejects the subscription and closes when the acknowledgement is wrong, even coalesced", async () => {
+    const stream = fakeStream();
+    const socket = new SupervisionSocket(stream, 1_000);
+    const events: unknown[] = [];
+    socket.onEvent((event) => events.push(event));
+    const subscribing = socket.subscribe();
+    stream.push([
+      JSON.stringify({ id: "herdr-tools-1", result: { type: "pong" } }),
+      JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } }),
+      "",
+    ].join("\n"));
+    await expect(subscribing).rejects.toBeInstanceOf(SupervisionProtocolError);
+    expect(events).toEqual([]);
+    expect(socket.isClosed()).toBe(true);
+    expect(socket.closure()).toBeInstanceOf(SupervisionProtocolError);
+  });
+});

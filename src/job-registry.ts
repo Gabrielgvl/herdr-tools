@@ -526,7 +526,8 @@ function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation)
         agentKind: boundedText(view.child.agentKind, PUBLIC_FIELD_BYTES),
         paneId: boundedText(view.child.paneId, PUBLIC_FIELD_BYTES),
         terminalId: boundedText(view.child.terminalId, PUBLIC_FIELD_BYTES),
-        profileName: boundedText(view.child.profileName, PUBLIC_FIELD_BYTES)
+        profileName: boundedText(view.child.profileName, PUBLIC_FIELD_BYTES),
+        ...(view.child.requestedProfileName === undefined ? {} : { requestedProfileName: boundedText(view.child.requestedProfileName, PUBLIC_FIELD_BYTES) })
       }
     }),
     ...(view.status === undefined ? {} : { status: view.status }),

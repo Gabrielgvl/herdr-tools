@@ -9,6 +9,7 @@ import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitPa
 import { boundedText, type JobOperationControl, type JobRegistry, type JobRequestSnapshot, type JobRunResult, type JobTargetError } from "../job-registry.js";
 import { createTargetGenerationRef, historicalTargetEvidence, requireWaitTargetIdentity, sameWaitTargetIdentity, type TargetEvidence, type WaitTargetIdentity } from "../wait-target-evidence.js";
 import { withoutEnvironment } from "../redaction.js";
+import { deltaLines } from "../transcript-delta.js";
 import { formatCall, resultForRender, textComponent } from "../tui.js";
 
 export interface WaitClock {
@@ -189,26 +190,6 @@ export function matches(snapshot: WaitTargetSnapshot, condition: WaitCondition, 
   }
   const safeRegex = regex ?? new RE2(condition.match.value);
   return safeRegex.test(output) || safeRegex.test(compactOutput);
-}
-
-function samePrefix(previous: string[], current: string[]): number {
-  let index = 0;
-  while (index < previous.length && index < current.length && previous[index] === current[index]) index += 1;
-  return index;
-}
-
-export function deltaLines(previous: string[], current: string[]): string[] {
-  if (previous.length === 0) return current.slice(-100);
-  if (current.length >= previous.length && previous.every((line, index) => current[index] === line)) return current.slice(previous.length, previous.length + 100);
-  let overlap = Math.min(previous.length, current.length);
-  while (overlap > 0) {
-    const priorTail = previous.slice(previous.length - overlap);
-    if (priorTail.every((line, index) => line === current[index])) return current.slice(overlap, overlap + 100);
-    overlap -= 1;
-  }
-  const prefix = samePrefix(previous, current);
-  if (prefix === current.length) return [];
-  return current.slice(Math.max(prefix, current.length - 100), current.length);
 }
 
 const COMPACT_METADATA_KEYS = ["pane_id", "tab_id", "workspace_id", "label", "agent_name", "agent", "agent_status", "cwd", "revision"] as const;

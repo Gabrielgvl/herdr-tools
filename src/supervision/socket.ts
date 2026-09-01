@@ -132,6 +132,7 @@ export class SupervisionSocket {
   private closedError: Error | undefined;
   private closed = false;
   private subscribed = false;
+  private subscriptionRequestId: string | undefined;
   private eventHandler: ((event: SupervisionSocketEvent) => void) | undefined;
   private closeHandler: ((error: Error) => void) | undefined;
 
@@ -189,8 +190,24 @@ export class SupervisionSocket {
     if (!request) return true;
     this.pending.delete(parsed.id);
     clearTimeout(request.timer);
-    if (parsed.kind === "failure") request.reject(new SupervisionRequestError(parsed.error.code, parsed.error.message));
-    else request.resolve(parsed.result);
+    if (parsed.kind === "failure") {
+      request.reject(new SupervisionRequestError(parsed.error.code, parsed.error.message));
+      return true;
+    }
+    if (parsed.id === this.subscriptionRequestId) {
+      // The acknowledgement takes effect here, not in `subscribe`'s continuation:
+      // the transport can deliver it and the first replay event in one chunk, and
+      // this loop consumes that event before any await can resume.
+      try {
+        assertSubscriptionAck(parsed.result);
+      } catch (error) {
+        request.reject(error as Error);
+        this.fail(error as Error);
+        return false;
+      }
+      this.subscribed = true;
+    }
+    request.resolve(parsed.result);
     return true;
   }
 
@@ -208,8 +225,13 @@ export class SupervisionSocket {
   }
 
   request(method: string, params: Record<string, unknown>): Promise<unknown> {
+    return this.issue(method, params);
+  }
+
+  private issue(method: string, params: Record<string, unknown>, mark?: (id: string) => void): Promise<unknown> {
     if (this.closed) return Promise.reject(this.closedError);
     const id = `herdr-tools-${++this.nextId}`;
+    mark?.(id);
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -220,10 +242,22 @@ export class SupervisionSocket {
     });
   }
 
-  /** Issue the single `events.subscribe` this connection is allowed. */
+  /**
+   * Issue the single `events.subscribe` this connection is allowed. The
+   * acknowledgement is validated and takes effect inside the ingest loop, so a
+   * chunk carrying both it and the first replay event is accepted atomically.
+   */
   async subscribe(): Promise<void> {
-    assertSubscriptionAck(await this.request("events.subscribe", subscribeParams()));
-    this.subscribed = true;
+    await this.issue("events.subscribe", subscribeParams(), (id) => { this.subscriptionRequestId = id; });
+  }
+
+  /**
+   * Why this socket closed, or undefined while it is open. A caller that must
+   * not adopt a dead connection checks this rather than a separate flag, so the
+   * reason and the state can never disagree.
+   */
+  closure(): Error | undefined {
+    return this.closedError;
   }
 
   close(): void {

@@ -18,7 +18,10 @@ export interface SupervisionChildView {
   agentKind: string;
   paneId: string;
   terminalId: string;
+  /** The profile that actually started this child. */
   profileName: string;
+  /** Present only when fallback selection changed the profile after reservation. */
+  requestedProfileName?: string;
 }
 
 export interface SupervisionMonitorView {

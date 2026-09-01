@@ -7,6 +7,7 @@ vi.mock("node:fs/promises", () => ({ readFile: readFileMock }));
 import extension, { CORE_TOOL_NAMES, createPreflight, createRuntime, notificationForJob, readInjectedContext } from "../../index.js";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
+import { SupervisionRegistry } from "../../src/supervision/registry.js";
 
 const original = {
   env: process.env.HERDR_ENV,
@@ -261,5 +262,23 @@ describe("global extension registration", () => {
     await start?.({} as never, {} as never);
     expect(reset).toHaveBeenCalledTimes(2);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+  });
+
+  it("gives every session a fresh supervision monitor so a later launch can still reserve", async () => {
+    enable();
+    const beginSession = vi.spyOn(SupervisionRegistry.prototype, "beginSession");
+    const shutdownSupervision = vi.spyOn(SupervisionRegistry.prototype, "shutdown");
+    const { pi, handlers } = fakePi();
+    extension(pi);
+    const shutdown = handlers.find((entry) => entry.event === "session_shutdown")?.handler;
+    const start = handlers.find((entry) => entry.event === "session_start")?.handler;
+    await shutdown?.({} as never, {} as never);
+    expect(shutdownSupervision).toHaveBeenCalledTimes(1);
+    // The next session must not inherit the stopped monitor: without this every
+    // later herdr_launch would refuse at supervision reservation.
+    await start?.({} as never, { modelRegistry: { find: () => undefined, getAll: () => [], getApiKeyAndHeaders: async () => ({ ok: false, error: "none" }) } } as never);
+    expect(beginSession).toHaveBeenCalledTimes(1);
+    beginSession.mockRestore();
+    shutdownSupervision.mockRestore();
   });
 });

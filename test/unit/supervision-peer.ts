@@ -11,6 +11,8 @@ export interface ScriptedServer {
   connect(): Promise<SupervisionStream>;
   push(line: string): void;
   closeSubscription(): void;
+  /** The current subscription's raw emitter, captured before it is superseded. */
+  emitter(): (line: string) => void;
   readonly requests: readonly string[];
   readonly connects: number;
 }
@@ -18,6 +20,8 @@ export interface ScriptedServer {
 export interface ScriptedServerOptions {
   /** Answers `events.subscribe` with the wrong result type. */
   failSubscribe?: boolean;
+  /** Drops the connection in the same turn it acknowledges the subscription. */
+  closeOnSubscribeAck?: boolean;
   /** Consumed in order by `session.snapshot`; the last one repeats. */
   snapshots?: unknown[];
 }
@@ -59,6 +63,7 @@ export function scriptedServer(options: ScriptedServerOptions = {}): ScriptedSer
             pushTo = onData;
             closeSubscribed = () => onClose?.();
             onData(Buffer.from(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`, "utf8"));
+            if (options.closeOnSubscribeAck) onClose?.();
           });
         },
         destroy: () => undefined,
@@ -67,6 +72,10 @@ export function scriptedServer(options: ScriptedServerOptions = {}): ScriptedSer
       };
     },
     push: (line) => pushTo?.(Buffer.from(line, "utf8")),
+    emitter: () => {
+      const captured = pushTo;
+      return (line: string) => captured?.(Buffer.from(line, "utf8"));
+    },
     closeSubscription: () => closeSubscribed?.(),
     get requests() { return requests; },
     get connects() { return connects; },

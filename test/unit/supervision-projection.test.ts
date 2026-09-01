@@ -46,7 +46,7 @@ describe("the public supervision projection", () => {
         truncatedEvents: 4,
         unobservedEvents: 2,
         reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: true, lastReviewAtMs: 9, truncatedReviews: 1, reviews: Array.from({ length: 12 }, (_, index) => ({ atMs: index, classification: "progress" as const, summary: `r-${index}` })) },
-        child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-pi" },
+        child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-claude", requestedProfileName: "worker-pi" },
         status: "working",
         settledReason: "event:pane_closed",
       }),
@@ -61,7 +61,8 @@ describe("the public supervision projection", () => {
     expect(supervision.truncatedEvents).toBe(4 + 12);
     expect(supervision.reviewer.reviews).toHaveLength(6);
     expect(supervision.reviewer).toMatchObject({ truncatedReviews: 1 + 6, degraded: true, lastReviewAtMs: 9 });
-    expect(supervision.child).toMatchObject({ paneId: "p1" });
+    // A fallback-selected profile is published beside the one that was reserved.
+    expect(supervision.child).toMatchObject({ paneId: "p1", profileName: "worker-claude", requestedProfileName: "worker-pi" });
     expect(supervision.settledReason).toBe("event:pane_closed");
     expect(projected.pending_events).toHaveLength(1);
     expect(projected.truncation).toMatchObject({ supervisionTransitions: 12, supervisionEvents: 12, supervisionReviews: 6 });

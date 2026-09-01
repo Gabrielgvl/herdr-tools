@@ -76,6 +76,13 @@ describe("the supervision reviewer", () => {
     await reviewer.review({ ...request, transcriptDelta: ["x".repeat(50_000)] }, new AbortController().signal);
     expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(16_000);
     expect(prompt).toContain("continuously working");
+
+    // The bound is advertised in bytes, so it must hold for multibyte output too.
+    await reviewer.review({ ...request, transcriptDelta: ["😀".repeat(20_000)] }, new AbortController().signal);
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(16_000);
+    expect(prompt).toContain("continuously working");
+    // No code point is split by the bound.
+    expect(Buffer.from(prompt, "utf8").toString("utf8")).toBe(prompt);
   });
 
   it("fails closed on abort, on an unusable response, and on a transport error", async () => {

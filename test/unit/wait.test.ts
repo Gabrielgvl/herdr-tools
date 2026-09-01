@@ -3,9 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { CliProtocolError } from "../../src/cli.js";
 import { ReviewerFailure, type WaitReviewer } from "../../src/reviewer.js";
 import { createJobsTool } from "../../src/tools/jobs.js";
-import { WaitError, boundedBackgroundDetails, createWaitTool, deltaLines, deriveWaitLabel, errorCode, linkedSignal, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, runPreparedWait, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
+import { WaitError, boundedBackgroundDetails, createWaitTool, deriveWaitLabel, errorCode, linkedSignal, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, runPreparedWait, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
 import { JobRegistry } from "../../src/job-registry.js";
 import { createTargetGenerationRef, historicalTargetEvidence, isTargetEvidence, requireWaitTargetIdentity, sameWaitTargetIdentity } from "../../src/wait-target-evidence.js";
+import { deltaLines } from "../../src/transcript-delta.js";
 
 const snapshot = {
   type: "session_snapshot",

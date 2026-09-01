@@ -3091,6 +3091,25 @@ describe("herdr_launch automatic child supervision", () => {
     expect(supervision.released).toEqual(["launch_failed_supervision_bind"]);
   });
 
+  it("binds the profile that actually started the child after a fallback", async () => {
+    const supervision = stubSupervision();
+    const first = profile("primary", "pi", ["fallback"]);
+    const second = profile("fallback", "claude");
+    const result = await launch({ name: "worker", profile: "primary" }, catalog(first, second), makeCli({
+      paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }],
+      start: (_argv, attempt) => {
+        if (attempt === 0) throw startFailure();
+        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } } });
+      }
+    }).cli, undefined, { supervision });
+    // The reservation names the requested root, because it is taken before the
+    // fallback chain runs; the binding names the profile that actually started.
+    expect(supervision.reserved).toEqual([{ agentName: "worker", agentKind: "pi", profileName: "primary" }]);
+    expect(supervision.bound[0]!.profileName).toBe("fallback");
+    expect(supervision.bound[0]!.identity.agentKind).toBe("claude");
+    expect(result.details).toMatchObject({ profile: { selected: "fallback" }, supervision: { child: { profileName: "fallback", agentKind: "claude" } } });
+  });
+
   it("releases the reservation when the launch fails after reserving", async () => {
     const supervision = stubSupervision();
     const harness = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 2, killed: false }); } });

@@ -84,10 +84,25 @@ export interface SupervisionSocketFailure {
   error: { code: string; message: string };
 }
 
+/**
+ * An event validated at the protocol boundary.
+ *
+ * Every accepted event carries the pane it concerns and, for a `PaneInfo`-bearing
+ * kind, the whole validated record. A known kind whose own fields are malformed
+ * is refused rather than accepted and routed nowhere: silently dropping it would
+ * lose lifecycle evidence without degrading the monitor, which is exactly the
+ * failure the fail-closed contract exists to prevent.
+ */
 export interface SupervisionSocketEvent {
   kind: "event";
   event: SupervisionEventKind;
   data: Record<string, unknown>;
+  /** The pane this event concerns. Always usable. */
+  paneId: string;
+  /** Present for `PANE_RECORD_EVENT_KINDS`; validated at the boundary. */
+  pane?: SupervisionPaneRecord;
+  /** Present for `pane_moved`; validated at the boundary. */
+  previousPaneId?: string;
 }
 
 /** A line that parsed but carries an event kind outside the accepted set. */
@@ -166,23 +181,21 @@ export function parsePaneRecord(value: unknown): SupervisionPaneRecord {
   };
 }
 
-/** Read the pane record an event of a `PANE_RECORD_EVENT_KINDS` kind carries. */
-export function eventPaneRecord(event: SupervisionSocketEvent): SupervisionPaneRecord {
-  return parsePaneRecord(event.data.pane);
-}
-
-/** Read the pane id a thin event carries. */
-export function eventPaneId(event: SupervisionSocketEvent): string {
-  return requiredString(event.data.pane_id, "pane_id");
-}
-
-/** Read the previous pane id an atomic `pane_moved` event must carry. */
-export function movePreviousPaneId(event: SupervisionSocketEvent): string {
-  return requiredString(event.data.previous_pane_id, "previous_pane_id");
-}
-
 export function isPaneRecordEvent(kind: SupervisionEventKind): boolean {
   return (PANE_RECORD_EVENT_KINDS as readonly string[]).includes(kind);
+}
+
+/**
+ * Validate one accepted event's own fields. A `PaneInfo`-bearing kind must carry
+ * a complete pane record, `pane_moved` must additionally be atomic, and a thin
+ * kind must carry a usable pane id.
+ */
+function validateEvent(event: SupervisionEventKind, data: Record<string, unknown>): Omit<SupervisionSocketEvent, "kind" | "event" | "data"> {
+  if (data.type !== event) throw new SupervisionProtocolError("Herdr socket event type does not match its kind", { event });
+  if (!isPaneRecordEvent(event)) return { paneId: requiredString(data.pane_id, "pane_id") };
+  const pane = parsePaneRecord(data.pane);
+  if (event !== "pane_moved") return { paneId: pane.paneId, pane };
+  return { paneId: pane.paneId, pane, previousPaneId: requiredString(data.previous_pane_id, "previous_pane_id") };
 }
 
 /**
@@ -215,7 +228,8 @@ export function parseSocketLine(line: string): SupervisionSocketLine {
   const event = requiredString(parsed.event, "event");
   if (!record(parsed.data)) throw new SupervisionProtocolError("Herdr socket event data is malformed", { event });
   if (!(SUPERVISION_EVENT_KINDS as readonly string[]).includes(event)) return { kind: "ignored" };
-  return { kind: "event", event: event as SupervisionEventKind, data: parsed.data };
+  const kind = event as SupervisionEventKind;
+  return { kind: "event", event: kind, data: parsed.data, ...validateEvent(kind, parsed.data) };
 }
 
 /** The acknowledgement `events.subscribe` must return before any event is accepted. */

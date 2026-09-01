@@ -59,7 +59,7 @@ describe("the Pi host supervision wiring", () => {
     runtime.bindModelRegistry({ find: () => undefined, getAll: () => [], getApiKeyAndHeaders: async () => ({ ok: false, error: "no credential" }) });
 
     const reservation = await runtime.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity });
+    await reservation.bind({ identity, profileName: "worker-pi" });
     expect(runtime.jobs.get(reservation.jobId)).toMatchObject({ kind: "supervisor", supervision: { state: "active" } });
 
     socket.push(paneUpdated("blocked", 4));
@@ -100,7 +100,7 @@ describe("the MCP host supervision wiring", () => {
       expect((server!.server as unknown as { _capabilities: Record<string, unknown> })._capabilities).toMatchObject({ experimental: { "claude/channel": {} }, tools: {} });
 
       const reservation = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-      await reservation.bind({ identity });
+      await reservation.bind({ identity, profileName: "worker-pi" });
       socket.push(paneUpdated("blocked", 4));
       await vi.waitFor(() => expect(notifications.some((message) => message.method === "notifications/claude/channel")).toBe(true));
       await server!.shutdown();

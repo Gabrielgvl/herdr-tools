@@ -43,7 +43,12 @@ export interface SupervisionRegistryDependencies {
   settingsLoader: () => Promise<Settings>;
   readTranscript: SupervisionTranscriptReader;
   notifier?: ManagerNotifier;
-  monitor?: SessionEventMonitor;
+  /**
+   * Builds this session's event monitor. A stopped monitor stays stopped, so a
+   * new manager session gets a genuinely new one rather than a revived
+   * connection that could outlive the session it belonged to.
+   */
+  monitorFactory?: () => SessionEventMonitor;
   monitorOptions?: SupervisionMonitorDependencies;
   /**
    * Resolved lazily: the Pi host only learns its model registry when a session
@@ -96,12 +101,14 @@ function deferred<T>(): Deferred<T> {
 }
 
 export class SupervisionRegistry implements SupervisionCoordinator {
-  private readonly monitor: SessionEventMonitor;
+  private readonly newMonitor: () => SessionEventMonitor;
+  private monitor: SessionEventMonitor;
   private readonly notifier: ManagerNotifier;
   private readonly supervisors = new Set<Supervisor>();
 
   constructor(private readonly deps: SupervisionRegistryDependencies) {
-    this.monitor = deps.monitor ?? new SessionEventMonitor(deps.monitorOptions ?? {});
+    this.newMonitor = deps.monitorFactory ?? (() => new SessionEventMonitor(deps.monitorOptions ?? {}));
+    this.monitor = this.newMonitor();
     this.notifier = deps.notifier ?? inertNotifier;
   }
 
@@ -117,7 +124,10 @@ export class SupervisionRegistry implements SupervisionCoordinator {
    * launch has a stable job ID to return.
    */
   async reserve(request: SupervisionReserveRequest, generation?: JobGeneration): Promise<SupervisionReservation> {
-    await this.monitor.ensureStarted();
+    // Captured once: a session restart replaces the monitor, and this
+    // reservation belongs to the session it started in.
+    const monitor = this.monitor;
+    await monitor.ensureStarted();
     const settings = await this.deps.settingsLoader();
     const jobRequest: SupervisorJobRequestSnapshot = {
       kind: "supervisor",
@@ -138,7 +148,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       const supervisor = new Supervisor({
         jobId: identity.jobId,
         child: { ...request.child },
-        monitor: this.monitor,
+        monitor,
         notifier: this.notifier,
         reviewer: this.reviewer(),
         cadenceMs: settings.reviewCadenceMinutes * 60_000,
@@ -171,5 +181,16 @@ export class SupervisionRegistry implements SupervisionCoordinator {
     for (const supervisor of [...this.supervisors]) supervisor.shutdown();
     this.supervisors.clear();
     this.monitor.stop();
+  }
+
+  /**
+   * Start a new manager session. Supervision is session-scoped, so the previous
+   * session's supervisors and monitor are stopped and a fresh monitor replaces
+   * them. Without this a post-shutdown session would keep a permanently stopped
+   * monitor and every later launch would refuse at reservation.
+   */
+  beginSession(): void {
+    this.shutdown();
+    this.monitor = this.newMonitor();
   }
 }

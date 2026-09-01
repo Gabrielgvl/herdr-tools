@@ -35,7 +35,7 @@ function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[
     settingsLoader: async () => settings,
     readTranscript: async () => ["line"],
     notifier,
-    monitor: new SessionEventMonitor({ connect: () => server.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
+    monitorFactory: () => new SessionEventMonitor({ connect: () => server.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
     ...(options.reviewer ? { reviewerFactory: () => options.reviewer! } : {}),
     scheduler: { setTimer: () => "timer", clearTimer: () => undefined },
     idFactory: (() => { let id = 0; return () => `fixture-${++id}`; })(),
@@ -65,7 +65,7 @@ describe("the supervision registry", () => {
   it("binds, publishes a live view, and settles when the exact child goes away", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity, stateChangeSeq: 2 });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2 });
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ kind: "supervisor", supervision: { state: "active", status: "working", child: { paneId: "p1" } } });
 
     f.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
@@ -78,7 +78,7 @@ describe("the supervision registry", () => {
   it("refuses herdr_jobs cancel while the exact child is live and allows it afterwards", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity });
+    await reservation.bind({ identity, profileName: "worker-pi" });
     const tool = createJobsTool(f.jobs);
     await expect(tool.execute("id", { operation: "cancel", jobId: reservation.jobId } as never, undefined, undefined, {} as never)).rejects.toBeInstanceOf(SupervisionActiveError);
     await expect(f.jobs.cancel(reservation.jobId)).rejects.toMatchObject({ code: "SUPERVISION_ACTIVE" });
@@ -92,7 +92,7 @@ describe("the supervision registry", () => {
   it("returns soft receipts through herdr_jobs get and counts them in list", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane])] });
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity });
+    await reservation.bind({ identity, profileName: "worker-pi" });
     f.push(`${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { ...pane, agent_status: "blocked", revision: 4 } } })}\n`);
     await vi_waitFor(() => (f.jobs.get(reservation.jobId)?.unobservedEvents ?? 0) > 0);
 
@@ -120,7 +120,7 @@ describe("the supervision registry", () => {
   it("cancels every supervisor on manager-session shutdown", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane])] });
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity });
+    await reservation.bind({ identity, profileName: "worker-pi" });
     f.supervision.shutdown();
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ supervision_result: "cancelled", supervision_reason: "manager_session_shutdown" });

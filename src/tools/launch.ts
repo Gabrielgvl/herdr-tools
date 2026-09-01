@@ -1834,7 +1834,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         progress(onUpdate, phase, created);
         const stateChangeSeq = ready.baseline?.stateChangeSeq ?? readinessStateChangeSeq(ready.agent);
         try {
-          await reservation!.bind({ identity: capturedIdentity, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) });
+          // The selected profile, not the one reserved before the fallback chain ran.
+          await reservation!.bind({ identity: capturedIdentity, profileName: chosenProfile.name, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) });
         } catch (error) {
           if (!(error instanceof SupervisionBindError)) throw error;
           // Partial effect: the child exists and may already be working. Nothing

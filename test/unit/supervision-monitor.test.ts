@@ -83,7 +83,7 @@ describe("the session event monitor", () => {
     peer.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p2", workspace_id: "w1" } })}\n`);
     peer.push(`${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { pane_id: "p1", terminal_id: "t1", tab_id: "tab", workspace_id: "w1", agent_status: "idle", revision: 2 } } })}\n`);
     peer.push(`${JSON.stringify({ event: "pane_moved", data: { type: "pane_moved", previous_pane_id: "p1", previous_tab_id: "tab", previous_workspace_id: "w1", pane: { pane_id: "p5", terminal_id: "t1", tab_id: "tab2", workspace_id: "w1", agent_status: "idle", revision: 3 } } })}\n`);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(watcher.events).toHaveLength(3));
 
     expect(watcher.events.map((event) => event.event)).toEqual(["pane_closed", "pane_updated", "pane_moved"]);
     expect(bystander.events).toHaveLength(0);
@@ -156,5 +156,97 @@ describe("the session event monitor", () => {
     const settled = attempts;
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(attempts).toBe(settled);
+  });
+});
+
+describe("stream ordering and dead-socket refusal", () => {
+  it("delivers events strictly in stream order even when one suspends", async () => {
+    const peer = scriptedServer();
+    const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let seen = 0;
+    monitor.addObserver({
+      matches: () => true,
+      onEvent: async (event, ordinal) => {
+        order.push(`start:${event.event}:${ordinal}`);
+        // The first event suspends, exactly as a reconciliation snapshot does.
+        if (++seen === 1) await firstBlocked;
+        order.push(`end:${event.event}:${ordinal}`);
+      },
+      onBootstrap: async () => undefined,
+      onMonitorDegraded: () => undefined,
+      onMonitorRecovered: () => undefined,
+    });
+    await monitor.ensureStarted();
+
+    peer.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
+    peer.push(`${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { pane_id: "p1", terminal_id: "t1", tab_id: "tab", workspace_id: "w1", agent_status: "idle", revision: 2 } } })}\n`);
+    await vi.waitFor(() => expect(order).toEqual(["start:pane_closed:1"]));
+    // The later full update cannot overtake the suspended thin event.
+    releaseFirst();
+    await vi.waitFor(() => expect(order).toHaveLength(4));
+    expect(order).toEqual(["start:pane_closed:1", "end:pane_closed:1", "start:pane_updated:2", "end:pane_updated:2"]);
+    monitor.stop();
+  });
+
+  it("counts ordinals over every accepted event, not only routed ones", async () => {
+    const peer = scriptedServer();
+    const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
+    const ordinals: number[] = [];
+    monitor.addObserver({
+      matches: (paneId) => paneId === "p2",
+      onEvent: async (_event, ordinal) => { ordinals.push(ordinal); },
+      onBootstrap: async () => undefined,
+      onMonitorDegraded: () => undefined,
+      onMonitorRecovered: () => undefined,
+    });
+    await monitor.ensureStarted();
+    for (const paneId of ["p1", "p2", "p1", "p2"]) {
+      peer.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: paneId, workspace_id: "w1" } })}\n`);
+    }
+    await vi.waitFor(() => expect(ordinals).toHaveLength(2));
+    // Ordinal 2 and 4: the log position, not this observer's own count.
+    expect(ordinals).toEqual([2, 4]);
+    monitor.stop();
+  });
+
+  it("survives an observer that throws without breaking the ordered chain", async () => {
+    const peer = scriptedServer();
+    const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
+    const seen: number[] = [];
+    monitor.addObserver({
+      matches: () => true,
+      onEvent: async (_event, ordinal) => {
+        seen.push(ordinal);
+        // A throwing observer must not break the ordered dispatch chain.
+        if (seen.length === 1) throw new Error("observer failed");
+      },
+      onBootstrap: async () => undefined,
+      onMonitorDegraded: () => undefined,
+      onMonitorRecovered: () => undefined,
+    });
+    await monitor.ensureStarted();
+    const closed = `${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`;
+    peer.push(closed);
+    peer.push(closed);
+    await vi.waitFor(() => expect(seen).toEqual([1, 2]));
+
+    // A superseded connection cannot emit: it is closed before it is replaced.
+    const superseded = peer.emitter();
+    peer.closeSubscription();
+    await vi.waitFor(() => expect(peer.connects).toBeGreaterThan(2));
+    superseded(closed);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(seen).toEqual([1, 2]);
+    monitor.stop();
+  });
+
+  it("refuses to adopt a subscription whose socket died before adoption", async () => {
+    const peer = scriptedServer({ closeOnSubscribeAck: true });
+    const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
+    await expect(monitor.ensureStarted()).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
+    monitor.stop();
   });
 });

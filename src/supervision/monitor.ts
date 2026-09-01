@@ -43,8 +43,13 @@ export const realMonitorClock: MonitorClock = {
 export interface SupervisionObserver {
   /** True when this observer is currently bound to the given pane id. */
   matches(paneId: string): boolean;
-  /** One stream event for a pane this observer matched. */
-  onEvent(event: SupervisionSocketEvent, generation: number): Promise<void>;
+  /**
+   * One stream event for a pane this observer matched, with its ordinal in this
+   * connection's event stream. The replay is deterministic and the ordinal counts
+   * every accepted event rather than only routed ones, so ordinal `n` names the
+   * same log entry on every connection regardless of which pane it concerns.
+   */
+  onEvent(event: SupervisionSocketEvent, ordinal: number): Promise<void>;
   /** A fresh bootstrap. `reconnected` is false only for the very first one. */
   onBootstrap(snapshot: HerdrSnapshot, generation: number, reconnected: boolean): Promise<void>;
   /** The monitor lost its connection and could not immediately restore it. */
@@ -82,6 +87,12 @@ export class SessionEventMonitor {
   private readonly observers = new Set<SupervisionObserver>();
   private socket: SupervisionSocket | undefined;
   private starting: Promise<HerdrSnapshot> | undefined;
+  /**
+   * Socket events are delivered to observers strictly in stream order. Without
+   * this, a thin event awaiting a reconciliation snapshot could be overtaken by a
+   * later full update and then apply its older snapshot on top of it.
+   */
+  private dispatchTail: Promise<void> = Promise.resolve();
   private generationValue = 0;
   private degraded = false;
   private stopped = false;
@@ -121,11 +132,11 @@ export class SessionEventMonitor {
   async ensureStarted(): Promise<void> {
     if (this.stopped) throw new SupervisionSocketError("SUPERVISION_SOCKET_CLOSED", "The supervision monitor has been shut down");
     if (this.socket && !this.socket.isClosed()) return;
-    this.starting ??= this.bootstrap().finally(() => { this.starting = undefined; });
+    this.starting ??= this.bootstrap(false).finally(() => { this.starting = undefined; });
     await this.starting;
   }
 
-  private async bootstrap(): Promise<HerdrSnapshot> {
+  private async bootstrap(reconnected: boolean, recovered = false): Promise<HerdrSnapshot> {
     const snapshot = await this.snapshot();
     const socket = new SupervisionSocket(await this.connect(resolveSocketPath(this.env)), this.requestTimeoutMs);
     try {
@@ -134,11 +145,32 @@ export class SessionEventMonitor {
       socket.close();
       throw error;
     }
+    // A socket that died between the acknowledgement and adoption is never
+    // adopted: keeping it would leave supervision reporting an active
+    // subscription that can never deliver another event.
+    const closure = socket.closure();
+    if (closure) throw closure;
     this.socket = socket;
     this.generationValue += 1;
-    socket.onEvent((event) => { void this.dispatch(event); });
+    // The ordinal counter belongs to this connection, so a later connection
+    // restarts counting without disturbing work already queued from this one.
+    // A superseded socket cannot emit: it is always closed before it is replaced.
+    const stream = { ordinal: 0 };
+    socket.onEvent((event) => {
+      const ordinal = ++stream.ordinal;
+      this.enqueue(() => this.dispatch(event, ordinal));
+    });
     socket.onClose(() => { void this.onSocketClosed(); });
+    if (reconnected) {
+      const generation = this.generationValue;
+      this.enqueue(() => this.announce(snapshot, generation, recovered));
+    }
     return snapshot;
+  }
+
+  /** Append one ordered unit of observer work to the single dispatch chain. */
+  private enqueue(work: () => Promise<void>): void {
+    this.dispatchTail = this.dispatchTail.then(work).catch(() => undefined);
   }
 
   /**
@@ -155,17 +187,20 @@ export class SessionEventMonitor {
     }
   }
 
-  private async dispatch(event: SupervisionSocketEvent): Promise<void> {
-    const paneId = typeof event.data.pane_id === "string"
-      ? event.data.pane_id
-      : typeof (event.data.pane as { pane_id?: unknown } | undefined)?.pane_id === "string"
-        ? (event.data.pane as { pane_id: string }).pane_id
-        : undefined;
-    const previousPaneId = typeof event.data.previous_pane_id === "string" ? event.data.previous_pane_id : undefined;
-    const generation = this.generationValue;
+  private async dispatch(event: SupervisionSocketEvent, ordinal: number): Promise<void> {
+    // Both identifiers are validated at the protocol boundary, so an accepted
+    // event always names the pane it concerns.
     for (const observer of [...this.observers]) {
-      if (!(paneId !== undefined && observer.matches(paneId)) && !(previousPaneId !== undefined && observer.matches(previousPaneId))) continue;
-      await observer.onEvent(event, generation);
+      if (!observer.matches(event.paneId) && !(event.previousPaneId !== undefined && observer.matches(event.previousPaneId))) continue;
+      await observer.onEvent(event, ordinal);
+    }
+  }
+
+  /** Recovery is reported before the bootstrap it recovered into. */
+  private async announce(snapshot: HerdrSnapshot, generation: number, recovered: boolean): Promise<void> {
+    for (const observer of [...this.observers]) {
+      if (recovered) observer.onMonitorRecovered();
+      await observer.onBootstrap(snapshot, generation, true);
     }
   }
 
@@ -176,15 +211,11 @@ export class SessionEventMonitor {
     let attempt = 0;
     while (!this.stopped) {
       try {
-        const snapshot = await this.bootstrap();
-        const generation = this.generationValue;
-        const recovered = this.degraded;
+        // Bootstrap enqueues its own announcement, so recovery and the bootstrap
+        // are ordered ahead of every event the new connection delivers.
+        await this.bootstrap(true, this.degraded);
         this.degraded = false;
         this.reconnecting = false;
-        for (const observer of [...this.observers]) {
-          if (recovered) observer.onMonitorRecovered();
-          await observer.onBootstrap(snapshot, generation, true);
-        }
         return;
       } catch (error) {
         if (!this.degraded) {

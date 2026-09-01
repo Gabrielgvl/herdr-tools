@@ -22,6 +22,25 @@ export const SUPERVISION_REVIEWER_MAX_TOKENS = 512;
 
 const MAX_PROMPT_BYTES = 16_000;
 
+/**
+ * Bound the prompt by UTF-8 bytes, not by UTF-16 code units. A pane transcript is
+ * arbitrary terminal output, so a character slice against a byte budget can emit
+ * a request several times the advertised size. The head is kept: the instructions
+ * come first and must survive.
+ */
+function boundedPromptBytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let kept = "";
+  let size = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (size + characterBytes > maxBytes) break;
+    kept += character;
+    size += characterBytes;
+  }
+  return kept;
+}
+
 /** Classifications that wake the manager while the supervisor stays active. */
 export const SUPERVISION_ATTENTION_CLASSIFICATIONS = ["stalled", "blocked", "risk", "appears_complete", "unknown"] as const;
 
@@ -47,7 +66,7 @@ export interface SupervisionReviewer {
 }
 
 function promptFor(request: SupervisionReviewRequest): string {
-  return [
+  const prompt = [
     "You supervise one Herdr child agent that has been continuously working with no state change.",
     "Judge only from the supplied evidence whether it is genuinely progressing.",
     "Return exactly one JSON object with only these keys: classification and summary.",
@@ -59,7 +78,8 @@ function promptFor(request: SupervisionReviewRequest): string {
       metadata: request.metadata,
       transcriptDelta: request.transcriptDelta,
     }),
-  ].join("\n").slice(0, MAX_PROMPT_BYTES);
+  ].join("\n");
+  return boundedPromptBytes(prompt, MAX_PROMPT_BYTES);
 }
 
 export class ModelSupervisionReviewer implements SupervisionReviewer {

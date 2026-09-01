@@ -167,6 +167,10 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
   });
   pi.on("session_start", async (_event, context) => {
     runtime.bindModelRegistry(context.modelRegistry);
+    // Supervision is session-scoped: the previous session's supervisors and
+    // event connection are stopped and a fresh monitor replaces them, so a
+    // session that follows a shutdown can still launch.
+    runtime.supervision.beginSession();
     runtime.jobs.beginSession();
     runtime.waitJobsUi.beginSession(context);
     runtime.recipients.reset();

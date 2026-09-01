@@ -1,10 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assertSubscriptionAck,
-  eventPaneId,
-  eventPaneRecord,
   isPaneRecordEvent,
-  movePreviousPaneId,
   parseAgentSession,
   parsePaneRecord,
   parseSocketLine,
@@ -27,10 +24,6 @@ const pane = {
   agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" },
   label: "worker",
 };
-
-function event(kind: string, data: Record<string, unknown>): SupervisionSocketEvent {
-  return { kind: "event", event: kind as SupervisionSocketEvent["event"], data };
-}
 
 describe("supervision socket protocol", () => {
   it("publishes exactly the fixed global subscription set", () => {
@@ -82,14 +75,32 @@ describe("supervision socket protocol", () => {
     expect(() => parseAgentSession("nope")).toThrow(/agent session is malformed/u);
   });
 
-  it("reads the fields each event kind carries", () => {
+  it("validates each known event kind's own fields and refuses the malformed ones", () => {
     expect(isPaneRecordEvent("pane_updated")).toBe(true);
     expect(isPaneRecordEvent("pane_closed")).toBe(false);
-    expect(eventPaneRecord(event("pane_updated", { pane }))).toMatchObject({ paneId: "p1" });
-    expect(eventPaneId(event("pane_closed", { pane_id: "p1" }))).toBe("p1");
-    expect(() => eventPaneId(event("pane_closed", {}))).toThrow(/usable identifier/u);
-    expect(movePreviousPaneId(event("pane_moved", { previous_pane_id: "p0", pane }))).toBe("p0");
-    expect(() => movePreviousPaneId(event("pane_moved", { pane }))).toThrow(/usable identifier/u);
+
+    const accepted = (data: Record<string, unknown>): SupervisionSocketEvent =>
+      parseSocketLine(JSON.stringify({ event: data.type, data })) as SupervisionSocketEvent;
+    expect(accepted({ type: "pane_updated", pane })).toMatchObject({ paneId: "p1", pane: { paneId: "p1", revision: 7 } });
+    expect(accepted({ type: "pane_closed", pane_id: "p1", workspace_id: "w1" })).toMatchObject({ paneId: "p1" });
+    expect(accepted({ type: "pane_moved", previous_pane_id: "p0", pane })).toMatchObject({ paneId: "p1", previousPaneId: "p0" });
+
+    // A known kind whose own fields are unusable is refused rather than accepted
+    // and routed to no observer.
+    const refusals: Array<[Record<string, unknown>, string]> = [
+      [{ type: "pane_updated", pane: { revision: 1 } }, "usable identifier"],
+      [{ type: "pane_updated" }, "pane record is malformed"],
+      [{ type: "pane_closed", workspace_id: "w1" }, "usable identifier"],
+      [{ type: "pane_exited", pane_id: "" }, "usable identifier"],
+      [{ type: "pane_agent_detected", pane_id: 7 }, "usable identifier"],
+      [{ type: "pane_moved", pane }, "usable identifier"],
+      [{ type: "pane_updated", pane, extra: 1 }, "does not match its kind"],
+    ];
+    for (const [data, fragment] of refusals) {
+      const event = data.extra === undefined ? data.type : "pane_closed";
+      expect(() => parseSocketLine(JSON.stringify({ event, data })), JSON.stringify(data)).toThrow(new RegExp(fragment, "u"));
+      expect(() => parseSocketLine(JSON.stringify({ event, data }))).toThrow(SupervisionProtocolError);
+    }
   });
 
   it("requires the subscription acknowledgement before any event", () => {

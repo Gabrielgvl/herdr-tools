@@ -29,6 +29,19 @@ Read every inbound `[HERDR AGENT MESSAGE v1]` envelope before acting on its payl
 
 `herdr_inspect` accepts exclusive shapes: `{}`, `{"mode":"context"}`, `{"mode":"health"}`, `{"mode":"target","target":"..."}`, or `{"mode":"collection","collection":"panes|agents|tabs|profiles"}`. Mixing fields across modes, such as `{"mode":"context","collection":"panes"}`, is rejected as `INVALID_INPUT`; the published schema and the server enforce the same rule, so a rejection means the argument was wrong, not that the server is stricter than advertised.
 
+## Oracle review protocol
+
+Treat Oracle as a second-model evidence lane, not as owner authority. Managers do not run a long browser invocation in the manager pane; launch a visible worker with the Oracle task, exact files, timeout, and requested effort, then supervise it through Herdr.
+
+- Default browser review: `--engine browser --model gpt-5.6-sol --browser-thinking-time extra-high --timeout 10m`. Extra High is not Pro and must never be reported as Pro.
+- Explicit browser Pro: use `--model gpt-5.6-sol --browser-thinking-time pro` only when the assignment or owner explicitly requires Pro. Never invent a `GPT-5.6 Sol Pro` model ID and never silently downgrade a Pro request to Extra High.
+- A browser Pro claim requires fresh fail-closed evidence before submission: verified model label `GPT-5.6 Sol`, requested effort `pro`, and an exact selected `Pro` announcement. English `Pro, 5 of 5` and Portuguese `Pro, 5 de 5` qualify only because the label is exactly `Pro`; numeric position alone does not.
+- `selection-unverified`, ambiguous/malformed picker evidence, authentication loss, or model mismatch is a blocker. Do not retry unchanged, infer Pro from a fifth slider position, click `Answer now`, submit anyway, or claim that the run was Pro.
+- Recover an existing run with `oracle status` and `oracle session <id> --render` rather than resubmitting an ambiguous prompt. The remote host permits three active browser tabs by default; a fourth run may wait for a lease and is not necessarily hung.
+- API Pro (`--engine api --model gpt-5.6-sol --reasoning-mode pro --reasoning-effort max`) is a separately billed path and requires explicit authority for that external spend. A manager cannot infer that authority from a failed browser run.
+
+In the final synthesis, distinguish `requested`, `verified before submission`, and `completed`. A completed answer without exact pre-submit Pro evidence is not a verified Pro answer.
+
 ## Automatic child supervision
 
 Every successful `herdr_launch` creates a supervisor for that exact child and returns its stable job ID in the result content and details. This is not optional and there is no tool for it: supervision is a first-class `kind: "supervisor"` job in the same `herdr_jobs` registry as waits. Record the job ID with the child's pane ID. A launch that reports `SUPERVISION_UNAVAILABLE` did nothing at all and can be retried after the blocker is fixed. A launch that reports `SUPERVISION_UNCONFIRMED` left a real child running unwatched: do not relaunch it, do not reuse its pane, inspect it with `herdr_inspect`, and report the unsupervised child.

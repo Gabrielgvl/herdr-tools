@@ -10,7 +10,7 @@ import type { ReconciliationFailureReason } from "../../src/supervision/events.j
 import { emptySnapshotResult, scriptedServer } from "./supervision-peer.js";
 import type { SupervisionStream } from "../../src/supervision/socket.js";
 import type { SupervisionSocketEvent } from "../../src/supervision/protocol.js";
-import type { HerdrSnapshot } from "../../src/targets.js";
+import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 
 function observer(paneId: string) {
   const events: SupervisionSocketEvent[] = [];
@@ -61,6 +61,14 @@ class ManualMonitorScheduler implements MonitorScheduler {
     const timer = this.timers.find((candidate) => candidate.active);
     if (!timer) throw new Error("no monitor timer is armed");
     timer.active = false;
+    timer.callback();
+  }
+
+  fireNextTwice(): void {
+    const timer = this.timers.find((candidate) => candidate.active);
+    if (!timer) throw new Error("no monitor timer is armed");
+    timer.active = false;
+    timer.callback();
     timer.callback();
   }
 }
@@ -170,6 +178,82 @@ describe("the session event monitor", () => {
     expect(scheduler.pendingDelays()).toEqual([]);
   });
 
+  it("ignores stopped, stale, and incomplete periodic timer state", async () => {
+    const stopped = new SessionEventMonitor({ connect: () => scriptedServer().connect(), env, clock: instantClock });
+    const stoppedInternals = stopped as unknown as { armPeriodicReconciliation(epoch: number): void };
+    stopped.stop();
+    expect(() => stoppedInternals.armPeriodicReconciliation(0)).not.toThrow();
+
+    const scheduler = new ManualMonitorScheduler();
+    const active = new SessionEventMonitor({
+      connect: () => scriptedServer().connect(),
+      env,
+      clock: instantClock,
+      scheduler,
+    });
+    active.addObserver(observer("p1"));
+    const activeInternals = active as unknown as {
+      armPeriodicReconciliation(epoch: number): void;
+      runPeriodicReconciliation(epoch: number, dueAt: number): Promise<void>;
+      reconciliationNextDueAt: number | undefined;
+      reconciliationTimer: unknown;
+    };
+    const timer = activeInternals.reconciliationTimer;
+    activeInternals.reconciliationTimer = undefined;
+    activeInternals.reconciliationNextDueAt = undefined;
+    expect(() => activeInternals.armPeriodicReconciliation(1)).not.toThrow();
+    activeInternals.reconciliationTimer = timer;
+    await activeInternals.runPeriodicReconciliation(0, 30_000);
+    active.stop();
+  });
+
+  it("rolls an overdue due time forward before arming the timer", () => {
+    let clockReads = 0;
+    const scheduler = new ManualMonitorScheduler();
+    const monitor = new SessionEventMonitor({
+      connect: () => scriptedServer().connect(),
+      env,
+      clock: {
+        now: () => clockReads++ === 0 ? 0 : SUPERVISION_RECONCILIATION_INTERVAL_MS + 1,
+        sleep: async () => undefined,
+      },
+      scheduler,
+    });
+    monitor.addObserver(observer("p1"));
+    expect(scheduler.pendingDelays()).toEqual([SUPERVISION_RECONCILIATION_INTERVAL_MS - 1]);
+    monitor.stop();
+  });
+
+  it("does not start a second periodic read while one is in flight", async () => {
+    let now = 0;
+    let releaseConnect!: () => void;
+    const heldConnect = new Promise<void>((resolve) => { releaseConnect = resolve; });
+    const scheduler = new ManualMonitorScheduler();
+    const peer = scriptedServer();
+    const connect = vi.fn(async () => {
+      if (connect.mock.calls.length === 3) await heldConnect;
+      return peer.connect();
+    });
+    const monitor = new SessionEventMonitor({
+      connect,
+      env,
+      clock: { now: () => now, sleep: async () => undefined },
+      scheduler,
+    });
+    const watcher = observer("p1");
+    monitor.addObserver(watcher);
+    await monitor.ensureStarted();
+
+    now = SUPERVISION_RECONCILIATION_INTERVAL_MS;
+    scheduler.fireNextTwice();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(3));
+    expect(scheduler.pendingDelays()).toEqual([SUPERVISION_RECONCILIATION_INTERVAL_MS]);
+    releaseConnect();
+    await vi.waitFor(() => expect(watcher.reconciliations).toHaveLength(1));
+    expect(connect).toHaveBeenCalledTimes(3);
+    monitor.stop();
+  });
+
   it("reports fixed shared-attempt failures without leaking causes and recovers on a valid snapshot", async () => {
     let now = 0;
     const scheduler = new ManualMonitorScheduler();
@@ -203,6 +287,96 @@ describe("the session event monitor", () => {
     monitor.stop();
   });
 
+  it("drops periodic results after observers are removed during a read", async () => {
+    let releaseConnect!: () => void;
+    const heldConnect = new Promise<void>((resolve) => { releaseConnect = resolve; });
+    const scheduler = new ManualMonitorScheduler();
+    const peer = scriptedServer();
+    const connect = vi.fn(async () => {
+      if (connect.mock.calls.length === 3) await heldConnect;
+      return peer.connect();
+    });
+    const monitor = new SessionEventMonitor({
+      connect,
+      env,
+      clock: { now: () => 0, sleep: async () => undefined },
+      scheduler,
+    });
+    const watcher = observer("p1");
+    monitor.addObserver(watcher);
+    await monitor.ensureStarted();
+
+    scheduler.fireNext();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(3));
+    monitor.removeObserver(watcher);
+    releaseConnect();
+    await vi.waitFor(() => expect(peer.requests.filter((request) => request === "session.snapshot")).toHaveLength(2));
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    expect(watcher.reconciliations).toEqual([]);
+    monitor.stop();
+  });
+
+  it("drops stale reconciliation deliveries and tolerates observers without hooks", async () => {
+    const scheduler = new ManualMonitorScheduler();
+    const monitor = new SessionEventMonitor({
+      connect: () => scriptedServer().connect(),
+      env,
+      clock: instantClock,
+      scheduler,
+    });
+    const passive: SupervisionObserver = {
+      matches: () => false,
+      onEvent: async () => undefined,
+      onBootstrap: async () => undefined,
+      onMonitorDegraded: () => undefined,
+      onMonitorRecovered: () => undefined,
+    };
+    const watcher = observer("p1");
+    monitor.addObserver(passive);
+    monitor.addObserver(watcher);
+    const internals = monitor as unknown as {
+      dispatchReconciliationSnapshot(snapshot: HerdrSnapshot, participants: readonly SupervisionObserver[], epoch: number): Promise<void>;
+      dispatchReconciliationFailure(reason: ReconciliationFailureReason, participants: readonly SupervisionObserver[], epoch: number): Promise<void>;
+    };
+    const snapshot = parseSnapshotResult(emptySnapshotResult);
+    await internals.dispatchReconciliationSnapshot(snapshot, [passive, watcher], 1);
+    await internals.dispatchReconciliationFailure("request_failed", [passive, watcher], 1);
+    expect(watcher.reconciliations).toHaveLength(1);
+    expect(watcher.reconciliationFailures).toEqual(["request_failed"]);
+
+    monitor.stop();
+    await internals.dispatchReconciliationSnapshot(snapshot, [watcher], 1);
+    await internals.dispatchReconciliationFailure("request_failed", [watcher], 1);
+    expect(watcher.reconciliations).toHaveLength(1);
+    expect(watcher.reconciliationFailures).toEqual(["request_failed"]);
+  });
+
+  it("reports snapshot setup and request failures through the bounded error path", async () => {
+    let setupDestroyed = 0;
+    const setupFailure: SupervisionStream = {
+      write: () => undefined,
+      destroy: () => { setupDestroyed += 1; },
+      onData: () => { throw new Error("setup failed"); },
+      onClose: () => undefined,
+    };
+    const setupMonitor = new SessionEventMonitor({ connect: async () => setupFailure, env, clock: instantClock });
+    await expect(setupMonitor.snapshot()).rejects.toThrow("setup failed");
+    expect(setupDestroyed).toBe(1);
+
+    let requestWrites = 0;
+    let requestDestroyed = 0;
+    const requestFailure: SupervisionStream = {
+      write: () => { requestWrites += 1; throw new Error("request failed"); },
+      destroy: () => { requestDestroyed += 1; },
+      onData: () => undefined,
+      onClose: () => undefined,
+    };
+    const requestMonitor = new SessionEventMonitor({ connect: async () => requestFailure, env, clock: instantClock });
+    await expect(requestMonitor.snapshot()).rejects.toThrow("request failed");
+    expect(requestWrites).toBe(1);
+    expect(requestDestroyed).toBe(1);
+  });
+
   it("refuses to start without a socket path, and after shutdown", async () => {
     const unset = new SessionEventMonitor({ connect: () => scriptedServer().connect(), env: {}, clock: instantClock });
     await expect(unset.ensureStarted()).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
@@ -210,6 +384,8 @@ describe("the session event monitor", () => {
     const peer = scriptedServer();
     const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
     await monitor.ensureStarted();
+    monitor.stop();
+    monitor.addObserver(observer("p1"));
     monitor.stop();
     monitor.stop();
     await expect(monitor.ensureStarted()).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });

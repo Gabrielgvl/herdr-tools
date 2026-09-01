@@ -144,6 +144,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -256,6 +257,7 @@ describe("MCP server startup", () => {
   });
 
   it("serves the bundled catalog and the real settings file by default", async () => {
+    vi.useFakeTimers();
     const harness = await start({ profiles: undefined, settingsLoader: undefined });
     const profiles = await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "profiles" } });
     expect(profiles.isError).toBeUndefined();
@@ -263,6 +265,7 @@ describe("MCP server startup", () => {
     const beyondDefaultCadence = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 600_000 } });
     expect(beyondDefaultCadence.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(beyondDefaultCadence).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1);
     await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED" } }));
     expect(readFileMock).toHaveBeenCalled();
     await harness.handle.shutdown();
@@ -392,15 +395,18 @@ describe("MCP tool serving", () => {
 
 describe("MCP wait and job semantics", () => {
   it("records a reviewer failure in the detached job beyond the review cadence", async () => {
+    vi.useFakeTimers();
     const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.advanceTimersByTimeAsync(60_000 + 1);
     await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("model-backed wait review is unavailable on the MCP host") } }));
     await harness.handle.shutdown();
   });
 
   it("registers a detached wait that is polled through herdr_jobs and fails closed beyond the cadence", async () => {
+    vi.useFakeTimers();
     const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
     const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(detached.isError).toBeUndefined();
@@ -408,6 +414,7 @@ describe("MCP wait and job semantics", () => {
     expect(jobId.startsWith("job_")).toBe(true);
     const listed = await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "list" } });
     expect(textOf(listed)).toContain(jobId);
+    await vi.advanceTimersByTimeAsync(60_000 + 1);
     await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.wait_result).toBe("failed"));
     const job = await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "get", jobId } });
     expect(textOf(job)).toContain("REVIEWER_FAILED");

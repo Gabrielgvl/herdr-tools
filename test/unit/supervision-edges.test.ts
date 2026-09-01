@@ -104,7 +104,7 @@ function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: EdgeOp
 
 describe("supervisor guards after settlement", () => {
   it("ignores every stream path once the supervisor has settled", async () => {
-    const h = edgeSupervisor([snapshot([paneRecord()]), snapshot([])]);
+    const h = edgeSupervisor([snapshot([paneRecord()]), snapshot([], [])]);
     await h.supervisor.bind({ identity, profileName: "worker-pi" });
     await h.supervisor.onEvent(thinEvent("pane_closed", "p1"));
     expect(await h.supervisor.run()).toMatchObject({ outcome: "released" });
@@ -137,7 +137,7 @@ describe("supervisor guards after settlement", () => {
     const binding = supervisor.bind({ identity, profileName: "worker-pi" });
     // Both events are queued synchronously, before binding can set the anchor.
     const queued = [supervisor.onEvent(paneEvent("pane_updated", paneRecord("blocked", 6))), supervisor.onEvent(paneEvent("pane_updated", paneRecord("idle", 7)))];
-    await binding;
+    await expect(binding).rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "settled_during_bind", settledDuringBind: true, supervisionOutcome: "cancelled" } });
     await Promise.all(queued);
     expect(supervisor.view().transitions.map((transition) => transition.to)).toEqual(["blocked"]);
   });
@@ -353,6 +353,7 @@ describe("review-round remediations", () => {
     const h = edgeSupervisor([
       snapshot([paneRecord("working")]),
       snapshot([moved], [{ pane_id: "p2", name: "worker" }]),
+      snapshot([paneRecord("working", 9, "p2")], [{ pane_id: "p2", name: "worker" }]),
     ]);
     await h.supervisor.bind({ identity, profileName: "worker-pi" });
 
@@ -381,6 +382,7 @@ describe("review-round remediations", () => {
     const h = edgeSupervisor([
       snapshot([paneRecord("working")]),
       snapshot([moved], [{ pane_id: "p2", name: "worker" }]),
+      snapshot([paneRecord("working", 6, "p2")], [{ pane_id: "p2", name: "worker" }]),
     ]);
     const binding = h.supervisor.bind({ identity, profileName: "worker-pi" });
     const queued = h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
@@ -442,7 +444,7 @@ describe("review-round remediations", () => {
     h.releaseReview();
     await review;
     expect(h.supervisor.view().reviewer.degraded).toBe(false);
-    expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
+    expect(types(h.wakes)).toEqual(["evidence_gap", "work_cycle_completed"]);
     // The finished run's own cadence is not re-armed from an obsolete review.
     expect(h.arms).toEqual([]);
   });

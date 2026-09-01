@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { JobRegistry } from "../../src/job-registry.js";
 import { LaunchParamsSchema } from "../../src/launch-schema.js";
@@ -83,6 +83,10 @@ function surfaceFor(overrides: Partial<HerdrToolSurfaceDependencies> = {}) {
 
 const extensionContext = { cwd: "/unused-host-cwd", signal: new AbortController().signal, modelRegistry: { find: () => undefined, getAll: () => [] } } as unknown as ExtensionContext;
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe("shared tool surface", () => {
   it("constructs exactly the seven core tools in order with one identity per tool", () => {
     const { surface } = surfaceFor();
@@ -131,16 +135,19 @@ describe("shared tool surface", () => {
   });
 
   it("forwards an injected reviewer factory and otherwise keeps the Pi model reviewer", async () => {
+    vi.useFakeTimers();
     const reviewerFactory = vi.fn(() => { throw Object.assign(new Error("no reviewer"), { code: "REVIEWER_FAILED" }); });
     const longWait = { targets: ["w:p2"], match: "any" as const, condition: { kind: "state" as const, state: "blocked" as const }, timeoutMs: 120_000 };
     const injected = surfaceFor({ reviewerFactory });
     const injectedStarted = await injected.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext);
     expect(injectedStarted.details).toMatchObject({ operation_phase: "accepted" });
+    await vi.advanceTimersByTimeAsync(60_000 + 1);
     await vi.waitFor(() => expect(injected.deps.jobs.list("settled").total).toBe(1));
     expect(reviewerFactory).toHaveBeenCalledTimes(1);
     const piHost = surfaceFor();
     const piStarted = await piHost.surface.wait.execute("id", longWait as never, new AbortController().signal, undefined, extensionContext);
     expect(piStarted.details).toMatchObject({ operation_phase: "accepted" });
+    await vi.advanceTimersByTimeAsync(60_000 + 1);
     await vi.waitFor(() => expect(piHost.deps.jobs.list("settled").total).toBe(1));
   });
 

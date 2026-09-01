@@ -160,6 +160,22 @@ export function boundedLines(output: string): string[] {
 }
 
 const KNOWN_WAIT_STATES = new Set<WaitRawState>(["idle", "working", "blocked", "done", "unknown"]);
+const AUTHORITATIVE_AGENT_STATE = Symbol("authoritativeAgentState");
+type PrivatelyObservedSnapshot = WaitTargetSnapshot & { [AUTHORITATIVE_AGENT_STATE]?: WaitRawState };
+
+function retainAuthoritativeState(snapshot: WaitTargetSnapshot, state: WaitRawState | undefined): WaitTargetSnapshot {
+  if (state !== undefined) Object.defineProperty(snapshot, AUTHORITATIVE_AGENT_STATE, { value: state, enumerable: false });
+  return snapshot;
+}
+
+function retainedAuthoritativeState(snapshot: WaitTargetSnapshot): WaitRawState | undefined {
+  return (snapshot as PrivatelyObservedSnapshot)[AUTHORITATIVE_AGENT_STATE];
+}
+
+function retainableAgentState(agent: Record<string, unknown>): WaitRawState | undefined {
+  const state = agent.agent_status;
+  return typeof state === "string" && KNOWN_WAIT_STATES.has(state as WaitRawState) ? state as WaitRawState : undefined;
+}
 
 function rawState(metadata: Record<string, unknown>): string {
   const value = metadata.agent_status;
@@ -363,10 +379,10 @@ async function readFreshAgent(cli: WaitCli, paneId: string, signal: AbortSignal,
   }
 }
 
-async function readStrictIdentity(cli: WaitCli, pane: Record<string, unknown>, paneId: string, signal: AbortSignal, control?: JobOperationControl): Promise<WaitTargetIdentity> {
+async function readStrictIdentity(cli: WaitCli, pane: Record<string, unknown>, paneId: string, signal: AbortSignal, control?: JobOperationControl): Promise<{ identity: WaitTargetIdentity; agent: Record<string, unknown> }> {
   const agent = await readFreshAgent(cli, paneId, signal, control);
   if (!agent) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity is unavailable");
-  return waitIdentity([pane, agent], paneId);
+  return { identity: waitIdentity([pane, agent], paneId), agent };
 }
 
 async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock, signal: AbortSignal, control?: JobOperationControl, strict = false): Promise<WaitTargetSnapshot> {
@@ -375,8 +391,10 @@ async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock,
   try {
     const pane = paneFrom((await guardedCall(() => cli.runJson(["pane", "get", paneId], signal), signal, control)).result, paneId);
     let identityA: WaitTargetIdentity | undefined;
+    let finalAgentState: WaitRawState | undefined;
     if (strict) {
-      identityA = await readStrictIdentity(cli, pane, paneId, signal, control);
+      const before = await readStrictIdentity(cli, pane, paneId, signal, control);
+      identityA = before.identity;
       if (!item.identity || !sameWaitTargetIdentity(identityA, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity changed");
     }
     const readArgs = ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"];
@@ -385,13 +403,14 @@ async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock,
       : { value: await guardedCall(() => cli.runText(readArgs, signal), signal, control), truncated: false };
     if (strict) {
       const after = paneFrom((await guardedCall(() => cli.runJson(["pane", "get", paneId], signal), signal, control)).result, paneId);
-      const identityB = await readStrictIdentity(cli, after, paneId, signal, control);
-      if (!identityA || !sameWaitTargetIdentity(identityA, identityB) || !item.identity || !sameWaitTargetIdentity(identityB, item.identity)) {
+      const verified = await readStrictIdentity(cli, after, paneId, signal, control);
+      if (!identityA || !sameWaitTargetIdentity(identityA, verified.identity) || !item.identity || !sameWaitTargetIdentity(verified.identity, item.identity)) {
         throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity changed");
       }
+      finalAgentState = retainableAgentState(verified.agent);
     }
     checkAbort(signal);
-    return { target: item.ref, targetId: paneId, metadata: metadataWithoutIdentity(pane), recentUnwrappedLines: boundedLines(output.value), outputTruncated: output.truncated, observedAtMs: clock.now(), matched: false };
+    return retainAuthoritativeState({ target: item.ref, targetId: paneId, metadata: metadataWithoutIdentity(pane), recentUnwrappedLines: boundedLines(output.value), outputTruncated: output.truncated, observedAtMs: clock.now(), matched: false }, finalAgentState);
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;
@@ -435,7 +454,7 @@ async function readCurrentStateTarget(
       metadata = targetMetadata(item, agent, pane, { agent_status: status });
     }
     const observedAtMs = clock.now();
-    return {
+    return retainAuthoritativeState({
       target: item.ref,
       targetId: paneId,
       metadata: metadataWithoutIdentity(metadata),
@@ -443,7 +462,7 @@ async function readCurrentStateTarget(
       observedAtMs,
       matched: observedAtMs < deadline && matchesState(status, condition.state),
       target_evidence: historicalTargetEvidence(agentAbsent ? "agent_absent_observed" : "predicate_observed", observedAtMs, item.targetGenerationRef, "composite_observation")
-    };
+    }, agentAbsent ? undefined : status as WaitRawState);
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;
@@ -638,18 +657,21 @@ async function readNativeTarget(
     const pane = await readFreshPane(cli, item.target.paneId!, signal, control);
     const agent = await readFreshAgent(cli, item.target.paneId!, signal, control);
     const agentAbsent = agent === undefined;
+    let authoritativeAgentState: WaitRawState | undefined;
     if (agentAbsent) {
       if (status !== "unknown" || explicitState(pane, "pane") !== "unknown") throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target identity is unavailable");
       if (!sameAgentFreePaneIdentity(pane, item)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target occupant changed");
     } else {
-      if (explicitState(agent, "agent") === undefined) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait omitted the authoritative state");
+      const agentState = explicitState(agent, "agent");
+      if (agentState === undefined) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait omitted the authoritative state");
+      authoritativeAgentState = agentState as WaitRawState;
       const identity = waitIdentity([record, pane, agent], item.target.paneId!);
       if (!item.identity || !sameWaitTargetIdentity(identity, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target occupant changed");
     }
     const observedAtMs = clock.now();
     const matched = observedAtMs < deadline && matchesState(status, condition.state);
     const metadata = agentAbsent ? pane : targetMetadata(item, record, agent, pane);
-    return nativeSnapshot(item, metadata, status, observedAtMs, matched, agentAbsent);
+    return retainAuthoritativeState(nativeSnapshot(item, metadata, status, observedAtMs, matched, agentAbsent), authoritativeAgentState);
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     // A typed timeout from the native command means its predicate expired; a
@@ -811,6 +833,25 @@ function observationResult(params: WaitParams, read: WaitObservation, reviewerSu
   if (aggregate(params, read.snapshots)) return conditionMetResult(read.snapshots, reviewerSummaries, read.targetErrors);
   if (read.targetErrors.length > 0) throwTargetReadFailure(read, reviewerSummaries);
   return undefined;
+}
+
+async function unknownReviewProvesWorking(
+  cli: WaitCli,
+  item: ReadTargetInput | undefined,
+  snapshot: WaitTargetSnapshot | undefined,
+  signal: AbortSignal,
+  control?: JobOperationControl,
+): Promise<boolean> {
+  if (!item?.identity || !snapshot || snapshot.targetId !== item.identity.paneId) return false;
+  const retained = retainedAuthoritativeState(snapshot);
+  if (retained !== undefined) return retained === "working";
+  const agent = await readFreshAgent(cli, item.identity.paneId, signal, control);
+  if (!agent) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: authoritative agent state is unavailable");
+  const state = explicitState(agent, "agent");
+  if (state === undefined) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: agent response omitted its authoritative state");
+  const observed = waitIdentity([agent], item.identity.paneId);
+  if (!sameWaitTargetIdentity(observed, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: wait target identity changed");
+  return state === "working";
 }
 
 export function mapReviewerFailure(error: unknown): WaitError {
@@ -1005,13 +1046,6 @@ export async function runPreparedWait(
     if (settled) return settled;
   }
   let reviewer: WaitReviewer | undefined;
-  if (longWait) {
-    try {
-      reviewer = deps.reviewerFactory ? deps.reviewerFactory(settings, context) : createPiModelReviewer(context, settings.reviewerModel);
-    } catch (error) {
-      throw mapReviewerFailure(error);
-    }
-  }
   const reviewerSummaries: ReviewerSummary[] = [];
   const sentLines = new Map<string, string[]>();
   let lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
@@ -1065,7 +1099,23 @@ export async function runPreparedWait(
       settled = observationResult(params, fresh, reviewerSummaries);
       if (settled) return settled;
     }
-    const requests: ReviewerRequest[] = snapshots.map((snapshot) => {
+    const supervisorCovered: Array<{ target: string; targetId: string; supervisorJobId: string }> = [];
+    const explicitSnapshots: WaitTargetSnapshot[] = [];
+    for (const snapshot of snapshots) {
+      const item = resolved.find((candidate) => candidate.target.paneId === snapshot.targetId);
+      const coverage = item?.identity ? deps.jobRegistry.activeSupervisorFor(item.identity) : undefined;
+      if (coverage) supervisorCovered.push({ target: snapshot.target, targetId: snapshot.targetId, supervisorJobId: coverage.jobId });
+      else explicitSnapshots.push(snapshot);
+    }
+    control?.publishSemanticReview({
+      observedAtMs: clock.now(),
+      supervisorCovered,
+      explicitReviewerTargetIds: explicitSnapshots.map((snapshot) => snapshot.targetId),
+      omittedSupervisorCovered: 0,
+      omittedExplicitReviewerTargetIds: 0,
+    });
+    if (explicitSnapshots.length === 0) continue;
+    const requests: ReviewerRequest[] = explicitSnapshots.map((snapshot) => {
       const previous = sentLines.get(snapshot.targetId) ?? [];
       const delta = deltaLines(previous, snapshot.recentUnwrappedLines);
       sentLines.set(snapshot.targetId, snapshot.recentUnwrappedLines.slice(-100));
@@ -1074,7 +1124,8 @@ export async function runPreparedWait(
     let reviews: ReviewerResult[];
     try {
       control?.check();
-      const reviewerRun = await runReviewersWithDeadline(reviewer!, requests, signal, deadline, clock, control);
+      reviewer ??= deps.reviewerFactory ? deps.reviewerFactory(settings, context) : createPiModelReviewer(context, settings.reviewerModel);
+      const reviewerRun = await runReviewersWithDeadline(reviewer, requests, signal, deadline, clock, control);
       if (reviewerRun.kind === "timed_out") return timedOutResult(snapshots, reviewerSummaries, targetErrors);
       reviews = reviewerRun.reviews;
       checkAbort(signal);
@@ -1089,15 +1140,16 @@ export async function runPreparedWait(
       settled = observationResult(params, fresh, reviewerSummaries);
       if (settled) return settled;
     }
-    let managerJudgment = false;
+    let hardManagerJudgment = false;
+    const unknownReviews: ReviewerResult[] = [];
     for (const review of reviews) {
       const summary: ReviewerSummary = { target: resolved.find((item) => item.target.paneId === review.targetId)?.ref ?? review.targetId, targetId: review.targetId, classification: review.classification, summary: review.summary.slice(0, 500) };
       reviewerSummaries.push(summary);
-      const terminal = review.classification === "stalled" || review.classification === "blocked" || review.classification === "risk" || review.classification === "unknown";
-      managerJudgment ||= terminal;
+      hardManagerJudgment ||= review.classification === "stalled" || review.classification === "blocked" || review.classification === "risk";
+      if (review.classification === "unknown") unknownReviews.push(review);
       progress(`review ${review.targetId}: ${review.classification} ${review.summary}`);
     }
-    if (managerJudgment) {
+    if (hardManagerJudgment || unknownReviews.length > 0) {
       if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries, targetErrors);
       if (nativePredicate) {
         const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
@@ -1112,6 +1164,24 @@ export async function runPreparedWait(
       targetErrors = read.targetErrors;
       settled = observationResult(params, read, reviewerSummaries);
       if (settled) return settled;
+      if (!hardManagerJudgment) {
+        let unknownRequiresJudgment = false;
+        for (const review of unknownReviews) {
+          const item = resolved.find((candidate) => candidate.target.paneId === review.targetId);
+          const snapshot = snapshots.find((candidate) => candidate.targetId === review.targetId);
+          try {
+            unknownRequiresJudgment ||= !(await unknownReviewProvesWorking(deps.cli, item, snapshot, signal, control));
+          } catch (error) {
+            if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries, targetErrors);
+            if (!item) {
+              unknownRequiresJudgment = true;
+              continue;
+            }
+            throwTargetReadFailure({ snapshots, targetErrors: [targetError(item, error)], expired: false }, reviewerSummaries);
+          }
+        }
+        if (!unknownRequiresJudgment) continue;
+      }
       return managerJudgmentResult(snapshots, reviewerSummaries, targetErrors);
     }
   }

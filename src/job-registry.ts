@@ -44,6 +44,11 @@ const PUBLIC_SUPERVISION_REVIEWS = 6;
 const PUBLIC_LIST_JOBS = 100;
 const PUBLIC_SUMMARY_ITEMS = 2;
 const PUBLIC_FIELD_BYTES = 256;
+const SEMANTIC_REVIEW_COVERED_LIMIT = 6;
+const SEMANTIC_REVIEW_EXPLICIT_LIMIT = 8;
+const SEMANTIC_REVIEW_TARGET_BYTES = 128;
+const SEMANTIC_REVIEW_JOB_ID_BYTES = 64;
+const SEMANTIC_REVIEW_TOTAL_BYTES = 4_096;
 type LateSettlementKind = "fulfilled" | "rejected";
 
 export interface TruncatedDetails {
@@ -134,6 +139,14 @@ export interface JobProgress {
   details?: unknown;
 }
 
+export interface WaitSemanticReviewProjection {
+  observedAtMs: number;
+  supervisorCovered: Array<{ target: string; targetId: string; supervisorJobId: string }>;
+  explicitReviewerTargetIds: string[];
+  omittedSupervisorCovered: number;
+  omittedExplicitReviewerTargetIds: number;
+}
+
 export interface JobResultTargetSnapshot {
   target: string;
   targetId: string;
@@ -221,6 +234,7 @@ export interface JobDetail {
   finishedAtMs?: number;
   request: JobRequestSnapshot;
   progress?: JobProgress;
+  semanticReview?: WaitSemanticReviewProjection;
   wait_result?: WaitResult;
   supervision_result?: SupervisionResult;
   supervision_reason?: string;
@@ -283,6 +297,7 @@ export interface JobOperationControl {
   readonly isOpen: () => boolean;
   readonly check: () => void;
   readonly beginActivity: () => () => void;
+  readonly publishSemanticReview: (projection: WaitSemanticReviewProjection) => void;
 }
 
 export interface JobRunResult {
@@ -395,6 +410,49 @@ function fitJsonString(value: string, maxBytes: number): string {
 export function boundedText(value: string, limit = MAX_SUMMARY_CHARS): string {
   const lineBounded = truncateTail(value, { maxBytes: limit, maxLines: MAX_TEXT_LINES }).content;
   return fitJsonString(lineBounded, Math.max(2, limit));
+}
+
+function boundedOmission(value: number): number {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function incrementOmission(value: number, amount: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, value + amount);
+}
+
+export function boundedSemanticReview(value: WaitSemanticReviewProjection): WaitSemanticReviewProjection {
+  if (!Number.isSafeInteger(value.observedAtMs) || value.observedAtMs < 0 || !Array.isArray(value.supervisorCovered) || !Array.isArray(value.explicitReviewerTargetIds)) {
+    throw new Error("SEMANTIC_REVIEW_INVALID: ownership projection is malformed");
+  }
+  if (value.supervisorCovered.some((entry) => typeof entry !== "object" || entry === null || typeof entry.target !== "string" || typeof entry.targetId !== "string" || typeof entry.supervisorJobId !== "string")
+    || value.explicitReviewerTargetIds.some((targetId) => typeof targetId !== "string")) {
+    throw new Error("SEMANTIC_REVIEW_INVALID: ownership projection entries are malformed");
+  }
+  const sourceCovered = value.supervisorCovered;
+  const sourceExplicit = value.explicitReviewerTargetIds;
+  const projection: WaitSemanticReviewProjection = {
+    observedAtMs: value.observedAtMs,
+    supervisorCovered: sourceCovered.slice(0, SEMANTIC_REVIEW_COVERED_LIMIT).map((entry) => ({
+      target: boundedText(entry.target, SEMANTIC_REVIEW_TARGET_BYTES),
+      targetId: boundedText(entry.targetId, SEMANTIC_REVIEW_TARGET_BYTES),
+      supervisorJobId: boundedText(entry.supervisorJobId, SEMANTIC_REVIEW_JOB_ID_BYTES),
+    })),
+    explicitReviewerTargetIds: sourceExplicit.slice(0, SEMANTIC_REVIEW_EXPLICIT_LIMIT).map((targetId) => boundedText(targetId, SEMANTIC_REVIEW_TARGET_BYTES)),
+    omittedSupervisorCovered: incrementOmission(boundedOmission(value.omittedSupervisorCovered), Math.max(0, sourceCovered.length - SEMANTIC_REVIEW_COVERED_LIMIT)),
+    omittedExplicitReviewerTargetIds: incrementOmission(boundedOmission(value.omittedExplicitReviewerTargetIds), Math.max(0, sourceExplicit.length - SEMANTIC_REVIEW_EXPLICIT_LIMIT)),
+  };
+  while (jsonBytes(projection) > SEMANTIC_REVIEW_TOTAL_BYTES && (projection.supervisorCovered.length > 0 || projection.explicitReviewerTargetIds.length > 0)) {
+    const coveredTailBytes = projection.supervisorCovered.length === 0 ? -1 : jsonBytes(projection.supervisorCovered.at(-1));
+    const explicitTailBytes = projection.explicitReviewerTargetIds.length === 0 ? -1 : jsonBytes(projection.explicitReviewerTargetIds.at(-1));
+    if (coveredTailBytes >= explicitTailBytes) {
+      projection.supervisorCovered.pop();
+      projection.omittedSupervisorCovered = incrementOmission(projection.omittedSupervisorCovered, 1);
+    } else {
+      projection.explicitReviewerTargetIds.pop();
+      projection.omittedExplicitReviewerTargetIds = incrementOmission(projection.omittedExplicitReviewerTargetIds, 1);
+    }
+  }
+  return projection;
 }
 
 function truncatedDetails(content: string, maxBytes = PUBLIC_FIELD_BYTES): TruncatedDetails {
@@ -732,6 +790,7 @@ function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
     ...(copy.startedAtMs === undefined ? {} : { startedAtMs: copy.startedAtMs }),
     ...(copy.finishedAtMs === undefined ? {} : { finishedAtMs: copy.finishedAtMs }),
     request: minimalRequest(copy.request),
+    ...(copy.semanticReview ? { semanticReview: copy.semanticReview } : {}),
     ...(copy.operation_phase === "settled" && copy.wait_result ? { wait_result: copy.wait_result } : {}),
     ...(copy.operation_phase === "settled" && copy.supervision_result ? { supervision_result: copy.supervision_result } : {}),
     ...(copy.unobservedEvents === undefined ? {} : { unobservedEvents: copy.unobservedEvents }),
@@ -757,6 +816,7 @@ export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): Jo
     ...(detail.finishedAtMs === undefined ? {} : { finishedAtMs: detail.finishedAtMs }),
     request: copyRequest(detail.request, truncation),
     ...(detail.progress ? { progress: copyProgress(detail.progress, truncation) } : {}),
+    ...(detail.semanticReview ? { semanticReview: boundedSemanticReview(detail.semanticReview) } : {}),
     ...(terminal && detail.wait_result ? { wait_result: detail.wait_result } : {}),
     ...(terminal && detail.supervision_result ? { supervision_result: detail.supervision_result } : {}),
     ...(terminal && detail.supervision_reason ? { supervision_reason: boundedText(detail.supervision_reason, PUBLIC_FIELD_BYTES) } : {}),
@@ -1017,7 +1077,7 @@ export class JobRegistry {
     }
   }
 
-  private createControl(record: Pick<JobRecord, "gateOpen" | "fenceValue" | "runnerDone" | "activityCount" | "resolveDrain">): JobOperationControl {
+  private createControl(record: Pick<JobRecord, "detail" | "gateOpen" | "fenceValue" | "runnerDone" | "activityCount" | "resolveDrain">): JobOperationControl {
     return {
       get fence() { return record.fenceValue; },
       isOpen: () => record.gateOpen,
@@ -1034,6 +1094,12 @@ export class JobRegistry {
           record.activityCount -= 1;
           this.signalDrain(record);
         };
+      },
+      publishSemanticReview: (projection) => {
+        if (record.detail.kind !== "wait") throw new Error("JOB_KIND_MISMATCH: only a wait job accepts semantic review ownership");
+        if (!record.gateOpen || record.detail.operation_phase !== "running") throw Object.assign(new Error("ABORTED: operation fence is closed"), { code: "ABORTED" });
+        record.detail.semanticReview = boundedSemanticReview(projection);
+        this.notifyChange();
       }
     };
   }

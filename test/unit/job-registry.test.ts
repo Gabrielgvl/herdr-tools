@@ -242,6 +242,70 @@ describe("JobRegistry", () => {
     expect(registry.size()).toBe(0);
   });
 
+  it("publishes bounded semantic-review ownership independently and rejects late or wrong-kind writes", async () => {
+    const gate = deferred<JobRunResult>();
+    let control!: JobOperationControl;
+    const registry = new JobRegistry({ idFactory: (() => { let id = 0; return () => `job_semantic_${++id}`; })() });
+    const covered = Array.from({ length: 10 }, (_, index) => ({
+      target: `target-${index}-${"界".repeat(100)}`,
+      targetId: `pane-${index}-${"界".repeat(100)}`,
+      supervisorJobId: `job_supervisor_${index}_${"x".repeat(100)}`,
+    }));
+    const explicit = Array.from({ length: 12 }, (_, index) => `explicit-${index}-${"界".repeat(100)}`);
+    const handle = registry.register(request, async (_signal, update, operationControl) => {
+      control = operationControl;
+      operationControl.publishSemanticReview({
+        observedAtMs: 10,
+        supervisorCovered: covered,
+        explicitReviewerTargetIds: explicit,
+        omittedSupervisorCovered: 2,
+        omittedExplicitReviewerTargetIds: 3,
+      });
+      update("ownership published", { oversized: "z".repeat(10_000) });
+      return gate.promise;
+    });
+    await vi.waitFor(() => expect(control).toBeDefined());
+    const projected = registry.get(handle.jobId)!;
+    expect(projected.progress?.details).toMatchObject({ truncated: true });
+    expect(projected.semanticReview).toMatchObject({ observedAtMs: 10 });
+    expect(projected.semanticReview?.supervisorCovered.length).toBeLessThanOrEqual(6);
+    expect(projected.semanticReview?.explicitReviewerTargetIds.length).toBeLessThanOrEqual(8);
+    expect((projected.semanticReview?.supervisorCovered.length ?? 0) + (projected.semanticReview?.omittedSupervisorCovered ?? 0)).toBe(covered.length + 2);
+    expect((projected.semanticReview?.explicitReviewerTargetIds.length ?? 0) + (projected.semanticReview?.omittedExplicitReviewerTargetIds ?? 0)).toBe(explicit.length + 3);
+    expect(Buffer.byteLength(JSON.stringify(projected.semanticReview), "utf8")).toBeLessThanOrEqual(4_096);
+    expect(projected.semanticReview?.supervisorCovered.every((entry) => Buffer.byteLength(entry.target, "utf8") <= 128 && Buffer.byteLength(entry.targetId, "utf8") <= 128 && Buffer.byteLength(entry.supervisorJobId, "utf8") <= 64)).toBe(true);
+    expect(projected.semanticReview).not.toHaveProperty("truncated");
+    expect(registry.list().jobs[0]).not.toHaveProperty("semanticReview");
+    projected.semanticReview!.explicitReviewerTargetIds.push("mutated");
+    expect(registry.get(handle.jobId)?.semanticReview?.explicitReviewerTargetIds).not.toContain("mutated");
+
+    gate.resolve(success);
+    await handle.promise;
+    const terminalProjection = registry.get(handle.jobId)?.semanticReview;
+    expect(terminalProjection).toBeDefined();
+    expect(() => control.publishSemanticReview({ observedAtMs: 11, supervisorCovered: [], explicitReviewerTargetIds: [], omittedSupervisorCovered: 0, omittedExplicitReviewerTargetIds: 0 })).toThrow(/operation fence is closed/u);
+    expect(registry.get(handle.jobId)?.semanticReview).toEqual(terminalProjection);
+
+    let supervisorControl!: JobOperationControl;
+    const supervisorGate = deferred<{ supervision_result: "cancelled"; reason: string }>();
+    const supervisor = registry.register({
+      kind: "supervisor",
+      label: "supervise one",
+      targets: ["one"],
+      targetIds: [],
+      target_generation_refs: ["target_generation_semantic"],
+      child: { agentName: "one", agentKind: "pi", profileName: "worker-pi" },
+      settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" },
+    }, async (_signal, _update, operationControl) => {
+      supervisorControl = operationControl;
+      return supervisorGate.promise;
+    });
+    await vi.waitFor(() => expect(supervisorControl).toBeDefined());
+    expect(() => supervisorControl.publishSemanticReview({ observedAtMs: 11, supervisorCovered: [], explicitReviewerTargetIds: [], omittedSupervisorCovered: 0, omittedExplicitReviewerTargetIds: 0 })).toThrow(/JOB_KIND_MISMATCH/u);
+    supervisorGate.resolve({ supervision_result: "cancelled", reason: "test_complete" });
+    await supervisor.promise;
+  });
+
   it("bounds uncloneable and oversized progress details", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_details" });
     const handle = registry.register(request, async (_signal, update) => { update("progress", () => undefined); return new Promise(() => undefined); });

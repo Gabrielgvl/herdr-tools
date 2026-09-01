@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { CliProtocolError } from "../../src/cli.js";
-import { ReviewerFailure, type WaitReviewer } from "../../src/reviewer.js";
+import { ReviewerFailure, type ReviewerRequest, type WaitReviewer } from "../../src/reviewer.js";
 import { createJobsTool } from "../../src/tools/jobs.js";
 import { WaitError, boundedBackgroundDetails, createWaitTool, deriveWaitLabel, errorCode, linkedSignal, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, runPreparedWait, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
 import { JobRegistry } from "../../src/job-registry.js";
@@ -1044,6 +1044,81 @@ describe("herdr_wait", () => {
     await expect(execute(fakeCli({ p1: "done" }), { targets: ["p1"], match: "any", condition: { kind: "state", state: "completed" }, timeoutMs: 3_600_000 }, { reviewerFactory: failingFactory })).resolves.toMatchObject({ wait_result: "condition_met", matched: true });
   });
 
+  it("keeps an all-covered long wait reviewer-lazy and publishes exact ownership", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_covered_wait" });
+    const coverage = vi.spyOn(registry, "activeSupervisorFor").mockReturnValue({ jobId: "job_supervisor_exact" });
+    const reviewerFactory = vi.fn(() => { throw new Error("covered wait reviewer must stay unresolved"); });
+    const tool = createWaitTool({
+      cli: nativeCli({ statuses: { p1: "working", p2: "working" } }),
+      context,
+      settingsLoader: async () => settings,
+      jobRegistry: registry,
+      clock: clock(),
+      pollIntervalMs: 60_000,
+      reviewerFactory,
+      requireTargetIdentity: true,
+    });
+    const accepted = await tool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "never" } }, timeoutMs: 120_001 } as never, new AbortController().signal, undefined, extensionContext);
+    await vi.waitFor(() => expect(registry.get((accepted.details as { jobId: string }).jobId)?.operation_phase).toBe("settled"));
+    const detail = registry.get("job_covered_wait")!;
+    expect(detail.wait_result).toBe("timed_out");
+    expect(detail.semanticReview).toMatchObject({
+      supervisorCovered: [{ target: "p1", targetId: "p1", supervisorJobId: "job_supervisor_exact" }],
+      explicitReviewerTargetIds: [],
+      omittedSupervisorCovered: 0,
+      omittedExplicitReviewerTargetIds: 0,
+    });
+    expect(coverage).toHaveBeenCalled();
+    expect(reviewerFactory).not.toHaveBeenCalled();
+  });
+
+  it("reviews only uncovered targets in a mixed wait and constructs one reviewer lazily", async () => {
+    const registry = new JobRegistry();
+    vi.spyOn(registry, "activeSupervisorFor").mockImplementation((identity) => identity.paneId === "p1" ? { jobId: "job_supervisor_p1" } : undefined);
+    const reviewed: string[] = [];
+    const reviewerFactory = vi.fn((): WaitReviewer => ({ review: async ({ targetId }) => {
+      reviewed.push(targetId);
+      return { targetId, classification: "progress", summary: "explicit owner" };
+    } }));
+    const result = await execute(nativeCli({ statuses: { p1: "working", p2: "working" } }), {
+      targets: ["p1", "p2"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "never" } }, timeoutMs: 120_001,
+    }, { jobRegistry: registry, clock: clock(), pollIntervalMs: 60_000, reviewerFactory, requireTargetIdentity: true });
+    expect(result.wait_result).toBe("timed_out");
+    expect(reviewed).toEqual(["p2", "p2"]);
+    expect(reviewerFactory).toHaveBeenCalledTimes(1);
+  });
+
+  it("recomputes coverage each cadence without advancing covered transcript baselines", async () => {
+    const cli = nativeCli({ statuses: { p1: "working", p2: "working" } });
+    let transcriptRead = 0;
+    cli.runText = async (argv) => {
+      cli.calls.push(argv);
+      transcriptRead += 1;
+      return ["base", ...(transcriptRead >= 2 ? ["first"] : []), ...(transcriptRead >= 3 ? ["covered"] : []), ...(transcriptRead >= 4 ? ["after"] : [])].join("\n");
+    };
+    const registry = new JobRegistry();
+    const ownership = [undefined, { jobId: "job_supervisor_p1" }, undefined] as const;
+    let ownershipIndex = 0;
+    vi.spyOn(registry, "activeSupervisorFor").mockImplementation(() => ownership[ownershipIndex++]);
+    const requests: ReviewerRequest[] = [];
+    const result = await execute(cli, {
+      targets: ["p1"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "never" } }, timeoutMs: 180_001,
+    }, {
+      jobRegistry: registry,
+      clock: clock(),
+      pollIntervalMs: 60_000,
+      requireTargetIdentity: true,
+      reviewerFactory: () => ({ review: async (request) => {
+        requests.push(request);
+        return { targetId: request.targetId, classification: "progress", summary: "still running" };
+      } }),
+    });
+    expect(result.wait_result).toBe("timed_out");
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.transcriptDelta).toEqual(["base", "first"]);
+    expect(requests[1]?.transcriptDelta).toEqual(["covered", "after"]);
+  });
+
   it("aborts reviewer calls at the remaining wait deadline", async () => {
     const pending = execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 1 }, {
       settingsLoader: async () => ({ ...settings, reviewCadenceMinutes: 0 }),
@@ -1215,10 +1290,59 @@ describe("herdr_wait", () => {
     expect(result).toMatchObject({ wait_result: "timed_out", matched: false, reason: "timeout" });
   });
 
-  it.each(["stalled", "blocked", "risk", "unknown"] as const)("ends with manager judgment for %s reviewer findings", async (classification) => {
+  it.each(["stalled", "blocked", "risk"] as const)("ends with manager judgment for %s reviewer findings", async (classification) => {
     const reviewer: WaitReviewer = { review: async ({ targetId }) => ({ targetId, classification, summary: "attention" }) };
     const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
     expect(result).toMatchObject({ wait_result: "manager_judgment_required", matched: false, reason: "manager_judgment_required" });
+  });
+
+  it("retains unknown but continues only when a post-review exact agent read proves working", async () => {
+    const workingCli = nativeCli({ statuses: { p1: "working", p2: "working" } });
+    const workingRunJson = workingCli.runJson.bind(workingCli);
+    let reviewReturned = false;
+    let postReviewAgentGets = 0;
+    workingCli.runJson = async (argv, signal) => {
+      if (reviewReturned && argv[0] === "agent" && argv[1] === "get") postReviewAgentGets += 1;
+      return workingRunJson(argv, signal);
+    };
+    const reviewer: WaitReviewer = { review: async ({ targetId }) => {
+      reviewReturned = true;
+      return { targetId, classification: "unknown", summary: "uncertain" };
+    } };
+    const working = await execute(workingCli, {
+      targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001,
+    }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
+    expect(working).toMatchObject({ wait_result: "timed_out", reviewerSummaries: [{ targetId: "p1", classification: "unknown" }] });
+    // Existing post-review condition precedence performs two current-state
+    // refreshes plus the final native verification; unknown adds no fourth read.
+    expect(postReviewAgentGets).toBe(3);
+
+    reviewReturned = false;
+    const idle = await execute(nativeCli({ statuses: { p1: "idle", p2: "working" } }), {
+      targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001,
+    }, { clock: clock(), pollIntervalMs: 60_000, reviewerFactory: () => reviewer });
+    expect(idle).toMatchObject({ wait_result: "manager_judgment_required", reviewerSummaries: [{ targetId: "p1", classification: "unknown" }] });
+  });
+
+  it.each([
+    ["working", "idle", "manager_judgment_required"],
+    ["idle", "working", "timed_out"],
+  ] as const)("uses authoritative agent state %s/%s rather than output metadata", async (paneState, agentState, expected) => {
+    const cli = nativeCli({ statuses: { p1: "working", p2: "working" } });
+    const original = cli.runJson.bind(cli);
+    cli.runJson = async (argv, signal) => {
+      const envelope = await original(argv, signal);
+      if (argv[0] === "pane" && argv[1] === "get") return { ...envelope, result: { pane: { ...((envelope.result as { pane: Record<string, unknown> }).pane), agent_status: paneState } } };
+      if (argv[0] === "agent" && argv[1] === "get") return { ...envelope, result: { agent: { ...((envelope.result as { agent: Record<string, unknown> }).agent), agent_status: agentState } } };
+      return envelope;
+    };
+    const result = await execute(cli, {
+      targets: ["p1"], match: "all", condition: { kind: "output", match: { kind: "literal", value: "never" } }, timeoutMs: 60_001,
+    }, {
+      clock: clock(), pollIntervalMs: 60_000, requireTargetIdentity: true,
+      reviewerFactory: () => ({ review: async ({ targetId }) => ({ targetId, classification: "unknown", summary: "output uncertain" }) }),
+    });
+    expect(result.wait_result).toBe(expected);
   });
 
   it("covers all wait predicates and bounded transcript helpers", () => {
@@ -1313,9 +1437,10 @@ describe("herdr_wait", () => {
     expect(result).toMatchObject({ wait_result: "timed_out", matched: false, reason: "timeout" });
   });
 
-  it("preserves an unknown reviewer target in the manager summary", async () => {
-    const reviewer: WaitReviewer = { review: async () => ({ targetId: "external", classification: "blocked", summary: "attention" }) };
+  it("preserves an unmapped unknown reviewer target in the manager summary", async () => {
+    const reviewer: WaitReviewer = { review: async () => ({ targetId: "external", classification: "unknown", summary: "attention" }) };
     const result = await execute(fakeCli({ p1: "working" }), { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 }, { clock: clock(), pollIntervalMs: 100_000, reviewerFactory: () => reviewer });
+    expect(result.wait_result).toBe("manager_judgment_required");
     expect((result as { reviewerSummaries?: Array<{ target?: string }> }).reviewerSummaries?.[0]?.target).toBe("external");
   });
 

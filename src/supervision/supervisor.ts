@@ -145,6 +145,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * proven move resets it to the destination pane's own numbering.
    */
   private lastRevision = 0;
+  /**
+   * The destination of a move already proven to be this child's, retained
+   * because the destination's own snapshot was invalid at the time. The child is
+   * there and not in the origin pane, so the origin's later absence is only this
+   * move's shadow: every authoritative read classifies this destination instead,
+   * until one is valid enough to follow or to settle on.
+   */
+  private pendingMoveDestination: SupervisionPaneRecord | undefined;
   private evidenceGaps = 0;
   private eventStreamDegraded = false;
   private reconciliationDegraded = false;
@@ -295,6 +303,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.anchor = undefined;
     this.status = undefined;
     this.lastRevision = 0;
+    this.pendingMoveDestination = undefined;
     this.selectedProfileName = undefined;
     this.bindingPublished = false;
     if (!this.isSettled()) this.state = "reserved";
@@ -411,6 +420,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       await this.followMove(event, pane);
       return;
     }
+    if (this.pendingMoveDestination !== undefined) {
+      // The watermark still counts the origin pane's revisions while the child
+      // is already elsewhere, so nothing can be folded against it. The retained
+      // destination is classified authoritatively instead.
+      await this.reconcile(`event:${event.event}`);
+      return;
+    }
     if (pane.revision < this.lastRevision) return;
     const verdict = paneContinuity(this.identity!, pane);
     if (verdict === "replaced") {
@@ -455,6 +471,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     const target = classifySnapshotTarget(snapshot, pane.paneId);
     if (target.kind === "invalid") {
+      // The move itself is proven; only this one read of its destination is
+      // unusable. Retaining the destination is what keeps the origin pane's
+      // absence — which this very move caused — from later reading as a closure.
+      this.pendingMoveDestination = pane;
       this.markReconciliationFailure(target.reason);
       return;
     }
@@ -469,11 +489,19 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       return;
     }
     this.markReconciliationSuccess();
+    this.adoptMove(next, occupant);
+  }
+
+  /**
+   * Rebase onto a destination pane whose occupant is proven to be this child.
+   * Revisions are per pane, so the watermark and the anchor take the
+   * destination's own numbering. Keeping the origin pane's higher revision would
+   * discard every later event on the new pane.
+   */
+  private adoptMove(next: SupervisedIdentity, occupant: AuthoritativeOccupant): void {
+    this.pendingMoveDestination = undefined;
     this.identity = next;
     this.paneId = next.paneId;
-    // Revisions are per pane, so the watermark and the anchor are re-based on the
-    // destination's own numbering. Keeping the old pane's higher revision would
-    // discard every later event on the new pane.
     this.lastRevision = occupant.pane.revision;
     this.anchor = { ...this.anchor!, revision: occupant.pane.revision, status: occupant.pane.agentStatus };
     this.publish(`child moved to pane ${next.paneId}`);
@@ -516,7 +544,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private async applyAuthoritativeSnapshot(snapshot: HerdrSnapshot, trigger: string, missingOutcome: "identity_lost" | "released"): Promise<void> {
-    const target = classifySnapshotTarget(snapshot, this.identity!.paneId);
+    // A retained move destination is where the child actually is, so it is the
+    // pane every rule below judges. The origin pane's absence is this move's own
+    // shadow and proves nothing; only the destination's absence is a closure.
+    const moved = this.pendingMoveDestination;
+    const target = classifySnapshotTarget(snapshot, moved?.paneId ?? this.identity!.paneId);
     if (target.kind === "invalid") {
       this.markReconciliationFailure(target.reason);
       return;
@@ -542,6 +574,15 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (verdict === "unproven") {
       this.markReconciliationSuccess();
       await this.settleWithEvent("released", "released", trigger, `the child agent is no longer present in its pane (${trigger})`);
+      return;
+    }
+    if (moved !== undefined) {
+      // Continuity against the destination's own occupant is exactly the proof
+      // the move's first read could not supply, so the move completes here. The
+      // watermark still counts origin revisions, so it is rebased rather than
+      // compared with the destination's pane-local numbering.
+      this.markReconciliationSuccess();
+      this.adoptMove({ ...this.identity!, paneId: moved.paneId }, occupant);
       return;
     }
     if (occupant.pane.revision < this.lastRevision) {

@@ -570,6 +570,50 @@ describe("supervisor pane moves", () => {
     expect(invalid.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
     expect(types(invalid.wakes)).toEqual(["reconciliation_degraded"]);
   });
+
+  /** The destination of a proven move whose first destination read was invalid. */
+  const invalidDestination = (): HerdrSnapshot => snapshot([paneRecord({ paneId: "p2" }), paneRecord({ paneId: "p2" })]);
+
+  it("follows a retained move destination once a later read of it is valid", async () => {
+    const destination = paneRecord({ paneId: "p2", revision: 1, status: "idle" });
+    const h = await bound([invalidDestination(), invalidDestination(), snapshot([destination], [{ pane_id: "p2", name: "worker" }])]);
+    await h.supervisor.onEvent(paneEvent("pane_moved", destination, { previous_pane_id: "p1" }));
+    expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
+
+    // Origin-pane evidence cannot be folded while the child is elsewhere: the
+    // watermark still counts origin revisions and the child is not there. It
+    // triggers a read, and a still-invalid destination keeps the move pending.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 9 })));
+    expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" }, status: "working" });
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 9 })));
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p2" }, status: "idle" });
+    expect(h.supervisor.matches("p2")).toBe(true);
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "work_cycle_completed"]);
+
+    // The recovered move rebases too, so revision two is the next destination
+    // event rather than a jump from the origin pane's numbering.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ paneId: "p2", revision: 2, status: "working" })));
+    expect(h.supervisor.view()).toMatchObject({ status: "working", monitor: { evidenceGaps: 0 } });
+  });
+
+  it("settles replacement when the retained destination holds a different agent", async () => {
+    const h = await bound([invalidDestination()]);
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 6 }), { previous_pane_id: "p1" }));
+    // The origin pane is absent because this very move emptied it. Judging that
+    // absence would settle `pane_closed` on a child that is alive in p2.
+    await h.supervisor.onReconciliationSnapshot(snapshot([paneRecord({ paneId: "p2", terminalId: "t9" })], [{ pane_id: "p2", name: "other" }]));
+    expect(await h.supervisor.run()).toEqual({ outcome: "identity_replaced", reason: "periodic_snapshot" });
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "identity_replaced"]);
+  });
+
+  it("settles pane_closed only when the retained destination is itself absent", async () => {
+    const h = await bound([invalidDestination()]);
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 6 }), { previous_pane_id: "p1" }));
+    await h.supervisor.onReconciliationSnapshot(snapshot([], []));
+    expect(await h.supervisor.run()).toEqual({ outcome: "released", reason: "periodic_snapshot" });
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "pane_closed"]);
+  });
 });
 
 describe("supervisor reconnect and monitor health", () => {

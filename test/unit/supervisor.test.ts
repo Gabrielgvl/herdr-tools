@@ -48,6 +48,9 @@ function thinEvent(kind: string, paneId = "p1"): SupervisionSocketEvent {
   return parseSocketLine(JSON.stringify({ event: kind, data: { type: kind, pane_id: paneId, workspace_id: "w1" } })) as SupervisionSocketEvent;
 }
 
+/** The destination of a proven move whose read of that destination was invalid. */
+const invalidDestination = (paneId = "p2"): HerdrSnapshot => snapshot([paneRecord({ paneId }), paneRecord({ paneId })]);
+
 interface Harness {
   supervisor: Supervisor;
   wakes: SupervisionWake[];
@@ -70,7 +73,7 @@ interface Harness {
 interface HarnessOptions {
   snapshots?: Array<HerdrSnapshot | Error>;
   review?: (call: number) => Promise<SupervisionReviewResult>;
-  transcript?: () => Promise<string[]>;
+  transcript?: (paneId: string) => Promise<string[]>;
   cadenceMs?: number;
 }
 
@@ -573,9 +576,6 @@ describe("supervisor pane moves", () => {
     expect(types(invalid.wakes)).toEqual(["reconciliation_degraded"]);
   });
 
-  /** The destination of a proven move whose first destination read was invalid. */
-  const invalidDestination = (): HerdrSnapshot => snapshot([paneRecord({ paneId: "p2" }), paneRecord({ paneId: "p2" })]);
-
   it("follows a retained move destination once a later read of it is valid", async () => {
     const destination = paneRecord({ paneId: "p2", revision: 1, status: "idle" });
     const h = await bound([invalidDestination(), invalidDestination(), snapshot([destination], [{ pane_id: "p2", name: "worker" }])]);
@@ -615,6 +615,48 @@ describe("supervisor pane moves", () => {
     await h.supervisor.onReconciliationSnapshot(snapshot([], []));
     expect(await h.supervisor.run()).toEqual({ outcome: "released", reason: "periodic_snapshot" });
     expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "pane_closed"]);
+  });
+
+  it("reconciles a retained destination's own events instead of folding them on the origin watermark", async () => {
+    const destination = paneRecord({ paneId: "p2", revision: 1, status: "blocked" });
+    const h = await bound([invalidDestination(), snapshot([destination], [{ pane_id: "p2", name: "worker" }])]);
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1 }), { previous_pane_id: "p1" }));
+    // The destination is routed here from the moment it is retained: its events
+    // are this child's, and without them the move could never be completed by
+    // anything but a periodic snapshot.
+    expect(h.supervisor.matches("p2")).toBe(true);
+
+    // Pane-local revision one is below the origin pane's watermark of five, so
+    // folding it there would discard it. It drives an authoritative read of the
+    // destination, which both completes the move and adopts the proven status.
+    await h.supervisor.onEvent(paneEvent("pane_updated", destination));
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p2" }, status: "blocked" });
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(0);
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "blocked"]);
+  });
+
+  it("follows a chained move out of a retained destination without concluding the child was lost", async () => {
+    const h = await bound([
+      invalidDestination(),
+      invalidDestination("p3"),
+      snapshot([paneRecord({ paneId: "p3", revision: 2, status: "idle" })], [{ pane_id: "p3", name: "worker" }]),
+    ]);
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1 }), { previous_pane_id: "p1" }));
+    expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
+
+    // p2 -> p3 while p2 is still only the retained destination. Judging it a
+    // foreign move would reconcile p2 — which this second move has just emptied
+    // — and settle a false `pane_closed` on a child that is alive in p3.
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p3", revision: 2 }), { previous_pane_id: "p2" }));
+    expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
+    expect(h.supervisor.childLive()).toBe(true);
+    // The retained destination moved with the child, so p3 is now what routes.
+    expect(h.supervisor.matches("p3")).toBe(true);
+    expect(h.supervisor.matches("p2")).toBe(false);
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ paneId: "p3", revision: 2, status: "idle" })));
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p3" }, status: "idle" });
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "work_cycle_completed"]);
   });
 });
 
@@ -847,7 +889,7 @@ describe("supervisor reconnect and monitor health", () => {
 
 describe("supervisor review cadence", () => {
   async function working(options: HarnessOptions = {}): Promise<Harness> {
-    const h = harness({ ...options, snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    const h = harness({ ...options, snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), ...(options.snapshots ?? [])] });
     await h.supervisor.bind({ identity, profileName: "worker-pi" });
     return h;
   }
@@ -938,6 +980,55 @@ describe("supervisor review cadence", () => {
     await vi.waitFor(() => expect(h.supervisor.view().reviewer.reviews).toEqual([]));
     // The obsolete review stored nothing and armed nothing of its own.
     expect(h.timerArmed()).toBe(false);
+  });
+
+  it("neither reads a transcript nor reaches the reviewer while a move destination is unresolved", async () => {
+    const reads: string[] = [];
+    // The destination's first read is invalid, so the move is retained. The read
+    // that resolves it also shows p1 already reused by a different agent: the
+    // origin transcript is a stranger's output, and semantic review must never
+    // have touched it.
+    const resolved = snapshot(
+      [paneRecord({ paneId: "p2", revision: 1, status: "working" }), paneRecord({ terminalId: "t9", agentSession: { ...session, value: "other" } })],
+      [{ pane_id: "p2", name: "worker" }, { pane_id: "p1", name: "other" }],
+    );
+    const h = await working({ snapshots: [invalidDestination(), resolved], transcript: async (paneId) => { reads.push(paneId); return ["line"]; } });
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "working" }), { previous_pane_id: "p1" }));
+
+    h.fireTimer();
+    await Promise.resolve();
+    expect(reads).toEqual([]);
+    expect(h.reviews).toBe(0);
+    // The cadence keeps ticking so the run resumes rather than being abandoned.
+    expect(h.timerArmed()).toBe(true);
+
+    // Exact identity is re-established at the destination; review resumes there.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ paneId: "p2", revision: 1, status: "working" })));
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p2" } });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(reads).toEqual(["p2"]);
+  });
+
+  it("abandons an in-flight review when a move leaves the reviewed pane unresolved", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const reads: string[] = [];
+    const h = await working({
+      snapshots: [invalidDestination()],
+      transcript: async (paneId) => { reads.push(paneId); await gate; return ["line"]; },
+    });
+    const inFlight = (h.supervisor as unknown as { review(): Promise<void> }).review();
+    await vi.waitFor(() => expect(reads).toEqual(["p1"]));
+
+    // The child leaves p1 while its transcript is still being read. The read
+    // cannot be undone, but the model must not be reached with it.
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "working" }), { previous_pane_id: "p1" }));
+    release();
+    await inFlight;
+    expect(h.reviews).toBe(0);
+    expect(h.supervisor.view().reviewer).toMatchObject({ degraded: false, reviews: [] });
+    expect(h.timerArmed()).toBe(true);
   });
 
   it("clears the cadence when the child leaves the working state", async () => {

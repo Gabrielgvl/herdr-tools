@@ -322,8 +322,19 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     return this.state === "settled";
   }
 
+  /**
+   * A retained move destination is routed as well as the origin pane. The child
+   * is already there, so its lifecycle events — including a further move out of
+   * it — are this supervisor's evidence; without them a chained move would reach
+   * nobody and the origin pane's emptiness would later read as a closure.
+   */
   matches(paneId: string): boolean {
-    return !this.stopped && this.paneId === paneId;
+    return !this.stopped && (this.paneId === paneId || this.pendingMoveDestination?.paneId === paneId);
+  }
+
+  /** The pane this supervisor currently believes holds the child. */
+  private currentPaneId(): string {
+    return this.pendingMoveDestination?.paneId ?? this.identity!.paneId;
   }
 
   /**
@@ -459,8 +470,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    */
   private async followMove(event: SupervisionSocketEvent, pane: SupervisionPaneRecord): Promise<void> {
     // Atomicity is a protocol-boundary guarantee: a `pane_moved` without a
-    // previous pane id never reaches a supervisor.
-    if (event.previousPaneId! !== this.identity!.paneId) {
+    // previous pane id never reaches a supervisor. The origin is the pane the
+    // child is currently believed to occupy, so a chained move out of a retained
+    // destination is followed as this child's move rather than judged foreign —
+    // judging it foreign would reconcile a destination the child has already
+    // left and settle a false closure on it.
+    if (event.previousPaneId! !== this.currentPaneId()) {
       await this.reconcile("event:move_foreign_previous_pane");
       return;
     }
@@ -708,10 +723,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * either way.
    */
   private async review(): Promise<void> {
-    if (this.reviewing) {
-      // An obsolete review from an earlier run is still settling. Re-arm so the
-      // current run is not starved by a call it could not make.
-      if (this.reviewable()) this.armReview(this.deps.cadenceMs);
+    if (this.reviewing || this.pendingMoveDestination !== undefined) {
+      // Either an obsolete review from an earlier run is still settling, or a
+      // proven move has left the child's exact pane unresolved. Neither may read
+      // a transcript or reach the model: the origin pane no longer holds this
+      // child and Herdr reuses pane ids, so its output can already belong to
+      // somebody else. Re-arm so the current run is not starved by a call it
+      // could not make, and resume once exact identity is re-established.
+      if (this.reviewRunLive()) this.armReview(this.deps.cadenceMs);
       return;
     }
     if (!this.reviewable()) return;
@@ -765,17 +784,28 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // Only the run this review belonged to may re-arm. A newer run already
       // armed its own cadence when it began, and clearing that here would delay
       // it by a whole interval.
-      if (!this.stopped && this.reviewable(run)) this.armReview(this.deps.cadenceMs);
+      if (!this.stopped && this.reviewRunLive(run)) this.armReview(this.deps.cadenceMs);
     }
   }
 
   /**
-   * A review is only meaningful while the child is still inside the same
-   * continuous working run it was started for.
+   * The cadence still belongs to somebody: the child is inside the same
+   * continuous working run the review was armed for. This is what decides
+   * re-arming, so a run that is merely waiting for its exact pane keeps ticking.
    */
-  private reviewable(run?: number): boolean {
+  private reviewRunLive(run?: number): boolean {
     if (this.stopped || this.isSettled() || this.status !== "working") return false;
     return run === undefined || this.workingRun === run;
+  }
+
+  /**
+   * A review may actually read and dispatch: its run is live *and* the child's
+   * exact pane is proven. A pending move fails this closed at every checkpoint,
+   * so a move landing mid-review discards the result instead of reviewing a pane
+   * the child has left.
+   */
+  private reviewable(run?: number): boolean {
+    return this.pendingMoveDestination === undefined && this.reviewRunLive(run);
   }
 
   // -------------------------------------------------------------------- events

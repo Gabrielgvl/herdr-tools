@@ -23,11 +23,26 @@ export const SUPERVISION_EVENT_TYPES = [
   "pane_closed",
   "monitor_degraded",
   "monitor_recovered",
+  "reconciliation_degraded",
+  "reconciliation_recovered",
   "evidence_gap",
 ] as const;
 export type SupervisionEventType = (typeof SUPERVISION_EVENT_TYPES)[number];
 
 export type SupervisionEventPriority = "normal" | "high";
+
+export const RECONCILIATION_FAILURE_REASONS = [
+  "connect_failed",
+  "request_failed",
+  "snapshot_protocol_invalid",
+  "duplicate_target_pane",
+  "duplicate_target_agent",
+  "orphan_target_agent",
+  "target_identity_contradiction",
+  "target_record_malformed",
+  "revision_regressed",
+] as const;
+export type ReconciliationFailureReason = (typeof RECONCILIATION_FAILURE_REASONS)[number];
 
 /** Event types that settle the supervisor immediately after the wake. */
 export const SUPERVISION_SETTLING_EVENT_TYPES = ["identity_replaced", "identity_lost", "released", "pane_closed"] as const;

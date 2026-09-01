@@ -5,7 +5,9 @@ import {
   eventPriority,
   isSettlingEvent,
   materialTransitionEvent,
+  RECONCILIATION_FAILURE_REASONS,
   SupervisionEventLog,
+  SUPERVISION_EVENT_TYPES,
   SUPERVISION_MAX_EVENTS,
   SUPERVISION_MAX_RETURNED_EVENTS,
 } from "../../src/supervision/events.js";
@@ -35,10 +37,26 @@ describe("supervision event model", () => {
     expect(eventPriority("identity_lost")).toBe("high");
     expect(eventPriority("work_cycle_completed")).toBe("normal");
     expect(eventPriority("monitor_degraded")).toBe("normal");
+    expect(eventPriority("reconciliation_degraded")).toBe("normal");
+    expect(SUPERVISION_EVENT_TYPES).toContain("reconciliation_degraded");
+    expect(SUPERVISION_EVENT_TYPES).toContain("reconciliation_recovered");
+    expect(RECONCILIATION_FAILURE_REASONS).toEqual([
+      "connect_failed",
+      "request_failed",
+      "snapshot_protocol_invalid",
+      "duplicate_target_pane",
+      "duplicate_target_agent",
+      "orphan_target_agent",
+      "target_identity_contradiction",
+      "target_record_malformed",
+      "revision_regressed",
+    ]);
     expect(isSettlingEvent("released")).toBe(true);
     expect(isSettlingEvent("pane_closed")).toBe(true);
     expect(isSettlingEvent("identity_replaced")).toBe(true);
     expect(isSettlingEvent("blocked")).toBe(false);
+    expect(isSettlingEvent("reconciliation_degraded")).toBe(false);
+    expect(isSettlingEvent("reconciliation_recovered")).toBe(false);
   });
 
   it("mints opaque event ids and refuses an unusable factory", () => {

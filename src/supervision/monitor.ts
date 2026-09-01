@@ -18,6 +18,7 @@
  */
 
 import { parseSnapshotResult, type HerdrSnapshot } from "../targets.js";
+import type { ReconciliationFailureReason } from "./events.js";
 import type { SupervisionSocketEvent } from "./protocol.js";
 import {
   createNodeSupervisionConnect,
@@ -25,10 +26,28 @@ import {
   SupervisionSocket,
   SupervisionSocketError,
   type SupervisionConnect,
+  type SupervisionStream,
 } from "./socket.js";
 
 export const SUPERVISION_RECONNECT_MIN_MS = 250;
 export const SUPERVISION_RECONNECT_MAX_MS = 8_000;
+export const SUPERVISION_RECONCILIATION_INTERVAL_MS = 30_000;
+
+export interface MonitorTimer {
+  cancel(): void;
+}
+
+export interface MonitorScheduler {
+  setTimer(callback: () => void, milliseconds: number): MonitorTimer;
+}
+
+export const realMonitorScheduler: MonitorScheduler = {
+  setTimer: (callback, milliseconds) => {
+    const timer = setTimeout(callback, milliseconds);
+    timer.unref?.();
+    return { cancel: () => clearTimeout(timer) };
+  },
+};
 
 export interface MonitorClock {
   now(): number;
@@ -58,12 +77,17 @@ export interface SupervisionObserver {
   onMonitorDegraded(reason: string): void;
   /** The monitor restored its connection after a degraded episode. */
   onMonitorRecovered(): void;
+  /** One successful shared periodic snapshot, ordered with socket events. */
+  onReconciliationSnapshot?(snapshot: HerdrSnapshot): Promise<void>;
+  /** One failed shared periodic snapshot attempt. */
+  onReconciliationFailure?(reason: ReconciliationFailureReason): void | Promise<void>;
 }
 
 export interface SupervisionMonitorDependencies {
   connect?: SupervisionConnect;
   env?: NodeJS.ProcessEnv;
   clock?: MonitorClock;
+  scheduler?: MonitorScheduler;
   random?: () => number;
   requestTimeoutMs?: number;
   maxReconnectDelayMs?: number;
@@ -92,10 +116,15 @@ function reasonOf(error: unknown): string {
   return typeof code === "string" ? code : "SUPERVISION_SOCKET_CLOSED";
 }
 
+type SnapshotAttempt =
+  | { ok: true; snapshot: HerdrSnapshot }
+  | { ok: false; reason: Extract<ReconciliationFailureReason, "connect_failed" | "request_failed" | "snapshot_protocol_invalid">; error: unknown };
+
 export class SessionEventMonitor {
   private readonly connect: SupervisionConnect;
   private readonly env: NodeJS.ProcessEnv;
   private readonly clock: MonitorClock;
+  private readonly scheduler: MonitorScheduler;
   private readonly random: () => number;
   private readonly requestTimeoutMs: number | undefined;
   private readonly maxReconnectDelayMs: number;
@@ -112,11 +141,16 @@ export class SessionEventMonitor {
   private degraded = false;
   private stopped = false;
   private reconnecting = false;
+  private reconciliationTimer: MonitorTimer | undefined;
+  private reconciliationNextDueAt: number | undefined;
+  private reconciliationEpoch = 0;
+  private reconciliationInFlight = false;
 
   constructor(deps: SupervisionMonitorDependencies = {}) {
     this.connect = deps.connect ?? createNodeSupervisionConnect();
     this.env = deps.env ?? process.env;
     this.clock = deps.clock ?? realMonitorClock;
+    this.scheduler = deps.scheduler ?? realMonitorScheduler;
     this.random = deps.random ?? Math.random;
     this.requestTimeoutMs = deps.requestTimeoutMs;
     this.maxReconnectDelayMs = deps.maxReconnectDelayMs ?? SUPERVISION_RECONNECT_MAX_MS;
@@ -131,11 +165,15 @@ export class SessionEventMonitor {
   }
 
   addObserver(observer: SupervisionObserver): void {
+    if (this.stopped) return;
+    const wasEmpty = this.observers.size === 0;
     this.observers.add(observer);
+    if (wasEmpty && this.observers.size > 0) this.startPeriodicReconciliation();
   }
 
   removeObserver(observer: SupervisionObserver): void {
     this.observers.delete(observer);
+    if (this.observers.size === 0) this.stopPeriodicReconciliation();
   }
 
   /**
@@ -192,14 +230,120 @@ export class SessionEventMonitor {
   /**
    * Append one ordered unit of observer work to the single dispatch chain.
    *
-   * `dispatch` and `announce` are the only units, and both are total: every
-   * observer call they make is isolated, so the chain cannot be poisoned by one
-   * observer. A rejection here would therefore be a defect in the monitor
-   * itself, and swallowing it silently is what hid a lost lifecycle event
-   * before, so nothing is swallowed.
+   * Event dispatch, reconnect announcement, and periodic reconciliation are
+   * total units: every observer call they make is isolated, so the chain cannot
+   * be poisoned by one observer. A rejection here would therefore be a defect in
+   * the monitor itself, and swallowing it silently is what hid a lost lifecycle
+   * event before, so nothing is swallowed.
    */
   private enqueue(work: () => Promise<void>): void {
     this.dispatchTail = this.dispatchTail.then(work);
+  }
+
+  private startPeriodicReconciliation(): void {
+    this.reconciliationEpoch += 1;
+    this.reconciliationNextDueAt = this.clock.now() + SUPERVISION_RECONCILIATION_INTERVAL_MS;
+    this.armPeriodicReconciliation(this.reconciliationEpoch);
+  }
+
+  private stopPeriodicReconciliation(): void {
+    this.reconciliationEpoch += 1;
+    this.reconciliationTimer?.cancel();
+    this.reconciliationTimer = undefined;
+    this.reconciliationNextDueAt = undefined;
+  }
+
+  /** Schedule against fixed due times, never completion-relative sleeps. */
+  private armPeriodicReconciliation(epoch: number): void {
+    if (this.stopped || this.observers.size === 0 || epoch !== this.reconciliationEpoch || this.reconciliationTimer) return;
+    let dueAt = this.reconciliationNextDueAt;
+    if (dueAt === undefined) return;
+    const now = this.clock.now();
+    while (dueAt < now) dueAt += SUPERVISION_RECONCILIATION_INTERVAL_MS;
+    this.reconciliationNextDueAt = dueAt;
+    this.reconciliationTimer = this.scheduler.setTimer(() => {
+      this.reconciliationTimer = undefined;
+      void this.runPeriodicReconciliation(epoch, dueAt!);
+    }, Math.max(0, dueAt - now));
+  }
+
+  private async runPeriodicReconciliation(epoch: number, dueAt: number): Promise<void> {
+    if (this.stopped || this.observers.size === 0 || epoch !== this.reconciliationEpoch) return;
+    let nextDueAt = dueAt + SUPERVISION_RECONCILIATION_INTERVAL_MS;
+    const startedAt = this.clock.now();
+    while (nextDueAt <= startedAt) nextDueAt += SUPERVISION_RECONCILIATION_INTERVAL_MS;
+    this.reconciliationNextDueAt = nextDueAt;
+    if (this.reconciliationInFlight) {
+      this.armPeriodicReconciliation(epoch);
+      return;
+    }
+
+    const participants = [...this.observers];
+    this.reconciliationInFlight = true;
+    try {
+      const attempt = await this.readSnapshotAttempt();
+      if (this.stopped || this.observers.size === 0 || epoch !== this.reconciliationEpoch) return;
+      if (attempt.ok) this.enqueue(() => this.dispatchReconciliationSnapshot(attempt.snapshot, participants, epoch));
+      else this.enqueue(() => this.dispatchReconciliationFailure(attempt.reason, participants, epoch));
+    } finally {
+      this.reconciliationInFlight = false;
+      this.armPeriodicReconciliation(epoch);
+    }
+  }
+
+  private async dispatchReconciliationSnapshot(snapshot: HerdrSnapshot, participants: readonly SupervisionObserver[], epoch: number): Promise<void> {
+    if (this.stopped || epoch !== this.reconciliationEpoch) return;
+    for (const observer of participants) {
+      if (!this.observers.has(observer) || !observer.onReconciliationSnapshot) continue;
+      try {
+        await observer.onReconciliationSnapshot(snapshot);
+      } catch {
+        // The observer owns its reconciliation state and failure evidence.
+      }
+    }
+  }
+
+  private async dispatchReconciliationFailure(reason: ReconciliationFailureReason, participants: readonly SupervisionObserver[], epoch: number): Promise<void> {
+    if (this.stopped || epoch !== this.reconciliationEpoch) return;
+    for (const observer of participants) {
+      if (!this.observers.has(observer) || !observer.onReconciliationFailure) continue;
+      try {
+        await observer.onReconciliationFailure(reason);
+      } catch {
+        // Isolated so every participant receives the shared attempt outcome.
+      }
+    }
+  }
+
+  private async readSnapshotAttempt(): Promise<SnapshotAttempt> {
+    let stream: SupervisionStream;
+    try {
+      stream = await this.connect(resolveSocketPath(this.env));
+    } catch (error) {
+      return { ok: false, reason: "connect_failed", error };
+    }
+    let socket: SupervisionSocket;
+    try {
+      socket = new SupervisionSocket(stream, this.requestTimeoutMs);
+    } catch (error) {
+      stream.destroy();
+      return { ok: false, reason: "request_failed", error };
+    }
+    try {
+      let result: unknown;
+      try {
+        result = await socket.request("session.snapshot", {});
+      } catch (error) {
+        return { ok: false, reason: "request_failed", error };
+      }
+      try {
+        return { ok: true, snapshot: parseSnapshotResult(result) };
+      } catch (error) {
+        return { ok: false, reason: "snapshot_protocol_invalid", error };
+      }
+    } finally {
+      socket.close();
+    }
   }
 
   /**
@@ -208,12 +352,9 @@ export class SessionEventMonitor {
    */
   async snapshot(): Promise<HerdrSnapshot> {
     this.assertRunning();
-    const socket = new SupervisionSocket(await this.connect(resolveSocketPath(this.env)), this.requestTimeoutMs);
-    try {
-      return parseSnapshotResult(await socket.request("session.snapshot", {}));
-    } finally {
-      socket.close();
-    }
+    const attempt = await this.readSnapshotAttempt();
+    if (!attempt.ok) throw attempt.error;
+    return attempt.snapshot;
   }
 
   private async dispatch(event: SupervisionSocketEvent): Promise<void> {
@@ -286,6 +427,7 @@ export class SessionEventMonitor {
    */
   stop(): void {
     this.stopped = true;
+    this.stopPeriodicReconciliation();
     this.observers.clear();
     this.socket?.close();
     this.socket = undefined;

@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { SessionEventMonitor, type MonitorClock, type SupervisionObserver } from "../../src/supervision/monitor.js";
-import { scriptedServer } from "./supervision-peer.js";
+import {
+  SessionEventMonitor,
+  SUPERVISION_RECONCILIATION_INTERVAL_MS,
+  type MonitorClock,
+  type MonitorScheduler,
+  type SupervisionObserver,
+} from "../../src/supervision/monitor.js";
+import type { ReconciliationFailureReason } from "../../src/supervision/events.js";
+import { emptySnapshotResult, scriptedServer } from "./supervision-peer.js";
 import type { SupervisionStream } from "../../src/supervision/socket.js";
 import type { SupervisionSocketEvent } from "../../src/supervision/protocol.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
@@ -9,19 +16,53 @@ function observer(paneId: string) {
   const events: SupervisionSocketEvent[] = [];
   const bootstraps: Array<{ generation: number; reconnected: boolean }> = [];
   const degraded: string[] = [];
+  const reconciliations: HerdrSnapshot[] = [];
+  const reconciliationFailures: ReconciliationFailureReason[] = [];
   let recovered = 0;
-  const value: SupervisionObserver & { events: typeof events; bootstraps: typeof bootstraps; degraded: typeof degraded; recovered: () => number } = {
+  const value: SupervisionObserver & {
+    events: typeof events;
+    bootstraps: typeof bootstraps;
+    degraded: typeof degraded;
+    reconciliations: typeof reconciliations;
+    reconciliationFailures: typeof reconciliationFailures;
+    recovered: () => number;
+  } = {
     matches: (candidate) => candidate === paneId,
     onEvent: async (event) => { events.push(event); },
     onBootstrap: async (_snapshot: HerdrSnapshot, generation, reconnected) => { bootstraps.push({ generation, reconnected }); },
     onMonitorDegraded: (reason) => { degraded.push(reason); },
     onMonitorRecovered: () => { recovered += 1; },
+    onReconciliationSnapshot: async (snapshot) => { reconciliations.push(snapshot); },
+    onReconciliationFailure: (reason) => { reconciliationFailures.push(reason); },
     events,
     bootstraps,
     degraded,
+    reconciliations,
+    reconciliationFailures,
     recovered: () => recovered,
   };
   return value;
+}
+
+class ManualMonitorScheduler implements MonitorScheduler {
+  private readonly timers: Array<{ callback: () => void; milliseconds: number; active: boolean }> = [];
+
+  setTimer(callback: () => void, milliseconds: number) {
+    const timer = { callback, milliseconds, active: true };
+    this.timers.push(timer);
+    return { cancel: () => { timer.active = false; } };
+  }
+
+  pendingDelays(): number[] {
+    return this.timers.filter((timer) => timer.active).map((timer) => timer.milliseconds);
+  }
+
+  fireNext(): void {
+    const timer = this.timers.find((candidate) => candidate.active);
+    if (!timer) throw new Error("no monitor timer is armed");
+    timer.active = false;
+    timer.callback();
+  }
 }
 
 const instantClock: MonitorClock = { now: () => Date.now(), sleep: async () => undefined };
@@ -47,6 +88,118 @@ describe("the session event monitor", () => {
     expect((await monitor.snapshot()).protocol).toBe(20);
     expect(connect).toHaveBeenCalledTimes(3);
     expect(peer.requests).toEqual(["session.snapshot", "events.subscribe", "session.snapshot"]);
+    monitor.stop();
+  });
+
+  it("runs one shared periodic snapshot for every observer and cancels with the last observer", async () => {
+    let now = 0;
+    const scheduler = new ManualMonitorScheduler();
+    const peer = scriptedServer();
+    const monitor = new SessionEventMonitor({
+      connect: () => peer.connect(),
+      env,
+      clock: { now: () => now, sleep: async () => undefined },
+      scheduler,
+    });
+    expect(scheduler.pendingDelays()).toEqual([]);
+    const first = observer("p1");
+    const second = observer("p2");
+    monitor.addObserver(first);
+    monitor.addObserver(second);
+    expect(scheduler.pendingDelays()).toEqual([SUPERVISION_RECONCILIATION_INTERVAL_MS]);
+    await monitor.ensureStarted();
+    expect(first.reconciliations).toEqual([]);
+    expect(second.reconciliations).toEqual([]);
+
+    now = SUPERVISION_RECONCILIATION_INTERVAL_MS;
+    scheduler.fireNext();
+    await vi.waitFor(() => expect(first.reconciliations).toHaveLength(1));
+    expect(second.reconciliations).toHaveLength(1);
+    expect(peer.requests).toEqual(["session.snapshot", "events.subscribe", "session.snapshot"]);
+    expect(scheduler.pendingDelays()).toEqual([SUPERVISION_RECONCILIATION_INTERVAL_MS]);
+
+    monitor.removeObserver(first);
+    expect(scheduler.pendingDelays()).toEqual([SUPERVISION_RECONCILIATION_INTERVAL_MS]);
+    monitor.removeObserver(second);
+    expect(scheduler.pendingDelays()).toEqual([]);
+    expect(() => scheduler.fireNext()).toThrow(/no monitor timer/u);
+    monitor.stop();
+  });
+
+  it("uses fixed due times, never overlaps reads, and skips delayed catch-up bursts", async () => {
+    let now = 0;
+    let releaseConnect!: () => void;
+    const heldConnect = new Promise<void>((resolve) => { releaseConnect = resolve; });
+    const scheduler = new ManualMonitorScheduler();
+    const peer = scriptedServer();
+    const connect = vi.fn(async () => {
+      if (connect.mock.calls.length === 3) await heldConnect;
+      return peer.connect();
+    });
+    const monitor = new SessionEventMonitor({
+      connect,
+      env,
+      clock: { now: () => now, sleep: async () => undefined },
+      scheduler,
+    });
+    const watcher = observer("p1");
+    monitor.addObserver(watcher);
+    await monitor.ensureStarted();
+
+    now = 30_000;
+    scheduler.fireNext();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(3));
+    expect(scheduler.pendingDelays()).toEqual([]);
+    expect(watcher.reconciliations).toEqual([]);
+
+    now = 45_000;
+    releaseConnect();
+    await vi.waitFor(() => expect(watcher.reconciliations).toHaveLength(1));
+    // The next fixed due time is 60s, not 30s after the 45s completion.
+    expect(scheduler.pendingDelays()).toEqual([15_000]);
+
+    // Firing the 60s timer late at 95s skips the elapsed 90s due time. It runs
+    // once and schedules 120s instead of bursting a second catch-up attempt.
+    now = 95_000;
+    scheduler.fireNext();
+    await vi.waitFor(() => expect(watcher.reconciliations).toHaveLength(2));
+    expect(connect).toHaveBeenCalledTimes(4);
+    expect(scheduler.pendingDelays()).toEqual([25_000]);
+    expect(peer.requests.filter((request) => request === "session.snapshot")).toHaveLength(3);
+    monitor.stop();
+    expect(scheduler.pendingDelays()).toEqual([]);
+  });
+
+  it("reports fixed shared-attempt failures without leaking causes and recovers on a valid snapshot", async () => {
+    let now = 0;
+    const scheduler = new ManualMonitorScheduler();
+    const peer = scriptedServer({ snapshots: [emptySnapshotResult, { type: "backend-secret" }, emptySnapshotResult] });
+    const connect = vi.fn(async () => {
+      if (connect.mock.calls.length === 3) throw new Error("connect-backend-secret");
+      return peer.connect();
+    });
+    const monitor = new SessionEventMonitor({
+      connect,
+      env,
+      clock: { now: () => now, sleep: async () => undefined },
+      scheduler,
+    });
+    const watcher = observer("p1");
+    monitor.addObserver(watcher);
+    await monitor.ensureStarted();
+
+    now = 30_000;
+    scheduler.fireNext();
+    await vi.waitFor(() => expect(watcher.reconciliationFailures).toEqual(["connect_failed"]));
+    now = 60_000;
+    scheduler.fireNext();
+    await vi.waitFor(() => expect(watcher.reconciliationFailures).toEqual(["connect_failed", "snapshot_protocol_invalid"]));
+    now = 90_000;
+    scheduler.fireNext();
+    await vi.waitFor(() => expect(watcher.reconciliations).toHaveLength(1));
+
+    expect(JSON.stringify(watcher.reconciliationFailures)).not.toContain("backend-secret");
+    expect(scheduler.pendingDelays()).toEqual([30_000]);
     monitor.stop();
   });
 

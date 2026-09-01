@@ -1,7 +1,8 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { accessSync, constants, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { CORE_TOOL_NAMES } from "../../src/tool-surface.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -10,6 +11,30 @@ const manifest = JSON.parse(readFileSync(join(packageRoot, ".claude-plugin/plugi
 const serverMap = JSON.parse(readFileSync(join(packageRoot, "mcp-servers.json"), "utf8")) as Record<string, { command?: string; args?: string[]; env?: Record<string, string> }>;
 const skill = readFileSync(join(packageRoot, "skills/manager/SKILL.md"), "utf8");
 
+/**
+ * The stdio command the server map may pin. Two forms are supported and nothing
+ * else: the literal `node`, which is what the tracked canonical map carries and
+ * what resolves through `PATH`, and the absolute path of an executable file
+ * named `node`, which is what an operator whose Node is provided by a version
+ * manager (Volta, nvm, asdf, a Nix profile) ends up pinning locally. Everything
+ * else is rejected, including a relative path, a wrapper script under another
+ * name, an argument-carrying command string, a shell, and an absolute path that
+ * is not an executable file on this machine — a command the plugin host would
+ * execute must be a real Node binary, not merely a plausible-looking string.
+ */
+function isSupportedNodeCommand(command: unknown): boolean {
+  if (typeof command !== "string" || command.length === 0) return false;
+  if (command === "node") return true;
+  if (!isAbsolute(command) || basename(command) !== "node") return false;
+  try {
+    if (!statSync(command).isFile()) return false;
+    accessSync(command, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function tree(directory: string, prefix = ""): string[] {
   return readdirSync(directory).flatMap((entry) => {
     const full = join(directory, entry);
@@ -17,6 +42,55 @@ function tree(directory: string, prefix = ""): string[] {
     return statSync(full).isDirectory() ? tree(full, relative) : [relative];
   }).sort();
 }
+
+describe("supported stdio Node command", () => {
+  const fixtures = mkdtempSync(join(tmpdir(), "herdr-plugin-command-"));
+  const executable = join(fixtures, "node");
+  const unreadable = join(fixtures, "not-executable", "node");
+  const renamed = join(fixtures, "nodejs");
+  const directory = join(fixtures, "as-directory", "node");
+  writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  mkdirSync(dirname(unreadable), { recursive: true });
+  writeFileSync(unreadable, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+  writeFileSync(renamed, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  mkdirSync(directory, { recursive: true });
+
+  afterAll(() => rmSync(fixtures, { recursive: true, force: true }));
+
+  it("accepts the literal command and an absolute executable named node", () => {
+    expect(isSupportedNodeCommand("node")).toBe(true);
+    expect(isSupportedNodeCommand(executable)).toBe(true);
+    // The Node running this suite is itself a supported pin on any platform
+    // whose interpreter is named `node`, which is the case this contract exists
+    // for; assert it only there so the check stays a fact, not a guess.
+    if (basename(process.execPath) === "node") expect(isSupportedNodeCommand(process.execPath)).toBe(true);
+  });
+
+  it("rejects every other command shape", () => {
+    for (const rejected of [
+      "",
+      "  ",
+      "sh",
+      "bash",
+      "nodejs",
+      "node --experimental-strip-types",
+      "/usr/bin/env node",
+      "./node",
+      join("relative", "node"),
+      `${executable} --inspect`,
+      renamed,
+      unreadable,
+      directory,
+      join(fixtures, "missing", "node"),
+      fixtures
+    ]) {
+      expect(isSupportedNodeCommand(rejected), rejected).toBe(false);
+    }
+    for (const rejected of [undefined, null, 0, false, ["node"], { command: "node" }]) {
+      expect(isSupportedNodeCommand(rejected), JSON.stringify(rejected) ?? "undefined").toBe(false);
+    }
+  });
+});
 
 describe("Claude manager plugin package", () => {
   it("contains only the manifest, the server map, and the conduct skill", () => {
@@ -39,14 +113,19 @@ describe("Claude manager plugin package", () => {
 
   it("registers exactly one stdio server under the pinned key", () => {
     expect(Object.keys(serverMap)).toEqual(["herdr"]);
-    expect(serverMap.herdr).toEqual({
-      command: "node",
-      args: ["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"]
-    });
+    const entry = serverMap.herdr!;
+    // The entry carries nothing but the command and its args: no `env`, no
+    // transport override, no working directory.
+    expect(Object.keys(entry).sort()).toEqual(["args", "command"]);
+    expect(entry.args).toEqual(["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"]);
+    // The command is asserted semantically, not literally: the tracked map pins
+    // `node`, while a locally installed copy may pin the absolute Node binary a
+    // version manager selected. Both run the same entry; nothing else may.
+    expect(isSupportedNodeCommand(entry.command), `unsupported stdio command ${JSON.stringify(entry.command)}`).toBe(true);
     // `CLAUDE_PROJECT_DIR` is exported to MCP server subprocesses by Claude Code
     // itself, verified live against a loaded plugin, so no explicit `env`
     // mapping is carried. The server still refuses to start without it.
-    expect(serverMap.herdr!.env).toBeUndefined();
+    expect(entry.env).toBeUndefined();
   });
 
   it("resolves its command to the installed main build entry", () => {

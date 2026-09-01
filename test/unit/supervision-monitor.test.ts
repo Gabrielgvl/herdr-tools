@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  realMonitorClock,
   SessionEventMonitor,
   SUPERVISION_RECONCILIATION_INTERVAL_MS,
   type MonitorClock,
@@ -375,6 +376,32 @@ describe("the session event monitor", () => {
     await expect(requestMonitor.snapshot()).rejects.toThrow("request failed");
     expect(requestWrites).toBe(1);
     expect(requestDestroyed).toBe(1);
+
+    const defaults = new SessionEventMonitor();
+    defaults.stop();
+
+    const reconnectPeer = scriptedServer();
+    let failures = 1;
+    const degraded = observer("p1");
+    const reconnectMonitor = new SessionEventMonitor({
+      connect: async () => {
+        if (reconnectPeer.connects >= 2 && failures > 0) {
+          failures -= 1;
+          throw new Error("missing code");
+        }
+        return reconnectPeer.connect();
+      },
+      env,
+      random: () => 0,
+      maxReconnectDelayMs: 1,
+    });
+    reconnectMonitor.addObserver(degraded);
+    await reconnectMonitor.ensureStarted();
+    reconnectPeer.closeSubscription();
+    await vi.waitFor(() => expect(degraded.degraded).toEqual(["SUPERVISION_SOCKET_CLOSED"]));
+    expect(degraded.recovered()).toBe(1);
+    reconnectMonitor.stop();
+    await expect(realMonitorClock.sleep(0)).resolves.toBeUndefined();
   });
 
   it("refuses to start without a socket path, and after shutdown", async () => {

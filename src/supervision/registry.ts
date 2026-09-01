@@ -171,7 +171,12 @@ export class SupervisionRegistry implements SupervisionCoordinator {
     const bound = await ready.promise;
     return {
       jobId: registered.jobId,
-      bind: (binding) => bound.bind(binding),
+      bind: async (binding) => {
+        // The job request and the supervision view are updated together, so a
+        // fallback-selected profile can never be authoritative in only one.
+        this.deps.jobs.bindSupervisionChild(registered.jobId, { agentKind: binding.identity.agentKind, profileName: binding.profileName });
+        await bound.bind(binding);
+      },
       release: (reason) => bound.release(reason),
     };
   }

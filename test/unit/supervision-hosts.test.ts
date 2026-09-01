@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,9 +25,16 @@ async function herdrSocket(): Promise<{ path: string; push(line: string): void }
   const directory = mkdtempSync(join(tmpdir(), "herdr-hosts-"));
   directories.push(directory);
   const path = join(directory, "herdr.sock");
-  const clients: Array<{ write(line: string): void }> = [];
+  const clients = new Set<Socket>();
   const server = createServer((socket) => {
-    clients.push({ write: (line) => socket.write(line) });
+    clients.add(socket);
+    // Every `session.snapshot` is its own short-lived connection, so by the time
+    // an event is pushed most of these sockets are already gone. A closed peer
+    // is forgotten rather than written to, and a write that still loses the race
+    // is absorbed here: an unhandled socket error is an uncaught exception.
+    const forget = (): void => { clients.delete(socket); };
+    socket.on("close", forget);
+    socket.on("error", forget);
     socket.on("data", (chunk) => {
       for (const line of chunk.toString("utf8").split("\n").filter((value) => value.trim().length > 0)) {
         const request = JSON.parse(line) as { id: string; method: string };
@@ -38,7 +45,7 @@ async function herdrSocket(): Promise<{ path: string; push(line: string): void }
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(path, () => resolve()));
-  return { path, push: (line) => { for (const client of clients) client.write(line); } };
+  return { path, push: (line) => { for (const client of clients) if (!client.destroyed) client.write(line); } };
 }
 
 const paneUpdated = (status: string, revision: number): string =>

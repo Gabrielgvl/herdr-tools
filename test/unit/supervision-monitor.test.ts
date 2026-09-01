@@ -108,6 +108,17 @@ describe("the session event monitor", () => {
       random: () => 0.5,
       maxReconnectDelayMs: 1_000,
     });
+    // Health is reported to every observer, so a first one that fails on either
+    // health call must not cost the rest their degradation, recovery, or
+    // bootstrap. A failure escaping the reconnect loop would also leave the
+    // monitor permanently marked reconnecting and never reconnect again.
+    monitor.addObserver({
+      matches: () => true,
+      onEvent: async () => undefined,
+      onBootstrap: async () => undefined,
+      onMonitorDegraded: () => { throw new Error("degradation failed"); },
+      onMonitorRecovered: () => { throw new Error("recovery failed"); },
+    });
     const watcher = observer("p1");
     monitor.addObserver(watcher);
     await monitor.ensureStarted();
@@ -169,11 +180,11 @@ describe("stream ordering and dead-socket refusal", () => {
     let seen = 0;
     monitor.addObserver({
       matches: () => true,
-      onEvent: async (event, ordinal) => {
-        order.push(`start:${event.event}:${ordinal}`);
+      onEvent: async (event) => {
+        order.push(`start:${event.event}`);
         // The first event suspends, exactly as a reconciliation snapshot does.
         if (++seen === 1) await firstBlocked;
-        order.push(`end:${event.event}:${ordinal}`);
+        order.push(`end:${event.event}`);
       },
       onBootstrap: async () => undefined,
       onMonitorDegraded: () => undefined,
@@ -183,21 +194,21 @@ describe("stream ordering and dead-socket refusal", () => {
 
     peer.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
     peer.push(`${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { pane_id: "p1", terminal_id: "t1", tab_id: "tab", workspace_id: "w1", agent_status: "idle", revision: 2 } } })}\n`);
-    await vi.waitFor(() => expect(order).toEqual(["start:pane_closed:1"]));
+    await vi.waitFor(() => expect(order).toEqual(["start:pane_closed"]));
     // The later full update cannot overtake the suspended thin event.
     releaseFirst();
     await vi.waitFor(() => expect(order).toHaveLength(4));
-    expect(order).toEqual(["start:pane_closed:1", "end:pane_closed:1", "start:pane_updated:2", "end:pane_updated:2"]);
+    expect(order).toEqual(["start:pane_closed", "end:pane_closed", "start:pane_updated", "end:pane_updated"]);
     monitor.stop();
   });
 
-  it("counts ordinals over every accepted event, not only routed ones", async () => {
+  it("routes an event only to the observers whose pane it names", async () => {
     const peer = scriptedServer();
     const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
-    const ordinals: number[] = [];
+    const routed: string[] = [];
     monitor.addObserver({
       matches: (paneId) => paneId === "p2",
-      onEvent: async (_event, ordinal) => { ordinals.push(ordinal); },
+      onEvent: async (event) => { routed.push(event.paneId); },
       onBootstrap: async () => undefined,
       onMonitorDegraded: () => undefined,
       onMonitorRecovered: () => undefined,
@@ -206,41 +217,84 @@ describe("stream ordering and dead-socket refusal", () => {
     for (const paneId of ["p1", "p2", "p1", "p2"]) {
       peer.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: paneId, workspace_id: "w1" } })}\n`);
     }
-    await vi.waitFor(() => expect(ordinals).toHaveLength(2));
-    // Ordinal 2 and 4: the log position, not this observer's own count.
-    expect(ordinals).toEqual([2, 4]);
+    await vi.waitFor(() => expect(routed).toHaveLength(2));
+    expect(routed).toEqual(["p2", "p2"]);
     monitor.stop();
   });
 
-  it("survives an observer that throws without breaking the ordered chain", async () => {
+  it("delivers an event and a bootstrap to every matching observer even when one fails", async () => {
     const peer = scriptedServer();
     const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
-    const seen: number[] = [];
+    const thrower: string[] = [];
+    const sibling = observer("p1");
+    // A failing observer must neither break the ordered dispatch chain nor
+    // deprive its siblings of the very event it failed on: the monitor can never
+    // deliver that event again. Each of its three entry points can fail, and
+    // `onEvent` fails before its first await, which a rejected promise misses.
     monitor.addObserver({
-      matches: () => true,
-      onEvent: async (_event, ordinal) => {
-        seen.push(ordinal);
-        // A throwing observer must not break the ordered dispatch chain.
-        if (seen.length === 1) throw new Error("observer failed");
-      },
-      onBootstrap: async () => undefined,
+      matches: (paneId) => { thrower.push(`matches:${paneId}`); throw new Error("routing failed"); },
+      onEvent: () => { throw new Error("fold failed"); },
+      onBootstrap: async () => { throw new Error("bootstrap failed"); },
       onMonitorDegraded: () => undefined,
-      onMonitorRecovered: () => undefined,
+      onMonitorRecovered: () => { throw new Error("recovery failed"); },
     });
+    monitor.addObserver(sibling);
     await monitor.ensureStarted();
     const closed = `${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`;
     peer.push(closed);
     peer.push(closed);
-    await vi.waitFor(() => expect(seen).toEqual([1, 2]));
+    await vi.waitFor(() => expect(sibling.events).toHaveLength(2));
+    // A `matches` that throws claims nothing, so the failing observer is skipped
+    // rather than aborting the routing decision for the ones behind it.
+    expect(thrower).toEqual(["matches:p1", "matches:p1"]);
+
+    // The same isolation on the reconnect path: degradation, recovery, and the
+    // bootstrap all reach the sibling.
+    peer.closeSubscription();
+    await vi.waitFor(() => expect(sibling.bootstraps).toEqual([{ generation: 2, reconnected: true }]));
 
     // A superseded connection cannot emit: it is closed before it is replaced.
     const superseded = peer.emitter();
     peer.closeSubscription();
-    await vi.waitFor(() => expect(peer.connects).toBeGreaterThan(2));
+    await vi.waitFor(() => expect(peer.connects).toBeGreaterThan(4));
     superseded(closed);
     await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(seen).toEqual([1, 2]);
+    expect(sibling.events).toHaveLength(2);
     monitor.stop();
+  });
+
+
+  it("delivers events that arrive inside the acknowledgement's own chunk", async () => {
+    // The socket accepts events the moment the acknowledgement lands, which can
+    // be before `subscribe` resolves. A handler installed afterwards would drop
+    // the head of the replay into an undefined callback, silently.
+    const closed = `${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`;
+    const peer = scriptedServer({ eventsWithAck: [closed, closed] });
+    const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
+    const watcher = observer("p1");
+    monitor.addObserver(watcher);
+    await monitor.ensureStarted();
+    await vi.waitFor(() => expect(watcher.events).toHaveLength(2));
+    expect(watcher.events.map((event) => event.paneId)).toEqual(["p1", "p1"]);
+    monitor.stop();
+  });
+
+  it("refuses to adopt a connection for a session that stopped while it was starting", async () => {
+    // Stopping is the end of the manager session. A bootstrap still awaiting its
+    // acknowledgement must not hand the stopped monitor a live socket, which
+    // would outlive the session it belonged to.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const peer = scriptedServer({ holdSubscribe: held });
+    const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
+    const starting = monitor.ensureStarted();
+    await vi.waitFor(() => expect(peer.requests).toContain("events.subscribe"));
+    monitor.stop();
+    release();
+    await expect(starting).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
+    // Nothing was adopted, so the abandoned attempt is not shared with a later caller.
+    expect(monitor.generation).toBe(0);
+    await expect(monitor.ensureStarted()).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
   });
 
   it("refuses to adopt a subscription whose socket died before adoption", async () => {

@@ -22,6 +22,8 @@ export interface SupervisionChildView {
   profileName: string;
   /** Present only when fallback selection changed the profile after reservation. */
   requestedProfileName?: string;
+  /** Present only when fallback selection changed the kind after reservation. */
+  requestedAgentKind?: string;
 }
 
 export interface SupervisionMonitorView {

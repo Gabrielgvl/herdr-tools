@@ -44,12 +44,14 @@ export interface SupervisionObserver {
   /** True when this observer is currently bound to the given pane id. */
   matches(paneId: string): boolean;
   /**
-   * One stream event for a pane this observer matched, with its ordinal in this
-   * connection's event stream. The replay is deterministic and the ordinal counts
-   * every accepted event rather than only routed ones, so ordinal `n` names the
-   * same log entry on every connection regardless of which pane it concerns.
+   * One stream event for a pane this observer matched.
+   *
+   * The monitor deliberately supplies no stream position. Herdr's retained log
+   * can drop entries from its head, so a connection-local position is not a
+   * stable event identity: after truncation the same position names a different
+   * entry. An observer must decide from the event's own authoritative content.
    */
-  onEvent(event: SupervisionSocketEvent, ordinal: number): Promise<void>;
+  onEvent(event: SupervisionSocketEvent): Promise<void>;
   /** A fresh bootstrap. `reconnected` is false only for the very first one. */
   onBootstrap(snapshot: HerdrSnapshot, generation: number, reconnected: boolean): Promise<void>;
   /** The monitor lost its connection and could not immediately restore it. */
@@ -70,6 +72,19 @@ export interface SupervisionMonitorDependencies {
 function backoffDelay(attempt: number, random: () => number, maxDelayMs: number): number {
   const ceiling = Math.min(maxDelayMs, SUPERVISION_RECONNECT_MIN_MS * 2 ** Math.min(attempt, 16));
   return Math.max(1, Math.floor(random() * ceiling));
+}
+
+/**
+ * Whether one event belongs to one observer. A `matches` that fails is read as
+ * "not this observer": a broken observer cannot claim an event, and it must not
+ * abort the routing decision for the ones that come after it.
+ */
+function routes(observer: SupervisionObserver, event: SupervisionSocketEvent): boolean {
+  try {
+    return observer.matches(event.paneId) || (event.previousPaneId !== undefined && observer.matches(event.previousPaneId));
+  } catch {
+    return false;
+  }
 }
 
 function reasonOf(error: unknown): string {
@@ -130,7 +145,7 @@ export class SessionEventMonitor {
    * every read is a separate connection on this protocol.
    */
   async ensureStarted(): Promise<void> {
-    if (this.stopped) throw new SupervisionSocketError("SUPERVISION_SOCKET_CLOSED", "The supervision monitor has been shut down");
+    this.assertRunning();
     if (this.socket && !this.socket.isClosed()) return;
     this.starting ??= this.bootstrap(false).finally(() => { this.starting = undefined; });
     await this.starting;
@@ -138,29 +153,31 @@ export class SessionEventMonitor {
 
   private async bootstrap(reconnected: boolean, recovered = false): Promise<HerdrSnapshot> {
     const snapshot = await this.snapshot();
+    this.assertRunning();
     const socket = new SupervisionSocket(await this.connect(resolveSocketPath(this.env)), this.requestTimeoutMs);
+    // Handlers are installed before the subscription is issued: Herdr may deliver
+    // the acknowledgement and the first replay events in one chunk, and the
+    // socket accepts those events the moment the acknowledgement lands. A handler
+    // installed after `subscribe` resolves would miss them silently.
+    socket.onEvent((event) => { this.enqueue(() => this.dispatch(event)); });
+    socket.onClose(() => { void this.onSocketClosed(); });
     try {
       await socket.subscribe();
+      // A monitor stopped while this bootstrap was awaiting must not adopt a live
+      // connection: the session it belonged to is over, and the socket would
+      // outlive it.
+      this.assertRunning();
+      // A socket that died between the acknowledgement and adoption is never
+      // adopted either: keeping it would leave supervision reporting an active
+      // subscription that can never deliver another event.
+      const closure = socket.closure();
+      if (closure) throw closure;
     } catch (error) {
       socket.close();
       throw error;
     }
-    // A socket that died between the acknowledgement and adoption is never
-    // adopted: keeping it would leave supervision reporting an active
-    // subscription that can never deliver another event.
-    const closure = socket.closure();
-    if (closure) throw closure;
     this.socket = socket;
     this.generationValue += 1;
-    // The ordinal counter belongs to this connection, so a later connection
-    // restarts counting without disturbing work already queued from this one.
-    // A superseded socket cannot emit: it is always closed before it is replaced.
-    const stream = { ordinal: 0 };
-    socket.onEvent((event) => {
-      const ordinal = ++stream.ordinal;
-      this.enqueue(() => this.dispatch(event, ordinal));
-    });
-    socket.onClose(() => { void this.onSocketClosed(); });
     if (reconnected) {
       const generation = this.generationValue;
       this.enqueue(() => this.announce(snapshot, generation, recovered));
@@ -168,9 +185,21 @@ export class SessionEventMonitor {
     return snapshot;
   }
 
-  /** Append one ordered unit of observer work to the single dispatch chain. */
+  private assertRunning(): void {
+    if (this.stopped) throw new SupervisionSocketError("SUPERVISION_SOCKET_CLOSED", "The supervision monitor has been shut down");
+  }
+
+  /**
+   * Append one ordered unit of observer work to the single dispatch chain.
+   *
+   * `dispatch` and `announce` are the only units, and both are total: every
+   * observer call they make is isolated, so the chain cannot be poisoned by one
+   * observer. A rejection here would therefore be a defect in the monitor
+   * itself, and swallowing it silently is what hid a lost lifecycle event
+   * before, so nothing is swallowed.
+   */
   private enqueue(work: () => Promise<void>): void {
-    this.dispatchTail = this.dispatchTail.then(work).catch(() => undefined);
+    this.dispatchTail = this.dispatchTail.then(work);
   }
 
   /**
@@ -178,7 +207,7 @@ export class SessionEventMonitor {
    * request per connection, so this never shares the subscription's connection.
    */
   async snapshot(): Promise<HerdrSnapshot> {
-    if (this.stopped) throw new SupervisionSocketError("SUPERVISION_SOCKET_CLOSED", "The supervision monitor has been shut down");
+    this.assertRunning();
     const socket = new SupervisionSocket(await this.connect(resolveSocketPath(this.env)), this.requestTimeoutMs);
     try {
       return parseSnapshotResult(await socket.request("session.snapshot", {}));
@@ -187,20 +216,32 @@ export class SessionEventMonitor {
     }
   }
 
-  private async dispatch(event: SupervisionSocketEvent, ordinal: number): Promise<void> {
+  private async dispatch(event: SupervisionSocketEvent): Promise<void> {
     // Both identifiers are validated at the protocol boundary, so an accepted
-    // event always names the pane it concerns.
+    // event always names the pane it concerns. Each observer is isolated: one
+    // supervisor that fails must not deprive its siblings of the same event,
+    // which they could never be given again. The isolation wraps the call rather
+    // than its promise, because a failure thrown before the first await is a
+    // failure all the same.
     for (const observer of [...this.observers]) {
-      if (!observer.matches(event.paneId) && !(event.previousPaneId !== undefined && observer.matches(event.previousPaneId))) continue;
-      await observer.onEvent(event, ordinal);
+      if (!routes(observer, event)) continue;
+      try {
+        await observer.onEvent(event);
+      } catch {
+        // Isolated: the observer's own state machine owns this failure.
+      }
     }
   }
 
   /** Recovery is reported before the bootstrap it recovered into. */
   private async announce(snapshot: HerdrSnapshot, generation: number, recovered: boolean): Promise<void> {
     for (const observer of [...this.observers]) {
-      if (recovered) observer.onMonitorRecovered();
-      await observer.onBootstrap(snapshot, generation, true);
+      try {
+        if (recovered) observer.onMonitorRecovered();
+        await observer.onBootstrap(snapshot, generation, true);
+      } catch {
+        // Isolated for the same reason: a bootstrap is offered once per connection.
+      }
     }
   }
 
@@ -221,7 +262,16 @@ export class SessionEventMonitor {
         if (!this.degraded) {
           this.degraded = true;
           const reason = reasonOf(error);
-          for (const observer of [...this.observers]) observer.onMonitorDegraded(reason);
+          // Isolated per observer, like every other observer call: a failure here
+          // would otherwise escape the reconnect loop and leave the monitor
+          // permanently marked as reconnecting, so it would never reconnect.
+          for (const observer of [...this.observers]) {
+            try {
+              observer.onMonitorDegraded(reason);
+            } catch {
+              // The observer's own state machine owns this failure.
+            }
+          }
         }
         await this.clock.sleep(backoffDelay(attempt, this.random, this.maxReconnectDelayMs));
         attempt += 1;
@@ -230,11 +280,17 @@ export class SessionEventMonitor {
     this.reconnecting = false;
   }
 
-  /** Shut the monitor down. Idempotent; no reconnect is attempted afterwards. */
+  /**
+   * Shut the monitor down. Idempotent; no reconnect is attempted afterwards, and
+   * a bootstrap that is still awaiting refuses to adopt its connection.
+   */
   stop(): void {
     this.stopped = true;
     this.observers.clear();
     this.socket?.close();
     this.socket = undefined;
+    // A bootstrap in flight will now throw at its next checkpoint. Dropping the
+    // shared attempt keeps a later caller from awaiting a doomed one.
+    this.starting = undefined;
   }
 }

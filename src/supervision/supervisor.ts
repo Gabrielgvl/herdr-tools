@@ -139,14 +139,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private identity: SupervisedIdentity | undefined;
   private anchor: SupervisionAnchor | undefined;
   private status: SupervisionAgentStatus | undefined;
-  private lastRevision = 0;
   /**
-   * The highest connection-stream ordinal this supervisor has folded. The monitor
-   * counts every accepted event, not only routed ones, so the ordinal names the
-   * same log entry on every connection and survives a pane move rewriting the
-   * routing key.
+   * The highest pane revision this supervisor has folded, always relative to the
+   * pane it is currently bound to. It is the whole deduplication mechanism: a
+   * `PaneInfo` event below it describes state already reflected here, and a
+   * proven move resets it to the destination pane's own numbering.
    */
-  private foldedThrough = 0;
+  private lastRevision = 0;
   private evidenceGaps = 0;
   private reviewerDegraded = false;
   private lastReviewAtMs: number | undefined;
@@ -232,17 +231,24 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     return !this.stopped && this.paneId === paneId;
   }
 
-  async onEvent(event: SupervisionSocketEvent, ordinal: number): Promise<void> {
+  async onEvent(event: SupervisionSocketEvent): Promise<void> {
     if (this.stopped) return;
     if (this.identity === undefined) {
       this.queued.push(event);
       return;
     }
-    if (ordinal <= this.foldedThrough) return;
-    this.foldedThrough = ordinal;
     await this.fold(event);
   }
 
+  /**
+   * Resynchronise from authoritative state, then let the replay contribute only
+   * what that state does not already cover.
+   *
+   * The retained log can drop entries from its head, so no position in it is a
+   * stable identity and none is used. The fresh snapshot is the truth: its
+   * revision becomes the deduplication watermark, and its status is applied, so
+   * a supervisor can never resume silently stale.
+   */
   async onBootstrap(snapshot: HerdrSnapshot, _generation: number, reconnected: boolean): Promise<void> {
     if (this.stopped || this.identity === undefined || this.anchor === undefined) return;
     if (!reconnected) return;
@@ -253,13 +259,16 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     // Requirement 7: resume silently only when nothing advanced. A revision past
     // the last folded one proves the lifecycle sequence moved while the socket
-    // was down, whether or not the retained log can still replay it.
+    // was down, and those individual transitions are not recoverable from the
+    // log alone, so the gap is reported and the current state is adopted.
     if (occupant.pane.revision > this.lastRevision) {
       this.evidenceGaps += 1;
       this.emit("evidence_gap", `supervision reconnected with the child's lifecycle already advanced (revision ${this.lastRevision} to ${occupant.pane.revision})`, {
         lastFoldedRevision: this.lastRevision,
         observedRevision: occupant.pane.revision,
       });
+      this.lastRevision = occupant.pane.revision;
+      this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
     }
   }
 
@@ -279,9 +288,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   // -------------------------------------------------------------------- folding
 
   /**
-   * Events that arrived between adding the observer and proving the anchor. Their
-   * ordinals were assigned by the monitor before binding completed, so they are
-   * folded in arrival order and the watermark advances with them.
+   * Events that arrived between adding the observer and proving the anchor. They
+   * are folded in arrival order against the same revision watermark every other
+   * event uses, so a queued historical event is discarded exactly as a replayed
+   * one is.
    */
   private async drainQueued(): Promise<void> {
     const pending = this.queued.splice(0);
@@ -302,11 +312,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // The protocol boundary refused every malformed known event, so a
     // `PaneInfo`-bearing kind always carries its validated record.
     const pane = event.pane!;
+    // The revision gate comes first, and applies to a move as well: a replayed
+    // or queued historical move must never be re-followed, because its previous
+    // pane no longer matches the identity it already moved.
+    if (pane.revision < this.lastRevision) return;
     if (event.event === "pane_moved") {
       await this.followMove(event, pane);
       return;
     }
-    if (pane.revision < this.anchor!.revision) return;
     const verdict = paneContinuity(this.identity!, pane);
     if (verdict === "replaced") {
       await this.reconcile("event:continuity_broken");
@@ -323,12 +336,23 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   /**
    * Requirement 6: follow a move only when the atomic event and a fresh
    * authoritative occupant both prove terminal and agent-session continuity.
+   *
+   * A move that does not describe *this* occupant leaving *this* pane is not our
+   * move at all. Pane ids are reused, so such an event can reach us by routing
+   * alone; concluding `identity_lost` from it would settle a live supervisor on
+   * somebody else's evidence. Those reconcile from authoritative state instead,
+   * and only a move that is provably ours but whose destination cannot be
+   * confirmed settles.
    */
   private async followMove(event: SupervisionSocketEvent, pane: SupervisionPaneRecord): Promise<void> {
     // Atomicity is a protocol-boundary guarantee: a `pane_moved` without a
     // previous pane id never reaches a supervisor.
     if (event.previousPaneId! !== this.identity!.paneId) {
-      await this.settle("identity_lost", "move_previous_pane_mismatch");
+      await this.reconcile("event:move_foreign_previous_pane");
+      return;
+    }
+    if (paneContinuity(this.identity!, pane) !== "continuous") {
+      await this.reconcile("event:move_identity_unproven");
       return;
     }
     let snapshot: HerdrSnapshot;
@@ -346,7 +370,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     this.identity = next;
     this.paneId = next.paneId;
-    this.lastRevision = Math.max(this.lastRevision, occupant!.pane.revision);
+    // Revisions are per pane, so the watermark and the anchor are re-based on the
+    // destination's own numbering. Keeping the old pane's higher revision would
+    // discard every later event on the new pane.
+    this.lastRevision = occupant!.pane.revision;
+    this.anchor = { ...this.anchor!, revision: occupant!.pane.revision, status: occupant!.pane.agentStatus };
     this.publish(`child moved to pane ${next.paneId}`);
     this.applyStatus(occupant!.pane.agentStatus, occupant!.pane.revision, "snapshot");
   }
@@ -441,6 +469,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * either way.
    */
   private async review(): Promise<void> {
+    if (this.reviewing) {
+      // An obsolete review from an earlier run is still settling. Re-arm so the
+      // current run is not starved by a call it could not make.
+      if (this.reviewable()) this.armReview(this.deps.cadenceMs);
+      return;
+    }
     if (!this.reviewable()) return;
     this.reviewing = true;
     const run = this.workingRun;
@@ -477,6 +511,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         this.publish(`review ${result.classification}: ${result.summary}`);
       }
     } catch (error) {
+      // A failure that belongs to a run which has already ended is not evidence
+      // about anything either: it must not degrade the reviewer, wake anyone, or
+      // publish, exactly as an obsolete success must not.
+      if (!this.reviewable(run)) return;
       if (!this.reviewerDegraded) {
         this.reviewerDegraded = true;
         this.emit("reviewer_degraded", `the supervision reviewer failed (${reviewerReason(error)}) and will retry at the next cadence`, { reason: reviewerReason(error) });
@@ -485,7 +523,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       }
     } finally {
       this.reviewing = false;
-      if (!this.stopped && !this.isSettled() && this.status === "working") this.armReview(this.deps.cadenceMs);
+      // Only the run this review belonged to may re-arm. A newer run already
+      // armed its own cadence when it began, and clearing that here would delay
+      // it by a whole interval.
+      if (!this.stopped && this.reviewable(run)) this.armReview(this.deps.cadenceMs);
     }
   }
 
@@ -495,7 +536,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    */
   private reviewable(run?: number): boolean {
     if (this.stopped || this.isSettled() || this.status !== "working") return false;
-    return run === undefined ? !this.reviewing : this.workingRun === run;
+    return run === undefined || this.workingRun === run;
   }
 
   // -------------------------------------------------------------------- events
@@ -583,6 +624,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       terminalId: identity.terminalId,
       profileName,
       ...(profileName === this.deps.child.profileName ? {} : { requestedProfileName: this.deps.child.profileName }),
+      ...(identity.agentKind === this.deps.child.agentKind ? {} : { requestedAgentKind: this.deps.child.agentKind }),
     };
   }
 

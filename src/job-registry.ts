@@ -89,17 +89,26 @@ export interface WaitJobRequestSnapshot extends JobRequestCommon {
 }
 
 /**
- * What the launch *requested*. A reservation is taken before any topology
- * mutation, so no pane or terminal id exists yet; the bound identity appears in
- * the supervision view instead of being back-dated into this snapshot.
+ * The child this supervisor watches.
+ *
+ * A reservation is taken before any topology mutation, so at first these are the
+ * requested values and no pane or terminal id exists yet. Binding replaces the
+ * profile and kind with the ones that actually started the child — profile
+ * fallback can change both — and keeps the requested values beside them only
+ * when they differ, so the request and the supervision view can never report
+ * different profiles for the same child.
  */
+export interface SupervisedJobChild {
+  agentName: string;
+  agentKind: string;
+  profileName: string;
+  requestedAgentKind?: string;
+  requestedProfileName?: string;
+}
+
 export interface SupervisorJobRequestSnapshot extends JobRequestCommon {
   kind: "supervisor";
-  child: {
-    agentName: string;
-    agentKind: string;
-    profileName: string;
-  };
+  child: SupervisedJobChild;
   settings: {
     reviewCadenceMinutes: number;
     reviewerModel: string;
@@ -459,7 +468,9 @@ function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): Jo
       child: {
         agentName: boundedText(request.child.agentName, PUBLIC_FIELD_BYTES),
         agentKind: boundedText(request.child.agentKind, PUBLIC_FIELD_BYTES),
-        profileName: boundedText(request.child.profileName, PUBLIC_FIELD_BYTES)
+        profileName: boundedText(request.child.profileName, PUBLIC_FIELD_BYTES),
+        ...(request.child.requestedAgentKind === undefined ? {} : { requestedAgentKind: boundedText(request.child.requestedAgentKind, PUBLIC_FIELD_BYTES) }),
+        ...(request.child.requestedProfileName === undefined ? {} : { requestedProfileName: boundedText(request.child.requestedProfileName, PUBLIC_FIELD_BYTES) })
       },
       settings: {
         reviewCadenceMinutes: request.settings.reviewCadenceMinutes,
@@ -527,7 +538,8 @@ function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation)
         paneId: boundedText(view.child.paneId, PUBLIC_FIELD_BYTES),
         terminalId: boundedText(view.child.terminalId, PUBLIC_FIELD_BYTES),
         profileName: boundedText(view.child.profileName, PUBLIC_FIELD_BYTES),
-        ...(view.child.requestedProfileName === undefined ? {} : { requestedProfileName: boundedText(view.child.requestedProfileName, PUBLIC_FIELD_BYTES) })
+        ...(view.child.requestedProfileName === undefined ? {} : { requestedProfileName: boundedText(view.child.requestedProfileName, PUBLIC_FIELD_BYTES) }),
+        ...(view.child.requestedAgentKind === undefined ? {} : { requestedAgentKind: boundedText(view.child.requestedAgentKind, PUBLIC_FIELD_BYTES) })
       }
     }),
     ...(view.status === undefined ? {} : { status: view.status }),
@@ -1124,6 +1136,27 @@ export class JobRegistry {
       this.signalDrain(record);
     }
     return publicDetail(record.detail);
+  }
+
+  /**
+   * Record the profile and kind that actually started the supervised child.
+   * Profile fallback resolves after the reservation, so the reserved values are
+   * only a request until binding proves what ran; they are retained beside the
+   * bound values only when they differ.
+   */
+  bindSupervisionChild(jobId: string, bound: { agentKind: string; profileName: string }): void {
+    const record = this.jobs.get(jobId);
+    if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
+    if (record.detail.request.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job has a supervised child");
+    const child = record.detail.request.child;
+    record.detail.request.child = {
+      agentName: child.agentName,
+      agentKind: bound.agentKind,
+      profileName: bound.profileName,
+      ...(bound.agentKind === child.agentKind ? {} : { requestedAgentKind: child.agentKind }),
+      ...(bound.profileName === child.profileName ? {} : { requestedProfileName: child.profileName })
+    };
+    this.notifyChange();
   }
 
   /** Attach a supervisor's port so the registry can publish its bounded view. */

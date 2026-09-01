@@ -134,7 +134,28 @@ describe("the registry's supervision port", () => {
       async () => new Promise<never>(() => undefined),
     );
     expect(() => registry.attachSupervision(wait.jobId, port())).toThrow(/JOB_KIND_MISMATCH/u);
+    // Only a supervisor job has a supervised child to re-point at the bound profile.
+    expect(() => registry.bindSupervisionChild("job_missing", { agentKind: "pi", profileName: "worker-pi" })).toThrow(/JOB_NOT_FOUND/u);
+    expect(() => registry.bindSupervisionChild(wait.jobId, { agentKind: "pi", profileName: "worker-pi" })).toThrow(/JOB_KIND_MISMATCH/u);
     void registry.cancel(wait.jobId);
+  });
+
+  it("re-points the supervised child at the profile and kind that actually started it", () => {
+    const registry = new JobRegistry({ idFactory: () => "job_bind" });
+    const registered = registry.register(request, async () => new Promise<never>(() => undefined));
+    expect(registry.get(registered.jobId)?.request).toMatchObject({ child: { agentKind: "pi", profileName: "worker-pi" } });
+
+    // Fallback selection can change both, and only what changed is kept beside it.
+    registry.bindSupervisionChild(registered.jobId, { agentKind: "claude", profileName: "worker-claude" });
+    expect(registry.get(registered.jobId)?.request).toMatchObject({
+      child: { agentName: "worker", agentKind: "claude", profileName: "worker-claude", requestedAgentKind: "pi", requestedProfileName: "worker-pi" },
+    });
+
+    registry.bindSupervisionChild(registered.jobId, { agentKind: "claude", profileName: "worker-claude" });
+    const rebound = registry.get(registered.jobId)?.request;
+    expect(rebound).not.toHaveProperty(["child", "requestedAgentKind"]);
+    expect(rebound).not.toHaveProperty(["child", "requestedProfileName"]);
+    registry.shutdown();
   });
 
   it("cancels a supervisor whose child is already gone and stops it on shutdown", async () => {

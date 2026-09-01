@@ -22,6 +22,13 @@ export interface ScriptedServerOptions {
   failSubscribe?: boolean;
   /** Drops the connection in the same turn it acknowledges the subscription. */
   closeOnSubscribeAck?: boolean;
+  /**
+   * Event lines delivered inside the acknowledgement's own chunk, exactly as a
+   * real transport coalesces the acknowledgement with the head of the replay.
+   */
+  eventsWithAck?: string[];
+  /** Gates `events.subscribe`: it answers only once this resolves. */
+  holdSubscribe?: Promise<void>;
   /** Consumed in order by `session.snapshot`; the last one repeats. */
   snapshots?: unknown[];
 }
@@ -50,21 +57,24 @@ export function scriptedServer(options: ScriptedServerOptions = {}): ScriptedSer
           requests.push(request.method);
           if (answered) return;
           answered = true;
-          queueMicrotask(() => {
+          const answer = async (): Promise<void> => {
             if (request.method === "session.snapshot") {
               lastSnapshot = queue.shift() ?? lastSnapshot ?? emptySnapshotResult;
               onData(Buffer.from(`${JSON.stringify({ id: request.id, result: lastSnapshot })}\n`, "utf8"));
               return;
             }
+            if (options.holdSubscribe) await options.holdSubscribe;
             if (options.failSubscribe) {
               onData(Buffer.from(`${JSON.stringify({ id: request.id, result: { type: "pong" } })}\n`, "utf8"));
               return;
             }
             pushTo = onData;
             closeSubscribed = () => onClose?.();
-            onData(Buffer.from(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`, "utf8"));
+            // One chunk, as the transport really delivers it.
+            onData(Buffer.from(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n${(options.eventsWithAck ?? []).join("")}`, "utf8"));
             if (options.closeOnSubscribeAck) onClose?.();
-          });
+          };
+          queueMicrotask(() => { void answer(); });
         },
         destroy: () => undefined,
         onData: (handler) => { onData = handler; },

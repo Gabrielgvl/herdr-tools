@@ -1324,6 +1324,47 @@ describe("herdr_wait", () => {
     expect(idle).toMatchObject({ wait_result: "manager_judgment_required", reviewerSummaries: [{ targetId: "p1", classification: "unknown" }] });
   });
 
+  it("uses a fresh exact agent read for unknown reviews and preserves read failures", async () => {
+    for (const mode of ["working", "idle", "absent", "missing_state", "changed", "deadline"] as const) {
+      const cli = nativeCli({ statuses: { p1: "working", p2: "working" } });
+      const original = cli.runJson.bind(cli);
+      let reviewReturned = false;
+      let postReviewAgentGets = 0;
+      let now = 0;
+      const runClock: WaitClock = { now: () => now, sleep: async (milliseconds) => { now += milliseconds; } };
+      cli.runJson = async (argv, signal) => {
+        if (reviewReturned && argv[0] === "agent" && argv[1] === "get") {
+          postReviewAgentGets += 1;
+          const response = await original(argv, signal);
+          const agent = (response.result as { agent: Record<string, unknown> }).agent;
+          if (postReviewAgentGets <= 2 || mode === "missing_state") {
+            const identityOnly = { ...agent };
+            delete identityOnly.agent_status;
+            return { ...response, result: { agent: identityOnly } };
+          }
+          if (mode === "absent") throw new CliProtocolError("CLI_PROTOCOL_ERROR", "agent absent", { errorEnvelope: { error: { code: "agent_not_found", message: "agent absent" } } });
+          if (mode === "deadline") {
+            now = 60_001;
+            throw new Error("agent read deadline");
+          }
+          if (mode === "changed") return { ...response, result: { agent: { ...agent, terminal_id: "replaced-terminal" } } };
+          return { ...response, result: { agent: { ...agent, agent_status: mode } } };
+        }
+        return original(argv, signal);
+      };
+      const reviewer: WaitReviewer = { review: async ({ targetId }) => {
+        reviewReturned = true;
+        return { targetId, classification: "unknown", summary: "uncertain" };
+      } };
+      const params = { targets: ["p1"], match: "all" as const, condition: { kind: "output" as const, match: { kind: "literal" as const, value: "never" } }, timeoutMs: 60_001 };
+      const outcome = execute(cli, params, { clock: runClock, pollIntervalMs: 60_000, requireTargetIdentity: true, reviewerFactory: () => reviewer });
+      if (mode === "working") await expect(outcome).resolves.toMatchObject({ wait_result: "timed_out", matched: false });
+      else if (mode === "idle") await expect(outcome).resolves.toMatchObject({ wait_result: "manager_judgment_required", matched: false });
+      else if (mode === "deadline") await expect(outcome).resolves.toMatchObject({ wait_result: "timed_out", matched: false });
+      else await expect(outcome).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", result: { wait_result: "failed", targetErrors: [{ targetId: "p1", code: "CLI_PROTOCOL_ERROR" }] } });
+    }
+  });
+
   it.each([
     ["working", "idle", "manager_judgment_required"],
     ["idle", "working", "timed_out"],

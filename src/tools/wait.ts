@@ -1173,11 +1173,7 @@ export async function runPreparedWait(
             unknownRequiresJudgment ||= !(await unknownReviewProvesWorking(deps.cli, item, snapshot, signal, control));
           } catch (error) {
             if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries, targetErrors);
-            if (!item) {
-              unknownRequiresJudgment = true;
-              continue;
-            }
-            throwTargetReadFailure({ snapshots, targetErrors: [targetError(item, error)], expired: false }, reviewerSummaries);
+            throwTargetReadFailure({ snapshots, targetErrors: [targetError(item!, error)], expired: false }, reviewerSummaries);
           }
         }
         if (!unknownRequiresJudgment) continue;

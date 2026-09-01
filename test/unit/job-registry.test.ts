@@ -3,6 +3,7 @@ import { boundedList, fitsPublic, JobRegistry, jobDetailContent, publicDetail, t
 import { historicalTargetEvidence } from "../../src/wait-target-evidence.js";
 
 const request: JobRequestSnapshot = {
+  kind: "wait",
   label: "wait for one",
   targets: ["one"],
   targetIds: ["p1"],
@@ -256,7 +257,7 @@ describe("JobRegistry", () => {
     registry.cancel(handle.jobId);
 
     const truncatedRegistry = new JobRegistry({ idFactory: () => "job_truncated_detail" });
-    const large = truncatedRegistry.register({ ...request, condition: { transcript: "x".repeat(100_000) } }, async () => new Promise<never>(() => undefined));
+    const large = truncatedRegistry.register({ ...(request as Extract<JobRequestSnapshot, { kind: "wait" }>), condition: { transcript: "x".repeat(100_000) } }, async () => new Promise<never>(() => undefined));
     expect(jobDetailContent(truncatedRegistry.get(large.jobId)!)).toContain('"requestCondition": true');
     truncatedRegistry.cancel(large.jobId);
   });
@@ -363,6 +364,7 @@ describe("JobRegistry", () => {
   it("degrades oversized public detail and list projections without invalid JSON", () => {
     const detail = publicDetail({
       jobId: "job_" + "j".repeat(2_000),
+      kind: "wait",
       operation_phase: "settled",
       wait_result: "cancelled",
       sequence: 1,
@@ -386,7 +388,7 @@ describe("JobRegistry", () => {
     const forced = publicDetail({ ...detail, progress: { text: "p".repeat(10_000), atMs: 1, details: { evidence: "e" } } }, 1);
     expect(forced.truncation).toMatchObject({ publicEvidenceOmitted: true, progressTextClipped: true });
     const manyMatches = publicDetail({
-      jobId: "job_many_matches",
+      jobId: "job_many_matches", kind: "wait" as const,
       operation_phase: "settled",
       wait_result: "condition_met",
       sequence: 1,
@@ -396,23 +398,23 @@ describe("JobRegistry", () => {
     });
     expect(manyMatches.truncation).toMatchObject({ resultMatchedTargets: 1 });
 
-    const lateProjection = publicDetail({ jobId: "job_late_projection", operation_phase: "settled", wait_result: "unknown", sequence: 1, createdAtMs: 1, request, late_settlement_observed: { kind: "fulfilled", observedAtMs: 2 } });
+    const lateProjection = publicDetail({ jobId: "job_late_projection", kind: "wait" as const, operation_phase: "settled", wait_result: "unknown", sequence: 1, createdAtMs: 1, request, late_settlement_observed: { kind: "fulfilled", observedAtMs: 2 } });
     expect(lateProjection).toMatchObject({ late_settlement_observed: { kind: "fulfilled", observedAtMs: 2 } });
-    const invalidProjection = publicDetail({ jobId: "job_invalid", operation_phase: "running", sequence: 1, createdAtMs: 1, request, truncation: { bad: 1n } as unknown as JobDetail["truncation"] });
+    const invalidProjection = publicDetail({ jobId: "job_invalid", kind: "wait" as const, operation_phase: "running", sequence: 1, createdAtMs: 1, request, truncation: { bad: 1n } as unknown as JobDetail["truncation"] });
     expect(invalidProjection.truncation ?? {}).not.toHaveProperty("bad");
     expect(fitsPublic(1n)).toBe(false);
-    const malformedCondition = publicDetail({ jobId: "job_condition", operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: (() => undefined) as unknown as JobRequestSnapshot["condition"] } });
+    const malformedCondition = publicDetail({ jobId: "job_condition", kind: "wait" as const, operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...(request as Extract<JobRequestSnapshot, { kind: "wait" }>), condition: (() => undefined) as unknown as Extract<JobRequestSnapshot, { kind: "wait" }>["condition"] } });
     expect(malformedCondition.truncation).toMatchObject({ requestCondition: true });
-    const clippedCondition = publicDetail({ jobId: "job_condition_clip", operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: { kind: "output", match: { kind: "literal", value: "x".repeat(10_000) } } } });
+    const clippedCondition = publicDetail({ jobId: "job_condition_clip", kind: "wait" as const, operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...(request as Extract<JobRequestSnapshot, { kind: "wait" }>), condition: { kind: "output", match: { kind: "literal", value: "x".repeat(10_000) } } } });
     expect(clippedCondition.truncation).toMatchObject({ requestCondition: true, requestConditionClipped: true });
-    const unclippedCondition = publicDetail({ jobId: "job_condition_extra", operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...request, condition: { kind: "output", match: { kind: "literal", value: "short" }, extra: "x".repeat(10_000) } as unknown as JobRequestSnapshot["condition"] } });
+    const unclippedCondition = publicDetail({ jobId: "job_condition_extra", kind: "wait" as const, operation_phase: "running", sequence: 1, createdAtMs: 1, request: { ...(request as Extract<JobRequestSnapshot, { kind: "wait" }>), condition: { kind: "output", match: { kind: "literal", value: "short" }, extra: "x".repeat(10_000) } as unknown as Extract<JobRequestSnapshot, { kind: "wait" }>["condition"] } });
     expect(unclippedCondition.truncation).toMatchObject({ requestCondition: true });
     expect(unclippedCondition.truncation?.requestConditionClipped).toBeUndefined();
-    const clippedError = publicDetail({ jobId: "job_error", operation_phase: "settled", wait_result: "failed", sequence: 1, createdAtMs: 1, request, error: { code: "c".repeat(2_000), message: "m".repeat(2_000) } });
+    const clippedError = publicDetail({ jobId: "job_error", kind: "wait" as const, operation_phase: "settled", wait_result: "failed", sequence: 1, createdAtMs: 1, request, error: { code: "c".repeat(2_000), message: "m".repeat(2_000) } });
     expect(clippedError.truncation).toMatchObject({ errorCodeClipped: true, errorMessageClipped: true });
 
     const lateCompacted = publicDetail({
-      jobId: "job_late_compact",
+      jobId: "job_late_compact", kind: "wait" as const,
       operation_phase: "settled",
       wait_result: "unknown",
       sequence: 1,
@@ -423,7 +425,7 @@ describe("JobRegistry", () => {
     }, 1);
     expect(lateCompacted).toMatchObject({ late_settlement_observed: { kind: "fulfilled" } });
     const compacted = publicDetail({
-      jobId: "job_compact",
+      jobId: "job_compact", kind: "wait" as const,
       operation_phase: "settled",
       wait_result: "condition_met",
       sequence: 1,
@@ -434,7 +436,7 @@ describe("JobRegistry", () => {
     }, 1);
     expect(compacted.truncation).toMatchObject({ publicEvidenceOmitted: true });
     const minimalWithMatch = publicDetail({
-      jobId: "job_compact_match",
+      jobId: "job_compact_match", kind: "wait" as const,
       operation_phase: "settled",
       wait_result: "cancelled",
       sequence: 1,
@@ -446,10 +448,10 @@ describe("JobRegistry", () => {
       result: { wait_result: "condition_met", matched: true, matchedTargetCount: 2, matchedTargets: [{ target: "target", targetId: "p1" }] }
     }, 1);
     expect(minimalWithMatch.result).toMatchObject({ matchedTargetCount: 2, matchedTargets: [{ targetId: "p1" }] });
-    const noResult = publicDetail({ jobId: "job_no_result", operation_phase: "running", sequence: 1, createdAtMs: 1, request }, 1);
+    const noResult = publicDetail({ jobId: "job_no_result", kind: "wait" as const, operation_phase: "running", sequence: 1, createdAtMs: 1, request }, 1);
     expect(noResult.result).toBeUndefined();
     const noLines = publicDetail({
-      jobId: "job_no_lines",
+      jobId: "job_no_lines", kind: "wait" as const,
       operation_phase: "settled",
       wait_result: "condition_met",
       sequence: 1,
@@ -458,7 +460,7 @@ describe("JobRegistry", () => {
       result: { wait_result: "condition_met", matched: true, targets: [{ target: "target", targetId: "p1", metadata: {}, recentUnwrappedLines: [], observedAtMs: 1, matched: true }] }
     }, 1);
     expect(noLines.truncation).toMatchObject({ publicEvidenceOmitted: true });
-    const untouched = publicDetail({ jobId: "job_untouched", operation_phase: "running", sequence: 1, createdAtMs: 1, request }, 1);
+    const untouched = publicDetail({ jobId: "job_untouched", kind: "wait" as const, operation_phase: "running", sequence: 1, createdAtMs: 1, request }, 1);
     expect(untouched.operation_phase).toBe("running");
 
     const jobs = Array.from({ length: 100 }, (_, index) => ({
@@ -469,6 +471,7 @@ describe("JobRegistry", () => {
       createdAtMs: index,
       startedAtMs: index === 0 ? index : undefined,
       finishedAtMs: index === 0 ? index : undefined,
+      kind: "wait" as const,
       targetIds: [`p${index}`],
       targets: [`target-${index}`],
       ...(index === 0 ? { wait_result: "condition_met" as const, reason: "condition_met", error: { code: "CODE", message: "message" } } : index === 1 ? { error: { message: "message" } } : {}),

@@ -960,6 +960,7 @@ export async function prepareWait(deps: WaitDependencies, rawParams: unknown, si
 
 export function jobRequestFromPrepared(prepared: PreparedWait): JobRequestSnapshot {
   return {
+    kind: "wait",
     label: prepared.label,
     targets: [...prepared.params.targets],
     targetIds: prepared.resolved.map((item) => item.target.id),

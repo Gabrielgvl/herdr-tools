@@ -4,6 +4,7 @@ import { JobRegistry, type JobRequestSnapshot } from "../../src/job-registry.js"
 import { formatElapsed, WaitJobsUi, type WaitJobsUiScheduler } from "../../src/wait-jobs-ui.js";
 
 const request: JobRequestSnapshot = {
+  kind: "wait",
   label: "review worker",
   targets: ["worker"],
   targetIds: ["p1"],
@@ -66,7 +67,7 @@ describe("WaitJobsUi", () => {
       const job = registry.register(request, pending);
       expect(vi.getTimerCount()).toBe(1);
       vi.advanceTimersByTime(1_000);
-      expect(rendered.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠙ Herdr waits: 1 · oldest 1s · /herdr-waits");
+      expect(rendered.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠙ Herdr jobs: 1 · oldest 1s · /herdr-waits");
       await registry.cancel(job.jobId);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
@@ -77,11 +78,11 @@ describe("WaitJobsUi", () => {
   it("starts one live footer timer and clears it when the active set empties", async () => {
     const h = harness();
     const job = h.registry.register(request, pending);
-    expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠋ Herdr waits: 1 · oldest 0s · /herdr-waits");
+    expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠋ Herdr jobs: 1 · oldest 0s · /herdr-waits");
     expect(h.scheduler.setInterval).toHaveBeenCalledTimes(1);
     h.setNow(12_000);
     h.tick();
-    expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠙ Herdr waits: 1 · oldest 2s · /herdr-waits");
+    expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", "⠙ Herdr jobs: 1 · oldest 2s · /herdr-waits");
     expect(h.scheduler.setInterval).toHaveBeenCalledTimes(1);
     await h.registry.cancel(job.jobId);
     expect(h.scheduler.clearInterval).toHaveBeenCalledWith("timer");
@@ -92,12 +93,12 @@ describe("WaitJobsUi", () => {
     const h = harness();
     expect(h.ui.toggle(h.context)).toBe(true);
     const first = h.registry.register(request, pending);
-    expect(h.setWidget).toHaveBeenLastCalledWith("herdr-waits", ["review worker · 0s · job_1"], { placement: "aboveEditor" });
+    expect(h.setWidget).toHaveBeenLastCalledWith("herdr-waits", ["wait · review worker · 0s · job_1"], { placement: "aboveEditor" });
     await h.registry.cancel(first.jobId);
     expect(h.setWidget).toHaveBeenLastCalledWith("herdr-waits", undefined, { placement: "aboveEditor" });
     h.setNow(15_000);
     h.registry.register({ ...request, label: "test worker" }, pending);
-    expect(h.setWidget).toHaveBeenLastCalledWith("herdr-waits", ["test worker · 0s · job_2"], { placement: "aboveEditor" });
+    expect(h.setWidget).toHaveBeenLastCalledWith("herdr-waits", ["wait · test worker · 0s · job_2"], { placement: "aboveEditor" });
     expect(h.ui.toggle(h.context)).toBe(false);
     expect(h.setWidget).toHaveBeenLastCalledWith("herdr-waits", undefined, { placement: "aboveEditor" });
   });
@@ -111,11 +112,11 @@ describe("WaitJobsUi", () => {
     }
     h.setNow(31_000);
     h.ui.refresh();
-    expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", expect.stringContaining("Herdr waits: 21 · oldest 30s"));
+    expect(h.setStatus).toHaveBeenLastCalledWith("herdr-waits", expect.stringContaining("Herdr jobs: 21 · oldest 30s"));
     const rows = h.setWidget.mock.calls.at(-1)?.[1] as string[];
     expect(rows).toHaveLength(10);
     expect(rows[0]).toContain("wait 21");
-    expect(rows.at(-1)).toBe("… 12 more active waits");
+    expect(rows.at(-1)).toBe("… 12 more active jobs");
   });
 
   it("clears UI and resets widget preference at session boundaries", () => {

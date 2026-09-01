@@ -104,14 +104,15 @@ export class WaitJobsUi {
     const now = this.now();
     const oldest = formatElapsed(now - overview.oldestStartedAtMs!);
     const spinner = SPINNER_FRAMES[this.spinnerIndex]!;
-    this.safeSetStatus(`${spinner} Herdr waits: ${overview.total} · oldest ${oldest} · /herdr-waits`);
+    const unobserved = overview.jobs.reduce((total, job) => total + (job.unobservedEvents ?? 0), 0);
+    this.safeSetStatus(`${spinner} Herdr jobs: ${overview.total} · oldest ${oldest}${unobserved > 0 ? ` · ${unobserved} unobserved` : ""} · /herdr-waits`);
     if (!this.widgetEnabled) {
       this.safeSetWidget(undefined);
       return;
     }
     const visibleJobs = overview.total > overview.jobs.length ? overview.jobs.slice(0, MAX_WIDGET_LINES - 1) : overview.jobs;
-    const rows = visibleJobs.map((job) => `${job.label} · ${formatElapsed(now - (job.startedAtMs ?? job.createdAtMs))} · ${job.jobId}`);
-    if (overview.total > visibleJobs.length) rows.push(`… ${overview.total - visibleJobs.length} more active waits`);
+    const rows = visibleJobs.map((job) => `${job.kind === "supervisor" ? "supervisor" : "wait"} · ${job.label} · ${formatElapsed(now - (job.startedAtMs ?? job.createdAtMs))}${job.unobservedEvents ? ` · ${job.unobservedEvents} unobserved` : ""} · ${job.jobId}`);
+    if (overview.total > visibleJobs.length) rows.push(`… ${overview.total - visibleJobs.length} more active jobs`);
     this.safeSetWidget(rows);
   }
 

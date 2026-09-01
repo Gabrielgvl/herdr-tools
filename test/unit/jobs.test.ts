@@ -3,6 +3,7 @@ import { JobRegistry, type JobRequestSnapshot } from "../../src/job-registry.js"
 import { createJobsTool, boundedContent, detailContent } from "../../src/tools/jobs.js";
 
 const request: JobRequestSnapshot = {
+  kind: "wait",
   label: "wait for worker",
   targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10,
   settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }
@@ -20,9 +21,9 @@ describe("herdr_jobs", () => {
     const pending = new Promise<never>(() => undefined);
     const handle = jobs.register(request, async () => pending);
     const listed = await tool.execute("id", { operation: "list" } as never, new AbortController().signal, undefined, {} as never);
-    expect(listed.details).toMatchObject({ operation: "jobs", kind: "list", total: 1, jobs: [{ jobId: handle.jobId, label: "wait for worker", operation_phase: "accepted" }] });
+    expect(listed.details).toMatchObject({ operation: "jobs", view: "list", total: 1, jobs: [{ jobId: handle.jobId, label: "wait for worker", operation_phase: "accepted" }] });
     const got = await tool.execute("id", { operation: "get", jobId: handle.jobId } as never, undefined, undefined, {} as never);
-    expect(got.details).toMatchObject({ operation: "jobs", kind: "job", jobId: handle.jobId, operation_phase: "accepted", request: { label: "wait for worker" } });
+    expect(got.details).toMatchObject({ operation: "jobs", view: "job", jobId: handle.jobId, operation_phase: "accepted", request: { label: "wait for worker" } });
     const cancelled = await tool.execute("id", { operation: "cancel", jobId: handle.jobId } as never, undefined, undefined, {} as never);
     expect(cancelled.details).toMatchObject({ jobId: handle.jobId, operation_phase: "settled", wait_result: "unknown" });
     await expect(tool.execute("id", { operation: "get", jobId: "job_unknown" } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "JOB_NOT_FOUND" });
@@ -54,7 +55,7 @@ describe("herdr_jobs", () => {
     const defaultCall = tool.renderCall?.({} as never, {} as never, {} as never);
     expect(defaultCall?.render(80)).toEqual(["herdr_jobs · jobs"]);
     defaultCall?.invalidate();
-    const listResult = tool.renderResult?.({ content: [], details: { operation: "jobs", kind: "list", jobs: [], total: 0, offset: 0, limit: 20, nextOffset: null }, isError: false } as never, { expanded: false, isPartial: false }, {} as never, {} as never);
+    const listResult = tool.renderResult?.({ content: [], details: { operation: "jobs", view: "list", jobs: [], total: 0, offset: 0, limit: 20, nextOffset: null }, isError: false } as never, { expanded: false, isPartial: false }, {} as never, {} as never);
     expect(listResult?.render(80)).toEqual(["jobs · 0/0"]);
     listResult?.invalidate();
     const small = boundedContent({ ok: true });
@@ -66,7 +67,7 @@ describe("herdr_jobs", () => {
     expect(malformed?.render(80)).toEqual(["error UNKNOWN"]);
     malformed?.invalidate();
 
-    const acceptedWithoutResult = tool.renderResult?.({ content: [], details: { operation: "jobs", kind: "job", operation_phase: "settled" }, isError: false } as never, { expanded: false, isPartial: false }, {} as never, {} as never);
+    const acceptedWithoutResult = tool.renderResult?.({ content: [], details: { operation: "jobs", view: "job", operation_phase: "settled" }, isError: false } as never, { expanded: false, isPartial: false }, {} as never, {} as never);
     expect(acceptedWithoutResult?.render(80)).toEqual(["job · settled"]);
     acceptedWithoutResult?.invalidate();
     const failed = jobs.register(request, async () => { throw new Error("failed"); });

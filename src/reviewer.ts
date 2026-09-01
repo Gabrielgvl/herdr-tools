@@ -40,7 +40,7 @@ const MAX_PROMPT_BYTES = 16_000;
 const MAX_SUMMARY_CHARS = 500;
 const MAX_RESPONSE_CHARS = 2_000;
 
-function modelFor(registry: ModelRegistrySeam, identifier: string): Model<Api> {
+export function modelFor(registry: ModelRegistrySeam, identifier: string): Model<Api> {
   if (identifier.length === 0 || /\s/.test(identifier) || identifier.includes(String.fromCharCode(0))) throw new ReviewerFailure("Configured reviewer model identifier is invalid", { model: identifier });
   const separator = identifier.indexOf("/");
   const matches = separator > 0
@@ -50,11 +50,11 @@ function modelFor(registry: ModelRegistrySeam, identifier: string): Model<Api> {
   return matches[0];
 }
 
-function textFrom(message: AssistantMessage): string {
+export function textFrom(message: AssistantMessage): string {
   return message.content.filter((part): part is TextContent => part.type === "text").map((part) => part.text).join("").slice(0, MAX_RESPONSE_CHARS);
 }
 
-function strictResult(targetId: string, raw: string): ReviewerResult {
+export function strictResult(targetId: string, raw: string): ReviewerResult {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);

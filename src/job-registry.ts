@@ -2,12 +2,32 @@ import { randomUUID } from "node:crypto";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import { WAIT_LABEL_MAX_BYTES } from "./wait-schema.js";
 import { isTargetEvidence, type TargetEvidence } from "./wait-target-evidence.js";
+import type { SupervisionEvent } from "./supervision/events.js";
+import type { SupervisionJobPort, SupervisionJobView } from "./supervision/state.js";
 
 export const OPERATION_PHASES = ["accepted", "running", "cancel_requested", "settled"] as const;
 export type OperationPhase = (typeof OPERATION_PHASES)[number];
 
+export const JOB_KINDS = ["wait", "supervisor"] as const;
+export type JobKind = (typeof JOB_KINDS)[number];
+
 export const WAIT_RESULTS = ["condition_met", "timed_out", "manager_judgment_required", "failed", "cancelled", "unknown"] as const;
 export type WaitResult = (typeof WAIT_RESULTS)[number];
+
+export const SUPERVISION_RESULTS = ["released", "identity_lost", "identity_replaced", "failed", "cancelled", "unknown"] as const;
+export type SupervisionResult = (typeof SUPERVISION_RESULTS)[number];
+
+/** The generic terminal outcomes both job kinds share. */
+type GenericTerminal = "failed" | "cancelled" | "unknown";
+
+export class SupervisionActiveError extends Error {
+  readonly code = "SUPERVISION_ACTIVE" as const;
+
+  constructor(readonly details: Record<string, unknown>) {
+    super("SUPERVISION_ACTIVE: a supervisor cannot be cancelled while its exact child is live");
+    this.name = "SupervisionActiveError";
+  }
+}
 
 const MAX_TEXT_BYTES = 50_000;
 const MAX_TEXT_LINES = 2_000;
@@ -17,6 +37,9 @@ const PUBLIC_REQUEST_ITEMS = 8;
 const PUBLIC_RESULT_TARGETS = 6;
 const PUBLIC_TARGET_LINES = 4;
 const PUBLIC_REVIEWER_SUMMARIES = 6;
+const PUBLIC_SUPERVISION_TRANSITIONS = 8;
+const PUBLIC_SUPERVISION_EVENTS = 8;
+const PUBLIC_SUPERVISION_REVIEWS = 6;
 const PUBLIC_LIST_JOBS = 100;
 const PUBLIC_SUMMARY_ITEMS = 2;
 const PUBLIC_FIELD_BYTES = 256;
@@ -45,11 +68,16 @@ export interface JobTargetError {
   message: string;
 }
 
-export interface JobRequestSnapshot {
+/** The fields both request kinds share, so summaries and lists stay kind-agnostic. */
+interface JobRequestCommon {
   label: string;
   targets: string[];
   targetIds: string[];
   target_generation_refs?: string[];
+}
+
+export interface WaitJobRequestSnapshot extends JobRequestCommon {
+  kind: "wait";
   match: "any" | "all";
   condition: unknown;
   timeoutMs: number;
@@ -59,6 +87,27 @@ export interface JobRequestSnapshot {
     reviewerThinking: "low";
   };
 }
+
+/**
+ * What the launch *requested*. A reservation is taken before any topology
+ * mutation, so no pane or terminal id exists yet; the bound identity appears in
+ * the supervision view instead of being back-dated into this snapshot.
+ */
+export interface SupervisorJobRequestSnapshot extends JobRequestCommon {
+  kind: "supervisor";
+  child: {
+    agentName: string;
+    agentKind: string;
+    profileName: string;
+  };
+  settings: {
+    reviewCadenceMinutes: number;
+    reviewerModel: string;
+    reviewerThinking: "max";
+  };
+}
+
+export type JobRequestSnapshot = WaitJobRequestSnapshot | SupervisorJobRequestSnapshot;
 
 export interface JobProgress {
   text: string;
@@ -126,6 +175,11 @@ export interface JobTruncation {
   resultTargetErrors?: number;
   reviewerSummaries?: number;
   reviewerFieldsClipped?: number;
+  supervisionTransitions?: number;
+  supervisionEvents?: number;
+  supervisionReviews?: number;
+  supervisionFieldsClipped?: number;
+  pendingEvents?: number;
   errorDetails?: boolean;
   errorCodeClipped?: boolean;
   errorMessageClipped?: boolean;
@@ -140,6 +194,7 @@ export interface LateSettlementObservation {
 
 export interface JobDetail {
   jobId: string;
+  kind: JobKind;
   operation_phase: OperationPhase;
   sequence: number;
   createdAtMs: number;
@@ -148,7 +203,13 @@ export interface JobDetail {
   request: JobRequestSnapshot;
   progress?: JobProgress;
   wait_result?: WaitResult;
+  supervision_result?: SupervisionResult;
+  supervision_reason?: string;
   result?: JobResultSnapshot;
+  supervision?: SupervisionJobView;
+  /** Soft receipts. Present only on a `get` that observed them. */
+  pending_events?: SupervisionEvent[];
+  unobservedEvents?: number;
   error?: JobErrorSnapshot;
   cancelReason?: "cancelled" | "shutdown";
   late_settlement_observed?: LateSettlementObservation;
@@ -157,6 +218,7 @@ export interface JobDetail {
 
 export interface JobSummary {
   jobId: string;
+  kind: JobKind;
   label: string;
   operation_phase: OperationPhase;
   sequence: number;
@@ -166,6 +228,8 @@ export interface JobSummary {
   targetIds: string[];
   targets: string[];
   wait_result?: WaitResult;
+  supervision_result?: SupervisionResult;
+  unobservedEvents?: number;
   reason?: string;
   progress?: { text: string; atMs: number };
   error?: { code?: string; message: string };
@@ -211,6 +275,18 @@ export interface JobRunResult {
   targetErrors?: JobResultSnapshot["targetErrors"];
   targets?: JobResultSnapshot["targets"];
   reviewerSummaries?: JobResultSnapshot["reviewerSummaries"];
+}
+
+export interface SupervisionRunResult {
+  supervision_result: SupervisionResult;
+  reason?: string;
+}
+
+/** What a runner may return, discriminated by the job kind that registered it. */
+export type JobKindRunResult = JobRunResult | SupervisionRunResult;
+
+function isSupervisionRunResult(value: JobKindRunResult): value is SupervisionRunResult {
+  return "supervision_result" in value;
 }
 
 export interface JobRunError {
@@ -265,6 +341,7 @@ interface JobRecord {
   activityCount: number;
   executionPromise: Promise<void>;
   resolveDrain: Array<() => void>;
+  supervision?: SupervisionJobPort;
 }
 
 function clone<T>(value: T): T {
@@ -369,11 +446,31 @@ function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): Jo
   const refs = request.target_generation_refs === undefined
     ? undefined
     : boundedStrings(request.target_generation_refs, PUBLIC_REQUEST_ITEMS, truncation, "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped");
-  return {
+  const common = {
     label,
     targets: boundedStrings(request.targets, PUBLIC_REQUEST_ITEMS, truncation, "requestTargets", "requestTargetsClipped"),
     targetIds: boundedStrings(request.targetIds, PUBLIC_REQUEST_ITEMS, truncation, "requestTargetIds", "requestTargetIdsClipped"),
-    ...(refs === undefined ? {} : { target_generation_refs: refs }),
+    ...(refs === undefined ? {} : { target_generation_refs: refs })
+  };
+  if (request.kind === "supervisor") {
+    return {
+      kind: "supervisor",
+      ...common,
+      child: {
+        agentName: boundedText(request.child.agentName, PUBLIC_FIELD_BYTES),
+        agentKind: boundedText(request.child.agentKind, PUBLIC_FIELD_BYTES),
+        profileName: boundedText(request.child.profileName, PUBLIC_FIELD_BYTES)
+      },
+      settings: {
+        reviewCadenceMinutes: request.settings.reviewCadenceMinutes,
+        reviewerModel,
+        reviewerThinking: request.settings.reviewerThinking
+      }
+    };
+  }
+  return {
+    kind: "wait",
+    ...common,
     match: request.match,
     condition: boundedCondition(request.condition, truncation),
     timeoutMs: request.timeoutMs,
@@ -382,6 +479,58 @@ function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): Jo
       reviewerModel,
       reviewerThinking: request.settings.reviewerThinking
     }
+  };
+}
+
+function boundedSupervisionEvent(event: SupervisionEvent, truncation: JobTruncation): SupervisionEvent {
+  const eventId = boundedText(event.eventId, PUBLIC_FIELD_BYTES);
+  const summary = boundedText(event.summary, PUBLIC_FIELD_BYTES);
+  if (eventId !== event.eventId || summary !== event.summary) truncation.supervisionFieldsClipped = (truncation.supervisionFieldsClipped ?? 0) + 1;
+  return { eventId, atMs: event.atMs, type: event.type, priority: event.priority, summary, ...(event.details === undefined ? {} : { details: event.details }) };
+}
+
+function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation): SupervisionJobView {
+  const transitions = view.transitions.slice(-PUBLIC_SUPERVISION_TRANSITIONS);
+  const events = view.events.slice(-PUBLIC_SUPERVISION_EVENTS).map((event) => boundedSupervisionEvent(event, truncation));
+  const reviews = view.reviewer.reviews.slice(-PUBLIC_SUPERVISION_REVIEWS).map((review) => {
+    const summary = boundedText(review.summary, PUBLIC_FIELD_BYTES);
+    if (summary !== review.summary) truncation.supervisionFieldsClipped = (truncation.supervisionFieldsClipped ?? 0) + 1;
+    return { atMs: review.atMs, classification: review.classification, summary };
+  });
+  const omittedTransitions = view.transitions.length - transitions.length;
+  const omittedEvents = view.events.length - events.length;
+  const omittedReviews = view.reviewer.reviews.length - reviews.length;
+  if (omittedTransitions > 0) truncation.supervisionTransitions = omittedTransitions;
+  if (omittedEvents > 0) truncation.supervisionEvents = omittedEvents;
+  if (omittedReviews > 0) truncation.supervisionReviews = omittedReviews;
+  return {
+    state: view.state,
+    monitor: { ...view.monitor },
+    reviewer: {
+      model: boundedText(view.reviewer.model, PUBLIC_FIELD_BYTES),
+      thinking: view.reviewer.thinking,
+      cadenceMinutes: view.reviewer.cadenceMinutes,
+      degraded: view.reviewer.degraded,
+      reviews,
+      truncatedReviews: view.reviewer.truncatedReviews + omittedReviews,
+      ...(view.reviewer.lastReviewAtMs === undefined ? {} : { lastReviewAtMs: view.reviewer.lastReviewAtMs })
+    },
+    transitions,
+    truncatedTransitions: view.truncatedTransitions + omittedTransitions,
+    events,
+    truncatedEvents: view.truncatedEvents + omittedEvents,
+    unobservedEvents: view.unobservedEvents,
+    ...(view.child === undefined ? {} : {
+      child: {
+        agentName: boundedText(view.child.agentName, PUBLIC_FIELD_BYTES),
+        agentKind: boundedText(view.child.agentKind, PUBLIC_FIELD_BYTES),
+        paneId: boundedText(view.child.paneId, PUBLIC_FIELD_BYTES),
+        terminalId: boundedText(view.child.terminalId, PUBLIC_FIELD_BYTES),
+        profileName: boundedText(view.child.profileName, PUBLIC_FIELD_BYTES)
+      }
+    }),
+    ...(view.status === undefined ? {} : { status: view.status }),
+    ...(view.settledReason === undefined ? {} : { settledReason: boundedText(view.settledReason, PUBLIC_FIELD_BYTES) })
   };
 }
 
@@ -480,7 +629,7 @@ function copyProgress(progress: JobProgress, truncation: JobTruncation): JobProg
 }
 
 const TRUNCATION_KEYS = [
-  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped", "requestCondition", "requestConditionClipped", "requestLabelClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetGenerationRefsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "resultTargetEvidence", "resultTargetErrors", "reviewerSummaries", "reviewerFieldsClipped", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted", "lateSettlementClipped"
+  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped", "requestCondition", "requestConditionClipped", "requestLabelClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetGenerationRefsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "resultTargetEvidence", "resultTargetErrors", "reviewerSummaries", "reviewerFieldsClipped", "supervisionTransitions", "supervisionEvents", "supervisionReviews", "supervisionFieldsClipped", "pendingEvents", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted", "lateSettlementClipped"
 ] as const;
 
 function boundedTruncation(value: JobTruncation | undefined): JobTruncation {
@@ -518,28 +667,58 @@ function compactDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
     truncation.reviewerSummaries = (truncation.reviewerSummaries ?? 0) + 1;
     truncation.publicEvidenceOmitted = true;
   }
+  if (copy.supervision) {
+    truncation.supervisionTransitions = (truncation.supervisionTransitions ?? 0) + copy.supervision.transitions.length;
+    truncation.supervisionEvents = (truncation.supervisionEvents ?? 0) + copy.supervision.events.length;
+    truncation.supervisionReviews = (truncation.supervisionReviews ?? 0) + copy.supervision.reviewer.reviews.length;
+    copy.supervision = {
+      ...copy.supervision,
+      transitions: [],
+      truncatedTransitions: copy.supervision.truncatedTransitions + copy.supervision.transitions.length,
+      events: [],
+      truncatedEvents: copy.supervision.truncatedEvents + copy.supervision.events.length,
+      reviewer: { ...copy.supervision.reviewer, reviews: [], truncatedReviews: copy.supervision.reviewer.truncatedReviews + copy.supervision.reviewer.reviews.length }
+    };
+    truncation.publicEvidenceOmitted = true;
+  }
+  if (copy.pending_events) {
+    truncation.pendingEvents = (truncation.pendingEvents ?? 0) + copy.pending_events.length;
+    delete copy.pending_events;
+    truncation.publicEvidenceOmitted = true;
+  }
   return copy;
+}
+
+function minimalRequest(request: JobRequestSnapshot): JobRequestSnapshot {
+  if (request.kind === "supervisor") {
+    return { kind: "supervisor", label: request.label, targets: [], targetIds: [], child: request.child, settings: request.settings };
+  }
+  return {
+    kind: "wait",
+    label: request.label,
+    targets: [],
+    targetIds: [],
+    match: request.match,
+    condition: { truncated: true, kind: "object" },
+    timeoutMs: request.timeoutMs,
+    settings: request.settings
+  };
 }
 
 function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
   truncation.publicEvidenceOmitted = true;
   return {
     jobId: boundedText(copy.jobId, 128),
+    kind: copy.kind,
     operation_phase: copy.operation_phase,
     sequence: copy.sequence,
     createdAtMs: copy.createdAtMs,
     ...(copy.startedAtMs === undefined ? {} : { startedAtMs: copy.startedAtMs }),
     ...(copy.finishedAtMs === undefined ? {} : { finishedAtMs: copy.finishedAtMs }),
-    request: {
-      label: copy.request.label,
-      targets: [],
-      targetIds: [],
-      match: copy.request.match,
-      condition: { truncated: true, kind: "object" },
-      timeoutMs: copy.request.timeoutMs,
-      settings: copy.request.settings
-    },
+    request: minimalRequest(copy.request),
     ...(copy.operation_phase === "settled" && copy.wait_result ? { wait_result: copy.wait_result } : {}),
+    ...(copy.operation_phase === "settled" && copy.supervision_result ? { supervision_result: copy.supervision_result } : {}),
+    ...(copy.unobservedEvents === undefined ? {} : { unobservedEvents: copy.unobservedEvents }),
     ...(copy.result ? { result: { wait_result: copy.result.wait_result, matched: copy.result.matched, ...(copy.result.matchedTargetCount === undefined ? {} : { matchedTargetCount: copy.result.matchedTargetCount }), ...(copy.result.matchedTargets ? { matchedTargets: copy.result.matchedTargets.slice(0, 1) } : {}) } } : {}),
     ...(copy.cancelReason ? { cancelReason: copy.cancelReason } : {}),
     ...(copy.late_settlement_observed ? { late_settlement_observed: copy.late_settlement_observed } : {}),
@@ -554,6 +733,7 @@ export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): Jo
   const terminal = detail.operation_phase === "settled";
   const copy: JobDetail = {
     jobId,
+    kind: detail.kind,
     operation_phase: detail.operation_phase,
     sequence: detail.sequence,
     createdAtMs: detail.createdAtMs,
@@ -562,6 +742,11 @@ export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): Jo
     request: copyRequest(detail.request, truncation),
     ...(detail.progress ? { progress: copyProgress(detail.progress, truncation) } : {}),
     ...(terminal && detail.wait_result ? { wait_result: detail.wait_result } : {}),
+    ...(terminal && detail.supervision_result ? { supervision_result: detail.supervision_result } : {}),
+    ...(terminal && detail.supervision_reason ? { supervision_reason: boundedText(detail.supervision_reason, PUBLIC_FIELD_BYTES) } : {}),
+    ...(detail.supervision ? { supervision: boundedSupervision(detail.supervision, truncation) } : {}),
+    ...(detail.pending_events ? { pending_events: detail.pending_events.map((event) => boundedSupervisionEvent(event, truncation)) } : {}),
+    ...(detail.unobservedEvents === undefined ? {} : { unobservedEvents: detail.unobservedEvents }),
     ...(terminal && detail.result ? { result: copyResult({
       wait_result: detail.result.wait_result,
       matched: detail.result.matched,
@@ -615,6 +800,7 @@ function summary(detail: JobDetail): JobSummary {
   if (jobId !== detail.jobId) truncation.jobIdClipped = true;
   return clone({
     jobId,
+    kind: detail.kind,
     label,
     operation_phase: detail.operation_phase,
     sequence: detail.sequence,
@@ -625,7 +811,10 @@ function summary(detail: JobDetail): JobSummary {
     targets,
     ...(refs === undefined ? {} : { target_generation_refs: refs }),
     ...(detail.operation_phase === "settled" && detail.wait_result ? { wait_result: detail.wait_result } : {}),
+    ...(detail.operation_phase === "settled" && detail.supervision_result ? { supervision_result: detail.supervision_result } : {}),
+    ...(detail.unobservedEvents === undefined ? {} : { unobservedEvents: detail.unobservedEvents }),
     ...(detail.result?.reason ? { reason: boundedText(detail.result.reason, 128) } : {}),
+    ...(detail.supervision_reason ? { reason: boundedText(detail.supervision_reason, 128) } : {}),
     ...(detail.cancelReason ? { reason: detail.cancelReason } : {}),
     ...(progress ? { progress } : {}),
     ...(detail.error ? { error: { ...(detail.error.code ? { code: boundedText(detail.error.code, 48) } : {}), message: boundedText(detail.error.message, 128) } } : {}),
@@ -641,6 +830,7 @@ function compactSummaryForList(value: JobSummary): JobSummary {
   const truncation = { ...value.truncation, ...(jobIdClipped ? { jobIdClipped: true } : {}), ...(labelClipped ? { labelClipped: true } : {}) };
   return {
     jobId,
+    kind: value.kind,
     label,
     operation_phase: value.operation_phase,
     sequence: value.sequence,
@@ -650,6 +840,8 @@ function compactSummaryForList(value: JobSummary): JobSummary {
     targetIds: [],
     targets: [],
     ...(value.wait_result ? { wait_result: value.wait_result } : {}),
+    ...(value.supervision_result ? { supervision_result: value.supervision_result } : {}),
+    ...(value.unobservedEvents === undefined ? {} : { unobservedEvents: value.unobservedEvents }),
     ...(value.reason ? { reason: boundedText(value.reason, 64) } : {}),
     ...(value.progress ? { progress: { text: boundedText(value.progress.text, 64), atMs: value.progress.atMs } } : {}),
     ...(value.error ? { error: { ...(value.error.code ? { code: boundedText(value.error.code, 32) } : {}), message: boundedText(value.error.message, 64) } } : {}),
@@ -666,6 +858,7 @@ export function boundedList(result: JobListResult): JobListResult {
     const label = boundedText(job.label, 32);
     return {
       jobId,
+      kind: job.kind,
       label,
       operation_phase: job.operation_phase,
       sequence: job.sequence,
@@ -673,6 +866,8 @@ export function boundedList(result: JobListResult): JobListResult {
       ...(job.startedAtMs === undefined ? {} : { startedAtMs: job.startedAtMs }),
       ...(job.finishedAtMs === undefined ? {} : { finishedAtMs: job.finishedAtMs }),
       ...(job.wait_result ? { wait_result: job.wait_result } : {}),
+      ...(job.supervision_result ? { supervision_result: job.supervision_result } : {}),
+      ...(job.unobservedEvents === undefined ? {} : { unobservedEvents: job.unobservedEvents }),
       targetIds: [],
       targets: [],
       truncation: { ...(job.truncation ?? {}), jobIdClipped: true, ...(label !== job.label || job.truncation?.labelClipped === true ? { labelClipped: true } : {}) }
@@ -747,6 +942,25 @@ export class JobRegistry {
     this.notifyChange();
   }
 
+  private settleSupervisionLocked(record: JobRecord, outcome: SupervisionResult, reason: string | undefined, error?: JobErrorSnapshot): boolean {
+    if (record.detail.operation_phase === "settled") return false;
+    this.closeGate(record);
+    record.detail.operation_phase = "settled";
+    record.detail.supervision_result = outcome;
+    if (reason !== undefined) record.detail.supervision_reason = reason;
+    if (error) record.detail.error = error;
+    record.detail.finishedAtMs = this.clock.now();
+    this.notifyChange();
+    return true;
+  }
+
+  /** Settle either kind with one of the outcomes both kinds share. */
+  private settleGenericLocked(record: JobRecord, outcome: GenericTerminal, error?: JobErrorSnapshot): boolean {
+    return record.detail.kind === "supervisor"
+      ? this.settleSupervisionLocked(record, outcome, error?.code, error)
+      : this.settleLocked(record, outcome, undefined, error);
+  }
+
   private settleLocked(record: JobRecord, waitResult: WaitResult, result?: JobRunResult, error?: JobErrorSnapshot): boolean {
     if (record.detail.operation_phase === "settled") return false;
     // Fence first: no terminal authority is published while the gate remains open.
@@ -806,7 +1020,7 @@ export class JobRegistry {
 
   register(
     request: JobRequestSnapshot,
-    run: (signal: AbortSignal, update: (text: string, details?: unknown) => void, control: JobOperationControl) => Promise<JobRunResult>,
+    run: (signal: AbortSignal, update: (text: string, details?: unknown) => void, control: JobOperationControl) => Promise<JobKindRunResult>,
     generation: JobGeneration = this.generation
   ): RegisteredJob {
     if (!this.isCurrent(generation)) throw new Error("SESSION_REPLACED: wait session was replaced before registration");
@@ -815,6 +1029,7 @@ export class JobRegistry {
     const controller = new AbortController();
     const detail: JobDetail = {
       jobId,
+      kind: request.kind,
       operation_phase: "accepted",
       sequence: ++this.sequence,
       createdAtMs: this.clock.now(),
@@ -847,7 +1062,7 @@ export class JobRegistry {
     return { jobId, generation, signal: controller.signal, detail: publicDetail(detail), promise: record.executionPromise };
   }
 
-  private async execute(record: JobRecord, run: (signal: AbortSignal, update: (text: string, details?: unknown) => void, control: JobOperationControl) => Promise<JobRunResult>): Promise<void> {
+  private async execute(record: JobRecord, run: (signal: AbortSignal, update: (text: string, details?: unknown) => void, control: JobOperationControl) => Promise<JobKindRunResult>): Promise<void> {
     const started = await record.lock.runExclusive(() => {
       if (record.detail.operation_phase !== "accepted" || !record.gateOpen) return false;
       record.detail.operation_phase = "running";
@@ -870,7 +1085,8 @@ export class JobRegistry {
           this.late(record, "fulfilled");
           return;
         }
-        this.settleLocked(record, result.wait_result, result);
+        if (isSupervisionRunResult(result)) this.settleSupervisionLocked(record, result.supervision_result, result.reason);
+        else this.settleLocked(record, result.wait_result, result);
       });
     } catch (error) {
       record.runnerDone = true;
@@ -885,6 +1101,10 @@ export class JobRegistry {
           message: error instanceof Error ? error.message : String(error),
           ...(typeof error === "object" && error !== null && "details" in error ? { details: (error as { details?: unknown }).details } : {})
         };
+        if (record.detail.kind === "supervisor") {
+          this.settleSupervisionLocked(record, "failed", mapped.code, mapped);
+          return;
+        }
         const partialResult = typeof error === "object" && error !== null && "result" in error && typeof (error as { result?: unknown }).result === "object" && (error as { result?: { wait_result?: unknown } }).result?.wait_result === "failed"
           ? (error as { result: JobRunResult }).result
           : undefined;
@@ -908,17 +1128,51 @@ export class JobRegistry {
     return publicDetail(record.detail);
   }
 
-  get(jobId: string): JobDetail | undefined {
+  /** Attach a supervisor's port so the registry can publish its bounded view. */
+  attachSupervision(jobId: string, port: SupervisionJobPort): void {
     const record = this.jobs.get(jobId);
-    return record ? publicDetail(record.detail) : undefined;
+    if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
+    if (record.detail.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job accepts a supervision port");
+    record.supervision = port;
+    this.notifyChange();
   }
 
-  list(operationPhase?: OperationPhase, offset = 0, limit = 20): JobListResult {
+  /**
+   * Project a job with its live supervision view. `observeEvents` returns the
+   * pending soft receipts and marks exactly the returned events observed.
+   */
+  private projected(record: JobRecord, observeEvents: boolean): JobDetail {
+    const port = record.supervision;
+    if (!port) return publicDetail(record.detail);
+    const view = port.view();
+    const pending = observeEvents ? port.takePendingEvents() : undefined;
+    return publicDetail({
+      ...record.detail,
+      supervision: view,
+      // `takePendingEvents` has already marked the returned events observed, so
+      // the published count is the state a follow-up `get` would see.
+      unobservedEvents: observeEvents ? port.view().unobservedEvents : view.unobservedEvents,
+      ...(pending === undefined || pending.length === 0 ? {} : { pending_events: pending })
+    });
+  }
+
+  /** Summaries carry only the unobserved count, never the events themselves. */
+  private withUnobserved(record: JobRecord): JobDetail {
+    const port = record.supervision;
+    return port ? { ...record.detail, unobservedEvents: port.view().unobservedEvents } : record.detail;
+  }
+
+  get(jobId: string, options: { observeEvents?: boolean } = {}): JobDetail | undefined {
+    const record = this.jobs.get(jobId);
+    return record ? this.projected(record, options.observeEvents === true) : undefined;
+  }
+
+  list(operationPhase?: OperationPhase, offset = 0, limit = 20, kind?: JobKind): JobListResult {
     const filtered = [...this.jobs.values()]
-      .filter((record) => operationPhase === undefined || record.detail.operation_phase === operationPhase)
+      .filter((record) => (operationPhase === undefined || record.detail.operation_phase === operationPhase) && (kind === undefined || record.detail.kind === kind))
       .sort((left, right) => right.detail.sequence - left.detail.sequence);
     const pageLimit = Math.min(Math.max(1, limit), PUBLIC_LIST_JOBS);
-    const jobs = filtered.slice(offset, offset + pageLimit).map((record) => summary(record.detail));
+    const jobs = filtered.slice(offset, offset + pageLimit).map((record) => summary(this.withUnobserved(record)));
     const result: JobListResult = {
       jobs,
       total: filtered.length,
@@ -935,7 +1189,7 @@ export class JobRegistry {
       .sort((left, right) => right.detail.sequence - left.detail.sequence);
     const starts = running.map((record) => record.detail.startedAtMs ?? record.detail.createdAtMs);
     return {
-      jobs: running.slice(0, Math.max(0, limit)).map((record) => summary(record.detail)),
+      jobs: running.slice(0, Math.max(0, limit)).map((record) => summary(this.withUnobserved(record))),
       total: running.length,
       ...(starts.length > 0 ? { oldestStartedAtMs: Math.min(...starts) } : {})
     };
@@ -952,9 +1206,18 @@ export class JobRegistry {
     return this.isDrained(record);
   }
 
+  /**
+   * Ordinary cancellation. A supervisor whose exact child is still live is
+   * refused: the child would keep working with nobody watching it, which is the
+   * exact state automatic supervision exists to prevent. Session shutdown is a
+   * different path and is never refused.
+   */
   async cancel(jobId: string): Promise<JobDetail | undefined> {
     const record = this.jobs.get(jobId);
     if (!record) return undefined;
+    if (record.supervision?.childLive() === true) {
+      throw new SupervisionActiveError({ jobId: boundedText(record.detail.jobId, PUBLIC_FIELD_BYTES), kind: record.detail.kind });
+    }
     const request = await record.lock.runExclusive(() => {
       if (record.detail.operation_phase === "settled") return false;
       if (record.detail.operation_phase === "cancel_requested") return true;
@@ -966,20 +1229,21 @@ export class JobRegistry {
       this.notifyChange();
       return true;
     });
-    if (!request) return publicDetail(record.detail);
+    if (!request) return this.projected(record, false);
     const drained = await this.waitForDrain(record);
     return record.lock.runExclusive(() => {
-      if (record.detail.operation_phase === "settled") return publicDetail(record.detail);
-      const waitResult: WaitResult = drained ? "cancelled" : "unknown";
+      if (record.detail.operation_phase === "settled") return this.projected(record, false);
+      const outcome: GenericTerminal = drained ? "cancelled" : "unknown";
       const error = drained ? undefined : { code: "CANCELLATION_UNCERTAIN", message: "Cancellation quiescence was not observed" };
-      this.settleLocked(record, waitResult, undefined, error);
-      return publicDetail(record.detail);
+      this.settleGenericLocked(record, outcome, error);
+      return this.projected(record, false);
     });
   }
 
-  beginSession(): JobGeneration {
-    this.accepting = false;
+  /** Session teardown. Supervisors are stopped unconditionally; nothing persists. */
+  private abandonAll(): void {
     for (const record of this.jobs.values()) {
+      record.supervision?.shutdown();
       if (record.detail.operation_phase === "settled") continue;
       this.closeGate(record);
       record.detail.operation_phase = "cancel_requested";
@@ -989,6 +1253,11 @@ export class JobRegistry {
       this.signalDrain(record);
     }
     this.jobs.clear();
+  }
+
+  beginSession(): JobGeneration {
+    this.accepting = false;
+    this.abandonAll();
     this.generationValue += 1;
     this.accepting = true;
     this.notifyChange();
@@ -998,16 +1267,7 @@ export class JobRegistry {
   shutdown(): void {
     this.accepting = false;
     this.generationValue += 1;
-    for (const record of this.jobs.values()) {
-      if (record.detail.operation_phase === "settled") continue;
-      this.closeGate(record);
-      record.detail.operation_phase = "cancel_requested";
-      record.detail.cancelReason = "shutdown";
-      record.controller.abort();
-      record.runnerDone = true;
-      this.signalDrain(record);
-    }
-    this.jobs.clear();
+    this.abandonAll();
     this.notifyChange();
   }
 

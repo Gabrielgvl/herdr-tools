@@ -6,9 +6,13 @@ import { truncateTail } from "@earendil-works/pi-coding-agent";
 
 const OUTPUT_TRUNCATION_MARKER = "\n[output truncated]";
 
+/**
+ * `view` rather than `kind`: `kind` now names the job kind on every job detail
+ * and summary, so the result's own list/job discriminator needs its own name.
+ */
 export type JobsDetails =
-  | ({ operation: "jobs"; kind: "list" } & JobListResult)
-  | ({ operation: "jobs"; kind: "job" } & JobDetail);
+  | ({ operation: "jobs"; view: "list" } & JobListResult)
+  | ({ operation: "jobs"; view: "job" } & JobDetail);
 
 export class JobsError extends Error {
   constructor(readonly code: "INVALID_INPUT" | "JOB_NOT_FOUND", message: string, readonly details: Record<string, unknown> = {}) {
@@ -38,7 +42,7 @@ export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof Job
   return {
     name: "herdr_jobs",
     label: "Herdr Jobs",
-    description: "List, inspect, or cancel detached Herdr wait jobs owned by this Pi session.",
+    description: "List, inspect, or cancel the detached Herdr jobs this session owns: wait jobs and the supervisor jobs herdr_launch creates for every child. list accepts an optional kind filter and shows unobserved supervision event counts; get returns a supervisor's pending events and marks exactly those observed; cancel is refused for a supervisor whose exact child is still live.",
     parameters: JobsParamsSchema,
     async execute(_id, rawParams) {
       let params: JobsParams;
@@ -48,17 +52,21 @@ export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof Job
         throw new JobsError("INVALID_INPUT", error instanceof Error ? error.message : String(error));
       }
       if (params.operation === "list") {
-        const page = registry.list(params.operation_phase, params.offset ?? 0, params.limit ?? 20);
-        return resultFor({ operation: "jobs", kind: "list", ...page });
+        const page = registry.list(params.operation_phase, params.offset ?? 0, params.limit ?? 20, params.kind);
+        return resultFor({ operation: "jobs", view: "list", ...page });
       }
-      const job = registry.get(params.jobId);
-      if (!job) throw new JobsError("JOB_NOT_FOUND", `JOB_NOT_FOUND: unknown Herdr job ${params.jobId}`, { jobId: params.jobId });
       if (params.operation === "cancel") {
+        if (!registry.get(params.jobId)) throw new JobsError("JOB_NOT_FOUND", `JOB_NOT_FOUND: unknown Herdr job ${params.jobId}`, { jobId: params.jobId });
+        // A supervision refusal is a typed model-visible failure, not a job result.
         const cancelled = await registry.cancel(params.jobId);
         if (!cancelled) throw new JobsError("JOB_NOT_FOUND", `JOB_NOT_FOUND: unknown Herdr job ${params.jobId}`, { jobId: params.jobId });
-        return resultFor({ operation: "jobs", kind: "job", ...cancelled });
+        return resultFor({ operation: "jobs", view: "job", ...cancelled });
       }
-      return resultFor({ operation: "jobs", kind: "job", ...job });
+      // A `get` is the soft-receipt read: it returns pending supervision events
+      // and marks exactly the events it returned.
+      const job = registry.get(params.jobId, { observeEvents: true });
+      if (!job) throw new JobsError("JOB_NOT_FOUND", `JOB_NOT_FOUND: unknown Herdr job ${params.jobId}`, { jobId: params.jobId });
+      return resultFor({ operation: "jobs", view: "job", ...job });
     },
     renderCall(rawArgs, theme) {
       const args = rawArgs as JobsParams;
@@ -73,12 +81,13 @@ export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof Job
       }
       const details = result.details as JobsDetails | undefined;
       if (!details || details.operation !== "jobs") return textComponent("error UNKNOWN", theme, "error");
-      if (details.kind === "list") return textComponent(`jobs · ${details.jobs.length}/${details.total}`, theme, "muted");
+      if (details.view === "list") return textComponent(`jobs · ${details.jobs.length}/${details.total}`, theme, "muted");
       const phase = details.operation_phase;
-      const waitResult = details.wait_result;
-      const state = phase === "settled" && waitResult ? `settled · ${waitResult}` : phase;
-      const tone = waitResult === "failed" ? "error" : waitResult === "manager_judgment_required" || waitResult === "unknown" || waitResult === "cancelled" ? "warning" : "muted";
-      return textComponent(`job · ${state}`, theme, tone);
+      const outcome = details.wait_result ?? details.supervision_result;
+      const state = phase === "settled" && outcome ? `settled · ${outcome}` : phase;
+      const unobserved = details.unobservedEvents === undefined || details.unobservedEvents === 0 ? "" : ` · ${details.unobservedEvents} unobserved`;
+      const tone = outcome === "failed" ? "error" : outcome === "manager_judgment_required" || outcome === "unknown" || outcome === "cancelled" || outcome === "identity_lost" || outcome === "identity_replaced" ? "warning" : "muted";
+      return textComponent(`${details.kind === "supervisor" ? "supervisor" : "job"} · ${state}${unobserved}`, theme, tone);
     }
   };
 }

@@ -380,6 +380,57 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(evidence(panes).items).toEqual(expect.arrayContaining([expect.objectContaining({ workspace_id: reboundWorkspaceId })]));
 
       await new Promise((settle) => setTimeout(settle, PANE_SETTLE_MS));
+
+      // The reviewer-refusal contract gets its own target, because it must not
+      // depend on the prompt-bearing launch below: that launch legitimately
+      // fails closed when prompt consumption cannot be proven, is never retried,
+      // and ends the run early. This launch carries no initial prompt, so it has
+      // no consumption to confirm and no prompt phase to fail in, and its pane is
+      // closed again immediately after the contract is proven.
+      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "worker-pi" });
+      expect(reviewerTargetLaunch.isError, text(reviewerTargetLaunch)).toBeUndefined();
+      const reviewerTargetEvidence = evidence(reviewerTargetLaunch);
+      expect(reviewerTargetEvidence).toMatchObject({
+        operation: "launch",
+        outcome: "launched",
+        placement: { mode: "same_tab" },
+        kind: "pi",
+        initialPromptSent: false,
+        promptSubmitted: false
+      });
+      const reviewerPaneId = String(reviewerTargetEvidence.paneId);
+      // A wait longer than the review cadence must build a reviewer, and the MCP
+      // host has none: model-backed review is unavailable there, so the reviewer
+      // factory refuses and the detached job must settle fail-closed rather than
+      // wait on unsupervised. The condition is a non-native pane-output literal
+      // that can never appear, so the initial observation completes at once and
+      // the wait reaches the long-wait reviewer factory without sleeping through
+      // the fixed review cadence; the timeout still exceeds that cadence, which
+      // is what makes this a long wait. Neither the cadence nor the explicit
+      // wait's own reviewer settings are altered to make this reachable.
+      const unsupervised = await call("herdr_wait", {
+        targets: [reviewerPaneId],
+        match: "any",
+        condition: { kind: "output", match: { kind: "literal", value: IMPOSSIBLE_OUTPUT_LITERAL } },
+        timeoutMs: 31 * 60_000,
+        label: "mcp long wait"
+      });
+      expect(unsupervised.isError, text(unsupervised)).toBeUndefined();
+      const unsupervisedJobId = evidence(unsupervised).jobId as string;
+      await vi.waitFor(async () => {
+        const job = await call("herdr_jobs", { operation: "get", jobId: unsupervisedJobId });
+        expect(evidence(job)).toMatchObject({
+          operation: "jobs",
+          view: "job",
+          jobId: unsupervisedJobId,
+          operation_phase: "settled",
+          wait_result: "failed",
+          error: { code: "REVIEWER_FAILED" }
+        });
+      }, { timeout: 20_000, interval: 100 });
+      const closedReviewerPane = await call("herdr_pane", { operation: "close", target: reviewerPaneId });
+      expect(closedReviewerPane.isError, text(closedReviewerPane)).toBeUndefined();
+
       const prelaunch = await call("herdr_inspect", { mode: "target", target: preparedPaneId });
       const prelaunchMetadata = record(evidence(prelaunch).metadata);
       expect(prelaunchMetadata).toMatchObject({ pane_id: preparedPaneId, agent_status: "unknown" });
@@ -455,36 +506,6 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(evidence(communicated)).toMatchObject({ operation: "steer", envelope: { version: "v1", kind: "steer" }, sender: { paneId: String(movedPane.pane_id) } });
       const transcript = await call("herdr_inspect", { mode: "target", target: workerPaneId });
       expect(JSON.stringify(evidence(transcript).recentUnwrappedLines)).toContain("[HERDR AGENT MESSAGE v1]");
-      // A wait longer than the review cadence must build a reviewer, and the MCP
-      // host has none: model-backed review is unavailable there, so the reviewer
-      // factory refuses and the detached job must settle fail-closed rather than
-      // wait on unsupervised. The condition is a non-native pane-output literal
-      // that can never appear, so the initial observation completes at once and
-      // the wait reaches the long-wait reviewer factory without sleeping through
-      // the fixed review cadence; the timeout still exceeds that cadence, which
-      // is what makes this a long wait. Neither the cadence nor the explicit
-      // wait's own reviewer settings are altered to make this reachable.
-      const unsupervised = await call("herdr_wait", {
-        targets: [workerPaneId],
-        match: "any",
-        condition: { kind: "output", match: { kind: "literal", value: IMPOSSIBLE_OUTPUT_LITERAL } },
-        timeoutMs: 31 * 60_000,
-        label: "mcp long wait"
-      });
-      expect(unsupervised.isError, text(unsupervised)).toBeUndefined();
-      const unsupervisedJobId = evidence(unsupervised).jobId as string;
-      await vi.waitFor(async () => {
-        const job = await call("herdr_jobs", { operation: "get", jobId: unsupervisedJobId });
-        expect(evidence(job)).toMatchObject({
-          operation: "jobs",
-          view: "job",
-          jobId: unsupervisedJobId,
-          operation_phase: "settled",
-          wait_result: "failed",
-          error: { code: "REVIEWER_FAILED" }
-        });
-      }, { timeout: 20_000, interval: 100 });
-
       const detached = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 20_000, label: "mcp detached" });
       const jobId = evidence(detached).jobId as string;
       expect(jobId.startsWith("job_")).toBe(true);

@@ -99,6 +99,13 @@ describe("supervised identity continuity", () => {
     expect(occupantContinuity(identity, evidence.occupant)).toBe("continuous");
   });
 
+  it("accepts an agent record that omits optional session evidence", () => {
+    expect(classifySnapshotTarget(snapshot(
+      [rawPane()],
+      [{ pane_id: "p1", name: "worker", terminal_id: "t1", agent: "pi" }],
+    ), "p1")).toMatchObject({ kind: "unique", occupant: { agentPresent: true, agentName: "worker", pane: { paneId: "p1" } } });
+  });
+
   it("follows a move only on atomic evidence plus a fresh matching occupant", () => {
     const moved = pane({ paneId: "p2", revision: 9 });
     const fresh = { pane: pane({ paneId: "p2", revision: 1 }), agentPresent: true, agentName: "worker" };

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { formatCall, formatResult, resultForRender, textComponent } from "../../src/tui.js";
+import { formatCall, formatResult, renderResultComponent, resultForRender, textComponent } from "../../src/tui.js";
 
 describe("compact tool rows", () => {
   it("shows operation and target without raw transcripts or JSON", () => {
@@ -73,6 +73,9 @@ describe("compact tool rows", () => {
       isError: true,
       details: { ...details, code: "LAUNCH_FAILED", supervisorJobId: "job_other" }
     }, {}, "w1:p2")).toEqual({ text: "error LAUNCH_FAILED · w1:p2", tone: "error" });
+    expect(resultForRender("launch", { isError: true, details: { ...details, code: "LAUNCH_FAILED", paneId: "" } })).toEqual({ text: "error LAUNCH_FAILED", tone: "error" });
+    expect(resultForRender("launch", { isError: true, details: { ...details, code: "LAUNCH_FAILED", supervision: { ...details.supervision, state: "settled" } } })).toEqual({ text: "error LAUNCH_FAILED", tone: "error" });
+    expect(resultForRender("launch", { isError: true, details: { ...details, code: "LAUNCH_FAILED", supervision: { ...details.supervision, child: { ...details.supervision.child, paneId: "w1:p3" } } } })).toEqual({ text: "error LAUNCH_FAILED", tone: "error" });
   });
 
   it("keeps rows compact for omitted targets and every non-success outcome", () => {
@@ -80,5 +83,6 @@ describe("compact tool rows", () => {
     expect(formatResult({ operation: "communicate", outcome: "error" })).toBe("error UNKNOWN");
     expect(formatResult({ operation: "wait", outcome: "partial" })).toBe("partial");
     expect(formatResult({ operation: "other", outcome: "success" })).toBe("other");
+    expect(renderResultComponent("communicate", { details: { outcome: "success" } }, {}, { fg: (name: string, value: string) => `${name}:${value}` }, "p1").render(40)[0]).toBe("success:sent · p1");
   });
 });

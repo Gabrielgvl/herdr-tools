@@ -78,6 +78,70 @@ describe("compact tool rows", () => {
     expect(resultForRender("launch", { isError: true, details: { ...details, code: "LAUNCH_FAILED", supervision: { ...details.supervision, child: { ...details.supervision.child, paneId: "w1:p3" } } } })).toEqual({ text: "error LAUNCH_FAILED", tone: "error" });
   });
 
+  it("renders the recovery handles for every unconfirmed shape the launch window produces", () => {
+    const supervision = {
+      jobId: "job_supervisor_2",
+      state: "active",
+      child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", profileName: "worker-pi" }
+    };
+    const unconfirmed = {
+      assignmentState: "unconfirmed",
+      agentStarted: true,
+      recipientRegistered: false,
+      paneId: "w1:p2",
+      supervisorJobId: "job_supervisor_2",
+      supervision
+    };
+    const row = (details: Record<string, unknown>) => resultForRender("launch", { isError: true, details }, {}, "w1:p2");
+    const handles = "assignment unconfirmed · w1:p2 · supervisor job_supervisor_2";
+    // Pre-acknowledgement: the prompt transport failed before any acknowledgement,
+    // so nothing observed consumption and the child may still hold the assignment.
+    expect(row({ ...unconfirmed, promptSubmitted: false, phase: "prompt_verification", causeCode: "CLI_INCOMPATIBLE" }))
+      .toEqual({ text: `error LAUNCH_FAILED · ${handles}`, tone: "error" });
+    // Before the prompt phase is even entered, while supervision is already bound.
+    expect(row({ ...unconfirmed, promptSubmitted: false, phase: "supervision_bind", causeCode: "ENVELOPE_TOO_LARGE" }))
+      .toEqual({ text: `error LAUNCH_FAILED · ${handles}`, tone: "error" });
+    // Acknowledged, then a non-PROMPT_UNCONFIRMED transport failure carrying its own code.
+    expect(row({ ...unconfirmed, promptSubmitted: true, code: "ABORTED", causeCode: "ABORTED" }))
+      .toEqual({ text: `error ABORTED · ${handles}`, tone: "error" });
+    expect(row({ ...unconfirmed, promptSubmitted: true, code: "POSTSTATE_UNAVAILABLE", promptConsumption: "unconfirmed" }))
+      .toEqual({ text: `error POSTSTATE_UNAVAILABLE · ${handles}`, tone: "error" });
+  });
+
+  it("falls back to the generic error row for malformed or contradictory unconfirmed details", () => {
+    const details = {
+      causeCode: "PROMPT_UNCONFIRMED",
+      phase: "prompt_verification",
+      assignmentState: "unconfirmed",
+      promptConsumption: "unconfirmed",
+      agentStarted: true,
+      promptSubmitted: true,
+      recipientRegistered: false,
+      paneId: "w1:p2",
+      supervision: {
+        jobId: "job_supervisor_2",
+        state: "active",
+        child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", profileName: "worker-pi" }
+      }
+    };
+    const generic = { text: "error LAUNCH_FAILED · w1:p2", tone: "error" };
+    const row = (overrides: Record<string, unknown>) => resultForRender("launch", { isError: true, details: { ...details, code: "LAUNCH_FAILED", ...overrides } }, {}, "w1:p2");
+    expect(row({ agentStarted: false })).toEqual(generic);
+    expect(row({ recipientRegistered: true })).toEqual(generic);
+    expect(row({ promptSubmitted: "yes" })).toEqual(generic);
+    // Consumption cannot be confirmed while the assignment is unconfirmed.
+    expect(row({ promptConsumption: "confirmed" })).toEqual(generic);
+    expect(row({ supervision: { ...details.supervision, child: "w1:p2" } })).toEqual(generic);
+    expect(row({ supervision: { ...details.supervision, jobId: "job supervisor" } })).toEqual(generic);
+    expect(row({ paneId: " w1:p2" })).toEqual(generic);
+    expect(row({ paneId: "w".repeat(257) })).toEqual({ text: "error LAUNCH_FAILED · w1:p2", tone: "error" });
+    // A code that is not a module-authored token is untrusted text, never a row prefix.
+    expect(resultForRender("launch", { isError: true, details: { ...details, code: "launch failed" } }, {}, "w1:p2"))
+      .toEqual({ text: "error launch failed · w1:p2", tone: "error" });
+    expect(resultForRender("launch", { isError: true, details: { ...details, code: 7 } }, {}, "w1:p2"))
+      .toEqual({ text: "error UNKNOWN · w1:p2", tone: "error" });
+  });
+
   it("keeps rows compact for omitted targets and every non-success outcome", () => {
     expect(formatCall("herdr_wait", "waiting")).toBe("herdr_wait · waiting");
     expect(formatResult({ operation: "communicate", outcome: "error" })).toBe("error UNKNOWN");

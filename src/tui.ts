@@ -60,8 +60,6 @@ interface ResultDetails {
   wait_result?: unknown;
   reason?: unknown;
   code?: unknown;
-  causeCode?: unknown;
-  phase?: unknown;
   delivery?: unknown;
   promptConsumption?: unknown;
   assignmentState?: unknown;
@@ -89,22 +87,39 @@ function compactIdentifier(value: unknown): value is string {
   });
 }
 
+/** The shape every failure code this extension and the Herdr CLI transport define. */
+const FAILURE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
+
+/**
+ * The launch recovery handles, for every failure the assignment-unconfirmed
+ * window can produce: the whole window from the moment the prompt is built
+ * until consumption is proven, not only the `PROMPT_UNCONFIRMED` verdict. A
+ * pre-acknowledgement transport failure and a bounded transport failure carry
+ * the same unrecoverable state — a supervised child that may already hold the
+ * assignment — so the row must name the same pane and supervisor. Anything that
+ * is not an internally consistent unconfirmed shape falls back to the generic
+ * error row rather than inventing a handle.
+ */
 function assignmentUnconfirmedRow(details: ResultDetails | undefined): string | undefined {
   if (details?.assignmentState !== "unconfirmed"
-    || details.causeCode !== "PROMPT_UNCONFIRMED"
-    || details.phase !== "prompt_verification"
-    || details.promptConsumption !== "unconfirmed"
     || details.agentStarted !== true
-    || details.promptSubmitted !== true
+    || typeof details.promptSubmitted !== "boolean"
     || details.recipientRegistered !== false
-    || (details.code !== undefined && details.code !== "LAUNCH_FAILED")
+    || (details.promptConsumption !== undefined && details.promptConsumption !== "unconfirmed")
     || !compactIdentifier(details.paneId)
     || !record(details.supervision)) return undefined;
+  // Absent on the Pi host, where the failure code stays on the error itself and
+  // only the details reach this row; the launch window's classified code is
+  // LAUNCH_FAILED unless the transport named another one.
+  const code = details.code === undefined
+    ? "LAUNCH_FAILED"
+    : typeof details.code === "string" && FAILURE_CODE_PATTERN.test(details.code) ? details.code : undefined;
+  if (code === undefined) return undefined;
   const supervision = details.supervision;
   if (supervision.state !== "active" || !compactIdentifier(supervision.jobId) || !record(supervision.child)) return undefined;
   if (supervision.child.paneId !== details.paneId) return undefined;
   if (details.supervisorJobId !== undefined && details.supervisorJobId !== supervision.jobId) return undefined;
-  return `error LAUNCH_FAILED · assignment unconfirmed · ${details.paneId} · supervisor ${supervision.jobId}`;
+  return `error ${code} · assignment unconfirmed · ${details.paneId} · supervisor ${supervision.jobId}`;
 }
 
 export function resultForRender(

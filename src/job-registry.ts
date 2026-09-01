@@ -689,20 +689,13 @@ function compactDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
   return copy;
 }
 
+/**
+ * The request a minimal projection keeps. `copyRequest` has already bounded
+ * every field, so only the per-target lists are dropped; rebuilding the request
+ * per kind would add a branch no bounded detail can reach.
+ */
 function minimalRequest(request: JobRequestSnapshot): JobRequestSnapshot {
-  if (request.kind === "supervisor") {
-    return { kind: "supervisor", label: request.label, targets: [], targetIds: [], child: request.child, settings: request.settings };
-  }
-  return {
-    kind: "wait",
-    label: request.label,
-    targets: [],
-    targetIds: [],
-    match: request.match,
-    condition: { truncated: true, kind: "object" },
-    timeoutMs: request.timeoutMs,
-    settings: request.settings
-  };
+  return { ...request, targets: [], targetIds: [] };
 }
 
 function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
@@ -943,15 +936,10 @@ export class JobRegistry {
   }
 
   private settleSupervisionLocked(record: JobRecord, outcome: SupervisionResult, reason: string | undefined, error?: JobErrorSnapshot): boolean {
-    if (record.detail.operation_phase === "settled") return false;
-    this.closeGate(record);
-    record.detail.operation_phase = "settled";
-    record.detail.supervision_result = outcome;
-    if (reason !== undefined) record.detail.supervision_reason = reason;
-    if (error) record.detail.error = error;
-    record.detail.finishedAtMs = this.clock.now();
-    this.notifyChange();
-    return true;
+    return this.settleOnce(record, () => {
+      record.detail.supervision_result = outcome;
+      if (reason !== undefined) record.detail.supervision_reason = reason;
+    }, error);
   }
 
   /** Settle either kind with one of the outcomes both kinds share. */
@@ -961,29 +949,38 @@ export class JobRegistry {
       : this.settleLocked(record, outcome, undefined, error);
   }
 
-  private settleLocked(record: JobRecord, waitResult: WaitResult, result?: JobRunResult, error?: JobErrorSnapshot): boolean {
+  /**
+   * The single settlement gate both kinds pass through. Fence first: no terminal
+   * authority is published while the gate remains open.
+   */
+  private settleOnce(record: JobRecord, apply: () => void, error?: JobErrorSnapshot): boolean {
     if (record.detail.operation_phase === "settled") return false;
-    // Fence first: no terminal authority is published while the gate remains open.
     this.closeGate(record);
     record.detail.operation_phase = "settled";
-    record.detail.wait_result = waitResult;
-    if (result) {
-      record.detail.result = clone({
-        wait_result: result.wait_result,
-        matched: result.matched,
-        ...(result.reason ? { reason: result.reason } : {}),
-        ...(result.matchedTargetCount === undefined ? {} : { matchedTargetCount: result.matchedTargetCount }),
-        ...(result.matchedTargets ? { matchedTargets: result.matchedTargets } : {}),
-        ...(result.targetErrors ? { targetErrors: result.targetErrors } : {}),
-        ...(result.targets ? { targets: result.targets } : {}),
-        ...(result.reviewerSummaries ? { reviewerSummaries: result.reviewerSummaries } : {})
-      });
-    } else {
-      record.detail.result = { wait_result: waitResult, matched: false, reason: error?.code ?? "unknown" };
-    }
+    apply();
     if (error) record.detail.error = error;
     record.detail.finishedAtMs = this.clock.now();
     this.notifyChange();
+    return true;
+  }
+
+  private settleLocked(record: JobRecord, waitResult: WaitResult, result?: JobRunResult, error?: JobErrorSnapshot): boolean {
+    const settled = this.settleOnce(record, () => {
+      record.detail.wait_result = waitResult;
+      record.detail.result = result
+        ? clone({
+          wait_result: result.wait_result,
+          matched: result.matched,
+          ...(result.reason ? { reason: result.reason } : {}),
+          ...(result.matchedTargetCount === undefined ? {} : { matchedTargetCount: result.matchedTargetCount }),
+          ...(result.matchedTargets ? { matchedTargets: result.matchedTargets } : {}),
+          ...(result.targetErrors ? { targetErrors: result.targetErrors } : {}),
+          ...(result.targets ? { targets: result.targets } : {}),
+          ...(result.reviewerSummaries ? { reviewerSummaries: result.reviewerSummaries } : {})
+        })
+        : { wait_result: waitResult, matched: false, reason: error?.code ?? "unknown" };
+    }, error);
+    if (!settled) return false;
     if (record.detail.cancelReason === undefined && waitResult !== "cancelled") this.notifyTerminal(record);
     return true;
   }

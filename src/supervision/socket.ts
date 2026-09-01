@@ -83,8 +83,8 @@ export function createNodeSupervisionConnect(connectTimeoutMs = SUPERVISION_CONN
   return (socketPath: string) => new Promise<SupervisionStream>((resolve, reject) => {
     const socket = createSocket(socketPath);
     let settled = false;
+    // Both settling paths clear this timer, so it can only fire while unsettled.
     const timer = setTimeout(() => {
-      if (settled) return;
       settled = true;
       socket.destroy();
       reject(new SupervisionSocketError("SUPERVISION_SOCKET_UNAVAILABLE", "Herdr socket did not connect within the bound"));

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError } from "../../src/cli.js";
-import { createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
+import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
@@ -3044,6 +3044,51 @@ describe("herdr_launch automatic child supervision", () => {
     expect(supervision.released).toEqual(["launch_failed_supervision_bind"]);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
     expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
+  });
+
+  it("classifies an untyped reserve failure and rethrows a non-binding failure unchanged", async () => {
+    const untyped = stubSupervision({ reserveError: new Error("plain failure") });
+    const reserveFailure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: untyped }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    expect(reserveFailure.details).toMatchObject({ causeCode: "SUPERVISION_UNAVAILABLE", phase: "supervision_reserve" });
+
+    // A failure that is not a binding refusal is not reshaped into one.
+    const foreign = stubSupervision({ bindError: Object.assign(new Error("monitor gone"), { code: "SUPERVISION_SOCKET_CLOSED" }) });
+    const bindFailure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: foreign }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    expect(bindFailure.details).toMatchObject({ phase: "supervision_bind", causeCode: "SUPERVISION_SOCKET_CLOSED" });
+    expect(bindFailure.details).not.toHaveProperty("supervisionEvidence");
+  });
+
+  it("cancels a reconciliation read with the caller's own reason", async () => {
+    const controller = new AbortController();
+    const seen: AbortSignal[] = [];
+    const pending = boundedLaunchReconciliationRead(async (signal) => {
+      seen.push(signal);
+      return new Promise<never>(() => undefined);
+    }, controller.signal, Date.now() + 10_000);
+    const reason = new Error("caller went away");
+    controller.abort(reason);
+    expect(seen[0]!.aborted).toBe(true);
+    expect(seen[0]!.reason).toBe(reason);
+    // The caller's abort does not itself settle the race; the deadline still bounds it.
+    void pending.catch(() => undefined);
+  });
+
+  it("cancels the reconciliation read when the caller aborts", async () => {
+    const supervision = stubSupervision({ bindError: new SupervisionBindError("unproven", {}) });
+    const controller = new AbortController();
+    const readSignals: AbortSignal[] = [];
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signalValue, preserve) => {
+      if (argv[0] === "api" && harness.stdinInputs.length === 0 && readSignals.length === 0 && supervision.released.length > 0) {
+        readSignals.push(signalValue);
+        controller.abort();
+      }
+      return base(argv, signalValue, preserve);
+    });
+    const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: async () => ({ path: "/cache/body.md" }) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), supervision });
+    await expect(tool.execute("id", { name: "worker", profile: "worker" } as never, controller.signal, undefined, extensionContext)).rejects.toBeDefined();
+    expect(supervision.released).toEqual(["launch_failed_supervision_bind"]);
   });
 
   it("releases the reservation when the launch fails after reserving", async () => {

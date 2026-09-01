@@ -5,7 +5,7 @@ import type { StdinExec } from "./src/exec-stdin.js";
 import { defaultAttachmentStore, type AttachmentStore } from "./src/messages/store.js";
 import { RecipientRegistry } from "./src/messages/recipients.js";
 import { boundedText, JobRegistry, type JobDetail } from "./src/job-registry.js";
-import { SupervisionRegistry } from "./src/supervision/registry.js";
+import { createCliTranscriptReader, SupervisionRegistry } from "./src/supervision/registry.js";
 import { createPiSupervisionNotifier } from "./src/supervision/notify.js";
 import { createRegistryModelService, type SupervisionModelService } from "./src/supervision/model-service.js";
 import type { ModelRegistrySeam } from "./src/reviewer.js";
@@ -126,9 +126,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: () => loadSettings(),
-    readTranscript: (paneId, signal) => cli
-      .runText(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal)
-      .then((output) => (output.length === 0 ? [] : output.split(/\r?\n/u).slice(-100))),
+    readTranscript: createCliTranscriptReader(cli),
     ...(pi.sendMessage ? { notifier: createPiSupervisionNotifier((message, deliveryOptions) => pi.sendMessage!(message, deliveryOptions)) } : {}),
     models: () => models.current,
     monitorOptions: { env },

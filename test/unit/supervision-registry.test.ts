@@ -59,6 +59,7 @@ function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[
     monitor: new SessionEventMonitor({ connect: async () => server.stream, env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
     ...(options.reviewer ? { reviewerFactory: () => options.reviewer! } : {}),
     scheduler: { setTimer: () => "timer", clearTimer: () => undefined },
+    idFactory: (() => { let id = 0; return () => `fixture-${++id}`; })(),
   });
   return { jobs, supervision, wakes, push: server.push };
 }

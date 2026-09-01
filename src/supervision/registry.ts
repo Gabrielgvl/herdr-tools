@@ -24,6 +24,20 @@ import {
 /** The transcript source the reviewer reads. Bounded by the CLI's own evidence limits. */
 export type SupervisionTranscriptReader = (paneId: string, signal: AbortSignal) => Promise<string[]>;
 
+/** The bounded transcript window a reviewer receives. */
+export const SUPERVISION_TRANSCRIPT_LINES = 100;
+
+/**
+ * The one authoritative transcript read both hosts use. It is the same
+ * `pane read` the wait reviewer uses, so supervision adds no new Herdr surface.
+ */
+export function createCliTranscriptReader(cli: { runText(argv: string[], signal: AbortSignal): Promise<string> }): SupervisionTranscriptReader {
+  return async (paneId, signal) => {
+    const output = await cli.runText(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(SUPERVISION_TRANSCRIPT_LINES), "--format", "text"], signal);
+    return output.length === 0 ? [] : output.split(/\r?\n/u).slice(-SUPERVISION_TRANSCRIPT_LINES);
+  };
+}
+
 export interface SupervisionRegistryDependencies {
   jobs: JobRegistry;
   settingsLoader: () => Promise<Settings>;

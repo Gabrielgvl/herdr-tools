@@ -35,7 +35,6 @@ import {
   isPaneRecordEvent,
   movePreviousPaneId,
   parsePaneRecord,
-  SupervisionProtocolError,
   type SupervisionAgentStatus,
   type SupervisionPaneRecord,
   type SupervisionSocketEvent,
@@ -288,8 +287,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     let pane: SupervisionPaneRecord;
     try {
       pane = eventPaneRecord(event);
-    } catch (error) {
-      if (!(error instanceof SupervisionProtocolError)) throw error;
+    } catch {
+      // `parsePaneRecord` refuses rather than guesses, so a malformed record is
+      // a reconciliation trigger like any other unprovable observation.
       await this.reconcile("event:malformed_pane_record");
       return;
     }
@@ -297,7 +297,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       await this.followMove(event, pane);
       return;
     }
-    if (pane.revision < (this.anchor?.revision ?? 0)) return;
+    if (pane.revision < this.anchor!.revision) return;
     const verdict = paneContinuity(this.identity!, pane);
     if (verdict === "replaced") {
       await this.reconcile("event:continuity_broken");
@@ -319,8 +319,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     let previous: string;
     try {
       previous = movePreviousPaneId(event);
-    } catch (error) {
-      if (!(error instanceof SupervisionProtocolError)) throw error;
+    } catch {
       await this.settle("identity_lost", "move_not_atomic");
       return;
     }
@@ -350,7 +349,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   /** One coalesced authoritative reconciliation. Concurrent triggers collapse into a re-run. */
   private async reconcile(trigger: string): Promise<void> {
-    if (this.state === "settled") return;
+    // `fold` and `followMove` are the only callers and both refuse once settled,
+    // so this method needs no settled guard of its own.
     if (this.reconciling) {
       this.reconcileAgain = true;
       return;
@@ -443,7 +443,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       const result = await this.deps.reviewer.review({
         paneId: this.identity!.paneId,
         agentName: this.identity!.agentName,
-        workingForMs: Math.max(0, this.deps.clock.now() - (this.workingSinceMs ?? this.deps.clock.now())),
+        workingForMs: Math.max(0, this.deps.clock.now() - this.workingSinceMs!),
         metadata: { agentKind: this.identity!.agentKind, status: this.status, revision: this.lastRevision },
         transcriptDelta,
       }, this.abort.signal);
@@ -479,13 +479,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.publish(`${type}: ${summary}`);
     this.deps.notifier.wake({
       jobId: this.deps.jobId,
-      child: {
-        agentName: this.identity?.agentName ?? this.deps.child.agentName,
-        // The bound identity is authoritative once binding proved it; before that
-        // only the requested profile's kind exists.
-        agentKind: this.identity?.agentKind ?? this.deps.child.agentKind,
-        paneId: this.identity?.paneId ?? this.paneId ?? "",
-      },
+      // Every material event is emitted after binding, so the bound identity is
+      // authoritative here rather than the requested profile's shape.
+      child: { agentName: this.identity!.agentName, agentKind: this.identity!.agentKind, paneId: this.identity!.paneId },
       event,
     });
     return event;

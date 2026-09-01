@@ -11,7 +11,7 @@ import { resetOwnership, RuntimeOwnership } from "../ownership.js";
 import { discoverProfiles } from "../profiles/discovery.js";
 import type { ProfileCatalog } from "../profiles/types.js";
 import { ReviewerFailure } from "../reviewer.js";
-import { SupervisionRegistry } from "../supervision/registry.js";
+import { createCliTranscriptReader, SupervisionRegistry } from "../supervision/registry.js";
 import { CLAUDE_CHANNEL_CAPABILITY, createChannelSupervisionNotifier } from "../supervision/notify.js";
 import { createBuiltinModelService } from "../supervision/model-service.js";
 import { loadSettings, type Settings } from "../settings.js";
@@ -128,9 +128,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
-    readTranscript: (paneId, signal) => cli
-      .runText(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], signal)
-      .then((output) => (output.length === 0 ? [] : output.split(/\r?\n/u).slice(-100))),
+    readTranscript: createCliTranscriptReader(cli),
     notifier: createChannelSupervisionNotifier((notification) => channel.current?.(notification)),
     // The MCP host has no Pi model registry, and `hostContext` deliberately
     // still throws for `context.modelRegistry`. It resolves the supervisor's

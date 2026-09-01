@@ -145,15 +145,21 @@ For each event on the shared stream:
 count, matching the repository's bounded-evidence rule.
 
 **Reconnect (requirement 7).** On reconnect the monitor re-runs bootstrap
-(`session.snapshot`, then `events.subscribe`, then the replay) and each supervisor refolds
-from `anchor`. Then:
+(`session.snapshot`, then `events.subscribe`, then the replay). Each supervisor then does
+exactly two things, and neither of them tries to locate the replay boundary:
 
-- every folded transition the supervisor had **not** already processed is processed now;
-- if there was at least one such transition, or if the replay no longer contains any event
-  for the bound pane at or after `anchor.revision` while the fresh snapshot shows the pane's
-  revision has advanced past the last folded revision, exactly one high-priority
-  `evidence_gap` event is emitted;
-- otherwise the supervisor resumes **silently**.
+- **Gap decision, from the bootstrap snapshot alone.** If the fresh snapshot cannot prove the
+  bound occupant is still there, the supervisor settles `identity_lost`. If it can, and the
+  pane's `revision` is greater than the last folded revision, the lifecycle sequence advanced
+  while the socket was down: exactly one high-priority `evidence_gap` is emitted. If the
+  revision is unchanged, the supervisor resumes **silently**. This is a single authoritative
+  comparison, not an inference about which replayed events were missed, so it is correct
+  whether the retained log can still replay the outage or has scrolled past it.
+- **Replay dedupe, by relevant-event index.** The replay is deterministic, so the *n*-th event
+  relevant to this supervisor is the same event on every connection. The supervisor replays
+  its fold cursor from zero and skips every relevant event at or below the cursor it had
+  already reached; everything beyond it is folded, whether it happened during the outage or
+  after it.
 
 If reconnect is not available the supervisor is **visibly degraded** — job progress records
 it, one `monitor_degraded` wake is emitted, and reconnection is retried with bounded
@@ -289,19 +295,19 @@ Delivery is **wake/report only**, best effort, never a gate, never retried.
   `notifications/claude/channel` with bounded `content` and `meta`. There is no delivery
   acknowledgement and no Herdr agent prompt injection.
 
-`manager-claude` opts in locally with the exact flags the installed Claude 2.1.252 accepts
-(both verified to parse against the real binary):
+`manager-claude` opts in locally with the documented development-channel flag, using the
+plugin's own MCP server key:
 
 ```
---channels server:plugin_herdr-tools_herdr
---dangerously-load-development-channels server:plugin_herdr-tools_herdr
+--dangerously-load-development-channels server:herdr
 ```
 
-The identifier `plugin_herdr-tools_herdr` is the MCP server name Claude assigns to this
-plugin's `herdr` server, observed as the `mcp__plugin_herdr-tools_herdr__*` tool namespace.
-It is declared in the profile (`runtime.channels` / `runtime.developmentChannels`) rather
-than hard-coded in the adapter, so a different install can correct it without a code change.
-See §16 for the residual risk.
+The flag is hidden from `claude --help` in 2.1.252 but is a real root-command option, and
+`--channels` is proven to require a tagged `server:<name>` or `plugin:<name>@<marketplace>`
+entry. The entry is declared in the profile as `runtime.developmentChannels` rather than
+hard-coded in the adapter, and it is validated as a tagged entry at profile-parse time, so a
+different install can correct it without a code change. It is profile-only: a launch override
+must not be able to open an inbound channel the profile did not declare. See §16.
 
 ## 13. Settings
 
@@ -327,12 +333,13 @@ operation. No compatibility shim preserves the old wording.
 
 ## 16. Known risks
 
-- **R1 — channel identifier.** `--channels` and `--dangerously-load-development-channels`
-  are proven to exist and to parse on Claude 2.1.252, and `--channels` is proven to require
-  a tagged `server:`/`plugin:` entry. The exact server name for a `--plugin-dir`-loaded
-  plugin is inferred from the observed tool namespace and is **not** proven end-to-end. If it
-  is wrong, Claude may refuse the entry at startup. Mitigation: the entries are declarative
-  profile fields, delivery is best effort, and Pi delivery is unaffected.
+- **R1 — channel delivery.** `--dangerously-load-development-channels` is proven to exist
+  and to parse on Claude 2.1.252, and the entry `server:herdr` matches the plugin's own MCP
+  server key. End-to-end channel delivery is **not** proven here: it additionally requires the
+  organization's `channelsEnabled` managed setting, which this repository can neither set nor
+  observe. Mitigation: the entry is declarative profile data, delivery is best effort by
+  contract, soft receipts make every event recoverable through `herdr_jobs get`, and Pi
+  delivery is unaffected.
 - **R2 — replay volume.** A long-lived Herdr session replays a large log on every connect
   and reconnect. The monitor parses it under a per-line bound and discards non-matching
   events without allocation beyond the parsed record.

@@ -131,9 +131,12 @@ manager sessions.
   read-only observation transport owned by one module.
 - Supervision adds a long-lived connection and a periodic model call per continuously working
   child. Both are bounded and both are visible in `herdr_jobs`.
-- The Claude channel identifier for a `--plugin-dir`-loaded plugin is inferred from the
-  observed MCP tool namespace and is not proven end-to-end. It is declarative profile data so
-  it can be corrected without a code change, and a wrong value degrades Claude delivery only.
+- Claude channel delivery is opted into with `--dangerously-load-development-channels
+  server:herdr`, using the plugin's own MCP server key. The flag is proven to parse on Claude
+  2.1.252, but end-to-end delivery also depends on the organization's `channelsEnabled`
+  managed setting, which this repository cannot set or observe. The entry is declarative
+  profile data so it can be corrected without a code change, and undelivered wakes cost
+  nothing: every event is recoverable through `herdr_jobs get`.
 
 ## Alternatives rejected
 

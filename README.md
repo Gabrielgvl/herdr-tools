@@ -6,6 +6,8 @@ Two hosts serve the same implementation. Pi loads the extension through the root
 
 `herdr_wait` is the MCP state/output wait tool. It is not a CLI lifecycle command: CLI readiness uses `herdr agent wait`, while output conditions are evaluated from authoritative pane output.
 
+Every successful `herdr_launch` also creates a **supervisor**: a whole-life, session-scoped watcher of that exact child, listed and inspected through the existing `herdr_jobs` tool as a first-class `kind: "supervisor"` job. Supervision observes and reports; it never mutates the child and never adds a tool.
+
 ## Quick start
 
 ```bash
@@ -55,6 +57,20 @@ claude plugin update herdr-tools@herdr-tools --scope user -y
 
 The cached plugin intentionally points back to `/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js`, so main installed at that path must be built. For development or sideloading, `claude --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/role-plugins/manager` remains an explicit alternative to the global marketplace installation.
 
+## Automatic child supervision
+
+A supervisor exists from the moment a child exists, including a launch with no `initialPrompt` and a launch into an existing pane. `herdr_launch` reserves it before its first topology mutation and binds it only after the exact launch identity is proven and, when a prompt was sent, after prompt consumption is confirmed. A launch that cannot bind a supervisor fails with `SUPERVISION_UNCONFIRMED` as a partial effect: the child is left alone, nothing is retried, and nothing is cleaned up. A successful launch returns the supervisor's stable job ID.
+
+Supervision watches the Herdr lifecycle stream directly. It opens **one** connection to `HERDR_SOCKET_PATH` for the whole session, bootstraps with `session.snapshot`, and issues one acknowledged `events.subscribe`; Herdr 0.8.2 drops a connection that subscribes twice, so the subscription set is fixed and global and every supervisor is multiplexed over it. The child is pinned by `terminal_id` plus the whole `agent_session` and anchored on the pane `revision` its bind snapshot observed, because Herdr reuses pane IDs. A pane move is followed only on atomic evidence plus a fresh matching occupant. On reconnect a supervisor resumes silently only when the fresh snapshot proves nothing advanced; otherwise it emits one high-priority `evidence_gap` and keeps going. There is no polling fallback: a socket that cannot be restored leaves the supervisor visibly degraded.
+
+Working starts are silent. The manager is woken for a completed work cycle, a block, reviewer attention, reviewer degradation and recovery, identity replacement or loss, release, pane close, monitor health changes, and an evidence gap. A child that has been working continuously for the configured cadence is reviewed with exactly `openai-codex/gpt-5.6-luna` at thinking `max` — separate from the explicit-wait reviewer, which stays Luna at `low`. Reviewer failure degrades visibly once and retries at the next cadence.
+
+Wakes are best effort and never retried. Pi wakes by steered custom context. Claude wakes through the Claude Code Channels research preview served by the same MCP server, which advertises `capabilities.experimental["claude/channel"]` and sends `notifications/claude/channel`; `manager-claude` opts in locally with `--dangerously-load-development-channels server:herdr`, and the organization's `channelsEnabled` policy still applies. Nothing is lost when a wake does not arrive: every material event carries an opaque ID, `herdr_jobs get` returns the pending ones and marks exactly those observed, and `herdr_jobs list` and the active-job footer show unobserved counts.
+
+`herdr_jobs cancel` is refused with `SUPERVISION_ACTIVE` while the exact child is live. Manager-session shutdown cancels supervisors, and nothing persists across sessions.
+
+The full contract is in [the supervision spec](docs/specs/auto-child-supervision.md) and [ADR-019](docs/decisions/019-automatic-child-supervision.md).
+
 ## Configuration
 
 `config.json` is optional and must contain only:
@@ -68,7 +84,7 @@ The cached plugin intentionally points back to `/home/gabriel/.pi/agent/extensio
 }
 ```
 
-The cadence is an integer from 1 through 30. A configured reviewer uses fixed `low` thinking. Missing settings use the documented defaults; malformed or invalid settings fail closed.
+The cadence is an integer from 1 through 30 and is shared by the explicit-wait reviewer and the supervision reviewer. `wait.reviewerModel` is wait-only and uses fixed `low` thinking; the supervision reviewer pins `openai-codex/gpt-5.6-luna` at `max` in code. Missing settings use the documented defaults; malformed or invalid settings fail closed.
 
 ## Tool examples
 
@@ -122,7 +138,8 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `src/context.ts` resolves the live effective caller context from the injected pane identity and authoritative topology; `src/targets.ts` resolves exact targets against that context.
 - `src/tools/` contains the seven public tools. `src/tools/turn-control.ts` owns the internal identity-bound cancel/interrupt protocol. Profile discovery and typed Pi/Claude adapters live under `src/profiles/`; `herdr_launch` is strict profile-only: no profile, no launch.
 - `src/reviewer.ts` contains the tool-less in-process model reviewer used by long waits.
-- `src/wait-jobs-ui.ts` owns session-scoped footer/widget rendering for active detached waits.
+- `src/supervision/` owns automatic child supervision: strict validation of every socket value (`protocol.ts`), the newline-delimited JSON client (`socket.ts`), the one multiplexed session event connection (`monitor.ts`), exact-child pinning and move continuity (`identity.ts`), transitions and soft receipts (`events.ts`), the Luna-max supervisor reviewer and its host-independent model service (`reviewer.ts`, `model-service.ts`), Pi and Claude Channel wakes (`notify.ts`), one child's state machine (`supervisor.ts`), and the reserve/bind/settle coordinator (`registry.ts`). This is the only module that touches the Herdr socket, and it is read-only.
+- `src/wait-jobs-ui.ts` owns session-scoped footer/widget rendering for active detached jobs of both kinds.
 - `src/tui.ts` uses Pi `Text` components with bounded semantic rows.
 
-See [ADR-001](docs/decisions/001-extension-runtime-boundary.md) for the runtime boundary and ownership decisions, [ADR-009](docs/decisions/009-shared-claude-mcp-adapter.md) for the shared-implementation MCP adapter, [ADR-010](docs/decisions/010-claude-manager-plugin-conduct.md) for the historical Claude package boundary, [ADR-011](docs/decisions/011-manager-claude-profile-and-plugin-consolidation.md) for the current manager profile and plugin layout, [ADR-015](docs/decisions/015-semantic-initial-prompt-consumption-confirmation.md) for launch initial-prompt confirmation, and [ADR-017](docs/decisions/017-mcp-live-caller-context-rebinding.md) for live caller-context rebinding. The focused context contract is in [the MCP context-rebinding spec](docs/specs/mcp-context-rebind.md).
+See [ADR-001](docs/decisions/001-extension-runtime-boundary.md) for the runtime boundary and ownership decisions, [ADR-009](docs/decisions/009-shared-claude-mcp-adapter.md) for the shared-implementation MCP adapter, [ADR-010](docs/decisions/010-claude-manager-plugin-conduct.md) for the historical Claude package boundary, [ADR-011](docs/decisions/011-manager-claude-profile-and-plugin-consolidation.md) for the current manager profile and plugin layout, [ADR-015](docs/decisions/015-semantic-initial-prompt-consumption-confirmation.md) for launch initial-prompt confirmation, [ADR-017](docs/decisions/017-mcp-live-caller-context-rebinding.md) for live caller-context rebinding, and [ADR-019](docs/decisions/019-automatic-child-supervision.md) for automatic child supervision. The focused context contract is in [the MCP context-rebinding spec](docs/specs/mcp-context-rebind.md).

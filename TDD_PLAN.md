@@ -909,6 +909,11 @@ escalation, not a reason to rewrite this trace. The final implementation report
 must include TDD-plan deviations, architecture deviations, scope deviations,
 and concerns for the reviewer, as required by the source TDD skill.
 
+## Approved automatic child-supervision amendment (summary)
+
+Every successful `herdr_launch` creates a first-class `kind: "supervisor"` job.
+The full amendment is at the end of this document.
+
 ## Approved detached wait-job amendment
 
 The detached wait contract is now part of this plan. Add red/green coverage for
@@ -944,3 +949,89 @@ Rendering failures must not affect job state. Registration tests must verify the
 `/herdr-waits` read-only command, unchanged seven-tool registration, no factory
 background timer, and non-UI behavior. Existing terminal notification and
 `herdr_jobs` cancellation coverage remains authoritative.
+
+## Approved automatic child-supervision amendment
+
+Automatic child supervision is part of this plan. It is observation and
+notification only, and every test below holds the repository's enforced 100%
+threshold; no test may weaken it.
+
+**Protocol validation.** Cover the fixed global subscription set and prove it
+excludes `pane.agent_status_changed`, which requires a `pane_id` and therefore
+cannot serve children that do not exist yet. Cover reply, failure, accepted
+event, and ignored-kind parsing, and prove every malformed line is refused rather
+than skipped: non-JSON, non-object, unusable identifier, a reply with neither
+result nor error, a malformed error body, a line that is neither reply nor event,
+malformed event data, and an oversized frame. Cover `PaneInfo` validation for
+every field protocol 20 requires, for optional fields supplied as `null`, and for
+each malformed shape. Cover the subscription acknowledgement requirement.
+
+**Socket.** Cover request correlation by id, ignored unknown ids, server failures,
+request timeouts that leave the connection usable, lines reassembled across chunks
+without splitting a code point, skipped blank framing lines, refusal of an event
+that arrives before the acknowledgement, connection teardown on a malformed or
+oversized line, peer close, idempotent close, and a real unix-socket round trip
+through the `node:net` seam plus its unopenable and connect-bound paths.
+
+**Identity.** Cover whole-identity comparison including all four agent-session
+components, the `continuous`/`unproven`/`replaced` verdicts, agent-name checking
+only where a snapshot supplies one, and move continuity: proven, unproven session,
+wrong pane, replaced occupant, and a revision that went backwards.
+
+**Monitor.** Cover snapshot-then-subscribe bootstrap shared by concurrent callers,
+refusal without a socket path and after shutdown, closure on an unacknowledged
+subscription, fan-out by pane id including a move's previous pane id, lossless
+reconnect with one degraded episode and one recovery, a silent immediate
+reconnect, only-first-failure degradation reporting, and no reconnect after stop.
+
+**Supervisor.** Cover binding to the proven occupant with a revision anchor, with
+and without a `state_change_seq`; refusal to bind on an unreadable snapshot, a
+non-unique occupant, or a replaced identity; queued events during binding;
+historical replay below the anchor ignored; a working start recorded silently; a
+completed work cycle and a block waking; thin and unprovable events reconciling
+rather than concluding; reconciliation unavailability keeping supervision active;
+coalesced concurrent reconciliations; proven and unproven moves; silent reconnect
+versus one high-priority `evidence_gap`; replay dedupe across a reconnect;
+identity lost on reconnect; monitor degradation and recovery; the review cadence
+storing progress silently, waking on attention, degrading once and recovering
+once, treating an unreadable transcript as a reviewer failure, refusing to review
+a non-working or settled child, refusing concurrent reviews, and not re-arming for
+a child that stopped working mid-review; soft receipts returned once; settlement
+on shutdown, on a released reservation, and never twice.
+
+**Reviewer and model service.** Cover the exact pinned model and `max` thinking,
+credentials omitted when the service supplies none, prompt bounding, abort before
+and during the call, malformed and non-JSON responses, transport failures
+including a non-`Error` rejection, the Pi registry adapter, the host-independent
+built-in catalogue service, and identifier validation. Cover that only
+`stalled`/`blocked`/`risk`/`appears_complete`/`unknown` wake the manager.
+
+**Job registry.** Cover the discriminated request union, `kind` on details and
+summaries, supervisor settlement into `supervision_result`/`supervision_reason`,
+the `kind` list filter, `attachSupervision` refusals, the bounded supervision
+projection with its truncation counters and field clipping, evidence dropped
+before the job in a compact projection, the minimal projection keeping the
+supervisor outcome and unobserved count, cancellation refusal while a child is
+live, and unconditional shutdown.
+
+**Launch.** Cover reservation before any topology mutation, binding after prompt
+confirmation, the returned job ID in content and details, supervision of a launch
+with no `initialPrompt` and of an existing-pane launch, `SUPERVISION_UNAVAILABLE`
+with no dispatched mutation, `SUPERVISION_UNCONFIRMED` as a partial effect with
+child evidence and no cleanup, an untyped reserve failure classified rather than
+echoed, a non-binding failure rethrown unchanged, and reservation release on any
+failure after reserving.
+
+**Notification and hosts.** Cover bounded wake content and meta, the Pi steer
+options, the Claude Channel method and capability, swallowed delivery failures on
+both paths, and an inert notifier. Cover both host wirings end to end against a
+real unix socket: the Pi runtime reserving, binding, and waking by steer, and the
+MCP server advertising `claude/channel`, resolving its own model service, and
+waking by channel notification.
+
+**Profile.** Cover tagged-only `runtime.developmentChannels` entries, the emitted
+`--dangerously-load-development-channels` argv, and the unchanged capability
+matrix for every other bundled profile.
+
+Existing explicit-wait behaviour, its reviewer at Luna `low`, and existing
+`herdr_jobs` coverage remain authoritative and unchanged.

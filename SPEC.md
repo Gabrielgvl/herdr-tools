@@ -44,7 +44,9 @@ The extension must not edit `/home/gabriel/.pi/agent/extensions/herdr-agent-stat
 
 ### CLI adapter
 
-All Herdr operations go through `pi.exec("herdr", argv, options)` with an argument array. The extension must not invoke a shell string, call Herdr's socket directly, reimplement the Herdr protocol, or synthesize Herdr identifiers.
+All Herdr *operations* go through `pi.exec("herdr", argv, options)` with an argument array. The extension must not invoke a shell string, reimplement the Herdr protocol, or synthesize Herdr identifiers.
+
+The one exception is automatic child supervision, which observes the local Herdr socket read-only. Supervision issues exactly `session.snapshot` and one `events.subscribe` per connection over newline-delimited JSON at `HERDR_SOCKET_PATH`, validates every value the server sends against the installed `herdr api schema`, and never mutates anything. Every mutation, and every operation of the seven tools, still goes through the CLI. See `docs/specs/auto-child-supervision.md` and ADR-019.
 
 The installed CLI is authoritative for command syntax, supported agent kinds, response shape, and client/server compatibility. The adapter must:
 
@@ -244,11 +246,13 @@ Long waits use mandatory in-process, tool-less reviewer calls:
 
 After preflight, the extension always registers a stable opaque `job_${randomUUID()}` identifier and runs the prepared wait engine under a fresh per-job `AbortController`. The prepared parameters, settings, resolved IDs, and opaque target-generation references are copied at registration. Timeout starts after registration. The initiating signal, call-scoped update callback, and synchronous result path are never used by post-registration work. A session generation check prevents stale preflight from registering into a replacement session. The tool returns the detached acknowledgement immediately; all later operation phases, terminal `wait_result` values, progress, reviewer evidence, and cancellation evidence are read through `herdr_jobs`.
 
+The registry holds two job kinds. A `kind: "wait"` job is the detached wait described here. A `kind: "supervisor"` job is created automatically by every successful `herdr_launch` and watches that exact child for its whole life; it is described in "Automatic child supervision" below. Both kinds are listed, inspected, and shut down through `herdr_jobs`, and there is no eighth public tool.
+
 The in-memory, session-wide registry has no concurrency cap and retains terminal jobs until shutdown. Its public operation phases are exactly `accepted`, `running`, `cancel_requested`, and `settled`. `wait_result` is absent before `settled` and, at settlement, is exactly one of `condition_met`, `timed_out`, `manager_judgment_required`, `failed`, `cancelled`, or `unknown`. Terminal transitions are first-wins, and only latest bounded progress is stored. `herdr_jobs` is the sole public registry view and is strict:
 
-- `{operation:"list", operation_phase?, offset?, limit?}` filters by operation phase, orders newest-first by insertion sequence, filters before pagination, defaults offset to `0` and limit to `20`, caps limit at `100`, and returns `{total,nextOffset,jobs}` with transcript-free summaries.
-- `{operation:"get", jobId}` returns a bounded, typed full current or settled detail for an owned job. A settled target observation carries structured `target_evidence` with its kind, observation timestamp, opaque target-generation reference, `currency: "historical_non_current"`, and evidence source; it is never current target truth.
-- `{operation:"cancel", jobId}` closes the operation gate and advances its fence before publishing `cancel_requested` or aborting the runner. It waits for bounded runner/command/callback quiescence: only observed drain settles `wait_result: "cancelled"`; uncertainty settles `wait_result: "unknown"` with `CANCELLATION_UNCERTAIN`. A settled job is returned unchanged, and unknown IDs are structured `JOB_NOT_FOUND`.
+- `{operation:"list", operation_phase?, kind?, offset?, limit?}` filters by operation phase and optionally by job kind, orders newest-first by insertion sequence, filters before pagination, defaults offset to `0` and limit to `20`, caps limit at `100`, and returns `{total,nextOffset,jobs}` with transcript-free summaries.
+- `{operation:"get", jobId}` returns a bounded, typed full current or settled detail for an owned job. For a supervisor it also returns the pending unobserved supervision events and marks exactly the events it returned observed. A settled target observation carries structured `target_evidence` with its kind, observation timestamp, opaque target-generation reference, `currency: "historical_non_current"`, and evidence source; it is never current target truth.
+- `{operation:"cancel", jobId}` is refused with `SUPERVISION_ACTIVE` for a supervisor whose exact child is still live. Otherwise it closes the operation gate and advances its fence before publishing `cancel_requested` or aborting the runner. It waits for bounded runner/command/callback quiescence: only observed drain settles `wait_result: "cancelled"`; uncertainty settles `wait_result: "unknown"` with `CANCELLATION_UNCERTAIN`. A settled job is returned unchanged, and unknown IDs are structured `JOB_NOT_FOUND`.
 
 On session shutdown, notification delivery is disabled first, running jobs are fenced and aborted, in-memory jobs are discarded, and registry ownership/generation is reset. `/tree` does not cancel jobs. Terminal notifications are one-shot, visible, best-effort Pi messages; they make no delivery or consumption claim. Explicit cancellation and shutdown cancellation never notify. Manager-judgment notifications start with `HIGH PRIORITY: MANAGER JUDGMENT REQUIRED` and use details priority `high`; every other terminal notice uses normal priority. Notification text and details identify the job ID, operation phase, terminal wait result when present, reason, requested/matched targets, and only bounded evidence kinds or error summaries, treating pane/output text as untrusted data.
 
@@ -261,6 +265,29 @@ All model-visible content, list summaries, terminal notifications, and renderers
 While detached jobs are active, the extension owns one session-scoped Pi footer status. It renders an animated spinner, the exact active count, the elapsed time of the oldest active job, and the `/herdr-waits` hint, refreshing once per second. The timer starts only when an active job exists and stops immediately when none remain. Status/UI failures never alter registry state.
 
 `/herdr-waits` is a read-only toggle for an above-editor active-job widget. Each visible row contains the effective label, current elapsed time, and exact job ID. Pi bounds string-array widgets to 10 lines, so the extension uses at most 10 total lines and reserves the final line for an omission count when more jobs are active. It clears while the active set is empty but remembers the enabled preference for the current session, so a later wait restores it automatically. A session transition clears footer/widget state, stops the timer, and resets the toggle. Inspect and cancel remain `herdr_jobs` operations; terminal notifications remain unchanged.
+
+
+### Automatic child supervision
+
+Every successful `herdr_launch` creates a live supervisor for the exact child it launched, including a launch with no `initialPrompt` and a launch into an existing pane. Supervision is observation and notification only: it never mutates the child, never gates its work, and never becomes a public tool.
+
+**Reserve, then bind.** `herdr_launch` reserves supervision before its first topology mutation, in phase `supervision_reserve`; a failure there refuses the launch with `SUPERVISION_UNAVAILABLE` and `effectCertainty: "absent"`. It binds in phase `supervision_bind`, after readiness has proven the exact launch identity and, when a prompt was sent, after prompt consumption is confirmed. A binding that cannot be proven throws `SUPERVISION_UNCONFIRMED` as a partial-effect failure carrying child evidence, with no retry and no cleanup of the child. Profile fallback stays strictly inside `agent_start`, before assignment and before binding. A launch that fails between reserve and bind releases its reservation so the job settles; releasing a reservation is never child cleanup. A successful launch returns the stable supervisor job ID in both its model-visible content and its details.
+
+**One session connection.** Supervision opens one connection to `HERDR_SOCKET_PATH` for the whole manager session and multiplexes it across every supervisor. Bootstrap is always `session.snapshot` first and one acknowledged `events.subscribe` second. The subscription set is fixed — `pane.created`, `pane.updated`, `pane.closed`, `pane.exited`, `pane.moved`, `pane.agent_detected` — because Herdr 0.8.2 drops a connection that subscribes twice, which also rules out per-pane `pane.agent_status_changed`. `pane.updated` carries a full `PaneInfo`, so it is the authoritative status channel.
+
+**Identity and anchoring.** A supervisor pins `pane_id`, `terminal_id`, the agent name and kind, and the whole four-part `agent_session`, and anchors on the pane `revision` its bind snapshot observed. Pane IDs are reused across the durable event log, so a thin event carrying only a pane ID is a reconciliation trigger — a fresh `session.snapshot` decides — never a conclusion. A pane move is followed only when an atomic move event and a fresh authoritative occupant both prove terminal and agent-session continuity; anything else settles `identity_lost` and wakes.
+
+**Reconnect.** On reconnect the monitor re-bootstraps and each supervisor refolds from its anchor. Resuming silently is allowed only when the reconnect snapshot proves the child's lifecycle did not advance; otherwise exactly one high-priority `evidence_gap` is emitted and supervision continues. If the socket cannot be restored the supervisor stays visibly degraded and retries with bounded jittered backoff. There is no polling fallback.
+
+**Material events.** Every exact-child transition is recorded. Working starts are silent. The manager is woken for a completed work cycle, a block, reviewer attention, reviewer degradation and recovery, identity replacement or loss, release or exit, pane close, monitor degradation and recovery, and an evidence gap.
+
+**Review cadence.** A child that has been working continuously for `wait.reviewCadenceMinutes` is reviewed with exactly `openai-codex/gpt-5.6-luna` at thinking `max`. Results store silently; `stalled`, `blocked`, `risk`, `appears_complete`, and `unknown` wake the manager and the supervisor stays active. A reviewer failure enters one visible degraded episode and retries at the next cadence, and the first success afterwards notifies recovery once. The reviewer never starts a Herdr agent and never selects a substitute model.
+
+**Wake delivery.** Wakes are report-only, best effort, and never retried. Pi delivers through the existing `sendMessage` custom-context path with `deliverAs: "steer"` and `triggerTurn: true`. Claude delivers through the Claude Code Channels research preview served by the same MCP server: the server advertises `capabilities.experimental["claude/channel"]` and sends `notifications/claude/channel` with bounded content and meta. `manager-claude` opts in with `runtime.developmentChannels: ["server:herdr"]`, emitted as `--dangerously-load-development-channels server:herdr`. Organization `channelsEnabled` policy still applies and cannot be observed from this repository.
+
+**Soft receipts.** Every material event carries an opaque `eventId`. `herdr_jobs get` returns the pending unobserved events and marks exactly those observed; `list` and the Pi active-job UI show unobserved counts. Event, transition, and reviewer history are bounded with explicit truncation counts. Nothing is resent.
+
+**Lifecycle.** Supervisors are session-scoped and never persist across manager sessions. Manager-session shutdown cancels them. Exact-child termination settles them. `herdr_jobs cancel` is refused with `SUPERVISION_ACTIVE` while the child is live.
 
 ### `herdr_launch`
 
@@ -409,6 +436,7 @@ The optional extension-owned `config.json` uses this JSON shape:
 - `wait.reviewCadenceMinutes`: integer, default `5`, inclusive range `1..30`.
 - `wait.reviewerModel`: model identifier, default `openai-codex/gpt-5.6-luna`.
 - Reviewer thinking level is fixed to `low` and is not configurable by a tool call.
+- `wait.reviewCadenceMinutes` is shared with the supervision reviewer. `wait.reviewerModel` is wait-only: the supervisor reviewer pins `openai-codex/gpt-5.6-luna` at thinking `max` in code, because it judges a child that has been working continuously with no transition to read.
 
 If `config.json` is absent, use the specified defaults. If it is present but malformed or invalid, fail closed with `INVALID_SETTINGS`; do not coerce values or fall back to defaults or another reviewer model. A configured reviewer model that cannot be resolved or authenticated causes a long wait to fail with `REVIEWER_FAILED`; there is no fallback model.
 
@@ -438,6 +466,11 @@ Errors are stable, concise, and machine-readable in structured details. At minim
 - `BACKEND_UNAVAILABLE`: CLI cannot reach the Herdr server/socket, including a failed compatibility preflight.
 - `CLI_INCOMPATIBLE`: compatibility health is malformed or reports incompatible client/server versions; mutations stop before dispatch.
 - `CLI_PROTOCOL_ERROR`: malformed or contradictory CLI output after compatibility preflight.
+- `SUPERVISION_UNAVAILABLE`: automatic child supervision could not be reserved; the launch is refused with no effect.
+- `SUPERVISION_UNCONFIRMED`: the child exists but supervision could not be bound to it; a partial-effect launch failure with child evidence, no retry, and no cleanup.
+- `SUPERVISION_ACTIVE`: `herdr_jobs cancel` was refused because the supervisor's exact child is still live.
+- `SUPERVISION_SOCKET_UNAVAILABLE`: `HERDR_SOCKET_PATH` is missing, malformed, or unopenable.
+- `SUPERVISION_PROTOCOL_ERROR`: a value the Herdr socket sent failed strict validation; the connection is dropped rather than guessed at.
 - `CLIENT_SERVER_INCOMPATIBLE`: health detects incompatible client/server versions or schemas.
 - `INVALID_INPUT`: schema or cross-field validation failure.
 - `INVALID_SETTINGS`: invalid extension-owned setting.
@@ -495,7 +528,7 @@ Each tool has a compact custom call/result row using Pi's extension renderer API
 - Call rows show the tool name, operation, and resolved human-readable target label/name when known.
 - Result rows show a short status such as inspected, sent, waiting, launched, updated, or closed, plus IDs/statuses needed for the next action.
 - `working`, `blocked`, `idle`/`done`, timeout, reviewer failure, protected, reconciled, and uncertain states use distinct semantic styling.
-- `herdr_launch` streams bounded progress through `onUpdate` for placement, readiness, explicit focus when requested, and prompt verification. `herdr_wait` stores bounded target-state and reviewer progress on the detached job for `herdr_jobs` inspection instead of using the initiating update callback.
+- `herdr_launch` streams bounded progress through `onUpdate` for supervision reservation, placement, readiness, explicit focus when requested, prompt verification, and supervision binding. A supervisor stores bounded transition, reviewer, and event progress on its own job for `herdr_jobs` inspection. `herdr_wait` stores bounded target-state and reviewer progress on the detached job for `herdr_jobs` inspection instead of using the initiating update callback.
 - Default output never prints full transcripts, environment values, raw CLI JSON, or reviewer prompts. Expanded details may show the fixed bounded transcript and structured metadata.
 - Errors render their stable code and concise reason. They do not look like successful operations.
 - TUI-specific rendering is guarded by Pi mode capabilities; RPC receives structured results, and close operations never require interactive UI confirmation.
@@ -519,6 +552,18 @@ The implementation belongs only under the separate directory below:
 │   ├── mutations.ts                # completed-mutation preservation and close reconciliation
 │   ├── settings.ts                 # extension-owned settings validation
 │   ├── wait-review.ts              # bounded, tool-less in-process reviewers
+│   ├── supervision/                # automatic child supervision
+│   │   ├── protocol.ts              # strict validation of every socket value
+│   │   ├── socket.ts                # newline-delimited JSON client
+│   │   ├── monitor.ts               # one multiplexed session event connection
+│   │   ├── identity.ts              # exact-child pinning and move continuity
+│   │   ├── events.ts                # transitions, material wakes, soft receipts
+│   │   ├── reviewer.ts              # Luna-max supervisor review
+│   │   ├── model-service.ts         # host-independent model registry/auth
+│   │   ├── notify.ts                # Pi steer and Claude Channel wakes
+│   │   ├── supervisor.ts            # one child's state machine
+│   │   ├── registry.ts              # reserve → bind → settle coordinator
+│   │   └── state.ts                 # the bounded view herdr_jobs publishes
 │   ├── tools/                      # seven tool implementations
 │   │   └── turn-control.ts          # strict cancel/interrupt protocol
 │   └── tui.ts                      # compact call/result/progress rendering

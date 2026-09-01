@@ -34,8 +34,10 @@ purpose. Probing the installed Herdr 0.8.2 (protocol 20) established four facts 
 constrain any design built on it:
 
 - `events.subscribe` is acknowledged with `subscription_started` and then streams.
-- A **second** `events.subscribe` on the same connection makes the server drop the
-  connection. The subscription set is fixed for a connection's life.
+- A connection answers exactly **one** request. A second request on a connection that
+  already replied is ignored and the connection closes; a request after `events.subscribe`
+  resets it. The subscription set is fixed for a connection's life, and every read is its own
+  short-lived connection.
 - `pane.agent_status_changed` requires a `pane_id`, so it is unusable on a connection that
   must serve children that do not exist yet. The globally subscribable `pane.updated`
   carries a full `PaneInfo` — including `agent_status`, `agent_session`, `terminal_id`, and
@@ -61,11 +63,15 @@ tool is added and supervision is never disguised as a one-shot `herdr_wait`.
 supervisor-shaped lies in it, and a supervisor settles into `supervision_result` rather than
 into `wait_result`.
 
-**3. One session-level socket connection, multiplexed, with a fixed global subscription
-set.** Because a connection's subscription set cannot be extended, the monitor subscribes
-once to `pane.created`, `pane.updated`, `pane.closed`, `pane.exited`, `pane.moved`, and
-`pane.agent_detected`, and fans events out to supervisors by identity. Adding a supervisor
-never resubscribes, so it can never drop the connection out from under its siblings.
+**3. One long-lived subscription connection, multiplexed; reads are separate and on
+demand.** Because a connection answers one request, the monitor holds one connection that
+carries `events.subscribe` and nothing else — `pane.updated`, `pane.closed`, `pane.exited`,
+`pane.moved`, `pane.agent_detected` — and fans events out to supervisors by identity. Adding
+a supervisor never resubscribes, so it can never drop the connection out from under its
+siblings, and a launch whose subscription is already live opens no connection at all. Every
+`session.snapshot` is a unary read on its own connection, taken only when something needs
+it: a redundant per-launch snapshot was enough to disturb a clientless headless Herdr server
+into failing prompt consumption, so reads are strictly on demand.
 
 **4. Anchor on `revision` and exact identity, never on stream position.** The replay has no
 boundary marker, so no design may try to find one. A supervisor stores the `revision` its

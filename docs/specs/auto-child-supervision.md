@@ -30,10 +30,13 @@ are `{"event":"<EventKind>","data":{...,"type":"<EventKind>"}}` and carry **no**
 `{"type":"subscription_started"}`. Only after that acknowledgement may pushed events be
 accepted.
 
-**F3 — one `events.subscribe` per connection.** A second `events.subscribe` on an already
-subscribed connection makes the server drop the connection (observed `ECONNRESET`). The
-subscription set is therefore fixed for the life of a connection and cannot be extended
-per child.
+**F3 — one request per connection.** A connection answers its first request and nothing
+else: a second request on a connection that already replied is ignored and the connection
+closes, and a request issued after `events.subscribe` resets it (`ECONNRESET`). This was
+established against a live named server; the earlier reading — that only a second
+`events.subscribe` was refused — was too narrow. Two consequences: the subscription set is
+fixed for the life of a connection and cannot be extended per child, and every
+`session.snapshot` is a unary read on its own short-lived connection.
 
 **F4 — `pane.agent_status_changed` requires a `pane_id`.** Because of **F3** it cannot be
 used by a session-level connection that must serve children discovered later. The globally
@@ -55,9 +58,11 @@ never identify a child.
 
 ## 3. Consequences of the protocol facts
 
-- **C1.** The session monitor opens **one** connection with a **fixed global** subscription
-  set and multiplexes it across all supervisors (requirement 14). Adding a supervisor never
-  resubscribes and never risks the connection.
+- **C1.** The session monitor holds **one** long-lived connection carrying a **fixed global**
+  subscription and nothing else, multiplexed across all supervisors (requirement 14). Adding
+  a supervisor never resubscribes and never risks the connection. Reads are separate,
+  short-lived connections, and a launch whose subscription is already live opens none: a
+  redundant per-launch snapshot measurably disturbed the observed session.
 - **C2.** Supervision anchors on `revision` plus exact agent identity, not on stream
   position, so the unmarked replay boundary (**F5**) needs no heuristic and no quiescence
   timer.
@@ -73,12 +78,14 @@ never identify a child.
 ## 4. Fixed subscription set
 
 ```
-pane.created  pane.updated  pane.closed  pane.exited  pane.moved  pane.agent_detected
+pane.updated  pane.closed  pane.exited  pane.moved  pane.agent_detected
 ```
 
-`pane.focused`, `pane.output_matched`, `pane.scroll_changed`, and every workspace/tab/layout
-kind are excluded: none of them carries supervision-material information that
-`pane.updated` does not already carry, and each would multiply replay volume.
+`pane.created` is excluded because a supervisor binds to a pane that already exists, so a
+creation event for it can only be historical. `pane.focused`, `pane.output_matched`,
+`pane.scroll_changed`, and every workspace/tab/layout kind are excluded: none carries
+supervision-material information that `pane.updated` does not already carry, and each would
+multiply replay volume.
 
 ## 5. Module layout
 
@@ -340,9 +347,14 @@ operation. No compatibility shim preserves the old wording.
   observe. Mitigation: the entry is declarative profile data, delivery is best effort by
   contract, soft receipts make every event recoverable through `herdr_jobs get`, and Pi
   delivery is unaffected.
-- **R2 — replay volume.** A long-lived Herdr session replays a large log on every connect
-  and reconnect. The monitor parses it under a per-line bound and discards non-matching
-  events without allocation beyond the parsed record.
+- **R2 — replay volume and observer load.** A long-lived Herdr session replays a large log
+  on every connect and reconnect, and `pane.updated` fires on output changes for every pane
+  in the session. The monitor parses each line under a per-line bound and discards
+  non-matching events immediately, but the parse itself is unavoidable. A manager observing
+  a very busy session pays for it. This is measurable: a redundant per-launch snapshot
+  connection was enough to disturb a clientless headless Herdr server badly enough to break
+  prompt consumption in the disposable integration session, which is why reads are now
+  strictly on demand.
 - **R3 — retained-log truncation.** If Herdr's retained log is a ring buffer, a long outage
   can scroll the anchor out. That case is detected in §7 and reported as `evidence_gap`
   rather than assumed benign.

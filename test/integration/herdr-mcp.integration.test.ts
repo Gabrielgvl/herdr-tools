@@ -12,6 +12,7 @@ import { HerdrCli } from "../../src/cli.js";
 import { JobRegistry } from "../../src/job-registry.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
 import { publishedInputSchema } from "../../src/mcp/adapter.js";
+import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE } from "../../src/tools/launch.js";
 import { createPreflight, createToolSurface, CORE_TOOL_NAMES } from "../../src/tool-surface.js";
 import { stopDisposableServer } from "./disposable-session.js";
 import { stubSupervision } from "../unit/supervision-fixtures.js";
@@ -34,6 +35,12 @@ const PANE_SETTLE_MS = 3_000;
 const ENVIRONMENT_SENTINEL = "integration-environment-sentinel";
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
+
+/** Every field `herdr_launch` publishes to the model on failure, and nothing else. */
+const LAUNCH_DIAGNOSTIC_FIELDS = ["agentStarted", "code", "created", "effectCertainty", "phase", "promptSubmitted", "recipientRegistered", "recoveryGuidance"];
+const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
+/** The identifier fields the diagnostic's `created` block may carry. */
+const LAUNCH_CREATED_FIELDS = ["tabId", "paneId", "agentId"];
 
 function record(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("integration response is not an object");
@@ -120,8 +127,55 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       }
       return diagnostic;
     };
+    /**
+     * The whole model-visible failure projection for `herdr_launch`, asserted as
+     * an exact shape rather than by sampling fields. Production deliberately
+     * withholds every raw failure field over MCP — cause code and cause message,
+     * the CLI error envelope, prompt submission and confirmation evidence, phase
+     * timing, attempts, the retained attachment — and publishes one fixed-shape
+     * diagnostic instead. This asserts both halves of that contract: exactly the
+     * published fields are present, and the withheld ones are absent from the
+     * result and from the message. Authoritative failure evidence still comes
+     * from the CLI readbacks below, which is where it belongs.
+     */
+    const launchFailureDiagnostic = (result: ToolResult): Record<string, unknown> => {
+      const failure = evidence(result);
+      expect(Object.keys(failure).sort()).toEqual(["code", "details", "message"]);
+      expect(typeof failure.code).toBe("string");
+      const details = record(failure.details);
+      expect(Object.keys(details).sort()).toEqual(["diagnostic", "tool"]);
+      expect(details.tool).toBe("herdr_launch");
+      const diagnostic = record(details.diagnostic);
+      expect(Object.keys(diagnostic).sort()).toEqual(LAUNCH_DIAGNOSTIC_FIELDS);
+      expect(String(diagnostic.code)).toMatch(LAUNCH_CODE_PATTERN);
+      expect(typeof diagnostic.phase).toBe("string");
+      for (const flag of ["agentStarted", "promptSubmitted", "recipientRegistered"]) {
+        expect(typeof diagnostic[flag], flag).toBe("boolean");
+      }
+      expect(["absent", "partial", "unknown", "confirmed"]).toContain(diagnostic.effectCertainty);
+      expect(Object.values(LAUNCH_RECOVERY_GUIDANCE)).toContain(diagnostic.recoveryGuidance);
+      const created = record(diagnostic.created);
+      for (const [field, value] of Object.entries(created)) {
+        expect(LAUNCH_CREATED_FIELDS, field).toContain(field);
+        expect(typeof value, field).toBe("string");
+      }
+      // The message is the fixed summary plus exactly this diagnostic: no cause
+      // text, and no second record the projection did not publish.
+      const separator = ` ${LAUNCH_DIAGNOSTIC_MARKER} `;
+      const message = String(failure.message);
+      const offset = message.indexOf(separator);
+      expect(offset, message).toBeGreaterThan(0);
+      expect(message.slice(0, offset)).toBe(LAUNCH_DIAGNOSTIC_SUMMARY);
+      expect(JSON.parse(message.slice(offset + separator.length))).toEqual(diagnostic);
+      // Nothing the model receives may carry the withheld raw evidence.
+      for (const withheld of ["causeCode", "causeMessage", "cliFailure", "promptConfirmation", "initialPromptSubmission", "promptConsumption", "timing", "attempts", "readiness", "reconciliation", "attachment", "recipientGrant"]) {
+        expect(text(result), withheld).not.toContain(withheld);
+      }
+      return diagnostic;
+    };
     const schedulingToleranceMs = 500;
-    const assertLaunchPhaseTiming = (details: Record<string, unknown>, monotonicWallElapsedMs: number, confirmationTimedOut: boolean): void => {
+    /** Success-path phase timing; a failure publishes no timing over MCP. */
+    const assertLaunchPhaseTiming = (details: Record<string, unknown>, monotonicWallElapsedMs: number): void => {
       const readiness = record(details.readiness);
       const confirmation = record(details.promptConfirmation);
       const timing = record(details.timing);
@@ -136,15 +190,14 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(decomposedPhaseElapsedMs).toBeLessThanOrEqual(monotonicWallElapsedMs + schedulingToleranceMs);
       expect(readiness.elapsedMs).toBe(selectedStartReadinessMs);
       expect(confirmation.elapsedMs).toBe(postAckConfirmationMs);
-      if (confirmationTimedOut) {
-        expect(Number(postAckConfirmationMs)).toBeGreaterThanOrEqual(5_000 - schedulingToleranceMs);
-        expect(Number(postAckConfirmationMs)).toBeLessThanOrEqual(monotonicWallElapsedMs + schedulingToleranceMs);
-      }
     };
-    const recordLaunchFailureBeforeTeardown = async (result: ToolResult, paneId: string, elapsedMs: number): Promise<void> => {
-      const failure = evidence(result);
-      const details = record(failure.details);
-      process.stderr.write(`INTEGRATION_LAUNCH_FAILURE_BEFORE_TEARDOWN ${JSON.stringify({ elapsedMs, code: failure.code, causeCode: details.causeCode, phase: details.phase, promptSubmitted: details.promptSubmitted, promptConsumption: details.promptConsumption, initialPromptSubmission: details.initialPromptSubmission, promptConfirmation: details.promptConfirmation, timing: details.timing, created: details.created })}\n`);
+    /**
+     * The model-visible diagnostic is what MCP publishes, so it is what gets
+     * logged. Everything richer is read back from the CLI below, which is the
+     * authoritative source for the raw fields this projection withholds.
+     */
+    const recordLaunchFailureBeforeTeardown = async (diagnostic: Record<string, unknown>, paneId: string, elapsedMs: number): Promise<void> => {
+      process.stderr.write(`INTEGRATION_LAUNCH_FAILURE_BEFORE_TEARDOWN ${JSON.stringify({ elapsedMs, diagnostic })}\n`);
       for (const [label, args] of [
         ["agent_get", ["agent", "get", paneId]],
         ["pane_get", ["pane", "get", paneId]]
@@ -329,33 +382,34 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const launchStartedAt = performance.now();
       const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", initialPrompt: "Use the bash tool to run pwd, then report the working directory." });
       const launchElapsedMs = performance.now() - launchStartedAt;
-      const launchFailureEvidence = evidence(launched);
-      let launchFailurePaneId = preparedPaneId;
       if (launched.isError) {
-        const launchFailureDetails = record(launchFailureEvidence.details);
-        const launchFailureCreated = launchFailureDetails.created === undefined ? {} : record(launchFailureDetails.created);
-        launchFailurePaneId = typeof launchFailureCreated.paneId === "string" ? launchFailureCreated.paneId : preparedPaneId;
-        await recordLaunchFailureBeforeTeardown(launched, launchFailurePaneId, launchElapsedMs);
-        const failure = evidence(launched);
-        const details = record(failure.details);
-        expect(failure.code).toBe("LAUNCH_FAILED");
-        expect(details).toMatchObject({
-          causeCode: "PROMPT_UNCONFIRMED",
+        const diagnostic = launchFailureDiagnostic(launched);
+        const created = record(diagnostic.created);
+        const launchFailurePaneId = typeof created.paneId === "string" ? created.paneId : preparedPaneId;
+        await recordLaunchFailureBeforeTeardown(diagnostic, launchFailurePaneId, launchElapsedMs);
+        // Exactly one live launch failure is an accepted outcome: the agent
+        // started, the prompt was acknowledged, and its consumption could not be
+        // proven inside the confirmation window, so the launch fails closed and
+        // preserves the pane. Any other failure is a real defect and must fail
+        // this run rather than be tolerated by a loose shape.
+        expect(diagnostic).toMatchObject({
+          code: "LAUNCH_FAILED",
           phase: "prompt_verification",
+          agentStarted: true,
           promptSubmitted: true,
-          promptConsumption: "unconfirmed",
-          initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: launchFailurePaneId },
-          promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100, elapsedMs: expect.any(Number) },
-          timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
-          created: expect.any(Object)
+          // Binding, and with it recipient registration, is only reached after
+          // consumption is confirmed.
+          recipientRegistered: false,
+          recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
         });
-        assertLaunchPhaseTiming(details, launchElapsedMs, record(details.promptConfirmation).reason === "timeout");
-        // Exact fail-closed uncertainty is an accepted live outcome. Do not run
-        // wait, steer, transcript, reviewer, job, or close assertions against an
-        // assignment whose consumption was not proven.
+        // A submitted prompt can never be reconciled as having had no effect.
+        expect(["partial", "unknown"]).toContain(diagnostic.effectCertainty);
+        expect(typeof created.paneId).toBe("string");
+        // Do not run wait, steer, transcript, reviewer, job, or close assertions
+        // against an assignment whose consumption was not proven.
         return;
       }
-      const launchEvidence = launchFailureEvidence;
+      const launchEvidence = evidence(launched);
       const workerPaneId = String(launchEvidence.paneId);
       expect(launchEvidence).toMatchObject({
         operation: "launch",
@@ -369,7 +423,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
         profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max" } }
       });
-      assertLaunchPhaseTiming(launchEvidence, launchElapsedMs, false);
+      assertLaunchPhaseTiming(launchEvidence, launchElapsedMs);
       expect(record(launchEvidence.sender).paneId).toBe(String(movedPane.pane_id));
       expect(record(record(launchEvidence.profile).source).kind).toBe("bundled");
       const launchedSnapshot = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);

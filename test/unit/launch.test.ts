@@ -737,7 +737,8 @@ describe("herdr_launch profile-only contract", () => {
         paneStates: [observedPane("idle", 7), observedPane(state, 7)]
       });
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: `unchanged ${state}` }, catalog(profile("worker")), harness.cli, undefined, { recipients });
+      const supervision = stubSupervision({ jobId: `job_timeout_${state}` });
+      const pending = launch({ name: "worker", profile: "worker", initialPrompt: `unchanged ${state}` }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision });
       const failure = expect(pending).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: {
@@ -745,6 +746,10 @@ describe("herdr_launch profile-only contract", () => {
           phase: "prompt_verification",
           promptSubmitted: true,
           promptConsumption: "unconfirmed",
+          assignmentState: "unconfirmed",
+          paneId: "w1:p2",
+          supervisorJobId: `job_timeout_${state}`,
+          supervision: { jobId: `job_timeout_${state}`, state: "active", child: { paneId: "w1:p2", agentName: "worker", profileName: "worker" } },
           initialPromptSubmission: { confirmed: true, stateChangeSeq: 7, revision: 3 },
           promptConfirmation: {
             timeoutMs: 5_000,
@@ -765,6 +770,8 @@ describe("herdr_launch profile-only contract", () => {
       expect(harness.stdinInputs).toHaveLength(1);
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
       expect(recipients.get("w1:p2")).toBeUndefined();
+      expect(supervision.bindAttempts).toHaveLength(1);
+      expect(supervision.released).toEqual([]);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -809,10 +816,14 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason, samples: 1, sourceCode } }
     });
-    expect(launchDiagnostic(failure)).toMatchObject({ effectCertainty: expect.any(String), recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed });
-    expect(failure.message).toContain("An agent exists");
-    expect(failure.message).toContain("may already be consumed");
-    expect(failure.message).toContain("do not relaunch or reuse the pane");
+    expect(launchDiagnostic(failure)).toMatchObject({
+      paneId: "w1:p2",
+      supervisorJobId: lastSupervision.jobId,
+      assignmentState: "unconfirmed",
+      effectCertainty: expect.any(String),
+      recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed,
+    });
+    expect(failure.message).toContain(LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed);
     expect(harness.stdinInputs).toHaveLength(1);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
@@ -830,9 +841,11 @@ describe("herdr_launch profile-only contract", () => {
     });
     await expect(launch({ name: "worker", profile: "worker", initialPrompt: "bad pane" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
-      details: { causeCode: "PROMPT_UNCONFIRMED", phase: "prompt_verification", promptSubmitted: true, promptConfirmation: { reason: "read_failed", sourceCode } }
+      details: { causeCode: "PROMPT_UNCONFIRMED", phase: "prompt_verification", assignmentState: "unconfirmed", paneId: "w1:p2", supervision: { state: "active" }, promptSubmitted: true, promptConfirmation: { reason: "read_failed", sourceCode } }
     });
     expect(harness.stdinInputs).toHaveLength(1);
+    expect(lastSupervision.bound).toHaveLength(1);
+    expect(lastSupervision.released).toEqual([]);
   });
 
   it("fails closed immediately when the acknowledged target is replaced", async () => {
@@ -2577,13 +2590,18 @@ describe("herdr_launch profile-only contract", () => {
       return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" }, interactive_ready: true, revision: 3 } });
     });
     const recipients = new RecipientRegistry();
-    const tool = createLaunchTool({ cli: aborted.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) }, attachments: fakeAttachments(), recipients });
+    const supervision = stubSupervision({ jobId: "job_abort_supervisor" });
+    const tool = createLaunchTool({ cli: aborted.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) }, attachments: fakeAttachments(), recipients, supervision });
     await expect(tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "go" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: {
         causeCode: "PROMPT_UNCONFIRMED",
         promptSubmitted: true,
         promptConsumption: "unconfirmed",
+        assignmentState: "unconfirmed",
+        paneId: "w1:p2",
+        supervisorJobId: "job_abort_supervisor",
+        supervision: { jobId: "job_abort_supervisor", state: "active" },
         initialPromptSubmission: { confirmed: true },
         promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED", samples: 0 },
         created: { paneId: "w1:p2", tabId: "w1:t1" }
@@ -2591,6 +2609,8 @@ describe("herdr_launch profile-only contract", () => {
     });
     expect(aborted.stdinInputs).toHaveLength(1);
     expect(recipients.get("w1:p2")).toBeUndefined();
+    expect(supervision.bindAttempts).toHaveLength(1);
+    expect(supervision.released).toEqual([]);
   });
 
   it("preserves acknowledged effect evidence when abort cancels an in-flight confirmation read", async () => {
@@ -2995,8 +3015,9 @@ describe("herdr_launch automatic child supervision", () => {
 
   it("supervises a launch with no initialPrompt and one into an existing pane", async () => {
     const noPrompt = stubSupervision();
-    await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: noPrompt });
+    const noPromptResult = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: noPrompt });
     expect(noPrompt.bound).toHaveLength(1);
+    expect(noPromptResult.details).not.toHaveProperty("assignmentState");
     // No prompt means no readiness baseline, so the anchor takes the agent record's counter.
     expect(noPrompt.bound[0]!.stateChangeSeq).toBe(7);
 
@@ -3029,20 +3050,34 @@ describe("herdr_launch automatic child supervision", () => {
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "start")).toBe(false);
   });
 
-  it("reports SUPERVISION_UNCONFIRMED as a partial effect and neither retries nor cleans up", async () => {
-    const supervision = stubSupervision({ bindError: new SupervisionBindError("binding could not be proven", { cause: "identity_mismatch" }) });
+  it.each([
+    ["closure", "released", "event:pane_closed"],
+    ["release", "released", "snapshot:agent_released"],
+    ["replacement", "identity_replaced", "snapshot:identity_replaced"],
+    ["identity loss", "identity_lost", "event:pane_moved_unproven"],
+  ] as const)("reports queued %s settlement as SUPERVISION_UNCONFIRMED before focus or prompt", async (_label, outcome, reason) => {
+    const supervision = stubSupervision({ bindError: new SupervisionBindError("binding settled during queued evidence", {
+      cause: "settled_during_bind", settledDuringBind: true, supervisionOutcome: outcome, supervisionReason: reason,
+    }) });
     const harness = makeCli();
-    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    const recipients = new RecipientRegistry();
+    const failure = await launch({ name: "worker", profile: "worker", focus: true, initialPrompt: "must not dispatch" }, catalog(profile("worker")), harness.cli, undefined, { supervision, recipients }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
     expect(failure.details).toMatchObject({
       phase: "supervision_bind",
       causeCode: "SUPERVISION_UNCONFIRMED",
       agentStarted: true,
-      supervisionEvidence: { cause: "identity_mismatch" },
+      promptSubmitted: false,
+      recipientRegistered: false,
+      supervisionEvidence: { cause: "settled_during_bind", settledDuringBind: true, supervisionOutcome: outcome, supervisionReason: reason },
       reconciliation: { effectCertainty: "partial" }
     });
-    // The reservation settles so its job does not leak; the child is untouched.
+    expect(supervision.bindAttempts).toHaveLength(1);
+    expect(supervision.bound).toHaveLength(0);
     expect(supervision.released).toEqual(["launch_failed_supervision_bind"]);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(harness.calls.some((call) => call[0] === "agent" && (call[1] === "focus" || call[1] === "prompt"))).toBe(false);
+    expect(harness.stdinInputs).toHaveLength(0);
+    expect(recipients.get("w1:p2")).toBeUndefined();
     expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
   });
 
@@ -3118,14 +3153,76 @@ describe("herdr_launch automatic child supervision", () => {
     expect(supervision.bound).toEqual([]);
   });
 
-  it("binds only after the prompt was submitted and its consumption confirmed", async () => {
-    const supervision = stubSupervision();
+  it("binds exactly once after readiness and before focus or prompt dispatch", async () => {
     const harness = makeCli();
-    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), harness.cli, undefined, { supervision });
-    expect(result.details).toMatchObject({ promptConsumption: "confirmed", supervision: { jobId: supervision.jobId } });
+    const supervision = stubSupervision({ onBind: () => {
+      expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "focus")).toBe(false);
+      expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
+      expect(harness.stdinInputs).toHaveLength(0);
+    } });
+    const result = await launch({ name: "worker", profile: "worker", focus: true, initialPrompt: "go" }, catalog(profile("worker")), harness.cli, undefined, { supervision });
+    expect(result.details).toMatchObject({ promptConsumption: "confirmed", assignmentState: "confirmed", supervision: { jobId: supervision.jobId } });
     expect(harness.stdinInputs).toHaveLength(1);
+    expect(supervision.bindAttempts).toHaveLength(1);
     expect(supervision.bound).toHaveLength(1);
+    expect(supervision.released).toEqual([]);
+    const focusIndex = harness.calls.findIndex((call) => call[0] === "agent" && call[1] === "focus");
+    const promptIndex = harness.calls.findIndex((call) => call[0] === "agent" && call[1] === "prompt");
+    expect(focusIndex).toBeGreaterThan(-1);
+    expect(promptIndex).toBeGreaterThan(focusIndex);
     // The baseline the readiness sample captured, not a later or defaulted value.
     expect(supervision.bound[0]!.stateChangeSeq).toBe(7);
+  });
+
+  it("retains bound supervision when focus fails before assignment dispatch", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "focus") throw Object.assign(new Error("focus failed"), { code: "CLI_PROTOCOL_ERROR" });
+      return base(argv, signal, preserve);
+    });
+    const supervision = stubSupervision({ jobId: "job_focus_retained" });
+    const failure = await launch({ name: "worker", profile: "worker", focus: true, initialPrompt: "must remain private" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    expect(failure.details).toMatchObject({ phase: "focus", paneId: "w1:p2", supervisorJobId: "job_focus_retained", supervision: { jobId: "job_focus_retained", state: "active" }, promptSubmitted: false, recipientRegistered: false });
+    expect(failure.details).not.toHaveProperty("assignmentState");
+    expect(supervision.bound).toHaveLength(1);
+    expect(supervision.released).toEqual([]);
+    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
+  });
+
+  it("retains bound supervision after one prompt when acknowledgement parsing fails", async () => {
+    const harness = makeCli();
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
+      harness.calls.push(argv);
+      harness.stdinInputs.push(input);
+      return ok("cli:agent:prompt", { type: "malformed_acknowledgement" });
+    });
+    const recipients = new RecipientRegistry();
+    const supervision = stubSupervision({ jobId: "job_ack_retained" });
+    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "private-prompt-canary" }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    expect(failure.details).toMatchObject({ phase: "prompt_verification", assignmentState: "unconfirmed", paneId: "w1:p2", supervisorJobId: "job_ack_retained", supervision: { jobId: "job_ack_retained", state: "active" }, promptSubmitted: true, recipientRegistered: false });
+    expect(supervision.bound).toHaveLength(1);
+    expect(supervision.released).toEqual([]);
+    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
+    expect(harness.calls.some((call) => call[1] === "send-keys" || call[1] === "close" || call[1] === "kill")).toBe(false);
+    expect(recipients.get("w1:p2")).toBeUndefined();
+    expect(JSON.stringify(failure.details)).not.toContain("private-prompt-canary");
+  });
+
+  it("retains bound supervision and confirmed assignment evidence when recipient registration fails", async () => {
+    const harness = makeCli();
+    const recipients = new RecipientRegistry();
+    vi.spyOn(recipients, "recordFor").mockImplementation(() => { throw new Error("recipient registry unavailable"); });
+    const supervision = stubSupervision({ jobId: "job_recipient_retained" });
+    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "one prompt" }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    expect(failure.details).toMatchObject({ phase: "prompt_verification", assignmentState: "confirmed", paneId: "w1:p2", supervisorJobId: "job_recipient_retained", supervision: { jobId: "job_recipient_retained", state: "active" }, promptSubmitted: true, recipientRegistered: false });
+    expect(supervision.bound).toHaveLength(1);
+    expect(supervision.released).toEqual([]);
+    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
+    expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
   });
 });

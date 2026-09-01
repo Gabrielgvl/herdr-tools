@@ -141,6 +141,7 @@ export interface LaunchDetails extends LaunchResourceIds {
   promptSubmitted?: boolean;
   recipientRegistered?: boolean;
   promptConsumption?: PromptConsumption;
+  assignmentState?: "confirmed" | "unconfirmed";
   initialPromptDelivery?: MessageDelivery;
   initialPromptSubmission?: PromptSubmissionEvidence;
   initialPromptObservation?: PromptObservation;
@@ -180,7 +181,7 @@ const realLaunchClock: LaunchClock = { now: () => performance.now() };
 
 export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
   inspectBeforeRetry: "Inspect the affected pane and agent with herdr_inspect before retrying; do not assume that no agent started.",
-  preserveUnconfirmed: "An agent exists and the acknowledged prompt may already be consumed; do not relaunch or reuse the pane. Inspect the existing agent before continuing.",
+  preserveUnconfirmed: "Inspect the existing child with herdr_inspect and its active supervisor with herdr_jobs get; do not relaunch, resend, close or reuse the pane, register a recipient, or continue dependent work while assignment consumption is unconfirmed.",
   noEffect: "No launch mutation was dispatched; correct the failure and retry only after validating the request.",
   unknownEffect: "Inspect the affected pane and agent with herdr_inspect before any retry; the launch effect is unknown and must not be assumed absent."
 } as const);
@@ -192,6 +193,9 @@ interface LaunchModelDiagnostic {
   code: string;
   phase: LaunchPhase;
   created: LaunchResourceIds;
+  paneId?: string;
+  supervisorJobId?: string;
+  assignmentState?: "unconfirmed";
   agentStarted: boolean;
   promptSubmitted: boolean;
   recipientRegistered: boolean;
@@ -252,11 +256,18 @@ function safeLaunchCode(code: unknown): string {
  * carries exactly one diagnostic record.
  */
 function launchDiagnosticMessage(diagnostic: LaunchModelDiagnostic): string {
+  const paneId = safeDiagnosticString(diagnostic.paneId);
+  const supervisorJobId = safeDiagnosticString(diagnostic.supervisorJobId);
+  const assignmentUnconfirmed = diagnostic.assignmentState === "unconfirmed" && paneId !== undefined && supervisorJobId !== undefined;
   const payload: LaunchModelDiagnostic = {
-    ...diagnostic,
     code: safeLaunchCode(diagnostic.code),
     phase: diagnostic.phase,
     created: safeDiagnosticIds(diagnostic.created),
+    ...(assignmentUnconfirmed ? { paneId, supervisorJobId, assignmentState: "unconfirmed" as const } : {}),
+    agentStarted: diagnostic.agentStarted,
+    promptSubmitted: diagnostic.promptSubmitted,
+    recipientRegistered: diagnostic.recipientRegistered,
+    effectCertainty: diagnostic.effectCertainty,
     recoveryGuidance: diagnostic.recoveryGuidance
   };
   const suffix = `\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`;
@@ -270,6 +281,7 @@ function launchDiagnosticMessage(diagnostic: LaunchModelDiagnostic): string {
       code: payload.code,
       phase: payload.phase,
       created: {},
+      ...(payload.assignmentState === "unconfirmed" ? { paneId: payload.paneId, supervisorJobId: payload.supervisorJobId, assignmentState: payload.assignmentState } : {}),
       agentStarted: payload.agentStarted,
       promptSubmitted: payload.promptSubmitted,
       recipientRegistered: payload.recipientRegistered,
@@ -1461,7 +1473,7 @@ function partialError(
   created: LaunchResourceIds,
   phase: LaunchPhase,
   grant: RecipientGrant,
-  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; readiness?: LaunchReadinessEvidence; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
+  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; assignmentState?: "confirmed" | "unconfirmed"; readiness?: LaunchReadinessEvidence; supervision?: NonNullable<LaunchDetails["supervision"]>; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
   delivery?: MessageDelivery,
   published?: PublishedAttachment,
   reconciliation?: LaunchReconciliationEvidence
@@ -1500,6 +1512,8 @@ function partialError(
     agentStarted: effects.agentStarted,
     promptSubmitted: effects.promptSubmitted,
     recipientRegistered: effects.recipientRegistered,
+    ...(effects.assignmentState === undefined ? {} : { assignmentState: effects.assignmentState }),
+    ...(effects.supervision === undefined ? {} : { paneId: effects.supervision.child.paneId, supervisorJobId: effects.supervision.jobId, supervision: effects.supervision }),
     effectCertainty,
     ...(Object.keys(effects.timing).length === 0 ? {} : { timing: effects.timing }),
     ...(effects.attempts.length === 0 ? {} : { attempts: effects.attempts }),
@@ -1510,14 +1524,22 @@ function partialError(
     ...(readiness === undefined ? {} : { readiness }),
     ...(reconciliation === undefined ? {} : { reconciliation })
   };
+  const assignmentUnconfirmed = effects.assignmentState === "unconfirmed" && effects.supervision !== undefined;
   return new LaunchError(code, LAUNCH_DIAGNOSTIC_SUMMARY, details, {
     phase,
     created,
+    ...(assignmentUnconfirmed ? {
+      paneId: effects.supervision!.child.paneId,
+      supervisorJobId: effects.supervision!.jobId,
+      assignmentState: "unconfirmed" as const,
+    } : {}),
     agentStarted: effects.agentStarted,
     promptSubmitted: effects.promptSubmitted,
     recipientRegistered: effects.recipientRegistered,
     effectCertainty,
-    recoveryGuidance: diagnosticRecovery(effectCertainty, effects.promptSubmitted, effects.mutationDispatched)
+    recoveryGuidance: assignmentUnconfirmed
+      ? LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
+      : diagnosticRecovery(effectCertainty, effects.promptSubmitted, effects.mutationDispatched)
   });
 }
 
@@ -1682,7 +1704,10 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let tabId: string | undefined;
       let agentStarted = false;
       let promptSubmitted = false;
+      let assignmentState: "confirmed" | "unconfirmed" | undefined;
       let recipientRegistered = false;
+      let supervisionBound = false;
+      let boundSupervision: LaunchDetails["supervision"] | undefined;
       let readiness: LaunchReadinessEvidence | undefined;
       let selectedAttemptStartedAt: number | undefined;
       const timing: LaunchTimingEvidence = {};
@@ -1780,6 +1805,28 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         timing.selectedStartReadinessMs = readiness.elapsedMs;
         const capturedIdentity = ready.identity;
         agentId ??= idFrom(ready.agent, "agent_id") ?? idFrom(ready.agent, "id") ?? idFrom(ready.pane, "agent_id");
+        phase = "supervision_bind";
+        progress(onUpdate, phase, created);
+        const stateChangeSeq = ready.baseline?.stateChangeSeq ?? readinessStateChangeSeq(ready.agent);
+        try {
+          // The selected profile, not the one reserved before the fallback chain ran.
+          await reservation!.bind({ identity: capturedIdentity, profileName: chosenProfile.name, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) });
+        } catch (error) {
+          if (!(error instanceof SupervisionBindError)) throw error;
+          // Partial effect: the child exists and may already be working. Nothing
+          // is retried and nothing is cleaned up.
+          throw new LaunchError("SUPERVISION_UNCONFIRMED", "Automatic child supervision could not be bound to the launched agent", {
+            causeCode: "SUPERVISION_UNCONFIRMED",
+            supervisionJobId: reservation!.jobId,
+            supervisionEvidence: boundAgentSessionStrings(error.details)
+          });
+        }
+        supervisionBound = true;
+        boundSupervision = {
+          jobId: reservation!.jobId,
+          state: "active",
+          child: { agentName: capturedIdentity.agentName, agentKind: capturedIdentity.agentKind, paneId: resolvedPaneId, terminalId: capturedIdentity.terminalId, profileName: chosenProfile.name }
+        };
         if (params.focus === true) {
           phase = "focus";
           progress(onUpdate, phase, created);
@@ -1794,6 +1841,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         let promptConfirmation: PromptConfirmationEvidence | undefined;
         let postState: Record<string, unknown> | undefined = ready.pane;
         if (params.initialPrompt !== undefined) {
+          assignmentState = "unconfirmed";
           // Readiness returned this baseline from the same coherent sample that
           // captured identity; there is no later one-shot baseline read.
           const baseline = ready.baseline!;
@@ -1821,30 +1869,21 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
           } catch (error) {
             timing.postAckConfirmationMs = ((error as LaunchError).details.promptConfirmation as PromptConfirmationEvidence).elapsedMs;
+            if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") {
+              throw new LaunchError(error.code, error.message, {
+                ...error.details,
+                paneId: resolvedPaneId,
+                supervisorJobId: reservation!.jobId,
+                assignmentState: "unconfirmed",
+                supervision: boundSupervision!,
+              });
+            }
             throw error;
           }
           promptConsumption = "confirmed";
+          assignmentState = "confirmed";
           initialPromptSent = true;
           if (agentId) created.agentId = agentId;
-        }
-        // Binding is the last precondition of a successful launch. It runs only
-        // after the exact launch identity is proven and, when a prompt was sent,
-        // after its consumption is confirmed.
-        phase = "supervision_bind";
-        progress(onUpdate, phase, created);
-        const stateChangeSeq = ready.baseline?.stateChangeSeq ?? readinessStateChangeSeq(ready.agent);
-        try {
-          // The selected profile, not the one reserved before the fallback chain ran.
-          await reservation!.bind({ identity: capturedIdentity, profileName: chosenProfile.name, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) });
-        } catch (error) {
-          if (!(error instanceof SupervisionBindError)) throw error;
-          // Partial effect: the child exists and may already be working. Nothing
-          // is retried and nothing is cleaned up.
-          throw new LaunchError("SUPERVISION_UNCONFIRMED", "Automatic child supervision could not be bound to the launched agent", {
-            causeCode: "SUPERVISION_UNCONFIRMED",
-            supervisionJobId: reservation!.jobId,
-            supervisionEvidence: boundAgentSessionStrings(error.details)
-          });
         }
         const authoritativeName = capturedIdentity.agentName;
         const capability = capabilities.get(chosenProfile.name)!;
@@ -1862,7 +1901,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           promptSubmitted,
           recipientRegistered,
           readiness,
-          ...(params.initialPrompt === undefined ? {} : { promptConsumption }),
+          ...(params.initialPrompt === undefined ? {} : { promptConsumption, assignmentState: assignmentState! }),
           ...(initialPromptDelivery ? { initialPromptDelivery } : {}),
           ...(initialPromptSubmission ? { initialPromptSubmission: compactPromptSubmission(initialPromptSubmission) } : {}),
           ...(initialPromptObservation ? { initialPromptObservation } : {}),
@@ -1875,11 +1914,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           } : {}),
           recipient,
           effectCertainty: "confirmed",
-          supervision: {
-            jobId: reservation!.jobId,
-            state: "active",
-            child: { agentName: authoritativeName, agentKind: capturedIdentity.agentKind, paneId: resolvedPaneId, terminalId: capturedIdentity.terminalId, profileName: chosenProfile.name }
-          },
+          supervision: boundSupervision!,
           profile: {
             name: chosenProfile.name, requested: params.profile, selected: chosenProfile.name,
             source: { kind: chosenProfile.source.kind, path: chosenProfile.source.path }, timeoutMinutes: chosenProfile.timeoutMinutes,
@@ -1925,9 +1960,20 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           if (reconciliation?.paneId !== undefined && created.paneId === undefined) created.paneId = reconciliation.paneId;
           if (reconciliation?.agentId !== undefined && created.agentId === undefined) created.agentId = reconciliation.agentId;
         }
-        // Releasing an unbound reservation settles its job; it is never child cleanup.
-        reservation?.release(`launch_failed_${phase}`);
-        throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, mutationDispatched: topologyMutationDispatched, ...(readiness === undefined ? {} : { readiness }), timing, attempts }, initialPromptDelivery, published, reconciliation);
+        // Releasing an unbound reservation settles its job; a committed exact
+        // supervisor is retained through every later launch failure.
+        if (!supervisionBound) reservation?.release(`launch_failed_${phase}`);
+        throw partialError(error, created, phase, grant!, {
+          agentStarted,
+          promptSubmitted,
+          recipientRegistered,
+          mutationDispatched: topologyMutationDispatched,
+          ...(assignmentState === undefined ? {} : { assignmentState }),
+          ...(readiness === undefined ? {} : { readiness }),
+          ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }),
+          timing,
+          attempts,
+        }, initialPromptDelivery, published, reconciliation);
       } finally {
         // The launch window is over; the directory is kept only by its own content.
         await grant?.release();

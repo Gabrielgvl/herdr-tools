@@ -175,6 +175,9 @@ describe("supervisor binding", () => {
     const missing = harness({ snapshots: [snapshot([], [])] });
     await expect(missing.supervisor.bind({ identity, profileName: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
 
+    const invalid = harness({ snapshots: [snapshot([paneRecord(), paneRecord()])] });
+    await expect(invalid.supervisor.bind({ identity, profileName: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
+
     const agentFree = harness({ snapshots: [snapshot([paneRecord()], [])] });
     await expect(agentFree.supervisor.bind({ identity, profileName: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
 
@@ -202,6 +205,41 @@ describe("supervisor binding", () => {
     expect(order).toEqual(["commit:reserved:undefined", "publish:active:p1"]);
     expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
     expect(h.supervisor.view().transitions).toEqual([{ atMs: 1_000, from: "working", to: "idle", revision: 6, source: "event" }]);
+  });
+
+  it("rolls back when queued evidence cannot be drained", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    (h.supervisor as unknown as { deps: { notifier: ManagerNotifier } }).deps.notifier = {
+      wake: () => { throw new Error("wake failed"); },
+    };
+    const rollback = vi.fn();
+    const publication: SupervisionChildBindingPublication = { commit: vi.fn(), rollback, publish: vi.fn() };
+    const binding = h.supervisor.bind({ identity, profileName: "worker-pi" }, publication);
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    const failure = await binding.catch((error: SupervisionBindError) => error);
+    expect(failure).toBeInstanceOf(SupervisionBindError);
+    expect((failure as SupervisionBindError).details).toMatchObject({ cause: "UNKNOWN" });
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(h.supervisor.view().state).toBe("reserved");
+    expect(h.supervisor.view().child).toBeUndefined();
+    expect(h.observers).toBe(0);
+  });
+
+  it("reports a settled queued bind without assuming settlement details", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    (h.supervisor as unknown as { deps: { update: () => void } }).deps.update = () => {
+      (h.supervisor as unknown as { state: string }).state = "settled";
+    };
+    const rollback = vi.fn();
+    const publication: SupervisionChildBindingPublication = { commit: vi.fn(), rollback, publish: vi.fn() };
+    const binding = h.supervisor.bind({ identity, profileName: "worker-pi" }, publication);
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    const failure = await binding.catch((error: SupervisionBindError) => error);
+    expect(failure).toBeInstanceOf(SupervisionBindError);
+    expect((failure as SupervisionBindError).details).toMatchObject({ cause: "settled_during_bind", settledDuringBind: true });
+    expect((failure as SupervisionBindError).details).not.toHaveProperty("supervisionOutcome");
+    expect(rollback).toHaveBeenCalledTimes(1);
+    h.supervisor.shutdown();
   });
 
   it("rejects when queued closure or replacement evidence settles during bind", async () => {
@@ -238,6 +276,28 @@ describe("supervisor binding", () => {
       expect(scenario.h.supervisor.childLive()).toBe(false);
       expect(await scenario.h.supervisor.run()).toMatchObject({ outcome: scenario.outcome });
     }
+  });
+
+  it("does not reset a shutdown settlement when binding read fails", async () => {
+    const h = harness();
+    (h.supervisor as unknown as { deps: { monitor: { snapshot: () => Promise<HerdrSnapshot> } } }).deps.monitor.snapshot = async () => {
+      h.supervisor.shutdown();
+      throw new Error("snapshot closed");
+    };
+    await expect(h.supervisor.bind({ identity, profileName: "worker-pi" })).rejects.toBeInstanceOf(SupervisionBindError);
+    expect(await h.supervisor.run()).toEqual({ outcome: "cancelled", reason: "manager_session_shutdown" });
+    expect(h.supervisor.view().state).toBe("settled");
+  });
+
+  it("marks the reviewer degraded when its initial cadence cannot be armed", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })])] });
+    (h.supervisor as unknown as { deps: { scheduler: SupervisionScheduler } }).deps.scheduler.setTimer = () => {
+      throw new Error("timer failed");
+    };
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    expect(h.supervisor.view()).toMatchObject({ state: "active", reviewer: { degraded: true } });
+    expect(h.timerArmed()).toBe(false);
+    expect(h.progress).toContain("supervision reviewer cadence could not be armed");
   });
 
   it("rolls back a failed request publication and keeps the reservation unbound", async () => {
@@ -338,6 +398,18 @@ describe("supervisor folding", () => {
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
     expect(h.progress.some((line) => line.includes("reconciliation_degraded"))).toBe(true);
     expect(h.supervisor.view().state).toBe("degraded");
+
+    for (const [code, reason] of [
+      ["SUPERVISION_SOCKET_UNAVAILABLE", "connect_failed"],
+      ["CLI_PROTOCOL_ERROR", "snapshot_protocol_invalid"],
+      ["SUPERVISION_PROTOCOL_ERROR", "snapshot_protocol_invalid"],
+    ] as const) {
+      const candidate = await bound();
+      const error = Object.assign(new Error("down"), { code });
+      (candidate.supervisor as unknown as { deps: { monitor: { snapshot: () => Promise<HerdrSnapshot> } } }).deps.monitor.snapshot = async () => { throw error; };
+      await candidate.supervisor.onEvent(thinEvent("pane_exited"));
+      expect(candidate.wakes[0]?.event.details).toMatchObject({ reason });
+    }
   });
 
   it("coalesces concurrent reconciliations into a single re-run", async () => {
@@ -416,6 +488,11 @@ describe("supervisor pane moves", () => {
     const unproven = await bound([snapshot([paneRecord({ paneId: "p2", revision: 6, agentSession: { ...session, value: "other" } })], [{ pane_id: "p2", name: "worker" }])]);
     await unproven.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 6 }), { previous_pane_id: "p1" }));
     expect(await unproven.supervisor.run()).toMatchObject({ reason: "move_continuity_unproven" });
+
+    const invalid = await bound([snapshot([paneRecord({ paneId: "p2" }), paneRecord({ paneId: "p2" })])]);
+    await invalid.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 6 }), { previous_pane_id: "p1" }));
+    expect(invalid.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
+    expect(types(invalid.wakes)).toEqual(["reconciliation_degraded"]);
   });
 });
 
@@ -486,6 +563,8 @@ describe("supervisor reconnect and monitor health", () => {
   it("ignores stream traffic before binding and after shutdown", async () => {
     const unbound = harness();
     await unbound.supervisor.onBootstrap(snapshot([]), 1, true);
+    await unbound.supervisor.onReconciliationSnapshot(snapshot([]));
+    unbound.supervisor.onReconciliationFailure("request_failed");
     expect(unbound.supervisor.matches("p1")).toBe(false);
     unbound.supervisor.onMonitorDegraded("X");
     expect(unbound.wakes).toHaveLength(0);
@@ -494,6 +573,8 @@ describe("supervisor reconnect and monitor health", () => {
     h.supervisor.shutdown();
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
     await h.supervisor.onBootstrap(snapshot([]), 2, true);
+    await h.supervisor.onReconciliationSnapshot(snapshot([]));
+    h.supervisor.onReconciliationFailure("request_failed");
     h.supervisor.onMonitorRecovered();
     expect(h.wakes).toHaveLength(0);
   });
@@ -713,6 +794,9 @@ describe("the supervisor job port", () => {
   it("returns pending events once and marks exactly those observed", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
     await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    expect(h.supervisor.coversIdentity(identity)).toBe(true);
+    expect(h.supervisor.coversIdentity({ ...identity, paneId: "p2" })).toBe(false);
+    expect(h.supervisor.coversIdentity({ ...identity, agentSession: undefined } as unknown as SupervisedIdentity)).toBe(false);
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 6 })));
     expect(h.supervisor.view().unobservedEvents).toBe(1);
     const first: SupervisionEvent[] = h.supervisor.takePendingEvents();
@@ -740,6 +824,7 @@ describe("the supervisor job port", () => {
     await settledThenStopped.supervisor.bind({ identity, profileName: "worker-pi" });
     await settledThenStopped.supervisor.onEvent(thinEvent("pane_closed"));
     settledThenStopped.supervisor.shutdown();
+    await (settledThenStopped.supervisor as unknown as { settle(outcome: "cancelled", reason: string): Promise<void> }).settle("cancelled", "ignored");
     expect(await settledThenStopped.supervisor.run()).toMatchObject({ outcome: "released" });
 
     const releasedAfterSettle = harness({ snapshots: [snapshot([paneRecord()]), snapshot([], [])] });
@@ -761,6 +846,7 @@ describe("the supervisor job port", () => {
   it("reports a reserved supervisor as not live", () => {
     const h = harness();
     expect(h.supervisor.childLive()).toBe(false);
+    expect(h.supervisor.coversIdentity(identity)).toBe(false);
     expect(h.supervisor.view()).toMatchObject({ state: "reserved", transitions: [], events: [], unobservedEvents: 0 });
     expect(h.supervisor.view().child).toBeUndefined();
   });

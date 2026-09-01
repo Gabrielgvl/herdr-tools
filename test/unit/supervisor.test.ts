@@ -278,6 +278,81 @@ describe("supervisor binding", () => {
     }
   });
 
+  it("folds evidence admitted during the drain in arrival order behind the evidence already queued", async () => {
+    const h = harness();
+    let admitted: Promise<void> | undefined;
+    let calls = 0;
+    (h.supervisor as unknown as { deps: { monitor: { snapshot: () => Promise<HerdrSnapshot> } } }).deps.monitor.snapshot = async () => {
+      calls += 1;
+      if (calls === 1) return snapshot([paneRecord({ status: "working", revision: 5 })]);
+      // Admitted while the drain's own reconciliation is in flight. Folding it
+      // here rather than in its turn would apply revision 8 before the snapshot
+      // this call answers and before the evidence already queued ahead of it,
+      // regressing the watermark and discarding revision 7 entirely.
+      admitted = h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 8 })));
+      return snapshot([paneRecord({ status: "blocked", revision: 6 })]);
+    };
+    let transitionsAtCommit = -1;
+    const publication: SupervisionChildBindingPublication = {
+      commit: () => { transitionsAtCommit = h.supervisor.view().transitions.length; },
+      rollback: vi.fn(),
+      publish: vi.fn(),
+    };
+    const binding = h.supervisor.bind({ identity, profileName: "worker-pi" }, publication);
+    const first = h.supervisor.onEvent(thinEvent("pane_exited"));
+    const second = h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7 })));
+    await binding;
+    await Promise.all([first, second, admitted]);
+    expect(h.supervisor.view().transitions).toEqual([
+      { atMs: 1_000, from: "working", to: "blocked", revision: 6, source: "snapshot" },
+      { atMs: 1_000, from: "blocked", to: "working", revision: 7, source: "event" },
+      { atMs: 1_000, from: "working", to: "idle", revision: 8, source: "event" },
+    ]);
+    // Every admitted event was folded before the binding went public.
+    expect(transitionsAtCommit).toBe(3);
+    expect(h.supervisor.view().monitor.reconciliation).toMatchObject({ degraded: false, consecutiveFailures: 0 });
+    expect(publication.rollback).not.toHaveBeenCalled();
+  });
+
+  it("holds the commit for closure evidence admitted during the drain", async () => {
+    const h = harness();
+    let closure: Promise<void> | undefined;
+    let proveClosure!: (snapshot: HerdrSnapshot) => void;
+    const closureSnapshot = new Promise<HerdrSnapshot>((resolve) => { proveClosure = resolve; });
+    let calls = 0;
+    (h.supervisor as unknown as { deps: { monitor: { snapshot: () => Promise<HerdrSnapshot> } } }).deps.monitor.snapshot = async () => {
+      calls += 1;
+      if (calls === 1) return snapshot([paneRecord({ status: "working", revision: 5 })]);
+      // A move is followed without holding the reconciliation coalescer, so this
+      // admission is the case where a concurrent fold would race the commit
+      // rather than collapse into the reconciliation already running.
+      if (calls === 2) {
+        closure = h.supervisor.onEvent(thinEvent("pane_closed"));
+        return snapshot([paneRecord({ paneId: "p2", status: "working", revision: 3 })], [{ pane_id: "p2", name: "worker" }]);
+      }
+      return closureSnapshot;
+    };
+    const commit = vi.fn();
+    const rollback = vi.fn();
+    const binding = h.supervisor.bind({ identity, profileName: "worker-pi" }, { commit, rollback, publish: vi.fn() });
+    const move = h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", status: "working", revision: 3 }), { previous_pane_id: "p1" }));
+    const settled = binding.catch((error: SupervisionBindError) => error);
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    // The closure is still being proven, so the binding cannot have gone public.
+    expect(commit).not.toHaveBeenCalled();
+
+    proveClosure(snapshot([], []));
+    const failure = await settled;
+    expect(failure).toBeInstanceOf(SupervisionBindError);
+    expect((failure as SupervisionBindError).details).toMatchObject({ cause: "settled_during_bind", settledDuringBind: true, supervisionOutcome: "released" });
+    expect(commit).not.toHaveBeenCalled();
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(h.supervisor.childLive()).toBe(false);
+    expect(h.supervisor.view().child).toBeUndefined();
+    expect(await h.supervisor.run()).toMatchObject({ outcome: "released" });
+    await Promise.all([move, closure]);
+  });
+
   it("does not reset a shutdown settlement when binding read fails", async () => {
     const h = harness();
     (h.supervisor as unknown as { deps: { monitor: { snapshot: () => Promise<HerdrSnapshot> } } }).deps.monitor.snapshot = async () => {
@@ -412,11 +487,12 @@ describe("supervisor folding", () => {
     }
   });
 
-  it("coalesces concurrent reconciliations into a single re-run", async () => {
+  it("reconciles concurrently admitted triggers one at a time, in arrival order", async () => {
     const h = await bound({ snapshots: [snapshot([paneRecord({ status: "blocked", revision: 6 })]), snapshot([paneRecord({ status: "idle", revision: 7 })])] });
     const first = h.supervisor.onEvent(thinEvent("pane_exited"));
     const second = h.supervisor.onEvent(thinEvent("pane_exited"));
     await Promise.all([first, second]);
+    // Each trigger got its own authoritative read, in the order it was admitted.
     expect(types(h.wakes)).toEqual(["evidence_gap", "blocked", "evidence_gap"]);
     expect(h.supervisor.view().status).toBe("idle");
   });

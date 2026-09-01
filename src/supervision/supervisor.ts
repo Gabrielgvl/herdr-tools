@@ -125,7 +125,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private readonly scheduler: SupervisionScheduler;
   private readonly settled: Promise<Settlement>;
   private resolveSettled!: (settlement: Settlement) => void;
+  /** Admitted evidence, in arrival order, that the mutation chain has not folded yet. */
   private readonly queued: SupervisionSocketEvent[] = [];
+  /**
+   * The one ordered mutation chain. Every fold and the bind commit run on it, so
+   * evidence can never fold beside a fold, out of arrival order, or against a
+   * binding whose commit has not yet seen it.
+   */
+  private chain: Promise<void> = Promise.resolve();
   private state: SupervisionState = "reserved";
   private paneId: string | undefined;
   private identity: SupervisedIdentity | undefined;
@@ -155,11 +162,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private reviewedTranscript: string[] = [];
   private reviewTimer: unknown;
   private reviewing = false;
-  private reconciling = false;
-  private reconcileAgain = false;
   private settlement: Settlement | undefined;
   private selectedProfileName: string | undefined;
   private bindStarted = false;
+  /** True from the moment the anchor is prepared until the bind commit resolves. */
+  private bindPending = false;
   private bindingPublished = false;
   private stopped = false;
   private readonly abort = new AbortController();
@@ -211,8 +218,24 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.anchor = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, ...(binding.stateChangeSeq === undefined ? {} : { stateChangeSeq: binding.stateChangeSeq }) };
     this.status = occupant.pane.agentStatus;
     this.lastRevision = occupant.pane.revision;
+    // The drain, the settlement check, and the publication are one task on the
+    // mutation chain: an event admitted at any point before the commit folds
+    // inside this task, and the commit sees its outcome.
+    this.bindPending = true;
+    await this.serialize(async () => {
+      // Cleared inside the task, so the very next task on the chain folds for
+      // itself rather than deferring to a bind that is already over.
+      try {
+        await this.commitBinding(binding, publication);
+      } finally {
+        this.bindPending = false;
+      }
+    });
+  }
+
+  private async commitBinding(binding: SupervisionBinding, publication: SupervisionChildBindingPublication): Promise<void> {
     try {
-      await this.drainQueued();
+      await this.drainAdmitted();
     } catch (error) {
       publication.rollback();
       this.resetPreparedBinding();
@@ -288,24 +311,32 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     return !this.stopped && this.paneId === paneId;
   }
 
+  /**
+   * Admit evidence. Arrival order is fixed here; the chain folds it. An event
+   * that lands while an earlier fold — or the bind commit — is still in flight
+   * waits its turn rather than folding beside it.
+   */
   async onEvent(event: SupervisionSocketEvent): Promise<void> {
     if (this.stopped) return;
-    if (this.identity === undefined) {
-      this.queued.push(event);
-      return;
-    }
-    await this.fold(event);
+    this.queued.push(event);
+    await this.serialize(() => this.foldAdmitted());
   }
 
   /** Reconnect snapshots use the same identity, validity, and revision rules as periodic snapshots. */
   async onBootstrap(snapshot: HerdrSnapshot, _generation: number, reconnected: boolean): Promise<void> {
-    if (this.stopped || this.identity === undefined || this.anchor === undefined || !reconnected) return;
-    await this.applyAuthoritativeSnapshot(snapshot, "reconnect", "identity_lost");
+    if (this.stopped || !reconnected) return;
+    await this.serialize(async () => {
+      if (this.stopped || this.identity === undefined || this.anchor === undefined) return;
+      await this.applyAuthoritativeSnapshot(snapshot, "reconnect", "identity_lost");
+    });
   }
 
   async onReconciliationSnapshot(snapshot: HerdrSnapshot): Promise<void> {
-    if (this.stopped || this.identity === undefined || this.anchor === undefined || this.isSettled()) return;
-    await this.applyAuthoritativeSnapshot(snapshot, "periodic_snapshot", "released");
+    if (this.stopped) return;
+    await this.serialize(async () => {
+      if (this.stopped || this.identity === undefined || this.anchor === undefined || this.isSettled()) return;
+      await this.applyAuthoritativeSnapshot(snapshot, "periodic_snapshot", "released");
+    });
   }
 
   onReconciliationFailure(reason: ReconciliationFailureReason): void {
@@ -330,16 +361,35 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   // -------------------------------------------------------------------- folding
 
+  /** Run one task on the mutation chain. A failing task never breaks the chain. */
+  private serialize<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(task);
+    this.chain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
   /**
-   * Events that arrived between adding the observer and proving the anchor. They
-   * are folded in arrival order against the same revision watermark every other
-   * event uses, so a queued historical event is discarded exactly as a replayed
-   * one is.
+   * While a bind is in flight the drain belongs to it alone, so a fold that
+   * fails before the commit still fails the bind rather than escaping through
+   * whichever admission happened to reach the chain first.
    */
-  private async drainQueued(): Promise<void> {
-    const pending = this.queued.splice(0);
-    for (const event of pending) {
-      if (this.stopped) return;
+  private async foldAdmitted(): Promise<void> {
+    if (this.bindPending) return;
+    await this.drainAdmitted();
+  }
+
+  /**
+   * Fold every admitted event, in arrival order, against the same revision
+   * watermark every other event uses, so a queued historical event is discarded
+   * exactly as a replayed one is. Evidence admitted while the loop runs is
+   * picked up by the same pass, which is what lets the bind commit prove that
+   * nothing it admitted is still unfolded. Before the anchor is proven there is
+   * nothing to fold against, so admitted evidence waits for the binding drain.
+   */
+  private async drainAdmitted(): Promise<void> {
+    while (!this.stopped && this.identity !== undefined) {
+      const event = this.queued.shift();
+      if (event === undefined) return;
       await this.fold(event);
     }
   }
@@ -430,30 +480,24 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
   }
 
-  /** One coalesced authoritative reconciliation. Concurrent triggers collapse into a re-run. */
+  /**
+   * One authoritative reconciliation.
+   *
+   * `fold` and `followMove` are the only callers and both refuse once settled,
+   * so this needs no settled guard of its own. Both also run on the mutation
+   * chain, so two reconciliations can never overlap and none can be started by
+   * evidence this one has not seen — which is why triggers are answered one
+   * read each rather than coalesced.
+   */
   private async reconcile(trigger: string): Promise<void> {
-    // `fold` and `followMove` are the only callers and both refuse once settled,
-    // so this method needs no settled guard of its own.
-    if (this.reconciling) {
-      this.reconcileAgain = true;
+    let snapshot: HerdrSnapshot;
+    try {
+      snapshot = await this.deps.monitor.snapshot();
+    } catch (error) {
+      this.markReconciliationFailure(reconciliationFailureReason(error));
       return;
     }
-    this.reconciling = true;
-    try {
-      do {
-        this.reconcileAgain = false;
-        let snapshot: HerdrSnapshot;
-        try {
-          snapshot = await this.deps.monitor.snapshot();
-        } catch (error) {
-          this.markReconciliationFailure(reconciliationFailureReason(error));
-          return;
-        }
-        await this.applyAuthoritativeSnapshot(snapshot, trigger, "released");
-      } while (this.reconcileAgain && !this.isSettled());
-    } finally {
-      this.reconciling = false;
-    }
+    await this.applyAuthoritativeSnapshot(snapshot, trigger, "released");
   }
 
   private applyEventRevision(pane: SupervisionPaneRecord): void {

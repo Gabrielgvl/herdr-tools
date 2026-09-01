@@ -247,7 +247,13 @@ function errorDetails(error: unknown): unknown {
 }
 
 function launchDiagnosticId(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 && !/[\0\r\n]/u.test(value) ? singleLine(value, 256) : undefined;
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  const hasControlCharacter = [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  });
+  if (Buffer.byteLength(value, "utf8") > 256 || hasControlCharacter || value.trim() !== value) return undefined;
+  return value;
 }
 
 function launchDiagnosticPayload(message: string): Record<string, unknown> | undefined {
@@ -275,8 +281,27 @@ function launchDiagnosticPayload(message: string): Record<string, unknown> | und
     const id = launchDiagnosticId((createdValue as Record<string, unknown>)[field]);
     return id === undefined ? [] : [[field, id] as const];
   }));
+  const conditionalFields = ["paneId", "supervisorJobId", "assignmentState"] as const;
+  const hasConditionalFields = conditionalFields.some((field) => Object.prototype.hasOwnProperty.call(value, field));
+  let assignmentUnconfirmed: { paneId: string; supervisorJobId: string; assignmentState: "unconfirmed" } | undefined;
+  if (hasConditionalFields) {
+    const paneId = launchDiagnosticId(value.paneId);
+    const supervisorJobId = launchDiagnosticId(value.supervisorJobId);
+    if (paneId === undefined || supervisorJobId === undefined || value.assignmentState !== "unconfirmed") return undefined;
+    assignmentUnconfirmed = { paneId, supervisorJobId, assignmentState: "unconfirmed" };
+  }
   const code = typeof value.code === "string" && LAUNCH_CODE_PATTERN.test(value.code) ? value.code : "LAUNCH_FAILED";
-  return { code, phase, created, agentStarted: value.agentStarted, promptSubmitted: value.promptSubmitted, recipientRegistered: value.recipientRegistered, effectCertainty, recoveryGuidance };
+  return {
+    code,
+    phase,
+    created,
+    ...(assignmentUnconfirmed === undefined ? {} : assignmentUnconfirmed),
+    agentStarted: value.agentStarted,
+    promptSubmitted: value.promptSubmitted,
+    recipientRegistered: value.recipientRegistered,
+    effectCertainty,
+    recoveryGuidance
+  };
 }
 
 /**

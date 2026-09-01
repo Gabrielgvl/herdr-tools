@@ -54,6 +54,59 @@ export function textComponent(text: string, theme?: unknown, tone?: "accent" | "
   return new BoundedText(tone ? style(theme, tone, text) : text);
 }
 
+interface ResultDetails {
+  outcome?: unknown;
+  operation_phase?: unknown;
+  wait_result?: unknown;
+  reason?: unknown;
+  code?: unknown;
+  causeCode?: unknown;
+  phase?: unknown;
+  delivery?: unknown;
+  promptConsumption?: unknown;
+  assignmentState?: unknown;
+  agentStarted?: unknown;
+  promptSubmitted?: unknown;
+  recipientRegistered?: unknown;
+  postState?: { agent_status?: string };
+  finalState?: { agent_status?: string };
+  paneId?: string;
+  supervisorJobId?: unknown;
+  supervision?: unknown;
+  tabId?: string;
+  jobId?: string;
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function compactIdentifier(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || [...value].length > 256 || value.trim() !== value) return false;
+  return ![...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  });
+}
+
+function assignmentUnconfirmedRow(details: ResultDetails | undefined): string | undefined {
+  if (details?.assignmentState !== "unconfirmed"
+    || details.causeCode !== "PROMPT_UNCONFIRMED"
+    || details.phase !== "prompt_verification"
+    || details.promptConsumption !== "unconfirmed"
+    || details.agentStarted !== true
+    || details.promptSubmitted !== true
+    || details.recipientRegistered !== false
+    || (details.code !== undefined && details.code !== "LAUNCH_FAILED")
+    || !compactIdentifier(details.paneId)
+    || !record(details.supervision)) return undefined;
+  const supervision = details.supervision;
+  if (supervision.state !== "active" || !compactIdentifier(supervision.jobId) || !record(supervision.child)) return undefined;
+  if (supervision.child.paneId !== details.paneId) return undefined;
+  if (details.supervisorJobId !== undefined && details.supervisorJobId !== supervision.jobId) return undefined;
+  return `error LAUNCH_FAILED · assignment unconfirmed · ${details.paneId} · supervisor ${supervision.jobId}`;
+}
+
 export function resultForRender(
   operation: string,
   result: { details?: unknown; isError?: boolean },
@@ -61,7 +114,7 @@ export function resultForRender(
   targetId?: string,
 ): { text: string; tone: "success" | "warning" | "error" | "muted" } {
   if (options.isPartial) return { text: `partial · ${operation}`, tone: "warning" };
-  const details = result.details as { outcome?: unknown; operation_phase?: unknown; wait_result?: unknown; reason?: unknown; code?: unknown; delivery?: unknown; postState?: { agent_status?: string }; finalState?: { agent_status?: string }; paneId?: string; tabId?: string; jobId?: string } | undefined;
+  const details = result.details as ResultDetails | undefined;
   if (operation === "wait" && details?.operation_phase === "accepted") return { text: `accepted${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "muted" };
   if (operation === "wait" && details?.operation_phase === "running") return { text: `running${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "muted" };
   if (operation === "wait" && details?.operation_phase === "cancel_requested") return { text: `cancel_requested${typeof details.jobId === "string" ? ` · ${details.jobId}` : ""}`, tone: "warning" };
@@ -71,6 +124,10 @@ export function resultForRender(
     return { text: `settled · ${waitResult}${targetId ? ` · ${targetId}` : ""}`, tone };
   }
   if (details?.outcome === "partial") return { text: `partial${targetId ? ` · ${targetId}` : ""}`, tone: "warning" };
+  if (result.isError && operation === "launch") {
+    const row = assignmentUnconfirmedRow(details);
+    if (row !== undefined) return { text: row, tone: "error" };
+  }
   if (result.isError) {
     const code = typeof details?.code === "string" ? details.code : "UNKNOWN";
     const delivery = details?.delivery === "inline" || details?.delivery === "attachment" ? details.delivery : undefined;

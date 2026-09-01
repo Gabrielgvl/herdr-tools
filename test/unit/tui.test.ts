@@ -49,6 +49,32 @@ describe("compact tool rows", () => {
     expect(textComponent("status", theme, "success").render(20)[0]).toBe("success:status");
   });
 
+  it("renders the exact assignment-unconfirmed launch recovery row from active supervision", () => {
+    const details = {
+      causeCode: "PROMPT_UNCONFIRMED",
+      phase: "prompt_verification",
+      assignmentState: "unconfirmed",
+      promptConsumption: "unconfirmed",
+      agentStarted: true,
+      promptSubmitted: true,
+      recipientRegistered: false,
+      paneId: "w1:p2",
+      supervision: {
+        jobId: "job_supervisor_2",
+        state: "active",
+        child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", profileName: "worker-pi" }
+      }
+    };
+    expect(resultForRender("launch", { isError: true, details }, {}, "stale-target")).toEqual({
+      text: "error LAUNCH_FAILED · assignment unconfirmed · w1:p2 · supervisor job_supervisor_2",
+      tone: "error"
+    });
+    expect(resultForRender("launch", {
+      isError: true,
+      details: { ...details, code: "LAUNCH_FAILED", supervisorJobId: "job_other" }
+    }, {}, "w1:p2")).toEqual({ text: "error LAUNCH_FAILED · w1:p2", tone: "error" });
+  });
+
   it("keeps rows compact for omitted targets and every non-success outcome", () => {
     expect(formatCall("herdr_wait", "waiting")).toBe("herdr_wait · waiting");
     expect(formatResult({ operation: "communicate", outcome: "error" })).toBe("error UNKNOWN");

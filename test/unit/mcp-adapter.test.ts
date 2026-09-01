@@ -419,6 +419,33 @@ describe("MCP error mapping", () => {
     expect(text).toContain(LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry);
   });
 
+  it("publishes the complete assignment-unconfirmed diagnostic without attached launch evidence", () => {
+    const diagnostic = {
+      code: "LAUNCH_FAILED",
+      phase: "prompt_verification",
+      created: { tabId: "w:t2" },
+      paneId: "w:p2",
+      supervisorJobId: "job_supervisor_2",
+      assignmentState: "unconfirmed",
+      agentStarted: true,
+      promptSubmitted: true,
+      recipientRegistered: false,
+      effectCertainty: "partial",
+      recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
+    };
+    const secrets = ["private-prompt", "environment-secret", "backend-secret", "session-secret"];
+    const outcome = errorOutcome(
+      "LAUNCH_FAILED",
+      `Launch failed; inspect the structured diagnostic\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`,
+      { prompt: secrets[0], environment: secrets[1], causeMessage: secrets[2], agentSession: secrets[3] },
+      "herdr_launch"
+    );
+    expect(payload(outcome).details).toEqual({ tool: "herdr_launch", diagnostic });
+    const text = outcome.content.map((block) => block.text).join("\n");
+    for (const secret of secrets) expect(text).not.toContain(secret);
+    expect(Buffer.byteLength(JSON.stringify(diagnostic), "utf8")).toBeLessThan(8_192);
+  });
+
   it("rejects malformed launch diagnostics instead of publishing arbitrary attached data", () => {
     const base = { phase: "agent_start", created: {}, agentStarted: true, promptSubmitted: false, recipientRegistered: false, effectCertainty: "partial", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry };
     const messages = [
@@ -429,7 +456,16 @@ describe("MCP error mapping", () => {
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, effectCertainty: "not-a-certainty" })}`,
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, recoveryGuidance: "not-guidance" })}`,
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, agentStarted: "yes" })}`,
-      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, created: null })}`
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, created: null })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, paneId: "w:p2" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, supervisorJobId: "job_2" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, assignmentState: "unconfirmed" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, paneId: "w:p2", supervisorJobId: "job_2" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, paneId: "w:p2", assignmentState: "unconfirmed" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, supervisorJobId: "job_2", assignmentState: "unconfirmed" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, paneId: "w:p2", supervisorJobId: "job_2", assignmentState: "confirmed" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, paneId: "", supervisorJobId: "job_2", assignmentState: "unconfirmed" })}`,
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify({ ...base, paneId: "w:p2", supervisorJobId: "job\n2", assignmentState: "unconfirmed" })}`
     ];
     for (const message of messages) {
       const outcome = errorOutcome("LAUNCH_FAILED", message, { secret: "must-not-publish" }, "herdr_launch");

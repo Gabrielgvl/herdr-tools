@@ -74,6 +74,17 @@ never identify a child.
   pane ID, and **F6** makes a pane ID untrustworthy. They are treated as *reconciliation
   triggers*, never as conclusions: the monitor takes a fresh `session.snapshot` and the
   supervisor decides from authoritative state.
+- **C5.** Every accepted event is validated on its own fields at the protocol boundary, not
+  merely proven to be an object. A known kind that is malformed is refused — dropping the
+  connection, which the monitor reports and reconnects from — rather than accepted and
+  routed to no observer, which would lose lifecycle evidence silently. A `pane_moved` that is
+  not atomic is a protocol violation, not an unproven move, so it never reaches a supervisor.
+- **C6.** The subscription acknowledgement is validated and takes effect inside the socket's
+  ingest loop, because the transport may deliver it and the first replay event in one chunk.
+  The monitor never adopts a socket that closed before adoption.
+- **C7.** Events reach observers through one ordered chain. Without it, a thin event awaiting
+  its reconciliation snapshot could be overtaken by a later full update and then revert the
+  status that update had already applied.
 
 ## 4. Fixed subscription set
 
@@ -148,6 +159,14 @@ For each event on the shared stream:
   reconciliation per supervisor is in flight, and a request while one is in flight sets a
   re-run flag rather than queueing.
 
+Deduplication is by **connection stream ordinal**, not by the supervisor's own count of
+routed events. The monitor numbers every accepted event on a connection, so ordinal *n*
+names the same durable log entry on every connection, and a supervisor skips everything at
+or below the highest ordinal it has folded. Counting only routed events would break the
+moment a proven move rewrote the routing key: old-pane history would stop contributing while
+the watermark still included it, and the supervisor would go silently blind for as many
+events as the difference.
+
 `transitions` is bounded to `SUPERVISION_MAX_TRANSITIONS = 64` with a `truncatedTransitions`
 count, matching the repository's bounded-evidence rule.
 
@@ -162,11 +181,11 @@ exactly two things, and neither of them tries to locate the replay boundary:
   revision is unchanged, the supervisor resumes **silently**. This is a single authoritative
   comparison, not an inference about which replayed events were missed, so it is correct
   whether the retained log can still replay the outage or has scrolled past it.
-- **Replay dedupe, by relevant-event index.** The replay is deterministic, so the *n*-th event
-  relevant to this supervisor is the same event on every connection. The supervisor replays
-  its fold cursor from zero and skips every relevant event at or below the cursor it had
-  already reached; everything beyond it is folded, whether it happened during the outage or
-  after it.
+- **Replay dedupe, by stream ordinal.** The replay is deterministic and ordinals restart at
+  one on each connection, so ordinal *n* is the same log entry every time. The supervisor
+  skips every event at or below the highest ordinal it has already folded; everything beyond
+  it is folded, whether it happened during the outage or after it. This holds across a pane
+  move, because the ordinal counts log position rather than this supervisor's own routing.
 
 If reconnect is not available the supervisor is **visibly degraded** — job progress records
 it, one `monitor_degraded` wake is emitted, and reconnection is retried with bounded
@@ -204,7 +223,16 @@ supervisor job settles immediately after the wake.
   constant, not a setting: the setting `wait.reviewerModel` continues to govern the
   explicit `herdr_wait` reviewer, which stays Luna at `low`.
 - Evidence: bounded compact pane metadata plus the transcript delta since the previous
-  review, read through the existing `pane read --source recent-unwrapped` path.
+  **completed** review, read through the existing `pane read --source recent-unwrapped` path.
+  A pane read returns the latest window rather than what changed, so the delta is computed
+  against the window the previous review consumed, using the same rule the explicit wait
+  reviewer uses (`src/transcript-delta.ts`). Handing the whole window back each cadence would
+  let a stalled child keep reading as fresh progress.
+- A review is only evidence about the run it was started for. If the child leaves `working`
+  while the transcript read or the model call is in flight, the review is abandoned: nothing
+  is stored, nothing is announced, and the transcript cursor does not advance over lines no
+  review consumed.
+- The prompt is bounded in UTF-8 bytes, never split mid-code-point.
 - Result storage is silent (job progress). Only `stalled`, `blocked`, `risk`,
   `appears_complete`, and `unknown` wake the manager, and the supervisor stays active.
 - A reviewer failure enters a degraded episode: one `reviewer_degraded` wake, then retry at

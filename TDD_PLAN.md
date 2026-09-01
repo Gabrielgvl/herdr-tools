@@ -1035,3 +1035,26 @@ matrix for every other bundled profile.
 
 Existing explicit-wait behaviour, its reviewer at Luna `low`, and existing
 `herdr_jobs` coverage remain authoritative and unchanged.
+
+### Review-round remediation coverage
+
+The first review round added these required regressions, all inside the enforced 100%
+threshold:
+
+- a Pi session that follows a shutdown reserves successfully, and the replaced monitor stays
+  stopped;
+- a subscription acknowledgement and the first replay event delivered in one socket chunk are
+  accepted atomically, and a wrong acknowledgement in the same chunk still rejects and closes;
+- a subscription whose socket died before adoption is refused;
+- events reach observers strictly in stream order even when one suspends on a snapshot, and
+  an observer that throws does not break the chain;
+- ordinals count every accepted event, not only routed ones, so replay deduplication holds
+  across a proven pane move;
+- every malformed known lifecycle event is refused at the protocol boundary rather than
+  routed nowhere;
+- consecutive reviews receive only the newly produced transcript lines;
+- a review whose work cycle ends during the transcript read or the model call is abandoned,
+  with nothing stored, nothing announced, and no advanced transcript cursor;
+- a fallback-selected profile is bound and published, with the reserved profile kept beside it
+  only when the two differ;
+- the reviewer prompt bound holds for multibyte output and never splits a code point.

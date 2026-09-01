@@ -26,6 +26,7 @@ import {
   movedIdentity,
   occupantContinuity,
   paneContinuity,
+  sameSupervisedIdentity,
   type AuthoritativeOccupant,
   type SupervisedIdentity,
   type SupervisionAnchor,
@@ -797,6 +798,17 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   childLive(): boolean {
     return this.bindingPublished && (this.state === "active" || this.state === "degraded") && this.identity !== undefined;
+  }
+
+  coversIdentity(identity: SupervisedIdentity): boolean {
+    if (!this.childLive() || this.identity === undefined) return false;
+    try {
+      return sameSupervisedIdentity(this.identity, identity);
+    } catch {
+      // The internal query is fail-closed if a structurally incomplete identity
+      // crosses the typed seam.
+      return false;
+    }
   }
 
   shutdown(): void {

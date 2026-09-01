@@ -3,6 +3,7 @@ import { truncateTail } from "@earendil-works/pi-coding-agent";
 import { WAIT_LABEL_MAX_BYTES } from "./wait-schema.js";
 import { isTargetEvidence, type TargetEvidence } from "./wait-target-evidence.js";
 import type { SupervisionEvent } from "./supervision/events.js";
+import type { SupervisedIdentity } from "./supervision/identity.js";
 import type { SupervisionJobPort, SupervisionJobView } from "./supervision/state.js";
 
 export const OPERATION_PHASES = ["accepted", "running", "cancel_requested", "settled"] as const;
@@ -1203,6 +1204,16 @@ export class JobRegistry {
     if (record.detail.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job accepts a supervision port");
     record.supervision = port;
     this.notifyChange();
+  }
+
+  /** Read-only exact ownership lookup. It never projects or consumes receipts. */
+  activeSupervisorFor(identity: SupervisedIdentity): { jobId: string } | undefined {
+    for (const record of this.jobs.values()) {
+      if (record.detail.kind !== "supervisor" || record.detail.operation_phase === "settled") continue;
+      const port = record.supervision;
+      if (port?.childLive() === true && port.coversIdentity?.(identity) === true) return { jobId: record.detail.jobId };
+    }
+    return undefined;
   }
 
   /**

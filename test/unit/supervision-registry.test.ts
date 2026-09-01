@@ -81,6 +81,41 @@ describe("the supervision registry", () => {
     f.supervision.shutdown();
   });
 
+  it("finds coverage only for the complete exact live identity without observing receipts", async () => {
+    const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    expect(f.jobs.activeSupervisorFor(identity)).toBeUndefined();
+    await reservation.bind({ identity, profileName: "worker-pi" });
+    expect(f.jobs.activeSupervisorFor(identity)).toEqual({ jobId: reservation.jobId });
+
+    const mismatches: SupervisedIdentity[] = [
+      { ...identity, paneId: "p2" },
+      { ...identity, terminalId: "t2" },
+      { ...identity, agentName: "other" },
+      { ...identity, agentKind: "claude" },
+      { ...identity, agentSession: { ...session, source: "other" } },
+      { ...identity, agentSession: { ...session, agent: "other" } },
+      { ...identity, agentSession: { ...session, kind: "other" } },
+      { ...identity, agentSession: { ...session, value: "other" } },
+    ];
+    for (const mismatch of mismatches) expect(f.jobs.activeSupervisorFor(mismatch)).toBeUndefined();
+    expect(f.jobs.activeSupervisorFor({ paneId: "p1" } as SupervisedIdentity)).toBeUndefined();
+
+    f.push(`${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { ...pane, agent_status: "blocked", revision: 4 } } })}\n`);
+    await vi_waitFor(() => (f.jobs.get(reservation.jobId)?.unobservedEvents ?? 0) > 0);
+    const liveSupervisor = [...(f.supervision as unknown as { supervisors: Set<{ onReconciliationFailure(reason: "request_failed"): Promise<void> }> }).supervisors][0]!;
+    await liveSupervisor.onReconciliationFailure("request_failed");
+    expect(f.jobs.get(reservation.jobId)?.supervision?.state).toBe("degraded");
+    const pendingBeforeQuery = f.jobs.get(reservation.jobId)?.unobservedEvents;
+    expect(f.jobs.activeSupervisorFor(identity)).toEqual({ jobId: reservation.jobId });
+    expect(f.jobs.get(reservation.jobId)?.unobservedEvents).toBe(pendingBeforeQuery);
+
+    f.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
+    await vi_waitForSettled(f.jobs, reservation.jobId);
+    expect(f.jobs.activeSupervisorFor(identity)).toBeUndefined();
+    f.supervision.shutdown();
+  });
+
   it("rolls request target publication back when queued evidence settles during bind", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });

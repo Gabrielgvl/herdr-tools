@@ -10,6 +10,7 @@ const request: SupervisorJobRequestSnapshot = {
   label: "supervise worker",
   targets: ["worker"],
   targetIds: [],
+  target_generation_refs: ["target_generation_projection"],
   child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
   settings: { reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max" },
 };
@@ -122,6 +123,7 @@ describe("the registry's supervision port", () => {
     view: () => view({ unobservedEvents: 1 }),
     takePendingEvents: () => [event(1)],
     childLive: () => false,
+    coversIdentity: () => false,
     shutdown: () => undefined,
     ...overrides,
   });
@@ -134,27 +136,28 @@ describe("the registry's supervision port", () => {
       async () => new Promise<never>(() => undefined),
     );
     expect(() => registry.attachSupervision(wait.jobId, port())).toThrow(/JOB_KIND_MISMATCH/u);
-    // Only a supervisor job has a supervised child to re-point at the bound profile.
-    expect(() => registry.bindSupervisionChild("job_missing", { agentKind: "pi", profileName: "worker-pi" })).toThrow(/JOB_NOT_FOUND/u);
-    expect(() => registry.bindSupervisionChild(wait.jobId, { agentKind: "pi", profileName: "worker-pi" })).toThrow(/JOB_KIND_MISMATCH/u);
+    // Only a supervisor job has a supervised child binding transaction.
+    expect(() => registry.prepareSupervisionChildBinding("job_missing", { agentKind: "pi", profileName: "worker-pi", paneId: "p1" })).toThrow(/JOB_NOT_FOUND/u);
+    expect(() => registry.prepareSupervisionChildBinding(wait.jobId, { agentKind: "pi", profileName: "worker-pi", paneId: "p1" })).toThrow(/JOB_KIND_MISMATCH/u);
     void registry.cancel(wait.jobId);
   });
 
-  it("re-points the supervised child at the profile and kind that actually started it", () => {
+  it("publishes the selected child and exact target through one binding transaction", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_bind" });
     const registered = registry.register(request, async () => new Promise<never>(() => undefined));
-    expect(registry.get(registered.jobId)?.request).toMatchObject({ child: { agentKind: "pi", profileName: "worker-pi" } });
+    await vi.waitFor(() => expect(registry.get(registered.jobId)?.operation_phase).toBe("running"));
+    expect(registry.get(registered.jobId)?.request).toMatchObject({ child: { agentKind: "pi", profileName: "worker-pi" }, targetIds: [] });
 
-    // Fallback selection can change both, and only what changed is kept beside it.
-    registry.bindSupervisionChild(registered.jobId, { agentKind: "claude", profileName: "worker-claude" });
+    const publication = registry.prepareSupervisionChildBinding(registered.jobId, { agentKind: "claude", profileName: "worker-claude", paneId: "p1" });
+    publication.commit();
+    publication.publish();
     expect(registry.get(registered.jobId)?.request).toMatchObject({
+      targets: ["worker"],
+      targetIds: ["p1"],
+      target_generation_refs: ["target_generation_projection"],
       child: { agentName: "worker", agentKind: "claude", profileName: "worker-claude", requestedAgentKind: "pi", requestedProfileName: "worker-pi" },
     });
-
-    registry.bindSupervisionChild(registered.jobId, { agentKind: "claude", profileName: "worker-claude" });
-    const rebound = registry.get(registered.jobId)?.request;
-    expect(rebound).not.toHaveProperty(["child", "requestedAgentKind"]);
-    expect(rebound).not.toHaveProperty(["child", "requestedProfileName"]);
+    expect(() => registry.prepareSupervisionChildBinding(registered.jobId, { agentKind: "claude", profileName: "worker-claude", paneId: "p1" })).toThrow(/SUPERVISION_ALREADY_BOUND/u);
     registry.shutdown();
   });
 

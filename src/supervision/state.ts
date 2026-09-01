@@ -10,6 +10,7 @@
 import type { ReconciliationFailureReason, SupervisionEvent, SupervisionTransition } from "./events.js";
 import type { SupervisionAgentStatus } from "./protocol.js";
 import type { ReviewClassification } from "../reviewer.js";
+import type { SupervisedIdentity } from "./identity.js";
 
 export type SupervisionState = "reserved" | "active" | "degraded" | "settled";
 
@@ -86,6 +87,8 @@ export interface SupervisionJobPort {
   takePendingEvents(): SupervisionEvent[];
   /** True while the exact child is still live, which refuses `herdr_jobs cancel`. */
   childLive(): boolean;
+  /** Exact private identity match used only for semantic-review ownership. */
+  coversIdentity?(identity: SupervisedIdentity): boolean;
   /** Stop supervising because the session is shutting down. */
   shutdown(): void;
 }

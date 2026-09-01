@@ -261,6 +261,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     try {
       publication.commit();
       this.bindingPublished = true;
+      // Adopt the outage the monitor is already in, so this supervisor owns the
+      // episode it was born into: without it the view projects degraded from the
+      // monitor's flag while this side believes it is connected, and the
+      // reconnect that follows is dropped as a recovery from nothing.
+      this.eventStreamDegraded = this.deps.monitor.isDegraded();
       this.state = "active";
       this.refreshActiveState();
       publication.publish();
@@ -305,6 +310,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.lastRevision = 0;
     this.pendingMoveDestination = undefined;
     this.selectedProfileName = undefined;
+    this.eventStreamDegraded = false;
     this.bindingPublished = false;
     if (!this.isSettled()) this.state = "reserved";
   }

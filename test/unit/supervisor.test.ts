@@ -64,6 +64,7 @@ interface Harness {
   reviews: number;
   observers: number;
   degradeMonitor(): void;
+  recoverMonitor(): void;
 }
 
 interface HarnessOptions {
@@ -130,6 +131,7 @@ function harness(options: HarnessOptions = {}): Harness {
     get reviews() { return reviews; },
     get observers() { return observers; },
     degradeMonitor: () => { degraded = true; },
+    recoverMonitor: () => { degraded = false; },
   } as Harness;
 }
 
@@ -803,6 +805,43 @@ describe("supervisor reconnect and monitor health", () => {
     expect(types(h.wakes)).toEqual(["monitor_degraded", "monitor_recovered"]);
     h.degradeMonitor();
     expect(h.supervisor.view().monitor).toMatchObject({ connected: false, degraded: true, generation: 1 });
+  });
+
+  /** Binding during an outage is the one way this supervisor never observes the degrade that started it. */
+  async function boundDuringOutage(): Promise<Harness> {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    h.degradeMonitor();
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    expect(h.supervisor.view()).toMatchObject({ state: "degraded", monitor: { connected: false, degraded: true } });
+    expect(h.supervisor.childLive()).toBe(true);
+    // The outage was already visible when the child bound, so it is not news.
+    expect(h.wakes).toHaveLength(0);
+    return h;
+  }
+
+  it("adopts an outage that was already running when it bound and recovers from it exactly once", async () => {
+    const h = await boundDuringOutage();
+
+    // The monitor announces recovery before it clears its own flag.
+    h.supervisor.onMonitorRecovered();
+    expect(types(h.wakes)).toEqual(["monitor_recovered"]);
+    h.recoverMonitor();
+    expect(h.supervisor.view()).toMatchObject({ state: "active", monitor: { connected: true, degraded: false } });
+
+    h.supervisor.onMonitorRecovered();
+    expect(types(h.wakes)).toEqual(["monitor_recovered"]);
+  });
+
+  it("keeps a re-announced bind-time outage silent and still recovers once", async () => {
+    const h = await boundDuringOutage();
+    h.supervisor.onMonitorDegraded("SUPERVISION_SOCKET_UNAVAILABLE");
+    expect(h.wakes).toHaveLength(0);
+    expect(h.supervisor.view().state).toBe("degraded");
+
+    h.supervisor.onMonitorRecovered();
+    h.recoverMonitor();
+    expect(h.supervisor.view()).toMatchObject({ state: "active", monitor: { connected: true, degraded: false } });
+    expect(types(h.wakes)).toEqual(["monitor_recovered"]);
   });
 });
 

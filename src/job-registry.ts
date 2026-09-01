@@ -106,6 +106,15 @@ export interface SupervisedJobChild {
   requestedProfileName?: string;
 }
 
+export interface SupervisionChildBindingPublication {
+  /** Mutate the private request snapshot without notifying public observers. */
+  commit(): void;
+  /** Restore the exact reserved request snapshot. Idempotent. */
+  rollback(): void;
+  /** Notify observers only after the supervisor has published bound state. */
+  publish(): void;
+}
+
 export interface SupervisorJobRequestSnapshot extends JobRequestCommon {
   kind: "supervisor";
   child: SupervisedJobChild;
@@ -1139,24 +1148,52 @@ export class JobRegistry {
   }
 
   /**
-   * Record the profile and kind that actually started the supervised child.
-   * Profile fallback resolves after the reservation, so the reserved values are
-   * only a request until binding proves what ran; they are retained beside the
-   * bound values only when they differ.
+   * Prepare the synchronous request half of supervisor binding. No public field
+   * changes until `commit`, and no observer is notified until `publish`, after
+   * the supervisor has installed its matching bound state.
    */
-  bindSupervisionChild(jobId: string, bound: { agentKind: string; profileName: string }): void {
+  prepareSupervisionChildBinding(jobId: string, bound: { agentKind: string; profileName: string; paneId: string }): SupervisionChildBindingPublication {
     const record = this.jobs.get(jobId);
     if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
     if (record.detail.request.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job has a supervised child");
-    const child = record.detail.request.child;
-    record.detail.request.child = {
-      agentName: child.agentName,
+    if (typeof bound.paneId !== "string" || bound.paneId.length === 0 || /[\0\r\n]/u.test(bound.paneId)) throw new Error("SUPERVISION_BINDING_INVALID: exact pane id is malformed");
+    const request = record.detail.request;
+    if (request.targetIds.length !== 0) throw new Error("SUPERVISION_ALREADY_BOUND: supervisor request already has an exact target");
+    if (request.targets.length !== 1 || request.target_generation_refs?.length !== 1) throw new Error("SUPERVISION_REQUEST_INVALID: supervisor target arrays are not aligned");
+    const reservedChild = clone(request.child);
+    const reservedTargetIds = [...request.targetIds];
+    const selectedChild: SupervisedJobChild = {
+      agentName: reservedChild.agentName,
       agentKind: bound.agentKind,
       profileName: bound.profileName,
-      ...(bound.agentKind === child.agentKind ? {} : { requestedAgentKind: child.agentKind }),
-      ...(bound.profileName === child.profileName ? {} : { requestedProfileName: child.profileName })
+      ...(bound.agentKind === reservedChild.agentKind ? {} : { requestedAgentKind: reservedChild.agentKind }),
+      ...(bound.profileName === reservedChild.profileName ? {} : { requestedProfileName: reservedChild.profileName })
     };
-    this.notifyChange();
+    let committed = false;
+    let published = false;
+    return {
+      commit: () => {
+        if (committed) throw new Error("SUPERVISION_ALREADY_BOUND: binding publication was already committed");
+        if (!record.gateOpen || record.detail.operation_phase !== "running") throw new Error("SUPERVISION_BINDING_CLOSED: supervisor job is no longer running");
+        request.child = clone(selectedChild);
+        request.targetIds = [bound.paneId];
+        committed = true;
+      },
+      rollback: () => {
+        if (!committed) return;
+        request.child = clone(reservedChild);
+        request.targetIds = [...reservedTargetIds];
+        committed = false;
+        if (published) this.notifyChange();
+        published = false;
+      },
+      publish: () => {
+        if (!committed) throw new Error("SUPERVISION_BINDING_UNCOMMITTED: cannot publish an uncommitted binding");
+        if (published) return;
+        published = true;
+        this.notifyChange();
+      },
+    };
   }
 
   /** Attach a supervisor's port so the registry can publish its bounded view. */

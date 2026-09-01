@@ -172,10 +172,19 @@ export class SupervisionRegistry implements SupervisionCoordinator {
     return {
       jobId: registered.jobId,
       bind: async (binding) => {
-        // The job request and the supervision view are updated together, so a
-        // fallback-selected profile can never be authoritative in only one.
-        this.deps.jobs.bindSupervisionChild(registered.jobId, { agentKind: binding.identity.agentKind, profileName: binding.profileName });
-        await bound.bind(binding);
+        const publication = this.deps.jobs.prepareSupervisionChildBinding(registered.jobId, {
+          agentKind: binding.identity.agentKind,
+          profileName: binding.profileName,
+          paneId: binding.identity.paneId,
+        });
+        try {
+          await bound.bind(binding, publication);
+        } catch (error) {
+          // Idempotent and required even when Supervisor already rolled back a
+          // partially committed publication.
+          publication.rollback();
+          throw error;
+        }
       },
       release: (reason) => bound.release(reason),
     };

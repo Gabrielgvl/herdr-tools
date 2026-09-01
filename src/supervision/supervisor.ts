@@ -47,7 +47,7 @@ import type {
   SupervisionReviewView,
   SupervisionState,
 } from "./state.js";
-import type { SupervisionResult } from "../job-registry.js";
+import type { SupervisionChildBindingPublication, SupervisionResult } from "../job-registry.js";
 
 export interface SupervisionScheduler {
   setTimer(callback: () => void, milliseconds: number): unknown;
@@ -111,6 +111,12 @@ interface Settlement {
   reason: string;
 }
 
+const inertBindingPublication: SupervisionChildBindingPublication = {
+  commit: () => undefined,
+  rollback: () => undefined,
+  publish: () => undefined,
+};
+
 export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private readonly log: SupervisionEventLog;
   private readonly transitions = new BoundedHistory<SupervisionTransition>(SUPERVISION_MAX_TRANSITIONS);
@@ -152,6 +158,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private reconcileAgain = false;
   private settlement: Settlement | undefined;
   private selectedProfileName: string | undefined;
+  private bindStarted = false;
+  private bindingPublished = false;
   private stopped = false;
   private readonly abort = new AbortController();
 
@@ -168,37 +176,76 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * registered *before* the confirming snapshot, so an event that lands between
    * the snapshot and the anchor is queued rather than lost.
    */
-  async bind(binding: SupervisionBinding): Promise<void> {
+  async bind(binding: SupervisionBinding, publication: SupervisionChildBindingPublication = inertBindingPublication): Promise<void> {
+    if (this.bindStarted || this.stopped || this.state !== "reserved") {
+      throw new SupervisionBindError("Supervision binding is single-use", this.bindEvidence(binding, { cause: "bind_already_attempted" }));
+    }
+    this.bindStarted = true;
     this.paneId = binding.identity.paneId;
     this.deps.monitor.addObserver(this);
     let snapshot: HerdrSnapshot;
     try {
       snapshot = await this.deps.monitor.snapshot();
     } catch (error) {
-      this.deps.monitor.removeObserver(this);
+      this.resetPreparedBinding();
       throw new SupervisionBindError("Supervision binding could not read authoritative state", this.bindEvidence(binding, { cause: reasonOf(error) }));
     }
     const target = classifySnapshotTarget(snapshot, binding.identity.paneId);
     if (target.kind !== "unique" || !target.occupant.agentPresent) {
-      this.deps.monitor.removeObserver(this);
+      this.resetPreparedBinding();
       const cause = target.kind === "invalid" ? target.reason : target.kind === "absent" ? "occupant_absent" : "agent_absent";
       throw new SupervisionBindError("Supervision binding found no valid unique authoritative occupant", this.bindEvidence(binding, { cause }));
     }
     const occupant = target.occupant;
     if (occupantContinuity(binding.identity, occupant) !== "continuous") {
-      this.deps.monitor.removeObserver(this);
+      this.resetPreparedBinding();
       throw new SupervisionBindError("Supervision binding could not prove the launched identity", this.bindEvidence(binding, { cause: "identity_mismatch", observedStatus: occupant.pane.agentStatus }));
     }
+
+    // Prepare the exact child privately. Queued evidence folds against this
+    // anchor, but the public view stays reserved until the drain proves the
+    // supervisor did not settle.
     this.identity = binding.identity;
     this.selectedProfileName = binding.profileName;
     this.anchor = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, ...(binding.stateChangeSeq === undefined ? {} : { stateChangeSeq: binding.stateChangeSeq }) };
     this.status = occupant.pane.agentStatus;
     this.lastRevision = occupant.pane.revision;
-    this.state = "active";
-    this.refreshActiveState();
-    this.enterStatus(occupant.pane.agentStatus);
+    try {
+      await this.drainQueued();
+    } catch (error) {
+      publication.rollback();
+      this.resetPreparedBinding();
+      throw new SupervisionBindError("Supervision binding could not drain queued evidence", this.bindEvidence(binding, { cause: reasonOf(error) }));
+    }
+    if (this.isSettled()) {
+      publication.rollback();
+      throw new SupervisionBindError("Supervision settled while queued binding evidence was drained", this.bindEvidence(binding, {
+        cause: "settled_during_bind",
+        settledDuringBind: true,
+        ...(this.settlement === undefined ? {} : { supervisionOutcome: this.settlement.outcome, supervisionReason: this.settlement.reason }),
+      }));
+    }
+
+    try {
+      publication.commit();
+      this.bindingPublished = true;
+      this.state = "active";
+      this.refreshActiveState();
+      publication.publish();
+    } catch (error) {
+      publication.rollback();
+      this.resetPreparedBinding();
+      throw new SupervisionBindError("Supervision binding could not publish its exact child", this.bindEvidence(binding, { cause: reasonOf(error) }));
+    }
+    try {
+      this.enterStatus(this.status!);
+    } catch {
+      // Lifecycle observation is already active. A reviewer timer failure cannot
+      // roll back exact supervision after its public commit.
+      this.reviewerDegraded = true;
+      this.publish("supervision reviewer cadence could not be armed");
+    }
     this.publish(`supervising ${this.deps.child.agentName}`);
-    await this.drainQueued();
   }
 
   /** Resolve when the supervisor settles. This is the supervisor job's run body. */
@@ -213,6 +260,20 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       agentSession: { ...binding.identity.agentSession },
       ...extra,
     };
+  }
+
+  private resetPreparedBinding(): void {
+    this.clearReviewTimer();
+    this.deps.monitor.removeObserver(this);
+    this.queued.length = 0;
+    this.paneId = undefined;
+    this.identity = undefined;
+    this.anchor = undefined;
+    this.status = undefined;
+    this.lastRevision = 0;
+    this.selectedProfileName = undefined;
+    this.bindingPublished = false;
+    if (!this.isSettled()) this.state = "reserved";
   }
 
   // ----------------------------------------------------------------- observer
@@ -498,7 +559,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private refreshActiveState(): void {
-    if (this.identity === undefined || this.isSettled()) return;
+    if (!this.bindingPublished || this.identity === undefined || this.isSettled()) return;
     this.state = this.eventStreamDegraded || this.reconciliationDegraded ? "degraded" : "active";
   }
 
@@ -522,6 +583,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   /** Reset or arm the review cadence for the status the child just entered. */
   private enterStatus(status: SupervisionAgentStatus): void {
     this.clearReviewTimer();
+    if (!this.bindingPublished) {
+      this.workingSinceMs = undefined;
+      return;
+    }
     if (status !== "working") {
       this.workingSinceMs = undefined;
       return;
@@ -667,7 +732,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   view(): SupervisionJobView {
     const streamDegraded = this.eventStreamDegraded || this.deps.monitor.isDegraded();
     const monitorDegraded = streamDegraded || this.reconciliationDegraded;
-    const projectedState = this.identity !== undefined && !this.isSettled()
+    const projectedState = this.bindingPublished && !this.isSettled()
       ? monitorDegraded ? "degraded" : "active"
       : this.state;
     return {
@@ -701,8 +766,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       events: this.log.history(),
       truncatedEvents: this.log.truncatedEvents(),
       unobservedEvents: this.log.unobserved(),
-      ...(this.identity === undefined ? {} : { child: this.childView(this.identity) }),
-      ...(this.status === undefined ? {} : { status: this.status }),
+      ...(!this.bindingPublished || this.identity === undefined ? {} : { child: this.childView(this.identity) }),
+      ...(!this.bindingPublished || this.status === undefined ? {} : { status: this.status }),
       ...(this.settlement === undefined ? {} : { settledReason: this.settlement.reason }),
     };
   }
@@ -731,7 +796,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   childLive(): boolean {
-    return this.state !== "settled" && this.identity !== undefined;
+    return this.bindingPublished && (this.state === "active" || this.state === "degraded") && this.identity !== undefined;
   }
 
   shutdown(): void {

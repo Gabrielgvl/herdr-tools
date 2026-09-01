@@ -14,8 +14,8 @@ const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThink
 
 const pane = { pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "working", revision: 3, agent: "pi", agent_session: session };
 
-function snapshotResult(panes: Array<Record<string, unknown>>): unknown {
-  return { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents: [{ pane_id: "p1", name: "worker" }] } };
+function snapshotResult(panes: Array<Record<string, unknown>>, agents: Array<Record<string, unknown>> = panes.some((item) => item.pane_id === "p1") ? [{ pane_id: "p1", name: "worker" }] : []): unknown {
+  return { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents } };
 }
 
 interface Fixture {
@@ -66,12 +66,33 @@ describe("the supervision registry", () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
     await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2 });
-    expect(f.jobs.get(reservation.jobId)).toMatchObject({ kind: "supervisor", supervision: { state: "active", status: "working", child: { paneId: "p1" } } });
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({
+      kind: "supervisor",
+      request: { targets: ["worker"], targetIds: ["p1"], child: { agentKind: "pi", profileName: "worker-pi" } },
+      supervision: { state: "active", status: "working", child: { paneId: "p1" } },
+    });
+    expect(f.jobs.get(reservation.jobId)?.request.target_generation_refs).toHaveLength(1);
+    expect(f.jobs.list(undefined, 0, 20, "supervisor").jobs[0]?.targetIds).toEqual(["p1"]);
 
     f.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "settled", supervision_result: "released", supervision_reason: "event:pane_closed" });
     expect(f.wakes.map((wake) => wake.event.type)).toEqual(["pane_closed"]);
+    f.supervision.shutdown();
+  });
+
+  it("rolls request target publication back when queued evidence settles during bind", async () => {
+    const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    const binding = reservation.bind({ identity, profileName: "worker-pi" });
+    f.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
+    await expect(binding).rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "settled_during_bind", settledDuringBind: true } });
+    await vi_waitForSettled(f.jobs, reservation.jobId);
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({
+      operation_phase: "settled",
+      request: { targets: ["worker"], targetIds: [], child: { agentKind: "pi", profileName: "worker-pi" } },
+      supervision_result: "released",
+    });
     f.supervision.shutdown();
   });
 

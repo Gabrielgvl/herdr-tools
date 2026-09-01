@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -33,6 +33,13 @@ const serverEntry = join(repoRoot, "dist/src/mcp-server.js");
 const PANE_SETTLE_MS = 3_000;
 /** Planted as a pane environment override; it must never appear in a tool result. */
 const ENVIRONMENT_SENTINEL = "integration-environment-sentinel";
+/**
+ * A pane-output literal no target can ever print: it is generated per run and is
+ * never written to a pane, never sent as a message, and never part of a prompt.
+ * It keeps a long wait's initial observation unmatched without depending on what
+ * the live child happens to have on screen.
+ */
+const IMPOSSIBLE_OUTPUT_LITERAL = `herdr-tools-impossible-output-${process.pid}-${randomUUID()}`;
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
 
@@ -448,12 +455,34 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(evidence(communicated)).toMatchObject({ operation: "steer", envelope: { version: "v1", kind: "steer" }, sender: { paneId: String(movedPane.pane_id) } });
       const transcript = await call("herdr_inspect", { mode: "target", target: workerPaneId });
       expect(JSON.stringify(evidence(transcript).recentUnwrappedLines)).toContain("[HERDR AGENT MESSAGE v1]");
-      const unsupervised = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 31 * 60_000 });
+      // A wait longer than the review cadence must build a reviewer, and the MCP
+      // host has none: model-backed review is unavailable there, so the reviewer
+      // factory refuses and the detached job must settle fail-closed rather than
+      // wait on unsupervised. The condition is a non-native pane-output literal
+      // that can never appear, so the initial observation completes at once and
+      // the wait reaches the long-wait reviewer factory without sleeping through
+      // the fixed review cadence; the timeout still exceeds that cadence, which
+      // is what makes this a long wait. Neither the cadence nor the explicit
+      // wait's own reviewer settings are altered to make this reachable.
+      const unsupervised = await call("herdr_wait", {
+        targets: [workerPaneId],
+        match: "any",
+        condition: { kind: "output", match: { kind: "literal", value: IMPOSSIBLE_OUTPUT_LITERAL } },
+        timeoutMs: 31 * 60_000,
+        label: "mcp long wait"
+      });
       expect(unsupervised.isError, text(unsupervised)).toBeUndefined();
       const unsupervisedJobId = evidence(unsupervised).jobId as string;
       await vi.waitFor(async () => {
         const job = await call("herdr_jobs", { operation: "get", jobId: unsupervisedJobId });
-        expect(text(job)).toContain("REVIEWER_FAILED");
+        expect(evidence(job)).toMatchObject({
+          operation: "jobs",
+          view: "job",
+          jobId: unsupervisedJobId,
+          operation_phase: "settled",
+          wait_result: "failed",
+          error: { code: "REVIEWER_FAILED" }
+        });
       }, { timeout: 20_000, interval: 100 });
 
       const detached = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 20_000, label: "mcp detached" });

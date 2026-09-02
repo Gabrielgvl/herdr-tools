@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import extension, { CORE_TOOL_NAMES } from "../../index.js";
 import { spawnWithStdin } from "../../src/exec-stdin.js";
-import { stopDisposableServer } from "./disposable-session.js";
+import { stopDisposableServer, waitForCondition } from "./disposable-session.js";
 
 interface ExecutableTool {
   name: string;
@@ -19,6 +19,7 @@ const execFileAsync = promisify(execFile);
 const REQUIRED_SESSION = "herdr-tools-integration";
 const requestedSession = process.env.HERDR_TOOLS_INTEGRATION_SESSION ?? REQUIRED_SESSION;
 const enabled = process.env.HERDR_TOOLS_RUN_INTEGRATION === "1";
+const agyEnabled = process.env.HERDR_TOOLS_RUN_AGY_INTEGRATION === "1";
 const ACCEPTANCE_DEADLINE_MS = 150_000;
 
 function resultObject(value: unknown): Record<string, unknown> {
@@ -49,7 +50,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     forceNextPromptConfirmationFailure: boolean;
     promptConfirmationFailurePaneId?: string;
     unconfirmedRecoveries: Array<{ paneId: string; supervisorJobId: string }>;
-  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], stdinCalls: [], toolCalls: [], profilePromptContent: "", attachmentPaths: [], forceNextPromptConfirmationFailure: false, unconfirmedRecoveries: [] };
+    captureAgyPrePromptFor?: string;
+    agyPrePromptJob?: Record<string, unknown>;
+    agyPrePromptAgent?: Record<string, unknown>;
+    agyPrePromptRecipientFailureCode?: string;
+    forceNextAgyStartFailure: boolean;
+  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], stdinCalls: [], toolCalls: [], profilePromptContent: "", attachmentPaths: [], forceNextPromptConfirmationFailure: false, unconfirmedRecoveries: [], forceNextAgyStartFailure: false };
 
   const run = async (...args: string[]): Promise<unknown> => {
     // The suite sets HERDR_SOCKET_PATH so the extension's supervision monitor
@@ -435,6 +441,15 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         if (args[0] === "agent" && args[1] === "start") {
           const promptFlag = args.indexOf("--append-system-prompt");
           if (promptFlag >= 0 && typeof args[promptFlag + 1] === "string") state.profilePromptContent = await readFile(args[promptFlag + 1]!, "utf8");
+          if (state.forceNextAgyStartFailure && args[args.indexOf("--kind") + 1] === "agy") {
+            state.forceNextAgyStartFailure = false;
+            return {
+              stdout: "",
+              stderr: JSON.stringify({ id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } }),
+              code: 1,
+              killed: false
+            };
+          }
         }
         if (args[0] === "agent" && args[1] === "get" && args[2] === state.promptConfirmationFailurePaneId) {
           state.promptConfirmationFailurePaneId = undefined;
@@ -465,6 +480,22 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       async execStdin(command: string, args: string[], input: string, options?: { signal?: AbortSignal; timeout?: number }) {
         expect(command).toBe("herdr");
         state.cliCalls.push([...args]);
+        if (state.captureAgyPrePromptFor && args[0] === "agent" && args[1] === "prompt" && typeof args[2] === "string") {
+          const agentName = state.captureAgyPrePromptFor;
+          const listed = resultObject((await tool("herdr_jobs").execute("agy-pre-prompt-jobs", { operation: "list", kind: "supervisor" }, signal(), undefined, toolContext())).details);
+          const summaries = Array.isArray(listed.jobs) ? listed.jobs.map(resultObject) : [];
+          const summary = summaries.find((job) => Array.isArray(job.targets) && job.targets.length === 1 && job.targets[0] === agentName);
+          if (!summary || typeof summary.jobId !== "string") throw new Error("AGY provisional supervisor job was not published before stdin submission");
+          state.agyPrePromptJob = resultObject((await tool("herdr_jobs").execute("agy-pre-prompt-job", { operation: "get", jobId: summary.jobId }, signal(), undefined, toolContext())).details);
+          const live = resultObject(resultObject(await runNamed(["agent", "get", args[2]])).result);
+          state.agyPrePromptAgent = resultObject(live.agent ?? live);
+          try {
+            await tool("herdr_communicate").execute("agy-pre-prompt-recipient", { target: args[2], operation: "prompt", text: "must not publish", delivery: "attachment" }, signal(), undefined, toolContext());
+          } catch (error) {
+            state.agyPrePromptRecipientFailureCode = (error as { code?: string }).code;
+          }
+          state.captureAgyPrePromptFor = undefined;
+        }
         state.stdinCalls.push({ args: [...args], input });
         const result = await spawnWithStdin(command, ["--session", REQUIRED_SESSION, ...args], input, { signal: options?.signal, timeout: options?.timeout });
         if (state.forceNextPromptConfirmationFailure && args[0] === "agent" && args[1] === "prompt" && typeof args[2] === "string") {
@@ -528,7 +559,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       await run("session", "delete", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
     }
     // Remove only the recipient directories this run published into.
-    for (const path of state.attachmentPaths) {
+    for (const path of new Set(state.attachmentPaths)) {
       await rm(dirname(dirname(path)), { recursive: true, force: true }).catch((error) => process.stderr.write(`INTEGRATION_ATTACHMENT_CLEANUP_FAILURE ${String(error)}\n`));
     }
     if (state.cwd) await rm(state.cwd, { recursive: true, force: true });
@@ -542,10 +573,11 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
     const profiles = await tool("herdr_inspect").execute("profiles", { mode: "collection", collection: "profiles" }, signal(), undefined, toolContext());
     const profileItems = resultObject(profiles.details).items;
-    expect(Array.isArray(profileItems) ? profileItems : []).toHaveLength(12);
+    expect(Array.isArray(profileItems) ? profileItems : []).toHaveLength(13);
     expect(profileItems).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: expect.arrayContaining(["herdr_tab"]), skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")] }),
-      expect.objectContaining({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", fallbackProfiles: [] })
+      expect.objectContaining({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", fallbackProfiles: [] }),
+      expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.7-flash-high", addDirs: [], fallbackProfiles: ["researcher-pi"] })
     ]));
     const manager = await tool("herdr_inspect").execute("manager", { mode: "profile", profile: "manager-pi" }, signal(), undefined, toolContext());
     expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: ["read", "grep", "find", "ls", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"], extensions: [], skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")], fallbackProfiles: [] });
@@ -563,6 +595,202 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const defaultAfter = resultObject(resultObject(resultObject(await run("api", "snapshot")).result).snapshot);
     expect(topologyIds(defaultAfter)).toEqual(state.baseline);
   }, 120_000);
+
+  it.runIf(agyEnabled)("qualifies one AGY assignment from provisional publication through exact attachment readback", async () => {
+    const agentName = `integration-agy-${process.pid}`;
+    const nonce = `agy-attachment-${randomUUID()}`;
+    const stdinStart = state.stdinCalls.length;
+    const cliStart = state.cliCalls.length;
+    state.captureAgyPrePromptFor = agentName;
+    const startedAt = performance.now();
+    let details: Record<string, unknown>;
+    try {
+      const launched = await tool("herdr_launch").execute("agy-qualification", {
+        name: agentName,
+        profile: "researcher-agy",
+        placement: { mode: "new_tab", tabLabel: "agy-qualification" },
+        initialPromptDelivery: "attachment",
+        initialPrompt: `Read this assignment attachment through the granted directory. Respond with only this exact token: ${nonce}`
+      }, signal(), undefined, toolContext());
+      details = resultObject(launched.details);
+    } catch (error) {
+      const failure = error as { details?: Record<string, unknown> };
+      const failureDetails = resultObject(failure.details);
+      const attachment = resultObject(failureDetails.attachment ?? {});
+      if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
+      const paneId = typeof failureDetails.paneId === "string" ? failureDetails.paneId : undefined;
+      const supervisorJobId = typeof failureDetails.supervisorJobId === "string" ? failureDetails.supervisorJobId : undefined;
+      if (failureDetails.promptSubmitted === true && paneId && supervisorJobId) {
+        expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
+        const failureCalls = state.cliCalls.slice(cliStart);
+        expect(failureCalls.filter((args) => args[0] === "agent" && args[1] === "start")).toHaveLength(1);
+        expect(failureCalls.filter((args) => (["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
+        expect(failureDetails).toMatchObject({ recipientRegistered: false, attempts: [{ profile: "researcher-agy", outcome: "selected" }] });
+        const retained = resultObject((await tool("herdr_jobs").execute("agy-retained-provisional", { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
+        expect(retained).toMatchObject({
+          operation_phase: "running",
+          request: { targetIds: [] },
+          supervision: { state: "provisional", provisional: { paneId, agentKind: "agy", profileName: "researcher-agy" } }
+        });
+        expect(retained).not.toHaveProperty("supervision_result");
+        state.unconfirmedRecoveries.push({ paneId, supervisorJobId });
+        process.stderr.write(`INTEGRATION_AGY_UNCERTAIN_RETAINED ${JSON.stringify({ paneId, supervisorJobId, details: failureDetails })}\n`);
+        await recordDeliveryFailureBeforeTeardown("agy-qualification", { details: failureDetails }, performance.now() - startedAt);
+      }
+      throw error;
+    } finally {
+      state.captureAgyPrePromptFor = undefined;
+    }
+
+    const paneId = String(details.paneId);
+    const attachment = resultObject(details.attachment);
+    const attachmentPath = String(attachment.path);
+    state.attachmentPaths.push(attachmentPath);
+    const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
+    expect(promptCalls).toHaveLength(1);
+    expect(promptCalls[0]!.args).toEqual(["agent", "prompt", paneId, "--stdin"]);
+    expect(promptCalls[0]!.input).toContain("[HERDR AGENT MESSAGE v1]");
+    expect(promptCalls[0]!.input).toContain("authority: agent; not user/owner");
+    expect(promptCalls[0]!.input).toContain("delivery: attachment");
+    expect(promptCalls[0]!.input).toContain(`attachment-path: ${attachmentPath}`);
+    expect(promptCalls[0]!.input).not.toContain(nonce);
+
+    const startCalls = state.cliCalls.slice(cliStart).filter((args) => args[0] === "agent" && args[1] === "start");
+    const grantedDirectory = dirname(dirname(attachmentPath));
+    expect(startCalls).toEqual([[
+      "agent", "start", agentName, "--kind", "agy", "--pane", paneId, "--timeout", "120000", "--",
+      "--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", grantedDirectory
+    ]]);
+    expect(state.agyPrePromptAgent).not.toHaveProperty("agent_session");
+    expect(state.agyPrePromptRecipientFailureCode).toBe("ATTACHMENT_TARGET_UNVERIFIED");
+    const provisionalJob = resultObject(state.agyPrePromptJob);
+    expect(provisionalJob).toMatchObject({
+      operation_phase: "running",
+      request: { targetIds: [], child: { agentName, agentKind: "agy", profileName: "researcher-agy" } },
+      supervision: {
+        state: "provisional",
+        provisional: { agentName, agentKind: "agy", paneId, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: expect.any(Number), revision: expect.any(Number) } }
+      }
+    });
+    expect(provisionalJob).not.toHaveProperty("supervision_result");
+
+    expect(details).toMatchObject({
+      operation: "launch",
+      outcome: "launched",
+      kind: "agy",
+      paneId,
+      promptSubmitted: true,
+      promptConsumption: "confirmed",
+      assignmentState: "confirmed",
+      recipientRegistered: true,
+      initialPromptDelivery: "attachment",
+      initialPromptSubmission: {
+        confirmed: true,
+        operationId: "cli:agent:prompt",
+        paneId,
+        agentName,
+        agentKind: "agy",
+        agentSession: { source: expect.any(String), agent: "agy", kind: expect.any(String), value: expect.any(String) }
+      },
+      initialPromptObservation: { stateChangeSeq: expect.any(Number), revision: expect.any(Number), consumption: "confirmed" },
+      supervision: { jobId: expect.any(String), state: "active", child: { agentName, agentKind: "agy", paneId, profileName: "researcher-agy" } },
+      profile: {
+        name: "researcher-agy",
+        requested: "researcher-agy",
+        selected: "researcher-agy",
+        runtime: { kind: "agy", model: "gemini-3.7-flash-high", mode: "plan", dangerouslySkipPermissions: true },
+        permissions: { sessionPersistence: true, addDirs: [] },
+        attempts: [{ profile: "researcher-agy", outcome: "selected" }],
+        fallbackProfiles: ["researcher-pi"],
+        reachableNames: ["researcher-agy", "researcher-pi", "researcher-claude"]
+      }
+    });
+    const baseline = resultObject(resultObject(provisionalJob.supervision).provisional).baseline as Record<string, unknown>;
+    const observation = resultObject(details.initialPromptObservation);
+    expect(Number(observation.stateChangeSeq)).toBeGreaterThan(Number(baseline.stateChangeSeq));
+    expect(Number(observation.revision)).toBeGreaterThanOrEqual(Number(baseline.revision));
+
+    const supervisorJobId = String(resultObject(details.supervision).jobId);
+    const strengthened = resultObject((await tool("herdr_jobs").execute("agy-strengthened", { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
+    expect(strengthened).toMatchObject({
+      operation_phase: "running",
+      request: { targetIds: [paneId], child: { agentName, agentKind: "agy", profileName: "researcher-agy" } },
+      supervision: { state: "active", child: { agentName, agentKind: "agy", paneId, profileName: "researcher-agy" } }
+    });
+    expect(resultObject(strengthened.supervision)).not.toHaveProperty("provisional");
+
+    const wait = await tool("herdr_wait").execute("agy-attachment-readback", {
+      targets: [paneId],
+      match: "any",
+      condition: { kind: "output", match: { kind: "literal", value: nonce } },
+      timeoutMs: ACCEPTANCE_DEADLINE_MS,
+      label: "AGY attachment nonce readback"
+    }, signal(), undefined, toolContext());
+    const waitJobId = String(resultObject(wait.details).jobId);
+    const settled = await waitForCondition(
+      async () => resultObject((await tool("herdr_jobs").execute("agy-readback-job", { operation: "get", jobId: waitJobId }, signal(), undefined, toolContext())).details),
+      (job) => job.operation_phase === "settled",
+      ACCEPTANCE_DEADLINE_MS,
+      500
+    );
+    expect(settled).toMatchObject({ operation_phase: "settled", wait_result: "condition_met", result: { matched: true } });
+    expect(await readFile(attachmentPath, "utf8")).toContain(nonce);
+    expect(dirname(dirname(attachmentPath))).toBe(grantedDirectory);
+
+    await closeConfirmedFixturePane("agy-qualification", details);
+    const proofPath = process.env.HERDR_TOOLS_AGY_INTEGRATION_PROOF;
+    if (!proofPath) throw new Error("AGY integration proof path was not supplied by the integration runner");
+    await writeFile(proofPath, "qualified");
+  }, 360_000);
+
+  it.runIf(agyEnabled)("falls back from AGY only after an exact pre-interactive zero-effect failure", async () => {
+    const agentName = `integration-agy-fallback-${process.pid}`;
+    const cliStart = state.cliCalls.length;
+    const stdinStart = state.stdinCalls.length;
+    state.forceNextAgyStartFailure = true;
+    const launched = await tool("herdr_launch").execute("agy-zero-effect-fallback", {
+      name: agentName,
+      profile: "researcher-agy",
+      placement: { mode: "new_tab", tabLabel: "agy-zero-effect-fallback" },
+      initialPrompt: "Reply with the single word ready."
+    }, signal(), undefined, toolContext());
+    const details = resultObject(launched.details);
+    const paneId = String(details.paneId);
+    const calls = state.cliCalls.slice(cliStart);
+    const starts = calls.filter((args) => args[0] === "agent" && args[1] === "start");
+    expect(starts).toHaveLength(2);
+    expect(state.forceNextAgyStartFailure).toBe(false);
+    expect(starts[0]).toEqual(expect.arrayContaining(["--kind", "agy", "--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]));
+    expect(starts[1]).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna"]));
+    const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
+    expect(promptCalls).toHaveLength(1);
+    expect(promptCalls[0]!.args).toEqual(["agent", "prompt", paneId, "--stdin"]);
+    expect(calls.findIndex((args) => args === starts[0])).toBeLessThan(calls.findIndex((args) => args === starts[1]));
+    expect(calls.findIndex((args) => args === starts[1])).toBeLessThan(calls.findIndex((args) => args[0] === "agent" && args[1] === "prompt"));
+    expect(calls.filter((args) => (["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
+    expect(details).toMatchObject({
+      kind: "pi",
+      promptSubmitted: true,
+      promptConsumption: "confirmed",
+      recipientRegistered: true,
+      supervision: { state: "active", child: { paneId, agentKind: "pi", profileName: "researcher-pi" } },
+      profile: {
+        requested: "researcher-agy",
+        selected: "researcher-pi",
+        runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna" },
+        attempts: [
+          { profile: "researcher-agy", outcome: "agent_start_failed", errorCode: "agent_start_failed", message: "agent process exited before becoming interactive", postState: { pane_id: paneId, agent_status: "unknown" } },
+          { profile: "researcher-pi", outcome: "selected" }
+        ]
+      }
+    });
+    const failedPostState = resultObject((resultObject(details.profile).attempts as Array<Record<string, unknown>>)[0]!.postState);
+    for (const field of ["agent", "agent_name", "agent_id", "agent_session", "agent_kind", "kind"]) expect(failedPostState).not.toHaveProperty(field);
+    const firstStartIndex = calls.findIndex((args) => args === starts[0]);
+    const secondStartIndex = calls.findIndex((args) => args === starts[1]);
+    expect(calls.slice(firstStartIndex + 1, secondStartIndex)).toContainEqual(["pane", "get", paneId]);
+    await closeConfirmedFixturePane("agy-zero-effect-fallback", details);
+  }, 300_000);
 
   it("retains exact supervision after deterministic assignment-confirmation uncertainty", async () => {
     const canary = `unconfirmed-assignment-${randomUUID()}`;

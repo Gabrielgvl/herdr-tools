@@ -1,5 +1,20 @@
 import type { ChildProcess } from "node:child_process";
 
+export async function waitForCondition<T>(
+  sample: () => Promise<T>,
+  matches: (value: T) => boolean,
+  timeoutMs: number,
+  intervalMs = 100
+): Promise<T | undefined> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    const value = await sample();
+    if (matches(value)) return value;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return undefined;
+}
+
 /**
  * A named integration server is a process-owned resource. Do not let the next
  * test recreate the same session until this child has actually exited.

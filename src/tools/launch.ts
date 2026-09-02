@@ -1842,7 +1842,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           if (!profile) throw new LaunchError("PROFILE_RESOLUTION_INVALID", `Resolved profile ${name} is unavailable`);
           return profile;
         });
-        if (profiles[0]!.runtime.kind === "agy" && params.initialPrompt === undefined) {
+        if (params.initialPrompt === undefined && profiles.some((profile) => profile.runtime.kind === "agy")) {
           throw new LaunchError("INVALID_INPUT", "AGY launches require initialPrompt");
         }
         recipientKey = mintRecipientKey();
@@ -1955,9 +1955,6 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         let startedAgent: StartedAgent | undefined;
         for (const profile of profiles) {
           const runtime = effectiveRuntimes.get(profile.name)!;
-          if (runtime.kind === "agy" && params.initialPrompt === undefined) {
-            throw new LaunchError("INVALID_INPUT", "AGY launches require initialPrompt");
-          }
           const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path)];
           const attemptStartedAt = clock.now();
           try {
@@ -2145,7 +2142,14 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         const authoritativeName = exactIdentity.agentName;
         const capability = capabilities.get(chosenProfile.name)!;
         const recipient = { recipientKey: recipientKey!, paneId: resolvedPaneId, agentName: authoritativeName, ...(agentId ? { agentId } : {}), profileName: chosenProfile.name, kind: capability.kind, capable: capability.capable, reason: capability.reason };
-        deps.recipients?.recordFor(chosenProfile.name, resolvedPaneId, recipient.recipientKey, capability, { ...exactIdentity, ...(agentId ? { agentId } : {}) });
+        deps.recipients?.recordFor(
+          chosenProfile.name,
+          resolvedPaneId,
+          recipient.recipientKey,
+          capability,
+          { ...exactIdentity, ...(agentId ? { agentId } : {}) },
+          chosenRuntime.kind === "agy" ? { agyStrengthened: true, attachmentDirectory: grant!.path } : undefined
+        );
         recipientRegistered = deps.recipients !== undefined;
         const effective = effectiveDetails(chosenProfile, chosenRuntime);
         const launchDetails: LaunchDetails = {

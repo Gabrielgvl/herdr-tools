@@ -3064,18 +3064,23 @@ describe("herdr_launch profile-only contract", () => {
     expect(supervision.bound).toHaveLength(0);
   });
 
-  it("rejects a promptless AGY profile before any mutation or reservation", async () => {
+  it.each([
+    ["primary", catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi"))],
+    ["reachable fallback", catalog(profile("researcher-pi", "pi", ["researcher-agy"]), profile("researcher-agy", "agy"))]
+  ] as const)("rejects a promptless AGY %s before any mutation or reservation", async (_label, profiles) => {
     const harness = makeCli();
     const attachments = fakeAttachments();
+    const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
     const recipients = new RecipientRegistry();
     const recipientRecord = vi.spyOn(recipients, "recordFor");
     const supervision = stubSupervision();
 
-    await expect(launch({ name: "worker", profile: "researcher-agy" }, catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi")), harness.cli, undefined, { attachments, recipients, supervision }))
+    await expect(launch({ name: "worker", profile: _label === "primary" ? "researcher-agy" : "researcher-pi" }, profiles, harness.cli, promptSources, { attachments, recipients, supervision }))
       .rejects.toMatchObject({ code: "INVALID_INPUT", details: { phase: "resolve_profile", effectCertainty: "absent" } });
 
     expect(harness.calls).toHaveLength(0);
     expect(harness.stdinInputs).toHaveLength(0);
+    expect(promptSources.create).not.toHaveBeenCalled();
     expect(attachments.ensureRecipient).not.toHaveBeenCalled();
     expect(attachments.publish).not.toHaveBeenCalled();
     expect(supervision.reserved).toHaveLength(0);
@@ -3088,25 +3093,26 @@ describe("herdr_launch profile-only contract", () => {
     ["prompt transport failure", "transport"],
     ["fresh occupant replacement", "identity_mismatch"],
     ["duplicate pane evidence", "duplicate"],
+    ["duplicate agent evidence", "duplicate_agent"],
     ["failed authoritative read", "read_failed"],
     ["contradictory authoritative read", "contradictory"],
     ["missing native session timeout", "missing_session"],
     ["malformed native session", "malformed_session"],
     ["changed native session", "changed_session"],
+    ["missing authoritative revision", "missing_revision"],
+    ["malformed authoritative revision", "malformed_revision"],
     ["lifecycle sequence does not advance", "stale_sequence"],
     ["revision regression", "revision_regression"],
-    ["move before strengthening", "move"],
+    ["moved authoritative occupant", "moved_occupant"],
     ["atomic strengthening publication failure", "strengthening"]
   ] as const)("retains AGY provisional publication after %s", async (_label, scenario) => {
     const clockControl = fakeManualClock();
     const harness = makeCli({ omitFreshAgentSession: true });
     const baseRun = harness.cli.runJson;
     const baseStdin = harness.cli.runJsonWithStdin!;
-    const strengtheningFailure = scenario === "move"
-      ? new SupervisionBindError("moved before strengthening", { cause: "move_before_strengthening" })
-      : scenario === "strengthening"
-        ? new SupervisionBindError("publication failed", { cause: "publication_failed" })
-        : undefined;
+    const strengtheningFailure = scenario === "strengthening"
+      ? new SupervisionBindError("publication failed", { cause: "publication_failed" })
+      : undefined;
     const safety = agySafetySupervision(strengtheningFailure);
     const attachments = fakeAttachments();
     const recipients = new RecipientRegistry();
@@ -3138,6 +3144,7 @@ describe("herdr_launch profile-only contract", () => {
         const current = (result.snapshot as HerdrSnapshot);
         records.push(...current.panes.filter((item) => item.pane_id === "w1:p2"), ...current.agents.filter((item) => item.pane_id === "w1:p2"));
         if (scenario === "duplicate") current.panes.push({ ...current.panes.find((item) => item.pane_id === "w1:p2")! });
+        if (scenario === "duplicate_agent") current.agents.push({ ...current.agents.find((item) => item.pane_id === "w1:p2")! });
         if (scenario === "contradictory") current.agents.find((item) => item.pane_id === "w1:p2")!.terminal_id = "terminal-contradiction";
       } else if (argv[0] === "agent" && argv[1] === "get") {
         records.push(result.agent as Record<string, unknown>);
@@ -3149,8 +3156,11 @@ describe("herdr_launch profile-only contract", () => {
         if (scenario === "missing_session") delete item.agent_session;
         if (scenario === "malformed_session") item.agent_session = "malformed";
         if (scenario === "changed_session") item.agent_session = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-changed" };
+        if (scenario === "missing_revision") delete item.revision;
+        if (scenario === "malformed_revision") item.revision = "malformed";
         if (scenario === "stale_sequence") { item.state_change_seq = 7; item.revision = 4; }
         if (scenario === "revision_regression") item.revision = 2;
+        if (scenario === "moved_occupant") item.pane_id = "w1:p3";
       }
       if (argv[0] === "pane" && argv[1] === "get" && (scenario === "missing_session" || scenario === "stale_sequence")) clockControl.advance(5_001);
       return response;
@@ -3203,6 +3213,7 @@ describe("herdr_launch profile-only contract", () => {
     }]);
     expect(supervision.strengthened[0]!.identity).toMatchObject({ paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy", agentSession: { agent: "agy", value: "session-0" } });
     expect(order).toEqual(["provisional", "strengthen", "recipient"]);
+    expect(recipients.get("w1:p2")).toMatchObject({ kind: "agy", agyStrengthened: true, attachmentDirectory: GRANT_PATH });
     expect(supervision.bound).toHaveLength(0);
     expect(supervision.released).toEqual([]);
     expect(result.details).toMatchObject({ kind: "agy", promptConsumption: "confirmed", assignmentState: "confirmed", supervision: { state: "active", child: { agentKind: "agy" } } });

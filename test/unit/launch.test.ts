@@ -3538,7 +3538,7 @@ describe("herdr_launch profile-only contract", () => {
 
   it("publishes AGY provisionally before one prompt, then strengthens before recipient registration", async () => {
     const order: string[] = [];
-    const harness = makeCli({ omitFreshAgentSession: true });
+    const harness = makeCli();
     const supervision = stubSupervision({
       onProvisionalBind: () => {
         order.push("provisional");
@@ -3623,7 +3623,7 @@ describe("herdr_launch profile-only contract", () => {
     expect(promptSources.create).toHaveBeenCalledTimes(1);
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "agy")).toEqual([
       "agent", "start", "worker", "--kind", "agy", "--pane", "w1:p2", "--timeout", "120000", "--",
-      "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", GRANT_PATH
+      "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", GRANT_PATH, "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."
     ]);
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "pi")).toEqual([
       "agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--",

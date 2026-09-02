@@ -95,6 +95,8 @@ function attachmentDirectoryArg(path: string | undefined): string[] {
   return ["--add-dir", path];
 }
 
+const AGY_BOOTSTRAP_PROMPT = "Initialize this interactive session and reply with exactly AGY_READY.";
+
 export function resolvePiRuntime(profile: Extract<Profile["runtime"], { kind: "pi" }>, overrides: PiRuntimeOverrides = {}, scopeRoot?: string): Extract<Profile["runtime"], { kind: "pi" }> {
   rejectIncompatible("pi", overrides as Record<string, unknown>);
   return {
@@ -155,7 +157,7 @@ export function buildAgyArgv(profile: Extract<Profile["runtime"], { kind: "agy" 
   if (!sessionPersistence) throw new ProfileAdapterError("AGY profiles must set sessionPersistence to true for interactive launches");
   if (promptFilePath !== undefined) throw new ProfileAdapterError("AGY profiles do not accept prompt source files");
   const effective = resolveAgyRuntime(profile, overrides, scopeRoot);
-  return ["--model", effective.model, "--mode", "plan", "--dangerously-skip-permissions", ...repeated("--add-dir", effective.addDirs), ...attachmentDirectoryArg(attachmentDirectory)];
+  return ["--model", effective.model, "--mode", "plan", "--dangerously-skip-permissions", ...repeated("--add-dir", effective.addDirs), ...attachmentDirectoryArg(attachmentDirectory), "--prompt-interactive", AGY_BOOTSTRAP_PROMPT];
 }
 
 export function buildRuntimeArgv(profile: Profile, runtime: Profile["runtime"], promptFilePath?: string, attachmentDirectory?: string): string[] {

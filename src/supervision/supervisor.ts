@@ -753,7 +753,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const pane = event.pane;
     const candidate = this.strengtheningCandidate;
     if (candidate === undefined) {
-      if (pane.paneId !== provisional.identity.paneId || pane.terminalId !== provisional.identity.terminalId || pane.agentKind !== provisional.identity.agentKind) {
+      if (pane.paneId !== provisional.identity.paneId
+        || pane.terminalId !== provisional.identity.terminalId
+        || (pane.agentKind !== undefined && pane.agentKind !== provisional.identity.agentKind)) {
         this.markProvisionalFailure("identity_mismatch");
         return;
       }

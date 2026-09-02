@@ -737,7 +737,8 @@ describe("AGY provisional supervision failures", () => {
     const missingKind = agyHarness([snapshot([agyPaneRecord()], [agyAgentRecord()])]);
     await bindAgy(missingKind);
     await missingKind.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent: null })));
-    expect(provisionalCause(missingKind)).toBe("identity_mismatch");
+    expect(missingKind.supervisor.view().state).toBe("provisional");
+    expect(missingKind.supervisor.view().events).toEqual([]);
     missingKind.supervisor.shutdown();
   });
 

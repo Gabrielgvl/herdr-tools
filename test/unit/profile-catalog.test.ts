@@ -300,9 +300,9 @@ describe("profile catalog", () => {
     const agy = parseProfile(profileText("researcher", "agy").replace("  addDirs: []", "  addDirs: [./docs]"), source(root, "researcher"));
     expect(agy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-high", addDirs: [join(root, "docs")] });
     expect(agy.sessionPersistence).toBe(true);
-    expect(buildProfileArgv(agy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs")]);
-    expect(buildProfileArgv(agy, { model: "gemini-override", addDirs: ["./override"] })).toEqual(["--model", "gemini-override", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "override")]);
-    expect(buildProfileArgv(agy, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs"), "--add-dir", "/tmp/message-attachments/key"]);
+    expect(buildProfileArgv(agy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs"), "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
+    expect(buildProfileArgv(agy, { model: "gemini-override", addDirs: ["./override"] })).toEqual(["--model", "gemini-override", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "override"), "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
+    expect(buildProfileArgv(agy, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs"), "--add-dir", "/tmp/message-attachments/key", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     expect(() => buildProfileArgv(agy, {}, "/tmp/prompt-source")).toThrow(/prompt source/);
     expect(() => buildProfileArgv({ ...agy, sessionPersistence: false })).toThrow(/sessionPersistence/);
     expect(() => buildProfileArgv(agy, { thinking: "low" } as never)).toThrow(/AGY/);
@@ -577,7 +577,7 @@ describe("profile catalog", () => {
     expect(researcherAgy.timeoutMinutes).toBe(30);
     expect(researcherAgy.fallbackProfiles).toEqual(["researcher-pi"]);
     expect(researcherAgy.body).toBe("\nCatalog metadata only. Herdr does not deliver this profile body to AGY. Every AGY task must be self-contained and sent through Herdr's visible v1 provenance-wrapped assignment.\n");
-    expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]);
+    expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-pi", "researcher-claude"]);
     expect(resolveProfile("researcher-pi", catalog).reachableNames).toEqual(["researcher-pi", "researcher-claude"]);
 

@@ -659,9 +659,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const grantedDirectory = dirname(dirname(attachmentPath));
     expect(startCalls).toEqual([[
       "agent", "start", agentName, "--kind", "agy", "--pane", paneId, "--timeout", "120000", "--",
-      "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", grantedDirectory
+      "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", grantedDirectory,
+      "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."
     ]]);
-    expect(state.agyPrePromptAgent).not.toHaveProperty("agent_session");
+    expect(state.agyPrePromptAgent).toMatchObject({ agent_session: { source: expect.any(String), agent: "agy", kind: expect.any(String), value: expect.any(String) } });
     expect(state.agyPrePromptRecipientFailureCode).toBe("ATTACHMENT_TARGET_UNVERIFIED");
     const provisionalJob = resultObject(state.agyPrePromptJob);
     expect(provisionalJob).toMatchObject({
@@ -761,6 +762,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(starts).toHaveLength(2);
     expect(state.forceNextAgyStartFailure).toBe(false);
     expect(starts[0]).toEqual(expect.arrayContaining(["--kind", "agy", "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]));
+    expect(starts[0]!.slice(-2)).toEqual(["--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     expect(starts[1]).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna"]));
     const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
     expect(promptCalls).toHaveLength(1);

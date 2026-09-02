@@ -5,6 +5,7 @@ import {
   movedIdentity,
   occupantContinuity,
   paneContinuity,
+  provisionalEventLifecycle,
   provisionalOccupantContinuity,
   sameSupervisedIdentity,
   type ProvisionalSupervisedIdentity,
@@ -133,6 +134,70 @@ describe("supervised identity continuity", () => {
     expect(classifyProvisionalSnapshotTarget(snapshot([agyPane({ state_change_seq: "5" })], [agyAgent()]), "p1")).toEqual({ kind: "invalid", reason: "target_record_malformed" });
     expect(provisionalOccupantContinuity(agyIdentity, { pane: { paneId: "p1", terminalId: "t1", tabId: "tab1", workspaceId: "w1", agentStatus: "idle", revision: 2, agentKind: "pi" }, agentPresent: true, agentName: "worker" })).toBe("replaced");
     expect(provisionalOccupantContinuity(agyIdentity, { pane: { paneId: "p1", terminalId: "t1", tabId: "tab1", workspaceId: "w1", agentStatus: "idle", revision: 2, agentKind: "agy" }, agentPresent: true })).toBe("unproven");
+  });
+
+  it("covers every AGY provisional lifecycle evidence shape", () => {
+    expect(classifyProvisionalSnapshotTarget(snapshot([], []), "p1")).toEqual({ kind: "absent" });
+    expect(classifyProvisionalSnapshotTarget(snapshot([agyPane(), agyPane()], []), "p1")).toEqual({ kind: "invalid", reason: "duplicate_target_pane" });
+
+    const changingSnapshot = snapshot([agyPane()], []);
+    let paneReads = 0;
+    Object.defineProperty(changingSnapshot, "panes", {
+      get: () => (++paneReads === 1 ? [agyPane()] : []),
+    });
+    expect(classifyProvisionalSnapshotTarget(changingSnapshot, "p1")).toEqual({ kind: "absent" });
+
+    const paneOnly = classifyProvisionalSnapshotTarget(snapshot([agyPane()], []), "p1");
+    expect(paneOnly).toMatchObject({ kind: "unique", occupant: { stateChangeSeq: 4 } });
+    const noLifecycle = classifyProvisionalSnapshotTarget(snapshot([agyPane({ state_change_seq: null })], []), "p1");
+    expect(noLifecycle).toMatchObject({ kind: "unique", occupant: { agentPresent: false } });
+    if (noLifecycle.kind !== "unique") throw new Error("expected unique evidence");
+    expect(noLifecycle.occupant).not.toHaveProperty("stateChangeSeq");
+
+    for (const [paneOverrides, agentOverrides] of [
+      [{ revision: 3 }, {}],
+      [{ agent_status: "working" }, {}],
+    ] as const) {
+      expect(classifyProvisionalSnapshotTarget(snapshot([agyPane(paneOverrides)], [agyAgent(agentOverrides)]), "p1"))
+        .toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
+    }
+    for (const paneOverrides of [
+      { state_change_seq: -1 },
+      { state_change_seq: 1.5 },
+      { revision: Number.MAX_SAFE_INTEGER + 1 },
+    ]) {
+      expect(classifyProvisionalSnapshotTarget(snapshot([agyPane(paneOverrides)], []), "p1"))
+        .toEqual({ kind: "invalid", reason: "target_record_malformed" });
+    }
+    const statuslessAgent = agyAgent();
+    delete statuslessAgent.agent_status;
+    expect(classifyProvisionalSnapshotTarget(snapshot([agyPane()], [statuslessAgent]), "p1")).toMatchObject({ kind: "unique" });
+    expect(classifyProvisionalSnapshotTarget(snapshot([agyPane()], [agyAgent({ agent_status: null })]), "p1")).toMatchObject({ kind: "unique" });
+    for (const agent_status of [1, "spinning"]) {
+      expect(classifyProvisionalSnapshotTarget(snapshot([agyPane()], [agyAgent({ agent_status })]), "p1"))
+        .toEqual({ kind: "invalid", reason: "target_record_malformed" });
+    }
+  });
+
+  it("covers every reduced AGY continuity verdict", () => {
+    const occupant = { pane: { paneId: "p1", terminalId: "t1", tabId: "tab1", workspaceId: "w1", agentStatus: "idle" as const, revision: 2, agentKind: "agy", agentSession: agyIdentity.agentKind === "agy" ? { source: "agy", agent: "agy", kind: "id", value: "s1" } : undefined }, agentPresent: true, agentName: "worker" };
+    expect(provisionalOccupantContinuity(agyIdentity, { ...occupant, agentPresent: false })).toBe("unproven");
+    expect(provisionalOccupantContinuity(agyIdentity, { ...occupant, pane: { ...occupant.pane, paneId: "p2" } })).toBe("replaced");
+    expect(provisionalOccupantContinuity(agyIdentity, { ...occupant, pane: { ...occupant.pane, terminalId: "t2" } })).toBe("replaced");
+    expect(provisionalOccupantContinuity(agyIdentity, { ...occupant, agentName: "other" })).toBe("replaced");
+    expect(provisionalOccupantContinuity(agyIdentity, { ...occupant, pane: { ...occupant.pane, agentSession: { ...occupant.pane.agentSession!, agent: "pi" } } })).toBe("replaced");
+  });
+
+  it("extracts provisional lifecycle only from complete pane events", () => {
+    const complete = { event: "pane_updated", data: { pane: { state_change_seq: 5 } }, pane: pane({ agentKind: "agy", agentSession: undefined }) };
+    expect(provisionalEventLifecycle(complete as never)).toEqual({ status: "working", revision: 5, stateChangeSeq: 5 });
+    expect(provisionalEventLifecycle({ ...complete, data: { pane: {} } } as never)).toEqual({ status: "working", revision: 5 });
+    expect(() => provisionalEventLifecycle({ event: "pane_closed", data: {} } as never)).toThrow(/unavailable/u);
+    expect(() => provisionalEventLifecycle({ ...complete, pane: undefined } as never)).toThrow(/unavailable/u);
+    for (const raw of ["pane", null, []]) {
+      expect(() => provisionalEventLifecycle({ ...complete, data: { pane: raw } } as never)).toThrow(/unavailable/u);
+    }
+    expect(() => provisionalEventLifecycle({ ...complete, data: { pane: { state_change_seq: -1 } } } as never)).toThrow(/malformed/u);
   });
 
   it("keeps the generic classifier unchanged when AGY lifecycle fields are malformed", () => {

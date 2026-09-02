@@ -6,7 +6,7 @@ sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna
-  thinking: medium
+  thinking: max
   tools:
     - read
     - bash

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { JobRegistry, publicDetail, type JobDetail, type SupervisorJobRequestSnapshot } from "../../src/job-registry.js";
 import { SUPERVISION_MAX_EVENTS, type SupervisionEvent } from "../../src/supervision/events.js";
-import type { SupervisionJobPort, SupervisionJobView } from "../../src/supervision/state.js";
+import { isSupervisionJobView, type SupervisionJobPort, type SupervisionJobView } from "../../src/supervision/state.js";
 import { SupervisionSocket, type SupervisionStream } from "../../src/supervision/socket.js";
 import { ModelSupervisionReviewer } from "../../src/supervision/reviewer.js";
 
@@ -106,6 +106,35 @@ describe("the public supervision projection", () => {
     }
   });
 
+  it("rejects malformed state evidence at every public boundary without throwing", () => {
+    const active = view();
+    const provisional = view({
+      state: "provisional",
+      provisional: {
+        agentName: "worker",
+        agentKind: "agy",
+        paneId: "p1",
+        terminalId: "t1",
+        profileName: "researcher-agy",
+        requestedProfileName: "",
+        baseline: { state: "idle", stateChangeSeq: 1, revision: 1 },
+      },
+      status: "idle",
+    });
+    const malformed = [
+      null,
+      { state: "unknown" },
+      { ...active, monitor: null },
+      { ...active, reviewer: { ...active.reviewer, reviews: [null] } },
+      { ...active, events: [null] },
+      { ...active, settledReason: 1 },
+      { ...active, child: undefined },
+      provisional,
+    ];
+    for (const value of malformed) expect(isSupervisionJobView(value)).toBe(false);
+    expect(isSupervisionJobView(new Proxy({}, { get: () => { throw new Error("unavailable"); } }))).toBe(false);
+  });
+
   it("keeps the newest bounded transitions, events, and reviews and counts what it dropped", () => {
     const projected = publicDetail(detail({
       supervision: view({
@@ -153,6 +182,35 @@ describe("the public supervision projection", () => {
     expect(reviewOnly.truncation?.supervisionFieldsClipped).toBe(1);
     expect(projected.supervision!.events[0]!.details).toEqual({ note: "n" });
     expect(projected.supervision!.events[0]!.summary.length).toBeLessThan(2_000);
+
+    const long = "x".repeat(2_000);
+    const clippedProvisional = publicDetail(detail({ supervision: view({
+      state: "provisional",
+      provisional: {
+        agentName: long,
+        agentKind: "agy",
+        paneId: long,
+        terminalId: long,
+        profileName: long,
+        requestedProfileName: long,
+        baseline: { state: "idle", stateChangeSeq: 1, revision: 1 },
+      },
+      status: undefined,
+    }) }));
+    expect(clippedProvisional.supervision).toMatchObject({ state: "provisional", provisional: { requestedProfileName: expect.any(String) } });
+    expect(clippedProvisional.supervision).not.toHaveProperty("status");
+    expect(clippedProvisional.truncation?.supervisionFieldsClipped).toBe(1);
+
+    const clippedChild = publicDetail(detail({ supervision: view({ child: {
+      agentName: long,
+      agentKind: long,
+      paneId: long,
+      terminalId: long,
+      profileName: long,
+      requestedProfileName: long,
+      requestedAgentKind: long,
+    } }) }));
+    expect(clippedChild.truncation?.supervisionFieldsClipped).toBe(1);
   });
 
   it("drops supervision evidence and pending receipts before it drops the job", () => {

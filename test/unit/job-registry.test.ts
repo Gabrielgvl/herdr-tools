@@ -673,6 +673,137 @@ describe("JobRegistry", () => {
     longIdRegistry.cancel(longIdHandle.jobId);
   });
 
+  it("requires a live matching installed supervisor before publishing a binding", async () => {
+    let id = 0;
+    const registry = new JobRegistry({ idFactory: () => `job_publication_${++id}`, quiescenceMs: 0 });
+    const pending = async () => new Promise<never>(() => undefined);
+    const common = {
+      monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
+      reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max" as const, cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+      transitions: [],
+      truncatedTransitions: 0,
+      events: [],
+      truncatedEvents: 0,
+      unobservedEvents: 0,
+    };
+    const port = (installed: SupervisionJobView, live = true): SupervisionJobPort => ({
+      view: () => installed,
+      takePendingEvents: () => [],
+      childLive: () => live,
+      shutdown: () => undefined,
+    });
+
+    const closed = registry.register(provisionalRequest, pending);
+    await vi.waitFor(() => expect(registry.get(closed.jobId)?.operation_phase).toBe("running"));
+    const closedPublication = registry.prepareProvisionalSupervisionChildBinding(closed.jobId, { agentKind: "agy", profileName: "researcher-agy" });
+    closedPublication.commit();
+    await registry.cancel(closed.jobId);
+    expect(() => closedPublication.publish()).toThrow(/SUPERVISION_BINDING_CLOSED/u);
+
+    const missing = registry.register(provisionalRequest, pending);
+    await vi.waitFor(() => expect(registry.get(missing.jobId)?.operation_phase).toBe("running"));
+    const missingPublication = registry.prepareProvisionalSupervisionChildBinding(missing.jobId, { agentKind: "agy", profileName: "researcher-agy" });
+    missingPublication.commit();
+    expect(() => missingPublication.publish()).toThrow(/SUPERVISION_PUBLICATION_UNCONFIRMED/u);
+
+    const invalid = registry.register(provisionalRequest, pending);
+    await vi.waitFor(() => expect(registry.get(invalid.jobId)?.operation_phase).toBe("running"));
+    registry.attachSupervision(invalid.jobId, port({ state: "reserved", ...common }, false));
+    const invalidPublication = registry.prepareProvisionalSupervisionChildBinding(invalid.jobId, { agentKind: "agy", profileName: "researcher-agy" });
+    invalidPublication.commit();
+    expect(() => invalidPublication.publish()).toThrow(/SUPERVISION_PUBLICATION_UNCONFIRMED/u);
+
+    const exactRequest: SupervisorJobRequestSnapshot = { ...provisionalRequest, targets: ["worker"], child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } };
+    const degraded = registry.register(exactRequest, pending);
+    await vi.waitFor(() => expect(registry.get(degraded.jobId)?.operation_phase).toBe("running"));
+    registry.attachSupervision(degraded.jobId, port({
+      state: "degraded",
+      ...common,
+      child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-pi" },
+      status: "working",
+    }));
+    const exactPublication = registry.prepareSupervisionChildBinding(degraded.jobId, { agentKind: "pi", profileName: "worker-pi", paneId: "p1" });
+    exactPublication.commit();
+    exactPublication.publish();
+    registry.shutdown();
+  });
+
+  it("covers defensive provisional and exact binding transactions", async () => {
+    let id = 0;
+    const registry = new JobRegistry({ idFactory: () => `job_binding_${++id}`, quiescenceMs: 0 });
+    const pending = async () => new Promise<never>(() => undefined);
+    const register = async (jobRequest: SupervisorJobRequestSnapshot = provisionalRequest) => {
+      const handle = registry.register(jobRequest, pending);
+      await vi.waitFor(() => expect(registry.get(handle.jobId)?.operation_phase).toBe("running"));
+      return handle;
+    };
+    const provisional = { agentKind: "agy" as const, profileName: "researcher-agy" };
+
+    expect(() => registry.prepareProvisionalSupervisionChildBinding("job_missing", provisional)).toThrow(/JOB_NOT_FOUND/u);
+    const wait = registry.register(request, pending);
+    await vi.waitFor(() => expect(registry.get(wait.jobId)?.operation_phase).toBe("running"));
+    expect(() => registry.prepareProvisionalSupervisionChildBinding(wait.jobId, provisional)).toThrow(/JOB_KIND_MISMATCH/u);
+
+    const nonAgy = await register({ ...provisionalRequest, child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    expect(() => registry.prepareProvisionalSupervisionChildBinding(nonAgy.jobId, provisional)).toThrow(/SUPERVISION_PROVISIONAL_INVALID/u);
+    const malformed = await register();
+    expect(() => registry.prepareProvisionalSupervisionChildBinding(malformed.jobId, { agentKind: "agy", profileName: "" })).toThrow(/SUPERVISION_BINDING_INVALID/u);
+    const misaligned = await register({ ...provisionalRequest, target_generation_refs: [] });
+    expect(() => registry.prepareProvisionalSupervisionChildBinding(misaligned.jobId, provisional)).toThrow(/SUPERVISION_REQUEST_INVALID/u);
+
+    const transactional = await register();
+    const first = registry.prepareProvisionalSupervisionChildBinding(transactional.jobId, { agentKind: "agy", profileName: "fallback-agy" });
+    const stale = registry.prepareProvisionalSupervisionChildBinding(transactional.jobId, provisional);
+    stale.rollback();
+    first.commit();
+    expect(registry.get(transactional.jobId)?.request).toMatchObject({ child: { profileName: "fallback-agy", requestedProfileName: "researcher-agy" } });
+    expect(() => first.commit()).toThrow(/SUPERVISION_ALREADY_BOUND/u);
+    expect(() => stale.commit()).toThrow(/SUPERVISION_ALREADY_BOUND/u);
+    expect(() => registry.prepareProvisionalSupervisionChildBinding(transactional.jobId, provisional)).toThrow(/SUPERVISION_ALREADY_BOUND/u);
+    first.rollback();
+    first.rollback();
+
+    const closed = await register();
+    const closedPublication = registry.prepareProvisionalSupervisionChildBinding(closed.jobId, provisional);
+    await registry.cancel(closed.jobId);
+    expect(() => closedPublication.commit()).toThrow(/SUPERVISION_BINDING_CLOSED/u);
+
+    const published = await register();
+    const installed: SupervisionJobView = {
+      state: "provisional",
+      monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
+      reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+      transitions: [], truncatedTransitions: 0, events: [], truncatedEvents: 0, unobservedEvents: 0,
+      provisional: { agentName: "agy", agentKind: "agy", paneId: "p1", terminalId: "t1", profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 1, revision: 1 } },
+    };
+    registry.attachSupervision(published.jobId, { view: () => installed, takePendingEvents: () => [], childLive: () => true, shutdown: () => undefined });
+    const publishedPublication = registry.prepareProvisionalSupervisionChildBinding(published.jobId, provisional);
+    publishedPublication.commit();
+    publishedPublication.publish();
+    publishedPublication.publish();
+
+    const invalidStrengthening = await register();
+    expect(() => registry.prepareSupervisionStrengthening(invalidStrengthening.jobId, { agentKind: "agy", profileName: "researcher-agy", paneId: "p1" })).toThrow(/SUPERVISION_STRENGTHENING_INVALID/u);
+    const unavailable = await register();
+    registry.prepareProvisionalSupervisionChildBinding(unavailable.jobId, provisional).commit();
+    expect(() => registry.prepareSupervisionStrengthening(unavailable.jobId, { agentKind: "agy", profileName: "researcher-agy", paneId: "p1" })).toThrow(/SUPERVISION_PUBLICATION_UNCONFIRMED/u);
+
+    const exactRequest: SupervisorJobRequestSnapshot = { ...provisionalRequest, child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } };
+    const exact = await register(exactRequest);
+    const exactFirst = registry.prepareSupervisionChildBinding(exact.jobId, { agentKind: "pi", profileName: "worker-pi", paneId: "p1" });
+    const exactStale = registry.prepareSupervisionChildBinding(exact.jobId, { agentKind: "pi", profileName: "worker-pi", paneId: "p1" });
+    exactFirst.commit();
+    expect(() => exactStale.commit()).toThrow(/SUPERVISION_BINDING_STALE/u);
+    const records = (registry as unknown as { jobs: Map<string, { supervisionBindingStage: "reserved" | "provisional" | "exact" }> }).jobs;
+    records.get(exact.jobId)!.supervisionBindingStage = "reserved";
+    expect(() => exactFirst.publish()).toThrow(/SUPERVISION_BINDING_STALE/u);
+
+    const uncovered = await register({ ...exactRequest, targetIds: ["p1"] });
+    expect(registry.activeSupervisorFor(provisionalIdentity)).toBeUndefined();
+    expect(registry.get(uncovered.jobId)?.operation_phase).toBe("running");
+    registry.shutdown();
+  });
+
   it("does not let notification or change-listener failures escape", async () => {
     const syncChange = new JobRegistry({ idFactory: () => "job_change_sync", onChange: () => { throw new Error("ui down"); } });
     const syncChangeHandle = syncChange.register(request, async () => success);

@@ -113,6 +113,16 @@ describe("the supervision registry", () => {
     f.supervision.shutdown();
   });
 
+  it("rolls back the request publication when AGY provisional evidence is rejected", async () => {
+    const baseline = snapshotResult([agyPane()], [agyAgent()]);
+    const f = fixture({ snapshots: [baseline] });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
+    await expect(reservation.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: -1, revision: 2 } }))
+      .rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "provisional_baseline_invalid" } });
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ request: { targetIds: [], child: { agentKind: "agy", profileName: "researcher-agy" } } });
+    f.supervision.shutdown();
+  });
+
   it("does not expose AGY provisional state through the exact binding path", async () => {
     const baseline = snapshotResult([agyPane()], [agyAgent()]);
     const f = fixture({ snapshots: [baseline, baseline] });

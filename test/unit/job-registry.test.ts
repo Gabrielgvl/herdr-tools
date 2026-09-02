@@ -133,6 +133,22 @@ describe("JobRegistry", () => {
     expect(shutdownCalls).toBe(1);
   });
 
+  it.each(["pi", "claude"] as const)("allows an AGY-requested reservation to bind an exact %s fallback", async (agentKind) => {
+    const registry = new JobRegistry({ idFactory: () => "job_fallback" });
+    const handle = registry.register(provisionalRequest, async () => new Promise<never>(() => undefined));
+    await vi.waitFor(() => expect(registry.get(handle.jobId)?.operation_phase).toBe("running"));
+
+    const profileName = `researcher-${agentKind}`;
+    const publication = registry.prepareSupervisionChildBinding(handle.jobId, { agentKind, profileName, paneId: "p1" });
+    publication.commit();
+    expect(registry.get(handle.jobId)?.request).toMatchObject({
+      targetIds: ["p1"],
+      child: { agentKind, profileName, requestedAgentKind: "agy", requestedProfileName: "researcher-agy" },
+    });
+    publication.rollback();
+    registry.shutdown();
+  });
+
   it("orders newest first, filters before pagination, and returns immutable views", async () => {
     let id = 0;
     let now = 0;

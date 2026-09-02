@@ -22,12 +22,17 @@ import {
   type SupervisionTransition,
 } from "./events.js";
 import {
+  classifyProvisionalSnapshotTarget,
   classifySnapshotTarget,
   movedIdentity,
   occupantContinuity,
   paneContinuity,
+  provisionalEventLifecycle,
+  provisionalOccupantContinuity,
   sameSupervisedIdentity,
   type AuthoritativeOccupant,
+  type ProvisionalSupervisedIdentity,
+  type ProvisionalSupervisionBinding,
   type SupervisedIdentity,
   type SupervisionAnchor,
 } from "./identity.js";
@@ -112,6 +117,15 @@ interface Settlement {
   reason: string;
 }
 
+interface StrengtheningCandidate {
+  binding: SupervisionBinding;
+  stateChangeSeq: number;
+  revision: number;
+  status: SupervisionAgentStatus;
+  initialRevision: number;
+  events: SupervisionTransition[];
+}
+
 const inertBindingPublication: SupervisionChildBindingPublication = {
   commit: () => undefined,
   rollback: () => undefined,
@@ -133,10 +147,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * binding whose commit has not yet seen it.
    */
   private chain: Promise<void> = Promise.resolve();
-  private state: Exclude<SupervisionState, "provisional"> = "reserved";
+  private state: SupervisionState = "reserved";
   private paneId: string | undefined;
   private identity: SupervisedIdentity | undefined;
+  private provisional: ProvisionalSupervisionBinding | undefined;
+  private provisionalFailure: string | undefined;
+  private provisionalNativeIdentity: SupervisedIdentity | undefined;
   private anchor: SupervisionAnchor | undefined;
+  private strengtheningCandidate: StrengtheningCandidate | undefined;
   private status: SupervisionAgentStatus | undefined;
   /**
    * The highest pane revision this supervisor has folded, always relative to the
@@ -184,9 +202,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private settlement: Settlement | undefined;
   private selectedProfileName: string | undefined;
   private bindStarted = false;
-  /** True from the moment the anchor is prepared until the bind commit resolves. */
+  private strengtheningStarted = false;
+  /** True from the moment the anchor is prepared until a bind/strengthen task resolves. */
   private bindPending = false;
   private bindingPublished = false;
+  private provisionalPublished = false;
   private stopped = false;
   private readonly abort = new AbortController();
 
@@ -252,6 +272,245 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     });
   }
 
+  /** Bind AGY before its native session exists, publishing only reduced evidence. */
+  async bindProvisional(binding: ProvisionalSupervisionBinding, publication: SupervisionChildBindingPublication = inertBindingPublication): Promise<void> {
+    if (this.bindStarted || this.stopped || this.state !== "reserved") {
+      throw new SupervisionBindError("Supervision binding is single-use", this.bindEvidence(binding, { cause: "bind_already_attempted" }));
+    }
+    if (this.deps.child.agentKind !== "agy" || binding.identity.agentKind !== "agy") {
+      throw new SupervisionBindError("Provisional supervision is AGY-only", this.bindEvidence(binding, { cause: "provisional_kind_invalid" }));
+    }
+    if (!validProvisionalBinding(binding)) {
+      throw new SupervisionBindError("AGY provisional binding evidence is malformed", this.bindEvidence(binding, { cause: "provisional_baseline_invalid" }));
+    }
+    this.bindStarted = true;
+    this.paneId = binding.identity.paneId;
+    this.deps.monitor.addObserver(this);
+    let snapshot: HerdrSnapshot;
+    try {
+      snapshot = await this.deps.monitor.snapshot();
+    } catch (error) {
+      this.resetPreparedBinding();
+      throw new SupervisionBindError("AGY provisional binding could not read authoritative state", this.bindEvidence(binding, { cause: reasonOf(error) }));
+    }
+    const target = classifyProvisionalSnapshotTarget(snapshot, binding.identity.paneId);
+    if (target.kind !== "unique" || !target.occupant.agentPresent) {
+      this.resetPreparedBinding();
+      const cause = target.kind === "invalid" ? target.reason : target.kind === "absent" ? "occupant_absent" : "agent_absent";
+      throw new SupervisionBindError("AGY provisional binding found no valid unique authoritative occupant", this.bindEvidence(binding, { cause }));
+    }
+    const occupant = target.occupant;
+    if (provisionalOccupantContinuity(binding.identity, occupant) !== "continuous") {
+      this.resetPreparedBinding();
+      throw new SupervisionBindError("AGY provisional binding could not prove the launched identity", this.bindEvidence(binding, { cause: "identity_mismatch", observedStatus: occupant.pane.agentStatus }));
+    }
+    if (occupant.pane.agentStatus !== "idle" || occupant.stateChangeSeq !== binding.baseline.stateChangeSeq || occupant.pane.revision !== binding.baseline.revision) {
+      this.resetPreparedBinding();
+      throw new SupervisionBindError("AGY provisional binding baseline changed before publication", this.bindEvidence(binding, {
+        cause: "baseline_changed",
+        observedStatus: occupant.pane.agentStatus,
+        observedRevision: occupant.pane.revision,
+        ...(occupant.stateChangeSeq === undefined ? {} : { observedStateChangeSeq: occupant.stateChangeSeq }),
+      }));
+    }
+
+    this.provisional = {
+      identity: { ...binding.identity },
+      profileName: binding.profileName,
+      baseline: { ...binding.baseline },
+    };
+    if (occupant.pane.agentSession !== undefined) {
+      this.provisionalNativeIdentity = { ...binding.identity, agentSession: { ...occupant.pane.agentSession } };
+    }
+    this.selectedProfileName = binding.profileName;
+    this.status = "idle";
+    this.anchor = { revision: binding.baseline.revision, status: "idle", stateChangeSeq: binding.baseline.stateChangeSeq };
+    this.lastRevision = binding.baseline.revision;
+    this.bindPending = true;
+    await this.serialize(async () => {
+      try {
+        await this.commitProvisional(binding, publication);
+      } finally {
+        this.bindPending = false;
+      }
+    });
+  }
+
+  /** Strengthen one AGY provisional binding from a fresh exact native-session read. */
+  async strengthen(binding: SupervisionBinding, publication: SupervisionChildBindingPublication = inertBindingPublication): Promise<void> {
+    if (!this.provisionalPublished || this.stopped || this.state !== "provisional" || this.bindingPublished || this.strengtheningStarted) {
+      throw new SupervisionBindError("AGY supervision strengthening is single-use", this.bindEvidence(binding, { cause: "strengthen_already_attempted" }));
+    }
+    if (binding.identity.agentKind !== "agy" || binding.identity.paneId !== this.provisional!.identity.paneId) {
+      throw new SupervisionBindError("AGY supervision strengthening identity is invalid", this.bindEvidence(binding, { cause: "strengthening_identity_invalid" }));
+    }
+    this.strengtheningStarted = true;
+    this.bindPending = true;
+    await this.serialize(async () => {
+      try {
+        await this.commitStrengthening(binding, publication);
+      } finally {
+        this.bindPending = false;
+      }
+    });
+  }
+
+  private async commitProvisional(binding: ProvisionalSupervisionBinding, publication: SupervisionChildBindingPublication): Promise<void> {
+    try {
+      await this.drainAdmitted();
+      if (this.provisionalFailure !== undefined) throw new Error(this.provisionalFailure);
+    } catch (error) {
+      const cause = this.provisionalFailure ?? reasonOf(error);
+      publication.rollback();
+      this.resetPreparedBinding();
+      throw new SupervisionBindError("AGY provisional supervision could not drain queued evidence", this.bindEvidence(binding, { cause }));
+    }
+    if (this.isSettled()) {
+      publication.rollback();
+      throw new SupervisionBindError("Supervision settled while AGY provisional evidence was drained", this.bindEvidence(binding, {
+        cause: "settled_during_bind",
+        settledDuringBind: true,
+        ...(this.settlement === undefined ? {} : { supervisionOutcome: this.settlement.outcome, supervisionReason: this.settlement.reason }),
+      }));
+    }
+    try {
+      publication.commit();
+      this.provisionalPublished = true;
+      this.state = "provisional";
+      publication.publish();
+    } catch (error) {
+      publication.rollback();
+      this.resetPreparedBinding();
+      throw new SupervisionBindError("AGY provisional supervision could not publish its reduced evidence", this.bindEvidence(binding, { cause: reasonOf(error) }));
+    }
+    this.publish(`supervising ${this.deps.child.agentName} provisionally`);
+  }
+
+  private async commitStrengthening(binding: SupervisionBinding, publication: SupervisionChildBindingPublication): Promise<void> {
+    if (this.provisionalFailure !== undefined) {
+      throw this.strengtheningError(binding, this.provisionalFailure, publication);
+    }
+    const provisional = this.provisional!;
+    let snapshot: HerdrSnapshot;
+    try {
+      snapshot = await this.deps.monitor.snapshot();
+    } catch (error) {
+      throw this.strengtheningError(binding, reasonOf(error), publication);
+    }
+    const target = classifyProvisionalSnapshotTarget(snapshot, provisional.identity.paneId);
+    if (target.kind !== "unique" || !target.occupant.agentPresent) {
+      const cause = target.kind === "invalid" ? target.reason : target.kind === "absent" ? "occupant_absent" : "agent_absent";
+      throw this.strengtheningError(binding, cause, publication);
+    }
+    const occupant = target.occupant;
+    if (provisionalOccupantContinuity(provisional.identity, occupant) !== "continuous") {
+      throw this.strengtheningError(binding, "identity_mismatch", publication);
+    }
+    if (occupant.stateChangeSeq === undefined || occupant.stateChangeSeq <= provisional.baseline.stateChangeSeq) {
+      throw this.strengtheningError(binding, "lifecycle_not_advanced", publication);
+    }
+    if (occupant.pane.revision < provisional.baseline.revision) {
+      throw this.strengtheningError(binding, "revision_regressed", publication);
+    }
+    const observedIdentity: SupervisedIdentity = { ...provisional.identity, agentSession: { ...occupant.pane.agentSession! } };
+    if (observedIdentity.agentSession.agent !== observedIdentity.agentKind
+      || (this.provisionalNativeIdentity !== undefined && !sameSupervisedIdentity(this.provisionalNativeIdentity, observedIdentity))
+      || !sameSupervisedIdentity(binding.identity, observedIdentity)) {
+      throw this.strengtheningError(binding, "native_identity_mismatch", publication);
+    }
+    this.provisionalNativeIdentity ??= observedIdentity;
+
+    this.strengtheningCandidate = {
+      binding: {
+        identity: observedIdentity,
+        profileName: binding.profileName,
+        stateChangeSeq: occupant.stateChangeSeq,
+      },
+      stateChangeSeq: occupant.stateChangeSeq,
+      revision: occupant.pane.revision,
+      status: occupant.pane.agentStatus,
+      initialRevision: occupant.pane.revision,
+      events: [],
+    };
+    try {
+      do {
+        await this.drainAdmitted();
+      } while (this.queued.length !== 0);
+      if (this.provisionalFailure !== undefined) throw new Error(this.provisionalFailure);
+    } catch (error) {
+      const cause = this.provisionalFailure ?? reasonOf(error);
+      this.strengtheningCandidate = undefined;
+      throw this.strengtheningError(binding, cause, publication);
+    }
+    const candidate = this.strengtheningCandidate;
+    if (candidate === undefined) throw this.strengtheningError(binding, "strengthening_candidate_missing", publication);
+    if (this.isSettled()) throw this.strengtheningError(binding, "settled_during_strengthen", publication);
+
+    const previous = {
+      provisional: this.provisional,
+      status: this.status,
+      anchor: this.anchor,
+      lastRevision: this.lastRevision,
+      selectedProfileName: this.selectedProfileName,
+      bindingPublished: this.bindingPublished,
+      provisionalPublished: this.provisionalPublished,
+      state: this.state,
+      identity: this.identity,
+    };
+    try {
+      if (this.queued.length !== 0) throw new Error("evidence_admitted_before_exact_commit");
+      publication.commit();
+      this.identity = { ...candidate.binding.identity, agentSession: { ...candidate.binding.identity.agentSession } };
+      this.selectedProfileName = candidate.binding.profileName;
+      this.anchor = { revision: candidate.revision, status: candidate.status, stateChangeSeq: candidate.stateChangeSeq };
+      this.status = candidate.status;
+      this.lastRevision = candidate.revision;
+      this.provisional = undefined;
+      this.provisionalPublished = false;
+      this.bindingPublished = true;
+      this.state = "active";
+      this.eventStreamDegraded = this.deps.monitor.isDegraded();
+      this.refreshActiveState();
+      publication.publish();
+    } catch {
+      try { publication.rollback(); } catch { /* rollback is best effort after a failed private commit */ }
+      this.provisional = previous.provisional;
+      this.status = previous.status;
+      this.anchor = previous.anchor;
+      this.lastRevision = previous.lastRevision;
+      this.selectedProfileName = previous.selectedProfileName;
+      this.bindingPublished = previous.bindingPublished;
+      this.provisionalPublished = previous.provisionalPublished;
+      this.state = previous.state;
+      this.identity = previous.identity;
+      this.strengtheningCandidate = undefined;
+      throw this.strengtheningError(binding, "publication_failed", publication);
+    }
+    this.strengtheningCandidate = undefined;
+    try {
+      this.enterStatus(this.status!);
+      let previousRevision = candidate.initialRevision;
+      for (const event of candidate.events) {
+        this.transitions.push(event);
+        if (event.revision === previousRevision) this.recordEvidenceGap("event", "status_changed_without_revision", previousRevision, event.revision);
+        else if (event.revision > previousRevision + 1) this.recordEvidenceGap("event", "revision_jump", previousRevision, event.revision, event.revision - previousRevision - 1);
+        previousRevision = event.revision;
+        const material = materialTransitionEvent(event.from, event.to);
+        if (material !== undefined) this.emit(material, `child ${event.from} → ${event.to}`, { from: event.from, to: event.to, revision: event.revision });
+      }
+    } catch {
+      this.reviewerDegraded = true;
+      this.publish("supervision reviewer cadence could not be armed");
+    }
+    this.publish(`supervising ${this.deps.child.agentName}`);
+  }
+
+  private strengtheningError(binding: SupervisionBinding, cause: string, publication: SupervisionChildBindingPublication): SupervisionBindError {
+    try { publication.rollback(); } catch { /* the provisional recovery handle remains authoritative */ }
+    this.markProvisionalFailure(cause);
+    return new SupervisionBindError("AGY supervision strengthening could not prove the exact child", this.bindEvidence(binding, { cause }));
+  }
+
   private async commitBinding(binding: SupervisionBinding, publication: SupervisionChildBindingPublication): Promise<void> {
     try {
       await this.drainAdmitted();
@@ -301,13 +560,15 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     return this.settled;
   }
 
-  private bindEvidence(binding: SupervisionBinding, extra: Record<string, unknown>): Record<string, unknown> {
-    return {
+  private bindEvidence(binding: SupervisionBinding | ProvisionalSupervisionBinding, extra: Record<string, unknown>): Record<string, unknown> {
+    const evidence = {
       jobId: this.deps.jobId,
       child: { ...this.deps.child, paneId: binding.identity.paneId, terminalId: binding.identity.terminalId },
-      agentSession: { ...binding.identity.agentSession },
       ...extra,
     };
+    return "baseline" in binding
+      ? { ...evidence, baseline: { ...binding.baseline } }
+      : { ...evidence, agentSession: { ...binding.identity.agentSession } };
   }
 
   private resetPreparedBinding(): void {
@@ -316,6 +577,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.queued.length = 0;
     this.paneId = undefined;
     this.identity = undefined;
+    this.provisional = undefined;
+    this.provisionalFailure = undefined;
+    this.provisionalNativeIdentity = undefined;
+    this.strengtheningCandidate = undefined;
     this.anchor = undefined;
     this.status = undefined;
     this.lastRevision = 0;
@@ -323,6 +588,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.selectedProfileName = undefined;
     this.eventStreamDegraded = false;
     this.bindingPublished = false;
+    this.provisionalPublished = false;
     if (!this.isSettled()) this.state = "reserved";
   }
 
@@ -363,7 +629,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   async onBootstrap(snapshot: HerdrSnapshot, _generation: number, reconnected: boolean): Promise<void> {
     if (this.stopped || !reconnected) return;
     await this.serialize(async () => {
-      if (this.stopped || this.identity === undefined || this.anchor === undefined) return;
+      if (this.stopped || this.isSettled()) return;
+      if (this.provisional !== undefined && !this.bindingPublished) {
+        this.applyProvisionalSnapshot(snapshot, "reconnect");
+        return;
+      }
+      if (this.identity === undefined || this.anchor === undefined) return;
       await this.applyAuthoritativeSnapshot(snapshot, "reconnect", "identity_lost");
     });
   }
@@ -371,26 +642,36 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   async onReconciliationSnapshot(snapshot: HerdrSnapshot): Promise<void> {
     if (this.stopped) return;
     await this.serialize(async () => {
-      if (this.stopped || this.identity === undefined || this.anchor === undefined || this.isSettled()) return;
+      if (this.stopped || this.isSettled()) return;
+      if (this.provisional !== undefined && !this.bindingPublished) {
+        this.applyProvisionalSnapshot(snapshot, "periodic_snapshot");
+        return;
+      }
+      if (this.identity === undefined || this.anchor === undefined) return;
       await this.applyAuthoritativeSnapshot(snapshot, "periodic_snapshot", "released");
     });
   }
 
   onReconciliationFailure(reason: ReconciliationFailureReason): void {
-    if (this.stopped || this.identity === undefined || this.isSettled()) return;
+    if (this.stopped || this.isSettled()) return;
+    if (this.provisional !== undefined && !this.bindingPublished) {
+      this.markProvisionalFailure(`reconciliation_${reason}`);
+      return;
+    }
+    if (this.identity === undefined) return;
     this.markReconciliationFailure(reason);
   }
 
   onMonitorDegraded(reason: string): void {
     // A reservation is not yet supervising anything, so it has no health to report.
-    if (this.stopped || this.identity === undefined || this.isSettled() || this.eventStreamDegraded) return;
+    if (this.stopped || (this.identity === undefined && this.provisional === undefined) || this.isSettled() || this.eventStreamDegraded) return;
     this.eventStreamDegraded = true;
     this.refreshActiveState();
     this.emit("monitor_degraded", `supervision lost its Herdr event connection (${reason}) and is retrying`, { reason });
   }
 
   onMonitorRecovered(): void {
-    if (this.stopped || this.identity === undefined || this.isSettled() || !this.eventStreamDegraded) return;
+    if (this.stopped || (this.identity === undefined && this.provisional === undefined) || this.isSettled() || !this.eventStreamDegraded) return;
     this.eventStreamDegraded = false;
     this.refreshActiveState();
     this.emit("monitor_recovered", "supervision restored its Herdr event connection");
@@ -424,15 +705,102 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * nothing to fold against, so admitted evidence waits for the binding drain.
    */
   private async drainAdmitted(): Promise<void> {
-    while (!this.stopped && this.identity !== undefined) {
+    while (!this.stopped && (this.identity !== undefined || this.provisional !== undefined)) {
       const event = this.queued.shift();
       if (event === undefined) return;
       await this.fold(event);
     }
   }
 
+  private foldProvisional(event: SupervisionSocketEvent): void {
+    const provisional = this.provisional;
+    if (provisional === undefined || this.provisionalFailure !== undefined) return;
+    if (event.event === "pane_moved") {
+      this.markProvisionalFailure("move_before_strengthening");
+      return;
+    }
+    if (!isPaneRecordEvent(event.event) || event.pane === undefined) {
+      this.markProvisionalFailure("event_lifecycle_unvalidated");
+      return;
+    }
+    const pane = event.pane;
+    const candidate = this.strengtheningCandidate;
+    if (candidate === undefined) {
+      if (pane.paneId !== provisional.identity.paneId || pane.terminalId !== provisional.identity.terminalId || pane.agentKind !== provisional.identity.agentKind) {
+        this.markProvisionalFailure("identity_mismatch");
+        return;
+      }
+      if (pane.agentSession !== undefined) {
+        const observedIdentity: SupervisedIdentity = { ...provisional.identity, agentSession: { ...pane.agentSession } };
+        if (observedIdentity.agentSession.agent !== observedIdentity.agentKind
+          || (this.provisionalNativeIdentity !== undefined && !sameSupervisedIdentity(this.provisionalNativeIdentity, observedIdentity))) {
+          this.markProvisionalFailure("native_identity_mismatch");
+          return;
+        }
+        this.provisionalNativeIdentity ??= observedIdentity;
+      } else if (this.provisionalNativeIdentity !== undefined) {
+        this.markProvisionalFailure("native_identity_mismatch");
+        return;
+      }
+    } else {
+      if (pane.paneId !== candidate.binding.identity.paneId || paneContinuity(candidate.binding.identity, pane) !== "continuous") {
+        this.markProvisionalFailure("native_identity_mismatch");
+        return;
+      }
+    }
+    let lifecycle: ReturnType<typeof provisionalEventLifecycle>;
+    try {
+      lifecycle = provisionalEventLifecycle(event);
+    } catch {
+      this.markProvisionalFailure("lifecycle_malformed");
+      return;
+    }
+    const baseline = provisional.baseline;
+    if (candidate === undefined) {
+      if (lifecycle.revision < baseline.revision) {
+        this.markProvisionalFailure("revision_regressed");
+        return;
+      }
+      if (lifecycle.revision === baseline.revision && (lifecycle.stateChangeSeq === undefined || lifecycle.stateChangeSeq <= baseline.stateChangeSeq)) return;
+      if (lifecycle.stateChangeSeq === undefined || lifecycle.stateChangeSeq <= baseline.stateChangeSeq) {
+        this.markProvisionalFailure("lifecycle_not_advanced");
+      }
+      return;
+    }
+    if (lifecycle.stateChangeSeq === undefined || lifecycle.stateChangeSeq < baseline.stateChangeSeq) {
+      this.markProvisionalFailure("lifecycle_not_advanced");
+      return;
+    }
+    if (lifecycle.revision < baseline.revision || lifecycle.revision < candidate.revision) {
+      this.markProvisionalFailure("revision_regressed");
+      return;
+    }
+    if (lifecycle.stateChangeSeq < candidate.stateChangeSeq) {
+      this.markProvisionalFailure("lifecycle_regressed");
+      return;
+    }
+    if (lifecycle.revision === candidate.revision && lifecycle.stateChangeSeq === candidate.stateChangeSeq && lifecycle.status !== candidate.status) {
+      this.markProvisionalFailure("lifecycle_contradiction");
+      return;
+    }
+    if (lifecycle.status !== candidate.status) candidate.events.push({
+      atMs: this.deps.clock.now(),
+      from: candidate.status,
+      to: lifecycle.status,
+      revision: lifecycle.revision,
+      source: "event",
+    });
+    candidate.revision = lifecycle.revision;
+    candidate.stateChangeSeq = lifecycle.stateChangeSeq;
+    candidate.status = lifecycle.status;
+  }
+
   private async fold(event: SupervisionSocketEvent): Promise<void> {
     if (this.state === "settled") return;
+    if (this.provisional !== undefined && !this.bindingPublished) {
+      this.foldProvisional(event);
+      return;
+    }
     if (!isPaneRecordEvent(event.event)) {
       // A thin event carries only a pane id, and Herdr reuses pane ids, so it is
       // a reconciliation trigger and never a conclusion.
@@ -655,6 +1023,47 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     });
   }
 
+  private applyProvisionalSnapshot(snapshot: HerdrSnapshot, trigger: string): void {
+    const provisional = this.provisional;
+    if (provisional === undefined || this.provisionalFailure !== undefined) return;
+    const target = classifyProvisionalSnapshotTarget(snapshot, provisional.identity.paneId);
+    if (target.kind !== "unique" || !target.occupant.agentPresent) {
+      const cause = target.kind === "invalid" ? target.reason : target.kind === "absent" ? "occupant_absent" : "agent_absent";
+      this.markProvisionalFailure(`${trigger}:${cause}`);
+      return;
+    }
+    const occupant = target.occupant;
+    if (provisionalOccupantContinuity(provisional.identity, occupant) !== "continuous") {
+      this.markProvisionalFailure(`${trigger}:identity_mismatch`);
+      return;
+    }
+    if (occupant.pane.agentSession !== undefined) {
+      const observedIdentity: SupervisedIdentity = { ...provisional.identity, agentSession: { ...occupant.pane.agentSession } };
+      if (observedIdentity.agentSession.agent !== observedIdentity.agentKind
+        || (this.provisionalNativeIdentity !== undefined && !sameSupervisedIdentity(this.provisionalNativeIdentity, observedIdentity))) {
+        this.markProvisionalFailure(`${trigger}:native_identity_mismatch`);
+        return;
+      }
+      this.provisionalNativeIdentity ??= observedIdentity;
+    } else if (this.provisionalNativeIdentity !== undefined) {
+      this.markProvisionalFailure(`${trigger}:native_identity_mismatch`);
+      return;
+    }
+    if (occupant.stateChangeSeq === undefined) {
+      this.markProvisionalFailure(`${trigger}:lifecycle_unavailable`);
+      return;
+    }
+    if (occupant.pane.revision < provisional.baseline.revision) {
+      this.markProvisionalFailure(`${trigger}:revision_regressed`);
+    }
+  }
+
+  private markProvisionalFailure(cause: string): void {
+    if (this.provisionalFailure !== undefined) return;
+    this.provisionalFailure = cause;
+    this.emit("evidence_gap", `AGY provisional supervision evidence was rejected (${cause})`, { cause });
+  }
+
   private markReconciliationFailure(reason: ReconciliationFailureReason): void {
     const now = this.deps.clock.now();
     this.reconciliationLastAttemptAtMs = now;
@@ -838,6 +1247,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   // -------------------------------------------------------------------- events
 
+  private childRef(): { agentName: string; agentKind: string; paneId: string } {
+    if (this.identity !== undefined) return { agentName: this.identity.agentName, agentKind: this.identity.agentKind, paneId: this.identity.paneId };
+    const provisional = this.provisional!;
+    return { agentName: provisional.identity.agentName, agentKind: provisional.identity.agentKind, paneId: provisional.identity.paneId };
+  }
+
   private emit(type: SupervisionEventType, summary: string, details?: Record<string, string | number | boolean>): SupervisionEvent {
     const event = this.log.record(type, this.deps.clock.now(), summary, details);
     this.publish(`${type}: ${summary}`);
@@ -845,7 +1260,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       jobId: this.deps.jobId,
       // Every material event is emitted after binding, so the bound identity is
       // authoritative here rather than the requested profile's shape.
-      child: { agentName: this.identity!.agentName, agentKind: this.identity!.agentKind, paneId: this.identity!.paneId },
+      child: this.childRef(),
       event,
     });
     return event;
@@ -910,7 +1325,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         truncatedReviews: this.reviews.truncated(),
         ...(this.lastReviewAtMs === undefined ? {} : { lastReviewAtMs: this.lastReviewAtMs }),
       },
-      transitions: this.transitions.entries(),
+      transitions: [
+        ...this.transitions.entries(),
+        ...(this.bindingPublished ? this.strengtheningCandidate?.events ?? [] : []),
+      ],
       truncatedTransitions: this.transitions.truncated(),
       events: this.log.history(),
       truncatedEvents: this.log.truncatedEvents(),
@@ -918,6 +1336,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       ...(this.settlement === undefined ? {} : { settledReason: this.settlement.reason }),
     };
     if (projectedState === "reserved") return { ...common, state: "reserved" };
+    if (projectedState === "provisional") {
+      if (this.provisional === undefined) return { ...common, state: "reserved" };
+      return { ...common, state: "provisional", provisional: this.provisionalView(this.provisional), status: "idle" };
+    }
     if (projectedState === "settled") return {
       ...common,
       state: "settled",
@@ -929,6 +1351,18 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       state: projectedState,
       child: this.childView(this.identity!),
       status: this.status!,
+    };
+  }
+
+  private provisionalView(binding: ProvisionalSupervisionBinding): NonNullable<Extract<SupervisionJobView, { state: "provisional" }>["provisional"]> {
+    return {
+      agentName: binding.identity.agentName,
+      agentKind: "agy",
+      paneId: binding.identity.paneId,
+      terminalId: binding.identity.terminalId,
+      profileName: binding.profileName,
+      ...(binding.profileName === this.deps.child.profileName ? {} : { requestedProfileName: this.deps.child.profileName }),
+      baseline: { ...binding.baseline },
     };
   }
 
@@ -956,7 +1390,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   childLive(): boolean {
-    return this.bindingPublished && (this.state === "active" || this.state === "degraded") && this.identity !== undefined;
+    return (this.provisionalPublished && this.state === "provisional" && this.provisional !== undefined)
+      || (this.bindingPublished && (this.state === "active" || this.state === "degraded") && this.identity !== undefined);
   }
 
   coversIdentity(identity: SupervisedIdentity): boolean {
@@ -984,6 +1419,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   /** Release a reservation that never bound, so its job settles instead of leaking. */
   release(reason: string): void {
+    // A published provisional job may have had prompt effect. Releasing it would
+    // destroy the only recovery handle, so manager shutdown is its sole stop path.
+    if (this.provisionalPublished && !this.bindingPublished) {
+      this.publish(`AGY provisional supervision retained; release refused (${reason})`);
+      return;
+    }
     if (this.stopped) return;
     this.stopped = true;
     this.clearReviewTimer();
@@ -994,6 +1435,39 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.settlement = { outcome: "failed", reason };
     this.resolveSettled(this.settlement);
   }
+}
+
+function validProvisionalBinding(binding: ProvisionalSupervisionBinding): boolean {
+  try {
+    const identity: ProvisionalSupervisedIdentity = binding.identity;
+    const baseline = binding.baseline;
+    return validProvisionalIdentity(identity)
+      && typeof binding.profileName === "string"
+      && binding.profileName.length > 0
+      && !/[\0\r\n]/u.test(binding.profileName)
+      && baseline.state === "idle"
+      && Number.isSafeInteger(baseline.stateChangeSeq)
+      && baseline.stateChangeSeq >= 0
+      && Number.isSafeInteger(baseline.revision)
+      && baseline.revision >= 0;
+  } catch {
+    return false;
+  }
+}
+
+function validProvisionalIdentity(identity: ProvisionalSupervisedIdentity): boolean {
+  return typeof identity === "object"
+    && identity !== null
+    && typeof identity.paneId === "string"
+    && identity.paneId.length > 0
+    && !/[\0\r\n]/u.test(identity.paneId)
+    && typeof identity.terminalId === "string"
+    && identity.terminalId.length > 0
+    && !/[\0\r\n]/u.test(identity.terminalId)
+    && typeof identity.agentName === "string"
+    && identity.agentName.length > 0
+    && !/[\0\r\n]/u.test(identity.agentName)
+    && identity.agentKind === "agy";
 }
 
 function reasonOf(error: unknown): string {

@@ -11,7 +11,7 @@
 
 import type { HerdrSnapshot } from "../targets.js";
 import type { ReconciliationFailureReason } from "./events.js";
-import { parsePaneRecord, type AgentSessionRecord, type SupervisionAgentStatus, type SupervisionPaneRecord } from "./protocol.js";
+import { isPaneRecordEvent, parsePaneRecord, SUPERVISION_AGENT_STATUSES, type AgentSessionRecord, type SupervisionAgentStatus, type SupervisionPaneRecord, type SupervisionSocketEvent } from "./protocol.js";
 
 export interface SupervisedIdentity {
   paneId: string;
@@ -19,6 +19,26 @@ export interface SupervisedIdentity {
   agentName: string;
   agentKind: string;
   agentSession: AgentSessionRecord;
+}
+
+/** Reduced-assurance identity used only by AGY before its native session exists. */
+export interface ProvisionalSupervisedIdentity {
+  paneId: string;
+  terminalId: string;
+  agentName: string;
+  agentKind: "agy";
+}
+
+export interface ProvisionalLifecycleBaseline {
+  state: "idle";
+  stateChangeSeq: number;
+  revision: number;
+}
+
+export interface ProvisionalSupervisionBinding {
+  identity: ProvisionalSupervisedIdentity;
+  profileName: string;
+  baseline: ProvisionalLifecycleBaseline;
 }
 
 export interface SupervisionAnchor {
@@ -70,6 +90,11 @@ export interface AuthoritativeOccupant {
   pane: SupervisionPaneRecord;
   agentPresent: boolean;
   agentName?: string;
+}
+
+/** A target-local occupant with the lifecycle counter needed by AGY strengthening. */
+export interface ProvisionalAuthoritativeOccupant extends AuthoritativeOccupant {
+  stateChangeSeq?: number;
 }
 
 export type TargetLocalReconciliationFailure = Extract<
@@ -153,6 +178,90 @@ export function classifySnapshotTarget(snapshot: HerdrSnapshot, paneId: string):
   } catch {
     return { kind: "invalid", reason: "target_record_malformed" };
   }
+}
+
+export type ProvisionalSnapshotTargetEvidence =
+  | { kind: "unique"; occupant: ProvisionalAuthoritativeOccupant }
+  | { kind: "absent" }
+  | { kind: "invalid"; reason: TargetLocalReconciliationFailure };
+
+function optionalLifecycleCounter(value: Record<string, unknown>, key: string): number | undefined {
+  if (!own(value, key) || value[key] === null || value[key] === undefined) return undefined;
+  if (typeof value[key] !== "number" || !Number.isSafeInteger(value[key]) || value[key] < 0) throw new Error("target lifecycle counter is malformed");
+  return value[key];
+}
+
+function optionalLifecycleStatus(value: Record<string, unknown>): SupervisionAgentStatus | undefined {
+  if (!own(value, "agent_status") || value.agent_status === null || value.agent_status === undefined) return undefined;
+  if (typeof value.agent_status !== "string" || !(SUPERVISION_AGENT_STATUSES as readonly string[]).includes(value.agent_status)) throw new Error("target lifecycle status is malformed");
+  return value.agent_status as SupervisionAgentStatus;
+}
+
+/**
+ * Read AGY's stronger lifecycle tuple without changing the exact Pi/Claude
+ * classifier. The generic snapshot classifier intentionally ignores these
+ * optional fields for existing runtimes; AGY requires them at its reduced-
+ * assurance boundary and therefore validates them here.
+ */
+export function classifyProvisionalSnapshotTarget(snapshot: HerdrSnapshot, paneId: string): ProvisionalSnapshotTargetEvidence {
+  const target = classifySnapshotTarget(snapshot, paneId);
+  if (target.kind !== "unique") return target;
+  const rawPane = snapshot.panes.find((item) => item.pane_id === paneId) as Record<string, unknown> | undefined;
+  const rawAgent = snapshot.agents.find((item) => item.pane_id === paneId) as Record<string, unknown> | undefined;
+  if (rawPane === undefined) return { kind: "absent" };
+  try {
+    const paneSequence = optionalLifecycleCounter(rawPane, "state_change_seq");
+    const agentSequence = rawAgent === undefined ? undefined : optionalLifecycleCounter(rawAgent, "state_change_seq");
+    const paneRevision = optionalLifecycleCounter(rawPane, "revision");
+    const agentRevision = rawAgent === undefined ? undefined : optionalLifecycleCounter(rawAgent, "revision");
+    const paneStatus = optionalLifecycleStatus(rawPane);
+    const agentStatus = rawAgent === undefined ? undefined : optionalLifecycleStatus(rawAgent);
+    if ((paneSequence !== undefined && agentSequence !== undefined && paneSequence !== agentSequence)
+      || (paneRevision !== undefined && agentRevision !== undefined && paneRevision !== agentRevision)
+      || (paneStatus !== undefined && agentStatus !== undefined && paneStatus !== agentStatus)) {
+      return { kind: "invalid", reason: "target_identity_contradiction" };
+    }
+    return {
+      kind: "unique",
+      occupant: {
+        ...target.occupant,
+        ...(agentSequence ?? paneSequence) === undefined ? {} : { stateChangeSeq: agentSequence ?? paneSequence },
+      },
+    };
+  } catch {
+    return { kind: "invalid", reason: "target_record_malformed" };
+  }
+}
+
+/** AGY's pre-native identity requires every visible identity component except the session. */
+export function provisionalOccupantContinuity(identity: ProvisionalSupervisedIdentity, occupant: AuthoritativeOccupant): ContinuityVerdict {
+  if (!occupant.agentPresent) return "unproven";
+  if (occupant.pane.paneId !== identity.paneId || occupant.pane.terminalId !== identity.terminalId) return "replaced";
+  if (occupant.agentName !== undefined && occupant.agentName !== identity.agentName) return "replaced";
+  if (occupant.agentName === undefined || occupant.pane.agentKind === undefined) return "unproven";
+  if (occupant.pane.agentKind !== identity.agentKind) return "replaced";
+  const session = occupant.pane.agentSession;
+  if (session !== undefined && session.agent !== identity.agentKind) return "replaced";
+  return "continuous";
+}
+
+/** Lifecycle fields retained on a validated full pane event for strengthening. */
+export interface ProvisionalEventLifecycle {
+  status: SupervisionAgentStatus;
+  revision: number;
+  stateChangeSeq?: number;
+}
+
+export function provisionalEventLifecycle(event: SupervisionSocketEvent): ProvisionalEventLifecycle {
+  if (!isPaneRecordEvent(event.event) || event.pane === undefined || typeof event.data.pane !== "object" || event.data.pane === null || Array.isArray(event.data.pane)) {
+    throw new Error("target lifecycle evidence is unavailable");
+  }
+  const stateChangeSeq = optionalLifecycleCounter(event.data.pane as Record<string, unknown>, "state_change_seq");
+  return {
+    status: event.pane.agentStatus,
+    revision: event.pane.revision,
+    ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }),
+  };
 }
 
 /** Judge an authoritative occupant, including the agent name a snapshot supplies. */

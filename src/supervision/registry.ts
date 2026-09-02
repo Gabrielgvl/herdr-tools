@@ -14,6 +14,7 @@ import { inertNotifier, type ManagerNotifier } from "./notify.js";
 import { ReviewerFailure } from "../reviewer.js";
 import { ModelSupervisionReviewer, SUPERVISION_REVIEWER_MODEL, type SupervisionReviewer } from "./reviewer.js";
 import type { SupervisionModelService } from "./model-service.js";
+import type { ProvisionalSupervisionBinding } from "./identity.js";
 import {
   Supervisor,
   type SupervisionBinding,
@@ -70,6 +71,8 @@ export interface SupervisionReserveRequest {
 export interface SupervisionReservation {
   readonly jobId: string;
   bind(binding: SupervisionBinding): Promise<void>;
+  bindProvisional(binding: ProvisionalSupervisionBinding): Promise<void>;
+  strengthen(binding: SupervisionBinding): Promise<void>;
   release(reason: string): void;
 }
 
@@ -182,6 +185,31 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         } catch (error) {
           // Idempotent and required even when Supervisor already rolled back a
           // partially committed publication.
+          publication.rollback();
+          throw error;
+        }
+      },
+      bindProvisional: async (binding) => {
+        const publication = this.deps.jobs.prepareProvisionalSupervisionChildBinding(registered.jobId, {
+          agentKind: binding.identity.agentKind,
+          profileName: binding.profileName,
+        });
+        try {
+          await bound.bindProvisional(binding, publication);
+        } catch (error) {
+          publication.rollback();
+          throw error;
+        }
+      },
+      strengthen: async (binding) => {
+        const publication = this.deps.jobs.prepareSupervisionStrengthening(registered.jobId, {
+          agentKind: binding.identity.agentKind,
+          profileName: binding.profileName,
+          paneId: binding.identity.paneId,
+        });
+        try {
+          await bound.strengthen(binding, publication);
+        } catch (error) {
           publication.rollback();
           throw error;
         }

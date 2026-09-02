@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { SupervisionChildBindingPublication } from "../../src/job-registry.js";
 import { ReviewerFailure } from "../../src/reviewer.js";
 import type { ReconciliationFailureReason, SupervisionEvent } from "../../src/supervision/events.js";
-import { classifySnapshotTarget, type SupervisedIdentity } from "../../src/supervision/identity.js";
+import { classifySnapshotTarget, type ProvisionalSupervisedIdentity, type ProvisionalSupervisionBinding, type SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
 import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervision/protocol.js";
 import type { SupervisionReviewResult, SupervisionReviewer } from "../../src/supervision/reviewer.js";
@@ -12,6 +12,8 @@ import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
 
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
+const agyIdentity: ProvisionalSupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy" };
+const agySession = { source: "agy", agent: "agy", kind: "id", value: "agy-1" };
 
 interface PaneOptions {
   paneId?: string;
@@ -33,6 +35,14 @@ function paneRecord(options: PaneOptions = {}): Record<string, unknown> {
     agent: options.agentKind === undefined ? "pi" : options.agentKind,
     agent_session: options.agentSession === undefined ? session : options.agentSession,
   };
+}
+
+function agyPaneRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "idle", revision: 2, agent: "agy", agent_session: null, state_change_seq: 4, ...overrides };
+}
+
+function agyAgentRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { pane_id: "p1", name: "worker", agent: "agy", agent_session: null, agent_status: "idle", revision: 2, state_change_seq: 4, ...overrides };
 }
 
 function snapshot(panes: Array<Record<string, unknown>>, agents: Array<Record<string, unknown>> = [{ pane_id: "p1", name: "worker" }]): HerdrSnapshot {
@@ -77,6 +87,7 @@ interface HarnessOptions {
   review?: (call: number) => Promise<SupervisionReviewResult>;
   transcript?: (paneId: string) => Promise<string[]>;
   cadenceMs?: number;
+  child?: SupervisorDependencies["child"];
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -104,7 +115,7 @@ function harness(options: HarnessOptions = {}): Harness {
   };
   const deps: SupervisorDependencies = {
     jobId: "job_supervisor",
-    child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
+    child: options.child ?? { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
     monitor: {
       addObserver: () => { observers += 1; },
       removeObserver: () => { observers -= 1; },
@@ -169,6 +180,98 @@ describe("supervisor binding", () => {
     expect(h.supervisor.childLive()).toBe(true);
     // A working child arms the review cadence immediately.
     expect(h.timerArmed()).toBe(true);
+  });
+
+  it("publishes AGY provisional evidence, keeps the observer, then strengthens atomically", async () => {
+    const baseline = snapshot([agyPaneRecord()], [agyAgentRecord()]);
+    const exact = snapshot(
+      [agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
+      [agyAgentRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
+    );
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" }, snapshots: [baseline, exact] });
+    const provisional: ProvisionalSupervisionBinding = { identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } };
+    const events: string[] = [];
+    await h.supervisor.bindProvisional(provisional, { commit: () => { events.push(`provisional-commit:${h.supervisor.view().state}`); }, rollback: vi.fn(), publish: () => { events.push(`provisional-publish:${h.supervisor.view().state}`); } });
+    expect(h.supervisor.view()).toMatchObject({ state: "provisional", provisional: { paneId: "p1", terminalId: "t1", agentKind: "agy", baseline: { stateChangeSeq: 4, revision: 2 } }, status: "idle" });
+    expect(h.supervisor.view()).not.toHaveProperty("child");
+    expect(h.supervisor.childLive()).toBe(true);
+    expect(h.observers).toBe(1);
+    expect(h.supervisor.coversIdentity({ ...agyIdentity, agentSession: agySession })).toBe(false);
+
+    const exactIdentity: SupervisedIdentity = { ...agyIdentity, agentSession: agySession };
+    await h.supervisor.strengthen({ identity: exactIdentity, profileName: "researcher-agy" }, { commit: () => { events.push(`exact-commit:${h.supervisor.view().state}`); }, rollback: vi.fn(), publish: () => { events.push(`exact-publish:${h.supervisor.view().state}`); } });
+    expect(events).toEqual(["provisional-commit:reserved", "provisional-publish:provisional", "exact-commit:provisional", "exact-publish:active"]);
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p1", terminalId: "t1", agentKind: "agy", profileName: "researcher-agy" }, status: "working" });
+    expect(h.supervisor.coversIdentity(exactIdentity)).toBe(true);
+    expect(h.observers).toBe(1);
+    h.supervisor.shutdown();
+  });
+
+  it("drains events admitted during the fresh AGY strengthening read before commit", async () => {
+    let resolveFresh!: (value: HerdrSnapshot) => void;
+    const fresh = new Promise<HerdrSnapshot>((resolve) => { resolveFresh = resolve; });
+    const baseline = snapshot([agyPaneRecord()], [agyAgentRecord()]);
+    const exact = snapshot(
+      [agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
+      [agyAgentRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
+    );
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" }, snapshots: [baseline, fresh] });
+    await h.supervisor.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    const commit = vi.fn();
+    let published: ReturnType<Supervisor["view"]> | undefined;
+    const strengthening = h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, profileName: "researcher-agy" }, { commit, rollback: vi.fn(), publish: () => { published = h.supervisor.view(); } });
+    await Promise.resolve();
+    const admitted = h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 4, state_change_seq: 6 })));
+    resolveFresh(exact);
+    await Promise.all([strengthening, admitted]);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(published).toMatchObject({ state: "active", status: "blocked", transitions: [{ from: "working", to: "blocked", revision: 4 }] });
+    expect(h.supervisor.view()).toMatchObject({ state: "active", status: "blocked", child: { paneId: "p1" } });
+    expect(h.supervisor.view().transitions).toEqual([{ atMs: 1_000, from: "working", to: "blocked", revision: 4, source: "event" }]);
+    h.supervisor.shutdown();
+  });
+
+  it("rejects a move admitted after the strengthening drain empties but before exact commit", async () => {
+    const baseline = snapshot([agyPaneRecord()], [agyAgentRecord()]);
+    const exact = snapshot(
+      [agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
+      [agyAgentRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
+    );
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" }, snapshots: [baseline, exact] });
+    await h.supervisor.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    const internals = h.supervisor as unknown as { drainAdmitted(): Promise<void> };
+    const drainAdmitted = internals.drainAdmitted.bind(h.supervisor);
+    let injectMove = true;
+    internals.drainAdmitted = async () => {
+      await drainAdmitted();
+      if (!injectMove) return;
+      injectMove = false;
+      void h.supervisor.onEvent(paneEvent("pane_moved", agyPaneRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 }), { previous_pane_id: "p1" }));
+    };
+    const publication = { commit: vi.fn(), rollback: vi.fn(), publish: vi.fn() };
+    const failure = await h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, profileName: "researcher-agy" }, publication)
+      .catch((error: SupervisionBindError) => error);
+    expect(failure).toBeInstanceOf(SupervisionBindError);
+    expect((failure as SupervisionBindError).details).toMatchObject({ cause: "move_before_strengthening" });
+    expect(publication.commit).not.toHaveBeenCalled();
+    h.supervisor.shutdown();
+  });
+
+  it("pins the first native session seen before strengthening", async () => {
+    const otherSession = { ...agySession, value: "agy-2" };
+    const baseline = snapshot([agyPaneRecord()], [agyAgentRecord()]);
+    const exact = snapshot(
+      [agyPaneRecord({ agent_session: otherSession, agent_status: "working", revision: 4, state_change_seq: 6 })],
+      [agyAgentRecord({ agent_session: otherSession, agent_status: "working", revision: 4, state_change_seq: 6 })],
+    );
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" }, snapshots: [baseline, exact] });
+    await h.supervisor.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })));
+    const failure = await h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: otherSession }, profileName: "researcher-agy" })
+      .catch((error: SupervisionBindError) => error);
+    expect(failure).toBeInstanceOf(SupervisionBindError);
+    expect((failure as SupervisionBindError).details).toMatchObject({ cause: "native_identity_mismatch" });
+    h.supervisor.shutdown();
   });
 
   it("binds without a state_change_seq rather than defaulting one", async () => {

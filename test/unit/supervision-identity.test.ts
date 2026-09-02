@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  classifyProvisionalSnapshotTarget,
   classifySnapshotTarget,
   movedIdentity,
   occupantContinuity,
   paneContinuity,
+  provisionalOccupantContinuity,
   sameSupervisedIdentity,
+  type ProvisionalSupervisedIdentity,
   type SupervisedIdentity,
 } from "../../src/supervision/identity.js";
 import type { SupervisionPaneRecord } from "../../src/supervision/protocol.js";
@@ -19,6 +22,8 @@ const identity: SupervisedIdentity = {
   agentKind: "pi",
   agentSession: session,
 };
+
+const agyIdentity: ProvisionalSupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy" };
 
 function pane(overrides: Partial<SupervisionPaneRecord> = {}): SupervisionPaneRecord {
   return {
@@ -38,6 +43,18 @@ function rawPane(overrides: Record<string, unknown> = {}): Record<string, unknow
 
 function snapshot(panes: Record<string, unknown>[], agents: Record<string, unknown>[]): HerdrSnapshot {
   return parseSnapshotResult({ type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents } });
+}
+
+function agyPane(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1",
+    agent_status: "idle", revision: 2, agent: "agy", agent_session: null, state_change_seq: 4,
+    ...overrides,
+  };
+}
+
+function agyAgent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { pane_id: "p1", name: "worker", agent: "agy", agent_session: null, state_change_seq: 4, revision: 2, agent_status: "idle", ...overrides };
 }
 
 describe("supervised identity continuity", () => {
@@ -104,6 +121,22 @@ describe("supervised identity continuity", () => {
       [rawPane()],
       [{ pane_id: "p1", name: "worker", terminal_id: "t1", agent: "pi" }],
     ), "p1")).toMatchObject({ kind: "unique", occupant: { agentPresent: true, agentName: "worker", pane: { paneId: "p1" } } });
+  });
+
+  it("classifies AGY's reduced-assurance occupant and preserves lifecycle coherence", () => {
+    const reduced = classifyProvisionalSnapshotTarget(snapshot([agyPane()], [agyAgent()]), "p1");
+    expect(reduced).toMatchObject({ kind: "unique", occupant: { agentPresent: true, agentName: "worker", stateChangeSeq: 4, pane: { paneId: "p1", agentKind: "agy" } } });
+    if (reduced.kind !== "unique") throw new Error("expected a unique AGY occupant");
+    expect(provisionalOccupantContinuity(agyIdentity, reduced.occupant)).toBe("continuous");
+
+    expect(classifyProvisionalSnapshotTarget(snapshot([agyPane({ state_change_seq: 5 })], [agyAgent()]), "p1")).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
+    expect(classifyProvisionalSnapshotTarget(snapshot([agyPane({ state_change_seq: "5" })], [agyAgent()]), "p1")).toEqual({ kind: "invalid", reason: "target_record_malformed" });
+    expect(provisionalOccupantContinuity(agyIdentity, { pane: { paneId: "p1", terminalId: "t1", tabId: "tab1", workspaceId: "w1", agentStatus: "idle", revision: 2, agentKind: "pi" }, agentPresent: true, agentName: "worker" })).toBe("replaced");
+    expect(provisionalOccupantContinuity(agyIdentity, { pane: { paneId: "p1", terminalId: "t1", tabId: "tab1", workspaceId: "w1", agentStatus: "idle", revision: 2, agentKind: "agy" }, agentPresent: true })).toBe("unproven");
+  });
+
+  it("keeps the generic classifier unchanged when AGY lifecycle fields are malformed", () => {
+    expect(classifySnapshotTarget(snapshot([agyPane({ state_change_seq: "bad" })], [agyAgent()]), "p1")).toMatchObject({ kind: "unique", occupant: { agentPresent: true } });
   });
 
   it("follows a move only on atomic evidence plus a fresh matching occupant", () => {

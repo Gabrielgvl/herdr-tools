@@ -4,18 +4,28 @@ import { SessionEventMonitor } from "../../src/supervision/monitor.js";
 import { SupervisionRegistry } from "../../src/supervision/registry.js";
 import { scriptedServer } from "./supervision-peer.js";
 import type { SupervisionReviewer } from "../../src/supervision/reviewer.js";
-import type { SupervisedIdentity } from "../../src/supervision/identity.js";
+import type { ProvisionalSupervisedIdentity, SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
 import { createJobsTool } from "../../src/tools/jobs.js";
 
 const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
+const agyIdentity: ProvisionalSupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy" };
+const agySession = { source: "agy", agent: "agy", kind: "id", value: "agy-1" };
 const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "low" as const };
 
 const pane = { pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "working", revision: 3, agent: "pi", agent_session: session };
 
 function snapshotResult(panes: Array<Record<string, unknown>>, agents: Array<Record<string, unknown>> = panes.some((item) => item.pane_id === "p1") ? [{ pane_id: "p1", name: "worker" }] : []): unknown {
   return { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents } };
+}
+
+function agyPane(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "idle", revision: 2, agent: "agy", agent_session: null, state_change_seq: 4, ...overrides };
+}
+
+function agyAgent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { pane_id: "p1", name: "worker", agent: "agy", agent_session: null, agent_status: "idle", revision: 2, state_change_seq: 4, ...overrides };
 }
 
 interface Fixture {
@@ -59,6 +69,55 @@ describe("the supervision registry", () => {
       settings: { reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max", reviewCadenceMinutes: 5 },
     });
     expect(detail.request.target_generation_refs?.[0]).toMatch(/^target_generation_/u);
+    f.supervision.shutdown();
+  });
+
+  it("publishes AGY provisional supervision and atomically strengthens it to exact coverage", async () => {
+    const baseline = snapshotResult([agyPane()], [agyAgent()]);
+    const exact = snapshotResult(
+      [agyPane({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
+      [agyAgent({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
+    );
+    const f = fixture({ snapshots: [baseline, baseline, exact] });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
+    await reservation.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({
+      operation_phase: "running",
+      request: { targetIds: [], child: { agentKind: "agy", profileName: "researcher-agy" } },
+      supervision: { state: "provisional", provisional: { paneId: "p1", terminalId: "t1", baseline: { stateChangeSeq: 4, revision: 2 } } },
+    });
+    expect(f.jobs.activeSupervisorFor({ ...agySession, paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy", agentSession: agySession })).toBeUndefined();
+    await expect(f.jobs.cancel(reservation.jobId)).rejects.toMatchObject({ code: "SUPERVISION_ACTIVE" });
+
+    const exactIdentity: SupervisedIdentity = { ...agyIdentity, agentSession: agySession };
+    await reservation.strengthen({ identity: exactIdentity, profileName: "researcher-agy", stateChangeSeq: 5 });
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({
+      operation_phase: "running",
+      request: { targetIds: ["p1"], child: { agentKind: "agy", profileName: "researcher-agy" } },
+      supervision: { state: "active", child: { paneId: "p1", agentKind: "agy" }, status: "working" },
+    });
+    expect(f.jobs.activeSupervisorFor(exactIdentity)).toEqual({ jobId: reservation.jobId });
+    f.supervision.shutdown();
+  });
+
+  it("keeps the provisional recovery handle when strengthening evidence is rejected", async () => {
+    const baseline = snapshotResult([agyPane()], [agyAgent()]);
+    const replaced = snapshotResult([agyPane({ terminal_id: "t9", agent_status: "working", revision: 3, state_change_seq: 5 })], [agyAgent({ terminal_id: "t9", agent_status: "working", revision: 3, state_change_seq: 5 })]);
+    const f = fixture({ snapshots: [baseline, baseline, replaced] });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
+    await reservation.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    await expect(reservation.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, profileName: "researcher-agy" })).rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "identity_mismatch" } });
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running", request: { targetIds: [] }, supervision: { state: "provisional" } });
+    expect(f.jobs.activeSupervisorFor({ ...agyIdentity, agentSession: agySession })).toBeUndefined();
+    await expect(f.jobs.cancel(reservation.jobId)).rejects.toMatchObject({ code: "SUPERVISION_ACTIVE" });
+    f.supervision.shutdown();
+  });
+
+  it("does not expose AGY provisional state through the exact binding path", async () => {
+    const baseline = snapshotResult([agyPane()], [agyAgent()]);
+    const f = fixture({ snapshots: [baseline, baseline] });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
+    await expect(reservation.bind({ identity: { ...agyIdentity, agentSession: agySession }, profileName: "researcher-agy" })).rejects.toThrow(/STRENGTHENING_REQUIRED/u);
     f.supervision.shutdown();
   });
 

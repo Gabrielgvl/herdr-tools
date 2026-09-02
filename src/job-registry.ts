@@ -1372,23 +1372,47 @@ export class JobRegistry {
    * the supervisor has installed its matching bound state.
    */
   prepareSupervisionChildBinding(jobId: string, bound: { agentKind: string; profileName: string; paneId: string }): SupervisionChildBindingPublication {
+    return this.prepareExactSupervisionChildBinding(jobId, bound, false);
+  }
+
+  /** Prepare the exact request half of an already-published AGY provisional binding. */
+  prepareSupervisionStrengthening(jobId: string, bound: { agentKind: string; profileName: string; paneId: string }): SupervisionChildBindingPublication {
+    return this.prepareExactSupervisionChildBinding(jobId, bound, true);
+  }
+
+  private prepareExactSupervisionChildBinding(
+    jobId: string,
+    bound: { agentKind: string; profileName: string; paneId: string },
+    strengthening: boolean,
+  ): SupervisionChildBindingPublication {
     const record = this.jobs.get(jobId);
     if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
     if (record.detail.request.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job has a supervised child");
     const request = record.detail.request;
-    if (request.child.agentKind === "agy" || record.supervisionBindingStage === "provisional") throw new Error("SUPERVISION_STRENGTHENING_REQUIRED: generic exact binding cannot bypass AGY strengthening");
+    if (strengthening) {
+      if (record.supervisionBindingStage !== "provisional" || request.child.agentKind !== "agy" || bound.agentKind !== "agy") throw new Error("SUPERVISION_STRENGTHENING_INVALID: only an AGY provisional supervisor can be strengthened");
+      try {
+        if (!record.supervision || record.supervision.childLive() !== true || record.supervision.view().state !== "provisional") throw new Error("invalid provisional supervisor");
+      } catch {
+        throw new Error("SUPERVISION_PUBLICATION_UNCONFIRMED: provisional supervisor state is unavailable");
+      }
+    } else if (bound.agentKind === "agy" || record.supervisionBindingStage === "provisional") {
+      throw new Error("SUPERVISION_STRENGTHENING_REQUIRED: generic exact binding cannot bypass AGY strengthening");
+    }
     if (typeof bound.paneId !== "string" || bound.paneId.length === 0 || /[\0\r\n]/u.test(bound.paneId)) throw new Error("SUPERVISION_BINDING_INVALID: exact pane id is malformed");
     if (record.supervisionBindingStage === "exact" || request.targetIds.length !== 0) throw new Error("SUPERVISION_ALREADY_BOUND: supervisor request already has an exact target");
     if (request.targets.length !== 1 || request.target_generation_refs?.length !== 1) throw new Error("SUPERVISION_REQUEST_INVALID: supervisor target arrays are not aligned");
     const reservedStage = record.supervisionBindingStage;
     const reservedChild = clone(request.child);
     const reservedTargetIds = [...request.targetIds];
+    const requestedAgentKind = reservedChild.requestedAgentKind ?? (bound.agentKind === reservedChild.agentKind ? undefined : reservedChild.agentKind);
+    const requestedProfileName = reservedChild.requestedProfileName ?? (bound.profileName === reservedChild.profileName ? undefined : reservedChild.profileName);
     const selectedChild: SupervisedJobChild = {
       agentName: reservedChild.agentName,
       agentKind: bound.agentKind,
       profileName: bound.profileName,
-      ...(bound.agentKind === reservedChild.agentKind ? {} : { requestedAgentKind: reservedChild.agentKind }),
-      ...(bound.profileName === reservedChild.profileName ? {} : { requestedProfileName: reservedChild.profileName })
+      ...(requestedAgentKind === undefined ? {} : { requestedAgentKind }),
+      ...(requestedProfileName === undefined ? {} : { requestedProfileName }),
     };
     let committed = false;
     let published = false;

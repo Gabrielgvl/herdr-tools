@@ -4,7 +4,7 @@ import { WAIT_LABEL_MAX_BYTES } from "./wait-schema.js";
 import { isTargetEvidence, type TargetEvidence } from "./wait-target-evidence.js";
 import type { SupervisionEvent } from "./supervision/events.js";
 import type { SupervisedIdentity } from "./supervision/identity.js";
-import type { SupervisionJobPort, SupervisionJobView } from "./supervision/state.js";
+import { isSupervisionJobView, type SupervisionChildView, type SupervisionJobPort, type SupervisionJobView, type SupervisionProvisionalView } from "./supervision/state.js";
 
 export const OPERATION_PHASES = ["accepted", "running", "cancel_requested", "settled"] as const;
 export type OperationPhase = (typeof OPERATION_PHASES)[number];
@@ -50,6 +50,7 @@ const SEMANTIC_REVIEW_TARGET_BYTES = 128;
 const SEMANTIC_REVIEW_JOB_ID_BYTES = 64;
 const SEMANTIC_REVIEW_TOTAL_BYTES = 4_096;
 type LateSettlementKind = "fulfilled" | "rejected";
+type SupervisionBindingStage = "reserved" | "provisional" | "exact";
 
 export interface TruncatedDetails {
   truncated: true;
@@ -115,10 +116,16 @@ export interface SupervisedJobChild {
 export interface SupervisionChildBindingPublication {
   /** Mutate the private request snapshot without notifying public observers. */
   commit(): void;
-  /** Restore the exact reserved request snapshot. Idempotent. */
+  /** Restore the reserved request snapshot. Idempotent. */
   rollback(): void;
-  /** Notify observers only after the supervisor has published bound state. */
+  /** Notify observers only after the supervisor has published matching state. */
   publish(): void;
+}
+
+/** The request half of an AGY provisional binding. */
+export interface ProvisionalSupervisionChildBinding {
+  agentKind: string;
+  profileName: string;
 }
 
 export interface SupervisorJobRequestSnapshot extends JobRequestCommon {
@@ -376,6 +383,33 @@ interface JobRecord {
   executionPromise: Promise<void>;
   resolveDrain: Array<() => void>;
   supervision?: SupervisionJobPort;
+  supervisionBindingStage: SupervisionBindingStage;
+}
+
+function sameOptional(left: string | undefined, right: string | undefined): boolean {
+  return left === right;
+}
+
+function verifyInstalledSupervisor(record: JobRecord, stage: "provisional" | "exact", child: SupervisedJobChild, paneId?: string): void {
+  if (!record.gateOpen || record.detail.operation_phase !== "running") throw new Error("SUPERVISION_BINDING_CLOSED: supervisor job is no longer running");
+  const port = record.supervision;
+  if (!port) throw new Error("SUPERVISION_PUBLICATION_UNCONFIRMED: supervisor state is not installed");
+  let view: SupervisionJobView;
+  try {
+    view = port.view();
+    if (!isSupervisionJobView(view) || port.childLive() !== true) throw new Error("invalid installed state");
+  } catch {
+    throw new Error("SUPERVISION_PUBLICATION_UNCONFIRMED: installed supervisor state is unavailable");
+  }
+  if (stage === "provisional") {
+    if (view.state !== "provisional" || view.provisional.agentName !== child.agentName || view.provisional.agentKind !== child.agentKind || view.provisional.profileName !== child.profileName || !sameOptional(view.provisional.requestedProfileName, child.requestedProfileName)) {
+      throw new Error("SUPERVISION_PUBLICATION_MISMATCH: installed provisional supervisor state does not match the binding");
+    }
+    return;
+  }
+  if ((view.state !== "active" && view.state !== "degraded") || view.child.agentName !== child.agentName || view.child.agentKind !== child.agentKind || view.child.profileName !== child.profileName || view.child.paneId !== paneId || !sameOptional(view.child.requestedAgentKind, child.requestedAgentKind) || !sameOptional(view.child.requestedProfileName, child.requestedProfileName)) {
+    throw new Error("SUPERVISION_PUBLICATION_MISMATCH: installed exact supervisor state does not match the binding");
+  }
 }
 
 function clone<T>(value: T): T {
@@ -568,7 +602,64 @@ function boundedSupervisionEvent(event: SupervisionEvent, truncation: JobTruncat
   return { eventId, atMs: event.atMs, type: event.type, priority: event.priority, summary, ...(event.details === undefined ? {} : { details: event.details }) };
 }
 
-function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation): SupervisionJobView {
+function boundedProvisional(view: SupervisionProvisionalView, truncation: JobTruncation): SupervisionProvisionalView {
+  const agentName = boundedText(view.agentName, PUBLIC_FIELD_BYTES);
+  const paneId = boundedText(view.paneId, PUBLIC_FIELD_BYTES);
+  const terminalId = boundedText(view.terminalId, PUBLIC_FIELD_BYTES);
+  const profileName = boundedText(view.profileName, PUBLIC_FIELD_BYTES);
+  const requestedProfileName = view.requestedProfileName === undefined ? undefined : boundedText(view.requestedProfileName, PUBLIC_FIELD_BYTES);
+  const clipped = [
+    agentName !== view.agentName,
+    paneId !== view.paneId,
+    terminalId !== view.terminalId,
+    profileName !== view.profileName,
+    requestedProfileName !== view.requestedProfileName,
+  ].some(Boolean);
+  if (clipped) truncation.supervisionFieldsClipped = (truncation.supervisionFieldsClipped ?? 0) + 1;
+  return {
+    agentName,
+    agentKind: "agy",
+    paneId,
+    terminalId,
+    profileName,
+    ...(requestedProfileName === undefined ? {} : { requestedProfileName }),
+    baseline: { ...view.baseline }
+  };
+}
+
+function boundedChild(view: SupervisionChildView, truncation: JobTruncation): SupervisionChildView {
+  const agentName = boundedText(view.agentName, PUBLIC_FIELD_BYTES);
+  const agentKind = boundedText(view.agentKind, PUBLIC_FIELD_BYTES);
+  const paneId = boundedText(view.paneId, PUBLIC_FIELD_BYTES);
+  const terminalId = boundedText(view.terminalId, PUBLIC_FIELD_BYTES);
+  const profileName = boundedText(view.profileName, PUBLIC_FIELD_BYTES);
+  const requestedProfileName = view.requestedProfileName === undefined ? undefined : boundedText(view.requestedProfileName, PUBLIC_FIELD_BYTES);
+  const requestedAgentKind = view.requestedAgentKind === undefined ? undefined : boundedText(view.requestedAgentKind, PUBLIC_FIELD_BYTES);
+  if ([
+    agentName !== view.agentName,
+    agentKind !== view.agentKind,
+    paneId !== view.paneId,
+    terminalId !== view.terminalId,
+    profileName !== view.profileName,
+    requestedProfileName !== view.requestedProfileName,
+    requestedAgentKind !== view.requestedAgentKind,
+  ].some(Boolean)) truncation.supervisionFieldsClipped = (truncation.supervisionFieldsClipped ?? 0) + 1;
+  return {
+    agentName,
+    agentKind,
+    paneId,
+    terminalId,
+    profileName,
+    ...(requestedProfileName === undefined ? {} : { requestedProfileName }),
+    ...(requestedAgentKind === undefined ? {} : { requestedAgentKind }),
+  };
+}
+
+function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation): SupervisionJobView | undefined {
+  if (!isSupervisionJobView(view)) {
+    truncation.publicEvidenceOmitted = true;
+    return undefined;
+  }
   const transitions = view.transitions.slice(-PUBLIC_SUPERVISION_TRANSITIONS);
   const events = view.events.slice(-PUBLIC_SUPERVISION_EVENTS).map((event) => boundedSupervisionEvent(event, truncation));
   const reviews = view.reviewer.reviews.slice(-PUBLIC_SUPERVISION_REVIEWS).map((review) => {
@@ -582,8 +673,7 @@ function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation)
   if (omittedTransitions > 0) truncation.supervisionTransitions = omittedTransitions;
   if (omittedEvents > 0) truncation.supervisionEvents = omittedEvents;
   if (omittedReviews > 0) truncation.supervisionReviews = omittedReviews;
-  return {
-    state: view.state,
+  const common = {
     monitor: { ...view.monitor },
     reviewer: {
       model: boundedText(view.reviewer.model, PUBLIC_FIELD_BYTES),
@@ -599,19 +689,26 @@ function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation)
     events,
     truncatedEvents: view.truncatedEvents + omittedEvents,
     unobservedEvents: view.unobservedEvents,
-    ...(view.child === undefined ? {} : {
-      child: {
-        agentName: boundedText(view.child.agentName, PUBLIC_FIELD_BYTES),
-        agentKind: boundedText(view.child.agentKind, PUBLIC_FIELD_BYTES),
-        paneId: boundedText(view.child.paneId, PUBLIC_FIELD_BYTES),
-        terminalId: boundedText(view.child.terminalId, PUBLIC_FIELD_BYTES),
-        profileName: boundedText(view.child.profileName, PUBLIC_FIELD_BYTES),
-        ...(view.child.requestedProfileName === undefined ? {} : { requestedProfileName: boundedText(view.child.requestedProfileName, PUBLIC_FIELD_BYTES) }),
-        ...(view.child.requestedAgentKind === undefined ? {} : { requestedAgentKind: boundedText(view.child.requestedAgentKind, PUBLIC_FIELD_BYTES) })
-      }
-    }),
-    ...(view.status === undefined ? {} : { status: view.status }),
     ...(view.settledReason === undefined ? {} : { settledReason: boundedText(view.settledReason, PUBLIC_FIELD_BYTES) })
+  };
+  if (view.state === "provisional") return {
+    ...common,
+    state: "provisional",
+    provisional: boundedProvisional(view.provisional, truncation),
+    ...(view.status === undefined ? {} : { status: view.status })
+  };
+  if (view.state === "active" || view.state === "degraded") return {
+    ...common,
+    state: view.state,
+    child: boundedChild(view.child, truncation),
+    status: view.status
+  };
+  if (view.state === "reserved") return { ...common, state: "reserved" };
+  return {
+    ...common,
+    state: "settled",
+    ...(view.child === undefined ? {} : { child: boundedChild(view.child, truncation) }),
+    ...(view.status === undefined ? {} : { status: view.status })
   };
 }
 
@@ -803,6 +900,7 @@ function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
 
 export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): JobDetail {
   const truncation: JobTruncation = boundedTruncation(detail.truncation);
+  const supervision = detail.supervision === undefined ? undefined : boundedSupervision(detail.supervision, truncation);
   const jobId = boundedText(detail.jobId, PUBLIC_FIELD_BYTES);
   if (jobId !== detail.jobId) truncation.jobIdClipped = true;
   const terminal = detail.operation_phase === "settled";
@@ -820,7 +918,7 @@ export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): Jo
     ...(terminal && detail.wait_result ? { wait_result: detail.wait_result } : {}),
     ...(terminal && detail.supervision_result ? { supervision_result: detail.supervision_result } : {}),
     ...(terminal && detail.supervision_reason ? { supervision_reason: boundedText(detail.supervision_reason, PUBLIC_FIELD_BYTES) } : {}),
-    ...(detail.supervision ? { supervision: boundedSupervision(detail.supervision, truncation) } : {}),
+    ...(supervision === undefined ? {} : { supervision }),
     ...(detail.pending_events ? { pending_events: detail.pending_events.map((event) => boundedSupervisionEvent(event, truncation)) } : {}),
     ...(detail.unobservedEvents === undefined ? {} : { unobservedEvents: detail.unobservedEvents }),
     ...(terminal && detail.result ? { result: copyResult({
@@ -1132,7 +1230,8 @@ export class JobRegistry {
       runnerDone: false,
       activityCount: 0,
       executionPromise: Promise.resolve(),
-      resolveDrain: [] as Array<() => void>
+      resolveDrain: [] as Array<() => void>,
+      supervisionBindingStage: "reserved" as const
     };
     const record = partial as JobRecord;
     record.control = this.createControl(partial);
@@ -1215,6 +1314,59 @@ export class JobRegistry {
   }
 
   /**
+   * Prepare the request half of AGY's provisional supervisor publication. It
+   * changes only the selected child metadata; targetIds stay empty until exact
+   * native-session strengthening.
+   */
+  prepareProvisionalSupervisionChildBinding(jobId: string, bound: ProvisionalSupervisionChildBinding): SupervisionChildBindingPublication {
+    const record = this.jobs.get(jobId);
+    if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
+    if (record.detail.request.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job has a supervised child");
+    if (record.detail.request.child.agentKind !== "agy" || bound.agentKind !== "agy") throw new Error("SUPERVISION_PROVISIONAL_INVALID: provisional supervision is AGY-only");
+    if (typeof bound.profileName !== "string" || bound.profileName.length === 0 || /[\0\r\n]/u.test(bound.profileName)) throw new Error("SUPERVISION_BINDING_INVALID: provisional profile name is malformed");
+    const request = record.detail.request;
+    if (record.supervisionBindingStage !== "reserved" || request.targetIds.length !== 0) throw new Error("SUPERVISION_ALREADY_BOUND: supervisor request already has a provisional or exact binding");
+    if (request.targets.length !== 1 || request.target_generation_refs?.length !== 1) throw new Error("SUPERVISION_REQUEST_INVALID: supervisor target arrays are not aligned");
+    const reservedChild = clone(request.child);
+    const reservedTargetIds = [...request.targetIds];
+    const selectedChild: SupervisedJobChild = {
+      agentName: reservedChild.agentName,
+      agentKind: "agy",
+      profileName: bound.profileName,
+      ...(bound.profileName === reservedChild.profileName ? {} : { requestedProfileName: reservedChild.profileName })
+    };
+    let committed = false;
+    let published = false;
+    return {
+      commit: () => {
+        if (committed) throw new Error("SUPERVISION_ALREADY_BOUND: binding publication was already committed");
+        if (!record.gateOpen || record.detail.operation_phase !== "running") throw new Error("SUPERVISION_BINDING_CLOSED: supervisor job is no longer running");
+        if (record.supervisionBindingStage !== "reserved") throw new Error("SUPERVISION_ALREADY_BOUND: supervisor request already has a provisional or exact binding");
+        request.child = clone(selectedChild);
+        request.targetIds = [];
+        record.supervisionBindingStage = "provisional";
+        committed = true;
+      },
+      rollback: () => {
+        if (!committed) return;
+        request.child = clone(reservedChild);
+        request.targetIds = [...reservedTargetIds];
+        record.supervisionBindingStage = "reserved";
+        committed = false;
+        if (published) this.notifyChange();
+        published = false;
+      },
+      publish: () => {
+        if (!committed) throw new Error("SUPERVISION_BINDING_UNCOMMITTED: cannot publish an uncommitted provisional binding");
+        if (published) return;
+        verifyInstalledSupervisor(record, "provisional", selectedChild);
+        published = true;
+        this.notifyChange();
+      },
+    };
+  }
+
+  /**
    * Prepare the synchronous request half of supervisor binding. No public field
    * changes until `commit`, and no observer is notified until `publish`, after
    * the supervisor has installed its matching bound state.
@@ -1223,10 +1375,12 @@ export class JobRegistry {
     const record = this.jobs.get(jobId);
     if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
     if (record.detail.request.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job has a supervised child");
-    if (typeof bound.paneId !== "string" || bound.paneId.length === 0 || /[\0\r\n]/u.test(bound.paneId)) throw new Error("SUPERVISION_BINDING_INVALID: exact pane id is malformed");
     const request = record.detail.request;
-    if (request.targetIds.length !== 0) throw new Error("SUPERVISION_ALREADY_BOUND: supervisor request already has an exact target");
+    if (request.child.agentKind === "agy" || record.supervisionBindingStage === "provisional") throw new Error("SUPERVISION_STRENGTHENING_REQUIRED: generic exact binding cannot bypass AGY strengthening");
+    if (typeof bound.paneId !== "string" || bound.paneId.length === 0 || /[\0\r\n]/u.test(bound.paneId)) throw new Error("SUPERVISION_BINDING_INVALID: exact pane id is malformed");
+    if (record.supervisionBindingStage === "exact" || request.targetIds.length !== 0) throw new Error("SUPERVISION_ALREADY_BOUND: supervisor request already has an exact target");
     if (request.targets.length !== 1 || request.target_generation_refs?.length !== 1) throw new Error("SUPERVISION_REQUEST_INVALID: supervisor target arrays are not aligned");
+    const reservedStage = record.supervisionBindingStage;
     const reservedChild = clone(request.child);
     const reservedTargetIds = [...request.targetIds];
     const selectedChild: SupervisedJobChild = {
@@ -1242,14 +1396,17 @@ export class JobRegistry {
       commit: () => {
         if (committed) throw new Error("SUPERVISION_ALREADY_BOUND: binding publication was already committed");
         if (!record.gateOpen || record.detail.operation_phase !== "running") throw new Error("SUPERVISION_BINDING_CLOSED: supervisor job is no longer running");
+        if (record.supervisionBindingStage !== reservedStage) throw new Error("SUPERVISION_BINDING_STALE: supervisor binding changed before commit");
         request.child = clone(selectedChild);
         request.targetIds = [bound.paneId];
+        record.supervisionBindingStage = "exact";
         committed = true;
       },
       rollback: () => {
         if (!committed) return;
         request.child = clone(reservedChild);
         request.targetIds = [...reservedTargetIds];
+        record.supervisionBindingStage = reservedStage;
         committed = false;
         if (published) this.notifyChange();
         published = false;
@@ -1257,6 +1414,8 @@ export class JobRegistry {
       publish: () => {
         if (!committed) throw new Error("SUPERVISION_BINDING_UNCOMMITTED: cannot publish an uncommitted binding");
         if (published) return;
+        if (record.supervisionBindingStage !== "exact") throw new Error("SUPERVISION_BINDING_STALE: supervisor binding changed before publish");
+        verifyInstalledSupervisor(record, "exact", selectedChild, bound.paneId);
         published = true;
         this.notifyChange();
       },
@@ -1275,9 +1434,13 @@ export class JobRegistry {
   /** Read-only exact ownership lookup. It never projects or consumes receipts. */
   activeSupervisorFor(identity: SupervisedIdentity): { jobId: string } | undefined {
     for (const record of this.jobs.values()) {
-      if (record.detail.kind !== "supervisor" || record.detail.operation_phase === "settled") continue;
+      if (record.detail.kind !== "supervisor" || record.detail.operation_phase === "settled" || record.detail.request.targetIds.length === 0) continue;
       const port = record.supervision;
-      if (port?.childLive() === true && port.coversIdentity?.(identity) === true) return { jobId: record.detail.jobId };
+      if (!port) continue;
+      // Provisional AGY evidence is intentionally not exact coverage, even if
+      // an internal port accidentally reports a matching native identity.
+      const state = port.view().state;
+      if ((state === "active" || state === "degraded") && port.childLive() === true && port.coversIdentity?.(identity) === true) return { jobId: record.detail.jobId };
     }
     return undefined;
   }
@@ -1360,12 +1523,13 @@ export class JobRegistry {
   async cancel(jobId: string): Promise<JobDetail | undefined> {
     const record = this.jobs.get(jobId);
     if (!record) return undefined;
-    if (record.supervision?.childLive() === true) {
-      throw new SupervisionActiveError({ jobId: boundedText(record.detail.jobId, PUBLIC_FIELD_BYTES), kind: record.detail.kind });
-    }
     const request = await record.lock.runExclusive(() => {
       if (record.detail.operation_phase === "settled") return false;
       if (record.detail.operation_phase === "cancel_requested") return true;
+      // Recheck under the transition lock immediately before closing the gate.
+      if (record.supervision?.childLive() === true) {
+        throw new SupervisionActiveError({ jobId: boundedText(record.detail.jobId, PUBLIC_FIELD_BYTES), kind: record.detail.kind });
+      }
       // The gate/fence closes before the cancellation request becomes visible.
       this.closeGate(record);
       record.detail.operation_phase = "cancel_requested";

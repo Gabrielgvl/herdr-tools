@@ -83,6 +83,8 @@ describe("supervisor-aware job surfaces", () => {
         monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
         reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
         transitions: [], truncatedTransitions: 0, events: [], truncatedEvents: 0, unobservedEvents: 3,
+        child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-pi" },
+        status: "working",
       }),
       takePendingEvents: () => [],
       childLive: () => true,

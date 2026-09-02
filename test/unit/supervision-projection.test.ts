@@ -20,17 +20,22 @@ function event(index: number, summary = `event-${index}`): SupervisionEvent {
 }
 
 function view(overrides: Partial<SupervisionJobView> = {}): SupervisionJobView {
-  return {
-    state: "active",
+  const merged = {
+    state: "active" as const,
     monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
-    reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+    reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max" as const, cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
     transitions: [],
     truncatedTransitions: 0,
     events: [],
     truncatedEvents: 0,
     unobservedEvents: 0,
+    child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-pi" },
+    status: "idle" as const,
     ...overrides,
   };
+  if (merged.state === "provisional") return { ...merged, child: undefined } as SupervisionJobView;
+  if (merged.state === "reserved") return { ...merged, child: undefined, status: undefined } as SupervisionJobView;
+  return merged as SupervisionJobView;
 }
 
 function detail(overrides: Partial<JobDetail> = {}): JobDetail {
@@ -38,6 +43,69 @@ function detail(overrides: Partial<JobDetail> = {}): JobDetail {
 }
 
 describe("the public supervision projection", () => {
+  it("publishes provisional AGY evidence without native-session or exact-child claims", () => {
+    const projected = publicDetail(detail({
+      supervision: view({
+        state: "provisional",
+        provisional: {
+          agentName: "worker",
+          agentKind: "agy",
+          paneId: "p1",
+          terminalId: "t1",
+          profileName: "researcher-agy",
+          baseline: { state: "idle", stateChangeSeq: 7, revision: 3 },
+        },
+        status: "idle",
+      }),
+    }));
+    expect(projected).toMatchObject({
+      operation_phase: "running",
+      supervision: {
+        state: "provisional",
+        provisional: {
+          agentName: "worker",
+          agentKind: "agy",
+          paneId: "p1",
+          terminalId: "t1",
+          profileName: "researcher-agy",
+          baseline: { state: "idle", stateChangeSeq: 7, revision: 3 },
+        },
+      },
+    });
+    expect(projected.supervision).not.toHaveProperty("child");
+    expect(JSON.stringify(projected.supervision)).not.toContain("agentSession");
+  });
+
+  it("omits malformed state evidence instead of projecting contradictory claims", () => {
+    const provisional = view({
+      state: "provisional",
+      provisional: {
+        agentName: "worker",
+        agentKind: "agy",
+        paneId: "p1",
+        terminalId: "t1",
+        profileName: "researcher-agy",
+        baseline: { state: "idle", stateChangeSeq: 7, revision: 3 },
+      },
+      status: "idle",
+    });
+    const exact = view({
+      state: "active",
+      child: { agentName: "worker", agentKind: "agy", paneId: "p1", terminalId: "t1", profileName: "researcher-agy" },
+      status: "idle",
+    });
+    const malformed = [
+      { ...provisional, child: exact.child },
+      { ...provisional, provisional: { ...provisional.provisional!, agentKind: "pi" } },
+      { ...exact, provisional: provisional.provisional },
+    ];
+    for (const supervision of malformed) {
+      const projected = publicDetail(detail({ supervision: supervision as unknown as SupervisionJobView }));
+      expect(projected).not.toHaveProperty("supervision");
+      expect(projected.truncation?.publicEvidenceOmitted).toBe(true);
+    }
+  });
+
   it("keeps the newest bounded transitions, events, and reviews and counts what it dropped", () => {
     const projected = publicDetail(detail({
       supervision: view({
@@ -147,9 +215,19 @@ describe("the registry's supervision port", () => {
     const registered = registry.register(request, async () => new Promise<never>(() => undefined));
     await vi.waitFor(() => expect(registry.get(registered.jobId)?.operation_phase).toBe("running"));
     expect(registry.get(registered.jobId)?.request).toMatchObject({ child: { agentKind: "pi", profileName: "worker-pi" }, targetIds: [] });
+    let installed: SupervisionJobView = view({ child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-pi" }, status: "idle" });
+    registry.attachSupervision(registered.jobId, port({
+      view: () => installed,
+      childLive: () => true,
+    }));
 
     const publication = registry.prepareSupervisionChildBinding(registered.jobId, { agentKind: "claude", profileName: "worker-claude", paneId: "p1" });
     publication.commit();
+    expect(() => publication.publish()).toThrow(/SUPERVISION_PUBLICATION_MISMATCH/u);
+    installed = view({
+      child: { agentName: "worker", agentKind: "claude", paneId: "p1", terminalId: "t1", profileName: "worker-claude", requestedAgentKind: "pi", requestedProfileName: "worker-pi" },
+      status: "idle",
+    });
     publication.publish();
     expect(registry.get(registered.jobId)?.request).toMatchObject({
       targets: ["worker"],
@@ -158,6 +236,50 @@ describe("the registry's supervision port", () => {
       child: { agentName: "worker", agentKind: "claude", profileName: "worker-claude", requestedAgentKind: "pi", requestedProfileName: "worker-pi" },
     });
     expect(() => registry.prepareSupervisionChildBinding(registered.jobId, { agentKind: "claude", profileName: "worker-claude", paneId: "p1" })).toThrow(/SUPERVISION_ALREADY_BOUND/u);
+    registry.shutdown();
+  });
+
+  it("requires an installed matching AGY provisional state before publishing", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_agy_provisional" });
+    const registered = registry.register({
+      ...request,
+      targets: ["agy"],
+      child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" },
+    }, async () => new Promise<never>(() => undefined));
+    await vi.waitFor(() => expect(registry.get(registered.jobId)?.operation_phase).toBe("running"));
+    let installed: SupervisionJobView = view({ child: { agentName: "worker", agentKind: "agy", paneId: "p1", terminalId: "t1", profileName: "researcher-agy" }, status: "idle" });
+    registry.attachSupervision(registered.jobId, port({ view: () => installed, childLive: () => true }));
+    const publication = registry.prepareProvisionalSupervisionChildBinding(registered.jobId, { agentKind: "agy", profileName: "researcher-agy" });
+    publication.commit();
+    expect(() => publication.publish()).toThrow(/SUPERVISION_PUBLICATION_MISMATCH/u);
+
+    installed = view({
+      state: "provisional",
+      provisional: {
+        agentName: "worker",
+        agentKind: "agy",
+        paneId: "p1",
+        terminalId: "t1",
+        profileName: "researcher-agy",
+        baseline: { state: "idle", stateChangeSeq: 1, revision: 1 },
+      },
+      status: "idle",
+    });
+    publication.publish();
+    expect(registry.get(registered.jobId)?.supervision?.state).toBe("provisional");
+    registry.shutdown();
+  });
+
+  it("does not let generic exact binding bypass AGY strengthening", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_agy_strengthen" });
+    const registered = registry.register({
+      ...request,
+      targets: ["agy"],
+      child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" },
+    }, async () => new Promise<never>(() => undefined));
+    await vi.waitFor(() => expect(registry.get(registered.jobId)?.operation_phase).toBe("running"));
+    expect(() => registry.prepareSupervisionChildBinding(registered.jobId, { agentKind: "agy", profileName: "researcher-agy", paneId: "p1" }))
+      .toThrow(/SUPERVISION_STRENGTHENING_REQUIRED/u);
     registry.shutdown();
   });
 

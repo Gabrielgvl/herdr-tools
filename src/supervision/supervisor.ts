@@ -133,7 +133,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * binding whose commit has not yet seen it.
    */
   private chain: Promise<void> = Promise.resolve();
-  private state: SupervisionState = "reserved";
+  private state: Exclude<SupervisionState, "provisional"> = "reserved";
   private paneId: string | undefined;
   private identity: SupervisedIdentity | undefined;
   private anchor: SupervisionAnchor | undefined;
@@ -885,8 +885,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const projectedState = this.bindingPublished && !this.isSettled()
       ? monitorDegraded ? "degraded" : "active"
       : this.state;
-    return {
-      state: projectedState,
+    const common = {
       monitor: {
         connected: !streamDegraded,
         degraded: monitorDegraded,
@@ -904,7 +903,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       },
       reviewer: {
         model: SUPERVISION_REVIEWER_MODEL,
-        thinking: "max",
+        thinking: "max" as const,
         cadenceMinutes: Math.round(this.deps.cadenceMs / 60_000),
         degraded: this.reviewerDegraded,
         reviews: this.reviews.entries(),
@@ -916,9 +915,20 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       events: this.log.history(),
       truncatedEvents: this.log.truncatedEvents(),
       unobservedEvents: this.log.unobserved(),
+      ...(this.settlement === undefined ? {} : { settledReason: this.settlement.reason }),
+    };
+    if (projectedState === "reserved") return { ...common, state: "reserved" };
+    if (projectedState === "settled") return {
+      ...common,
+      state: "settled",
       ...(!this.bindingPublished || this.identity === undefined ? {} : { child: this.childView(this.identity) }),
       ...(!this.bindingPublished || this.status === undefined ? {} : { status: this.status }),
-      ...(this.settlement === undefined ? {} : { settledReason: this.settlement.reason }),
+    };
+    return {
+      ...common,
+      state: projectedState,
+      child: this.childView(this.identity!),
+      status: this.status!,
     };
   }
 

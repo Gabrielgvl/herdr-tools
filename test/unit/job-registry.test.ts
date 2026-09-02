@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { boundedList, fitsPublic, JobRegistry, jobDetailContent, publicDetail, type JobDetail, type JobListResult, type JobRequestSnapshot, type JobRunResult, type JobOperationControl } from "../../src/job-registry.js";
+import { boundedList, fitsPublic, JobRegistry, jobDetailContent, publicDetail, SupervisionActiveError, type JobDetail, type JobListResult, type JobRequestSnapshot, type JobRunResult, type JobOperationControl, type SupervisorJobRequestSnapshot } from "../../src/job-registry.js";
 import { historicalTargetEvidence } from "../../src/wait-target-evidence.js";
+import type { SupervisionJobPort, SupervisionJobView } from "../../src/supervision/state.js";
+import type { SupervisedIdentity } from "../../src/supervision/identity.js";
 
 const request: JobRequestSnapshot = {
   kind: "wait",
@@ -22,6 +24,24 @@ function deferred<T>() {
 
 const success: JobRunResult = { wait_result: "condition_met", matched: true, reason: "condition_met", targets: [{ target: "one", targetId: "p1", metadata: { agent_status: "done" }, recentUnwrappedLines: ["done"], observedAtMs: 1, matched: true }] };
 
+const provisionalRequest: SupervisorJobRequestSnapshot = {
+  kind: "supervisor",
+  label: "supervise agy",
+  targets: ["agy"],
+  targetIds: [],
+  target_generation_refs: ["target_generation_provisional"],
+  child: { agentName: "agy", agentKind: "agy", profileName: "researcher-agy" },
+  settings: { reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max" },
+};
+
+const provisionalIdentity: SupervisedIdentity = {
+  paneId: "p1",
+  terminalId: "t1",
+  agentName: "agy",
+  agentKind: "agy",
+  agentSession: { source: "agy", agent: "agy", kind: "id", value: "native-session" },
+};
+
 describe("JobRegistry", () => {
   it("starts jobs without a cap and retains only the latest bounded progress", async () => {
     let ids = 0;
@@ -39,6 +59,78 @@ describe("JobRegistry", () => {
     await Promise.all([one.promise, two.promise]);
     expect(registry.get(one.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "condition_met" });
     expect(registry.get(two.jobId)).toMatchObject({ operation_phase: "settled", wait_result: "timed_out" });
+  });
+
+  it("publishes AGY provisional supervision without exact coverage or cancellation", async () => {
+    const onChange = vi.fn();
+    const registry = new JobRegistry({ idFactory: () => "job_provisional", onChange });
+    const handle = registry.register(provisionalRequest, async () => new Promise<never>(() => undefined));
+    await vi.waitFor(() => expect(registry.get(handle.jobId)?.operation_phase).toBe("running"));
+
+    let shutdownCalls = 0;
+    let childLive = false;
+    const provisionalView: SupervisionJobView = {
+      state: "provisional",
+      monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
+      reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+      transitions: [],
+      truncatedTransitions: 0,
+      events: [],
+      truncatedEvents: 0,
+      unobservedEvents: 0,
+      provisional: {
+        agentName: "agy",
+        agentKind: "agy",
+        paneId: "p1",
+        terminalId: "t1",
+        profileName: "researcher-agy",
+        baseline: { state: "idle", stateChangeSeq: 4, revision: 2 },
+      },
+      status: "idle",
+    };
+    const port: SupervisionJobPort = {
+      view: () => provisionalView,
+      takePendingEvents: () => [],
+      childLive: () => childLive,
+      coversIdentity: () => true,
+      shutdown: () => { shutdownCalls += 1; },
+    };
+    registry.attachSupervision(handle.jobId, port);
+    onChange.mockClear();
+
+    const publication = registry.prepareProvisionalSupervisionChildBinding(handle.jobId, { agentKind: "agy", profileName: "researcher-agy" });
+    expect(() => publication.publish()).toThrow(/SUPERVISION_BINDING_UNCOMMITTED/u);
+    publication.commit();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(registry.get(handle.jobId)).toMatchObject({
+      operation_phase: "running",
+      request: { targetIds: [], child: { agentName: "agy", agentKind: "agy", profileName: "researcher-agy" } },
+      supervision: { state: "provisional", provisional: { paneId: "p1", terminalId: "t1", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } } },
+    });
+    expect(registry.activeSupervisorFor(provisionalIdentity)).toBeUndefined();
+
+    // The child becomes live after cancellation's initial observation but before
+    // its locked transition. The locked recheck must refuse the close.
+    const cancellation = registry.cancel(handle.jobId);
+    childLive = true;
+    await expect(cancellation).rejects.toBeInstanceOf(SupervisionActiveError);
+    expect(registry.get(handle.jobId)?.operation_phase).toBe("running");
+
+    publication.publish();
+    expect(onChange).toHaveBeenCalledTimes(1);
+    await expect(registry.cancel(handle.jobId)).rejects.toBeInstanceOf(SupervisionActiveError);
+    expect(registry.get(handle.jobId)?.operation_phase).toBe("running");
+    expect(registry.size()).toBe(1);
+
+    publication.rollback();
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(registry.get(handle.jobId)).toMatchObject({
+      operation_phase: "running",
+      request: { targetIds: [], child: { agentKind: "agy", profileName: "researcher-agy" } },
+    });
+    expect(shutdownCalls).toBe(0);
+    registry.shutdown();
+    expect(shutdownCalls).toBe(1);
   });
 
   it("orders newest first, filters before pagination, and returns immutable views", async () => {

@@ -7,6 +7,7 @@ import {
   type SupervisorJobRequestSnapshot,
 } from "../../src/job-registry.js";
 import { classifySnapshotTarget } from "../../src/supervision/identity.js";
+import type { SupervisionJobPort, SupervisionJobView } from "../../src/supervision/state.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
 const waitRequest: JobRequestSnapshot = {
@@ -50,8 +51,29 @@ function pane(overrides: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
+function installedView(request: SupervisorJobRequestSnapshot): SupervisionJobView {
+  return {
+    state: "active",
+    monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
+    reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+    transitions: [],
+    truncatedTransitions: 0,
+    events: [],
+    truncatedEvents: 0,
+    unobservedEvents: 0,
+    child: { agentName: request.child.agentName, agentKind: request.child.agentKind, paneId: "p1", terminalId: "t1", profileName: request.child.profileName },
+    status: "working",
+  };
+}
+
 async function runningSupervisor(registry: JobRegistry, request: SupervisorJobRequestSnapshot = supervisorRequest): Promise<string> {
   const handle = registry.register(request, async () => new Promise<never>(() => undefined));
+  registry.attachSupervision(handle.jobId, {
+    view: () => installedView(request),
+    takePendingEvents: () => [],
+    childLive: () => true,
+    shutdown: () => undefined,
+  } satisfies SupervisionJobPort);
   await vi.waitFor(() => expect(registry.get(handle.jobId)?.operation_phase).toBe("running"));
   return handle.jobId;
 }
@@ -102,7 +124,7 @@ describe("coverage contract edges", () => {
     expect(() => registry.prepareSupervisionChildBinding(misaligned, { agentKind: "pi", profileName: "worker-pi", paneId: "p1" })).toThrow(/SUPERVISION_REQUEST_INVALID/u);
 
     const jobId = await runningSupervisor(registry);
-    const publication = registry.prepareSupervisionChildBinding(jobId, { agentKind: "claude", profileName: "worker-claude", paneId: "p1" });
+    const publication = registry.prepareSupervisionChildBinding(jobId, { agentKind: "pi", profileName: "worker-pi", paneId: "p1" });
     expect(() => publication.publish()).toThrow(/SUPERVISION_BINDING_UNCOMMITTED/u);
     publication.commit();
     expect(() => publication.commit()).toThrow(/SUPERVISION_ALREADY_BOUND/u);

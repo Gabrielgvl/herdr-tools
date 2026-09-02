@@ -3185,12 +3185,13 @@ describe("herdr_launch profile-only contract", () => {
     expect(recipients.size).toBe(0);
   });
 
-  it.each(["missing_session", "stale_lifecycle"] as const)("resamples AGY confirmation after %s and accepts an advanced unknown state", async (scenario) => {
+  it.each(["missing_session", "stale_lifecycle"] as const)("resamples AGY confirmation after %s and an advanced unknown state", async (scenario) => {
     vi.useFakeTimers();
     try {
       const harness = makeCli({ omitFreshAgentSession: true });
       const baseRun = harness.cli.runJson;
       const baseStdin = harness.cli.runJsonWithStdin!;
+      const supervision = stubSupervision();
       let confirmationSample = 0;
       harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
         const response = structuredClone(await baseStdin(argv, input, signal, preserve));
@@ -3214,7 +3215,7 @@ describe("herdr_launch profile-only contract", () => {
               : [];
         for (const record of records) {
           if (confirmationSample === 1 && scenario === "missing_session") delete record.agent_session;
-          record.agent_status = confirmationSample === 1 ? "idle" : "unknown";
+          record.agent_status = confirmationSample === 1 ? "idle" : confirmationSample === 2 ? "unknown" : scenario === "stale_lifecycle" ? "blocked" : "working";
           record.state_change_seq = confirmationSample === 1 ? 7 : 8;
           record.revision = confirmationSample === 1 ? 3 : 4;
           record.screen_detection_skipped = true;
@@ -3222,20 +3223,128 @@ describe("herdr_launch profile-only contract", () => {
         return response;
       });
 
-      const pending = launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli);
+      const pending = launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(supervision.strengthened).toHaveLength(0);
       await vi.advanceTimersByTimeAsync(100);
       await expect(pending).resolves.toMatchObject({ details: {
         promptConsumption: "confirmed",
         initialPromptSubmission: { confirmed: true },
-        initialPromptObservation: { status: "unknown", state: "unknown", stateChangeSeq: 8 },
-        promptConfirmation: { reason: "state_change_seq_advanced", samples: 2 }
+        initialPromptObservation: scenario === "stale_lifecycle"
+          ? { status: "not_working", state: "blocked", stateChangeSeq: 8 }
+          : { status: "working", state: "working", stateChangeSeq: 8 },
+        promptConfirmation: { reason: scenario === "stale_lifecycle" ? "state_change_seq_advanced" : "working", samples: 3 }
       } });
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it.each(["snapshot_target_missing", "direct_pane_missing", "agent_missing", "string_read_failure", "untyped_inner_failure", "lifecycle_skew"] as const)("fails AGY confirmation closed for %s", async (scenario) => {
+  it("resamples incomplete agent lifecycle while ignoring same-identity lifecycle and screen-diagnostic skew", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({ omitFreshAgentSession: true });
+      const base = harness.cli.runJson;
+      let confirmationSample = 0;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        const response = structuredClone(await base(argv, signal, preserve));
+        if (harness.stdinInputs.length === 0) return response;
+        if (argv[0] === "api") confirmationSample += 1;
+        const result = response.result as Record<string, unknown>;
+        const records = argv[0] === "api"
+          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
+          : argv[0] === "agent" && argv[1] === "get"
+            ? [result.agent as Record<string, unknown>]
+            : argv[0] === "pane" && argv[1] === "get"
+              ? [result.pane as Record<string, unknown>]
+              : [];
+        for (const item of records) {
+          const authoritative = argv[0] === "agent" && argv[1] === "get";
+          item.agent_status = authoritative ? "working" : "idle";
+          item.state_change_seq = authoritative ? 8 : 7;
+          item.revision = authoritative ? 4 : 3;
+          item.screen_detection_skipped = authoritative;
+          if (authoritative && confirmationSample === 1) {
+            delete item.agent_status;
+            delete item.state_change_seq;
+            delete item.revision;
+          }
+        }
+        return response;
+      });
+
+      const pending = launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli);
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(pending).resolves.toMatchObject({ details: {
+        initialPromptObservation: { status: "working", stateChangeSeq: 8, revision: 4, screenDetectionSkipped: true },
+        promptConfirmation: { samples: 2 }
+      } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["advanced_unknown", "incomplete_lifecycle", "ack_revision_regression"] as const)("keeps AGY confirmation unconfirmed through timeout for %s", async (scenario) => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({ omitFreshAgentSession: true });
+      const baseRun = harness.cli.runJson;
+      const baseStdin = harness.cli.runJsonWithStdin!;
+      const recipients = new RecipientRegistry();
+      const supervision = stubSupervision();
+      harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+        const response = structuredClone(await baseStdin(argv, input, signal, preserve));
+        if (scenario === "ack_revision_regression") (response.result as { agent: Record<string, unknown> }).agent.revision = 10;
+        return response;
+      });
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        const response = structuredClone(await baseRun(argv, signal, preserve));
+        if (harness.stdinInputs.length === 0) return response;
+        const result = response.result as Record<string, unknown>;
+        if (argv[0] === "agent" && argv[1] === "get") {
+          const agent = result.agent as Record<string, unknown>;
+          agent.agent_status = scenario === "advanced_unknown" ? "unknown" : "working";
+          agent.state_change_seq = 8;
+          agent.revision = 4;
+          if (scenario === "incomplete_lifecycle") delete agent.revision;
+        }
+        return response;
+      });
+
+      const pending = launch(
+        { name: "worker", profile: "researcher-agy", initialPrompt: "research" },
+        catalog(profile("researcher-agy", "agy")),
+        harness.cli,
+        undefined,
+        { clock: { now: () => Date.now() }, recipients, supervision }
+      ).catch((error: LaunchFailure) => error);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const failure = await pending;
+
+      expect(failure).toMatchObject({ code: "LAUNCH_FAILED", details: {
+        causeCode: "PROMPT_UNCONFIRMED",
+        phase: "prompt_verification",
+        assignmentState: "unconfirmed",
+        promptSubmitted: true,
+        promptConsumption: "unconfirmed",
+        initialPromptSubmission: { operationId: "cli:agent:prompt", paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy", revision: scenario === "ack_revision_regression" ? 10 : 3 },
+        initialPromptObservation: scenario === "advanced_unknown"
+          ? { status: "unknown", state: "unknown", stateChangeSeq: 8, revision: 4 }
+          : scenario === "incomplete_lifecycle"
+            ? { status: "working", state: "working", stateChangeSeq: 8 }
+            : { status: "working", state: "working", stateChangeSeq: 8, revision: 4 },
+        promptConfirmation: { reason: "timeout", samples: expect.any(Number), baseline: { revision: 3 } }
+      } });
+      expect((failure.details.promptConfirmation as { samples: number }).samples).toBeGreaterThan(1);
+      expect(harness.stdinInputs).toHaveLength(1);
+      expect(supervision.strengthened).toHaveLength(0);
+      expect(recipients.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["snapshot_target_missing", "direct_pane_missing", "agent_missing", "string_read_failure", "untyped_inner_failure"] as const)("fails AGY confirmation closed for %s", async (scenario) => {
     const harness = makeCli({ omitFreshAgentSession: true });
     const base = harness.cli.runJson;
     harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
@@ -3252,20 +3361,6 @@ describe("herdr_launch profile-only contract", () => {
       if (scenario === "agent_missing" && argv[0] === "agent" && argv[1] === "get") result.agent = null;
       if (scenario === "untyped_inner_failure" && argv[0] === "agent" && argv[1] === "get") {
         result.agent = new Proxy(result.agent as Record<string, unknown>, { getOwnPropertyDescriptor: () => { throw new Error("untyped identity read"); } });
-      }
-      if (scenario === "lifecycle_skew") {
-        const records = argv[0] === "api"
-          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
-          : argv[0] === "agent" && argv[1] === "get"
-            ? [result.agent as Record<string, unknown>]
-            : argv[0] === "pane" && argv[1] === "get"
-              ? [result.pane as Record<string, unknown>]
-              : [];
-        for (const record of records) {
-          record.agent_status = argv[0] === "pane" ? "idle" : "working";
-          record.state_change_seq = argv[0] === "pane" ? 7 : 8;
-          record.revision = argv[0] === "pane" ? 3 : 4;
-        }
       }
       return response;
     });
@@ -3317,11 +3412,17 @@ describe("herdr_launch profile-only contract", () => {
     }
   });
 
-  it("preserves AGY prompt effect when strengthening throws an untyped error", async () => {
+  it("preserves bounded AGY acknowledgement evidence when strengthening throws an untyped error", async () => {
     const harness = makeCli({ omitFreshAgentSession: true });
     const supervision = stubSupervision({ onStrengthen: () => { throw new Error("strengthen failed"); } });
-    await expect(launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision }))
-      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "supervision_bind", promptSubmitted: true } });
+    const failure = await launch({ name: "worker", profile: "researcher-agy", initialPrompt: "prompt-secret" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision })
+      .catch((error: LaunchFailure) => error);
+    expect(failure).toMatchObject({ code: "LAUNCH_FAILED", details: {
+      phase: "supervision_bind",
+      promptSubmitted: true,
+      initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy", revision: 3 }
+    } });
+    expect(JSON.stringify(failure.details)).not.toContain("prompt-secret");
     expect(harness.stdinInputs).toHaveLength(1);
   });
 
@@ -3399,7 +3500,7 @@ describe("herdr_launch profile-only contract", () => {
         if (scenario === "revision_regression") item.revision = 2;
         if (scenario === "moved_occupant") item.pane_id = "w1:p3";
       }
-      if (argv[0] === "pane" && argv[1] === "get" && (scenario === "missing_session" || scenario === "stale_sequence")) clockControl.advance(5_001);
+      if (argv[0] === "pane" && argv[1] === "get" && ["missing_session", "missing_revision", "stale_sequence", "revision_regression"].includes(scenario)) clockControl.advance(5_001);
       return response;
     });
 
@@ -3412,6 +3513,17 @@ describe("herdr_launch profile-only contract", () => {
     ).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
 
     expect(failure.code).not.toBeUndefined();
+    if (scenario !== "ack_mismatch" && scenario !== "transport") {
+      expect(failure.details.initialPromptSubmission).toMatchObject({
+        confirmed: true,
+        operationId: "cli:agent:prompt",
+        paneId: "w1:p2",
+        terminalId: "terminal-0",
+        agentName: "worker",
+        agentKind: "agy",
+        revision: 3
+      });
+    }
     expect(harness.stdinInputs).toHaveLength(1);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);

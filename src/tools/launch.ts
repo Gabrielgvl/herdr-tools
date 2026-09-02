@@ -1368,6 +1368,29 @@ interface AgyPromptAcknowledgement {
   screenDetectionSkipped?: boolean;
 }
 
+interface AgyPromptSubmissionEvidence extends ProvisionalSupervisedIdentity {
+  confirmed: true;
+  operationId: string;
+  interactiveReady: true;
+  agentSession?: AgentSessionIdentity;
+  revision: number;
+  stateChangeSeq?: number;
+  screenDetectionSkipped?: boolean;
+}
+
+function agyPromptSubmissionEvidence(acknowledgement: AgyPromptAcknowledgement): AgyPromptSubmissionEvidence {
+  return {
+    confirmed: true,
+    operationId: acknowledgement.operationId,
+    ...acknowledgement.identity,
+    interactiveReady: true,
+    ...(acknowledgement.agentSession === undefined ? {} : { agentSession: acknowledgement.agentSession }),
+    revision: acknowledgement.revision,
+    ...(acknowledgement.stateChangeSeq === undefined ? {} : { stateChangeSeq: acknowledgement.stateChangeSeq }),
+    ...(acknowledgement.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: acknowledgement.screenDetectionSkipped })
+  };
+}
+
 function parseAgyPromptAcknowledgement(response: JsonEnvelope, expected: ProvisionalSupervisedIdentity): AgyPromptAcknowledgement {
   if (response.id !== "cli:agent:prompt" || !record(response.result) || response.result.type !== "agent_prompted" || !record(response.result.agent)) {
     throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr prompt acknowledgement is incompatible");
@@ -1407,6 +1430,7 @@ function parseAgyPromptAcknowledgement(response: JsonEnvelope, expected: Provisi
 }
 
 function agyPromptUnconfirmed(
+  acknowledgement: AgyPromptAcknowledgement,
   clock: LaunchClock,
   startedAt: number,
   samples: number,
@@ -1419,6 +1443,7 @@ function agyPromptUnconfirmed(
     causeCode: "PROMPT_UNCONFIRMED",
     promptSubmitted: true,
     promptConsumption: "unconfirmed",
+    initialPromptSubmission: agyPromptSubmissionEvidence(acknowledgement),
     ...(last === undefined ? {} : { initialPromptObservation: last }),
     promptConfirmation: promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last, sourceCode)
   });
@@ -1450,15 +1475,15 @@ async function confirmAgyNativeSession(
       } catch (error) {
         if (window.cancellation()) throw error;
         const sourceCode = record(error) && typeof error.code === "string" ? error.code : "POSTSTATE_UNAVAILABLE";
-        throw agyPromptUnconfirmed(clock, startedAt, samples, sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "read_failed", baseline, last, sourceCode);
+        throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "read_failed", baseline, last, sourceCode);
       }
 
       const snapshotRecords = snapshotReadinessRecords(snapshot, acknowledgement.identity.paneId);
       if (snapshotRecords.duplicates !== undefined) {
-        throw agyPromptUnconfirmed(clock, startedAt, samples, "contradictory", baseline, last, "TARGET_IDENTITY_UNAVAILABLE");
+        throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, "contradictory", baseline, last, "TARGET_IDENTITY_UNAVAILABLE");
       }
       if (snapshotRecords.pending.length > 0) {
-        throw agyPromptUnconfirmed(clock, startedAt, samples, "identity_unavailable", baseline, last, "TARGET_IDENTITY_UNAVAILABLE");
+        throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, "identity_unavailable", baseline, last, "TARGET_IDENTITY_UNAVAILABLE");
       }
       const records = [...snapshotRecords.records, { source: "agent_get" as const, value: agent }, { source: "pane_get" as const, value: pane }];
       try {
@@ -1482,35 +1507,35 @@ async function confirmAgyNativeSession(
         }
         observedSession = identity.agentSession;
 
-        const lifecycles = records.map(({ source, value }) => ({ source, lifecycle: readinessLifecycle(value, source) }));
-        const authoritative = lifecycles.find(({ source }) => source === "agent_get")!.lifecycle;
-        if (authoritative.agentStatus === undefined || authoritative.stateChangeSeq === undefined || authoritative.revision === undefined) {
-          throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "AGY native-session lifecycle evidence is incomplete");
-        }
-        const observedBaseline: PromptObservationBaseline = {
-          state: authoritative.agentStatus,
-          stateChangeSeq: authoritative.stateChangeSeq,
-          revision: authoritative.revision,
+        // Lifecycle is coherent only within the authoritative agent-get record.
+        // Snapshot and pane records prove identity continuity across the sequential
+        // reads, but their lifecycle values may describe adjacent observations.
+        const lifecycleAgent = { ...agent };
+        delete lifecycleAgent.screen_detection_skipped;
+        const authoritative = readinessLifecycle(lifecycleAgent, "agent_get");
+        if (typeof agent.screen_detection_skipped === "boolean") authoritative.screenDetectionSkipped = agent.screen_detection_skipped;
+        const completeLifecycle = authoritative.agentStatus !== undefined
+          && authoritative.stateChangeSeq !== undefined
+          && authoritative.revision !== undefined;
+        last = {
+          status: authoritative.agentStatus === undefined
+            ? "unavailable"
+            : authoritative.agentStatus === "working"
+              ? "working"
+              : authoritative.agentStatus === "unknown" ? "unknown" : "not_working",
+          ...(authoritative.agentStatus === undefined ? {} : { state: authoritative.agentStatus }),
+          ...(authoritative.stateChangeSeq === undefined ? {} : { stateChangeSeq: authoritative.stateChangeSeq }),
+          ...(authoritative.revision === undefined ? {} : { revision: authoritative.revision }),
           ...(authoritative.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: authoritative.screenDetectionSkipped })
         };
-        if (readinessLifecycleSkew(lifecycles.filter(({ source }) => source !== "agent_get"), observedBaseline).length > 0) {
-          throw new LaunchError("TARGET_IDENTITY_CHANGED", "AGY native-session lifecycle evidence is contradictory");
-        }
-        if (authoritative.revision < baseline.revision) {
-          throw new LaunchError("TARGET_IDENTITY_CHANGED", "AGY native-session revision regressed");
-        }
-        last = {
-          status: authoritative.agentStatus === "working" ? "working" : authoritative.agentStatus === "unknown" ? "unknown" : "not_working",
-          state: authoritative.agentStatus,
-          stateChangeSeq: authoritative.stateChangeSeq,
-          revision: authoritative.revision,
-          ...(authoritative.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: authoritative.screenDetectionSkipped }),
-          ...(authoritative.stateChangeSeq > baseline.stateChangeSeq ? { consumption: "confirmed" as const } : {})
-        };
-        if (authoritative.stateChangeSeq <= baseline.stateChangeSeq) {
+        if (!completeLifecycle
+          || authoritative.agentStatus === "unknown"
+          || authoritative.stateChangeSeq! <= baseline.stateChangeSeq
+          || authoritative.revision! < Math.max(baseline.revision, acknowledgement.revision)) {
           await waitForReadPoll(window, PROMPT_CONFIRMATION_POLL_INTERVAL_MS);
           continue;
         }
+        last.consumption = "confirmed";
         const confirmation = promptConfirmationEvidence(clock, startedAt, samples, authoritative.agentStatus === "working" ? "working" : "state_change_seq_advanced", baseline, last);
         return {
           identity,
@@ -1532,13 +1557,13 @@ async function confirmAgyNativeSession(
         if (window.cancellation()) throw error;
         const sourceCode = error instanceof LaunchError ? error.code : "POSTSTATE_UNAVAILABLE";
         const reason: PromptConfirmationEvidence["reason"] = sourceCode === "TARGET_IDENTITY_CHANGED" ? "identity_changed" : sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "contradictory";
-        throw agyPromptUnconfirmed(clock, startedAt, samples, reason, baseline, last, sourceCode);
+        throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, reason, baseline, last, sourceCode);
       }
     }
   } catch (error) {
     if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") throw error;
-    if (window.cancellation()?.reason === "deadline") throw agyPromptUnconfirmed(clock, startedAt, samples, "timeout", baseline, last);
-    throw agyPromptUnconfirmed(clock, startedAt, samples, "caller_aborted", baseline, last, "ABORTED");
+    if (window.cancellation()?.reason === "deadline") throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, "timeout", baseline, last);
+    throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, "caller_aborted", baseline, last, "ABORTED");
   } finally {
     window.cleanup();
   }
@@ -1673,7 +1698,7 @@ function partialError(
   created: LaunchResourceIds,
   phase: LaunchPhase,
   grant: RecipientGrant,
-  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; assignmentState?: "confirmed" | "unconfirmed"; readiness?: LaunchReadinessEvidence; supervision?: NonNullable<LaunchDetails["supervision"]>; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
+  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; assignmentState?: "confirmed" | "unconfirmed"; initialPromptSubmission?: AgyPromptSubmissionEvidence; readiness?: LaunchReadinessEvidence; supervision?: NonNullable<LaunchDetails["supervision"]>; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
   delivery?: MessageDelivery,
   published?: PublishedAttachment,
   reconciliation?: LaunchReconciliationEvidence
@@ -1716,6 +1741,7 @@ function partialError(
     promptSubmitted: effects.promptSubmitted,
     recipientRegistered: effects.recipientRegistered,
     ...(effects.assignmentState === undefined ? {} : { assignmentState: effects.assignmentState }),
+    ...(effects.initialPromptSubmission === undefined ? {} : { initialPromptSubmission: effects.initialPromptSubmission }),
     ...(effects.supervision === undefined ? {} : { paneId: supervisionPaneId, supervisorJobId: effects.supervision.jobId, supervision: effects.supervision }),
     effectCertainty,
     ...(Object.keys(effects.timing).length === 0 ? {} : { timing: effects.timing }),
@@ -1915,6 +1941,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let supervisionBound = false;
       let boundSupervision: LaunchDetails["supervision"] | undefined;
       let readiness: LaunchReadinessEvidence | undefined;
+      let agyInitialPromptSubmission: AgyPromptSubmissionEvidence | undefined;
       let selectedAttemptStartedAt: number | undefined;
       const timing: LaunchTimingEvidence = {};
       try {
@@ -2075,6 +2102,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             promptSubmitted = true;
             if (chosenRuntime.kind === "agy") {
               agyAcknowledgement = parseAgyPromptAcknowledgement(promptResponse, capturedIdentity as ProvisionalSupervisedIdentity);
+              agyInitialPromptSubmission = agyPromptSubmissionEvidence(agyAcknowledgement);
             } else {
               initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity as PromptTargetIdentity);
             }
@@ -2230,6 +2258,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           recipientRegistered,
           mutationDispatched: topologyMutationDispatched,
           ...(assignmentState === undefined ? {} : { assignmentState }),
+          ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }),
           ...(readiness === undefined ? {} : { readiness }),
           ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }),
           timing,

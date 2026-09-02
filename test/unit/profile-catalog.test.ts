@@ -531,7 +531,7 @@ describe("profile catalog", () => {
   it("enforces the bundled capability matrix and shared role resources", async () => {
     const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
     const catalog = await runtime.profiles.load();
-    expect(catalog.effective.size).toBe(12);
+    expect(catalog.effective.size).toBe(13);
     expect(catalog.diagnostics).toEqual([]);
     const bundledRoot = catalog.effective.get("manager-pi")!.source.scopeRoot;
     const rolePluginRoot = join(bundledRoot, "herdr-profiles", "role-plugins");
@@ -571,6 +571,15 @@ describe("profile catalog", () => {
     expect(buildProfileArgv(managerClaude)).toEqual(["--model", "claude-fable-5", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "manager"), "--dangerously-load-development-channels", "server:herdr"]);
     expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
     expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-claude"]);
+    const researcherAgy = catalog.effective.get("researcher-agy")!;
+    expect(researcherAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.7-flash-high", addDirs: [] });
+    expect(researcherAgy.sessionPersistence).toBe(true);
+    expect(researcherAgy.timeoutMinutes).toBe(30);
+    expect(researcherAgy.fallbackProfiles).toEqual(["researcher-pi"]);
+    expect(researcherAgy.body).toBe("\nCatalog metadata only. Herdr does not deliver this profile body to AGY. Every AGY task must be self-contained and sent through Herdr's visible v1 provenance-wrapped assignment.\n");
+    expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]);
+    expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-pi", "researcher-claude"]);
+    expect(resolveProfile("researcher-pi", catalog).reachableNames).toEqual(["researcher-pi", "researcher-claude"]);
 
     const claudeTools = {
       scout: { allowedTools: ["Read", "Glob", "Grep", "Bash"], disallowedTools: ["Edit", "Write", "NotebookEdit", "Task"], permissionMode: "dontAsk" },
@@ -607,7 +616,7 @@ describe("profile catalog", () => {
   it("loads bundled profiles from the package scope", async () => {
     const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
     const catalog = await runtime.profiles.load();
-    expect(catalog.effective.size).toBe(12);
+    expect(catalog.effective.size).toBe(13);
     expect(catalog.effective.get("worker-pi")?.source.scopeRoot).toBe(process.cwd());
   });
 });

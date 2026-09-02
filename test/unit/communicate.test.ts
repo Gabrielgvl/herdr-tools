@@ -9,6 +9,8 @@ import { CommunicateParamsSchema } from "../../src/schemas.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
 const targetIdentity = { terminal_id: "term-reviewer", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-reviewer" } };
+const agySession = { source: "agy", agent: "agy", kind: "id", value: "session-agy" };
+const agyRecipientDirectory = "/cache/agy-recipient-key";
 // Herdr 0.8.2 pane records do not repeat agent_name; the paired agent and
 // identity reads provide the complementary fields used by prompt delivery.
 const basePane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "reviewer", agent_id: "agent-7", agent_status: "idle", agent: "pi", ...targetIdentity };
@@ -83,6 +85,35 @@ function makeCli(initial: State = "idle", options: { postState?: State } = {}) {
     });
   });
   return { cli: new HerdrCli(exec, 10_000, 50_000, stdinExec), calls, stdinInputs, exec, stdinExec };
+}
+
+function makeAgyCli(session = agySession) {
+  const harness = makeCli();
+  const pane = { ...basePane, agent: "agy", terminal_id: "term-agy", agent_session: session };
+  const agent = { ...baseSnapshot.agents[1]!, agent: "agy", terminal_id: "term-agy", agent_session: session };
+  harness.cli.runJson = vi.fn(async (argv) => {
+    if (argv[0] === "pane" && argv[1] === "current") return { id: "current-agy", result: { type: "pane_current", pane: callerPane } };
+    if (argv[0] === "api") return { id: "snapshot-agy", result: { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, pane], agents: [baseSnapshot.agents[0]!, agent] } } };
+    if (argv[0] === "agent" && argv[1] === "get") return { id: "agent-agy", result: { agent } };
+    if (argv[0] === "pane" && argv[1] === "get") return { id: "pane-agy", result: { pane } };
+    throw new Error(`unexpected argv ${argv.join(" ")}`);
+  });
+  harness.cli.runJsonWithStdin = vi.fn(async () => ({
+    id: "cli:agent:prompt",
+    result: { type: "agent_prompted", agent: { ...agent, interactive_ready: true, revision: 3, state_change_seq: 2 } }
+  }));
+  return harness;
+}
+
+function registerAgyRecipient(registry: RecipientRegistry, capable = true) {
+  return registry.recordFor(
+    "researcher-agy",
+    "w1:p2",
+    "agy-recipient-key",
+    { kind: "agy", capable, reason: capable ? "read" : "missing read capability" },
+    { paneId: "w1:p2", terminalId: "term-agy", agentName: "reviewer", agentKind: "agy", agentSession: agySession, agentId: "agent-7" },
+    { agyStrengthened: true, attachmentDirectory: agyRecipientDirectory }
+  );
 }
 
 function execute(cli: HerdrCli, params: Record<string, unknown>, signal: AbortSignal = new AbortController().signal) {
@@ -417,6 +448,40 @@ describe("herdr_communicate", () => {
     const unverifiedStore = { ...attachments, publish: vi.fn() } as unknown as AttachmentStore;
     await expect(createCommunicateTool({ cli: harness.cli, context, attachments: unverifiedStore }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED" });
     expect(unverifiedStore.publish).not.toHaveBeenCalled();
+  });
+
+  it("delivers AGY attachments only for strengthened exact identity and its granted directory", async () => {
+    const attachment = { target: "reviewer", operation: "prompt" as const, text: "body", delivery: "attachment" as const };
+    const recipients = new RecipientRegistry();
+    registerAgyRecipient(recipients);
+    const publish = vi.fn(async () => ({ attachmentId: "attachment-agy", path: `${agyRecipientDirectory}/attachment-agy/body.txt`, bytes: 4, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
+    const attachments = { root: "/cache", recipientDirectory: () => agyRecipientDirectory, ensureRecipient: async (key: string) => fakeGrant(key), publish } as AttachmentStore;
+    const exact = makeAgyCli();
+
+    await expect(createCommunicateTool({ cli: exact.cli, context, attachments, recipients }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
+      .resolves.toMatchObject({ details: { delivery: "attachment", attachment: { attachmentId: "attachment-agy" } } });
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ recipientKey: "agy-recipient-key", expectedRecipientDirectory: agyRecipientDirectory }));
+    expect(exact.cli.runJsonWithStdin).toHaveBeenCalledTimes(1);
+
+    for (const failure of [
+      { registry: new RecipientRegistry(), cli: makeAgyCli().cli, directory: agyRecipientDirectory },
+      { registry: (() => { const value = new RecipientRegistry(); registerAgyRecipient(value, false); return value; })(), cli: makeAgyCli().cli, directory: agyRecipientDirectory },
+      { registry: recipients, cli: makeAgyCli({ ...agySession, value: "replacement" }).cli, directory: agyRecipientDirectory },
+      { registry: recipients, cli: makeAgyCli().cli, directory: "/cache/wrong-recipient" }
+    ]) {
+      const refusedPublish = vi.fn();
+      const refusedStore = { ...attachments, recipientDirectory: () => failure.directory, publish: refusedPublish } as unknown as AttachmentStore;
+      await expect(createCommunicateTool({ cli: failure.cli, context, attachments: refusedStore, recipients: failure.registry }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
+        .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED" });
+      expect(refusedPublish).not.toHaveBeenCalled();
+      expect(failure.cli.runJsonWithStdin).not.toHaveBeenCalled();
+    }
+
+    const wrongPublication = { ...attachments, publish: vi.fn(async () => ({ attachmentId: "attachment-agy", path: "/cache/wrong/attachment-agy/body.txt", bytes: 4, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" })) } as AttachmentStore;
+    const wrongPath = makeAgyCli();
+    await expect(createCommunicateTool({ cli: wrongPath.cli, context, attachments: wrongPublication, recipients }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { phase: "publish", attachmentRetained: true } });
+    expect(wrongPath.cli.runJsonWithStdin).not.toHaveBeenCalled();
   });
 
   it("refuses attachment delivery for unregistered, incapable, and identity-mismatched recipients", async () => {

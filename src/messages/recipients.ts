@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute, resolve } from "node:path";
 import type { HerdrSnapshot } from "../targets.js";
 import type { ProfileKind } from "../profiles/types.js";
 import type { AttachmentCapability } from "../profiles/capability.js";
@@ -23,6 +24,15 @@ export interface RecipientRecord extends RecipientIdentity {
   kind: ProfileKind;
   capable: boolean;
   reason: string;
+  /** Present only after AGY's provisional supervisor was strengthened. */
+  agyStrengthened?: true;
+  /** The exact tools-owned directory granted to a strengthened AGY process. */
+  attachmentDirectory?: string;
+}
+
+export interface RecipientRegistrationEvidence {
+  agyStrengthened?: true;
+  attachmentDirectory?: string;
 }
 
 export interface RecipientVerification {
@@ -65,12 +75,26 @@ export function recipientIdentity(snapshot: HerdrSnapshot, paneId: string): Part
   }
 }
 
+function identityString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && !/[\0\r\n]/u.test(value);
+}
+
 function completeIdentity(value: Partial<RecipientIdentity>): value is RecipientIdentity {
-  return typeof value.paneId === "string"
-    && typeof value.terminalId === "string"
-    && typeof value.agentName === "string"
-    && typeof value.agentKind === "string"
-    && value.agentSession !== undefined;
+  return identityString(value.paneId)
+    && identityString(value.terminalId)
+    && identityString(value.agentName)
+    && identityString(value.agentKind)
+    && typeof value.agentSession === "object"
+    && value.agentSession !== null
+    && identityString(value.agentSession.source)
+    && identityString(value.agentSession.agent)
+    && identityString(value.agentSession.kind)
+    && identityString(value.agentSession.value)
+    && value.agentSession.agent === value.agentKind;
+}
+
+function validAttachmentDirectory(value: unknown): value is string {
+  return identityString(value) && isAbsolute(value) && resolve(value) === value;
 }
 
 function asPromptIdentity(value: RecipientIdentity): PromptTargetIdentity {
@@ -91,6 +115,9 @@ export function verifyRecipient(snapshot: HerdrSnapshot, record: RecipientRecord
   if (!record) return { verified: false, reason: "recipient capability is not registered in this runtime", identity: {} };
   const identity = recipientIdentity(snapshot, record.paneId);
   if (!record.capable) return { verified: false, reason: record.reason, identity };
+  if (record.kind === "agy" && (record.agyStrengthened !== true || !validAttachmentDirectory(record.attachmentDirectory))) {
+    return { verified: false, reason: "AGY recipient has no strengthened attachment capability", identity };
+  }
   if (!completeIdentity(identity)) {
     return { verified: false, reason: "recipient identity is unavailable or contradictory in the authoritative snapshot", identity };
   }
@@ -108,6 +135,12 @@ export class RecipientRegistry {
   private readonly records = new Map<string, RecipientRecord>();
 
   register(record: RecipientRecord): void {
+    if (!completeIdentity(record) || record.kind !== record.agentKind) {
+      throw new Error("Recipient registration identity does not match the launched profile and pane");
+    }
+    if (record.kind === "agy" && (record.agyStrengthened !== true || !validAttachmentDirectory(record.attachmentDirectory))) {
+      throw new Error("AGY recipient registration requires strengthened exact identity and attachment directory");
+    }
     this.records.set(record.paneId, { ...record, agentSession: { ...record.agentSession } });
   }
 
@@ -116,9 +149,12 @@ export class RecipientRegistry {
     return record ? { ...record, agentSession: { ...record.agentSession } } : undefined;
   }
 
-  recordFor(profileName: string, paneId: string, recipientKey: string, capability: AttachmentCapability & { kind: ProfileKind }, identity: PromptTargetIdentity & { agentId?: string }): RecipientRecord {
-    if (identity.paneId !== paneId || capability.kind !== identity.agentKind) {
+  recordFor(profileName: string, paneId: string, recipientKey: string, capability: AttachmentCapability & { kind: ProfileKind }, identity: PromptTargetIdentity & { agentId?: string }, evidence: RecipientRegistrationEvidence = {}): RecipientRecord {
+    if (identity.paneId !== paneId || capability.kind !== identity.agentKind || !completeIdentity(identity)) {
       throw new Error("Recipient registration identity does not match the launched profile and pane");
+    }
+    if (capability.kind === "agy" && (evidence.agyStrengthened !== true || !validAttachmentDirectory(evidence.attachmentDirectory))) {
+      throw new Error("AGY recipient registration requires strengthened exact identity and attachment directory");
     }
     const record: RecipientRecord = {
       paneId,
@@ -131,7 +167,8 @@ export class RecipientRegistry {
       profileName,
       kind: capability.kind,
       capable: capability.capable,
-      reason: capability.reason
+      reason: capability.reason,
+      ...(capability.kind === "agy" ? { agyStrengthened: true as const, attachmentDirectory: evidence.attachmentDirectory! } : {})
     };
     this.register(record);
     return record;

@@ -100,6 +100,8 @@ export interface AttachmentMetadata {
 export interface AttachmentPublishInput {
   body: string;
   recipientKey: string;
+  /** When present, publication refuses a recipient-key directory mismatch. */
+  expectedRecipientDirectory?: string;
   recipientPaneId?: string;
   recipientAgentName?: string;
   senderPaneId: string;
@@ -114,6 +116,12 @@ export interface PublishedAttachment {
   sha256: string;
   expiresAt: string;
   recipientPaneId?: string;
+}
+
+export function publishedAttachmentMatchesDirectory(attachment: PublishedAttachment, directory: string): boolean {
+  return validKey(attachment.attachmentId)
+    && resolve(directory) === directory
+    && attachment.path === join(directory, attachment.attachmentId, "body.txt");
 }
 
 export type AttachmentStoreErrorCode = "ATTACHMENT_STORE_FAILED" | "ATTACHMENT_QUOTA_EXCEEDED";
@@ -507,6 +515,10 @@ export function createAttachmentStore(io: AttachmentStoreIo = nodeAttachmentStor
   const publish = async (input: AttachmentPublishInput): Promise<PublishedAttachment> => {
     const data = validateBody(input.body);
     validateKey(input.recipientKey);
+    const expectedRecipientPath = recipientDirectory(input.recipientKey);
+    if (input.expectedRecipientDirectory !== undefined && input.expectedRecipientDirectory !== expectedRecipientPath) {
+      throw new AttachmentStoreError("ATTACHMENT_STORE_FAILED", "Attachment recipient directory does not match its key", { operation: "validate_recipient" });
+    }
     if (input.recipientPaneId !== undefined && (input.recipientPaneId.length === 0 || /[\0\r\n]/.test(input.recipientPaneId))) throw new AttachmentStoreError("ATTACHMENT_STORE_FAILED", "Attachment recipient pane ID is invalid", { operation: "validate_recipient" });
     const created = now();
     const expires = new Date(created.getTime() + ATTACHMENT_RETENTION_HOURS * 60 * 60 * 1_000);

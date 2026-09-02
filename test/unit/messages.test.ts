@@ -8,11 +8,12 @@ import { ATTACHMENT_MAX_BYTES, ATTACHMENT_RETENTION_HOURS, ATTACHMENT_STORE_MAX_
 import { RecipientRegistry, mintRecipientKey, recipientIdentity, verifyRecipient } from "../../src/messages/recipients.js";
 import { withDeliveryFailureEvidence } from "../../src/messages/failure.js";
 import { attachmentCapability } from "../../src/profiles/capability.js";
-import { ATTACHMENT_GRANT_NAME, ATTACHMENT_LOCK_NAME, ATTACHMENT_LOCK_OWNER_FILE, DEFAULT_GRANT_LEASE_MS, DEFAULT_LOCK_LEASE_MS, attachmentMetadataBytes, createAttachmentStore, type AttachmentDirEntry, type AttachmentStoreIo } from "../../src/messages/store.js";
+import { ATTACHMENT_GRANT_NAME, ATTACHMENT_LOCK_NAME, ATTACHMENT_LOCK_OWNER_FILE, DEFAULT_GRANT_LEASE_MS, DEFAULT_LOCK_LEASE_MS, attachmentMetadataBytes, createAttachmentStore, publishedAttachmentMatchesDirectory, type AttachmentDirEntry, type AttachmentStoreIo } from "../../src/messages/store.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import type { Profile } from "../../src/profiles/types.js";
 
 const targetIdentity = { terminal_id: "term-worker", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-worker" } };
+const agySession = { source: "agy", agent: "agy", kind: "id", value: "session-agy" };
 const snapshot: HerdrSnapshot = {
   version: "0.8.0",
   protocol: 20,
@@ -24,12 +25,14 @@ const snapshot: HerdrSnapshot = {
 
 const KEY = "recipient-key";
 
-function profile(kind: "pi" | "claude", overrides: Partial<Profile["runtime"]> = {}): Profile {
+function profile(kind: "pi" | "claude" | "agy", overrides: Partial<Profile["runtime"]> = {}): Profile {
   const runtime = kind === "pi"
     ? { kind: "pi" as const, model: "test", thinking: "low" as const, tools: [], extensions: [], skills: [], ...overrides }
-    : { kind: "claude" as const, model: "test", effort: "medium" as const, permissionMode: "default" as const, allowedTools: [], disallowedTools: [], addDirs: [], pluginDirs: [], ...overrides };
+    : kind === "claude"
+      ? { kind: "claude" as const, model: "test", effort: "medium" as const, permissionMode: "default" as const, allowedTools: [], disallowedTools: [], addDirs: [], pluginDirs: [], developmentChannels: [], ...overrides }
+      : { kind: "agy" as const, model: "test", addDirs: [], ...overrides };
   return {
-    name: `${kind}-profile`, description: "profile", timeoutMinutes: 1, sessionPersistence: kind === "claude", runtime: runtime as Profile["runtime"], fallbackProfiles: [], body: "body", source: { kind: "bundled", path: `/profiles/${kind}.md`, scopeRoot: "/profiles", precedence: 0 }
+    name: `${kind}-profile`, description: "profile", timeoutMinutes: 1, sessionPersistence: kind !== "pi", runtime: runtime as Profile["runtime"], fallbackProfiles: [], body: "body", source: { kind: "bundled", path: `/profiles/${kind}.md`, scopeRoot: "/profiles", precedence: 0 }
   };
 }
 
@@ -135,6 +138,28 @@ describe("large message limits and recipient capabilities", () => {
     expect(registry.size).toBe(0);
   });
 
+  it("registers AGY only from strengthened exact identity and rejects replacements", () => {
+    const registry = new RecipientRegistry();
+    const capability = attachmentCapability(profile("agy"));
+    const identity = { paneId: "w:p1", terminalId: "term-agy", agentName: "researcher", agentKind: "agy", agentSession: agySession };
+    const agySnapshot: HerdrSnapshot = {
+      ...snapshot,
+      panes: [{ ...snapshot.panes[0]!, terminal_id: "term-agy", agent_name: "researcher", agent: "agy", agent_session: agySession }],
+      agents: [{ ...snapshot.agents[0]!, terminal_id: "term-agy", name: "researcher", agent: "agy", agent_session: agySession }]
+    };
+
+    expect(() => registry.recordFor("agy-profile", "w:p1", KEY, capability, identity)).toThrow(/strengthened exact identity/u);
+    expect(() => registry.recordFor("agy-profile", "w:p1", KEY, capability, { ...identity, agentSession: undefined } as never, { agyStrengthened: true, attachmentDirectory: "/cache/agy" })).toThrow(/does not match/u);
+    expect(() => registry.recordFor("agy-profile", "w:p1", KEY, capability, { ...identity, agentSession: { ...agySession, agent: "pi" } }, { agyStrengthened: true, attachmentDirectory: "/cache/agy" })).toThrow(/does not match/u);
+    expect(() => registry.recordFor("agy-profile", "w:p1", KEY, capability, identity, { agyStrengthened: true, attachmentDirectory: "relative/agy" })).toThrow(/attachment directory/u);
+
+    const record = registry.recordFor("agy-profile", "w:p1", KEY, capability, identity, { agyStrengthened: true, attachmentDirectory: "/cache/agy" });
+    expect(record).toMatchObject({ kind: "agy", agyStrengthened: true, attachmentDirectory: "/cache/agy", agentSession: agySession });
+    expect(verifyRecipient(agySnapshot, record)).toMatchObject({ verified: true, identity: { agentKind: "agy", agentSession: agySession } });
+    expect(verifyRecipient({ ...agySnapshot, agents: [{ ...agySnapshot.agents[0]!, agent_session: { ...agySession, value: "replacement" } }] }, record)).toMatchObject({ verified: false });
+    expect(() => registry.register({ ...record, agyStrengthened: undefined } as never)).toThrow(/strengthened exact identity/u);
+  });
+
   it("adds body-free delivery evidence only to object failures", () => {
     expect(withDeliveryFailureEvidence("string failure", { delivery: "attachment" })).toBe("string failure");
     const typed = Object.assign(new Error("send failed"), { code: "CLI_TIMEOUT", details: { target: "w:p1" } });
@@ -159,6 +184,8 @@ describe("attachment store", () => {
       const body = "large\n☃";
       const published = await store.publish({ ...input, body, recipientPaneId: "w:p1", recipientAgentName: "worker" });
       expect(published).toMatchObject({ bytes: Buffer.byteLength(body), recipientPaneId: "w:p1", path: join(directory, published.attachmentId, "body.txt") });
+      expect(publishedAttachmentMatchesDirectory(published, directory)).toBe(true);
+      expect(publishedAttachmentMatchesDirectory({ ...published, path: join(directory, "other", "body.txt") }, directory)).toBe(false);
       expect(await readFile(published.path, "utf8")).toBe(body);
       const record = JSON.parse(await readFile(join(directory, published.attachmentId, "meta.json"), "utf8")) as Record<string, unknown>;
       expect(record).toMatchObject({ attachmentId: published.attachmentId, bytes: published.bytes, sha256: published.sha256, encoding: "utf-8", senderPaneId: "w:p0", recipientPaneId: "w:p1", operation: "prompt" });
@@ -260,6 +287,7 @@ describe("attachment store", () => {
       await expect(store.publish({ ...input, body: 4 as unknown as string })).rejects.toMatchObject({ code: "INVALID_INPUT" });
       await expect(store.publish({ ...input, body: "x".repeat(ATTACHMENT_MAX_BYTES + 1) })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
       await expect(store.publish({ ...input, body: "body", recipientKey: "short" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED" });
+      await expect(store.publish({ ...input, body: "body", expectedRecipientDirectory: join(storeRoot, "wrong-key") })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "validate_recipient" } });
       await expect(store.publish({ ...input, body: "body", recipientPaneId: "bad\n" })).rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "validate_recipient" } });
 
       const kept = await seedRecord(storeRoot, KEY, "22222222-2222-4222-8222-222222222222", { bytes: ATTACHMENT_STORE_QUOTA_BYTES }, "x");

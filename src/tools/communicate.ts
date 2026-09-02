@@ -5,7 +5,7 @@ import type { CompatibilityPreflight } from "../health.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import { classifyPromptObservation, compactPromptSubmission, requirePromptTargetIdentity, parsePromptSubmission, PromptIdentityError, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
-import type { AttachmentStore, PublishedAttachment } from "../messages/store.js";
+import { publishedAttachmentMatchesDirectory, type AttachmentStore, type PublishedAttachment } from "../messages/store.js";
 import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
@@ -200,6 +200,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         }
         let recipientKey: string | undefined;
         let recipientAgentName: string | undefined;
+        let recipientAttachmentDirectory: string | undefined;
         let recipientRecord: ReturnType<RecipientRegistry["get"]>;
         if (delivery === "attachment") {
           phase = "verify_recipient";
@@ -213,6 +214,18 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           }
           recipientKey = recipientRecord!.recipientKey;
           recipientAgentName = verification.identity.agentName;
+          if (recipientRecord!.kind === "agy") {
+            recipientAttachmentDirectory = recipientRecord!.attachmentDirectory;
+            let currentDirectory: string | undefined;
+            try {
+              currentDirectory = deps.attachments.recipientDirectory(recipientKey);
+            } catch {
+              // Report every store/key disagreement as an unavailable capability.
+            }
+            if (currentDirectory !== recipientAttachmentDirectory) {
+              throw Object.assign(new Error("Attachment target directory is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: "recipient attachment directory does not match the current store" } });
+            }
+          }
         }
         phase = "pre_state";
         if (params.operation !== "keys") {
@@ -242,12 +255,16 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             published = await deps.attachments!.publish({
               body: legacyParams.text,
               recipientKey: recipientKey!,
+              ...(recipientAttachmentDirectory ? { expectedRecipientDirectory: recipientAttachmentDirectory } : {}),
               recipientPaneId: target.paneId,
               recipientAgentName,
               senderPaneId: sender!.paneId,
               senderDisplay: sender!.display,
               operation: legacyParams.operation
             });
+            if (recipientAttachmentDirectory && !publishedAttachmentMatchesDirectory(published, recipientAttachmentDirectory)) {
+              throw Object.assign(new Error("Published attachment directory is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: "published attachment does not match the registered recipient directory" } });
+            }
           }
           const envelope = delivery === "attachment"
             ? buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "attachment", { ...published!, encoding: "utf-8" })

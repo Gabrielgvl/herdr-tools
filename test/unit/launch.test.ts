@@ -3456,6 +3456,39 @@ describe("herdr_launch profile-only contract", () => {
     expect(result.details).toMatchObject({ kind: "agy", promptConsumption: "confirmed", assignmentState: "confirmed", supervision: { state: "active", child: { agentKind: "agy" } } });
   });
 
+  it.each(["pi", "claude"] as const)("binds a zero-effect %s startup fallback to AGY provisionally", async (primaryKind) => {
+    const primary = profile(`primary-${primaryKind}`, primaryKind, ["fallback-agy"]);
+    const fallback = profile("fallback-agy", "agy");
+    const supervision = stubSupervision();
+    const harness = makeCli({
+      omitFreshAgentSession: true,
+      paneStates: [
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "agy", terminal_id: "terminal-1", agent_status: "idle", state_change_seq: 7, revision: 3 },
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "agy", terminal_id: "terminal-1", agent_session: { source: "herdr:agy", agent: "agy", kind: "id", value: "session-1" }, agent_status: "working", state_change_seq: 8, revision: 4 },
+      ],
+      start: (argv, attempt) => {
+        if (attempt === 0) throw startFailure();
+        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: argv[4], terminal_id: "terminal-1" } });
+      },
+    });
+
+    const result = await launch({ name: "worker", profile: primary.name, initialPrompt: "research" }, catalog(primary, fallback), harness.cli, undefined, { supervision });
+
+    expect(supervision.reserved).toEqual([{ agentName: "worker", agentKind: primaryKind, profileName: primary.name }]);
+    expect(supervision.provisionalBound).toEqual([{
+      identity: { paneId: "w1:p2", terminalId: "terminal-1", agentName: "worker", agentKind: "agy" },
+      profileName: "fallback-agy",
+      baseline: { state: "idle", stateChangeSeq: 7, revision: 3 },
+    }]);
+    expect(supervision.strengthened).toHaveLength(1);
+    expect(supervision.bound).toEqual([]);
+    expect(supervision.released).toEqual([]);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
+    expect(harness.stdinInputs).toEqual([envelope("research")]);
+    expect(result.details).toMatchObject({ kind: "agy", profile: { requested: primary.name, selected: "fallback-agy" }, promptConsumption: "confirmed", assignmentState: "confirmed" });
+  });
+
   it("keeps AGY bodies as metadata and starts an AGY fallback without a prompt source", async () => {
     const primary = profile("primary", "agy", ["fallback"]);
     const fallback = profile("fallback", "pi");

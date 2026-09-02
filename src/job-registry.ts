@@ -1322,17 +1322,19 @@ export class JobRegistry {
     const record = this.jobs.get(jobId);
     if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
     if (record.detail.request.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job has a supervised child");
-    if (record.detail.request.child.agentKind !== "agy" || bound.agentKind !== "agy") throw new Error("SUPERVISION_PROVISIONAL_INVALID: provisional supervision is AGY-only");
+    if (bound.agentKind !== "agy") throw new Error("SUPERVISION_PROVISIONAL_INVALID: provisional supervision is AGY-only");
     if (typeof bound.profileName !== "string" || bound.profileName.length === 0 || /[\0\r\n]/u.test(bound.profileName)) throw new Error("SUPERVISION_BINDING_INVALID: provisional profile name is malformed");
     const request = record.detail.request;
     if (record.supervisionBindingStage !== "reserved" || request.targetIds.length !== 0) throw new Error("SUPERVISION_ALREADY_BOUND: supervisor request already has a provisional or exact binding");
     if (request.targets.length !== 1 || request.target_generation_refs?.length !== 1) throw new Error("SUPERVISION_REQUEST_INVALID: supervisor target arrays are not aligned");
     const reservedChild = clone(request.child);
     const reservedTargetIds = [...request.targetIds];
+    const requestedAgentKind = reservedChild.requestedAgentKind ?? (reservedChild.agentKind === "agy" ? undefined : reservedChild.agentKind);
     const selectedChild: SupervisedJobChild = {
       agentName: reservedChild.agentName,
       agentKind: "agy",
       profileName: bound.profileName,
+      ...(requestedAgentKind === undefined ? {} : { requestedAgentKind }),
       ...(bound.profileName === reservedChild.profileName ? {} : { requestedProfileName: reservedChild.profileName })
     };
     let committed = false;

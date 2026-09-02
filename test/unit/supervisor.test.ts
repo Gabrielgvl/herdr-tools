@@ -226,6 +226,53 @@ describe("supervisor binding", () => {
     h.supervisor.shutdown();
   });
 
+  it("retains ordered lifecycle events before the fresh AGY strengthening read", async () => {
+    const exact = snapshot(
+      [agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 6, state_change_seq: 8 })],
+      [agyAgentRecord({ agent_session: agySession, agent_status: "idle", revision: 6, state_change_seq: 8 })],
+    );
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" }, snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), exact] });
+    await h.supervisor.bindProvisional(provisionalBinding);
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 4, state_change_seq: 6 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 5, state_change_seq: 7 })));
+    expect(h.supervisor.view()).toMatchObject({ state: "provisional", status: "idle", transitions: [], events: [] });
+    expect(h.wakes).toEqual([]);
+
+    let published: ReturnType<Supervisor["view"]> | undefined;
+    await h.supervisor.strengthen({ identity: exactAgyIdentity, profileName: "researcher-agy" }, {
+      commit: vi.fn(),
+      rollback: vi.fn(),
+      publish: () => { published = h.supervisor.view(); },
+    });
+
+    const transitions = [
+      { atMs: 1_000, from: "idle", to: "working", revision: 3, source: "event" },
+      { atMs: 1_000, from: "working", to: "blocked", revision: 4, source: "event" },
+      { atMs: 1_000, from: "blocked", to: "working", revision: 5, source: "event" },
+      { atMs: 1_000, from: "working", to: "idle", revision: 6, source: "snapshot" },
+    ];
+    expect(published).toMatchObject({ state: "active", status: "idle", transitions });
+    expect(h.supervisor.view().transitions).toEqual(transitions);
+    expect(types(h.wakes)).toEqual(["blocked", "work_cycle_completed"]);
+    h.supervisor.shutdown();
+  });
+
+  it.each([
+    [agyExactSnapshot({ revision: 3, state_change_seq: 6, agent_status: "blocked" }), "revision_regressed"],
+    [agyExactSnapshot({ revision: 5, state_change_seq: 5, agent_status: "blocked" }), "lifecycle_regressed"],
+    [agyExactSnapshot({ revision: 4, state_change_seq: 6, agent_status: "idle" }), "lifecycle_contradiction"],
+  ] as const)("rejects a strengthening snapshot behind retained event evidence (%s)", async (exact, cause) => {
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" }, snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), exact] });
+    await h.supervisor.bindProvisional(provisionalBinding);
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 4, state_change_seq: 6 })));
+    const publication = { commit: vi.fn(), rollback: vi.fn(), publish: vi.fn() };
+    await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, profileName: "researcher-agy" }, publication))
+      .rejects.toMatchObject({ details: { cause } });
+    expect(publication.commit).not.toHaveBeenCalled();
+    h.supervisor.shutdown();
+  });
+
   it("drains events admitted during the fresh AGY strengthening read before commit", async () => {
     let resolveFresh!: (value: HerdrSnapshot) => void;
     const fresh = new Promise<HerdrSnapshot>((resolve) => { resolveFresh = resolve; });
@@ -538,9 +585,6 @@ describe("AGY provisional supervision failures", () => {
   const agyHarness = (snapshots: Array<HerdrSnapshot | Error | Promise<HerdrSnapshot>> = []): Harness => harness({ child: agyChild, snapshots });
 
   it("validates every provisional binding field and remains single-use", async () => {
-    const wrongChild = harness();
-    await expect(wrongChild.supervisor.bindProvisional(provisionalBinding)).rejects.toMatchObject({ details: { cause: "provisional_kind_invalid" } });
-
     const wrongIdentity = { ...provisionalBinding, identity: { ...agyIdentity, agentKind: "pi" } } as unknown as ProvisionalSupervisionBinding;
     await expect(agyHarness().supervisor.bindProvisional(wrongIdentity)).rejects.toMatchObject({ details: { cause: "provisional_kind_invalid" } });
 
@@ -665,8 +709,23 @@ describe("AGY provisional supervision failures", () => {
     const stale = agyHarness([snapshot([agyPaneRecord()], [agyAgentRecord()])]);
     await bindAgy(stale);
     await stale.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ revision: 2, state_change_seq: 4 })));
+    await stale.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ revision: 2, state_change_seq: undefined })));
     expect(stale.supervisor.view().events).toEqual([]);
     stale.supervisor.shutdown();
+
+    const regressed = agyHarness([snapshot([agyPaneRecord()], [agyAgentRecord()])]);
+    await bindAgy(regressed);
+    await regressed.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ revision: 3, state_change_seq: 5 })));
+    await regressed.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ revision: 3, state_change_seq: 4 })));
+    expect(provisionalCause(regressed)).toBe("lifecycle_regressed");
+    regressed.supervisor.shutdown();
+
+    const contradictory = agyHarness([snapshot([agyPaneRecord()], [agyAgentRecord()])]);
+    await bindAgy(contradictory);
+    await contradictory.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_status: "working", revision: 3, state_change_seq: 5 })));
+    await contradictory.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_status: "blocked", revision: 3, state_change_seq: 5 })));
+    expect(provisionalCause(contradictory)).toBe("lifecycle_contradiction");
+    contradictory.supervisor.shutdown();
 
     const stableNative = agyHarness([snapshot([agyPaneRecord()], [agyAgentRecord()])]);
     await bindAgy(stableNative);
@@ -721,6 +780,18 @@ describe("AGY provisional supervision failures", () => {
     };
     await expect(h.supervisor.bindProvisional(provisionalBinding)).rejects.toMatchObject({ details: { cause: "DRAIN_FAILED" } });
     expect(h.observers).toBe(0);
+  });
+
+  it.each(["pi", "claude"] as const)("allows a %s reservation to bind and strengthen an AGY fallback", async (agentKind) => {
+    const h = harness({
+      child: { agentName: "worker", agentKind, profileName: `researcher-${agentKind}` },
+      snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), agyExactSnapshot()],
+    });
+    await h.supervisor.bindProvisional({ ...provisionalBinding, profileName: "fallback-agy" });
+    expect(h.supervisor.view()).toMatchObject({ state: "provisional", provisional: { agentKind: "agy", profileName: "fallback-agy", requestedProfileName: `researcher-${agentKind}` } });
+    await h.supervisor.strengthen({ identity: exactAgyIdentity, profileName: "fallback-agy" });
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { agentKind: "agy", profileName: "fallback-agy", requestedAgentKind: agentKind, requestedProfileName: `researcher-${agentKind}` } });
+    h.supervisor.shutdown();
   });
 
   it("projects the requested profile beside a provisional fallback", async () => {

@@ -117,13 +117,16 @@ interface Settlement {
   reason: string;
 }
 
-interface StrengtheningCandidate {
-  binding: SupervisionBinding;
+interface ProvisionalLifecycle {
   stateChangeSeq: number;
   revision: number;
   status: SupervisionAgentStatus;
-  initialRevision: number;
   events: SupervisionTransition[];
+}
+
+interface StrengtheningCandidate extends ProvisionalLifecycle {
+  binding: SupervisionBinding;
+  initialRevision: number;
 }
 
 const inertBindingPublication: SupervisionChildBindingPublication = {
@@ -153,6 +156,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private provisional: ProvisionalSupervisionBinding | undefined;
   private provisionalFailure: string | undefined;
   private provisionalNativeIdentity: SupervisedIdentity | undefined;
+  private provisionalLifecycle: ProvisionalLifecycle | undefined;
   private anchor: SupervisionAnchor | undefined;
   private strengtheningCandidate: StrengtheningCandidate | undefined;
   private status: SupervisionAgentStatus | undefined;
@@ -277,7 +281,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (this.bindStarted || this.stopped || this.state !== "reserved") {
       throw new SupervisionBindError("Supervision binding is single-use", this.bindEvidence(binding, { cause: "bind_already_attempted" }));
     }
-    if (this.deps.child.agentKind !== "agy" || binding.identity.agentKind !== "agy") {
+    if (binding.identity.agentKind !== "agy") {
       throw new SupervisionBindError("Provisional supervision is AGY-only", this.bindEvidence(binding, { cause: "provisional_kind_invalid" }));
     }
     if (!validProvisionalBinding(binding)) {
@@ -324,6 +328,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     this.selectedProfileName = binding.profileName;
     this.status = "idle";
+    this.provisionalLifecycle = {
+      stateChangeSeq: binding.baseline.stateChangeSeq,
+      revision: binding.baseline.revision,
+      status: "idle",
+      events: [],
+    };
     this.anchor = { revision: binding.baseline.revision, status: "idle", stateChangeSeq: binding.baseline.stateChangeSeq };
     this.lastRevision = binding.baseline.revision;
     this.bindPending = true;
@@ -409,8 +419,15 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (occupant.stateChangeSeq === undefined || occupant.stateChangeSeq <= provisional.baseline.stateChangeSeq) {
       throw this.strengtheningError(binding, "lifecycle_not_advanced", publication);
     }
-    if (occupant.pane.revision < provisional.baseline.revision) {
+    const retained = this.provisionalLifecycle!;
+    if (occupant.pane.revision < retained.revision) {
       throw this.strengtheningError(binding, "revision_regressed", publication);
+    }
+    if (occupant.stateChangeSeq < retained.stateChangeSeq) {
+      throw this.strengtheningError(binding, "lifecycle_regressed", publication);
+    }
+    if (occupant.pane.revision === retained.revision && occupant.stateChangeSeq === retained.stateChangeSeq && occupant.pane.agentStatus !== retained.status) {
+      throw this.strengtheningError(binding, "lifecycle_contradiction", publication);
     }
     const observedIdentity: SupervisedIdentity = { ...provisional.identity, agentSession: { ...occupant.pane.agentSession! } };
     if (observedIdentity.agentSession.agent !== observedIdentity.agentKind
@@ -429,8 +446,17 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       stateChangeSeq: occupant.stateChangeSeq,
       revision: occupant.pane.revision,
       status: occupant.pane.agentStatus,
-      initialRevision: occupant.pane.revision,
-      events: [],
+      initialRevision: retained.events.length === 0 ? occupant.pane.revision : provisional.baseline.revision,
+      events: [
+        ...retained.events,
+        ...(retained.events.length === 0 || occupant.pane.agentStatus === retained.status ? [] : [{
+          atMs: this.deps.clock.now(),
+          from: retained.status,
+          to: occupant.pane.agentStatus,
+          revision: occupant.pane.revision,
+          source: "snapshot" as const,
+        }]),
+      ],
     };
     try {
       do {
@@ -580,6 +606,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.provisional = undefined;
     this.provisionalFailure = undefined;
     this.provisionalNativeIdentity = undefined;
+    this.provisionalLifecycle = undefined;
     this.strengtheningCandidate = undefined;
     this.anchor = undefined;
     this.status = undefined;
@@ -757,14 +784,33 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     const baseline = provisional.baseline;
     if (candidate === undefined) {
-      if (lifecycle.revision < baseline.revision) {
+      const retained = this.provisionalLifecycle!;
+      if (lifecycle.revision < retained.revision) {
         this.markProvisionalFailure("revision_regressed");
         return;
       }
-      if (lifecycle.revision === baseline.revision && (lifecycle.stateChangeSeq === undefined || lifecycle.stateChangeSeq <= baseline.stateChangeSeq)) return;
-      if (lifecycle.stateChangeSeq === undefined || lifecycle.stateChangeSeq <= baseline.stateChangeSeq) {
-        this.markProvisionalFailure("lifecycle_not_advanced");
+      if (lifecycle.stateChangeSeq === undefined) {
+        if (lifecycle.revision !== baseline.revision) this.markProvisionalFailure("lifecycle_not_advanced");
+        return;
       }
+      if (lifecycle.stateChangeSeq < retained.stateChangeSeq) {
+        this.markProvisionalFailure("lifecycle_regressed");
+        return;
+      }
+      if (lifecycle.revision === retained.revision && lifecycle.stateChangeSeq === retained.stateChangeSeq) {
+        if (lifecycle.status !== retained.status) this.markProvisionalFailure("lifecycle_contradiction");
+        return;
+      }
+      if (lifecycle.status !== retained.status) retained.events.push({
+        atMs: this.deps.clock.now(),
+        from: retained.status,
+        to: lifecycle.status,
+        revision: lifecycle.revision,
+        source: "event",
+      });
+      retained.revision = lifecycle.revision;
+      retained.stateChangeSeq = lifecycle.stateChangeSeq;
+      retained.status = lifecycle.status;
       return;
     }
     if (lifecycle.stateChangeSeq === undefined || lifecycle.stateChangeSeq < baseline.stateChangeSeq) {

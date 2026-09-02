@@ -133,6 +133,26 @@ describe("JobRegistry", () => {
     expect(shutdownCalls).toBe(1);
   });
 
+  it.each(["pi", "claude"] as const)("allows a %s-requested reservation to bind an AGY fallback provisionally", async (agentKind) => {
+    const registry = new JobRegistry({ idFactory: () => "job_agy_fallback" });
+    const requestedProfileName = `researcher-${agentKind}`;
+    const handle = registry.register({
+      ...provisionalRequest,
+      child: { agentName: "worker", agentKind, profileName: requestedProfileName },
+    }, async () => new Promise<never>(() => undefined));
+    await vi.waitFor(() => expect(registry.get(handle.jobId)?.operation_phase).toBe("running"));
+
+    const publication = registry.prepareProvisionalSupervisionChildBinding(handle.jobId, { agentKind: "agy", profileName: "fallback-agy" });
+    publication.commit();
+    expect(registry.get(handle.jobId)?.request).toMatchObject({
+      targetIds: [],
+      child: { agentKind: "agy", profileName: "fallback-agy", requestedAgentKind: agentKind, requestedProfileName },
+    });
+    publication.rollback();
+    expect(registry.get(handle.jobId)?.request).toMatchObject({ child: { agentKind, profileName: requestedProfileName } });
+    registry.shutdown();
+  });
+
   it.each(["pi", "claude"] as const)("allows an AGY-requested reservation to bind an exact %s fallback", async (agentKind) => {
     const registry = new JobRegistry({ idFactory: () => "job_fallback" });
     const handle = registry.register(provisionalRequest, async () => new Promise<never>(() => undefined));
@@ -744,8 +764,8 @@ describe("JobRegistry", () => {
     await vi.waitFor(() => expect(registry.get(wait.jobId)?.operation_phase).toBe("running"));
     expect(() => registry.prepareProvisionalSupervisionChildBinding(wait.jobId, provisional)).toThrow(/JOB_KIND_MISMATCH/u);
 
-    const nonAgy = await register({ ...provisionalRequest, child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    expect(() => registry.prepareProvisionalSupervisionChildBinding(nonAgy.jobId, provisional)).toThrow(/SUPERVISION_PROVISIONAL_INVALID/u);
+    const nonAgy = await register();
+    expect(() => registry.prepareProvisionalSupervisionChildBinding(nonAgy.jobId, { agentKind: "pi", profileName: "worker-pi" })).toThrow(/SUPERVISION_PROVISIONAL_INVALID/u);
     const malformed = await register();
     expect(() => registry.prepareProvisionalSupervisionChildBinding(malformed.jobId, { agentKind: "agy", profileName: "" })).toThrow(/SUPERVISION_BINDING_INVALID/u);
     const misaligned = await register({ ...provisionalRequest, target_generation_refs: [] });

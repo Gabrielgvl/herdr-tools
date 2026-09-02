@@ -2,7 +2,7 @@
 
 ## Objective
 
-Replace the normal `pi-subagents` delegation path with visible, pane-backed Pi and Claude agents launched from reusable profiles. Build it in working layers rather than coupling the first release to every lifecycle feature.
+Replace the normal `pi-subagents` delegation path with visible, pane-backed Pi, Claude, and AGY agents launched from reusable profiles. Build it in working layers rather than coupling the first release to every lifecycle feature.
 
 The first implementation slice delivers a strict profile catalog and profile-backed launch that can be dogfooded immediately. It also gives each bundled role an explicit capability policy and one shared role skill across Pi and Claude, with `manager-pi` as the generic advisory manager and `manager-claude` as the explicit Claude/Fable manager and succession profile. Later slices add Herdr-native turn results, same-pane replacement, durable run state, and the blocking `herdr_delegate` lifecycle tool. `pi-subagents` remains installed only until the acceptance gates for the complete replacement pass.
 
@@ -17,21 +17,22 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Exact-name precedence is project > user > bundled; the winning file replaces the whole lower-precedence profile.
 - Files use strict YAML 1.2 frontmatter and a required literal Markdown body. No interpolation, includes, inheritance, environment expansion, or raw argv.
 - Filename stem must equal a required lowercase kebab-case `name`; `description`, exact `model`, `kind`, and kind-specific reasoning are required.
-- Each profile pins exactly one kind (`pi` or `claude`) through a discriminated runtime block. The body is appended to the runtime's default system prompt.
-- Claude profiles must set `sessionPersistence: true` because Herdr starts interactive Claude agents; Pi profiles may set it false and receive `--no-session`.
+- Each profile pins exactly one kind (`pi`, `claude`, or `agy`) through a discriminated runtime block. Pi and Claude bodies are appended through their existing system-prompt channels. An AGY body is catalog metadata only and never reaches the runtime.
+- Claude and AGY profiles must set `sessionPersistence: true` because Herdr starts interactive agents. Pi profiles may set it false and receive `--no-session`.
 - Relative runtime-resource paths resolve from the profile scope root. Arbitrary environment overrides are not supported by profile delegation.
-- Profile bodies are stored as durable owner-only prompt sources before topology mutation. The source is a UTF-8 exact-body SHA-256 content-addressed file under the Herdr-tools cache directory (`0700` directory, `0600` file), reused across launches and restarts; successful sources are never deleted.
+- Pi and Claude profile bodies are stored as durable owner-only prompt sources before topology mutation. The source is a UTF-8 exact-body SHA-256 content-addressed file under the Herdr-tools cache directory (`0700` directory, `0600` file), reused across launches and restarts; successful sources are never deleted.
 - Typed call overrides may replace typed defaults, including capability-expanding Claude permission modes. Project profiles have no trust gate. These are deliberate trust choices.
 - Fallbacks are ordered references to named profiles, validated as a graph. A launch has at most three attempts. Invalid profiles are isolated; only the selected reachable graph blocks launch.
-- Automatic fallback is allowed only after the installed CLI failure envelope `{id:"cli:agent:start",error:{code:"agent_start_failed",message:"agent process exited before becoming interactive"}}` with non-killed exit 1 and untruncated stderr, followed by an authoritative pane read with `agent_status:"unknown"` and no agent identity/session fields. Timeout, malformed/protocol, identity/kind, prompt, and uncertain-state failures stop.
+- Automatic fallback is allowed only after the installed CLI failure envelope `{id:"cli:agent:start",error:{code:"agent_start_failed",message:"agent process exited before becoming interactive"}}` with non-killed exit 1 and untruncated stderr, followed by an authoritative pane read with `agent_status:"unknown"` and no agent identity/session fields. Timeout, malformed protocol, identity, kind, prompt, provisional supervision, strengthening, and uncertain-state failures stop. After any possible prompt effect, launch never retries, falls back, cleans up, or releases the recovery handle.
 - Fallback targets use their own untouched defaults. Typed overrides apply only to the requested primary. The logical cwd, task, placement, and provenance carry across attempts.
-- Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager-pi` uses `openai-codex/gpt-5.6-sol` with high thinking as the generic advisory profile; `manager-claude` uses `claude-fable-5` with high effort, default permission mode, persistent session state, the manager plugin, and no fallback because manager identity must not silently change. The other roles have Pi and Claude variants with the existing direction/model policy:
+- Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager-pi` uses `openai-codex/gpt-5.6-sol` with high thinking as the generic advisory profile. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, persistent session state, the manager plugin, and no fallback because manager identity must not silently change. The other role directions and models are:
   - scout: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
-  - researcher: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
+  - researcher: `gemini-3.7-flash-high` -> `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - worker: `openai-codex/gpt-5.6-luna` with max thinking -> `claude-opus-5`;
   - reviewer: `openai-codex/gpt-5.6-sol` -> `claude-opus-5`;
   - planner: `claude-fable-5` -> `openai-codex/gpt-5.6-sol`.
-- Every bundled profile has one role-scoped skill. Claude profiles load the corresponding scope-local plugin directory; Pi profiles load the same skill path directly. Normal installed extension discovery remains enabled, while profile allowlists omit hidden delegation, durable-memory mutation, and unapproved lifecycle capabilities.
+  AGY research uses fixed plan mode and permission bypass. The existing Pi and Claude profile claims remain unchanged.
+- Every bundled Pi and Claude profile has one role-scoped skill. Claude profiles load the corresponding scope-local plugin directory; Pi profiles load the same skill path directly. Normal installed extension discovery remains enabled, while profile allowlists omit hidden delegation, durable-memory mutation, and unapproved lifecycle capabilities.
 - Bundled role bodies are rewritten for Herdr; they do not preserve chain, artifact, fork, or `pi-subagents` implementation assumptions.
 
 ## Layered delivery
@@ -43,9 +44,9 @@ Deliver now:
 - strict schema/parser and scoped discovery;
 - deterministic whole-profile precedence and graph validation;
 - bounded `herdr_inspect` profile collection/exact-profile modes; collection omissions expose `truncated`, exact whole-item `omittedCount`, exact diagnostic `diagnosticOmittedCount`, and an `OUTPUT_TRUNCATED` diagnostic in both details and model-visible JSON. Catalogs also retain the total generated diagnostic count even when retained diagnostics are capped;
-- typed Pi and Claude argv adapters;
+- typed Pi, Claude, and AGY argv adapters;
 - profile-backed launch through the existing launch implementation while preserving mandatory assignment provenance;
-- starter bundled profiles, shared role plugins/skills, explicit Pi/Claude capability matrices, and unit tests;
+- starter bundled profiles, shared role plugins and skills, explicit Pi and Claude capability matrices, the AGY researcher contract, and unit tests;
 - bounded automatic fallback for the exact pre-interactive process-exit error and authoritative no-agent proof; all other failures stop and return bounded attempt evidence.
 
 This slice must not pretend terminal transcript scraping is a structured result.
@@ -54,9 +55,15 @@ This slice must not pretend terminal transcript scraping is a structured result.
 
 `herdr_launch` has one public mode: `{name, profile, overrides?, placement?, label?, cwd?, focus?, initialPrompt?}`. Raw `kind`, `argv`, and `env` fields are rejected. Profile discovery remains rooted at the manager session cwd and accepts arbitrary valid named profiles.
 
-The advisory role defaults are: manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-pi for research, and reviewer-pi for review. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. These defaults do not restrict arbitrary valid profile selection. Primary-only typed overrides never leak into fallback profiles. Profile `timeoutMinutes` is task policy; Herdr startup uses a separate valid 120000 ms readiness timeout and a small CLI execution margin.
+The advisory role defaults are: manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-agy for research, and reviewer-pi for review. Its exact chain is `researcher-agy -> researcher-pi -> researcher-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. These defaults do not restrict arbitrary valid profile selection. Primary-only typed overrides never leak into fallback profiles. Profile `timeoutMinutes` is task policy; Herdr startup uses a separate valid 120000 ms readiness timeout and a small CLI execution margin.
 
-Launch details include requested and selected profile names, effective runtime/model/source/timeout/permissions, bounded per-attempt evidence, and (when an initial prompt is supplied) a typed atomic submission acknowledgement plus a separate working-state observation. Real Herdr protocol 20 `agent_started` may omit identity fields. Before dispatch or no-prompt return, launch runs one bounded, read-only identity-readiness preflight (target approximately five seconds with short polling): every sample freshly reads snapshot, `agent get`, and pane, and joins only that sample with fields actually supplied by start. Missing components are never merged across samples; a complete start field may cover a fresh omission, but a missing start session must be supplied by one sample. Contradictions fail immediately; timeout or caller abort fails closed with bounded evidence. Only the captured exact pane/terminal/name/kind and complete `agent_session` identity permits one provenance-wrapped `agent prompt --stdin` call without `--wait`; readiness is not a prompt retry. An exact `agent_prompted` identity, `interactive_ready:true`, and safe `revision` confirm acceptance. `screen_detection_skipped`, idle/done/blocked state, stale revision, or unavailable/replaced observation are observation outcomes, not reasons to press Enter, invoke a runtime hook, fall back, or resubmit. A replaced post-state is omitted from authoritative details and success rows and appears only as bounded mismatch evidence. A malformed, failed, or identity-mismatched identity/acknowledgement stops without duplicate bytes. Fallback uses the deterministic reachable order, up to three attempts, and only the exact installed CLI error envelope plus the schema-real `agent_status:"unknown"` no-agent proof; fallback is never used during identity polling. Every timeout, protocol, identity/kind, prompt, or uncertain start failure stops without fallback. Exhaustion stops and reports; it never invents another profile.
+AGY accepts only `model` and scope-normalized `addDirs` overrides. Its argv is fixed to `--model <model> --mode plan --dangerously-skip-permissions`, followed by the declared add directories and the Herdr-Tools-owned recipient attachment directory. It accepts no prompt file, raw argv, arbitrary environment, or promptless launch. The required `initialPrompt` is visible, provenance-wrapped, and self-contained because the profile body remains metadata and AGY receives repository `AGENTS.md` only through native discovery.
+
+Launch details include requested and selected profile names, effective runtime, model, source, timeout, permissions, bounded per-attempt evidence, and prompt confirmation evidence. Pi and Claude retain complete native-session readiness before dispatch or promptless success.
+
+AGY alone may publish a running, live, non-cancellable `provisional` supervisor after one coherent idle sample proves pane, terminal, name, kind, sequence, and revision without a native session. It then submits the mandatory envelope exactly once and requires the official full native `agent_session`, lifecycle advancement, and non-regressed revision within the existing five-second confirmation window. One observer-backed transaction drains provisional events before atomically publishing exact `active` or `degraded` coverage. Recipients and attachments remain unavailable until strengthening and semantic assignment confirmation both succeed.
+
+This provisional window carries an AGY-only reduced-assurance risk: pane, terminal, name, and kind continuity is not cryptographic attribution. A same-terminal replacement or stale report can be misattributed until exact strengthening. This AGY runtime support is a Herdr Tools-only change. Herdr Tools bounds but cannot eliminate that risk without a Herdr Core change. Pi and Claude remain strict. Any possible prompt effect followed by acknowledgement, transport, identity, read, timeout, or strengthening failure leaves the provisional supervisor and child visible and performs no retry, fallback, cleanup, reservation release, or recipient registration. The only fallback remains the exact pre-interactive no-agent case.
 
 ### Slice 2: Herdr runtime prerequisites
 
@@ -143,7 +150,7 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 ## Testing strategy
 
 - Unit-test parsing, schema rejection, precedence, shadow reporting, graph cycles/missing targets/max attempts, path resolution, argument generation, bounds, and redaction.
-- Assert the 12 bundled profiles, exact manager-claude and role capability matrices, shared resource paths, no hidden delegation tools, read-only mutation exclusions, and representative Pi/Claude launch flags.
+- Assert the 13 bundled profiles, exact `researcher-agy` chain and fixed argv, exact manager-claude and role capability matrices, shared resource paths, no hidden delegation tools, read-only mutation exclusions, and representative Pi, Claude, and AGY launch flags.
 - Unit-test launch ordering: resolve -> create pane/tab -> start exact kind/argv -> readiness -> provenance assignment.
 - Integration-test in a disposable Herdr session; never mutate or close the active user workspace.
 - Runtime work requires Pi and Claude contract tests for result correlation, cancellation, replacement, restart reconciliation, and capacity/storage failures.
@@ -176,12 +183,12 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 
 ## Slice 1 success criteria
 
-- [ ] Twelve bundled profiles resolve deterministically with source and shadow evidence; `manager-pi` remains the generic advisory manager and `manager-claude` is selected for explicit Claude/Fable management or Claude-to-Claude succession; both have no fallback.
+- [ ] Thirteen bundled profiles resolve deterministically with source and shadow evidence; `manager-pi` remains the generic advisory manager and `manager-claude` is selected for explicit Claude/Fable management or Claude-to-Claude succession; both have no fallback.
 - [ ] Every bundled role has one shared role skill, with matching Pi skill and Claude plugin resources.
 - [ ] Pi and Claude capability matrices exclude hidden delegation and keep direct mutation tools limited to workers.
 - [ ] Invalid unrelated profiles do not block valid profiles; invalid reachable fallback graphs fail before launch.
 - [ ] Exact profile inspection is bounded and redacts sensitive runtime values.
-- [ ] Pi and Claude adapters produce typed, shell-free argv with appended-system-prompt semantics.
+- [ ] Pi and Claude adapters produce typed, shell-free argv with appended-system-prompt semantics; AGY produces fixed plan and permission-bypass argv without a profile-body prompt source.
 - [ ] Profile-backed launch works in a disposable Herdr session and preserves the v1 assignment envelope.
 - [ ] At least one bundled Luna profile is used to perform real repository work after deployment.
 - [ ] Unit, typecheck, lint, build, and integration gates are green.

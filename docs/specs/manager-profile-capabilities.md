@@ -16,18 +16,19 @@ Success means profile launches are useful by default, hidden subagent spawning i
 - Both manager profiles orchestrate visible workers. The Claude manager may use Bash, Edit, and Write only after direct owner approval for coordination artifacts, read-only verification, monitoring, or directly owner-authorized control-plane actions; it must not perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation.
 - Use role-scoped tool allowlists while retaining installed extension discovery.
 - Configure role-specific skills.
-- Advisory defaults are manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-pi for research, and reviewer-pi for review. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.
+- Advisory defaults are manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-pi for reconnaissance, researcher-agy for research, and reviewer-pi for review. Its chain is exactly `researcher-agy -> researcher-pi -> researcher-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.
 
 ## Assumptions
 
 1. `manager-pi` uses `openai-codex/gpt-5.6-sol` with `thinking: high`, a 30-minute timeout, and no persistent Pi session.
 2. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, a 30-minute timeout, persistent session state, and no fallback because manager identity must not silently change.
-3. Existing model and fallback choices remain unchanged for non-manager roles.
+3. Existing Pi and Claude model and fallback choices remain unchanged. `researcher-agy` adds `gemini-3.7-flash-high` ahead of the existing researcher chain.
 4. Pi extension discovery remains enabled. Profile `runtime.extensions` stays empty because bundled profiles cannot portably reference machine-global package paths.
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
 7. Non-manager profiles cannot spawn hidden subagents. Pi profiles omit `Agent` and Herdr lifecycle tools; Claude profiles disallow `Task`.
 8. Read-only means no direct edit/write tool. As in Pi’s existing read-only agent convention, read-only roles retain shell access for inspection commands and are explicitly prohibited from state-changing shell commands by their role skill.
+9. AGY support is implemented only in Herdr Tools. It requires no Herdr Core change. The AGY profile body is metadata, not a runtime prompt.
 
 ## Tech Stack
 
@@ -55,6 +56,7 @@ herdr-profiles/
   manager-claude.md
   *-pi.md
   *-claude.md
+  researcher-agy.md
   role-plugins/
     manager/
       .claude-plugin/plugin.json
@@ -113,6 +115,12 @@ Explicitly absent from every non-manager Pi profile:
 
 `manager-pi` does not receive `bash`, `edit`, or `write`. `manager-claude` receives none of those tools through pre-approval; Claude's `default` permission mode keeps owner approval required when they are requested.
 
+### AGY researcher
+
+`researcher-agy` uses `gemini-3.7-flash-high`, persistent sessions, fixed plan mode, and `--dangerously-skip-permissions`. Only model and scope-normalized `addDirs` may be overridden. Its profile body is catalog metadata. Every launch requires one visible, provenance-wrapped, self-contained `initialPrompt`; AGY discovers repository `AGENTS.md` natively.
+
+AGY initially publishes provisional pane, terminal, name, and kind supervision because its native session may appear only after the first prompt. The launch strengthens to exact native-session supervision before reporting success or registering recipient and attachment capability. A failure after possible prompt effect leaves the provisional child and recovery evidence visible, with no retry, fallback, cleanup, reservation release, or recipient registration. This reduced-assurance window is accepted for AGY only. Pi and Claude still require complete native-session identity before assignment.
+
 ### Claude profiles
 
 | Role | Permission mode | Pre-approved tools | Disallowed tools |
@@ -162,6 +170,8 @@ Claude `allowedTools` pre-approves selected tools; `disallowedTools` supplies th
 
 ### Researcher
 
+- Use `researcher-agy` by default, with the declared Pi then Claude fallback chain available only for an exact pre-interactive no-agent start failure.
+- Give AGY a self-contained assignment because its profile body never reaches the runtime.
 - Answer a focused question with bounded, cited findings.
 - Prefer primary sources and separate sourced facts from inference.
 - If required web tools are unavailable, return a visible capability blocker instead of uncited approximation.
@@ -188,13 +198,13 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 
 ### Unit tests
 
-- Catalog discovers 12 bundled profiles with no diagnostics.
+- Catalog discovers 13 bundled profiles with no diagnostics.
 - `manager-pi` and `manager-claude` have exact identity, model, authority prompt, tools, shared skill/plugin path, and empty fallbacks.
 - Every Pi profile has a non-empty role allowlist and exactly one scoped role skill.
 - Every Claude profile has explicit permission mode, allowed/disallowed tools, and exactly one scoped plugin directory.
 - Read-only roles exclude direct mutation tools.
 - Non-manager roles exclude hidden delegation tools.
-- Pi and Claude launch argv contain the exact tool, skill, permission, and plugin flags.
+- Pi and Claude launch argv contain the exact tool, skill, permission, and plugin flags. AGY argv contains the exact model, plan mode, permission bypass, and bounded add-directory flags with no prompt source.
 - Invalid or escaping role resource paths remain rejected by existing parser tests.
 - A profile launch accepts that real Herdr protocol 20 `agent_started` may omit identity fields, then runs one bounded, read-only identity-readiness preflight (target approximately five seconds with short polling) before any prompt dispatch or recipient registration. Each sample freshly reads snapshot, `agent get`, and pane and joins only that coherent sample with fields actually supplied by start; missing components are never merged across samples. A complete start field may cover a fresh omission, but a missing start session must arrive in one sample. Contradictions fail immediately; timeout or caller abort fails closed with bounded evidence. Only the exact captured pane/terminal/name/kind and complete `agent_session` identity permits one provenance-wrapped `agent prompt --stdin` submission without `--wait`; the readiness window is not a prompt retry. The exact captured identity plus `agent_prompted` and `interactive_ready:true` acknowledge acceptance. The same full identity is persisted for attachment recipients; optional `agent_id` is diagnostic only. Headless `screen_detection_skipped`, idle post-state, stale revision, or unavailable/replaced observation never triggers Enter, a runtime hook, fallback, or a duplicate submission, and a replacement is never returned as authoritative post-state.
 
@@ -222,13 +232,13 @@ Checkpoint: load the catalog and build argv for the manager plus one Pi/Claude p
 - Keep models, reasoning, timeouts, persistence, and existing fallback direction unchanged.
 - Include `herdr_tab` in the manager set and the four approved background-job tools in `worker-pi`.
 
-Checkpoint: catalog resolution has 12 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
+Checkpoint: catalog resolution has 13 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
 
 ### 3. Enforce contracts in tests
 
 - Extend `test/unit/profile-catalog.test.ts` with an exact capability matrix and role-resource existence checks.
 - Add representative `buildProfileArgv` assertions for manager, worker, read-only Pi, and Claude profiles.
-- Update `test/integration/herdr-tools.integration.test.ts` to inspect 12 profiles, inspect both manager profiles, and verify exact worker tool/skill launch arguments without changing provenance or topology assertions.
+- Update `test/integration/herdr-tools.integration.test.ts` to inspect 13 profiles, inspect both manager profiles and `researcher-agy`, and verify exact worker and AGY launch arguments without changing provenance or topology assertions.
 - Add identity-bound prompt acknowledgement and optional post-dispatch observation in `src/tools/launch.ts`: accept partial Herdr protocol 20 `agent_started` identity, then run one bounded read-only snapshot + `agent get` + pane preflight sample at a time before submission and before no-prompt return. Join each sample only with start-supplied fields; never merge missing components across samples, and fail immediately on supplied contradictions. After one sample yields the exact pane/terminal/name/kind and complete `agent_session`, submit exactly once through `agent prompt --stdin` and require the typed `agent_prompted` response to match that captured identity, `interactive_ready:true`, and safe revision. Abort/timeout stops before stdin and recipient registration with bounded evidence. Persist that identity for attachments, report working/skipped/stale/unavailable observation without waiting, retrying, runtime hooks, fallback, or sending Enter, and omit replacement post-state from authoritative details and success rows.
 - Cover accepted idle/screen-detection-skipped launches, stale/unavailable observation, malformed/mismatched acknowledgements, and the no-duplicate/no-key boundary in `test/unit/launch.test.ts`.
 - Do not weaken strict parser, inspection-budget, discovery, or fallback tests.
@@ -257,7 +267,7 @@ HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration
 
 Then inspect the live profile collection from the built extension and confirm:
 
-- 12 effective profiles;
+- 13 effective profiles;
 - no diagnostics;
 - `manager-pi` reports the exact approved tools and skill;
 - existing profiles report their role-specific resources.
@@ -315,7 +325,7 @@ Then inspect the live profile collection from the built extension and confirm:
 ## Success Criteria
 
 - `manager-pi` can visibly orchestrate profile-backed workers through Herdr and cannot directly edit repositories.
-- All 12 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
+- All 13 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
 - All Pi and Claude variants use one shared role skill source per role.
 - Read-only and no-hidden-delegation boundaries are mechanically represented in profile configuration and tested.
 - Unit tests, typecheck, lint, build, and integration tests pass.

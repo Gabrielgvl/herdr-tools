@@ -24,7 +24,11 @@ for each other.
 
 ## Validated product decisions
 
-- Herdr core is not changed. No Rust work, no new CLI surface, no new Herdr API.
+- Herdr Core is not changed. No Rust work, no new CLI surface, no new Herdr API.
+- `researcher-agy` is the research default and uses `gemini-3.7-flash-high` with
+  fixed `--mode plan` and `--dangerously-skip-permissions`. Its exact chain is
+  `researcher-agy -> researcher-pi -> researcher-claude`. Primary model and bounded
+  `addDirs` overrides never leak into the Pi or Claude fallbacks.
 - Inline text uses the existing `herdr agent prompt <TARGET> --stdin` transport for
   every wrapped text delivery, including the small attachment-reference envelope.
 - Large text is stored by `herdr-tools` in a local attachment store it owns
@@ -46,9 +50,10 @@ for each other.
   unless the sender's own text asks for it.
 - First slice is text-only, atomic and owner-only on disk, recipient-scoped,
   quota- and expiry-bounded, and never logs a message body.
-- Every bundled Pi and Claude profile can read attachments. Pi profiles read the
-  absolute path with the default `read` tool; Claude profile launches receive an
-  extension-owned `--add-dir` for that recipient's own attachment directory.
+- Every bundled Pi, Claude, and AGY profile can read attachments. Pi profiles read the
+  absolute path with the default `read` tool. Claude and AGY profile launches receive an
+  extension-owned `--add-dir` for that recipient's own attachment directory. AGY is not
+  registered for later recipient or attachment delivery until exact-session strengthening.
 - Unprofiled or incapable targets fail visibly with a typed error instead of
   receiving an unusable reference.
 
@@ -83,26 +88,36 @@ No text delivery uses `--wait`, `--until`, or a synthesized Enter. For
 `herdr_communicate`, the fresh snapshot agent record, `agent get`, and pane records
 are the complete identity source: one strict join must establish the exact pane ID,
 terminal ID, agent name/kind, and complete `agent_session`, while every supplied field
-must agree and omitted/null fields remain absent. For `herdr_launch.initialPrompt`,
-real Herdr protocol 20 `agent_started` records may omit identity fields. Launch
-therefore runs one bounded, read-only identity-readiness preflight (target
-approximately five seconds with short polling) before dispatch or recipient
-registration. Every sample
-freshly reads snapshot, `agent get`, and pane, and joins that single coherent sample
-only with fields actually supplied by `agent_started`; no missing component is
-carried from an earlier sample. A complete start field may cover a fresh omission,
-but a missing start session must be present in one sample. Any contradiction against
-start or within a sample fails immediately; timeout or caller abort fails closed with
-bounded evidence. This is identity readiness, not a prompt retry: stdin remains
-zero or one submission, with no Enter, runtime hook, fallback, or duplicate bytes.
-A pane/name/kind match alone is insufficient.
-Herdr's optional working-state observation can report `agent_prompt_stalled` after
-accepting the bytes, and headless panes commonly return
+must agree and omitted/null fields remain absent. For a Pi or Claude
+`herdr_launch.initialPrompt`, real Herdr protocol 20 `agent_started` records may omit
+identity fields. Launch therefore runs one bounded, read-only identity-readiness
+preflight with short polling before dispatch or recipient registration. Every sample
+freshly reads snapshot, `agent get`, and pane, and joins that one sample only with fields
+actually supplied by `agent_started`. No missing component is carried from an earlier
+sample. A complete start field may cover a fresh omission, but a missing start session
+must be present in one sample. Contradiction, timeout, or caller abort fails closed with
+bounded evidence. A pane, name, and kind match alone is insufficient.
+
+AGY is the only exception. One coherent idle sample may lack native `agent_session`
+when it proves pane, terminal, name, kind, sequence, and revision. The launch publishes
+a live, non-cancellable provisional supervisor, submits the mandatory visible
+self-contained assignment once, then requires the full native session and lifecycle
+advancement within the existing five-second confirmation window. An observer-backed
+transaction drains provisional events before publishing exact coverage. Recipient and
+attachment capability registration happens only after strengthening and semantic
+confirmation. Pane and terminal continuity is not cryptographic attribution during
+this AGY-only reduced-assurance window, and Herdr Tools cannot eliminate that residual
+risk without a Herdr Core change.
+
+This is identity readiness, not a prompt retry. Stdin remains zero or one submission,
+with no Enter, runtime hook, fallback after possible effect, cleanup, reservation
+release, or duplicate bytes. Herdr's optional working-state observation can report
+`agent_prompt_stalled` after accepting the bytes, and headless panes commonly return
 `screen_detection_skipped:true` with an idle post-state. A successful
-`cli:agent:prompt` / `agent_prompted` envelope whose returned identity exactly
-matches the captured identity, with `interactive_ready` and safe `revision`, is
-the atomic submission acknowledgement. It confirms acceptance, not turn progress
-or completion. The follow-up agent/pane reads are optional identity-bound
+`cli:agent:prompt` / `agent_prompted` envelope must match the full captured Pi or Claude
+identity, or the provisional AGY pane, terminal, name, and kind. It must also carry
+`interactive_ready` and safe `revision`. This is the atomic submission acknowledgement.
+It confirms acceptance, not turn progress or completion. The follow-up agent/pane reads are optional identity-bound
 observation and report working, non-working, unknown, skipped, stale, or
 unavailable without resubmitting the body; a replacement is never described as
 the original target.
@@ -284,20 +299,23 @@ before every attachment send.
   - `pi`: capable when the effective `tools` (override if present, else profile) is
     empty (the default tool set includes `read`) or explicitly includes `read`;
   - `claude`: capable when the effective `disallowedTools` excludes `Read` and the
-    effective `allowedTools` is either empty or includes `Read`.
+    effective `allowedTools` is either empty or includes `Read`;
+  - `agy`: capable because launch grants its recipient directory with fixed
+    `--add-dir`; only `model` and scope-normalized `addDirs` may be overridden.
   Typed override validation runs first, so an incompatible-kind override still fails
   as `INVALID_PROFILE_OVERRIDE` rather than as a capability refusal.
-- Every bundled Pi and Claude profile satisfies this today: none of them restricts
-  tools. A user or project profile that does is reported incapable, not repaired.
+- Every bundled Pi, Claude, and AGY profile satisfies this today. A user or project Pi
+  or Claude profile that removes its read capability is reported incapable, not repaired.
 - Profile-backed `herdr_launch` mints the recipient key, ensures the recipient
   directory, and records `paneId → { recipientKey, profileName, kind, capable,
   reason, terminalId, agentName, agentKind, agentSession, agentId }` in the registry
-  on success. The pane, terminal, name, kind, and complete session object are the
-  binding; `agentId` is optional diagnostic metadata only.
-- Claude profile launches additionally receive an extension-owned
-  `--add-dir <root>/<recipientKey>`. Profile `addDirs` cannot express this path
-  (they are validated as relative to the profile scope root), so the grant belongs to
-  the launch adapter, not to profile configuration. No bundled profile file changes.
+  on success. An AGY record is committed only after exact-session strengthening and
+  semantic assignment confirmation. The pane, terminal, name, kind, and complete
+  session object are the binding; `agentId` is optional diagnostic metadata only.
+- Claude and AGY profile launches additionally receive an extension-owned
+  `--add-dir <root>/<recipientKey>`. Profile `addDirs` cannot express this path because
+  they are validated as relative to the profile scope root, so the grant belongs to
+  the launch adapter, not to profile configuration.
 - Launch is profile-only (ADR 008, profile-only launch and bounded fallback), so every
   launch produces a registry record. An attachment launch requires **every** profile in
   the resolved fallback chain to be capable, because any of them may be the one that
@@ -310,7 +328,8 @@ before every attachment send.
 - Before an attachment send, `herdr_communicate` requires a registry record for the
   resolved pane whose recorded pane, terminal, name, kind, and complete session
   identity still match the fresh authoritative snapshot and the pre-send join. A
-  same-name/pane replacement therefore fails even when `agent_id` is absent or
+  provisional AGY supervisor never satisfies this requirement. A same-name/pane
+  replacement therefore fails even when `agent_id` is absent or
   unchanged. A missing record, an incapable record, or an identity mismatch fails
   with `ATTACHMENT_TARGET_UNVERIFIED` and sends nothing.
 - Recovery for an unverified target is explicit: send `inline`, or relaunch the
@@ -369,15 +388,16 @@ before every attachment send.
   `ATTACHMENT_TARGET_UNVERIFIED` while the profile is resolved, before any topology
   mutation.
 - Storage happens before topology mutation, matching ADR-006: resolve profile →
-  check capability → create prompt source → mint recipient key and directory →
-  publish attachment → build argv (including the Claude `--add-dir` grant) → create
-  pane/tab → start agent and validate only the identity fields supplied by
-  `agent_started` → run the bounded protocol-20 identity-readiness preflight
-  until one coherent fresh snapshot plus `agent get` plus pane identity is
-  complete → send exactly one
-  identity-bound envelope over `--stdin` → validate the typed `agent_prompted`
-  acknowledgement → optionally observe the paired agent/pane state. The fresh joined
-  identity is mandatory even when no initial prompt is requested, and the same full
+  check capability → create a Pi or Claude prompt source → mint recipient key and
+  directory → publish attachment → build argv with the runtime's recipient
+  `--add-dir` grant where required → create pane/tab → start agent → run runtime-specific
+  readiness → send exactly one identity-bound envelope over `--stdin` → validate the
+  typed acknowledgement → confirm semantics. AGY creates no profile-body prompt source,
+  requires `initialPrompt`, publishes provisional supervision before submission, and
+  strengthens to the official native session before recipient registration or later
+  attachment delivery. The fresh joined
+  identity is mandatory for Pi and Claude even when no initial prompt is requested,
+  and the same full
   pane/terminal/name/kind/session binding is persisted in the recipient registry;
   `agent_id` is diagnostic only. Building profile argv therefore moves after the
   recipient key is minted. A newly-created pane has no authoritative pane ID before
@@ -391,7 +411,9 @@ before every attachment send.
   A replacement post-read is retained only as bounded mismatch evidence; it is never
   returned as `postState`, rendered as success-row state, or used for registration.
 - A launch failure still performs no cleanup: created panes and tabs remain and are
-  reported, and a published attachment remains until expiry.
+  reported, and a published attachment remains until expiry. After any possible AGY
+  prompt effect, launch also retains provisional supervision and never retries, falls
+  back, releases its reservation, or registers the recipient.
 - `details` gains `initialPromptDelivery`, `initialPromptSubmission`,
   `initialPromptObservation`, the same `attachment` block, and the recipient record
   identity. Streamed progress gains an `attachment_publish` phase before `placement`.
@@ -548,8 +570,8 @@ Unit tests with injected IO and a fake executor:
 - `herdr_communicate`: default inline route, oversized inline rejection, explicit
   attachment route ordering, unverified target rejection with nothing sent, `keys`
   rejecting `delivery`, unchanged busy/steer/post-state behaviour;
-- `herdr_launch`: pre-mutation publish ordering, Claude `--add-dir` grant, incapable
-  fallback-chain rejection before mutation, capability-removing override rejection before
+- `herdr_launch`: pre-mutation publish ordering, Claude and AGY `--add-dir` grants,
+  incapable fallback-chain rejection before mutation, capability-removing override rejection before
   storage or mutation, registry record on success, retained resources and retained
   attachment evidence on failure;
 - failure evidence: typed code preserved with `delivery`, `route`, `phase`, and
@@ -565,8 +587,8 @@ The suite separates gating acceptance from non-gating evidence.
 *confirmed* delivery and evidence only the recipient could produce: the attachment body
 carries a fresh token that appears nowhere in the envelope or argv and instructs the
 agent to write it to an exact marker path, and the test polls for that marker. A
-launched bundled Pi profile agent and a launched bundled Claude profile agent must each
-read their own attachment — the Claude case through its granted `--add-dir` directory.
+launched bundled Pi, Claude, and strengthened AGY profile agents must each read their
+own attachment. Claude and AGY use their granted `--add-dir` directories.
 Host-side reads of the published file are transport evidence and never substitute for
 recipient evidence. If a delivery cannot be confirmed, the acceptance test records a
 bounded failure with the exact code and phase and fails; it never converts the missing
@@ -618,10 +640,10 @@ and never mutates or closes the active user workspace.
       sends nothing.
 - [ ] A 1 MiB `attachment` request publishes an owner-only atomic attachment and
       delivers a reference envelope whose digest and byte count match the file.
-- [ ] A launched bundled Pi profile agent and a launched bundled Claude profile agent
-      each read their own attachment in a disposable session, proven by recipient-
-      produced evidence; an unconfirmed delivery leaves that criterion explicitly
-      blocked rather than satisfied.
+- [ ] Launched bundled Pi, Claude, and strengthened AGY profile agents each read their
+      own attachment in a disposable session, proven by recipient-produced evidence.
+      An unconfirmed delivery leaves that criterion explicitly blocked rather than
+      satisfied.
 - [ ] An unregistered or incapable target fails with `ATTACHMENT_TARGET_UNVERIFIED`
       before any publish or send, naming the requested route and phase.
 - [ ] Expired attachments are swept, quota exhaustion fails visibly, and no live

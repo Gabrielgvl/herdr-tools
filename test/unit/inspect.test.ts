@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { createInspectTool, MAX_INSPECT_CONTENT_BYTES } from "../../src/tools/inspect.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
+import { parseProfile, profileSource, type ProfileCatalog } from "../../src/profiles/index.js";
 
 const snapshot: HerdrSnapshot = {
   version: "0.8.0",
@@ -87,6 +88,25 @@ describe("herdr_inspect", () => {
     expect(JSON.stringify(healthContent)).not.toContain("/secret/socket");
     expect(JSON.stringify(healthContent)).not.toContain("health-secret");
     expect(Buffer.byteLength(contentText(healthResult), "utf8")).toBeLessThanOrEqual(MAX_INSPECT_CONTENT_BYTES);
+  });
+
+  it("exposes the strict AGY runtime and permissions in profile inspection", async () => {
+    const agy = parseProfile(`---\nname: researcher-agy\ndescription: AGY researcher\ntimeoutMinutes: 30\nsessionPersistence: true\nruntime:\n  kind: agy\n  model: gemini-3.7-flash-high\n  addDirs: [./research]\nfallbackProfiles: [researcher-pi]\n---\n\nCatalog metadata only.\n`, profileSource("bundled", "/profiles/researcher-agy.md", "/profiles"));
+    const pi = parseProfile(`---\nname: researcher-pi\ndescription: Pi researcher\ntimeoutMinutes: 30\nsessionPersistence: true\nruntime:\n  kind: pi\n  model: test/model\n  thinking: high\n  tools: [read]\nfallbackProfiles: []\n---\n\nPi fallback.\n`, profileSource("bundled", "/profiles/researcher-pi.md", "/profiles"));
+    const catalog: ProfileCatalog = { effective: new Map([[agy.name, agy], [pi.name, pi]]), candidates: [], diagnostics: [] };
+    const result = await createInspectTool({ cli: makeCli().cli, context, profiles: { load: async () => catalog } }).execute("id", { mode: "profile", profile: "researcher-agy" } as never, new AbortController().signal, undefined, extensionContext);
+
+    expect(result.details).toMatchObject({ profile: {
+      kind: "agy",
+      model: "gemini-3.7-flash-high",
+      mode: "plan",
+      dangerouslySkipPermissions: true,
+      addDirs: ["/profiles/research"],
+      sessionPersistence: true,
+      runtime: { kind: "agy", model: "gemini-3.7-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: ["/profiles/research"] },
+      fallbackProfiles: ["researcher-pi"]
+    } });
+    expect(JSON.parse(contentText(result))).toMatchObject({ profile: { kind: "agy", model: "gemini-3.7-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: ["/profiles/research"], sessionPersistence: true } });
   });
 
   it("reports a stale ancestor rebind in context mode", async () => {

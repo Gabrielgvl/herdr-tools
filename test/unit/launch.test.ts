@@ -124,11 +124,11 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
           ...liveSnapshot,
           panes: [
             ...liveSnapshot.panes.filter((pane) => pane.pane_id !== lastPaneId),
-            stripFreshSession({ pane_id: lastPaneId, tab_id: lastPaneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent_name: lastName, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "idle", state_change_seq: 7, revision: 3 })
+            stripFreshSession({ pane_id: lastPaneId, tab_id: lastPaneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent_name: lastName, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: promptSubmitted ? "working" : "idle", state_change_seq: promptSubmitted ? 8 : 7, revision: promptSubmitted ? 4 : 3, interactive_ready: true })
           ],
           agents: [
             ...liveSnapshot.agents.filter((agent) => agent.pane_id !== lastPaneId),
-            stripFreshSession({ pane_id: lastPaneId, name: lastName, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "idle", state_change_seq: 7, revision: 3 })
+            stripFreshSession({ pane_id: lastPaneId, name: lastName, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: promptSubmitted ? "working" : "idle", state_change_seq: promptSubmitted ? 8 : 7, revision: promptSubmitted ? 4 : 3, interactive_ready: true })
           ]
         };
         return ok("snapshot", { type: "session_snapshot", snapshot: currentSnapshot });
@@ -177,6 +177,7 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
           agent_status: promptSubmitted ? "working" : "idle",
           state_change_seq: promptSubmitted ? 8 : 7,
           revision: promptSubmitted ? 4 : 3,
+          interactive_ready: true,
           agent_session: lastAgentSession
         }) });
       }
@@ -185,7 +186,7 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
           ? options.paneStates[Math.min(paneReads++, options.paneStates.length - 1)]
           : undefined;
         const paneId = lastPaneId;
-        return ok("get", { pane: configured ?? stripFreshSession({ pane_id: paneId, tab_id: paneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: promptSubmitted ? "working" : "idle", state_change_seq: promptSubmitted ? 8 : 7, revision: promptSubmitted ? 4 : 3 }) });
+        return ok("get", { pane: configured ?? stripFreshSession({ pane_id: paneId, tab_id: paneId === "w1:p3" ? "w1:t2" : "w1:t1", workspace_id: "w1", agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: promptSubmitted ? "working" : "idle", state_change_seq: promptSubmitted ? 8 : 7, revision: promptSubmitted ? 4 : 3, interactive_ready: true }) });
       }
       if (argv[0] === "tab" && argv[1] === "get") return ok("tab-get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1:t2" } });
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
@@ -278,6 +279,27 @@ function launch(
     ...(extras.clock === undefined ? {} : { clock: extras.clock })
   });
   return tool.execute("id", params, new AbortController().signal, undefined, extensionContext);
+}
+
+function agySafetySupervision(strengthenFailure?: Error) {
+  let publishedView: Record<string, unknown> = { operation_phase: "running", state: "reserved", targetIds: [], live: true, cancellable: false };
+  const supervision = stubSupervision({
+    onProvisionalBind: (binding) => {
+      publishedView = {
+        operation_phase: "running",
+        state: "provisional",
+        targetIds: [],
+        live: true,
+        cancellable: false,
+        provisional: { ...binding.identity, profileName: binding.profileName, baseline: binding.baseline }
+      };
+    },
+    onStrengthen: (binding) => {
+      if (strengthenFailure) throw strengthenFailure;
+      publishedView = { operation_phase: "running", state: "active", targetIds: [binding.identity.paneId], live: true, cancellable: false, child: binding.identity };
+    }
+  });
+  return { supervision, publishedView: () => publishedView };
 }
 
 describe("herdr_launch evidence redaction", () => {
@@ -3023,6 +3045,169 @@ describe("herdr_launch profile-only contract", () => {
     expect(result.details).toMatchObject({ kind: "claude", profile: { requested: "primary", selected: "fallback", attempts: [{ profile: "primary", outcome: "agent_start_failed", errorCode: "agent_start_failed" }, { profile: "fallback", outcome: "selected" }] } });
   });
 
+  it.each(["pi", "claude"] as const)("keeps missing pre-prompt native sessions strict for %s", async (kind) => {
+    const clockControl = fakeManualClock();
+    const harness = makeCli({ omitFreshAgentSession: true });
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const response = await base(argv, signal, preserve);
+      if (harness.stdinInputs.length === 0 && argv[0] === "pane" && argv[1] === "get") clockControl.advance(120_001);
+      return response;
+    });
+    const supervision = stubSupervision();
+
+    await expect(launch({ name: "worker", profile: `worker-${kind}`, initialPrompt: "strict" }, catalog(profile(`worker-${kind}`, kind)), harness.cli, undefined, { supervision, clock: clockControl.clock }))
+      .rejects.toMatchObject({ code: "READY_TIMEOUT", details: { phase: "ready", promptSubmitted: false, recipientRegistered: false } });
+
+    expect(harness.stdinInputs).toHaveLength(0);
+    expect(supervision.provisionalBound).toHaveLength(0);
+    expect(supervision.bound).toHaveLength(0);
+  });
+
+  it("rejects a promptless AGY profile before any mutation or reservation", async () => {
+    const harness = makeCli();
+    const attachments = fakeAttachments();
+    const recipients = new RecipientRegistry();
+    const recipientRecord = vi.spyOn(recipients, "recordFor");
+    const supervision = stubSupervision();
+
+    await expect(launch({ name: "worker", profile: "researcher-agy" }, catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi")), harness.cli, undefined, { attachments, recipients, supervision }))
+      .rejects.toMatchObject({ code: "INVALID_INPUT", details: { phase: "resolve_profile", effectCertainty: "absent" } });
+
+    expect(harness.calls).toHaveLength(0);
+    expect(harness.stdinInputs).toHaveLength(0);
+    expect(attachments.ensureRecipient).not.toHaveBeenCalled();
+    expect(attachments.publish).not.toHaveBeenCalled();
+    expect(supervision.reserved).toHaveLength(0);
+    expect(supervision.released).toHaveLength(0);
+    expect(recipientRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["acknowledgement identity mismatch", "ack_mismatch"],
+    ["prompt transport failure", "transport"],
+    ["fresh occupant replacement", "identity_mismatch"],
+    ["duplicate pane evidence", "duplicate"],
+    ["failed authoritative read", "read_failed"],
+    ["contradictory authoritative read", "contradictory"],
+    ["missing native session timeout", "missing_session"],
+    ["malformed native session", "malformed_session"],
+    ["changed native session", "changed_session"],
+    ["lifecycle sequence does not advance", "stale_sequence"],
+    ["revision regression", "revision_regression"],
+    ["move before strengthening", "move"],
+    ["atomic strengthening publication failure", "strengthening"]
+  ] as const)("retains AGY provisional publication after %s", async (_label, scenario) => {
+    const clockControl = fakeManualClock();
+    const harness = makeCli({ omitFreshAgentSession: true });
+    const baseRun = harness.cli.runJson;
+    const baseStdin = harness.cli.runJsonWithStdin!;
+    const strengtheningFailure = scenario === "move"
+      ? new SupervisionBindError("moved before strengthening", { cause: "move_before_strengthening" })
+      : scenario === "strengthening"
+        ? new SupervisionBindError("publication failed", { cause: "publication_failed" })
+        : undefined;
+    const safety = agySafetySupervision(strengtheningFailure);
+    const attachments = fakeAttachments();
+    const recipients = new RecipientRegistry();
+    const recipientRecord = vi.spyOn(recipients, "recordFor");
+
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+      if (scenario === "transport") {
+        harness.calls.push(argv);
+        harness.stdinInputs.push(input);
+        throw Object.assign(new Error("transport result unknown"), { code: "CLI_PROTOCOL_ERROR" });
+      }
+      const response = structuredClone(await baseStdin(argv, input, signal, preserve));
+      if (scenario === "ack_mismatch") {
+        const agent = (response.result as { agent: Record<string, unknown> }).agent;
+        agent.terminal_id = "terminal-replaced";
+      }
+      return response;
+    });
+
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const afterPrompt = harness.stdinInputs.length > 0;
+      if (afterPrompt && scenario === "read_failed" && argv[0] === "api") throw Object.assign(new Error("snapshot unavailable"), { code: "CLI_PROTOCOL_ERROR" });
+      const response = structuredClone(await baseRun(argv, signal, preserve));
+      if (!afterPrompt || !(["api", "agent", "pane"] as const).includes(argv[0] as "api" | "agent" | "pane")) return response;
+
+      const result = response.result as Record<string, unknown>;
+      const records: Record<string, unknown>[] = [];
+      if (argv[0] === "api") {
+        const current = (result.snapshot as HerdrSnapshot);
+        records.push(...current.panes.filter((item) => item.pane_id === "w1:p2"), ...current.agents.filter((item) => item.pane_id === "w1:p2"));
+        if (scenario === "duplicate") current.panes.push({ ...current.panes.find((item) => item.pane_id === "w1:p2")! });
+        if (scenario === "contradictory") current.agents.find((item) => item.pane_id === "w1:p2")!.terminal_id = "terminal-contradiction";
+      } else if (argv[0] === "agent" && argv[1] === "get") {
+        records.push(result.agent as Record<string, unknown>);
+      } else if (argv[0] === "pane" && argv[1] === "get") {
+        records.push(result.pane as Record<string, unknown>);
+      }
+      for (const item of records) {
+        if (scenario === "identity_mismatch") item.terminal_id = "terminal-replaced";
+        if (scenario === "missing_session") delete item.agent_session;
+        if (scenario === "malformed_session") item.agent_session = "malformed";
+        if (scenario === "changed_session") item.agent_session = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-changed" };
+        if (scenario === "stale_sequence") { item.state_change_seq = 7; item.revision = 4; }
+        if (scenario === "revision_regression") item.revision = 2;
+      }
+      if (argv[0] === "pane" && argv[1] === "get" && (scenario === "missing_session" || scenario === "stale_sequence")) clockControl.advance(5_001);
+      return response;
+    });
+
+    const failure = await launch(
+      { name: "worker", profile: "researcher-agy", initialPrompt: "research" },
+      catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi")),
+      harness.cli,
+      undefined,
+      { attachments, recipients, supervision: safety.supervision, clock: clockControl.clock }
+    ).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+
+    expect(failure.code).not.toBeUndefined();
+    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
+    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill" || call[1] === "send-keys")).toBe(false);
+    expect(safety.supervision.provisionalBound).toHaveLength(1);
+    expect(safety.supervision.released).toEqual([]);
+    expect(safety.publishedView()).toMatchObject({ operation_phase: "running", state: "provisional", targetIds: [], live: true, cancellable: false, provisional: { paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy" } });
+    expect(recipientRecord).not.toHaveBeenCalled();
+    expect(recipients.get("w1:p2")).toBeUndefined();
+    expect(attachments.publish).not.toHaveBeenCalled();
+  });
+
+  it("publishes AGY provisionally before one prompt, then strengthens before recipient registration", async () => {
+    const order: string[] = [];
+    const harness = makeCli({ omitFreshAgentSession: true });
+    const supervision = stubSupervision({
+      onProvisionalBind: () => {
+        order.push("provisional");
+        expect(harness.stdinInputs).toHaveLength(0);
+      },
+      onStrengthen: () => { order.push("strengthen"); }
+    });
+    const recipients = new RecipientRegistry();
+    vi.spyOn(recipients, "recordFor").mockImplementation((...args) => {
+      order.push("recipient");
+      return RecipientRegistry.prototype.recordFor.call(recipients, ...args);
+    });
+
+    const result = await launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision, recipients });
+
+    expect(harness.stdinInputs).toEqual([envelope("research")]);
+    expect(supervision.provisionalBound).toEqual([{
+      identity: { paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy" },
+      profileName: "researcher-agy",
+      baseline: { state: "idle", stateChangeSeq: 7, revision: 3 }
+    }]);
+    expect(supervision.strengthened[0]!.identity).toMatchObject({ paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy", agentSession: { agent: "agy", value: "session-0" } });
+    expect(order).toEqual(["provisional", "strengthen", "recipient"]);
+    expect(supervision.bound).toHaveLength(0);
+    expect(supervision.released).toEqual([]);
+    expect(result.details).toMatchObject({ kind: "agy", promptConsumption: "confirmed", assignmentState: "confirmed", supervision: { state: "active", child: { agentKind: "agy" } } });
+  });
+
   it("keeps AGY bodies as metadata and starts an AGY fallback without a prompt source", async () => {
     const primary = profile("primary", "agy", ["fallback"]);
     const fallback = profile("fallback", "pi");
@@ -3030,13 +3215,17 @@ describe("herdr_launch profile-only contract", () => {
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
     const harness = makeCli({
       calls,
-      paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" }],
+      paneStates: [
+        { pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" },
+        { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" }, agent_status: "idle", state_change_seq: 7, revision: 3 },
+        { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" }, agent_status: "working", state_change_seq: 8, revision: 4 }
+      ],
       start: (_argv, attempt) => {
         if (attempt === 0) throw startFailure();
         return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" } } });
       }
     });
-    const result = await launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), harness.cli, promptSources);
+    const result = await launch({ name: "worker", profile: "primary", initialPrompt: "research" }, catalog(primary, fallback), harness.cli, promptSources);
 
     expect(promptSources.create).toHaveBeenCalledTimes(1);
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "agy")).toEqual([

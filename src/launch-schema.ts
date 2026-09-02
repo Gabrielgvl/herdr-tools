@@ -35,7 +35,7 @@ const LaunchCommonProperties = {
   label: Type.Optional(Identifier),
   cwd: Type.Optional(Identifier),
   focus: Type.Optional(Type.Boolean()),
-  initialPrompt: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" })),
+  initialPrompt: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000]*$", description: "Required when the selected profile uses the AGY runtime." })),
   initialPromptDelivery: Type.Optional(StringEnum(["inline", "attachment"] as const))
 };
 

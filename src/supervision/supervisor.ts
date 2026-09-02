@@ -494,6 +494,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       await this.reconcile("event:move_identity_unproven");
       return;
     }
+    // The move proves the child has left the origin before destination
+    // reconciliation starts. Invalidate every origin-pane review immediately;
+    // otherwise a transcript already being read could dispatch while this
+    // snapshot is pending, and a cadence could start another one.
+    this.pendingMoveDestination = pane;
+    this.paneIdentityGeneration += 1;
     let snapshot: HerdrSnapshot;
     try {
       snapshot = await this.deps.monitor.snapshot();
@@ -506,8 +512,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // The move itself is proven; only this one read of its destination is
       // unusable. Retaining the destination is what keeps the origin pane's
       // absence — which this very move caused — from later reading as a closure.
-      this.pendingMoveDestination = pane;
-      this.paneIdentityGeneration += 1;
       this.markReconciliationFailure(target.reason);
       return;
     }

@@ -73,7 +73,7 @@ interface Harness {
 }
 
 interface HarnessOptions {
-  snapshots?: Array<HerdrSnapshot | Error>;
+  snapshots?: Array<HerdrSnapshot | Error | Promise<HerdrSnapshot>>;
   review?: (call: number) => Promise<SupervisionReviewResult>;
   transcript?: (paneId: string) => Promise<string[]>;
   cadenceMs?: number;
@@ -112,7 +112,7 @@ function harness(options: HarnessOptions = {}): Harness {
         const next = queue.shift();
         if (next === undefined) throw Object.assign(new Error("no scripted snapshot"), { code: "SUPERVISION_SOCKET_CLOSED" });
         if (next instanceof Error) throw next;
-        return next;
+        return await next;
       },
       generation: 1,
       isDegraded: () => degraded,
@@ -1015,26 +1015,59 @@ describe("supervisor review cadence", () => {
     expect(reads).toEqual(["p2"]);
   });
 
-  it("abandons an in-flight review when a move leaves the reviewed pane unresolved", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+  it("abandons an in-flight review before a gated move snapshot can resolve", async () => {
     const reads: string[] = [];
-    const h = await working({
-      snapshots: [invalidDestination()],
-      transcript: async (paneId) => { reads.push(paneId); await gate; return ["line"]; },
-    });
+    const transcript = gatedTranscript(reads);
+    const destination = gatedSnapshot(snapshot([paneRecord({ paneId: "p2", status: "working", revision: 1 })], [{ pane_id: "p2", name: "worker" }]));
+    const h = await working({ snapshots: [destination.snapshot], transcript: transcript.transcript });
     const inFlight = (h.supervisor as unknown as { review(): Promise<void> }).review();
     await vi.waitFor(() => expect(reads).toEqual(["p1"]));
 
-    // The child leaves p1 while its transcript is still being read. The read
-    // cannot be undone, but the model must not be reached with it.
-    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "working" }), { previous_pane_id: "p1" }));
-    release();
+    const move = h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "working" }), { previous_pane_id: "p1" }));
+    await Promise.resolve();
+    transcript.release();
     await inFlight;
     expect(h.reviews).toBe(0);
     expect(h.supervisor.view().reviewer).toMatchObject({ degraded: false, reviews: [] });
-    expect(h.timerArmed()).toBe(true);
+
+    // The unresolved destination also blocks a new cadence from reading p1.
+    h.fireTimer();
+    await Promise.resolve();
+    expect(reads).toEqual(["p1"]);
+    expect(h.reviews).toBe(0);
+
+    destination.release();
+    await move;
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p2" } });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(reads).toEqual(["p1", "p2"]);
   });
+
+  it("does not start a review while a move snapshot is gated", async () => {
+    const reads: string[] = [];
+    const destination = gatedSnapshot(snapshot([paneRecord({ paneId: "p2", status: "working", revision: 1 })], [{ pane_id: "p2", name: "worker" }]));
+    const h = await working({ snapshots: [destination.snapshot], transcript: async (paneId) => { reads.push(paneId); return ["line"]; } });
+
+    const move = h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "working" }), { previous_pane_id: "p1" }));
+    await Promise.resolve();
+    h.fireTimer();
+    await Promise.resolve();
+    expect(reads).toEqual([]);
+    expect(h.reviews).toBe(0);
+
+    destination.release();
+    await move;
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(reads).toEqual(["p2"]);
+  });
+
+  function gatedSnapshot(result: HerdrSnapshot): { snapshot: Promise<HerdrSnapshot>; release(): void } {
+    let release!: () => void;
+    const snapshot = new Promise<HerdrSnapshot>((resolve) => { release = () => resolve(result); });
+    return { snapshot, release };
+  }
 
   /**
    * Read p1's transcript behind a gate, so a move can land while the read is in

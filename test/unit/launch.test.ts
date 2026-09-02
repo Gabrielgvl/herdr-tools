@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CliProtocolError } from "../../src/cli.js";
+import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
 import { errorOutcome } from "../../src/mcp/adapter.js";
 import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
@@ -740,6 +740,20 @@ describe("herdr_launch profile-only contract", () => {
       details: { phase: "prompt_verification", causeCode: "POST_ACK_CONFIRMATION_FAILED", causeMessage: "post-ack cleanup failed", promptSubmitted: true, assignmentState: "unconfirmed", timing: { postAckConfirmationMs: 11 } }
     });
     expect(removals).toBe(2);
+
+    const plainHarness = makeCli();
+    let plainRemovals = 0;
+    const plainSignal = {
+      aborted: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(() => {
+        plainRemovals += 1;
+        if (plainRemovals === 2) throw new Error("plain confirmation failure");
+      })
+    } as unknown as AbortSignal;
+    const plainTool = createLaunchTool({ cli: plainHarness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments() });
+    await expect(plainTool.execute("id", { name: "worker", profile: "worker", initialPrompt: "confirm once" }, plainSignal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeMessage: "plain confirmation failure", promptSubmitted: true } });
   });
 
   it.each([
@@ -3086,6 +3100,229 @@ describe("herdr_launch profile-only contract", () => {
     expect(supervision.reserved).toHaveLength(0);
     expect(supervision.released).toHaveLength(0);
     expect(recipientRecord).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed AGY interactive readiness before prompt bytes", async () => {
+    const harness = makeCli({ omitFreshAgentSession: true });
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      const response = structuredClone(await base(argv, signal, preserve));
+      if (!harness.calls.some((call) => call[0] === "agent" && call[1] === "start")) return response;
+      const result = response.result as Record<string, unknown>;
+      const records = argv[0] === "api"
+        ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
+        : argv[0] === "agent" && argv[1] === "get"
+          ? [result.agent as Record<string, unknown>]
+          : argv[0] === "pane" && argv[1] === "get"
+            ? [result.pane as Record<string, unknown>]
+            : [];
+      for (const record of records) record.interactive_ready = "yes";
+      return response;
+    });
+    const supervision = stubSupervision();
+
+    await expect(launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision }))
+      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", promptSubmitted: false } });
+    expect(harness.stdinInputs).toHaveLength(0);
+    expect(supervision.provisionalBound).toHaveLength(0);
+  });
+
+  it.each(["identity", "missing_interactive", "not_interactive"] as const)("resamples recoverable AGY readiness evidence for %s", async (scenario) => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({ omitFreshAgentSession: true });
+      const base = harness.cli.runJson;
+      let sample = 0;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        const response = structuredClone(await base(argv, signal, preserve));
+        if (harness.calls.some((call) => call[0] === "agent" && call[1] === "start") && argv[0] === "api") sample += 1;
+        if (sample !== 1) return response;
+        const result = response.result as Record<string, unknown>;
+        const records = argv[0] === "api"
+          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
+          : argv[0] === "agent" && argv[1] === "get"
+            ? [result.agent as Record<string, unknown>]
+            : argv[0] === "pane" && argv[1] === "get"
+              ? [result.pane as Record<string, unknown>]
+              : [];
+        for (const record of records) {
+          if (scenario === "identity") delete record.terminal_id;
+          if (scenario === "missing_interactive") delete record.interactive_ready;
+          if (scenario === "not_interactive") record.interactive_ready = false;
+        }
+        return response;
+      });
+
+      const pending = launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli);
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(pending).resolves.toMatchObject({ details: { readiness: { samples: 2 }, promptConsumption: "confirmed" } });
+      expect(harness.stdinInputs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["incompatible envelope", (response: JsonEnvelope) => { response.id = "wrong"; }],
+    ["malformed identity", (response: JsonEnvelope) => { ((response.result as { agent: Record<string, unknown> }).agent).terminal_id = {}; }],
+    ["missing interactive proof", (response: JsonEnvelope) => { ((response.result as { agent: Record<string, unknown> }).agent).interactive_ready = false; }],
+    ["missing revision", (response: JsonEnvelope) => { delete ((response.result as { agent: Record<string, unknown> }).agent).revision; }]
+  ] as const)("rejects an AGY acknowledgement with %s after one submission", async (_label, mutate) => {
+    const harness = makeCli({ omitFreshAgentSession: true });
+    const baseStdin = harness.cli.runJsonWithStdin!;
+    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+      const response = structuredClone(await baseStdin(argv, input, signal, preserve));
+      mutate(response);
+      return response;
+    });
+    const recipients = new RecipientRegistry();
+    const supervision = stubSupervision();
+
+    await expect(launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { recipients, supervision }))
+      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "prompt_verification", promptSubmitted: true, recipientRegistered: false } });
+    expect(harness.stdinInputs).toHaveLength(1);
+    expect(supervision.provisionalBound).toHaveLength(1);
+    expect(recipients.size).toBe(0);
+  });
+
+  it.each(["missing_session", "stale_lifecycle"] as const)("resamples AGY confirmation after %s and accepts an advanced unknown state", async (scenario) => {
+    vi.useFakeTimers();
+    try {
+      const harness = makeCli({ omitFreshAgentSession: true });
+      const baseRun = harness.cli.runJson;
+      const baseStdin = harness.cli.runJsonWithStdin!;
+      let confirmationSample = 0;
+      harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+        const response = structuredClone(await baseStdin(argv, input, signal, preserve));
+        const agent = (response.result as { agent: Record<string, unknown> }).agent;
+        delete agent.agent_session;
+        delete agent.state_change_seq;
+        delete agent.screen_detection_skipped;
+        return response;
+      });
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        const response = structuredClone(await baseRun(argv, signal, preserve));
+        if (harness.stdinInputs.length === 0) return response;
+        if (argv[0] === "api") confirmationSample += 1;
+        const result = response.result as Record<string, unknown>;
+        const records = argv[0] === "api"
+          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
+          : argv[0] === "agent" && argv[1] === "get"
+            ? [result.agent as Record<string, unknown>]
+            : argv[0] === "pane" && argv[1] === "get"
+              ? [result.pane as Record<string, unknown>]
+              : [];
+        for (const record of records) {
+          if (confirmationSample === 1 && scenario === "missing_session") delete record.agent_session;
+          record.agent_status = confirmationSample === 1 ? "idle" : "unknown";
+          record.state_change_seq = confirmationSample === 1 ? 7 : 8;
+          record.revision = confirmationSample === 1 ? 3 : 4;
+          record.screen_detection_skipped = true;
+        }
+        return response;
+      });
+
+      const pending = launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli);
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(pending).resolves.toMatchObject({ details: {
+        promptConsumption: "confirmed",
+        initialPromptSubmission: { confirmed: true },
+        initialPromptObservation: { status: "unknown", state: "unknown", stateChangeSeq: 8 },
+        promptConfirmation: { reason: "state_change_seq_advanced", samples: 2 }
+      } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["snapshot_target_missing", "direct_pane_missing", "agent_missing", "string_read_failure", "untyped_inner_failure", "lifecycle_skew"] as const)("fails AGY confirmation closed for %s", async (scenario) => {
+    const harness = makeCli({ omitFreshAgentSession: true });
+    const base = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (harness.stdinInputs.length > 0 && scenario === "string_read_failure" && argv[0] === "api") throw "unavailable";
+      const response = structuredClone(await base(argv, signal, preserve));
+      if (harness.stdinInputs.length === 0) return response;
+      const result = response.result as Record<string, unknown>;
+      if (scenario === "snapshot_target_missing" && argv[0] === "api") {
+        const current = result.snapshot as HerdrSnapshot;
+        current.panes = current.panes.filter((item) => item.pane_id !== "w1:p2");
+        current.agents = current.agents.filter((item) => item.pane_id !== "w1:p2");
+      }
+      if (scenario === "direct_pane_missing" && argv[0] === "agent" && argv[1] === "get") delete (result.agent as Record<string, unknown>).pane_id;
+      if (scenario === "agent_missing" && argv[0] === "agent" && argv[1] === "get") result.agent = null;
+      if (scenario === "untyped_inner_failure" && argv[0] === "agent" && argv[1] === "get") {
+        result.agent = new Proxy(result.agent as Record<string, unknown>, { getOwnPropertyDescriptor: () => { throw new Error("untyped identity read"); } });
+      }
+      if (scenario === "lifecycle_skew") {
+        const records = argv[0] === "api"
+          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
+          : argv[0] === "agent" && argv[1] === "get"
+            ? [result.agent as Record<string, unknown>]
+            : argv[0] === "pane" && argv[1] === "get"
+              ? [result.pane as Record<string, unknown>]
+              : [];
+        for (const record of records) {
+          record.agent_status = argv[0] === "pane" ? "idle" : "working";
+          record.state_change_seq = argv[0] === "pane" ? 7 : 8;
+          record.revision = argv[0] === "pane" ? 3 : 4;
+        }
+      }
+      return response;
+    });
+
+    await expect(launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli))
+      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "prompt_verification", promptSubmitted: true, recipientRegistered: false } });
+    expect(harness.stdinInputs).toHaveLength(1);
+  });
+
+  it("reports caller cancellation after observing stale AGY confirmation", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const harness = makeCli({ omitFreshAgentSession: true });
+      const base = harness.cli.runJson;
+      let abortScheduled = false;
+      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+        const response = structuredClone(await base(argv, signal, preserve));
+        if (harness.stdinInputs.length === 0) return response;
+        const result = response.result as Record<string, unknown>;
+        const records = argv[0] === "api"
+          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
+          : argv[0] === "agent" && argv[1] === "get"
+            ? [result.agent as Record<string, unknown>]
+            : argv[0] === "pane" && argv[1] === "get"
+              ? [result.pane as Record<string, unknown>]
+              : [];
+        for (const record of records) {
+          record.agent_status = "idle";
+          record.state_change_seq = 7;
+          record.revision = 3;
+        }
+        if (argv[0] === "pane" && argv[1] === "get" && !abortScheduled) {
+          abortScheduled = true;
+          setTimeout(() => controller.abort(), 50);
+        }
+        return response;
+      });
+      const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("researcher-agy", "agy")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
+
+      const outcome = expect(tool.execute("id", { name: "worker", profile: "researcher-agy", initialPrompt: "research" }, controller.signal, undefined, extensionContext))
+        .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { initialPromptObservation: { stateChangeSeq: 7 }, promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED" }, promptSubmitted: true } });
+      await vi.waitFor(() => expect(abortScheduled).toBe(true), { interval: 1 });
+      await vi.advanceTimersByTimeAsync(50);
+      await outcome;
+      expect(harness.stdinInputs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves AGY prompt effect when strengthening throws an untyped error", async () => {
+    const harness = makeCli({ omitFreshAgentSession: true });
+    const supervision = stubSupervision({ onStrengthen: () => { throw new Error("strengthen failed"); } });
+    await expect(launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision }))
+      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "supervision_bind", promptSubmitted: true } });
+    expect(harness.stdinInputs).toHaveLength(1);
   });
 
   it.each([

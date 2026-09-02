@@ -156,7 +156,9 @@ describe("large message limits and recipient capabilities", () => {
     const record = registry.recordFor("agy-profile", "w:p1", KEY, capability, identity, { agyStrengthened: true, attachmentDirectory: "/cache/agy" });
     expect(record).toMatchObject({ kind: "agy", agyStrengthened: true, attachmentDirectory: "/cache/agy", agentSession: agySession });
     expect(verifyRecipient(agySnapshot, record)).toMatchObject({ verified: true, identity: { agentKind: "agy", agentSession: agySession } });
+    expect(verifyRecipient(agySnapshot, { ...record, agyStrengthened: undefined } as never)).toMatchObject({ verified: false, reason: "AGY recipient has no strengthened attachment capability" });
     expect(verifyRecipient({ ...agySnapshot, agents: [{ ...agySnapshot.agents[0]!, agent_session: { ...agySession, value: "replacement" } }] }, record)).toMatchObject({ verified: false });
+    expect(() => registry.register({ ...record, agentKind: "pi" })).toThrow(/does not match/u);
     expect(() => registry.register({ ...record, agyStrengthened: undefined } as never)).toThrow(/strengthened exact identity/u);
   });
 

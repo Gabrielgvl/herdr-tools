@@ -1,12 +1,14 @@
 import { isAlias, isMap, isScalar, isSeq, parseDocument, type Node } from "yaml";
 import { basename, isAbsolute, relative, resolve, sep, win32 } from "node:path";
 import {
+  AGY_MODES,
   CLAUDE_EFFORTS,
   CLAUDE_PERMISSION_MODES,
   MAX_PROFILE_BODY_BYTES,
   MAX_PROFILE_BYTES,
   PROFILE_KINDS,
   THINKING_LEVELS,
+  type AgyMode,
   type ClaudeEffort,
   type ClaudePermissionMode,
   type ProfileKind,
@@ -92,8 +94,9 @@ function parseRuntime(value: unknown, scopeRoot: string): RuntimeProfile {
     return { kind: "pi", model: stringField(value.model, "runtime.model"), thinking: value.thinking as ThinkingLevel, tools: stringArray(value.tools, "runtime.tools"), extensions: resourcePaths(value.extensions, "runtime.extensions", scopeRoot), skills: resourcePaths(value.skills, "runtime.skills", scopeRoot) };
   }
   if (value.kind === "agy") {
-    exactKeys(value, ["kind", "model", "addDirs"], "runtime");
-    return { kind: "agy", model: stringField(value.model, "runtime.model"), addDirs: resourcePaths(value.addDirs, "runtime.addDirs", scopeRoot) };
+    exactKeys(value, ["kind", "model", "mode", "addDirs"], "runtime");
+    if (!AGY_MODES.includes(value.mode as AgyMode)) fail("runtime.mode is invalid");
+    return { kind: "agy", model: stringField(value.model, "runtime.model"), mode: value.mode as AgyMode, addDirs: resourcePaths(value.addDirs, "runtime.addDirs", scopeRoot) };
   }
   exactKeys(value, ["kind", "model", "effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs", "developmentChannels"], "runtime");
   if (!CLAUDE_EFFORTS.includes(value.effort as ClaudeEffort)) fail("runtime.effort is invalid");

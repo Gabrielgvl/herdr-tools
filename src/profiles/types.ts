@@ -9,6 +9,9 @@ export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODES)[number];
 
 export const PROFILE_KINDS = ["pi", "claude", "agy"] as const;
 export type ProfileKind = (typeof PROFILE_KINDS)[number];
+
+export const AGY_MODES = ["plan", "accept-edits"] as const;
+export type AgyMode = (typeof AGY_MODES)[number];
 export type ProfileSourceKind = "bundled" | "user" | "project";
 
 export interface ProfileSource {
@@ -47,6 +50,7 @@ export interface ClaudeRuntimeProfile {
 export interface AgyRuntimeProfile {
   kind: "agy";
   model: string;
+  mode: AgyMode;
   addDirs: string[];
 }
 

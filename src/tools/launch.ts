@@ -698,7 +698,7 @@ function effectiveDetails(profile: Profile, runtime: RuntimeProfile): { runtime:
     };
   }
   return {
-    runtime: { kind: "agy", model: runtime.model, mode: "plan", dangerouslySkipPermissions: true },
+    runtime: { kind: "agy", model: runtime.model, mode: runtime.mode, dangerouslySkipPermissions: true },
     permissions: { sessionPersistence: profile.sessionPersistence, addDirs: [...runtime.addDirs] }
   };
 }

@@ -129,6 +129,7 @@ export function resolveAgyRuntime(profile: Extract<Profile["runtime"], { kind: "
   return {
     kind: "agy",
     model: model(overrides.model, profile.model),
+    mode: profile.mode,
     addDirs: scopedValues(overrides.addDirs, profile.addDirs, "overrides.addDirs", scopeRoot)
   };
 }
@@ -157,7 +158,7 @@ export function buildAgyArgv(profile: Extract<Profile["runtime"], { kind: "agy" 
   if (!sessionPersistence) throw new ProfileAdapterError("AGY profiles must set sessionPersistence to true for interactive launches");
   if (promptFilePath !== undefined) throw new ProfileAdapterError("AGY profiles do not accept prompt source files");
   const effective = resolveAgyRuntime(profile, overrides, scopeRoot);
-  return ["--model", effective.model, "--mode", "plan", "--dangerously-skip-permissions", ...repeated("--add-dir", effective.addDirs), ...attachmentDirectoryArg(attachmentDirectory), "--prompt-interactive", AGY_BOOTSTRAP_PROMPT];
+  return ["--model", effective.model, "--mode", effective.mode, "--dangerously-skip-permissions", ...repeated("--add-dir", effective.addDirs), ...attachmentDirectoryArg(attachmentDirectory), "--prompt-interactive", AGY_BOOTSTRAP_PROMPT];
 }
 
 export function buildRuntimeArgv(profile: Profile, runtime: Profile["runtime"], promptFilePath?: string, attachmentDirectory?: string): string[] {

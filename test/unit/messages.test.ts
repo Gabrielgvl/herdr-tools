@@ -30,7 +30,7 @@ function profile(kind: "pi" | "claude" | "agy", overrides: Partial<Profile["runt
     ? { kind: "pi" as const, model: "test", thinking: "low" as const, tools: [], extensions: [], skills: [], ...overrides }
     : kind === "claude"
       ? { kind: "claude" as const, model: "test", effort: "medium" as const, permissionMode: "default" as const, allowedTools: [], disallowedTools: [], addDirs: [], pluginDirs: [], developmentChannels: [], ...overrides }
-      : { kind: "agy" as const, model: "test", addDirs: [], ...overrides };
+      : { kind: "agy" as const, model: "test", mode: "plan" as const, addDirs: [], ...overrides };
   return {
     name: `${kind}-profile`, description: "profile", timeoutMinutes: 1, sessionPersistence: kind !== "pi", runtime: runtime as Profile["runtime"], fallbackProfiles: [], body: "body", source: { kind: "bundled", path: `/profiles/${kind}.md`, scopeRoot: "/profiles", precedence: 0 }
   };

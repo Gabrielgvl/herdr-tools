@@ -74,12 +74,12 @@ const observedPane = (state: string | undefined, stateChangeSeq: number | undefi
   revision
 });
 
-function profile(name: string, kind: "pi" | "claude" | "agy" = "pi", fallbackProfiles: string[] = []) {
+function profile(name: string, kind: "pi" | "claude" | "agy" = "pi", fallbackProfiles: string[] = [], agyMode: "plan" | "accept-edits" = "plan") {
   const runtime = kind === "pi"
     ? "  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]"
     : kind === "claude"
       ? "  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]"
-      : "  kind: agy\n  model: gemini-3.8-flash-high\n  addDirs: []";
+      : `  kind: agy\n  model: gemini-3.8-flash-high\n  mode: ${agyMode}\n  addDirs: []`;
   return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${kind !== "pi"}\nruntime:\n${runtime}\nfallbackProfiles: ${JSON.stringify(fallbackProfiles)}\n---\n\nProfile body for ${name}.\n`, profileSource("bundled", `/profiles/${name}.md`, "/profiles"));
 }
 
@@ -3599,6 +3599,17 @@ describe("herdr_launch profile-only contract", () => {
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
     expect(harness.stdinInputs).toEqual([envelope("research")]);
     expect(result.details).toMatchObject({ kind: "agy", profile: { requested: primary.name, selected: "fallback-agy" }, promptConsumption: "confirmed", assignmentState: "confirmed" });
+  });
+
+  it("uses the selected AGY profile mode for launch and rejects mode overrides", async () => {
+    const workerAgy = profile("worker-agy", "agy", [], "accept-edits");
+    const harness = makeCli();
+    const result = await launch({ name: "worker", profile: "worker-agy", initialPrompt: "implement" }, catalog(workerAgy), harness.cli);
+    const start = harness.calls.find((call) => call[0] === "agent" && call[1] === "start");
+    expect(start).toEqual(expect.arrayContaining(["--model", "gemini-3.8-flash-high", "--mode", "accept-edits", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]));
+    expect(start).not.toContain("plan");
+    expect(result.details).toMatchObject({ kind: "agy", profile: { name: "worker-agy", runtime: { mode: "accept-edits", dangerouslySkipPermissions: true } } });
+    await expect(launch({ name: "worker", profile: "worker-agy", initialPrompt: "implement", overrides: { mode: "plan" } as never }, catalog(workerAgy), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
   });
 
   it("keeps AGY bodies as metadata and starts an AGY fallback without a prompt source", async () => {

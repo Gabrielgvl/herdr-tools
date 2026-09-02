@@ -91,9 +91,10 @@ describe("herdr_inspect", () => {
   });
 
   it("exposes the strict AGY runtime and permissions in profile inspection", async () => {
-    const agy = parseProfile(`---\nname: researcher-agy\ndescription: AGY researcher\ntimeoutMinutes: 30\nsessionPersistence: true\nruntime:\n  kind: agy\n  model: gemini-3.8-flash-high\n  addDirs: [./research]\nfallbackProfiles: [researcher-pi]\n---\n\nCatalog metadata only.\n`, profileSource("bundled", "/profiles/researcher-agy.md", "/profiles"));
+    const agy = parseProfile(`---\nname: researcher-agy\ndescription: AGY researcher\ntimeoutMinutes: 30\nsessionPersistence: true\nruntime:\n  kind: agy\n  model: gemini-3.8-flash-high\n  mode: plan\n  addDirs: [./research]\nfallbackProfiles: [researcher-pi]\n---\n\nCatalog metadata only.\n`, profileSource("bundled", "/profiles/researcher-agy.md", "/profiles"));
     const pi = parseProfile(`---\nname: researcher-pi\ndescription: Pi researcher\ntimeoutMinutes: 30\nsessionPersistence: true\nruntime:\n  kind: pi\n  model: test/model\n  thinking: high\n  tools: [read]\nfallbackProfiles: []\n---\n\nPi fallback.\n`, profileSource("bundled", "/profiles/researcher-pi.md", "/profiles"));
-    const catalog: ProfileCatalog = { effective: new Map([[agy.name, agy], [pi.name, pi]]), candidates: [], diagnostics: [] };
+    const workerAgy = parseProfile(`---\nname: worker-agy\ndescription: AGY worker\ntimeoutMinutes: 30\nsessionPersistence: true\nruntime:\n  kind: agy\n  model: gemini-3.8-flash-high\n  mode: accept-edits\n  addDirs: []\nfallbackProfiles: []\n---\n\nCatalog metadata only.\n`, profileSource("bundled", "/profiles/worker-agy.md", "/profiles"));
+    const catalog: ProfileCatalog = { effective: new Map([[agy.name, agy], [workerAgy.name, workerAgy], [pi.name, pi]]), candidates: [], diagnostics: [] };
     const result = await createInspectTool({ cli: makeCli().cli, context, profiles: { load: async () => catalog } }).execute("id", { mode: "profile", profile: "researcher-agy" } as never, new AbortController().signal, undefined, extensionContext);
 
     expect(result.details).toMatchObject({ profile: {
@@ -107,6 +108,10 @@ describe("herdr_inspect", () => {
       fallbackProfiles: ["researcher-pi"]
     } });
     expect(JSON.parse(contentText(result))).toMatchObject({ profile: { kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: ["/profiles/research"], sessionPersistence: true } });
+
+    const worker = await createInspectTool({ cli: makeCli().cli, context, profiles: { load: async () => catalog } }).execute("id", { mode: "profile", profile: "worker-agy" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(worker.details).toMatchObject({ profile: { kind: "agy", mode: "accept-edits", dangerouslySkipPermissions: true, runtime: { kind: "agy", mode: "accept-edits", dangerouslySkipPermissions: true } } });
+    expect(JSON.parse(contentText(worker))).toMatchObject({ profile: { kind: "agy", mode: "accept-edits", dangerouslySkipPermissions: true } });
   });
 
   it("reports a stale ancestor rebind in context mode", async () => {

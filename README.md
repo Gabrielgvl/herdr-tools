@@ -18,11 +18,11 @@ cp config.json.example config.json # optional; edit only extension-owned wait se
 
 Pi discovers the directory through its root `index.ts` when it is installed at `/home/gabriel/.pi/agent/extensions/herdr-tools/`. The installed `herdr` CLI is the only Herdr authority. Neither host intercepts raw Herdr Bash and neither launches an arbitrary executable.
 
-## Profile-backed AGY research
+## Profile-backed AGY roles
 
-`researcher-agy` is the default research profile. Its declared fallback chain is exactly `researcher-agy -> researcher-pi -> researcher-claude`. The AGY runtime uses `gemini-3.8-flash-high` with fixed `--mode plan` and `--dangerously-skip-permissions` flags. Callers may override only the model and scope-normalized `addDirs`, and those primary overrides never reach a fallback.
+`researcher-agy` is the default research profile and its chain is exactly `researcher-agy -> researcher-pi -> researcher-claude`. `scout-agy` is the reconnaissance default with `scout-agy -> scout-pi -> scout-claude`; `worker-pi` remains the implementation default with `worker-pi -> worker-agy -> worker-claude`. All AGY profiles use `gemini-3.8-flash-high`, `--dangerously-skip-permissions`, and a fixed per-profile mode: `plan` for research/scout and `accept-edits` for worker. Callers may override only model and scope-normalized `addDirs`; mode is never launch-overrideable and primary overrides never reach fallbacks.
 
-Every AGY launch requires a visible, self-contained `initialPrompt`. The profile Markdown body is catalog metadata only and never reaches AGY. AGY discovers repository `AGENTS.md` natively and receives the manager's single provenance-wrapped assignment through the normal prompt channel. This support is implemented entirely in Herdr Tools. It does not change Herdr Core or weaken the existing Pi and Claude launch contracts.
+Every AGY launch requires a visible, self-contained `initialPrompt`. The profile Markdown body is catalog metadata only and never reaches AGY. AGY discovers repository `AGENTS.md` natively and receives the manager's single provenance-wrapped assignment through the normal prompt channel. The worker mode can auto-approve repository mutations, so manager assignments must bound scope and tests. This support is implemented entirely in Herdr Tools. It does not change Herdr Core or weaken the existing Pi and Claude launch contracts.
 
 ## Claude Fable manager
 

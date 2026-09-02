@@ -32,7 +32,7 @@ runtime:
   skills:
     - herdr-profiles/role-plugins/worker/skills/worker
 fallbackProfiles:
-  - worker-claude
+  - worker-agy
 ---
 
 You are the Pi worker for a Herdr task.

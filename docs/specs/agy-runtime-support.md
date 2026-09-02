@@ -3,8 +3,8 @@
 ## Scope
 
 This is a Herdr Tools-only change. It adds AGY profile support without changing Herdr
-Core, AGY, or the existing Pi/Claude contracts. This commit is documentation only and
-touches no production or test files; the slices below are the later implementation plan.
+Core, AGY, or the existing Pi/Claude contracts. The implementation and its focused unit
+and disposable integration coverage are live on the feature branch.
 
 AGY is a reduced-assurance exception because its native session identity may be absent
 until after the first prompt. The exception is limited to AGY and is explicit rather
@@ -12,33 +12,40 @@ than hidden behind a fallback or compatibility path.
 
 ## Runtime contract
 
-Add `agy` as a strict runtime kind and bundle `researcher-agy`:
+Add `agy` as a strict runtime kind and bundle `researcher-agy`, `scout-agy`, and
+`worker-agy`:
 
 ```yaml
 runtime:
   kind: agy
   model: gemini-3.8-flash-high
+  mode: plan # or accept-edits; fixed by the profile
   addDirs: []
 ```
 
 - An AGY launch **requires `initialPrompt`**. A promptless AGY launch is rejected before
   mutation.
 - `sessionPersistence: true` is required. AGY has no non-persistent flag.
-- The fixed argv is `--model <model> --mode plan --dangerously-skip-permissions`,
-  followed by scope-normalized `--add-dir` values and the tools-owned recipient
-  attachment directory. No `--agent`, prompt file, arbitrary argv/env, or hidden
-  profile-body input is accepted.
+- The fixed argv is `--model <model> --mode <profile.mode> --dangerously-skip-permissions`,
+  where the required fixed mode is exactly `plan` or `accept-edits`, followed by
+  scope-normalized `--add-dir` values and the tools-owned recipient attachment
+  directory. No `--agent`, prompt file, arbitrary argv/env, or hidden profile-body
+  input is accepted, and mode is not launch-overrideable.
 - Only typed primary overrides `model` and `addDirs` are allowed. Overrides never leak
   into fallbacks; fallback profiles keep their own defaults.
-- `researcher-agy` falls back to `researcher-pi`, whose declared fallback yields exactly
-  `researcher-agy -> researcher-pi -> researcher-claude`.
+- `researcher-agy` uses `plan` and falls back to `researcher-pi`, yielding exactly
+  `researcher-agy -> researcher-pi -> researcher-claude`. `scout-agy` uses `plan` and
+  yields `scout-agy -> scout-pi -> scout-claude`. `worker-agy` uses `accept-edits` and
+  falls back to `worker-claude`; the implementation default `worker-pi` yields exactly
+  `worker-pi -> worker-agy -> worker-claude`.
 - The required Markdown body remains catalog metadata. AGY receives repository
   `AGENTS.md` through its native discovery and receives the manager's one explicit,
   visible v1 provenance-wrapped assignment through the existing prompt channel.
 
-Effective model-visible details expose the AGY kind, model, fixed mode,
+Effective model-visible details expose the AGY kind, actual fixed mode,
 `dangerouslySkipPermissions: true`, persistent-session permission, and bounded
-`addDirs`.
+`addDirs`. The worker's `accept-edits` mode plus permission bypass can auto-approve
+mutations, so manager assignments must bound scope and required tests.
 
 ## Provisional state and job-registry publication
 
@@ -269,13 +276,15 @@ replacement, missing capability, and directory mismatch fail closed.
 
 ### Slice 7: bundled profile and catalog guidance
 
-Files: `herdr-profiles/researcher-agy.md`,
+Files: `herdr-profiles/researcher-agy.md`, `herdr-profiles/scout-agy.md`,
+`herdr-profiles/worker-agy.md`,
 `herdr-profiles/role-plugins/manager/skills/manager/SKILL.md`,
 `test/unit/profile-catalog.test.ts`.
 
-Add the profile, recommend it for research, move catalog assertions from 12 to 13, and
-state that every AGY assignment is self-contained and provenance-wrapped; the profile
-body never reaches AGY.
+Add the three profiles, recommend the scout and researcher AGY defaults, route worker
+fallbacks through worker AGY, move catalog assertions from 13 to 15, and state that
+every AGY assignment is self-contained and provenance-wrapped; profile bodies never
+reach AGY.
 
 ### Slice 8: living documentation
 

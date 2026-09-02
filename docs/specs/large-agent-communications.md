@@ -26,9 +26,14 @@ for each other.
 
 - Herdr Core is not changed. No Rust work, no new CLI surface, no new Herdr API.
 - `researcher-agy` is the research default and uses `gemini-3.8-flash-high` with
-  fixed `--mode plan` and `--dangerously-skip-permissions`. Its exact chain is
-  `researcher-agy -> researcher-pi -> researcher-claude`. Primary model and bounded
-  `addDirs` overrides never leak into the Pi or Claude fallbacks.
+  fixed `--mode plan` and `--dangerously-skip-permissions`. `scout-agy` is the
+  reconnaissance default with `--mode plan` and chain `scout-agy -> scout-pi ->
+  scout-claude`; `worker-pi` remains the implementation default and chains through
+  `worker-agy` with fixed `--mode accept-edits` before `worker-claude`. Researcher's
+  exact chain is `researcher-agy -> researcher-pi -> researcher-claude`. Primary
+  model and bounded `addDirs` overrides never leak into fallbacks, and AGY mode is
+  never launch-overrideable. Worker accept-edits plus the permission bypass can
+  auto-approve mutations, so manager assignments must bound scope and tests.
 - Inline text uses the existing `herdr agent prompt <TARGET> --stdin` transport for
   every wrapped text delivery, including the small attachment-reference envelope.
 - Large text is stored by `herdr-tools` in a local attachment store it owns

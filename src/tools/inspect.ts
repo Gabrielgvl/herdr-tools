@@ -104,7 +104,7 @@ function compactProfile(profile: Profile): Record<string, unknown> {
         pluginDirs: boundedValues(profile.runtime.pluginDirs, 16, 512)
       }
       : {
-        mode: "plan",
+        mode: profile.runtime.mode,
         dangerouslySkipPermissions: true,
         addDirs: boundedValues(profile.runtime.addDirs, 16, 512)
       };
@@ -233,7 +233,7 @@ function exactProfile(catalog: ProfileCatalog, name: string): Record<string, unk
       : {
         kind: "agy",
         model: boundedText(profile.runtime.model, 256),
-        mode: "plan",
+        mode: profile.runtime.mode,
         dangerouslySkipPermissions: true,
         addDirs: boundedValues(profile.runtime.addDirs, 16, 512)
       };
@@ -256,7 +256,7 @@ function modelVisibleProfile(profile: Record<string, unknown>): Record<string, u
     ...(runtime?.model !== undefined ? { model: boundedText(String(runtime.model), 256) } : { model: boundedText(String(profile.model), 256) }),
     ...(runtime?.thinking !== undefined ? { thinking: boundedText(String(runtime.thinking), 32) } : profile.thinking !== undefined ? { thinking: boundedText(String(profile.thinking), 32) } : {}),
     ...(runtime?.effort !== undefined ? { effort: boundedText(String(runtime.effort), 32) } : profile.effort !== undefined ? { effort: boundedText(String(profile.effort), 32) } : {}),
-    ...(profile.kind === "agy" ? { mode: "plan", dangerouslySkipPermissions: true } : {}),
+    ...(profile.kind === "agy" ? { mode: boundedText(String(runtime?.mode ?? profile.mode), 32), dangerouslySkipPermissions: true } : {}),
     tools: boundedValues((profile.tools as string[] | undefined) || [], 32, 128),
     extensions: boundedValues((profile.extensions as string[] | undefined) || [], 16, 512),
     skills: boundedValues((profile.skills as string[] | undefined) || [], 16, 512),

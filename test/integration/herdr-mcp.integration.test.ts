@@ -362,11 +362,13 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const profiles = await call("herdr_inspect", { mode: "collection", collection: "profiles" });
       const catalog = evidence(profiles);
       expect(catalog).toMatchObject({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success" });
-      expect(Array.isArray(catalog.items) ? catalog.items : []).toHaveLength(13);
+      expect(Array.isArray(catalog.items) ? catalog.items : []).toHaveLength(15);
       expect(catalog.items).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "worker-pi", kind: "pi" }),
         expect.objectContaining({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", fallbackProfiles: [] }),
-        expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-high", addDirs: [], fallbackProfiles: ["researcher-pi"] })
+        expect.objectContaining({ name: "scout-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["scout-pi"] }),
+        expect.objectContaining({ name: "worker-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["worker-claude"] }),
+        expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-pi"] })
       ]));
       expect(catalog.diagnostics ?? []).toEqual([]);
 
@@ -392,7 +394,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       // starts. The MCP host has no explicit wait-review model service, so a
       // redundant reviewer would fail the job; remaining live proves the
       // supervisor retained sole semantic-review ownership.
-      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "worker-pi" });
+      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "scout-pi" });
       expect(reviewerTargetLaunch.isError, text(reviewerTargetLaunch)).toBeUndefined();
       const reviewerTargetEvidence = evidence(reviewerTargetLaunch);
       expect(reviewerTargetEvidence).toMatchObject({

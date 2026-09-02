@@ -22,7 +22,7 @@ function profileText(name: string, runtime: "pi" | "claude" | "agy" = "pi", extr
     ? "  kind: pi\n  model: test/model\n  thinking: low"
     : runtime === "claude"
       ? "  kind: claude\n  model: claude-test\n  effort: medium"
-      : "  kind: agy\n  model: gemini-3.7-flash-high\n  addDirs: []";
+      : "  kind: agy\n  model: gemini-3.8-flash-high\n  addDirs: []";
   const sessionPersistence = runtime === "pi" ? "false" : "true";
   return `---\nname: ${name}\ndescription: Test ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${sessionPersistence}\nruntime:\n${block}\nfallbackProfiles: ${fallbackProfiles}\n${extra}---\n\nBody for ${name}.\n`;
 }
@@ -298,11 +298,11 @@ describe("profile catalog", () => {
   it("parses and adapts strict AGY profiles", () => {
     const root = "/tmp/profile-scope";
     const agy = parseProfile(profileText("researcher", "agy").replace("  addDirs: []", "  addDirs: [./docs]"), source(root, "researcher"));
-    expect(agy.runtime).toEqual({ kind: "agy", model: "gemini-3.7-flash-high", addDirs: [join(root, "docs")] });
+    expect(agy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-high", addDirs: [join(root, "docs")] });
     expect(agy.sessionPersistence).toBe(true);
-    expect(buildProfileArgv(agy)).toEqual(["--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs")]);
+    expect(buildProfileArgv(agy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs")]);
     expect(buildProfileArgv(agy, { model: "gemini-override", addDirs: ["./override"] })).toEqual(["--model", "gemini-override", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "override")]);
-    expect(buildProfileArgv(agy, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs"), "--add-dir", "/tmp/message-attachments/key"]);
+    expect(buildProfileArgv(agy, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs"), "--add-dir", "/tmp/message-attachments/key"]);
     expect(() => buildProfileArgv(agy, {}, "/tmp/prompt-source")).toThrow(/prompt source/);
     expect(() => buildProfileArgv({ ...agy, sessionPersistence: false })).toThrow(/sessionPersistence/);
     expect(() => buildProfileArgv(agy, { thinking: "low" } as never)).toThrow(/AGY/);
@@ -572,12 +572,12 @@ describe("profile catalog", () => {
     expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
     expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-claude"]);
     const researcherAgy = catalog.effective.get("researcher-agy")!;
-    expect(researcherAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.7-flash-high", addDirs: [] });
+    expect(researcherAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-high", addDirs: [] });
     expect(researcherAgy.sessionPersistence).toBe(true);
     expect(researcherAgy.timeoutMinutes).toBe(30);
     expect(researcherAgy.fallbackProfiles).toEqual(["researcher-pi"]);
     expect(researcherAgy.body).toBe("\nCatalog metadata only. Herdr does not deliver this profile body to AGY. Every AGY task must be self-contained and sent through Herdr's visible v1 provenance-wrapped assignment.\n");
-    expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]);
+    expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]);
     expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-pi", "researcher-claude"]);
     expect(resolveProfile("researcher-pi", catalog).reachableNames).toEqual(["researcher-pi", "researcher-claude"]);
 

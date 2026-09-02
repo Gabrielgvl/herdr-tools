@@ -25,7 +25,7 @@ for each other.
 ## Validated product decisions
 
 - Herdr Core is not changed. No Rust work, no new CLI surface, no new Herdr API.
-- `researcher-agy` is the research default and uses `gemini-3.7-flash-high` with
+- `researcher-agy` is the research default and uses `gemini-3.8-flash-high` with
   fixed `--mode plan` and `--dangerously-skip-permissions`. Its exact chain is
   `researcher-agy -> researcher-pi -> researcher-claude`. Primary model and bounded
   `addDirs` overrides never leak into the Pi or Claude fallbacks.

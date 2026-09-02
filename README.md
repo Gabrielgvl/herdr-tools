@@ -20,7 +20,7 @@ Pi discovers the directory through its root `index.ts` when it is installed at `
 
 ## Profile-backed AGY research
 
-`researcher-agy` is the default research profile. Its declared fallback chain is exactly `researcher-agy -> researcher-pi -> researcher-claude`. The AGY runtime uses `gemini-3.7-flash-high` with fixed `--mode plan` and `--dangerously-skip-permissions` flags. Callers may override only the model and scope-normalized `addDirs`, and those primary overrides never reach a fallback.
+`researcher-agy` is the default research profile. Its declared fallback chain is exactly `researcher-agy -> researcher-pi -> researcher-claude`. The AGY runtime uses `gemini-3.8-flash-high` with fixed `--mode plan` and `--dangerously-skip-permissions` flags. Callers may override only the model and scope-normalized `addDirs`, and those primary overrides never reach a fallback.
 
 Every AGY launch requires a visible, self-contained `initialPrompt`. The profile Markdown body is catalog metadata only and never reaches AGY. AGY discovers repository `AGENTS.md` natively and receives the manager's single provenance-wrapped assignment through the normal prompt channel. This support is implemented entirely in Herdr Tools. It does not change Herdr Core or weaken the existing Pi and Claude launch contracts.
 

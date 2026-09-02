@@ -577,7 +577,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(profileItems).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: expect.arrayContaining(["herdr_tab"]), skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")] }),
       expect.objectContaining({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", fallbackProfiles: [] }),
-      expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.7-flash-high", addDirs: [], fallbackProfiles: ["researcher-pi"] })
+      expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-high", addDirs: [], fallbackProfiles: ["researcher-pi"] })
     ]));
     const manager = await tool("herdr_inspect").execute("manager", { mode: "profile", profile: "manager-pi" }, signal(), undefined, toolContext());
     expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: ["read", "grep", "find", "ls", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"], extensions: [], skills: [expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager")], fallbackProfiles: [] });
@@ -659,7 +659,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const grantedDirectory = dirname(dirname(attachmentPath));
     expect(startCalls).toEqual([[
       "agent", "start", agentName, "--kind", "agy", "--pane", paneId, "--timeout", "120000", "--",
-      "--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", grantedDirectory
+      "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", grantedDirectory
     ]]);
     expect(state.agyPrePromptAgent).not.toHaveProperty("agent_session");
     expect(state.agyPrePromptRecipientFailureCode).toBe("ATTACHMENT_TARGET_UNVERIFIED");
@@ -698,7 +698,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         name: "researcher-agy",
         requested: "researcher-agy",
         selected: "researcher-agy",
-        runtime: { kind: "agy", model: "gemini-3.7-flash-high", mode: "plan", dangerouslySkipPermissions: true },
+        runtime: { kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true },
         permissions: { sessionPersistence: true, addDirs: [] },
         attempts: [{ profile: "researcher-agy", outcome: "selected" }],
         fallbackProfiles: ["researcher-pi"],
@@ -760,7 +760,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const starts = calls.filter((args) => args[0] === "agent" && args[1] === "start");
     expect(starts).toHaveLength(2);
     expect(state.forceNextAgyStartFailure).toBe(false);
-    expect(starts[0]).toEqual(expect.arrayContaining(["--kind", "agy", "--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]));
+    expect(starts[0]).toEqual(expect.arrayContaining(["--kind", "agy", "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]));
     expect(starts[1]).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna"]));
     const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
     expect(promptCalls).toHaveLength(1);

@@ -322,7 +322,7 @@ For a long `herdr_wait`, an active bound supervisor with the complete exact targ
 }
 ```
 
-Raw `kind`, `argv`, and `env` launch fields are rejected. Profiles are resolved from the manager session cwd using bundled, user, then nearest-project discovery; arbitrary valid named profiles are allowed. Each profile pins exactly `pi`, `claude`, or `agy` and supplies typed runtime fields, timeout, persistence, and an ordered fallback graph of at most three reachable profiles. `researcher-agy` is the advisory research default, uses `gemini-3.7-flash-high`, and declares exactly `researcher-agy -> researcher-pi -> researcher-claude`.
+Raw `kind`, `argv`, and `env` launch fields are rejected. Profiles are resolved from the manager session cwd using bundled, user, then nearest-project discovery; arbitrary valid named profiles are allowed. Each profile pins exactly `pi`, `claude`, or `agy` and supplies typed runtime fields, timeout, persistence, and an ordered fallback graph of at most three reachable profiles. `researcher-agy` is the advisory research default, uses `gemini-3.8-flash-high`, and declares exactly `researcher-agy -> researcher-pi -> researcher-claude`.
 
 Rules:
 

@@ -17,7 +17,7 @@ Add `agy` as a strict runtime kind and bundle `researcher-agy`:
 ```yaml
 runtime:
   kind: agy
-  model: gemini-3.7-flash-high
+  model: gemini-3.8-flash-high
   addDirs: []
 ```
 

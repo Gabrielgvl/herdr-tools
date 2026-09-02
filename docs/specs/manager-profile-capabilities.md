@@ -22,7 +22,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 
 1. `manager-pi` uses `openai-codex/gpt-5.6-sol` with `thinking: high`, a 30-minute timeout, and no persistent Pi session.
 2. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, a 30-minute timeout, persistent session state, and no fallback because manager identity must not silently change.
-3. Existing Pi and Claude model and fallback choices remain unchanged. `researcher-agy` adds `gemini-3.7-flash-high` ahead of the existing researcher chain.
+3. Existing Pi and Claude model and fallback choices remain unchanged. `researcher-agy` adds `gemini-3.8-flash-high` ahead of the existing researcher chain.
 4. Pi extension discovery remains enabled. Profile `runtime.extensions` stays empty because bundled profiles cannot portably reference machine-global package paths.
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
@@ -117,7 +117,7 @@ Explicitly absent from every non-manager Pi profile:
 
 ### AGY researcher
 
-`researcher-agy` uses `gemini-3.7-flash-high`, persistent sessions, fixed plan mode, and `--dangerously-skip-permissions`. Only model and scope-normalized `addDirs` may be overridden. Its profile body is catalog metadata. Every launch requires one visible, provenance-wrapped, self-contained `initialPrompt`; AGY discovers repository `AGENTS.md` natively.
+`researcher-agy` uses `gemini-3.8-flash-high`, persistent sessions, fixed plan mode, and `--dangerously-skip-permissions`. Only model and scope-normalized `addDirs` may be overridden. Its profile body is catalog metadata. Every launch requires one visible, provenance-wrapped, self-contained `initialPrompt`; AGY discovers repository `AGENTS.md` natively.
 
 AGY initially publishes provisional pane, terminal, name, and kind supervision because its native session may appear only after the first prompt. The launch strengthens to exact native-session supervision before reporting success or registering recipient and attachment capability. A failure after possible prompt effect leaves the provisional child and recovery evidence visible, with no retry, fallback, cleanup, reservation release, or recipient registration. This reduced-assurance window is accepted for AGY only. Pi and Claude still require complete native-session identity before assignment.
 

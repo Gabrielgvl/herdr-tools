@@ -27,7 +27,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Fallback targets use their own untouched defaults. Typed overrides apply only to the requested primary. The logical cwd, task, placement, and provenance carry across attempts.
 - Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager-pi` uses `openai-codex/gpt-5.6-sol` with high thinking as the generic advisory profile. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, persistent session state, the manager plugin, and no fallback because manager identity must not silently change. The other role directions and models are:
   - scout: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
-  - researcher: `gemini-3.7-flash-high` -> `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
+  - researcher: `gemini-3.8-flash-high` -> `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - worker: `openai-codex/gpt-5.6-luna` with max thinking -> `claude-opus-5`;
   - reviewer: `openai-codex/gpt-5.6-sol` -> `claude-opus-5`;
   - planner: `claude-fable-5` -> `openai-codex/gpt-5.6-sol`.

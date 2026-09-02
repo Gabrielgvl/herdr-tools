@@ -79,7 +79,7 @@ function profile(name: string, kind: "pi" | "claude" | "agy" = "pi", fallbackPro
     ? "  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]"
     : kind === "claude"
       ? "  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]"
-      : "  kind: agy\n  model: gemini-3.7-flash-high\n  addDirs: []";
+      : "  kind: agy\n  model: gemini-3.8-flash-high\n  addDirs: []";
   return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${kind !== "pi"}\nruntime:\n${runtime}\nfallbackProfiles: ${JSON.stringify(fallbackProfiles)}\n---\n\nProfile body for ${name}.\n`, profileSource("bundled", `/profiles/${name}.md`, "/profiles"));
 }
 
@@ -3623,7 +3623,7 @@ describe("herdr_launch profile-only contract", () => {
     expect(promptSources.create).toHaveBeenCalledTimes(1);
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "agy")).toEqual([
       "agent", "start", "worker", "--kind", "agy", "--pane", "w1:p2", "--timeout", "120000", "--",
-      "--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", GRANT_PATH
+      "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", GRANT_PATH
     ]);
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "pi")).toEqual([
       "agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--",

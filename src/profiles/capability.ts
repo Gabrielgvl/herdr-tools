@@ -31,8 +31,11 @@ export function attachmentCapability(profile: Profile, overrides: RuntimeOverrid
     const tools = (overrides as PiRuntimeOverrides).tools ?? profile.runtime.tools;
     return { kind: "pi", ...piCapability(tools) };
   }
-  const claudeOverrides = overrides as ClaudeRuntimeOverrides;
-  const allowedTools = claudeOverrides.allowedTools ?? profile.runtime.allowedTools;
-  const disallowedTools = claudeOverrides.disallowedTools ?? profile.runtime.disallowedTools;
-  return { kind: "claude", ...claudeCapability(allowedTools, disallowedTools) };
+  if (profile.runtime.kind === "claude") {
+    const claudeOverrides = overrides as ClaudeRuntimeOverrides;
+    const allowedTools = claudeOverrides.allowedTools ?? profile.runtime.allowedTools;
+    const disallowedTools = claudeOverrides.disallowedTools ?? profile.runtime.disallowedTools;
+    return { kind: "claude", ...claudeCapability(allowedTools, disallowedTools) };
+  }
+  return { kind: "agy", capable: true, reason: "AGY profile can read its granted attachment directory" };
 }

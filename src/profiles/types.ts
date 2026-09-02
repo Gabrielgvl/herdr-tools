@@ -7,7 +7,7 @@ export type ClaudeEffort = (typeof CLAUDE_EFFORTS)[number];
 export const CLAUDE_PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"] as const;
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODES)[number];
 
-export const PROFILE_KINDS = ["pi", "claude"] as const;
+export const PROFILE_KINDS = ["pi", "claude", "agy"] as const;
 export type ProfileKind = (typeof PROFILE_KINDS)[number];
 export type ProfileSourceKind = "bundled" | "user" | "project";
 
@@ -44,7 +44,13 @@ export interface ClaudeRuntimeProfile {
   developmentChannels: string[];
 }
 
-export type RuntimeProfile = PiRuntimeProfile | ClaudeRuntimeProfile;
+export interface AgyRuntimeProfile {
+  kind: "agy";
+  model: string;
+  addDirs: string[];
+}
+
+export type RuntimeProfile = PiRuntimeProfile | ClaudeRuntimeProfile | AgyRuntimeProfile;
 
 export interface Profile {
   name: string;
@@ -107,7 +113,12 @@ export interface ClaudeRuntimeOverrides {
   pluginDirs?: string[];
 }
 
-export type RuntimeOverrides = PiRuntimeOverrides | ClaudeRuntimeOverrides;
+export interface AgyRuntimeOverrides {
+  model?: string;
+  addDirs?: string[];
+}
+
+export type RuntimeOverrides = PiRuntimeOverrides | ClaudeRuntimeOverrides | AgyRuntimeOverrides;
 
 export const MAX_PROFILE_BYTES = 64 * 1024;
 export const MAX_PROFILE_BODY_BYTES = 32 * 1024;

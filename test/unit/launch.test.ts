@@ -74,11 +74,13 @@ const observedPane = (state: string | undefined, stateChangeSeq: number | undefi
   revision
 });
 
-function profile(name: string, kind: "pi" | "claude" = "pi", fallbackProfiles: string[] = []) {
+function profile(name: string, kind: "pi" | "claude" | "agy" = "pi", fallbackProfiles: string[] = []) {
   const runtime = kind === "pi"
     ? "  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]"
-    : "  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]";
-  return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${kind === "claude"}\nruntime:\n${runtime}\nfallbackProfiles: ${JSON.stringify(fallbackProfiles)}\n---\n\nProfile body for ${name}.\n`, profileSource("bundled", `/profiles/${name}.md`, "/profiles"));
+    : kind === "claude"
+      ? "  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]"
+      : "  kind: agy\n  model: gemini-3.7-flash-high\n  addDirs: []";
+  return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${kind !== "pi"}\nruntime:\n${runtime}\nfallbackProfiles: ${JSON.stringify(fallbackProfiles)}\n---\n\nProfile body for ${name}.\n`, profileSource("bundled", `/profiles/${name}.md`, "/profiles"));
 }
 
 function catalog(...profiles: ReturnType<typeof profile>[]): ProfileCatalog {
@@ -3019,6 +3021,33 @@ describe("herdr_launch profile-only contract", () => {
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "claude")).toEqual(["agent", "start", "worker", "--kind", "claude", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "claude/test", "--effort", "medium", "--permission-mode", "dontAsk", "--allowed-tools", "Read", "--disallowed-tools", "Edit", "--add-dir", GRANT_PATH, "--append-system-prompt-file", "/cache/body.md"]);
     expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
     expect(result.details).toMatchObject({ kind: "claude", profile: { requested: "primary", selected: "fallback", attempts: [{ profile: "primary", outcome: "agent_start_failed", errorCode: "agent_start_failed" }, { profile: "fallback", outcome: "selected" }] } });
+  });
+
+  it("keeps AGY bodies as metadata and starts an AGY fallback without a prompt source", async () => {
+    const primary = profile("primary", "agy", ["fallback"]);
+    const fallback = profile("fallback", "pi");
+    const calls: string[][] = [];
+    const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
+    const harness = makeCli({
+      calls,
+      paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" }],
+      start: (_argv, attempt) => {
+        if (attempt === 0) throw startFailure();
+        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" } } });
+      }
+    });
+    const result = await launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), harness.cli, promptSources);
+
+    expect(promptSources.create).toHaveBeenCalledTimes(1);
+    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "agy")).toEqual([
+      "agent", "start", "worker", "--kind", "agy", "--pane", "w1:p2", "--timeout", "120000", "--",
+      "--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", GRANT_PATH
+    ]);
+    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "pi")).toEqual([
+      "agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--",
+      "--model", "test/model", "--thinking", "low", "--tools", "read", "--no-session", "--append-system-prompt", "/cache/body.md"
+    ]);
+    expect(result.details).toMatchObject({ kind: "pi", profile: { requested: "primary", selected: "fallback" } });
   });
 
   it("refuses fallback for mismatched errors, uncertain post-state, or an occupied pane", async () => {

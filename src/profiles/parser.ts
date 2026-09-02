@@ -85,11 +85,15 @@ function resourcePaths(value: unknown, field: string, scopeRoot: string): string
 
 function parseRuntime(value: unknown, scopeRoot: string): RuntimeProfile {
   if (!record(value)) fail("runtime must be an object");
-  if (!PROFILE_KINDS.includes(value.kind as ProfileKind)) fail("runtime.kind must be pi or claude");
+  if (!PROFILE_KINDS.includes(value.kind as ProfileKind)) fail("runtime.kind must be pi, claude, or agy");
   if (value.kind === "pi") {
     exactKeys(value, ["kind", "model", "thinking", "tools", "extensions", "skills"], "runtime");
     if (!THINKING_LEVELS.includes(value.thinking as ThinkingLevel)) fail("runtime.thinking is invalid");
     return { kind: "pi", model: stringField(value.model, "runtime.model"), thinking: value.thinking as ThinkingLevel, tools: stringArray(value.tools, "runtime.tools"), extensions: resourcePaths(value.extensions, "runtime.extensions", scopeRoot), skills: resourcePaths(value.skills, "runtime.skills", scopeRoot) };
+  }
+  if (value.kind === "agy") {
+    exactKeys(value, ["kind", "model", "addDirs"], "runtime");
+    return { kind: "agy", model: stringField(value.model, "runtime.model"), addDirs: resourcePaths(value.addDirs, "runtime.addDirs", scopeRoot) };
   }
   exactKeys(value, ["kind", "model", "effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs", "developmentChannels"], "runtime");
   if (!CLAUDE_EFFORTS.includes(value.effort as ClaudeEffort)) fail("runtime.effort is invalid");
@@ -163,6 +167,7 @@ export function parseProfile(text: string, source: ProfileSource): Profile {
   if (new Set(fallbackProfiles).size !== fallbackProfiles.length) fail("fallbackProfiles must not contain duplicates");
   const runtime = parseRuntime(values.runtime, source.scopeRoot);
   if (runtime.kind === "claude" && values.sessionPersistence === false) fail("Claude profiles must set sessionPersistence to true for interactive launches");
+  if (runtime.kind === "agy" && values.sessionPersistence === false) fail("AGY profiles must set sessionPersistence to true for interactive launches");
   return { name, description: stringField(values.description, "description"), timeoutMinutes: values.timeoutMinutes as number, sessionPersistence: values.sessionPersistence, runtime, fallbackProfiles, body, source };
 }
 

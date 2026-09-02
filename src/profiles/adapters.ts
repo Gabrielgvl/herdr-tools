@@ -1,4 +1,4 @@
-import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeRuntimeOverrides, type ClaudeEffort, type ClaudePermissionMode, type PiRuntimeOverrides, type Profile, type RuntimeOverrides, type ThinkingLevel } from "./types.js";
+import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type AgyRuntimeOverrides, type ClaudeRuntimeOverrides, type ClaudeEffort, type ClaudePermissionMode, type PiRuntimeOverrides, type Profile, type ProfileKind, type RuntimeOverrides, type ThinkingLevel } from "./types.js";
 import { normalizeScopedResourcePath } from "./parser.js";
 import { isAbsolute } from "node:path";
 
@@ -51,7 +51,11 @@ function scopedValues(value: string[] | undefined, fallback: string[], field: st
   }
 }
 
-function rejectIncompatible(kind: "pi" | "claude", overrides: Record<string, unknown>): void {
+function rejectIncompatible(kind: ProfileKind, overrides: Record<string, unknown>): void {
+  if (kind === "agy") {
+    for (const key of Object.keys(overrides)) if (key !== "model" && key !== "addDirs") throw new ProfileAdapterError(`${key} is only valid for AGY profiles`);
+    return;
+  }
   const invalid = kind === "pi"
     ? ["effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"]
     : ["thinking", "tools", "extensions", "skills"];
@@ -118,9 +122,19 @@ export function resolveClaudeRuntime(profile: Extract<Profile["runtime"], { kind
   };
 }
 
+export function resolveAgyRuntime(profile: Extract<Profile["runtime"], { kind: "agy" }>, overrides: AgyRuntimeOverrides = {}, scopeRoot?: string): Extract<Profile["runtime"], { kind: "agy" }> {
+  rejectIncompatible("agy", overrides as Record<string, unknown>);
+  return {
+    kind: "agy",
+    model: model(overrides.model, profile.model),
+    addDirs: scopedValues(overrides.addDirs, profile.addDirs, "overrides.addDirs", scopeRoot)
+  };
+}
+
 export function resolveProfileRuntime(profile: Profile, overrides: RuntimeOverrides = {}): Profile["runtime"] {
   if (profile.runtime.kind === "pi") return resolvePiRuntime(profile.runtime, overrides as PiRuntimeOverrides, profile.source.scopeRoot);
-  return resolveClaudeRuntime(profile.runtime, overrides as ClaudeRuntimeOverrides, profile.source.scopeRoot);
+  if (profile.runtime.kind === "claude") return resolveClaudeRuntime(profile.runtime, overrides as ClaudeRuntimeOverrides, profile.source.scopeRoot);
+  return resolveAgyRuntime(profile.runtime, overrides as AgyRuntimeOverrides, profile.source.scopeRoot);
 }
 
 export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, sessionPersistence: boolean, overrides: PiRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
@@ -137,9 +151,17 @@ export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "cl
   return [...args, ...promptFileArg("--append-system-prompt-file", promptFilePath)];
 }
 
+export function buildAgyArgv(profile: Extract<Profile["runtime"], { kind: "agy" }>, sessionPersistence: boolean, overrides: AgyRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string, attachmentDirectory?: string): string[] {
+  if (!sessionPersistence) throw new ProfileAdapterError("AGY profiles must set sessionPersistence to true for interactive launches");
+  if (promptFilePath !== undefined) throw new ProfileAdapterError("AGY profiles do not accept prompt source files");
+  const effective = resolveAgyRuntime(profile, overrides, scopeRoot);
+  return ["--model", effective.model, "--mode", "plan", "--dangerously-skip-permissions", ...repeated("--add-dir", effective.addDirs), ...attachmentDirectoryArg(attachmentDirectory)];
+}
+
 export function buildRuntimeArgv(profile: Profile, runtime: Profile["runtime"], promptFilePath?: string, attachmentDirectory?: string): string[] {
   if (runtime.kind === "pi") return buildPiArgv(runtime, profile.sessionPersistence, {}, promptFilePath);
-  return buildClaudeArgv(runtime, profile.sessionPersistence, {}, promptFilePath, undefined, attachmentDirectory);
+  if (runtime.kind === "claude") return buildClaudeArgv(runtime, profile.sessionPersistence, {}, promptFilePath, undefined, attachmentDirectory);
+  return buildAgyArgv(runtime, profile.sessionPersistence, {}, promptFilePath, profile.source.scopeRoot, attachmentDirectory);
 }
 
 export function buildProfileArgv(profile: Profile, overrides: RuntimeOverrides = {}, promptFilePath?: string, attachmentDirectory?: string): string[] {

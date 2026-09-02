@@ -14,7 +14,7 @@ import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
-import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type RuntimeProfile } from "../profiles/types.js";
+import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
@@ -150,7 +150,7 @@ export interface LaunchDetails extends LaunchResourceIds {
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
   envelope?: { version: "v1"; kind: "assignment"; delivery: MessageDelivery };
   attachment?: PublishedAttachment;
-  recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; profileName: string; kind: "pi" | "claude"; capable: boolean; reason: string };
+  recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; profileName: string; kind: ProfileKind; capable: boolean; reason: string };
   profile?: LaunchEffectiveProfile & { name: string; sessionPersistence: boolean };
 }
 
@@ -682,15 +682,22 @@ function startFailureEvidence(error: unknown): { code: string; message: string }
 }
 
 function effectiveDetails(profile: Profile, runtime: RuntimeProfile): { runtime: Record<string, unknown>; permissions: Record<string, unknown> } {
-  return runtime.kind === "pi"
-    ? {
+  if (runtime.kind === "pi") {
+    return {
       runtime: { kind: "pi", model: runtime.model, thinking: runtime.thinking },
       permissions: { sessionPersistence: profile.sessionPersistence, tools: [...runtime.tools], extensions: [...runtime.extensions], skills: [...runtime.skills] }
-    }
-    : {
+    };
+  }
+  if (runtime.kind === "claude") {
+    return {
       runtime: { kind: "claude", model: runtime.model, effort: runtime.effort },
       permissions: { sessionPersistence: profile.sessionPersistence, permissionMode: runtime.permissionMode, allowedTools: [...runtime.allowedTools], disallowedTools: [...runtime.disallowedTools], addDirs: [...runtime.addDirs], pluginDirs: [...runtime.pluginDirs] }
     };
+  }
+  return {
+    runtime: { kind: "agy", model: runtime.model, mode: "plan", dangerouslySkipPermissions: true },
+    permissions: { sessionPersistence: profile.sessionPersistence, addDirs: [...runtime.addDirs] }
+  };
 }
 
 function snapshotOf(result: unknown): HerdrSnapshot {
@@ -1628,9 +1635,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           if (initialPromptDelivery === "attachment" && !capability.capable) {
             throw new LaunchError("ATTACHMENT_TARGET_UNVERIFIED", "Profile cannot read a local attachment", { profile: profile.name, reason: capability.reason });
           }
-          const promptSource = await promptStore.create(profile.body);
-          promptPaths.set(profile.name, promptSource.path);
-          buildRuntimeArgv(profile, runtime, promptSource.path, grant.path);
+          const promptPath = runtime.kind === "agy" ? undefined : (await promptStore.create(profile.body)).path;
+          if (promptPath !== undefined) promptPaths.set(profile.name, promptPath);
+          buildRuntimeArgv(profile, runtime, promptPath, grant.path);
         }
         const effective = await contextResolver(abortSignal);
         contextDiagnostics = effective.diagnostics;

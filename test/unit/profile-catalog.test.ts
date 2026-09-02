@@ -2,7 +2,7 @@ import { access, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
+import { attachmentCapability, buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
 import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
 import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE, type LaunchDependencies } from "../../src/tools/launch.js";
 import { createRuntime } from "../../index.js";
@@ -17,11 +17,13 @@ function launchDiagnostic(error: Error): Record<string, unknown> {
 }
 
 function source(root: string, name: string) { return profileSource("project", join(root, `${name}.md`), root); }
-function profileText(name: string, runtime = "pi", extra = "", fallbackProfiles = "[]") {
+function profileText(name: string, runtime: "pi" | "claude" | "agy" = "pi", extra = "", fallbackProfiles = "[]") {
   const block = runtime === "pi"
     ? "  kind: pi\n  model: test/model\n  thinking: low"
-    : "  kind: claude\n  model: claude-test\n  effort: medium";
-  const sessionPersistence = runtime === "claude" ? "true" : "false";
+    : runtime === "claude"
+      ? "  kind: claude\n  model: claude-test\n  effort: medium"
+      : "  kind: agy\n  model: gemini-3.7-flash-high\n  addDirs: []";
+  const sessionPersistence = runtime === "pi" ? "false" : "true";
   return `---\nname: ${name}\ndescription: Test ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${sessionPersistence}\nruntime:\n${block}\nfallbackProfiles: ${fallbackProfiles}\n${extra}---\n\nBody for ${name}.\n`;
 }
 
@@ -291,6 +293,40 @@ describe("profile catalog", () => {
     expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { extensions: ["../outside"] }, undefined, "/tmp/profile-scope")).toThrow();
     for (const key of ["effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"] as const) expect(() => buildProfileArgv(pi, { [key]: key === "permissionMode" ? "plan" : key === "effort" ? "low" : ["value"] } as never)).toThrow();
     for (const key of ["thinking", "tools", "extensions", "skills"] as const) expect(() => buildProfileArgv(claude, { [key]: key === "thinking" ? "low" : ["value"] } as never)).toThrow();
+  });
+
+  it("parses and adapts strict AGY profiles", () => {
+    const root = "/tmp/profile-scope";
+    const agy = parseProfile(profileText("researcher", "agy").replace("  addDirs: []", "  addDirs: [./docs]"), source(root, "researcher"));
+    expect(agy.runtime).toEqual({ kind: "agy", model: "gemini-3.7-flash-high", addDirs: [join(root, "docs")] });
+    expect(agy.sessionPersistence).toBe(true);
+    expect(buildProfileArgv(agy)).toEqual(["--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs")]);
+    expect(buildProfileArgv(agy, { model: "gemini-override", addDirs: ["./override"] })).toEqual(["--model", "gemini-override", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "override")]);
+    expect(buildProfileArgv(agy, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "gemini-3.7-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs"), "--add-dir", "/tmp/message-attachments/key"]);
+    expect(() => buildProfileArgv(agy, {}, "/tmp/prompt-source")).toThrow(/prompt source/);
+    expect(() => buildProfileArgv({ ...agy, sessionPersistence: false })).toThrow(/sessionPersistence/);
+    expect(() => buildProfileArgv(agy, { thinking: "low" } as never)).toThrow(/AGY/);
+    expect(() => buildProfileArgv(agy, { addDirs: ["../outside"] })).toThrow(/scope root/);
+    expect(() => parseProfile(profileText("researcher", "agy").replace("  addDirs: []", "  addDirs: []\n  mode: plan"), source(root, "researcher"))).toThrow(ProfileParseError);
+    expect(() => parseProfile(profileText("researcher", "agy").replace("sessionPersistence: true", "sessionPersistence: false"), source(root, "researcher"))).toThrow(/AGY profiles must set sessionPersistence/);
+    expect(attachmentCapability(agy)).toEqual({ kind: "agy", capable: true, reason: "AGY profile can read its granted attachment directory" });
+  });
+
+  it("preserves AGY mode and permission metadata in model-visible profile inspection", async () => {
+    const root = "/tmp/profile-scope";
+    const agy = parseProfile(profileText("researcher", "agy"), source(root, "researcher"));
+    const tool = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({
+      effective: new Map([[agy.name, agy]]),
+      candidates: [{ name: agy.name, profile: agy, source: agy.source }],
+      diagnostics: []
+    }) } });
+    const content = (result: { content: Array<unknown> }) => JSON.parse((result.content[0] as { text: string }).text) as Record<string, unknown>;
+
+    const collection = content(await tool.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never));
+    expect((collection.items as Array<Record<string, unknown>>)[0]).toMatchObject({ kind: "agy", mode: "plan", dangerouslySkipPermissions: true });
+
+    const exact = content(await tool.execute("id", { mode: "profile", profile: "researcher" } as never, new AbortController().signal, undefined, {} as never));
+    expect(exact.profile).toMatchObject({ kind: "agy", mode: "plan", dangerouslySkipPermissions: true });
   });
 
   it("validates profile launch input before placement", () => {

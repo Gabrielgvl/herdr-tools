@@ -66,6 +66,9 @@ describe("supervision socket protocol", () => {
     expect(parsePaneRecord({ ...pane, agent: null, agent_session: null, label: null })).toEqual({
       paneId: "p1", terminalId: "t1", tabId: "tab1", workspaceId: "w1", agentStatus: "working", revision: 7,
     });
+    expect(parsePaneRecord({ ...pane, state_change_seq: 4 })).toMatchObject({ stateChangeSeq: 4 });
+    expect(parsePaneRecord({ ...pane, state_change_seq: null })).not.toHaveProperty("stateChangeSeq");
+    expect(() => parsePaneRecord({ ...pane, state_change_seq: -1 })).toThrow(/counter is malformed/u);
     expect(() => parsePaneRecord(null)).toThrow(/pane record is malformed/u);
     expect(() => parsePaneRecord({ ...pane, pane_id: "p\n1" })).toThrow(/usable identifier/u);
     expect(() => parsePaneRecord({ ...pane, agent_status: "spinning" })).toThrow(/agent status is malformed/u);

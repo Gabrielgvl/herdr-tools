@@ -200,8 +200,9 @@ describe("supervised identity continuity", () => {
     expect(() => provisionalEventLifecycle({ ...complete, data: { pane: { state_change_seq: -1 } } } as never)).toThrow(/malformed/u);
   });
 
-  it("keeps the generic classifier unchanged when AGY lifecycle fields are malformed", () => {
-    expect(classifySnapshotTarget(snapshot([agyPane({ state_change_seq: "bad" })], [agyAgent()]), "p1")).toMatchObject({ kind: "unique", occupant: { agentPresent: true } });
+  it("rejects malformed lifecycle fields before exact supervision can use them", () => {
+    expect(classifySnapshotTarget(snapshot([agyPane({ state_change_seq: "bad" })], [agyAgent()]), "p1"))
+      .toEqual({ kind: "invalid", reason: "target_record_malformed" });
   });
 
   it("follows a move only on atomic evidence plus a fresh matching occupant", () => {

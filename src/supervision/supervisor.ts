@@ -129,6 +129,12 @@ interface StrengtheningCandidate extends ProvisionalLifecycle {
   initialRevision: number;
 }
 
+interface SupervisionEndpoint {
+  revision: number;
+  status: SupervisionAgentStatus;
+  stateChangeSeq: number | undefined;
+}
+
 const inertBindingPublication: SupervisionChildBindingPublication = {
   commit: () => undefined,
   rollback: () => undefined,
@@ -169,6 +175,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private lastRevision = 0;
   /** The highest authoritative lifecycle sequence folded for the current exact child. */
   private lastStateChangeSeq: number | undefined;
+  /** The last exact endpoint folded, including a raw sequence for replay checks. */
+  private lastEndpoint: SupervisionEndpoint | undefined;
   /**
    * The destination of a move already proven to be this child's, retained
    * because the destination's own snapshot was invalid at the time. The child is
@@ -273,6 +281,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.status = occupant.pane.agentStatus;
     this.lastRevision = occupant.pane.revision;
     this.lastStateChangeSeq = stateChangeSeq;
+    this.lastEndpoint = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, stateChangeSeq: occupant.stateChangeSeq };
     // The drain, the settlement check, and the publication are one task on the
     // mutation chain: an event admitted at any point before the commit folds
     // inside this task, and the commit sees its outcome.
@@ -496,6 +505,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       state: this.state,
       identity: this.identity,
       lastStateChangeSeq: this.lastStateChangeSeq,
+      lastEndpoint: this.lastEndpoint,
     };
     try {
       if (this.queued.length !== 0) throw new Error("evidence_admitted_before_exact_commit");
@@ -506,6 +516,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       this.status = candidate.status;
       this.lastRevision = candidate.revision;
       this.lastStateChangeSeq = candidate.stateChangeSeq;
+      this.lastEndpoint = { revision: candidate.revision, status: candidate.status, stateChangeSeq: candidate.stateChangeSeq };
       this.provisional = undefined;
       this.provisionalPublished = false;
       this.bindingPublished = true;
@@ -520,6 +531,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       this.anchor = previous.anchor;
       this.lastRevision = previous.lastRevision;
       this.lastStateChangeSeq = previous.lastStateChangeSeq;
+      this.lastEndpoint = previous.lastEndpoint;
       this.selectedProfileName = previous.selectedProfileName;
       this.bindingPublished = previous.bindingPublished;
       this.provisionalPublished = previous.provisionalPublished;
@@ -629,6 +641,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.status = undefined;
     this.lastRevision = 0;
     this.lastStateChangeSeq = undefined;
+    this.lastEndpoint = undefined;
     this.pendingMoveDestination = undefined;
     this.selectedProfileName = undefined;
     this.eventStreamDegraded = false;
@@ -984,6 +997,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.identity = next;
     this.paneId = next.paneId;
     this.lastRevision = occupant.pane.revision;
+    this.lastEndpoint = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, stateChangeSeq: occupant.stateChangeSeq };
     this.anchor = {
       ...this.anchor!,
       revision: occupant.pane.revision,
@@ -1020,6 +1034,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private applyEventRevision(pane: SupervisionPaneRecord): void {
+    if (this.lastEndpoint !== undefined
+      && this.lastEndpoint.revision === pane.revision
+      && this.lastEndpoint.status === pane.agentStatus
+      && this.lastEndpoint.stateChangeSeq === pane.stateChangeSeq) return;
+    this.lastEndpoint = { revision: pane.revision, status: pane.agentStatus, stateChangeSeq: pane.stateChangeSeq };
     const previousRevision = this.lastRevision;
     const previousStateChangeSeq = this.lastStateChangeSeq;
     if (pane.revision > previousRevision + 1) {
@@ -1109,6 +1128,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const previousRevision = this.lastRevision;
     const previousStateChangeSeq = this.lastStateChangeSeq;
     const sequence = this.observeStateChangeSeq(occupant.stateChangeSeq);
+    this.lastEndpoint = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, stateChangeSeq: occupant.stateChangeSeq };
     if (occupant.pane.revision === previousRevision) {
       if (occupant.pane.agentStatus === this.status) return;
       if (sequence !== "advanced") {

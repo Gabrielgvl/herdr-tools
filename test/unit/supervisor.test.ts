@@ -1142,6 +1142,9 @@ describe("supervisor folding", () => {
     expect(h.supervisor.view()).toMatchObject({ status: "idle", monitor: { evidenceGaps: 1 } });
     const internals = h.supervisor as unknown as { lastRevision: number; lastStateChangeSeq?: number };
     expect(internals).toMatchObject({ lastRevision: 3, lastStateChangeSeq: 5 });
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 3, state_change_seq: 5 })));
+    expect(h.wakes).toHaveLength(2);
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(1);
     h.supervisor.shutdown();
   });
 
@@ -1155,7 +1158,15 @@ describe("supervisor folding", () => {
     expect(internals).toMatchObject({ lastRevision: 5, lastStateChangeSeq: 5 });
     expect(h.wakes.filter((wake) => wake.event.details?.reason === "revision_jump")).toHaveLength(1);
 
+    const wakeCount = h.wakes.length;
     await h.supervisor.onEvent(event);
+    expect(h.wakes).toHaveLength(wakeCount);
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(2);
+    expect(h.wakes.filter((wake) => wake.event.details?.reason === "revision_jump")).toHaveLength(1);
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 5, state_change_seq: 3 })));
+    expect(h.wakes).toHaveLength(wakeCount + 1);
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(3);
     expect(h.wakes.filter((wake) => wake.event.details?.reason === "revision_jump")).toHaveLength(1);
     expect(internals).toMatchObject({ lastRevision: 5, lastStateChangeSeq: 5 });
     h.supervisor.shutdown();

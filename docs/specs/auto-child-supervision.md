@@ -58,6 +58,21 @@ never identify a child.
 **F7 — `revision` is monotonic per pane occupancy** and is present on every
 `PaneInfo`-bearing event (`pane_created`, `pane_updated`, `pane_moved`).
 
+**F8 — `state_change_seq` is an optional authoritative lifecycle counter.** An exact
+occupant may advance it while `revision` stays constant. Tools keeps one monotonic lifecycle
+watermark from the bind anchor through full-pane events, authoritative snapshots, AGY
+strengthening, and proven pane moves. A same-revision status change is gap-free only when the
+exact occupant supplies a strictly advanced sequence. Missing, unchanged, regressed, or
+contradictory sequence evidence remains gap-visible or degrades reconciliation. Runtimes
+without the counter retain the revision-only rule. Exact move endpoints are retained in
+arrival order while destination reconciliation is pending. Once the destination is proven,
+the move endpoints are folded before the later snapshot endpoint. A lower snapshot sequence
+or revision degrades, and an equal sequence with a different status is contradictory. A
+snapshot that supplies the move's sequence and status credits that event even when output has
+advanced the pane revision. The revision advance remains visible as a source-`snapshot`
+`revision_jump`. A missing snapshot sequence may use the event tuple only when revision and
+status agree.
+
 ## 3. Consequences of the protocol facts
 
 - **C1.** The session monitor holds **one** long-lived connection carrying a **fixed global**
@@ -160,6 +175,16 @@ Only then is the bound `paneId` rewritten. The destination revision is pane-loca
 rebased as the new watermark after this proof; it is never compared with the origin pane's
 watermark. Nothing else may rewrite the bound pane ID.
 
+The move event's lifecycle endpoint is not collapsed into the fresh snapshot. Every exact
+endpoint from a chained pending move is folded in arrival order, followed by the snapshot
+endpoint. This preserves a completion followed by a new working transition. It also preserves
+an earlier sequence advance when a later chained move repeats the same sequence and status.
+A supplied snapshot sequence cannot trail any retained supplied sequence, and its status must
+match every retained endpoint at the same sequence. Retained endpoints that supply the same
+sequence must also agree on status. Contradictory evidence leaves the move pending and
+supervision degraded. These checks compare lifecycle evidence only. Revisions remain local to
+each move destination.
+
 Failing **2** or **3** is not a lost identity and does not settle. The monitor routes a move
 by its destination as well as its origin, and **F6** makes pane IDs reusable, so such an
 event is either a replay of a move this supervisor already followed or a *different*
@@ -172,19 +197,24 @@ wakes.
 ## 7. Anchoring, folding, gaps, and periodic reconciliation
 
 A supervisor stores `anchor = { paneId, revision, stateChangeSeq, status }` captured at
-bind, a bounded ordered `transitions` list, and `lastRevision`, the highest revision folded
-for the pane currently bound to the exact child. Revisions are the deduplication watermark,
-not stream positions. Herdr's retained event log can drop its head, and a proven pane move
-rebases the watermark to the destination pane's own numbering.
+bind, a bounded ordered `transitions` list, `lastRevision`, and one optional
+`lastStateChangeSeq` watermark. `lastRevision` is the highest revision folded for the pane
+currently bound to the exact child. Revisions are the deduplication watermark, not stream
+positions. The lifecycle watermark is used whenever authoritative evidence supplies
+`state_change_seq`, including after AGY strengthening and across proven pane moves. Herdr's
+retained event log can drop its head, and a proven pane move rebases the revision watermark
+to the destination pane's own numbering without discarding the lifecycle watermark.
 
 For each event on the shared stream:
 
 - an unrelated pane ID is ignored;
 - a full same-pane event below `lastRevision` is historical and ignored;
 - an event at `lastRevision` with the same status is a duplicate and stays silent;
-- an event at `lastRevision` with a changed status emits one high-priority `evidence_gap`
-  with `source: "event"` and `reason: "status_changed_without_revision"`, then adopts the
-  status;
+- an event at `lastRevision` with a changed status is adopted without a gap only when its
+  supplied `state_change_seq` strictly advances `lastStateChangeSeq`; absent or unchanged
+  lifecycle evidence emits the existing high-priority `status_changed_without_revision`
+  `evidence_gap` before adopting the status, while regressed evidence emits that gap and
+  leaves the current status and revision unchanged; an exact endpoint replay stays silent;
 - an event exactly one revision above the watermark advances normally;
 - an event more than one revision above the watermark emits one high-priority
   `evidence_gap` with `source: "event"`, `reason: "revision_jump"`, the previous and
@@ -192,11 +222,16 @@ For each event on the shared stream:
 - a thin event requests coalesced authoritative reconciliation. At most one event-triggered
   read per supervisor is in flight, and another trigger sets a rerun flag.
 
-Deduplication is `lastRevision` and nothing else. No stream position is used, because
-**F5**'s retained log drops entries from its head: after truncation the same position names a
-different entry, so a supervisor keyed on position would skip transitions it had never seen.
-A proven move changes the routing key, so the destination pane's own revision becomes the new
-watermark only after exact occupant proof. Origin and destination revisions are never compared.
+Revision deduplication remains `lastRevision`, and lifecycle deduplication uses the one
+optional `lastStateChangeSeq`; neither is a stream position. **F5**'s retained log drops
+entries from its head: after truncation the same position names a different entry, so a
+supervisor keyed on position would skip transitions it had never seen. A proven move changes
+the routing key, so the destination pane's own revision becomes the new revision watermark
+only after exact occupant proof, while the lifecycle watermark is retained. Origin and
+destination revisions are never compared. The move event starts the destination revision
+watermark, then the fresh snapshot is folded normally. A higher snapshot revision therefore
+stays gap-visible as a revision jump without inventing a
+`status_changed_without_revision` lifecycle gap when its sequence and status match the move.
 
 Events that arrive between adding the observer and proving the anchor are queued and then
 folded in arrival order against that same watermark, so a queued event advances it exactly as
@@ -238,10 +273,11 @@ and enters visible reconciliation degradation. Only a later valid target-local r
 recover the episode.
 
 For a valid continuous snapshot occupant, equal revision and status is silent. Equal revision
-with a changed status emits one source-`snapshot` `evidence_gap` with reason
-`status_changed_without_revision` and adopts the status. Any higher revision emits one
-source-`snapshot` `evidence_gap` with reason `revision_jump`, even when the endpoint status is
-unchanged, then adopts the snapshot revision and status. A lower revision is never adopted.
+with a changed status is gap-free only when `state_change_seq` strictly advances the lifecycle
+watermark. Missing, unchanged, regressed, or contradictory lifecycle evidence remains
+visible through the existing gap or reconciliation-degraded paths. Any higher revision emits
+one source-`snapshot` `evidence_gap` with reason `revision_jump`, even when the endpoint status
+is unchanged, then adopts the snapshot revision and status. A lower revision is never adopted.
 A gap remains visible because an endpoint can hide a transition that changed and returned.
 
 Reconciliation failures expose bounded `intervalMs`, degraded state, consecutive failure

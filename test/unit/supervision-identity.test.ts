@@ -105,6 +105,14 @@ describe("supervised identity continuity", () => {
     ]) {
       expect(classifySnapshotTarget(snapshot([{ ...rawPane(), agent_name: "worker" }], [contradictoryAgent]), "p1")).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
     }
+    expect(classifySnapshotTarget(
+      snapshot([{ ...rawPane(), agent_status: "idle", revision: 5 }], [{ ...agent, agent_status: "working", revision: 5, state_change_seq: 6 }]),
+      "p1",
+    )).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
+    expect(classifySnapshotTarget(
+      snapshot([{ ...rawPane(), agent_status: "idle", revision: 5 }], [{ ...agent, agent_status: "idle", revision: 6, state_change_seq: 6 }]),
+      "p1",
+    )).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
   });
 
   it("joins identity fields supplied only by the target-local agent record", () => {
@@ -146,6 +154,20 @@ describe("supervised identity continuity", () => {
       get: () => (++paneReads === 1 ? [agyPane()] : []),
     });
     expect(classifyProvisionalSnapshotTarget(changingSnapshot, "p1")).toEqual({ kind: "absent" });
+
+    const contradictoryTuple = snapshot([agyPane()], [agyAgent()]);
+    let contradictoryPaneReads = 0;
+    Object.defineProperty(contradictoryTuple, "panes", {
+      get: () => (++contradictoryPaneReads === 1 ? [agyPane()] : [agyPane({ state_change_seq: 5 })]),
+    });
+    expect(classifyProvisionalSnapshotTarget(contradictoryTuple, "p1")).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
+
+    const malformedTuple = snapshot([agyPane()], [agyAgent()]);
+    let malformedPaneReads = 0;
+    Object.defineProperty(malformedTuple, "panes", {
+      get: () => (++malformedPaneReads === 1 ? [agyPane()] : [agyPane({ state_change_seq: "bad" })]),
+    });
+    expect(classifyProvisionalSnapshotTarget(malformedTuple, "p1")).toEqual({ kind: "invalid", reason: "target_record_malformed" });
 
     const paneOnly = classifyProvisionalSnapshotTarget(snapshot([agyPane()], []), "p1");
     expect(paneOnly).toMatchObject({ kind: "unique", occupant: { stateChangeSeq: 4 } });
@@ -200,8 +222,9 @@ describe("supervised identity continuity", () => {
     expect(() => provisionalEventLifecycle({ ...complete, data: { pane: { state_change_seq: -1 } } } as never)).toThrow(/malformed/u);
   });
 
-  it("keeps the generic classifier unchanged when AGY lifecycle fields are malformed", () => {
-    expect(classifySnapshotTarget(snapshot([agyPane({ state_change_seq: "bad" })], [agyAgent()]), "p1")).toMatchObject({ kind: "unique", occupant: { agentPresent: true } });
+  it("rejects malformed lifecycle fields before exact supervision can use them", () => {
+    expect(classifySnapshotTarget(snapshot([agyPane({ state_change_seq: "bad" })], [agyAgent()]), "p1"))
+      .toEqual({ kind: "invalid", reason: "target_record_malformed" });
   });
 
   it("follows a move only on atomic evidence plus a fresh matching occupant", () => {

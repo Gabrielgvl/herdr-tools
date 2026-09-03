@@ -26,6 +26,7 @@ interface PaneOptions {
   terminalId?: string;
   status?: string;
   revision?: number;
+  stateChangeSeq?: number;
   agentSession?: Record<string, string> | null;
   agentKind?: string | null;
 }
@@ -38,6 +39,7 @@ function paneRecord(options: PaneOptions = {}): Record<string, unknown> {
     workspace_id: "w1",
     agent_status: options.status ?? "idle",
     revision: options.revision ?? 5,
+    ...(options.stateChangeSeq === undefined ? {} : { state_change_seq: options.stateChangeSeq }),
     agent: options.agentKind === undefined ? "pi" : options.agentKind,
     agent_session: options.agentSession === undefined ? session : options.agentSession,
   };
@@ -344,6 +346,10 @@ describe("supervisor binding", () => {
     const h = harness({ snapshots: [snapshot([paneRecord()])] });
     await expect(h.supervisor.bind({ identity, profileName: "worker-pi" })).resolves.toBeUndefined();
     expect(h.timerArmed()).toBe(false);
+
+    const regressed = harness({ snapshots: [snapshot([paneRecord({ stateChangeSeq: 3 })])] });
+    await expect(regressed.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 4 }))
+      .rejects.toMatchObject({ details: { cause: "lifecycle_regressed" } });
 
     const stopped = harness();
     stopped.supervisor.shutdown();
@@ -689,7 +695,6 @@ describe("AGY provisional supervision failures", () => {
       [paneEvent("pane_updated", agyPaneRecord({ agent_session: { ...agySession, agent: "pi" }, revision: 3, state_change_seq: 5 })), "native_identity_mismatch"],
       [paneEvent("pane_updated", agyPaneRecord({ revision: 1, state_change_seq: 5 })), "revision_regressed"],
       [paneEvent("pane_updated", agyPaneRecord({ revision: 3, state_change_seq: undefined })), "lifecycle_not_advanced"],
-      [paneEvent("pane_updated", agyPaneRecord({ revision: 3, state_change_seq: -1 })), "lifecycle_malformed"],
     ];
     for (const [event, cause] of events) {
       const h = agyHarness([snapshot([agyPaneRecord()], [agyAgentRecord()])]);
@@ -924,7 +929,7 @@ describe("AGY supervision strengthening failures", () => {
     h.supervisor.shutdown();
   });
 
-  it("replays strengthened transitions with gap evidence", async () => {
+  it("replays strengthened transitions without false same-revision gaps", async () => {
     let resolveFresh!: (value: HerdrSnapshot) => void;
     const fresh = new Promise<HerdrSnapshot>((resolve) => { resolveFresh = resolve; });
     const h = await provisional([fresh]);
@@ -935,7 +940,7 @@ describe("AGY supervision strengthening failures", () => {
     const working = h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 7, state_change_seq: 8 })));
     resolveFresh(agyExactSnapshot());
     await Promise.all([strengthening, sameRevision, jumped, working]);
-    expect(types(h.wakes)).toEqual(["evidence_gap", "blocked", "evidence_gap"]);
+    expect(types(h.wakes)).toEqual(["blocked", "evidence_gap"]);
     expect(h.supervisor.view()).toMatchObject({
       state: "active",
       status: "working",
@@ -1021,6 +1026,10 @@ describe("AGY supervision strengthening failures", () => {
     internals.applyProvisionalSnapshot(snapshot([], []), "test");
     internals.foldProvisional(thinEvent("pane_closed"));
     internals.provisionalFailure = undefined;
+    const valid = paneEvent("pane_updated", agyPaneRecord());
+    internals.foldProvisional({ ...valid, data: { ...valid.data, pane: null } } as never);
+    expect(provisionalCause(h)).toBe("lifecycle_malformed");
+    internals.provisionalFailure = undefined;
     internals.provisional = undefined;
     internals.applyProvisionalSnapshot(snapshot([], []), "test");
     internals.foldProvisional(thinEvent("pane_closed"));
@@ -1055,6 +1064,169 @@ describe("supervisor folding", () => {
     await h.supervisor.bind({ identity, profileName: "worker-pi" });
     return h;
   }
+
+  async function exactAgyBound(after: HerdrSnapshot[] = []): Promise<Harness> {
+    const child = { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" };
+    const h = harness({ child, snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), agyExactSnapshot(), ...after] });
+    await h.supervisor.bindProvisional(provisionalBinding);
+    await h.supervisor.strengthen({ identity: exactAgyIdentity, profileName: "researcher-agy" });
+    h.wakes.length = 0;
+    return h;
+  }
+
+  it("accepts AGY same-revision event transitions with an advancing lifecycle sequence", async () => {
+    const h = await exactAgyBound();
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 3, state_change_seq: 6 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "done", revision: 3, state_change_seq: 7 })));
+    expect(types(h.wakes)).toEqual(["work_cycle_completed", "work_cycle_completed"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "done", monitor: { evidenceGaps: 0 } });
+    h.supervisor.shutdown();
+  });
+
+  it("accepts AGY same-revision snapshot transitions with an advancing lifecycle sequence", async () => {
+    const h = await exactAgyBound();
+    await h.supervisor.onReconciliationSnapshot(agyExactSnapshot({ agent_status: "blocked", state_change_seq: 6 }));
+    await h.supervisor.onReconciliationSnapshot(agyExactSnapshot({ agent_status: "idle", state_change_seq: 7 }));
+    expect(types(h.wakes)).toEqual(["blocked"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "idle", monitor: { evidenceGaps: 0, reconciliation: { degraded: false } } });
+    h.supervisor.shutdown();
+  });
+
+  it("keeps AGY missing, unchanged, and regressed lifecycle evidence visible", async () => {
+    const missing = await exactAgyBound();
+    await missing.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 3, state_change_seq: undefined })));
+    expect(types(missing.wakes)).toEqual(["evidence_gap", "blocked"]);
+    expect(missing.supervisor.view().monitor.evidenceGaps).toBe(1);
+    missing.supervisor.shutdown();
+
+    const unchanged = await exactAgyBound();
+    await unchanged.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 3, state_change_seq: 5 })));
+    expect(types(unchanged.wakes)).toEqual(["evidence_gap", "blocked"]);
+    unchanged.supervisor.shutdown();
+
+    const regressed = await exactAgyBound();
+    await regressed.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 3, state_change_seq: 6 })));
+    await regressed.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 3, state_change_seq: 5 })));
+    expect(types(regressed.wakes)).toEqual(["blocked", "evidence_gap"]);
+    expect(regressed.supervisor.view()).toMatchObject({ status: "blocked", monitor: { evidenceGaps: 1 } });
+    regressed.supervisor.shutdown();
+
+    const snapshotRegression = await exactAgyBound();
+    await snapshotRegression.supervisor.onReconciliationSnapshot(agyExactSnapshot({ revision: 4, state_change_seq: 4, agent_status: "blocked" }));
+    expect(types(snapshotRegression.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(snapshotRegression.supervisor.view()).toMatchObject({ state: "degraded", status: "working", monitor: { reconciliation: { lastFailureReason: "revision_regressed" } } });
+    snapshotRegression.supervisor.shutdown();
+
+    const moved = agyPaneRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 });
+    const move = await exactAgyBound([snapshot([moved], [agyAgentRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 })])]);
+    await move.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+    expect(types(move.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(move.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
+    move.supervisor.shutdown();
+  });
+
+  it("rebases the lifecycle watermark across an AGY pane move", async () => {
+    const destination = agyPaneRecord({ pane_id: "p2", agent_session: agySession, agent_status: "idle", revision: 1, state_change_seq: 6 });
+    const h = await exactAgyBound([snapshot([destination], [agyAgentRecord({ pane_id: "p2", agent_session: agySession, agent_status: "idle", revision: 1, state_change_seq: 6 })])]);
+    await h.supervisor.onEvent(paneEvent("pane_moved", destination, { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_updated", { ...destination, agent_status: "blocked", state_change_seq: 7 }));
+    expect(types(h.wakes)).toEqual(["work_cycle_completed", "blocked"]);
+    expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p2" }, status: "blocked", monitor: { evidenceGaps: 0 } });
+    h.supervisor.shutdown();
+  });
+
+  it("keeps a same-revision regressed event gap-visible without adopting its status", async () => {
+    const h = await exactAgyBound();
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 3, state_change_seq: 4 })));
+    expect(types(h.wakes)).toEqual(["evidence_gap"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "working", monitor: { evidenceGaps: 1 } });
+    const internals = h.supervisor as unknown as { lastRevision: number; lastStateChangeSeq?: number };
+    expect(internals).toMatchObject({ lastRevision: 3, lastStateChangeSeq: 5 });
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })));
+    expect(h.wakes).toHaveLength(1);
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(1);
+    h.supervisor.shutdown();
+  });
+
+  it("keeps a newer regressed event endpoint gap-visible without adopting it", async () => {
+    const h = await exactAgyBound();
+    const event = paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 5, state_change_seq: 4 }));
+    await h.supervisor.onEvent(event);
+    expect(types(h.wakes)).toEqual(["evidence_gap", "evidence_gap"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "working", monitor: { evidenceGaps: 2 } });
+    const internals = h.supervisor as unknown as { lastRevision: number; lastStateChangeSeq?: number };
+    expect(internals).toMatchObject({ lastRevision: 3, lastStateChangeSeq: 5 });
+    expect(h.wakes.filter((wake) => wake.event.details?.reason === "revision_jump")).toHaveLength(1);
+
+    const wakeCount = h.wakes.length;
+    await h.supervisor.onEvent(event);
+    expect(h.wakes).toHaveLength(wakeCount);
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(2);
+    expect(h.wakes.filter((wake) => wake.event.details?.reason === "revision_jump")).toHaveLength(1);
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 5, state_change_seq: 3 })));
+    expect(h.wakes).toHaveLength(wakeCount + 2);
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(4);
+    expect(h.wakes.filter((wake) => wake.event.details?.reason === "revision_jump")).toHaveLength(2);
+    expect(internals).toMatchObject({ lastRevision: 3, lastStateChangeSeq: 5 });
+    h.supervisor.shutdown();
+  });
+
+  it("keeps move lifecycle gaps visible when the destination omits its sequence", async () => {
+    const destination = agyPaneRecord({ pane_id: "p2", agent_session: agySession, agent_status: "idle", revision: 1 });
+    delete destination.state_change_seq;
+    const destinationAgent = agyAgentRecord({ pane_id: "p2", agent_session: agySession, agent_status: "idle", revision: 1 });
+    delete destinationAgent.state_change_seq;
+    const h = await exactAgyBound([snapshot([destination], [destinationAgent])]);
+    await h.supervisor.onEvent(paneEvent("pane_moved", destination, { previous_pane_id: "p1" }));
+    expect(types(h.wakes)).toEqual(["evidence_gap", "work_cycle_completed"]);
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(1);
+    h.supervisor.shutdown();
+
+    const regressedDestination = agyPaneRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 });
+    const pending = await exactAgyBound([invalidDestination(), snapshot([regressedDestination], [agyAgentRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 })])]);
+    await pending.supervisor.onEvent(paneEvent("pane_moved", regressedDestination, { previous_pane_id: "p1" }));
+    await pending.supervisor.onReconciliationSnapshot(snapshot([regressedDestination], [agyAgentRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 })]));
+    expect(types(pending.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(pending.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
+    pending.supervisor.shutdown();
+
+    const absentDestination = await exactAgyBound([snapshot([], [])]);
+    await absentDestination.supervisor.onEvent(paneEvent("pane_moved", regressedDestination, { previous_pane_id: "p1" }));
+    expect(types(absentDestination.wakes)).toEqual(["identity_lost"]);
+    expect(await absentDestination.supervisor.run()).toMatchObject({ outcome: "identity_lost" });
+  });
+
+  it("accepts a Pi same-revision transition when its authoritative lifecycle sequence advances", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 4 })])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 4 });
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 5, stateChangeSeq: 5 })));
+    expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
+    expect(h.supervisor.view().monitor.evidenceGaps).toBe(0);
+    h.supervisor.shutdown();
+
+    const unanchored = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    await unanchored.supervisor.bind({ identity, profileName: "worker-pi" });
+    await unanchored.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 6, stateChangeSeq: 1 })));
+    expect(unanchored.supervisor.view().monitor.evidenceGaps).toBe(0);
+    unanchored.supervisor.shutdown();
+  });
+
+  it("keeps same-revision Pi and Claude transitions gap-visible without lifecycle evidence", async () => {
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    for (const [agentKind, agentSession] of [["pi", session], ["claude", claudeSession]] as const) {
+      const h = harness({
+        child: { agentName: "worker", agentKind, profileName: `worker-${agentKind}` },
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind, agentSession })])],
+      });
+      const boundIdentity = { ...identity, agentKind, agentSession };
+      await h.supervisor.bind({ identity: boundIdentity, profileName: `worker-${agentKind}` });
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 5, agentKind, agentSession })));
+      expect(types(h.wakes)).toEqual(["evidence_gap", "work_cycle_completed"]);
+      expect(h.supervisor.view().monitor.evidenceGaps).toBe(1);
+      h.supervisor.shutdown();
+    }
+  });
 
   it("ignores historical replay below the anchor and folds everything above it", async () => {
     const h = await bound();
@@ -1166,6 +1338,139 @@ describe("supervisor pane moves", () => {
     expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
   });
 
+  it("folds a move event sequence when its destination snapshot omits it", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const destination = paneRecord({ paneId: "p2", status: "idle", revision: 1 });
+    delete destination.state_change_seq;
+    const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+    expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
+    expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p2" }, status: "idle", monitor: { evidenceGaps: 0 } });
+    const internals = h.supervisor as unknown as { lastRevision: number; lastStateChangeSeq?: number };
+    expect(internals).toMatchObject({ lastRevision: 1, lastStateChangeSeq: 8 });
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", { ...moved, agent_status: "blocked", state_change_seq: 7 }));
+    expect(types(h.wakes)).toEqual(["work_cycle_completed", "evidence_gap"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "idle", monitor: { evidenceGaps: 1 } });
+    expect(internals).toMatchObject({ lastRevision: 1, lastStateChangeSeq: 8 });
+    h.supervisor.shutdown();
+  });
+
+  it("keeps a newer move sequence when the destination snapshot is lower", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const lower = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 7 });
+    const h = harness({ snapshots: [snapshot([origin]), snapshot([lower], [{ pane_id: "p2", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
+    const internals = h.supervisor as unknown as { lastStateChangeSeq?: number };
+    expect(internals.lastStateChangeSeq).toBe(8);
+
+    await h.supervisor.onReconciliationSnapshot(snapshot([lower], [{ pane_id: "p2", name: "worker" }]));
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(internals.lastStateChangeSeq).toBe(8);
+
+    await h.supervisor.onReconciliationSnapshot(snapshot([moved], [{ pane_id: "p2", name: "worker" }]));
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "work_cycle_completed"]);
+    expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p2" }, status: "idle" });
+    await h.supervisor.onEvent(paneEvent("pane_updated", { ...moved, agent_status: "blocked", state_change_seq: 7 }));
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "work_cycle_completed", "evidence_gap"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "idle", monitor: { evidenceGaps: 1 } });
+    expect(internals.lastStateChangeSeq).toBe(8);
+    h.supervisor.shutdown();
+  });
+
+  it("rejects a destination snapshot below the move revision", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const moved = paneRecord({ paneId: "p2", status: "idle", revision: 2, stateChangeSeq: 8 });
+    const lower = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const h = harness({ snapshots: [snapshot([origin]), snapshot([lower], [{ pane_id: "p2", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" }, status: "working" });
+    expect(h.wakes[0]?.event.details?.reason).toBe("revision_regressed");
+    h.supervisor.shutdown();
+  });
+
+  it("folds a proven move endpoint before a newer snapshot endpoint", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const destination = paneRecord({ paneId: "p2", status: "working", revision: 2, stateChangeSeq: 9 });
+    const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+
+    expect(types(h.wakes)).toEqual(["work_cycle_completed", "evidence_gap"]);
+    expect(h.wakes[1]?.event.details?.reason).toBe("revision_jump");
+    expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p2" }, status: "working", monitor: { evidenceGaps: 1 } });
+    expect(h.supervisor.view().transitions).toEqual([
+      { atMs: 1_000, from: "working", to: "idle", revision: 1, source: "event" },
+      { atMs: 1_000, from: "idle", to: "working", revision: 2, source: "snapshot" },
+    ]);
+    expect(h.supervisor as unknown as { lastRevision: number; lastStateChangeSeq?: number }).toMatchObject({ lastRevision: 2, lastStateChangeSeq: 9 });
+    h.supervisor.shutdown();
+  });
+
+  it("rejects equal-sequence move and snapshot status contradictions", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const destination = paneRecord({ paneId: "p2", status: "working", revision: 1, stateChangeSeq: 8 });
+    const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(h.supervisor.view()).toMatchObject({
+      state: "degraded",
+      child: { paneId: "p1" },
+      status: "working",
+      transitions: [],
+      monitor: { reconciliation: { lastFailureReason: "target_identity_contradiction" } },
+    });
+    expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(8);
+    h.supervisor.shutdown();
+  });
+
+  it("credits a matching move sequence across a newer snapshot revision", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const destination = paneRecord({ paneId: "p2", status: "idle", revision: 2, stateChangeSeq: 8 });
+    const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+
+    expect(types(h.wakes)).toEqual(["work_cycle_completed", "evidence_gap"]);
+    expect(h.wakes.filter((wake) => wake.event.type === "evidence_gap").map((wake) => wake.event.details?.reason)).toEqual(["revision_jump"]);
+    expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p2" }, status: "idle", monitor: { evidenceGaps: 1 } });
+    expect(h.supervisor.view().transitions).toEqual([
+      { atMs: 1_000, from: "working", to: "idle", revision: 1, source: "event" },
+    ]);
+    h.supervisor.shutdown();
+  });
+
+  it("does not merge a move sequence into an incoherent snapshot tuple", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const incoherent = paneRecord({ paneId: "p2", status: "working", revision: 2 });
+    delete incoherent.state_change_seq;
+    const h = harness({ snapshots: [snapshot([origin]), snapshot([incoherent], [{ pane_id: "p2", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+    expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1", }, monitor: { reconciliation: { lastFailureReason: "target_identity_contradiction" } } });
+    expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(8);
+    h.supervisor.shutdown();
+  });
+
   it("reconciles rather than concluding from a move that is not this child's", async () => {
     // A move with no previous pane id never reaches a supervisor: the protocol
     // boundary refuses it and the connection is dropped instead. A move whose
@@ -1267,7 +1572,7 @@ describe("supervisor pane moves", () => {
   it("reconciles a retained destination's own events instead of folding them on the origin watermark", async () => {
     const destination = paneRecord({ paneId: "p2", revision: 1, status: "blocked" });
     const h = await bound([invalidDestination(), snapshot([destination], [{ pane_id: "p2", name: "worker" }])]);
-    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1 }), { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "blocked" }), { previous_pane_id: "p1" }));
     // The destination is routed here from the moment it is retained: its events
     // are this child's, and without them the move could never be completed by
     // anything but a periodic snapshot.
@@ -1280,6 +1585,94 @@ describe("supervisor pane moves", () => {
     expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p2" }, status: "blocked" });
     expect(h.supervisor.view().monitor.evidenceGaps).toBe(0);
     expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "blocked"]);
+  });
+
+  it("does not adopt a regressed endpoint in a chained pending move", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const first = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const regressed = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 7 });
+    const destination = paneRecord({ paneId: "p3", status: "idle", revision: 2, stateChangeSeq: 9 });
+    const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([destination], [{ pane_id: "p3", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_moved", regressed, { previous_pane_id: "p2" }));
+
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "work_cycle_completed", "evidence_gap"]);
+    expect(h.wakes.at(-1)?.event.details).toMatchObject({ source: "event", reason: "status_changed_without_revision", previousStateChangeSeq: 8, observedStateChangeSeq: 7 });
+    expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p3" }, status: "idle", monitor: { evidenceGaps: 1 } });
+    expect(h.supervisor.view().transitions).toEqual([
+      { atMs: 1_000, from: "working", to: "idle", revision: 1, source: "event" },
+    ]);
+    expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(9);
+    h.supervisor.shutdown();
+  });
+
+  it("rejects a chained snapshot that contradicts an earlier retained lifecycle endpoint", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const first = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const regressed = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 7 });
+    const contradictory = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 8 });
+    const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([contradictory], [{ pane_id: "p3", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_moved", regressed, { previous_pane_id: "p2" }));
+
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(h.supervisor.view()).toMatchObject({
+      state: "degraded",
+      child: { paneId: "p1" },
+      status: "working",
+      transitions: [],
+      monitor: { reconciliation: { lastFailureReason: "target_identity_contradiction" } },
+    });
+    expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(8);
+    h.supervisor.shutdown();
+  });
+
+  it("rejects conflicting equal-sequence endpoints in a chained pending move", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const first = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const contradictory = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 8 });
+    const destination = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 9 });
+    const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([destination], [{ pane_id: "p3", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_moved", contradictory, { previous_pane_id: "p2" }));
+
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(h.supervisor.view()).toMatchObject({
+      state: "degraded",
+      child: { paneId: "p1" },
+      status: "working",
+      transitions: [],
+      monitor: { reconciliation: { lastFailureReason: "target_identity_contradiction" } },
+    });
+    expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(8);
+    h.supervisor.shutdown();
+  });
+
+  it("preserves earlier lifecycle advancement across chained pending moves", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const first = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const second = paneRecord({ paneId: "p3", status: "idle", revision: 2, stateChangeSeq: 8 });
+    const destination = paneRecord({ paneId: "p3", status: "idle", revision: 2 });
+    const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), invalidDestination("p3")] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_moved", second, { previous_pane_id: "p2" }));
+    await h.supervisor.onReconciliationSnapshot(snapshot([destination], [{ pane_id: "p3", name: "worker" }]));
+
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "work_cycle_completed"]);
+    expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p3" }, status: "idle", monitor: { evidenceGaps: 0 } });
+    expect(h.supervisor.view().transitions).toEqual([
+      { atMs: 1_000, from: "working", to: "idle", revision: 1, source: "event" },
+    ]);
+    expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(8);
+    h.supervisor.shutdown();
   });
 
   it("follows a chained move out of a retained destination without concluding the child was lost", async () => {

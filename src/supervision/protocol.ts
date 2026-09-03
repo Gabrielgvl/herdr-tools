@@ -67,6 +67,7 @@ export interface SupervisionPaneRecord {
   workspaceId: string;
   agentStatus: SupervisionAgentStatus;
   revision: number;
+  stateChangeSeq?: number;
   agentKind?: string;
   agentSession?: AgentSessionRecord;
   label?: string;
@@ -175,6 +176,7 @@ export function parsePaneRecord(value: unknown): SupervisionPaneRecord {
     workspaceId: requiredString(value.workspace_id, "workspace_id"),
     agentStatus: agentStatus(value.agent_status),
     revision: requiredCounter(value.revision, "revision"),
+    ...(value.state_change_seq === undefined || value.state_change_seq === null ? {} : { stateChangeSeq: requiredCounter(value.state_change_seq, "state_change_seq") }),
     ...(optionalString(value, "agent") === undefined ? {} : { agentKind: optionalString(value, "agent") }),
     ...(optionalAgentSession(value) === undefined ? {} : { agentSession: optionalAgentSession(value) }),
     ...(optionalString(value, "label") === undefined ? {} : { label: optionalString(value, "label") }),

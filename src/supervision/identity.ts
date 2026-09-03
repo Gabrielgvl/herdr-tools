@@ -45,7 +45,7 @@ export interface SupervisionAnchor {
   /** Pane revision at bind. Events below it are historical replay. */
   revision: number;
   status: SupervisionAgentStatus;
-  /** Recorded when the authoritative agent record supplied one. */
+  /** Recorded when the authoritative binding or occupant supplied one. */
   stateChangeSeq?: number;
 }
 
@@ -90,6 +90,7 @@ export interface AuthoritativeOccupant {
   pane: SupervisionPaneRecord;
   agentPresent: boolean;
   agentName?: string;
+  stateChangeSeq?: number;
 }
 
 /** A target-local occupant with the lifecycle counter needed by AGY strengthening. */
@@ -155,26 +156,34 @@ export function classifySnapshotTarget(snapshot: HerdrSnapshot, paneId: string):
     const paneRecord = panes[0]!;
     const pane = parsePaneRecord(paneRecord);
     const paneName = optionalIdentityString(paneRecord, "agent_name") ?? optionalIdentityString(paneRecord, "name");
-    if (agents.length === 0) return { kind: "unique", occupant: { pane, agentPresent: false, ...(paneName === undefined ? {} : { agentName: paneName }) } };
+    if (agents.length === 0) return { kind: "unique", occupant: { pane, agentPresent: false, ...(paneName === undefined ? {} : { agentName: paneName }), ...(pane.stateChangeSeq === undefined ? {} : { stateChangeSeq: pane.stateChangeSeq }) } };
 
     const agentRecord = agents[0]!;
     const agentName = optionalIdentityString(agentRecord, "name") ?? optionalIdentityString(agentRecord, "agent_name");
     const agentTerminal = optionalIdentityString(agentRecord, "terminal_id");
     const agentKind = optionalIdentityString(agentRecord, "agent");
     const agentSession = optionalSession(agentRecord);
+    const agentRevision = optionalLifecycleCounter(agentRecord, "revision");
+    const agentStatus = optionalLifecycleStatus(agentRecord);
+    const agentStateChangeSeq = optionalLifecycleCounter(agentRecord, "state_change_seq");
     if (contradictory(paneName, agentName)
       || contradictory(pane.terminalId, agentTerminal)
       || contradictory(pane.agentKind, agentKind)
-      || contradictory(pane.agentSession, agentSession)) {
+      || contradictory(pane.agentSession, agentSession)
+      || (agentRevision !== undefined && agentRevision !== pane.revision)
+      || (agentStatus !== undefined && agentStatus !== pane.agentStatus)
+      || (agentStateChangeSeq !== undefined && pane.stateChangeSeq !== undefined && agentStateChangeSeq !== pane.stateChangeSeq)) {
       return { kind: "invalid", reason: "target_identity_contradiction" };
     }
+    const stateChangeSeq = agentStateChangeSeq ?? pane.stateChangeSeq;
     const joinedPane: SupervisionPaneRecord = {
       ...pane,
       ...(pane.agentKind !== undefined || agentKind === undefined ? {} : { agentKind }),
       ...(pane.agentSession !== undefined || agentSession === undefined ? {} : { agentSession }),
+      ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }),
     };
     const joinedName = agentName ?? paneName;
-    return { kind: "unique", occupant: { pane: joinedPane, agentPresent: true, ...(joinedName === undefined ? {} : { agentName: joinedName }) } };
+    return { kind: "unique", occupant: { pane: joinedPane, agentPresent: true, ...(joinedName === undefined ? {} : { agentName: joinedName }), ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) } };
   } catch {
     return { kind: "invalid", reason: "target_record_malformed" };
   }
@@ -197,12 +206,7 @@ function optionalLifecycleStatus(value: Record<string, unknown>): SupervisionAge
   return value.agent_status as SupervisionAgentStatus;
 }
 
-/**
- * Read AGY's stronger lifecycle tuple without changing the exact Pi/Claude
- * classifier. The generic snapshot classifier intentionally ignores these
- * optional fields for existing runtimes; AGY requires them at its reduced-
- * assurance boundary and therefore validates them here.
- */
+/** Read AGY's stronger lifecycle tuple and retain its reduced-assurance checks. */
 export function classifyProvisionalSnapshotTarget(snapshot: HerdrSnapshot, paneId: string): ProvisionalSnapshotTargetEvidence {
   const target = classifySnapshotTarget(snapshot, paneId);
   if (target.kind !== "unique") return target;

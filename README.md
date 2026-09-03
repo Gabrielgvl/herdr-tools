@@ -18,6 +18,12 @@ cp config.json.example config.json # optional; edit only extension-owned wait se
 
 Pi discovers the directory through its root `index.ts` when it is installed at `/home/gabriel/.pi/agent/extensions/herdr-tools/`. The installed `herdr` CLI is the only Herdr authority. Neither host intercepts raw Herdr Bash and neither launches an arbitrary executable.
 
+## Harness flow
+
+Complex engineering work uses the bundled `harness-flow` skill: `explore → plan → work → critic → promote`. `manager-pi` is primary, every phase runs in a separate profile-backed agent, `pi-review` supplies auxiliary critic evidence, and `promoter-pi -> promoter-claude` finalizes the exact reviewed tree. The direct path remains the default when one bounded worker plus one objective gate can finish safely. Outside `HERDR_ENV=1`, the flow fails closed rather than substituting hidden agents or raw CLI control.
+
+The canonical skill is `herdr-profiles/role-plugins/manager/skills/harness-flow/SKILL.md`. Install or link that directory into the global skill stores for Pi, Claude, Codex, and Hermes so ad-hoc sessions apply the same activation gate; managers load it directly from their profile/plugin.
+
 ## Profile-backed AGY roles
 
 `researcher-agy` is the default research profile and its chain is exactly `researcher-agy -> researcher-pi -> researcher-claude`. `scout-agy` is the reconnaissance default with `scout-agy -> scout-pi -> scout-claude`; `worker-pi` remains the implementation default with `worker-pi -> worker-agy -> worker-claude`. All AGY profiles use `gemini-3.8-flash-high`, `--dangerously-skip-permissions`, and a fixed per-profile mode: `plan` for research/scout and `accept-edits` for worker. Callers may override only model and scope-normalized `addDirs`; mode is never launch-overrideable and primary overrides never reach fallbacks.
@@ -147,7 +153,8 @@ The integration harness refuses any session name other than `herdr-tools-integra
 - `index.ts` gates registration, builds the `pi.exec` CLI adapter, shares runtime ownership, and clears only in-memory ownership on session shutdown and session start.
 - `src/mcp/` holds the MCP host only: startup gating, the `cwd`/`signal` capability proxy, and the bounded process-execution adapter (`host.ts`), schema publication with redacted, parseable, bounded result/error mapping (`adapter.ts`), sequential scheduling for the mutating tools (`queue.ts`), and stdio wiring and lifecycle (`run.ts`). `src/mcp-server.ts` is the argument-free entry emitted to `dist/src/mcp-server.js`.
 - `src/redaction.ts` holds the one environment redaction both hosts apply to retained evidence, plus the model-boundary projection the MCP adapter applies again before publishing.
-- `herdr-profiles/role-plugins/manager/` is the self-contained Claude manager plugin: a stable `herdr-tools` manifest, the `herdr` stdio server map, and the shared `skills/manager/SKILL.md`. It carries the local MCP registration and manager conduct, while the profile keeps permissions explicit and owner-gated.
+- `herdr-profiles/role-plugins/manager/` is the self-contained Claude manager plugin: a stable `herdr-tools` manifest, the local MCP server map, and the shared `manager` plus `harness-flow` skills. It carries local MCP registration and manager conduct, while the profile keeps permissions explicit and owner-gated.
+- `herdr-profiles/role-plugins/promoter/` carries the no-edit finalization skill used by `promoter-pi -> promoter-claude`.
 - `src/cli.ts` bounds and validates CLI responses.
 - `src/context.ts` resolves the live effective caller context from the injected pane identity and authoritative topology; `src/targets.ts` resolves exact targets against that context.
 - `src/tools/` contains the seven public tools. `src/tools/turn-control.ts` owns the internal identity-bound cancel/interrupt protocol. Profile discovery and typed Pi, Claude, and AGY adapters live under `src/profiles/`; `herdr_launch` is strict profile-only: no profile, no launch.

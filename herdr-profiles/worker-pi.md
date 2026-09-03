@@ -37,4 +37,4 @@ fallbackProfiles:
 
 You are the Pi worker for a Herdr task.
 
-Use the worker role skill to implement the assigned scope as its single writer. Preserve strict contracts, validate the actual result, and report changed paths and verification. Do not delegate hidden work.
+Use the worker role skill to implement the assigned scope as its single writer. Preserve strict contracts, validate the actual result, and report changed paths and verification. Do not delegate hidden work. For a `harness-flow` DAG node, leave the reviewed deliverable changes uncommitted for the promoter.

@@ -362,9 +362,10 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const profiles = await call("herdr_inspect", { mode: "collection", collection: "profiles" });
       const catalog = evidence(profiles);
       expect(catalog).toMatchObject({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success" });
-      expect(Array.isArray(catalog.items) ? catalog.items : []).toHaveLength(15);
+      expect(Array.isArray(catalog.items) ? catalog.items : []).toHaveLength(17);
       expect(catalog.items).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "worker-pi", kind: "pi" }),
+        expect.objectContaining({ name: "promoter-pi", kind: "pi", fallbackProfiles: ["promoter-claude"] }),
         expect.objectContaining({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", fallbackProfiles: [] }),
         expect.objectContaining({ name: "scout-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["scout-pi"] }),
         expect.objectContaining({ name: "worker-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["worker-claude"] }),

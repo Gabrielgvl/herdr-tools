@@ -108,6 +108,7 @@ Common extension-backed navigation tools are selected by name but still supplied
 | `worker-pi` | Planner set plus `edit`, `write`, `bash_bg`, `jobs`, `job_decide`, `monitor` |
 | `reviewer-pi` | Planner set; no `edit` or `write` |
 | `researcher-pi` | Planner set; no `edit` or `write` |
+| `promoter-pi` | `read`, `bash`, `grep`, `find`, `ls`; Git metadata/final-commit scope only |
 
 Explicitly absent from every non-manager Pi profile:
 
@@ -115,7 +116,7 @@ Explicitly absent from every non-manager Pi profile:
 - Herdr lifecycle tools
 - durable-memory mutation tools
 
-`manager-pi` does not receive `bash`, `edit`, or `write`. `manager-claude` receives none of those tools through pre-approval; Claude's `default` permission mode keeps owner approval required when they are requested.
+`manager-pi` does not receive `bash`, `edit`, or `write`. `manager-claude` receives none of those tools through pre-approval; Claude's `default` permission mode keeps owner approval required when they are requested. Promoter profiles receive Bash but no direct edit/write tools. They may stage the reviewed tree, create its exact commit, and write ignored receipts; an agent-authored promoter assignment never authorizes pushes, PR creation, publication, deployment, messaging, or spending.
 
 ### AGY role profiles
 
@@ -200,9 +201,9 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 
 ### Unit tests
 
-- Catalog discovers 15 bundled profiles with no diagnostics.
+- Catalog discovers 17 bundled profiles with no diagnostics.
 - `manager-pi` and `manager-claude` have exact identity, model, authority prompt, tools, shared skill/plugin path, and empty fallbacks.
-- Every Pi profile has a non-empty role allowlist and exactly one scoped role skill.
+- Every Pi profile has a non-empty role allowlist and exactly one scoped role skill; `manager-pi` additionally loads `harness-flow`.
 - Every Claude profile has explicit permission mode, allowed/disallowed tools, and exactly one scoped plugin directory.
 - Read-only roles exclude direct mutation tools.
 - Non-manager roles exclude hidden delegation tools.
@@ -220,7 +221,7 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 
 ### 1. Add shared role resources
 
-- Add six scope-local role plugin directories under `herdr-profiles/role-plugins/`.
+- Add seven scope-local role plugin directories under `herdr-profiles/role-plugins/`.
 - Give each plugin a minimal Claude manifest and one `skills/<role>/SKILL.md` contract.
 - Keep role method in the shared skill; keep profile bodies focused on identity, authority, and expected result shape.
 - Add `herdr-profiles/manager-pi.md` with the approved Sol/high orchestration-only configuration and no fallback, plus `herdr-profiles/manager-claude.md` with the exact owner-gated Fable manager policy and no fallback.
@@ -234,13 +235,13 @@ Checkpoint: load the catalog and build argv for the manager plus one Pi/Claude p
 - Keep models, reasoning, timeouts, persistence, and existing fallback direction unchanged.
 - Include `herdr_tab` in the manager set and the four approved background-job tools in `worker-pi`.
 
-Checkpoint: catalog resolution has 15 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
+Checkpoint: catalog resolution has 17 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
 
 ### 3. Enforce contracts in tests
 
 - Extend `test/unit/profile-catalog.test.ts` with an exact capability matrix and role-resource existence checks.
 - Add representative `buildProfileArgv` assertions for manager, worker, read-only Pi, and Claude profiles.
-- Update `test/integration/herdr-tools.integration.test.ts` to inspect 15 profiles, inspect both manager profiles plus the AGY role profiles, and verify exact worker and AGY launch arguments without changing provenance or topology assertions.
+- Update `test/integration/herdr-tools.integration.test.ts` to inspect 17 profiles, inspect manager/promoter profiles plus the AGY role profiles, and verify exact worker and AGY launch arguments without changing provenance or topology assertions.
 - Add identity-bound prompt acknowledgement and optional post-dispatch observation in `src/tools/launch.ts`: accept partial Herdr protocol 20 `agent_started` identity, then run one bounded read-only snapshot + `agent get` + pane preflight sample at a time before submission and before no-prompt return. Join each sample only with start-supplied fields; never merge missing components across samples, and fail immediately on supplied contradictions. After one sample yields the exact pane/terminal/name/kind and complete `agent_session`, submit exactly once through `agent prompt --stdin` and require the typed `agent_prompted` response to match that captured identity, `interactive_ready:true`, and safe revision. Abort/timeout stops before stdin and recipient registration with bounded evidence. Persist that identity for attachments, report working/skipped/stale/unavailable observation without waiting, retrying, runtime hooks, fallback, or sending Enter, and omit replacement post-state from authoritative details and success rows.
 - Cover accepted idle/screen-detection-skipped launches, stale/unavailable observation, malformed/mismatched acknowledgements, and the no-duplicate/no-key boundary in `test/unit/launch.test.ts`.
 - Do not weaken strict parser, inspection-budget, discovery, or fallback tests.
@@ -269,7 +270,7 @@ HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration
 
 Then inspect the live profile collection from the built extension and confirm:
 
-- 15 effective profiles;
+- 17 effective profiles;
 - no diagnostics;
 - `manager-pi` reports the exact approved tools and skill;
 - existing profiles report their role-specific resources.
@@ -277,17 +278,17 @@ Then inspect the live profile collection from the built extension and confirm:
 ## Implementation Tasks
 
 - [x] Add role plugins and shared role skills.
-  - Acceptance: six valid plugin manifests and six non-empty role skills exist under the bundled scope.
+  - Acceptance: seven valid plugin manifests and seven non-empty role skills exist under the bundled scope; the manager plugin also contains `harness-flow`.
   - Verify: profile parser resolves each referenced path without diagnostics.
   - Files: `herdr-profiles/role-plugins/**`.
 
 - [x] Add `manager-pi` and `manager-claude`, and configure all manager/profile capabilities.
-  - Acceptance: six Pi profiles have exact tools and one role skill; manager-claude has the exact owner-gated Claude policy and shared manager plugin; only manager Pi has Herdr lifecycle tools in its Pi allowlist; only worker has edit/write and background-job tools among Pi profiles.
+  - Acceptance: seven Pi profiles have exact tools and one role skill, with the manager also loading `harness-flow`; manager-claude has the exact owner-gated Claude policy and shared manager plugin; only manager Pi has Herdr lifecycle tools in its Pi allowlist; only worker has edit/write and background-job tools among Pi profiles.
   - Verify: unit capability-matrix and argv tests.
   - Files: `herdr-profiles/*-pi.md`, `test/unit/profile-catalog.test.ts`.
 
 - [x] Configure all Claude profile capabilities.
-  - Acceptance: five Claude profiles have explicit permissions, hard exclusions, and one role plugin; every profile disallows hidden `Task` delegation.
+  - Acceptance: seven Claude profiles have explicit permissions, hard exclusions, and one role plugin; every non-manager profile disallows hidden `Task` delegation.
   - Verify: unit capability-matrix and argv tests.
   - Files: `herdr-profiles/*-claude.md`, `test/unit/profile-catalog.test.ts`.
 
@@ -327,8 +328,8 @@ Then inspect the live profile collection from the built extension and confirm:
 ## Success Criteria
 
 - `manager-pi` can visibly orchestrate profile-backed workers through Herdr and cannot directly edit repositories.
-- All 15 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
-- All Pi and Claude variants use one shared role skill source per role.
+- All 17 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
+- All Pi and Claude variants use one shared role skill source per role; the managers also expose the cross-role harness contract.
 - Read-only and no-hidden-delegation boundaries are mechanically represented in profile configuration and tested.
 - Unit tests, typecheck, lint, build, and integration tests pass.
 - The architecture decision is recorded in ADR-007.

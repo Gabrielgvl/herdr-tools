@@ -93,10 +93,11 @@ describe("supported stdio Node command", () => {
 });
 
 describe("Claude manager plugin package", () => {
-  it("contains only the manifest, the server map, and the conduct skill", () => {
+  it("contains only the manifest, server map, and manager skills", () => {
     expect(tree(packageRoot)).toEqual([
       ".claude-plugin/plugin.json",
       "mcp-servers.json",
+      "skills/harness-flow/SKILL.md",
       "skills/manager/SKILL.md"
     ]);
   });

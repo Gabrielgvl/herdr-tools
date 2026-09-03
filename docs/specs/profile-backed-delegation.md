@@ -9,7 +9,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 ## Validated product decisions
 
 - Profiles are owned and resolved by `herdr-tools`, not the Herdr runtime.
-- Bundled profiles use deliberate role-scoped capabilities. `manager-pi` orchestrates visible workers without direct mutation tools; `manager-claude` uses Claude `default` permission mode with only its core/research/Herdr namespace pre-approved and only `Task` hard-denied, so Bash/Edit/Write remain owner-gated; scout, planner, reviewer, and researcher are read-only; worker is the only bundled role with pre-approved direct edit/write and background-job tools.
+- Bundled profiles use deliberate role-scoped capabilities. `manager-pi` orchestrates visible workers without direct mutation tools; `manager-claude` uses Claude `default` permission mode with only its core/research/Herdr namespace pre-approved and only `Task` hard-denied, so Bash/Edit/Write remain owner-gated; scout, planner, reviewer, and researcher do not mutate repository state; worker is the only bundled role with pre-approved direct content mutation and background-job tools; promoter has Bash but may mutate only the reviewed Git index/ref metadata and ignored harness receipts needed to create the exact approved commit.
 - Profiles are separate Markdown files discovered from:
   1. bundled `herdr-profiles/*.md`;
   2. user `~/.pi/agent/herdr-profiles/*.md`;
@@ -25,14 +25,15 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Fallbacks are ordered references to named profiles, validated as a graph. A launch has at most three attempts. Invalid profiles are isolated; only the selected reachable graph blocks launch.
 - Automatic fallback is allowed only after the installed CLI failure envelope `{id:"cli:agent:start",error:{code:"agent_start_failed",message:"agent process exited before becoming interactive"}}` with non-killed exit 1 and untruncated stderr, followed by an authoritative pane read with `agent_status:"unknown"` and no agent identity/session fields. Timeout, malformed protocol, identity, kind, prompt, provisional supervision, strengthening, and uncertain-state failures stop. After any possible prompt effect, launch never retries, falls back, cleans up, or releases the recovery handle.
 - Fallback targets use their own untouched defaults. Typed overrides apply only to the requested primary. The logical cwd, task, placement, and provenance carry across attempts.
-- Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, and `researcher`. `manager-pi` uses `openai-codex/gpt-5.6-sol` with high thinking as the generic advisory profile. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, persistent session state, the manager plugin, and no fallback because manager identity must not silently change. The other role directions and models are:
+- Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, `researcher`, and `promoter`. `manager-pi` uses `openai-codex/gpt-5.6-sol` with high thinking as the generic advisory profile. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, persistent session state, the manager plugin, and no fallback because manager identity must not silently change. The other role directions and models are:
   - scout: `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - researcher: `gemini-3.8-flash-high` -> `openai-codex/gpt-5.6-luna` -> `claude-sonnet-5`;
   - worker: `openai-codex/gpt-5.6-luna` with max thinking -> `claude-opus-5`;
   - reviewer: `openai-codex/gpt-5.6-sol` -> `claude-opus-5`;
   - planner: `claude-fable-5` -> `openai-codex/gpt-5.6-sol`.
+  - promoter: `openai-codex/gpt-5.6-luna` -> `claude-opus-5`.
   AGY research uses fixed plan mode and permission bypass. The existing Pi and Claude profile claims remain unchanged.
-- Every bundled Pi and Claude profile has one role-scoped skill. Claude profiles load the corresponding scope-local plugin directory; Pi profiles load the same skill path directly. Normal installed extension discovery remains enabled, while profile allowlists omit hidden delegation, durable-memory mutation, and unapproved lifecycle capabilities.
+- Every bundled Pi and Claude profile has one role-scoped skill; `manager-pi` additionally loads the cross-role `harness-flow` skill. Claude profiles load the corresponding scope-local plugin directory; Pi profiles load the same skill path directly. Normal installed extension discovery remains enabled, while profile allowlists omit hidden delegation, durable-memory mutation, and unapproved lifecycle capabilities.
 - Bundled role bodies are rewritten for Herdr; they do not preserve chain, artifact, fork, or `pi-subagents` implementation assumptions.
 
 ## Layered delivery
@@ -55,7 +56,7 @@ This slice must not pretend terminal transcript scraping is a structured result.
 
 `herdr_launch` has one public mode: `{name, profile, overrides?, placement?, label?, cwd?, focus?, initialPrompt?}`. Raw `kind`, `argv`, and `env` fields are rejected. Profile discovery remains rooted at the manager session cwd and accepts arbitrary valid named profiles.
 
-The advisory role defaults are: manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-agy for reconnaissance, researcher-agy for research, and reviewer-pi for review. The exact AGY chains are `scout-agy -> scout-pi -> scout-claude` and `researcher-agy -> researcher-pi -> researcher-claude`; the implementation chain is `worker-pi -> worker-agy -> worker-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. These defaults do not restrict arbitrary valid profile selection. Primary-only typed overrides never leak into fallback profiles. Profile `timeoutMinutes` is task policy; Herdr startup uses a separate valid 120000 ms readiness timeout and a small CLI execution margin.
+The advisory role defaults are: manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-agy for reconnaissance, researcher-agy for research, and reviewer-pi for review. The explicit `harness-flow` overrides those generic defaults with Pi-first `scout-pi`, `researcher-pi`, `planner-pi`, `worker-pi`, `reviewer-pi`, and `promoter-pi`; its promoter chain is `promoter-pi -> promoter-claude`. The exact AGY chains are `scout-agy -> scout-pi -> scout-claude` and `researcher-agy -> researcher-pi -> researcher-claude`; the implementation chain is `worker-pi -> worker-agy -> worker-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. These defaults do not restrict arbitrary valid profile selection. Primary-only typed overrides never leak into fallback profiles. Profile `timeoutMinutes` is task policy; Herdr startup uses a separate valid 120000 ms readiness timeout and a small CLI execution margin.
 
 AGY accepts only `model` and scope-normalized `addDirs` overrides. Its argv is fixed to `--model <model> --mode <profile.mode> --dangerously-skip-permissions`, with required fixed `mode` exactly `plan` or `accept-edits`; mode is not launch-overrideable. Researcher and scout profiles use `plan`; the worker profile uses `accept-edits`. The declared add directories and the Herdr-Tools-owned recipient attachment directory follow. It accepts no prompt file, raw argv, arbitrary environment, or promptless launch. The required `initialPrompt` is visible, provenance-wrapped, and self-contained because the profile body remains metadata and AGY receives repository `AGENTS.md` only through native discovery. The worker's accept-edits mode plus permission bypass can auto-approve mutations, so manager assignments must bound scope and tests.
 
@@ -183,9 +184,9 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 
 ## Slice 1 success criteria
 
-- [ ] Thirteen bundled profiles resolve deterministically with source and shadow evidence; `manager-pi` remains the generic advisory manager and `manager-claude` is selected for explicit Claude/Fable management or Claude-to-Claude succession; both have no fallback.
-- [ ] Every bundled role has one shared role skill, with matching Pi skill and Claude plugin resources.
-- [ ] Pi and Claude capability matrices exclude hidden delegation and keep direct mutation tools limited to workers.
+- [ ] Seventeen bundled profiles resolve deterministically with source and shadow evidence; `manager-pi` remains the generic advisory manager and `manager-claude` is selected for explicit Claude/Fable management or Claude-to-Claude succession; both have no fallback.
+- [ ] Every bundled role has one shared role skill, with matching Pi skill and Claude plugin resources; the manager plugin also carries the cross-role `harness-flow` skill.
+- [ ] Pi and Claude capability matrices exclude hidden delegation, keep direct content mutation tools limited to workers, and limit promoter mutation to reviewed Git metadata and ignored harness receipts.
 - [ ] Invalid unrelated profiles do not block valid profiles; invalid reachable fallback graphs fail before launch.
 - [ ] Exact profile inspection is bounded and redacts sensitive runtime values.
 - [ ] Pi and Claude adapters produce typed, shell-free argv with appended-system-prompt semantics; AGY produces fixed plan and permission-bypass argv without a profile-body prompt source.

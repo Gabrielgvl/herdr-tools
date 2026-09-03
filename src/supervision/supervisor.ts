@@ -185,6 +185,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * until one is valid enough to follow or to settle on.
    */
   private pendingMoveDestination: SupervisionPaneRecord | undefined;
+  private pendingMoveLifecycleAdvanced = false;
   /**
    * Advances on every change to the pane this supervisor believes holds the
    * child — a retained move destination as well as an adopted one. A review
@@ -643,6 +644,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.lastStateChangeSeq = undefined;
     this.lastEndpoint = undefined;
     this.pendingMoveDestination = undefined;
+    this.pendingMoveLifecycleAdvanced = false;
     this.selectedProfileName = undefined;
     this.eventStreamDegraded = false;
     this.bindingPublished = false;
@@ -946,7 +948,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // otherwise a transcript already being read could dispatch while this
     // snapshot is pending, and a cadence could start another one.
     this.pendingMoveDestination = pane;
+    this.pendingMoveLifecycleAdvanced = false;
     this.paneIdentityGeneration += 1;
+    const eventSequence = this.observeStateChangeSeq(pane.stateChangeSeq);
+    this.pendingMoveLifecycleAdvanced = eventSequence === "advanced";
+    this.lastEndpoint = { revision: pane.revision, status: pane.agentStatus, stateChangeSeq: pane.stateChangeSeq };
     let snapshot: HerdrSnapshot;
     try {
       snapshot = await this.deps.monitor.snapshot();
@@ -968,18 +974,37 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       await this.settle("identity_lost", "move_continuity_unproven");
       return;
     }
-    const occupant = target.occupant;
+    const lifecycle = this.mergeMoveOccupant(pane, target.occupant);
+    if ("reason" in lifecycle) {
+      this.markReconciliationFailure(lifecycle.reason);
+      return;
+    }
+    const occupant = lifecycle.occupant;
     const next = movedIdentity(this.identity!, pane, occupant);
     if (next === undefined) {
       await this.settle("identity_lost", "move_continuity_unproven");
       return;
     }
-    if (this.lastStateChangeSeq !== undefined && occupant.stateChangeSeq !== undefined && occupant.stateChangeSeq < this.lastStateChangeSeq) {
+    if (this.lifecycleSequenceRegressed(occupant.stateChangeSeq)) {
       this.markReconciliationFailure("revision_regressed");
       return;
     }
     this.markReconciliationSuccess();
-    this.adoptMove(next, occupant);
+    this.adoptMove(next, occupant, pane, eventSequence === "advanced");
+  }
+
+  private mergeMoveOccupant(eventPane: SupervisionPaneRecord, occupant: AuthoritativeOccupant): { occupant: AuthoritativeOccupant } | { reason: "revision_regressed" | "target_identity_contradiction" } {
+    const eventSequence = eventPane.stateChangeSeq;
+    if (eventSequence === undefined) return { occupant };
+    if (occupant.stateChangeSeq !== undefined) {
+      if (occupant.stateChangeSeq < eventSequence) return { reason: "revision_regressed" };
+      return { occupant };
+    }
+    if (occupant.pane.revision !== eventPane.revision || occupant.pane.agentStatus !== eventPane.agentStatus) {
+      return { reason: "target_identity_contradiction" };
+    }
+    const pane = { ...occupant.pane, stateChangeSeq: eventSequence };
+    return { occupant: { ...occupant, pane, stateChangeSeq: eventSequence } };
   }
 
   /**
@@ -988,11 +1013,17 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * destination's own numbering. Keeping the origin pane's higher revision would
    * discard every later event on the new pane.
    */
-  private adoptMove(next: SupervisedIdentity, occupant: AuthoritativeOccupant): void {
+  private adoptMove(next: SupervisedIdentity, occupant: AuthoritativeOccupant, moveEvent?: SupervisionPaneRecord, moveEventLifecycleAdvanced = false): void {
     const previousStatus = this.status!;
     const previousStateChangeSeq = this.lastStateChangeSeq;
     const sequence = this.observeStateChangeSeq(occupant.stateChangeSeq);
+    const eventSupportsStatus = moveEventLifecycleAdvanced
+      && moveEvent?.stateChangeSeq !== undefined
+      && occupant.stateChangeSeq === moveEvent.stateChangeSeq
+      && occupant.pane.revision === moveEvent.revision
+      && occupant.pane.agentStatus === moveEvent.agentStatus;
     this.pendingMoveDestination = undefined;
+    this.pendingMoveLifecycleAdvanced = false;
     this.paneIdentityGeneration += 1;
     this.identity = next;
     this.paneId = next.paneId;
@@ -1007,7 +1038,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.publish(`child moved to pane ${next.paneId}`);
     if (previousStatus !== occupant.pane.agentStatus
       && (previousStateChangeSeq !== undefined || occupant.stateChangeSeq !== undefined)
-      && sequence !== "advanced") {
+      && sequence !== "advanced"
+      && !eventSupportsStatus) {
       this.recordEvidenceGap("snapshot", "status_changed_without_revision", occupant.pane.revision, occupant.pane.revision, undefined, previousStateChangeSeq, occupant.stateChangeSeq);
     }
     this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
@@ -1047,8 +1079,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const sequence = this.observeStateChangeSeq(pane.stateChangeSeq);
     if (sequence === "regressed") {
       this.recordEvidenceGap("event", "status_changed_without_revision", previousRevision, pane.revision, undefined, previousStateChangeSeq, pane.stateChangeSeq);
-      if (pane.revision > previousRevision) this.lastRevision = pane.revision;
-      this.applyStatus(pane.agentStatus, pane.revision, "event");
       return;
     }
     if (pane.revision === previousRevision) {
@@ -1104,12 +1134,17 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // the move's first read could not supply, so the move completes here. The
       // watermark still counts origin revisions, so it is rebased rather than
       // compared with the destination's pane-local numbering.
-      if (this.lifecycleSequenceRegressed(occupant.stateChangeSeq)) {
+      const lifecycle = this.mergeMoveOccupant(moved, occupant);
+      if ("reason" in lifecycle) {
+        this.markReconciliationFailure(lifecycle.reason);
+        return;
+      }
+      if (this.lifecycleSequenceRegressed(lifecycle.occupant.stateChangeSeq)) {
         this.markReconciliationFailure("revision_regressed");
         return;
       }
       this.markReconciliationSuccess();
-      this.adoptMove({ ...this.identity!, paneId: moved.paneId }, occupant);
+      this.adoptMove({ ...this.identity!, paneId: moved.paneId }, lifecycle.occupant, moved, this.pendingMoveLifecycleAdvanced);
       return;
     }
     if (occupant.pane.revision < this.lastRevision) {

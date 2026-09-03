@@ -64,7 +64,9 @@ watermark from the bind anchor through full-pane events, authoritative snapshots
 strengthening, and proven pane moves. A same-revision status change is gap-free only when the
 exact occupant supplies a strictly advanced sequence. Missing, unchanged, regressed, or
 contradictory sequence evidence remains gap-visible or degrades reconciliation. Runtimes
-without the counter retain the revision-only rule.
+without the counter retain the revision-only rule. On a proven move, the event sequence is
+folded before destination reconciliation; a lower snapshot sequence degrades, and a missing
+snapshot sequence may use the event tuple only when revision and status agree.
 
 ## 3. Consequences of the protocol facts
 
@@ -194,9 +196,10 @@ For each event on the shared stream:
 - a full same-pane event below `lastRevision` is historical and ignored;
 - an event at `lastRevision` with the same status is a duplicate and stays silent;
 - an event at `lastRevision` with a changed status is adopted without a gap only when its
-  supplied `state_change_seq` strictly advances `lastStateChangeSeq`; absent, unchanged,
-  regressed, or unanchored lifecycle evidence emits the existing high-priority
-  `status_changed_without_revision` `evidence_gap` before adopting the status;
+  supplied `state_change_seq` strictly advances `lastStateChangeSeq`; absent or unchanged
+  lifecycle evidence emits the existing high-priority `status_changed_without_revision`
+  `evidence_gap` before adopting the status, while regressed evidence emits that gap and
+  leaves the current status and revision unchanged; an exact endpoint replay stays silent;
 - an event exactly one revision above the watermark advances normally;
 - an event more than one revision above the watermark emits one high-priority
   `evidence_gap` with `source: "event"`, `reason: "revision_jump"`, the previous and

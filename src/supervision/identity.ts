@@ -163,11 +163,15 @@ export function classifySnapshotTarget(snapshot: HerdrSnapshot, paneId: string):
     const agentTerminal = optionalIdentityString(agentRecord, "terminal_id");
     const agentKind = optionalIdentityString(agentRecord, "agent");
     const agentSession = optionalSession(agentRecord);
+    const agentRevision = optionalLifecycleCounter(agentRecord, "revision");
+    const agentStatus = optionalLifecycleStatus(agentRecord);
     const agentStateChangeSeq = optionalLifecycleCounter(agentRecord, "state_change_seq");
     if (contradictory(paneName, agentName)
       || contradictory(pane.terminalId, agentTerminal)
       || contradictory(pane.agentKind, agentKind)
       || contradictory(pane.agentSession, agentSession)
+      || (agentRevision !== undefined && agentRevision !== pane.revision)
+      || (agentStatus !== undefined && agentStatus !== pane.agentStatus)
       || (agentStateChangeSeq !== undefined && pane.stateChangeSeq !== undefined && agentStateChangeSeq !== pane.stateChangeSeq)) {
       return { kind: "invalid", reason: "target_identity_contradiction" };
     }

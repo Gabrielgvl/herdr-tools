@@ -179,7 +179,11 @@ The move event's lifecycle endpoint is not collapsed into the fresh snapshot. Ev
 endpoint from a chained pending move is folded in arrival order, followed by the snapshot
 endpoint. This preserves a completion followed by a new working transition. It also preserves
 an earlier sequence advance when a later chained move repeats the same sequence and status.
-A snapshot with the same sequence but a different status is rejected as contradictory.
+A supplied snapshot sequence cannot trail any retained supplied sequence, and its status must
+match every retained endpoint at the same sequence. Retained endpoints that supply the same
+sequence must also agree on status. Contradictory evidence leaves the move pending and
+supervision degraded. These checks compare lifecycle evidence only. Revisions remain local to
+each move destination.
 
 Failing **2** or **3** is not a lost identity and does not settle. The monitor routes a move
 by its destination as well as its origin, and **F6** makes pane IDs reusable, so such an

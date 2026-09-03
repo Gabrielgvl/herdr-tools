@@ -1011,15 +1011,25 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   private mergeMoveOccupant(eventPane: SupervisionPaneRecord, occupant: AuthoritativeOccupant): { occupant: AuthoritativeOccupant } | { reason: "revision_regressed" | "target_identity_contradiction" } {
     if (occupant.pane.revision < eventPane.revision) return { reason: "revision_regressed" };
-    const eventSequence = eventPane.stateChangeSeq;
-    if (eventSequence === undefined) return { occupant };
-    if (occupant.stateChangeSeq !== undefined) {
-      if (occupant.stateChangeSeq < eventSequence) return { reason: "revision_regressed" };
-      if (occupant.stateChangeSeq === eventSequence && occupant.pane.agentStatus !== eventPane.agentStatus) {
+    // Lifecycle sequence is global across moves. Revisions remain local to the
+    // latest destination and are never compared across retained endpoints.
+    const retainedStatuses = new Map<number, SupervisionAgentStatus>();
+    for (const endpoint of this.pendingMoveEndpoints) {
+      const endpointSequence = endpoint.stateChangeSeq;
+      if (endpointSequence === undefined) continue;
+      const retainedStatus = retainedStatuses.get(endpointSequence);
+      if (retainedStatus !== undefined && retainedStatus !== endpoint.status) {
         return { reason: "target_identity_contradiction" };
       }
-      return { occupant };
+      retainedStatuses.set(endpointSequence, endpoint.status);
+      if (occupant.stateChangeSeq === undefined) continue;
+      if (endpointSequence > occupant.stateChangeSeq) return { reason: "revision_regressed" };
+      if (endpointSequence === occupant.stateChangeSeq && endpoint.status !== occupant.pane.agentStatus) {
+        return { reason: "target_identity_contradiction" };
+      }
     }
+    const eventSequence = eventPane.stateChangeSeq;
+    if (eventSequence === undefined || occupant.stateChangeSeq !== undefined) return { occupant };
     if (occupant.pane.revision !== eventPane.revision || occupant.pane.agentStatus !== eventPane.agentStatus) {
       return { reason: "target_identity_contradiction" };
     }

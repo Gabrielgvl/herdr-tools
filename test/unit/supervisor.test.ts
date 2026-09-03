@@ -1608,6 +1608,52 @@ describe("supervisor pane moves", () => {
     h.supervisor.shutdown();
   });
 
+  it("rejects a chained snapshot that contradicts an earlier retained lifecycle endpoint", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const first = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const regressed = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 7 });
+    const contradictory = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 8 });
+    const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([contradictory], [{ pane_id: "p3", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_moved", regressed, { previous_pane_id: "p2" }));
+
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(h.supervisor.view()).toMatchObject({
+      state: "degraded",
+      child: { paneId: "p1" },
+      status: "working",
+      transitions: [],
+      monitor: { reconciliation: { lastFailureReason: "target_identity_contradiction" } },
+    });
+    expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(8);
+    h.supervisor.shutdown();
+  });
+
+  it("rejects conflicting equal-sequence endpoints in a chained pending move", async () => {
+    const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
+    const first = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
+    const contradictory = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 8 });
+    const destination = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 9 });
+    const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([destination], [{ pane_id: "p3", name: "worker" }])] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
+    await h.supervisor.onEvent(paneEvent("pane_moved", contradictory, { previous_pane_id: "p2" }));
+
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    expect(h.supervisor.view()).toMatchObject({
+      state: "degraded",
+      child: { paneId: "p1" },
+      status: "working",
+      transitions: [],
+      monitor: { reconciliation: { lastFailureReason: "target_identity_contradiction" } },
+    });
+    expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(8);
+    h.supervisor.shutdown();
+  });
+
   it("preserves earlier lifecycle advancement across chained pending moves", async () => {
     const origin = paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 });
     const first = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });

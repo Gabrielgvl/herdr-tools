@@ -1028,6 +1028,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const sequence = this.observeStateChangeSeq(pane.stateChangeSeq);
     if (sequence === "regressed") {
       this.recordEvidenceGap("event", "status_changed_without_revision", previousRevision, pane.revision, undefined, previousStateChangeSeq, pane.stateChangeSeq);
+      if (pane.revision > previousRevision) this.lastRevision = pane.revision;
+      this.applyStatus(pane.agentStatus, pane.revision, "event");
       return;
     }
     if (pane.revision === previousRevision) {

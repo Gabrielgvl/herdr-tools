@@ -1108,7 +1108,7 @@ describe("supervisor folding", () => {
     await regressed.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 3, state_change_seq: 6 })));
     await regressed.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 3, state_change_seq: 5 })));
     expect(types(regressed.wakes)).toEqual(["blocked", "evidence_gap"]);
-    expect(regressed.supervisor.view()).toMatchObject({ status: "blocked", monitor: { evidenceGaps: 1 } });
+    expect(regressed.supervisor.view()).toMatchObject({ status: "idle", monitor: { evidenceGaps: 1 } });
     regressed.supervisor.shutdown();
 
     const snapshotRegression = await exactAgyBound();
@@ -1132,6 +1132,32 @@ describe("supervisor folding", () => {
     await h.supervisor.onEvent(paneEvent("pane_updated", { ...destination, agent_status: "blocked", state_change_seq: 7 }));
     expect(types(h.wakes)).toEqual(["work_cycle_completed", "blocked"]);
     expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p2" }, status: "blocked", monitor: { evidenceGaps: 0 } });
+    h.supervisor.shutdown();
+  });
+
+  it("adopts a same-revision status after a regressed lifecycle event without lowering its watermark", async () => {
+    const h = await exactAgyBound();
+    await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 3, state_change_seq: 4 })));
+    expect(types(h.wakes)).toEqual(["evidence_gap", "work_cycle_completed"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "idle", monitor: { evidenceGaps: 1 } });
+    const internals = h.supervisor as unknown as { lastRevision: number; lastStateChangeSeq?: number };
+    expect(internals).toMatchObject({ lastRevision: 3, lastStateChangeSeq: 5 });
+    h.supervisor.shutdown();
+  });
+
+  it("adopts a newer regressed event endpoint without repeating its revision gap", async () => {
+    const h = await exactAgyBound();
+    const event = paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 5, state_change_seq: 4 }));
+    await h.supervisor.onEvent(event);
+    expect(types(h.wakes)).toEqual(["evidence_gap", "evidence_gap", "work_cycle_completed"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "idle", monitor: { evidenceGaps: 2 } });
+    const internals = h.supervisor as unknown as { lastRevision: number; lastStateChangeSeq?: number };
+    expect(internals).toMatchObject({ lastRevision: 5, lastStateChangeSeq: 5 });
+    expect(h.wakes.filter((wake) => wake.event.details?.reason === "revision_jump")).toHaveLength(1);
+
+    await h.supervisor.onEvent(event);
+    expect(h.wakes.filter((wake) => wake.event.details?.reason === "revision_jump")).toHaveLength(1);
+    expect(internals).toMatchObject({ lastRevision: 5, lastStateChangeSeq: 5 });
     h.supervisor.shutdown();
   });
 

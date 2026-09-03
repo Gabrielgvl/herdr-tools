@@ -64,9 +64,14 @@ watermark from the bind anchor through full-pane events, authoritative snapshots
 strengthening, and proven pane moves. A same-revision status change is gap-free only when the
 exact occupant supplies a strictly advanced sequence. Missing, unchanged, regressed, or
 contradictory sequence evidence remains gap-visible or degrades reconciliation. Runtimes
-without the counter retain the revision-only rule. On a proven move, the event sequence is
-folded before destination reconciliation; a lower snapshot sequence degrades, and a missing
-snapshot sequence may use the event tuple only when revision and status agree.
+without the counter retain the revision-only rule. Exact move endpoints are retained in
+arrival order while destination reconciliation is pending. Once the destination is proven,
+the move endpoints are folded before the later snapshot endpoint. A lower snapshot sequence
+or revision degrades, and an equal sequence with a different status is contradictory. A
+snapshot that supplies the move's sequence and status credits that event even when output has
+advanced the pane revision. The revision advance remains visible as a source-`snapshot`
+`revision_jump`. A missing snapshot sequence may use the event tuple only when revision and
+status agree.
 
 ## 3. Consequences of the protocol facts
 
@@ -170,6 +175,12 @@ Only then is the bound `paneId` rewritten. The destination revision is pane-loca
 rebased as the new watermark after this proof; it is never compared with the origin pane's
 watermark. Nothing else may rewrite the bound pane ID.
 
+The move event's lifecycle endpoint is not collapsed into the fresh snapshot. Every exact
+endpoint from a chained pending move is folded in arrival order, followed by the snapshot
+endpoint. This preserves a completion followed by a new working transition. It also preserves
+an earlier sequence advance when a later chained move repeats the same sequence and status.
+A snapshot with the same sequence but a different status is rejected as contradictory.
+
 Failing **2** or **3** is not a lost identity and does not settle. The monitor routes a move
 by its destination as well as its origin, and **F6** makes pane IDs reusable, so such an
 event is either a replay of a move this supervisor already followed or a *different*
@@ -213,7 +224,10 @@ entries from its head: after truncation the same position names a different entr
 supervisor keyed on position would skip transitions it had never seen. A proven move changes
 the routing key, so the destination pane's own revision becomes the new revision watermark
 only after exact occupant proof, while the lifecycle watermark is retained. Origin and
-destination revisions are never compared.
+destination revisions are never compared. The move event starts the destination revision
+watermark, then the fresh snapshot is folded normally. A higher snapshot revision therefore
+stays gap-visible as a revision jump without inventing a
+`status_changed_without_revision` lifecycle gap when its sequence and status match the move.
 
 Events that arrive between adding the observer and proving the anchor are queued and then
 folded in arrival order against that same watermark, so a queued event advances it exactly as

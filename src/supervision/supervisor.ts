@@ -135,6 +135,14 @@ interface SupervisionEndpoint {
   stateChangeSeq: number | undefined;
 }
 
+type StateChangeSeqObservation = "advanced" | "unchanged" | "missing" | "regressed";
+
+function compareStateChangeSeq(previous: number | undefined, observed: number | undefined): StateChangeSeqObservation {
+  if (observed === undefined || previous === undefined) return "missing";
+  if (observed < previous) return "regressed";
+  return observed === previous ? "unchanged" : "advanced";
+}
+
 const inertBindingPublication: SupervisionChildBindingPublication = {
   commit: () => undefined,
   rollback: () => undefined,
@@ -185,7 +193,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * until one is valid enough to follow or to settle on.
    */
   private pendingMoveDestination: SupervisionPaneRecord | undefined;
-  private pendingMoveLifecycleAdvanced = false;
+  /** Exact move endpoints retained in arrival order until the destination is proven. */
+  private readonly pendingMoveEndpoints: SupervisionEndpoint[] = [];
+  private pendingMoveInitialStateChangeSeq: number | undefined;
   /**
    * Advances on every change to the pane this supervisor believes holds the
    * child — a retained move destination as well as an adopted one. A review
@@ -644,7 +654,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.lastStateChangeSeq = undefined;
     this.lastEndpoint = undefined;
     this.pendingMoveDestination = undefined;
-    this.pendingMoveLifecycleAdvanced = false;
+    this.pendingMoveEndpoints.length = 0;
+    this.pendingMoveInitialStateChangeSeq = undefined;
     this.selectedProfileName = undefined;
     this.eventStreamDegraded = false;
     this.bindingPublished = false;
@@ -946,13 +957,18 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // The move proves the child has left the origin before destination
     // reconciliation starts. Invalidate every origin-pane review immediately;
     // otherwise a transcript already being read could dispatch while this
-    // snapshot is pending, and a cadence could start another one.
+    // snapshot is pending, and a cadence could start another one. Keep every
+    // chained move endpoint so it can be folded before the eventual snapshot.
+    if (this.pendingMoveDestination === undefined) {
+      this.pendingMoveEndpoints.length = 0;
+      this.pendingMoveInitialStateChangeSeq = this.lastStateChangeSeq;
+    }
     this.pendingMoveDestination = pane;
-    this.pendingMoveLifecycleAdvanced = false;
     this.paneIdentityGeneration += 1;
-    const eventSequence = this.observeStateChangeSeq(pane.stateChangeSeq);
-    this.pendingMoveLifecycleAdvanced = eventSequence === "advanced";
-    this.lastEndpoint = { revision: pane.revision, status: pane.agentStatus, stateChangeSeq: pane.stateChangeSeq };
+    this.observeStateChangeSeq(pane.stateChangeSeq);
+    const endpoint = { revision: pane.revision, status: pane.agentStatus, stateChangeSeq: pane.stateChangeSeq };
+    this.pendingMoveEndpoints.push(endpoint);
+    this.lastEndpoint = endpoint;
     let snapshot: HerdrSnapshot;
     try {
       snapshot = await this.deps.monitor.snapshot();
@@ -990,14 +1006,18 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       return;
     }
     this.markReconciliationSuccess();
-    this.adoptMove(next, occupant, pane, eventSequence === "advanced");
+    this.adoptMove(next, occupant, pane);
   }
 
   private mergeMoveOccupant(eventPane: SupervisionPaneRecord, occupant: AuthoritativeOccupant): { occupant: AuthoritativeOccupant } | { reason: "revision_regressed" | "target_identity_contradiction" } {
+    if (occupant.pane.revision < eventPane.revision) return { reason: "revision_regressed" };
     const eventSequence = eventPane.stateChangeSeq;
     if (eventSequence === undefined) return { occupant };
     if (occupant.stateChangeSeq !== undefined) {
       if (occupant.stateChangeSeq < eventSequence) return { reason: "revision_regressed" };
+      if (occupant.stateChangeSeq === eventSequence && occupant.pane.agentStatus !== eventPane.agentStatus) {
+        return { reason: "target_identity_contradiction" };
+      }
       return { occupant };
     }
     if (occupant.pane.revision !== eventPane.revision || occupant.pane.agentStatus !== eventPane.agentStatus) {
@@ -1009,40 +1029,52 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   /**
    * Rebase onto a destination pane whose occupant is proven to be this child.
-   * Revisions are per pane, so the watermark and the anchor take the
-   * destination's own numbering. Keeping the origin pane's higher revision would
-   * discard every later event on the new pane.
+   * Revisions are per pane, so the move endpoint starts the destination's
+   * watermark. Its ordered lifecycle evidence is folded before the later
+   * snapshot endpoint, which may then advance both revision and lifecycle.
    */
-  private adoptMove(next: SupervisedIdentity, occupant: AuthoritativeOccupant, moveEvent?: SupervisionPaneRecord, moveEventLifecycleAdvanced = false): void {
-    const previousStatus = this.status!;
-    const previousStateChangeSeq = this.lastStateChangeSeq;
-    const sequence = this.observeStateChangeSeq(occupant.stateChangeSeq);
-    const eventSupportsStatus = moveEventLifecycleAdvanced
-      && moveEvent?.stateChangeSeq !== undefined
-      && occupant.stateChangeSeq === moveEvent.stateChangeSeq
-      && occupant.pane.revision === moveEvent.revision
-      && occupant.pane.agentStatus === moveEvent.agentStatus;
+  private adoptMove(next: SupervisedIdentity, occupant: AuthoritativeOccupant, moveEvent: SupervisionPaneRecord): void {
+    const endpoints = this.pendingMoveEndpoints.splice(0);
+    const initialStateChangeSeq = this.pendingMoveInitialStateChangeSeq;
     this.pendingMoveDestination = undefined;
-    this.pendingMoveLifecycleAdvanced = false;
+    this.pendingMoveInitialStateChangeSeq = undefined;
     this.paneIdentityGeneration += 1;
     this.identity = next;
     this.paneId = next.paneId;
-    this.lastRevision = occupant.pane.revision;
-    this.lastEndpoint = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, stateChangeSeq: occupant.stateChangeSeq };
+    this.lastRevision = moveEvent.revision;
     this.anchor = {
-      ...this.anchor!,
-      revision: occupant.pane.revision,
-      status: occupant.pane.agentStatus,
+      revision: moveEvent.revision,
+      status: this.status!,
       ...(this.lastStateChangeSeq === undefined ? {} : { stateChangeSeq: this.lastStateChangeSeq }),
     };
     this.publish(`child moved to pane ${next.paneId}`);
-    if (previousStatus !== occupant.pane.agentStatus
-      && (previousStateChangeSeq !== undefined || occupant.stateChangeSeq !== undefined)
-      && sequence !== "advanced"
-      && !eventSupportsStatus) {
-      this.recordEvidenceGap("snapshot", "status_changed_without_revision", occupant.pane.revision, occupant.pane.revision, undefined, previousStateChangeSeq, occupant.stateChangeSeq);
+    this.applyMoveEndpoints(endpoints, initialStateChangeSeq);
+    this.applySnapshotRevision(occupant);
+    this.anchor = {
+      revision: this.lastRevision,
+      status: this.status!,
+      ...(this.lastStateChangeSeq === undefined ? {} : { stateChangeSeq: this.lastStateChangeSeq }),
+    };
+  }
+
+  private applyMoveEndpoints(endpoints: SupervisionEndpoint[], initialStateChangeSeq: number | undefined): void {
+    let previousStateChangeSeq = initialStateChangeSeq;
+    for (const endpoint of endpoints) {
+      const priorStateChangeSeq = previousStateChangeSeq;
+      const sequence = compareStateChangeSeq(priorStateChangeSeq, endpoint.stateChangeSeq);
+      this.lastEndpoint = endpoint;
+      if (endpoint.stateChangeSeq !== undefined && sequence !== "regressed") previousStateChangeSeq = endpoint.stateChangeSeq;
+      if (sequence === "regressed") {
+        this.recordEvidenceGap("event", "status_changed_without_revision", endpoint.revision, endpoint.revision, undefined, priorStateChangeSeq, endpoint.stateChangeSeq);
+        continue;
+      }
+      if (endpoint.status !== this.status
+        && (priorStateChangeSeq !== undefined || endpoint.stateChangeSeq !== undefined)
+        && sequence !== "advanced") {
+        this.recordEvidenceGap("event", "status_changed_without_revision", endpoint.revision, endpoint.revision, undefined, priorStateChangeSeq, endpoint.stateChangeSeq);
+      }
+      this.applyStatus(endpoint.status, endpoint.revision, "event");
     }
-    this.applyStatus(occupant.pane.agentStatus, occupant.pane.revision, "snapshot");
   }
 
   /**
@@ -1144,7 +1176,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         return;
       }
       this.markReconciliationSuccess();
-      this.adoptMove({ ...this.identity!, paneId: moved.paneId }, lifecycle.occupant, moved, this.pendingMoveLifecycleAdvanced);
+      this.adoptMove({ ...this.identity!, paneId: moved.paneId }, lifecycle.occupant, moved);
       return;
     }
     if (occupant.pane.revision < this.lastRevision) {
@@ -1181,16 +1213,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     return observed !== undefined && this.lastStateChangeSeq !== undefined && observed < this.lastStateChangeSeq;
   }
 
-  private observeStateChangeSeq(observed: number | undefined): "advanced" | "unchanged" | "missing" | "regressed" {
-    if (observed === undefined) return "missing";
-    if (this.lastStateChangeSeq === undefined) {
-      this.lastStateChangeSeq = observed;
-      return "missing";
-    }
-    if (observed < this.lastStateChangeSeq) return "regressed";
-    if (observed === this.lastStateChangeSeq) return "unchanged";
-    this.lastStateChangeSeq = observed;
-    return "advanced";
+  private observeStateChangeSeq(observed: number | undefined): StateChangeSeqObservation {
+    const observation = compareStateChangeSeq(this.lastStateChangeSeq, observed);
+    if (observed !== undefined && observation !== "regressed") this.lastStateChangeSeq = observed;
+    return observation;
   }
 
   private recordEvidenceGap(source: SupervisionTransition["source"], reason: "revision_jump" | "status_changed_without_revision", previousRevision: number, observedRevision: number, omittedRevisions?: number, previousStateChangeSeq?: number, observedStateChangeSeq?: number): void {

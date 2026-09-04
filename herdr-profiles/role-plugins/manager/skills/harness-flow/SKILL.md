@@ -28,16 +28,16 @@ Do not use for a localized change that one bounded worker can implement and veri
 
 ## Profile Routing
 
-Child phases are Codex-free by default:
+Pi is primary:
 
 - manager: `manager-pi`; use `manager-claude` only when selected explicitly or for a deliberate manager handoff;
-- explore: `scout-agy`, plus `researcher-agy` only when external facts are required;
-- plan: `planner-claude`;
-- work: `worker-agy`;
-- critic: `reviewer-claude`;
-- promote: `promoter-claude`.
+- explore: `scout-pi`, plus `researcher-pi` only when external facts are required;
+- plan: `planner-pi`;
+- work: `worker-pi`;
+- critic: `reviewer-pi`;
+- promote: `promoter-pi`.
 
-Use a `*-pi` child profile only when the owner explicitly requests Pi or Codex for that child. Use each selected profile's declared fallback chain. Never hardcode provider or model IDs here. For prewalk, choose the highest-capability approved profile configuration for planning and the first genuinely novel DAG node; once that node establishes a pattern, use the default worker profile for later nodes.
+Use each profile's declared fallback chain. Never hardcode provider or model IDs here. For prewalk, choose the highest-capability approved profile configuration for planning and the first genuinely novel DAG node; once that node establishes a pattern, use the default worker profile for later nodes.
 
 AGY receives only self-contained, provenance-wrapped phase assignments. Do not assume profile Markdown or this skill reaches AGY.
 
@@ -58,13 +58,13 @@ Fix root causes at the shared path after checking callers. Do not simplify away 
 
 ### 1. Explore
 
-Launch a fresh `scout-agy` for bounded repository reconnaissance. Launch a separate `researcher-agy` only when the task depends on external facts. Run independent exploration in parallel.
+Launch a fresh `scout-pi` for bounded repository reconnaissance. Launch a separate `researcher-pi` only when the task depends on external facts. Run independent exploration in parallel.
 
 Each explorer returns exact evidence, constraints, unresolved decisions, and provenance. Exploration is complete when the planner no longer needs to guess about retrievable facts.
 
 ### 2. Plan
 
-Launch a fresh `planner-claude` with the owner's requirements and complete exploration evidence. Require an explicit DAG. Every node names:
+Launch a fresh `planner-pi` with the owner's requirements and complete exploration evidence. Require an explicit DAG. Every node names:
 
 - dependencies;
 - exact scope and intended invariant;
@@ -80,7 +80,7 @@ Use `pi-review plan` when the plan has material architectural risk or uncertaint
 
 ### 3. Work
 
-Launch one fresh `worker-agy` per ready DAG node. Supply the complete node, relevant evidence, current repository state, and exact gate; never make the worker rediscover the whole plan.
+Launch one fresh `worker-pi` per ready DAG node. Supply the complete node, relevant evidence, current repository state, and exact gate; never make the worker rediscover the whole plan.
 
 Run writers sequentially by default. Parallel writers require independent DAG nodes and isolated Git worktrees. Never run two writers in one checkout.
 
@@ -88,7 +88,7 @@ A worker is complete only when its gate passes and it reports changed paths plus
 
 ### 4. Critic
 
-After every DAG node is complete, launch a fresh `reviewer-claude`. The critic is read-only and must review requirements, actual diff, surrounding code, tests, and deliberate simplifications.
+After every DAG node is complete, launch a fresh `reviewer-pi`. The critic is read-only and must review requirements, actual diff, surrounding code, tests, and deliberate simplifications.
 
 The critic always uses `pi-review pr|diff` as auxiliary evidence for implementation review:
 
@@ -106,7 +106,7 @@ Before approval, the critic records the exact base commit, attached branch, revi
 
 ### 5. Promote
 
-Launch a fresh `promoter-claude` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, and an exact commit message. A manager launch is agent-authored and never carries owner authority.
+Launch a fresh `promoter-pi` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, and an exact commit message. A manager launch is agent-authored and never carries owner authority.
 
 The promoter first requires the current attached branch and `git rev-parse HEAD` to match the review manifest, then recomputes the reviewed tree OID from the repository root through the same temporary `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, and alternate-object procedure. It may not alter deliverable content. Any mismatch returns the flow to critic.
 

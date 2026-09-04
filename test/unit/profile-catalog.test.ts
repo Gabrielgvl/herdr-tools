@@ -604,17 +604,9 @@ describe("profile catalog", () => {
     expect(catalog.effective.get("promoter-pi")?.fallbackProfiles).toEqual(["promoter-claude"]);
     expect(resolveProfile("promoter-pi", catalog).reachableNames).toEqual(["promoter-pi", "promoter-claude"]);
 
-    const managerSkill = await readFile(join(rolePluginRoot, "manager", "skills", "manager", "SKILL.md"), "utf8");
-    expect(managerSkill).toContain("Child work is Codex-free by default");
-    expect(managerSkill).toContain("use `worker-agy` for implementation");
-    expect(managerSkill).toContain("Use any `*-pi` child profile only when the owner explicitly requests Pi or Codex");
-
     const harnessFlow = await readFile(join(rolePluginRoot, "manager", "skills", "harness-flow", "SKILL.md"), "utf8");
     expect(harnessFlow).toContain("name: harness-flow");
     expect(harnessFlow).toContain("explore → plan → work → critic → promote");
-    expect(harnessFlow).toContain("Child phases are Codex-free by default");
-    expect(harnessFlow).toContain("work: `worker-agy`");
-    expect(harnessFlow).toContain("Use a `*-pi` child profile only when the owner explicitly requests Pi or Codex");
     expect(harnessFlow).toContain("HERDR_ENV=1");
     expect(harnessFlow).toContain("pi-review");
     expect(harnessFlow).toContain("GIT_INDEX_FILE");

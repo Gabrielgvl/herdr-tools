@@ -692,7 +692,7 @@ describe("profile catalog", () => {
     expect(harnessFlow).toContain("git rev-parse HEAD^{tree}");
     expect(harnessFlow).toContain("GIT_OBJECT_DIRECTORY");
     expect(harnessFlow).toContain("git rev-parse --show-toplevel");
-    expect(harnessFlow).toContain("originating owner-authorized session");
+    expect(harnessFlow).toContain("The promoter executes the scoped delivery workflow");
 
     const promoterSkill = await readFile(join(rolePluginRoot, "promoter", "skills", "promoter", "SKILL.md"), "utf8");
     expect(promoterSkill).toContain("GIT_INDEX_FILE");
@@ -701,7 +701,11 @@ describe("profile catalog", () => {
     expect(promoterSkill).toContain("GIT_OBJECT_DIRECTORY");
     expect(promoterSkill).toContain("git commit-tree");
     expect(promoterSkill).toContain("git update-ref");
-    expect(promoterSkill).toContain("originating owner-authorized session");
+    expect(promoterSkill).toContain("Execute the assigned promotion");
+    for (const profileName of ["promoter-pi", "promoter-claude"]) {
+      const promoterProfile = await readFile(join(bundledRoot, "herdr-profiles", `${profileName}.md`), "utf8");
+      expect(promoterProfile).toContain("execute the assignment's scoped delivery workflow");
+    }
 
     const claudeTools = {
       scout: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },

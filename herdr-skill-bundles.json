@@ -17,7 +17,7 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",
-      "treeHash": "ed3495b3c521aa772c8284d17dee3520baba1b11cf1e8166005f6b4eaf3634d0"
+      "treeHash": "5c63d3844bf8e4a8b2b93cd32e0734b9eba5955138e574f5e32d7d09b124cecb"
     },
     "herdr-profiles/profile-plugins/manager/skills/decision-batch": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/decision-batch",

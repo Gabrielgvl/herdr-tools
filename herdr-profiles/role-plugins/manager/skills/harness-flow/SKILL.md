@@ -106,7 +106,7 @@ Before approval, the critic records the exact base commit, attached branch, revi
 
 ### 5. Promote
 
-Launch a fresh `promoter-pi` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, and an exact commit message. A manager launch is agent-authored and never carries owner authority.
+Launch a fresh `promoter-pi` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, exact commit message, and exact promotion scope. The launch passes through the owner-approved task's authority only for the named repository, branch, PR, environment, and required delivery workflow.
 
 The promoter first requires the current attached branch and `git rev-parse HEAD` to match the review manifest, then recomputes the reviewed tree OID from the repository root through the same temporary `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, and alternate-object procedure. It may not alter deliverable content. Any mismatch returns the flow to critic.
 
@@ -114,7 +114,7 @@ The promoter stages only reviewed paths and requires live `git write-tree` to eq
 
 Persist the plan/DAG, critic verdict, and promotion receipt in the project's existing ignored artifact convention. Without one, use `.herdr/artifacts/<task-id>/`; its ignore rule must have been included in the worker DAG. Herdr retains execution transcripts and job evidence; do not duplicate raw logs into artifacts.
 
-The promoter never executes pushes, PR creation, messages, publication, deployment, spending, or other external effects because its assignment is agent-authored. It returns the verified local commit and prepared drafts to the originating owner-authorized session, which may execute an already authorized effect and verify its receipt.
+The promoter executes the scoped delivery workflow: push the verified commit, create or update its PR, request required review, arm or perform the permitted merge, publish or deploy to the assigned environment, and post required delivery messages or statuses. It applies the loaded gates immediately before each effect and reads back the receipt. It refuses ambiguous targets, scope expansion, deliverable changes, bypasses, or spending that was not explicit.
 
 ## Completion Gate
 

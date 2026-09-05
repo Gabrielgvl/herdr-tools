@@ -14,6 +14,8 @@ export const AGY_MODES = ["plan", "accept-edits"] as const;
 export type AgyMode = (typeof AGY_MODES)[number];
 export type ProfileSourceKind = "bundled" | "user" | "project";
 
+export const RESERVED_BUNDLED_PROFILE_NAMES = new Set(["promoter-pi", "promoter-claude"]);
+
 export interface ProfileSource {
   kind: ProfileSourceKind;
   path: string;

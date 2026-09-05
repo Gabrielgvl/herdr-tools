@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, win32 } from "node:path";
 import { parseProfile, profileSource } from "./parser.js";
-import { MAX_PROFILE_BYTES, MAX_PROFILE_DIAGNOSTICS, type Profile, type ProfileCandidate, type ProfileCatalog, type ProfileDiagnostic, type ProfileSourceKind } from "./types.js";
+import { MAX_PROFILE_BYTES, MAX_PROFILE_DIAGNOSTICS, RESERVED_BUNDLED_PROFILE_NAMES, type Profile, type ProfileCandidate, type ProfileCatalog, type ProfileDiagnostic, type ProfileSourceKind } from "./types.js";
 
 export interface ProfileDiscoveryOptions {
   bundledDir: string;
@@ -156,6 +156,10 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
   const effective = new Map<string, Profile>();
   for (const candidate of candidates) {
     if (!candidate.profile) continue;
+    if (candidate.source.kind !== "bundled" && RESERVED_BUNDLED_PROFILE_NAMES.has(candidate.name)) {
+      addDiagnostic(diagnostics, { code: "SHADOWED_PROFILE", message: `${candidate.source.path} cannot replace reserved bundled profile ${candidate.name}`, path: candidate.source.path, name: candidate.name, source: candidate.source }, diagnosticCount);
+      continue;
+    }
     const prior = effective.get(candidate.name);
     if (!prior) effective.set(candidate.name, candidate.profile);
     else {
@@ -166,7 +170,7 @@ export async function discoverProfiles(options: ProfileDiscoveryOptions): Promis
 
   const blocked = new Set<string>();
   for (const candidate of candidates) {
-    if (!candidate.diagnostic) continue;
+    if (!candidate.diagnostic || (candidate.source.kind !== "bundled" && RESERVED_BUNDLED_PROFILE_NAMES.has(candidate.name))) continue;
     const selected = effective.get(candidate.name);
     if (selected && candidate.source.precedence >= selected.source.precedence) {
       effective.delete(candidate.name);

@@ -1,4 +1,4 @@
-import type { Profile, ProfileCandidate, ProfileCatalog, ProfileResolution, ProfileSourceKind } from "./types.js";
+import { RESERVED_BUNDLED_PROFILE_NAMES, type Profile, type ProfileCandidate, type ProfileCatalog, type ProfileResolution, type ProfileSourceKind } from "./types.js";
 
 export class ProfileResolutionError extends Error {
   readonly code = "PROFILE_RESOLUTION_INVALID" as const;
@@ -43,6 +43,10 @@ function highestBlocker(catalog: ProfileCatalog, name: string, value: Profile | 
 
 function profile(catalog: ProfileCatalog, name: string): Profile {
   const value = catalog.effective.get(name);
+  if (RESERVED_BUNDLED_PROFILE_NAMES.has(name)) {
+    if (value?.source.kind !== "bundled") throw new ProfileResolutionError(`Reserved profile ${name} is unavailable from the bundled catalog`, { name, blocked: true });
+    return value;
+  }
   const blocker = highestBlocker(catalog, name, value);
   if (blocker?.kind === "invalid") throw new ProfileResolutionError(`Profile ${name} is blocked by an invalid higher-precedence candidate`, { name, blocked: true, candidatePath: blocker.candidate.source.path });
   if (blocker?.kind === "unreadable") {

@@ -149,10 +149,13 @@ describe("profile catalog", () => {
     await writeFile(join(bundled, "worker.md"), profileText("worker"));
     await writeFile(join(user, "worker.md"), profileText("worker", "claude"));
     await writeFile(join(project, "worker.md"), profileText("worker"));
+    await writeFile(join(bundled, "promoter-pi.md"), profileText("promoter-pi"));
+    await writeFile(join(project, "promoter-pi.md"), profileText("promoter-pi", "claude"));
     await writeFile(join(project, "blocked.md"), "---\nname: blocked\ndescription: invalid\ntimeoutMinutes: 30\nsessionPersistence: false\nruntime:\n  kind: pi\n  model: x\n  thinking: invalid\nfallbackProfiles: []\n---\n\nbody\n");
     await writeFile(join(bundled, "blocked.md"), profileText("blocked"));
     const catalog = await discoverProfiles({ bundledDir: bundled, bundledScopeRoot: join(root, "package"), userDir: user, userScopeRoot: join(root, "home", ".pi", "agent"), projectDir: project, projectRoot: join(root, "project") });
     expect(catalog.effective.get("worker")?.source.scopeRoot).toBe(join(root, "project"));
+    expect(resolveProfile("promoter-pi", catalog).profile.source.kind).toBe("bundled");
     expect(catalog.effective.has("blocked")).toBe(false);
     expect(catalog.blocked?.has("blocked")).toBe(true);
     expect(catalog.diagnostics.some((item) => item.code === "SHADOWED_PROFILE")).toBe(true);

@@ -100,15 +100,14 @@ export interface ProfileResolution {
 }
 
 /**
- * Skill selection is profile-only. A launch override that could repoint
- * `skills` would turn the profile's exact allowlist back into a hint, so the
- * key does not exist here and is rejected wherever it appears.
+ * Resource selection is profile-only. A launch override that could repoint
+ * `extensions` or `skills` would turn the profile's exact allowlist back into
+ * a hint, so those keys do not exist here and are rejected wherever they appear.
  */
 export interface PiRuntimeOverrides {
   model?: string;
   thinking?: ThinkingLevel;
   tools?: string[];
-  extensions?: string[];
 }
 
 /** `pluginDirs` is profile-only for the same reason as Pi `skills`. */

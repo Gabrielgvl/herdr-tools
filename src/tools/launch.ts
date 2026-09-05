@@ -344,7 +344,7 @@ function validateParams(params: LaunchRequest): void {
   profileIdentifier(params.profile);
   if (params.overrides !== undefined) {
     if (!record(params.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
-    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort", "tools", "extensions", "permissionMode", "allowedTools", "disallowedTools", "addDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
+    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort", "tools", "permissionMode", "allowedTools", "disallowedTools", "addDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
     if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
     if (params.overrides.thinking !== undefined && (typeof params.overrides.thinking !== "string" || !THINKING_LEVELS.includes(params.overrides.thinking as typeof THINKING_LEVELS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.thinking is invalid");
     if (params.overrides.effort !== undefined && (typeof params.overrides.effort !== "string" || !CLAUDE_EFFORTS.includes(params.overrides.effort as typeof CLAUDE_EFFORTS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.effort is invalid");

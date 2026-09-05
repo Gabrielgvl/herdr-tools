@@ -71,15 +71,15 @@ describe("profile catalog", () => {
     expect(() => parseProfile(profileText("claude-disabled", "claude").replace("sessionPersistence: true", "sessionPersistence: false"), source(root, "claude-disabled"))).toThrow(ProfileParseError);
     const resources = parseProfile(profileText("worker").replace("thinking: low", "thinking: low\n  tools: [read]\n  extensions: [./ext.ts]\n  skills: [./skills]"), source(root, "worker"));
     expect(resources.runtime).toMatchObject({ tools: ["read"], extensions: [join(root, "ext.ts")], skills: [join(root, "skills")] });
-    expect(buildProfileArgv(resources, { extensions: ["./override.ts"] })).toContain(join(root, "override.ts"));
-    // Skill selection is profile-only, so an override attempt is refused
+    // Resource selection is profile-only, so override attempts are refused
     // rather than silently repointing the role's allowlist.
+    expect(() => buildProfileArgv(resources, { extensions: ["./override.ts"] } as never)).toThrow(/profile-only/);
     expect(() => buildProfileArgv(resources, { skills: ["./override-skills"] } as never)).toThrow(/profile-only/);
     expect(() => buildProfileArgv(claude, { pluginDirs: ["./override-plugin"] } as never)).toThrow(/profile-only/);
     expect(() => normalizeScopedResourcePath("", "resource", root)).toThrow(ProfileParseError);
     for (const path of ["/tmp/absolute.ts", "../outside.ts", "./nested//unsafe.ts", "C:\\outside.ts"]) {
       expect(() => parseProfile(profileText("worker").replace("thinking: low", `thinking: low\n  extensions: [${JSON.stringify(path)}]`), source(root, "worker"))).toThrow(ProfileParseError);
-      expect(() => buildProfileArgv(resources, { extensions: [path] })).toThrow();
+      expect(() => buildProfileArgv(resources, { extensions: [path] } as never)).toThrow(/profile-only/);
     }
     expect(buildProfileArgv(resources, {}, "/tmp/prompt")).toEqual(["--model", "test/model", "--thinking", "low", "--tools", "read", "--extension", join(root, "ext.ts"), "--no-skills", "--skill", join(root, "skills"), "--no-session", "--append-system-prompt", "/tmp/prompt"]);
     const claudeResources = parseProfile(profileText("claude-resource", "claude").replace("effort: medium", "effort: medium\n  permissionMode: acceptEdits\n  allowedTools: [Read]\n  disallowedTools: [Bash]\n  addDirs: [./docs]\n  pluginDirs: [./plugin]"), source(root, "claude-resource"));
@@ -294,8 +294,8 @@ describe("profile catalog", () => {
     expect(() => buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, { permissionMode: "invalid" as never })).toThrow();
     expect(buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, { permissionMode: "bypassPermissions" })).toContain("--allow-dangerously-skip-permissions");
     expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { tools: ["bad\nvalue"] })).toThrow();
-    expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { extensions: ["./extension"] })).toThrow(/scope root/);
-    expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { extensions: ["../outside"] }, undefined, "/tmp/profile-scope")).toThrow();
+    expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { extensions: ["./extension"] } as never)).toThrow(/profile-only/);
+    expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { extensions: ["../outside"] } as never)).toThrow(/profile-only/);
     for (const key of ["effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"] as const) expect(() => buildProfileArgv(pi, { [key]: key === "permissionMode" ? "plan" : key === "effort" ? "low" : ["value"] } as never)).toThrow();
     for (const key of ["thinking", "tools", "extensions", "skills"] as const) expect(() => buildProfileArgv(claude, { [key]: key === "thinking" ? "low" : ["value"] } as never)).toThrow();
   });
@@ -347,8 +347,8 @@ describe("profile catalog", () => {
       { name: "worker", profile: "worker", overrides: { model: "" } }, { name: "worker", profile: "worker", overrides: { tools: ["bad\nvalue"] } }, { name: "worker", kind: "pi", overrides: {} }
     ];
     for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams(value as never), `invalid case ${index}`).toThrow();
-    expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { thinking: "low", tools: ["read"], extensions: ["./ext"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."] } } as never)).not.toThrow();
-    for (const key of ["skills", "pluginDirs"]) expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { [key]: ["./selected"] } } as never)).toThrow(/Unknown profile override/);
+    expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { thinking: "low", tools: ["read"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."] } } as never)).not.toThrow();
+    for (const key of ["extensions", "skills", "pluginDirs"]) expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { [key]: ["./selected"] } } as never)).toThrow(/Unknown profile override/);
   });
 
   it("launches a resolved profile through the existing placement path", async () => {

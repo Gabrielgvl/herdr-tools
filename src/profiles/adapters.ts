@@ -51,8 +51,8 @@ function scopedValues(value: string[] | undefined, fallback: string[], field: st
   }
 }
 
-/** Skill selection belongs to the profile alone, for every runtime kind. */
-const PROFILE_ONLY_KEYS = ["skills", "pluginDirs"];
+/** Resource selection belongs to the profile alone, for every runtime kind. */
+const PROFILE_ONLY_KEYS = ["extensions", "skills", "pluginDirs"];
 
 function rejectIncompatible(kind: ProfileKind, overrides: Record<string, unknown>): void {
   for (const key of PROFILE_ONLY_KEYS) if (Object.prototype.hasOwnProperty.call(overrides, key)) throw new ProfileAdapterError(`${key} is profile-only and cannot be overridden at launch`);
@@ -101,14 +101,14 @@ function attachmentDirectoryArg(path: string | undefined): string[] {
 
 const AGY_BOOTSTRAP_PROMPT = "Initialize this interactive session and reply with exactly AGY_READY.";
 
-export function resolvePiRuntime(profile: Extract<Profile["runtime"], { kind: "pi" }>, overrides: PiRuntimeOverrides = {}, scopeRoot?: string): Extract<Profile["runtime"], { kind: "pi" }> {
+export function resolvePiRuntime(profile: Extract<Profile["runtime"], { kind: "pi" }>, overrides: PiRuntimeOverrides = {}): Extract<Profile["runtime"], { kind: "pi" }> {
   rejectIncompatible("pi", overrides as Record<string, unknown>);
   return {
     kind: "pi",
     model: model(overrides.model, profile.model),
     thinking: thinking(overrides.thinking, profile.thinking),
     tools: values(overrides.tools, profile.tools),
-    extensions: scopedValues(overrides.extensions, profile.extensions, "overrides.extensions", scopeRoot),
+    extensions: [...profile.extensions],
     skills: [...profile.skills]
   };
 }
@@ -139,7 +139,7 @@ export function resolveAgyRuntime(profile: Extract<Profile["runtime"], { kind: "
 }
 
 export function resolveProfileRuntime(profile: Profile, overrides: RuntimeOverrides = {}): Profile["runtime"] {
-  if (profile.runtime.kind === "pi") return resolvePiRuntime(profile.runtime, overrides as PiRuntimeOverrides, profile.source.scopeRoot);
+  if (profile.runtime.kind === "pi") return resolvePiRuntime(profile.runtime, overrides as PiRuntimeOverrides);
   if (profile.runtime.kind === "claude") return resolveClaudeRuntime(profile.runtime, overrides as ClaudeRuntimeOverrides, profile.source.scopeRoot);
   return resolveAgyRuntime(profile.runtime, overrides as AgyRuntimeOverrides, profile.source.scopeRoot);
 }
@@ -150,8 +150,8 @@ export function resolveProfileRuntime(profile: Profile, overrides: RuntimeOverri
  * `--skill` entries still load. It is passed unconditionally, so an empty
  * profile skill list means exactly no skills rather than ambient discovery.
  */
-export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, sessionPersistence: boolean, overrides: PiRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
-  const effective = resolvePiRuntime(profile, overrides, scopeRoot);
+export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, sessionPersistence: boolean, overrides: PiRuntimeOverrides = {}, promptFilePath?: string): string[] {
+  const effective = resolvePiRuntime(profile, overrides);
   const args = ["--model", effective.model, "--thinking", effective.thinking, ...commaSeparated("--tools", effective.tools), ...repeated("--extension", effective.extensions), "--no-skills", ...repeated("--skill", effective.skills)];
   if (!sessionPersistence) args.push("--no-session");
   return [...args, ...promptFileArg("--append-system-prompt", promptFilePath)];

@@ -19,7 +19,7 @@
     "generate:skill-bundles": "tsx scripts/generate-skill-bundles.ts",
     "build": "npm run generate:skill-bundles && tsc",
     "build:mcp": "tsc -p tsconfig.build.json",
-    "validate:plugin": "claude plugin validate ./herdr-profiles/role-plugins/manager"
+    "validate:plugin": "claude plugin validate ./herdr-profiles/role-plugins/manager && claude plugin validate ./herdr-profiles/profile-plugins/manager && claude plugin validate ./herdr-profiles/profile-plugins/executor"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.83.0",

@@ -2256,10 +2256,10 @@ describe("herdr_launch profile-only contract", () => {
       { ...valid, unknown: true }, { ...valid, profile: "" }, { ...valid, profile: "bad\nprofile" },
       { ...valid, overrides: null }, { ...valid, overrides: { unknown: true } }, { ...valid, overrides: { model: "" } },
       { ...valid, overrides: { thinking: "invalid" } }, { ...valid, overrides: { effort: "invalid" } }, { ...valid, overrides: { permissionMode: "invalid" } },
-      ...["tools", "extensions", "allowedTools", "disallowedTools", "addDirs"].map((key) => ({ ...valid, overrides: { [key]: ["bad\nvalue"] } })),
-      ...["tools", "extensions", "allowedTools", "disallowedTools", "addDirs"].map((key) => ({ ...valid, overrides: { [key]: 1 } })),
-      // Skill selection is profile-only, so these are unknown launch overrides.
-      ...["skills", "pluginDirs"].map((key) => ({ ...valid, overrides: { [key]: ["./skill"] } })),
+      ...["tools", "allowedTools", "disallowedTools", "addDirs"].map((key) => ({ ...valid, overrides: { [key]: ["bad\nvalue"] } })),
+      ...["tools", "allowedTools", "disallowedTools", "addDirs"].map((key) => ({ ...valid, overrides: { [key]: 1 } })),
+      // Resource selection is profile-only, so these are unknown launch overrides.
+      ...["extensions", "skills", "pluginDirs"].map((key) => ({ ...valid, overrides: { [key]: ["./skill"] } })),
       { ...valid, label: "" }, { ...valid, cwd: "" }, { ...valid, initialPrompt: "" }, { ...valid, initialPrompt: 1 }, { ...valid, focus: 1 },
       { ...valid, initialPrompt: "go", initialPromptDelivery: "elsewhere" }, { ...valid, initialPromptDelivery: "attachment" },
       { ...valid, placement: null }, { ...valid, placement: 1 }, { ...valid, placement: { mode: "same_tab", extra: true } },
@@ -2268,7 +2268,7 @@ describe("herdr_launch profile-only contract", () => {
       { ...valid, placement: { mode: "unsupported" } }
     ];
     for (const value of invalid) expect(() => validateLaunchParams(value as never)).toThrow();
-    expect(() => validateLaunchParams({ ...valid, overrides: { model: "m", tools: [], extensions: [], allowedTools: [], disallowedTools: [], addDirs: [] }, placement: { mode: "same_tab" } })).not.toThrow();
+    expect(() => validateLaunchParams({ ...valid, overrides: { model: "m", tools: [], allowedTools: [], disallowedTools: [], addDirs: [] }, placement: { mode: "same_tab" } })).not.toThrow();
   });
 
   it("retains the failing phase and bounded CLI evidence at the launch boundary", async () => {
@@ -2994,18 +2994,19 @@ describe("herdr_launch profile-only contract", () => {
     expect(result.details).toMatchObject({ profile: { name: "custom-profile", requested: "custom-profile", selected: "custom-profile", source: { path: "/profiles/custom-profile.md" }, timeoutMinutes: 30, runtime: { kind: "pi", model: "override/model", thinking: "high" }, permissions: { sessionPersistence: false, tools: ["read"], extensions: [], skills: [] }, attempts: [{ profile: "custom-profile", outcome: "selected" }] } });
   });
 
-  it("reports normalized primary capability overrides but keeps skill selection profile-only", async () => {
+  it("reports capability overrides but keeps resource selection profile-only", async () => {
     const root = scopeRoot("resource");
     mkdirSync(join(root, "base-skill"), { recursive: true });
     writeFileSync(join(root, "base-skill", "SKILL.md"), "canonical body\n");
     writeFileSync(join(root, "base-extension.ts"), "export default 0;\n");
-    writeFileSync(join(root, "override-extension.ts"), "export default 1;\n");
     const resourceProfile = scopedProfile(root, "resource-profile", "  extensions: [./base-extension.ts]\n  skills: [./base-skill]");
     const calls: string[][] = [];
-    const result = await launch({ name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "grep"], extensions: ["./override-extension.ts"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,grep", "--extension", join(root, "override-extension.ts"), "--no-skills", "--skill", join(root, "base-skill"), "--no-session", "--append-system-prompt", "/cache/body.md"]);
-    expect(result.details).toMatchObject({ profile: { runtime: { model: "override/model", thinking: "high" }, permissions: { tools: ["read", "grep"], extensions: [join(root, "override-extension.ts")], skills: [join(root, "base-skill")] } } });
-    await expect(launch({ name: "worker", profile: "resource-profile", overrides: { skills: ["./base-skill"] } as never }, catalog(resourceProfile), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    const result = await launch({ name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "grep"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,grep", "--extension", join(root, "base-extension.ts"), "--no-skills", "--skill", join(root, "base-skill"), "--no-session", "--append-system-prompt", "/cache/body.md"]);
+    expect(result.details).toMatchObject({ profile: { runtime: { model: "override/model", thinking: "high" }, permissions: { tools: ["read", "grep"], extensions: [join(root, "base-extension.ts")], skills: [join(root, "base-skill")] } } });
+    for (const key of ["extensions", "skills"]) {
+      await expect(launch({ name: "worker", profile: "resource-profile", overrides: { [key]: ["./base-skill"] } as never }, catalog(resourceProfile), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    }
   });
 
   it("refuses an escaping or stale skill selection for any reachable profile before the first launch effect", async () => {

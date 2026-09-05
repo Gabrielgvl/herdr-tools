@@ -619,7 +619,9 @@ describe("profile catalog", () => {
     const executorManifest = JSON.parse(await readFile(join(executorProfilePlugin, ".claude-plugin", "plugin.json"), "utf8"));
     expect(executorManifest).toMatchObject({ name: "herdr-executor", mcpServers: "./mcp-servers.json" });
     const executorServers = JSON.parse(await readFile(join(executorProfilePlugin, "mcp-servers.json"), "utf8"));
-    expect(executorServers).toMatchObject({ executor: { type: "http", url: "https://dev-server.piranha-palermo.ts.net/mcp", headers: { Authorization: expect.stringContaining("MCP_EXECUTOR_API_KEY") } } });
+    expect(executorServers).toMatchObject({ executor: { type: "http", url: "https://dev-server.piranha-palermo.ts.net/mcp", headersHelper: "${CLAUDE_PLUGIN_ROOT}/scripts/headers-helper.sh" } });
+    const executorHeadersHelper = await readFile(join(executorProfilePlugin, "scripts", "headers-helper.sh"), "utf8");
+    expect(executorHeadersHelper).toContain("MCP_EXECUTOR_API_KEY");
     const executorPi = await readFile(join(executorProfilePlugin, "pi.ts"), "utf8");
     expect(executorPi).toContain("createMcpAdapter");
     expect(executorPi).toContain('directTools: ["execute", "skills", "resume"]');

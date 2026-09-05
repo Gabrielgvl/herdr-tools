@@ -108,7 +108,7 @@ Common extension-backed navigation tools are selected by name but still supplied
 | `worker-pi` | Planner set plus `bash_bg`, `jobs`, `job_decide`, `monitor` |
 | `reviewer-pi` | Planner set |
 | `researcher-pi` | Planner set |
-| `promoter-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write`; Git metadata/final-commit scope only |
+| `promoter-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write`; exact reviewed commit and gated delivery scope only |
 
 Explicitly absent from every non-manager Pi profile:
 
@@ -116,7 +116,7 @@ Explicitly absent from every non-manager Pi profile:
 - Herdr lifecycle tools
 - durable-memory mutation tools
 
-Every Pi and Claude profile receives edit/write so it can persist an assignment-required handoff. Manager profiles restrict writes to exact assignment-supplied handoff or coordination paths and do not gain implementation authority. Manager, planner, researcher, and promoter load the profile-scoped Executor MCP and skill. Scout, worker, reviewer, and every AGY profile do not. Executor availability never authorizes pushes, PR creation, publication, deployment, messaging, spending, or another external mutation.
+Every Pi and Claude profile receives edit/write so it can persist an assignment-required handoff. Manager profiles restrict writes to exact assignment-supplied handoff or coordination paths and do not gain implementation authority. Manager, planner, researcher, and promoter load the profile-scoped Executor MCP and skill. Scout, worker, reviewer, and every AGY profile do not. Executor availability itself never authorizes an external mutation; the trusted promoter profile authorizes only its standard gated delivery workflow for the exact reviewed manifest and targets.
 
 ### AGY role profiles
 

@@ -9,7 +9,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 ## Validated product decisions
 
 - Profiles are owned and resolved by `herdr-tools`, not the Herdr runtime.
-- Bundled profiles use deliberate role-scoped capabilities. Both managers may write only exact assignment-supplied handoff or coordination paths, and neither gains implementation authority. Scout, planner, reviewer, and researcher do not mutate deliverable state; worker owns implementation; promoter has Bash but may mutate only the reviewed Git index/ref metadata and ignored harness receipts needed to create the exact approved commit.
+- Bundled profiles use deliberate role-scoped capabilities. Both managers may write only exact assignment-supplied handoff or coordination paths, and neither gains implementation authority. Scout, planner, reviewer, and researcher do not mutate deliverable state; worker owns implementation; the trusted promoter profile may commit and execute the gated delivery workflow for the exact reviewed manifest without changing deliverable content.
 - Profiles are separate Markdown files discovered from:
   1. bundled `herdr-profiles/*.md`;
   2. user `~/.pi/agent/herdr-profiles/*.md`;
@@ -210,7 +210,7 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 
 - [ ] Seventeen bundled profiles resolve deterministically with source and shadow evidence; `manager-pi` remains the generic advisory manager and `manager-claude` is selected for explicit Claude/Fable management or Claude-to-Claude succession; both have no fallback.
 - [ ] Every bundled role has one shared role skill, with matching Pi skill and Claude plugin resources; the globally installable manager plugin also carries the cross-role `harness-flow` skill and nothing else, while `manager-claude` loads the manager matrix from the session-only generated manager profile plugin.
-- [ ] Pi and Claude capability matrices exclude hidden delegation, keep direct content mutation tools limited to workers, and limit promoter mutation to reviewed Git metadata and ignored harness receipts.
+- [ ] Pi and Claude capability matrices exclude hidden delegation, keep direct content mutation tools limited to workers, and limit promoter content to the reviewed manifest while allowing its gated delivery workflow.
 - [ ] Invalid unrelated profiles do not block valid profiles; invalid reachable fallback graphs fail before launch.
 - [ ] Exact profile inspection is bounded and redacts sensitive runtime values.
 - [ ] Pi and Claude adapters produce typed, shell-free argv with appended-system-prompt semantics; AGY produces fixed plan and permission-bypass argv without a profile-body prompt source.

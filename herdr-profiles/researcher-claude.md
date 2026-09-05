@@ -15,9 +15,9 @@ runtime:
     - Bash
     - WebSearch
     - WebFetch
-  disallowedTools:
     - Edit
     - Write
+  disallowedTools:
     - NotebookEdit
     - Task
   addDirs: []

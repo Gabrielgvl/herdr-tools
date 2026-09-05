@@ -671,12 +671,12 @@ describe("profile catalog", () => {
     expect(promoterSkill).toContain("originating owner-authorized session");
 
     const claudeTools = {
-      scout: { allowedTools: ["Read", "Glob", "Grep", "Bash"], disallowedTools: ["Edit", "Write", "NotebookEdit", "Task"], permissionMode: "dontAsk" },
-      planner: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch"], disallowedTools: ["Edit", "Write", "NotebookEdit", "Task"], permissionMode: "dontAsk" },
+      scout: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
+      planner: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
       worker: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", "NotebookEdit", "WebSearch", "WebFetch"], disallowedTools: ["Task"], permissionMode: "acceptEdits" },
-      reviewer: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch"], disallowedTools: ["Edit", "Write", "NotebookEdit", "Task"], permissionMode: "dontAsk" },
-      researcher: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch"], disallowedTools: ["Edit", "Write", "NotebookEdit", "Task"], permissionMode: "dontAsk" },
-      promoter: { allowedTools: ["Read", "Glob", "Grep", "Bash"], disallowedTools: ["Edit", "Write", "NotebookEdit", "Task"], permissionMode: "dontAsk" }
+      reviewer: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
+      researcher: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
+      promoter: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" }
     } as const;
     for (const role of ["scout", "planner", "worker", "reviewer", "researcher", "promoter"] as const) {
       const profile = catalog.effective.get(`${role}-claude`)!;

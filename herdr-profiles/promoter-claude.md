@@ -13,9 +13,9 @@ runtime:
     - Glob
     - Grep
     - Bash
-  disallowedTools:
     - Edit
     - Write
+  disallowedTools:
     - NotebookEdit
     - Task
   addDirs: []

@@ -8,7 +8,7 @@ Implemented and verified.
 
 Add bundled `manager-pi` and `manager-claude` profiles that orchestrate visible Herdr workers without unapproved repository changes. Keep `manager-pi` as the generic advisory default and select `manager-claude` for owner-requested Claude/Fable management or Claude-to-Claude succession. Give every bundled Pi and Claude profile a deliberate role-scoped tool policy and a shared role skill, while retaining normal installed extension discovery.
 
-Success means profile launches are useful by default, hidden subagent spawning is excluded, non-manager Pi roles can persist required handoffs without gaining new authority, and missing task-critical extension capabilities are reported as blockers instead of silently replaced by weaker behavior.
+Success means profile launches are useful by default, hidden subagent spawning is excluded, non-manager roles can persist required handoffs without gaining new authority, and missing task-critical extension capabilities are reported as blockers instead of silently replaced by weaker behavior.
 
 ## Validated Owner Decisions
 
@@ -27,7 +27,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
 7. Non-manager profiles cannot spawn hidden subagents. Pi profiles omit `Agent` and Herdr lifecycle tools; Claude profiles disallow `Task`.
-8. Read-only describes repository authority, not tool absence. Non-manager Pi roles already retain Bash and now also receive edit/write for assignment-required handoffs; their role skills still prohibit unassigned repository mutation.
+8. Read-only describes repository authority, not tool absence. Non-manager Pi and Claude roles already retain Bash and now also receive edit/write for assignment-required handoffs; their role skills still prohibit unassigned repository mutation.
 9. AGY support is implemented only in Herdr Tools. It requires no Herdr Core change. The AGY profile body is metadata, not a runtime prompt.
 
 ## Tech Stack
@@ -116,7 +116,7 @@ Explicitly absent from every non-manager Pi profile:
 - Herdr lifecycle tools
 - durable-memory mutation tools
 
-`manager-pi` does not receive `bash`, `edit`, or `write`. Every non-manager Pi profile receives `edit` and `write` so it can persist an assignment-required handoff; those profiles already receive Bash, so withholding the direct tools was not a filesystem security boundary. Role prompts still prohibit repository mutation outside the assigned role. `manager-claude` receives none of those tools through pre-approval; Claude's `default` permission mode keeps owner approval required when they are requested. An agent-authored promoter assignment never authorizes pushes, PR creation, publication, deployment, messaging, or spending.
+`manager-pi` does not receive `bash`, `edit`, or `write`. Every non-manager Pi and Claude profile receives `edit` and `write` so it can persist an assignment-required handoff; those profiles already receive Bash, so withholding the direct tools was not a filesystem security boundary. Role prompts still prohibit repository mutation outside the assigned role. `manager-claude` receives none of those tools through pre-approval; Claude's `default` permission mode keeps owner approval required when they are requested. An agent-authored promoter assignment never authorizes pushes, PR creation, publication, deployment, messaging, or spending.
 
 ### AGY role profiles
 
@@ -128,15 +128,18 @@ AGY initially publishes provisional pane, terminal, name, and kind supervision b
 
 | Role | Permission mode | Pre-approved tools | Disallowed tools |
 |---|---|---|---|
-| Scout | `dontAsk` | `Read`, `Glob`, `Grep`, `Bash` | `Edit`, `Write`, `NotebookEdit`, `Task` |
-| Planner | `dontAsk` | Scout set plus `WebSearch`, `WebFetch` | `Edit`, `Write`, `NotebookEdit`, `Task` |
-| Reviewer | `dontAsk` | Planner set | `Edit`, `Write`, `NotebookEdit`, `Task` |
-| Researcher | `dontAsk` | Planner set | `Edit`, `Write`, `NotebookEdit`, `Task` |
+| Scout | `dontAsk` | `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write` | `NotebookEdit`, `Task` |
+| Planner | `dontAsk` | Scout set plus `WebSearch`, `WebFetch` | `NotebookEdit`, `Task` |
+| Reviewer | `dontAsk` | Planner set | `NotebookEdit`, `Task` |
+| Researcher | `dontAsk` | Planner set | `NotebookEdit`, `Task` |
+| Promoter | `dontAsk` | `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write` | `NotebookEdit`, `Task` |
 | Worker | `acceptEdits` | `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write`, `NotebookEdit`, `WebSearch`, `WebFetch` | `Task` |
 
 Claude `allowedTools` pre-approves selected tools; `disallowedTools` supplies the actual hard exclusions. Every Claude profile loads exactly its role plugin directory.
 
 ## Role Skill Contracts
+
+For every non-manager role, edit/write may persist only an assignment-required handoff at an exact path supplied by the assignment unless the role otherwise owns implementation.
 
 ### Manager
 
@@ -205,7 +208,7 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 - `manager-pi` and `manager-claude` have exact identity, model, authority prompt, tools, shared skill/plugin path, and empty fallbacks.
 - Every Pi profile has a non-empty role allowlist and exactly one scoped role skill; `manager-pi` additionally loads `harness-flow`.
 - Every Claude profile has explicit permission mode, allowed/disallowed tools, and exactly one scoped plugin directory.
-- Every non-manager Pi profile includes `edit` and `write` for assignment-required handoffs; role contracts still prohibit unassigned repository mutation.
+- Every non-manager Pi and Claude profile includes edit/write for assignment-required handoffs; role contracts still prohibit unassigned repository mutation.
 - Non-manager roles exclude hidden delegation tools.
 - Pi and Claude launch argv contain the exact tool, skill, permission, and plugin flags. AGY argv contains the exact model, plan mode, permission bypass, and bounded add-directory flags with no prompt source.
 - Invalid or escaping role resource paths remain rejected by existing parser tests.
@@ -288,7 +291,7 @@ Then inspect the live profile collection from the built extension and confirm:
   - Files: `herdr-profiles/*-pi.md`, `test/unit/profile-catalog.test.ts`.
 
 - [x] Configure all Claude profile capabilities.
-  - Acceptance: seven Claude profiles have explicit permissions, hard exclusions, and one role plugin; every non-manager profile disallows hidden `Task` delegation.
+  - Acceptance: seven Claude profiles have explicit permissions, hard exclusions, and one role plugin; every non-manager profile disallows hidden `Task` delegation and receives Edit/Write for exact-path handoffs.
   - Verify: unit capability-matrix and argv tests.
   - Files: `herdr-profiles/*-claude.md`, `test/unit/profile-catalog.test.ts`.
 
@@ -330,7 +333,7 @@ Then inspect the live profile collection from the built extension and confirm:
 - `manager-pi` can visibly orchestrate profile-backed workers through Herdr and cannot directly edit repositories.
 - All 17 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
 - All Pi and Claude variants use one shared role skill source per role; the managers also expose the cross-role harness contract.
-- No-hidden-delegation boundaries are mechanically represented in profile configuration; read-only repository behavior remains an explicit role contract because those Pi roles already have Bash and now also have edit/write for handoffs.
+- No-hidden-delegation boundaries are mechanically represented in profile configuration; read-only repository behavior remains an explicit role contract because those roles already have Bash and now also have edit/write for handoffs.
 - Unit tests, typecheck, lint, build, and integration tests pass.
 - The architecture decision is recorded in ADR-007.
 

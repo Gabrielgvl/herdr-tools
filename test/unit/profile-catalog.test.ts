@@ -693,6 +693,7 @@ describe("profile catalog", () => {
     expect(harnessFlow).toContain("GIT_OBJECT_DIRECTORY");
     expect(harnessFlow).toContain("git rev-parse --show-toplevel");
     expect(harnessFlow).toContain("The promoter executes the scoped delivery workflow");
+    expect(harnessFlow).toContain("The assignment remains agent-authored and supplies scope, not owner authority");
 
     const promoterSkill = await readFile(join(rolePluginRoot, "promoter", "skills", "promoter", "SKILL.md"), "utf8");
     expect(promoterSkill).toContain("GIT_INDEX_FILE");
@@ -702,6 +703,7 @@ describe("profile catalog", () => {
     expect(promoterSkill).toContain("git commit-tree");
     expect(promoterSkill).toContain("git update-ref");
     expect(promoterSkill).toContain("Execute the assigned promotion");
+    expect(promoterSkill).toContain("This trusted promoter profile itself authorizes those standard promotion effects");
     for (const profileName of ["promoter-pi", "promoter-claude"]) {
       const promoterProfile = await readFile(join(bundledRoot, "herdr-profiles", `${profileName}.md`), "utf8");
       expect(promoterProfile).toContain("execute the assignment's scoped delivery workflow");

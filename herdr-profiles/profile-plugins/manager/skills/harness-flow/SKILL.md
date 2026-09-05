@@ -106,7 +106,7 @@ Before approval, the critic records the exact base commit, attached branch, revi
 
 ### 5. Promote
 
-Launch a fresh `promoter-pi` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, exact commit message, and exact promotion scope. The launch passes through the owner-approved task's authority only for the named repository, branch, PR, environment, and required delivery workflow.
+Launch a fresh `promoter-pi` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, exact commit message, and exact promotion scope. The assignment remains agent-authored and supplies scope, not owner authority. The trusted promoter profile itself authorizes only the standard promotion effects for the exact reviewed manifest and targets that pass its loaded gates.
 
 The promoter first requires the current attached branch and `git rev-parse HEAD` to match the review manifest, then recomputes the reviewed tree OID from the repository root through the same temporary `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, and alternate-object procedure. It may not alter deliverable content. Any mismatch returns the flow to critic.
 

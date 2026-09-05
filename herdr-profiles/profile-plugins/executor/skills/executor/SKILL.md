@@ -3,7 +3,14 @@ name: executor
 description: "Use before calling Executor or any configured MCP integration through the Executor gateway."
 ---
 
-Treat Executor as the MCP gateway. Configured integrations are not limited to direct namespaces exposed by the host; discover and call them through `executor_execute`.
+Treat Executor as the MCP gateway. Configured integrations are not limited to direct namespaces exposed by the host; discover and call them through the host's Executor tools.
+
+Tool names depend on the host:
+
+- Pi: `executor_execute`, `executor_skills`, and `executor_resume`
+- Claude profile plugin: `mcp__plugin_herdr-executor_executor__execute`, `mcp__plugin_herdr-executor_executor__skills`, and `mcp__plugin_herdr-executor_executor__resume`
+
+When the instructions below name a Pi tool, use the corresponding Claude plugin tool in Claude.
 
 Before using a domain-specific integration, load the matching local guidance when it exists:
 

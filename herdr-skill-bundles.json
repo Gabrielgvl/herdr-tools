@@ -13,7 +13,7 @@
   "bundles": {
     "herdr-profiles/profile-plugins/manager/skills/manager": {
       "source": "./herdr-profiles/role-plugins/manager/skills/manager",
-      "treeHash": "cb44865a027494836e9a94b706f01cb3f8f0562c7a435e8beeb8f7554f321790"
+      "treeHash": "8a389bc15f84c52b68f67c02359743a67d71a04cda269bba00daf1a2d5bf6443"
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",
@@ -157,7 +157,7 @@
     },
     "herdr-profiles/profile-plugins/executor/skills/executor": {
       "source": "/home/gabriel/workspace/courier/.pi/skills/executor",
-      "treeHash": "1a468efd263bf3a1fc973c0bb8857c6c55b7005e65fb8b199ef5f6339a70231e"
+      "treeHash": "866be4521bf4d5656ffc9c543b42611902e5b3d94a14e7c7b293462bd98b3411"
     },
     "herdr-profiles/pi-skills/context-mode": {
       "source": "/home/gabriel/workspace/context-mode-pi-runtime/skills/context-mode",

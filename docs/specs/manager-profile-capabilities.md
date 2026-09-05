@@ -13,7 +13,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 ## Validated Owner Decisions
 
 - Keep `manager-pi` as the generic advisory default and add `manager-claude` for owner-requested Claude/Fable management or Claude-to-Claude succession.
-- Both manager profiles orchestrate visible workers. The Claude manager may use Bash, Edit, and Write only after direct owner approval for coordination artifacts, read-only verification, monitoring, or directly owner-authorized control-plane actions; it must not perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation.
+- Both manager profiles orchestrate visible workers and may use Edit/Write only for an exact assignment-supplied handoff or coordination path. The Claude manager still requires direct owner approval for Bash and control-plane actions. Neither manager may perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation.
 - Use role-scoped tool allowlists while retaining installed extension discovery.
 - Configure role-specific skills.
 - Advisory defaults are manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-agy for reconnaissance, researcher-agy for research, and reviewer-pi for review. The exact chains are `scout-agy -> scout-claude -> scout-pi`, `researcher-agy -> researcher-claude -> researcher-pi`, and `worker-pi -> worker-agy -> worker-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.

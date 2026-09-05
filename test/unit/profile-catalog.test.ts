@@ -637,10 +637,15 @@ describe("profile catalog", () => {
     expect(executorPi).toContain('directTools: ["execute", "skills", "resume"]');
     expect(executorPi).toContain("MCP_EXECUTOR_API_KEY");
     expect((await readdir(join(executorProfilePlugin, "skills"))).sort()).toEqual(["executor"]);
+    const executorSkill = await readFile(join(executorProfilePlugin, "skills", "executor", "SKILL.md"), "utf8");
+    expect(executorSkill).toContain("`executor_execute`, `executor_skills`, and `executor_resume`");
+    expect(executorSkill).toContain("`mcp__plugin_herdr-executor_executor__execute`");
 
     // The manager skill plugin holds the whole manager matrix. Executor stays
     // separate so only the four selected roles load its MCP server.
     expect((await readdir(join(managerProfilePlugin, "skills"))).sort()).toEqual([...rolePluginSkills.manager, ...managerProfileSkills].sort());
+    const managerRole = await readFile(join(rolePluginRoot, "manager", "skills", "manager", "SKILL.md"), "utf8");
+    expect(managerRole).toContain("Both managers receive Edit and Write only for an exact assignment-supplied handoff or coordination path");
     expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "medium", tools: [...piTools.manager], extensions: [join(executorProfilePlugin, "pi.ts")], skills: piSkills("manager") });
     expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual([]);
     const managerClaude = catalog.effective.get("manager-claude")!;

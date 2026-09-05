@@ -16,7 +16,8 @@
     "test:integration": "tsx scripts/test-integration.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "build": "tsc",
+    "generate:skill-bundles": "tsx scripts/generate-skill-bundles.ts",
+    "build": "npm run generate:skill-bundles && tsc",
     "build:mcp": "tsc -p tsconfig.build.json",
     "validate:plugin": "claude plugin validate ./herdr-profiles/role-plugins/manager"
   },
@@ -44,5 +45,8 @@
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.46.0",
     "vitest": "^4.1.9"
+  },
+  "volta": {
+    "node": "25.9.0"
   }
 }

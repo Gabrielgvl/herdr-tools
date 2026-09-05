@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, promises as fsPromises, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
@@ -6,7 +9,7 @@ import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolIm
 import { LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
-import { parseProfile, profileSource, type ProfileCatalog } from "../../src/profiles/index.js";
+import { parseProfile, profileSource, skillTreeDigest, SKILL_BUNDLE_REGISTRY_FILE, type ProfileCatalog } from "../../src/profiles/index.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { resultForRender } from "../../src/tui.js";
 import { stubSupervision, type StubSupervision } from "./supervision-fixtures.js";
@@ -81,6 +84,18 @@ function profile(name: string, kind: "pi" | "claude" | "agy" = "pi", fallbackPro
       ? "  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]"
       : `  kind: agy\n  model: gemini-3.8-flash-high\n  mode: ${agyMode}\n  addDirs: []`;
   return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${kind !== "pi"}\nruntime:\n${runtime}\nfallbackProfiles: ${JSON.stringify(fallbackProfiles)}\n---\n\nProfile body for ${name}.\n`, profileSource("bundled", `/profiles/${name}.md`, "/profiles"));
+}
+
+/** A real on-disk profile scope root, so physical containment is exercised. */
+function scopeRoot(label: string): string {
+  return mkdtempSync(join(tmpdir(), `herdr-scope-${label}-`));
+}
+
+function scopedProfile(root: string, name: string, resources: string, fallbackProfiles: string[] = [], kind: "pi" | "claude" = "pi") {
+  const runtime = kind === "pi"
+    ? `  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]\n${resources}`
+    : `  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]\n${resources}`;
+  return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${kind !== "pi"}\nruntime:\n${runtime}\nfallbackProfiles: ${JSON.stringify(fallbackProfiles)}\n---\n\nProfile body for ${name}.\n`, profileSource("bundled", join(root, `${name}.md`), root));
 }
 
 function catalog(...profiles: ReturnType<typeof profile>[]): ProfileCatalog {
@@ -2241,8 +2256,10 @@ describe("herdr_launch profile-only contract", () => {
       { ...valid, unknown: true }, { ...valid, profile: "" }, { ...valid, profile: "bad\nprofile" },
       { ...valid, overrides: null }, { ...valid, overrides: { unknown: true } }, { ...valid, overrides: { model: "" } },
       { ...valid, overrides: { thinking: "invalid" } }, { ...valid, overrides: { effort: "invalid" } }, { ...valid, overrides: { permissionMode: "invalid" } },
-      ...["tools", "extensions", "skills", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"].map((key) => ({ ...valid, overrides: { [key]: ["bad\nvalue"] } })),
-      ...["tools", "extensions", "skills", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"].map((key) => ({ ...valid, overrides: { [key]: 1 } })),
+      ...["tools", "extensions", "allowedTools", "disallowedTools", "addDirs"].map((key) => ({ ...valid, overrides: { [key]: ["bad\nvalue"] } })),
+      ...["tools", "extensions", "allowedTools", "disallowedTools", "addDirs"].map((key) => ({ ...valid, overrides: { [key]: 1 } })),
+      // Skill selection is profile-only, so these are unknown launch overrides.
+      ...["skills", "pluginDirs"].map((key) => ({ ...valid, overrides: { [key]: ["./skill"] } })),
       { ...valid, label: "" }, { ...valid, cwd: "" }, { ...valid, initialPrompt: "" }, { ...valid, initialPrompt: 1 }, { ...valid, focus: 1 },
       { ...valid, initialPrompt: "go", initialPromptDelivery: "elsewhere" }, { ...valid, initialPromptDelivery: "attachment" },
       { ...valid, placement: null }, { ...valid, placement: 1 }, { ...valid, placement: { mode: "same_tab", extra: true } },
@@ -2251,7 +2268,7 @@ describe("herdr_launch profile-only contract", () => {
       { ...valid, placement: { mode: "unsupported" } }
     ];
     for (const value of invalid) expect(() => validateLaunchParams(value as never)).toThrow();
-    expect(() => validateLaunchParams({ ...valid, overrides: { model: "m", tools: [], extensions: [], skills: [], allowedTools: [], disallowedTools: [], addDirs: [], pluginDirs: [] }, placement: { mode: "same_tab" } })).not.toThrow();
+    expect(() => validateLaunchParams({ ...valid, overrides: { model: "m", tools: [], extensions: [], allowedTools: [], disallowedTools: [], addDirs: [] }, placement: { mode: "same_tab" } })).not.toThrow();
   });
 
   it("retains the failing phase and bounded CLI evidence at the launch boundary", async () => {
@@ -2973,20 +2990,139 @@ describe("herdr_launch profile-only contract", () => {
     const calls: string[][] = [];
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/custom.md" })) };
     const result = await launch({ name: "worker", profile: "custom-profile", overrides: { model: "override/model", thinking: "high" } }, catalog(worker), makeCli({ calls }).cli, promptSources);
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read", "--no-session", "--append-system-prompt", "/cache/custom.md"]);
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/custom.md"]);
     expect(result.details).toMatchObject({ profile: { name: "custom-profile", requested: "custom-profile", selected: "custom-profile", source: { path: "/profiles/custom-profile.md" }, timeoutMinutes: 30, runtime: { kind: "pi", model: "override/model", thinking: "high" }, permissions: { sessionPersistence: false, tools: ["read"], extensions: [], skills: [] }, attempts: [{ profile: "custom-profile", outcome: "selected" }] } });
   });
 
-  it("reports normalized primary capability overrides instead of profile defaults", async () => {
-    const base = profile("resource-profile");
-    const resourceProfile = {
-      ...base,
-      runtime: { kind: "pi" as const, model: "test/model", thinking: "low" as const, tools: ["read"], extensions: ["/profiles/base-extension"], skills: ["/profiles/base-skill"] }
-    };
+  it("reports normalized primary capability overrides but keeps skill selection profile-only", async () => {
+    const root = scopeRoot("resource");
+    mkdirSync(join(root, "base-skill"), { recursive: true });
+    writeFileSync(join(root, "base-skill", "SKILL.md"), "canonical body\n");
+    writeFileSync(join(root, "base-extension.ts"), "export default 0;\n");
+    writeFileSync(join(root, "override-extension.ts"), "export default 1;\n");
+    const resourceProfile = scopedProfile(root, "resource-profile", "  extensions: [./base-extension.ts]\n  skills: [./base-skill]");
     const calls: string[][] = [];
-    const result = await launch({ name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "grep"], extensions: ["./override-extension"], skills: ["./override-skill"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,grep", "--extension", "/profiles/override-extension", "--skill", "/profiles/override-skill", "--no-session", "--append-system-prompt", "/cache/body.md"]);
-    expect(result.details).toMatchObject({ profile: { runtime: { model: "override/model", thinking: "high" }, permissions: { tools: ["read", "grep"], extensions: ["/profiles/override-extension"], skills: ["/profiles/override-skill"] } } });
+    const result = await launch({ name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "grep"], extensions: ["./override-extension.ts"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,grep", "--extension", join(root, "override-extension.ts"), "--no-skills", "--skill", join(root, "base-skill"), "--no-session", "--append-system-prompt", "/cache/body.md"]);
+    expect(result.details).toMatchObject({ profile: { runtime: { model: "override/model", thinking: "high" }, permissions: { tools: ["read", "grep"], extensions: [join(root, "override-extension.ts")], skills: [join(root, "base-skill")] } } });
+    await expect(launch({ name: "worker", profile: "resource-profile", overrides: { skills: ["./base-skill"] } as never }, catalog(resourceProfile), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
+  it("refuses an escaping or stale skill selection for any reachable profile before the first launch effect", async () => {
+    const root = scopeRoot("escape");
+    const outside = mkdtempSync(join(tmpdir(), "herdr-outside-"));
+    mkdirSync(join(outside, "skill"), { recursive: true });
+    writeFileSync(join(outside, "skill", "SKILL.md"), "outside body\n");
+    symlinkSync(join(outside, "skill"), join(root, "escaping-skill"), "dir");
+    const escaping = scopedProfile(root, "escaping-profile", "  skills: [./escaping-skill]");
+    const calls: string[][] = [];
+    const attachments = fakeAttachments();
+    const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
+    await expect(launch({ name: "worker", profile: "escaping-profile" }, catalog(escaping), makeCli({ calls }).cli, promptSources, { attachments }))
+      .rejects.toMatchObject({ code: "PROFILE_SKILL_PATH_ESCAPES_SCOPE", details: { profile: "escaping-profile" } });
+    expect(calls).toHaveLength(0);
+    expect(attachments.ensureRecipient).not.toHaveBeenCalled();
+    expect(promptSources.create).not.toHaveBeenCalled();
+    expect(lastSupervision.reserved).toHaveLength(0);
+
+    // A fallback profile is validated too, even though the primary is sound.
+    mkdirSync(join(root, "generated", "good-skill"), { recursive: true });
+    writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "good body\n");
+    const primary = scopedProfile(root, "primary-profile", "  skills: [./generated/good-skill]", ["escaping-profile"]);
+    const chainCalls: string[][] = [];
+    await expect(launch({ name: "worker", profile: "primary-profile" }, catalog(primary, escaping), makeCli({ calls: chainCalls }).cli))
+      .rejects.toMatchObject({ code: "PROFILE_SKILL_PATH_ESCAPES_SCOPE", details: { profile: "escaping-profile" } });
+    expect(chainCalls).toHaveLength(0);
+
+    // A generated bundle whose copy no longer matches its pin is stale, not repaired.
+    const soloProfile = catalog(scopedProfile(root, "primary-profile", "  skills: [./generated/good-skill]"));
+    writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ bundles: { "generated/good-skill": { source: "./generated/good-skill", treeHash: "0".repeat(64) } } }));
+    const staleCalls: string[][] = [];
+    const staleAttachments = fakeAttachments();
+    const stalePromptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
+    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: staleCalls }).cli, stalePromptSources, { attachments: staleAttachments }))
+      .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { profile: "primary-profile", path: join(root, "generated", "good-skill"), expected: "0".repeat(64) } });
+    expect(staleCalls).toHaveLength(0);
+    expect(staleAttachments.ensureRecipient).not.toHaveBeenCalled();
+    expect(stalePromptSources.create).not.toHaveBeenCalled();
+    expect(lastSupervision.reserved).toHaveLength(0);
+
+    // Canonical drift is caught even when the generated copy still matches its
+    // pin, and it also fails before the first launch effect.
+    const canonical = join(outside, "canonical-skill");
+    mkdirSync(canonical, { recursive: true });
+    writeFileSync(join(canonical, "SKILL.md"), "canonical body\n");
+    writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "canonical body\n");
+    const pinned = await skillTreeDigest(canonical);
+    writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ approvedSourceRoots: [outside], bundles: { "generated/good-skill": { source: canonical, treeHash: pinned } } }));
+    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
+
+    // A swap that lands after preflight but before the agent starts never
+    // reaches the CLI: the attempt revalidates immediately before its argv, so
+    // the content the agent loads is the content that passed the pin.
+    const swapCalls: string[][] = [];
+    const swapped = makeCli({ calls: swapCalls });
+    const swapCli: LaunchCli = {
+      runJson: async (argv, signal, preserveCompletedMutation) => {
+        // The last topology call before agent start, i.e. deep inside the
+        // validation-to-spawn window the old single preflight left open.
+        if (argv[0] === "pane" && argv[1] === "rename") writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "swapped after validation\n");
+        return swapped.cli.runJson(argv, signal, preserveCompletedMutation);
+      }
+    };
+    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, swapCli))
+      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "PROFILE_SKILL_BUNDLE_STALE", profile: "primary-profile", path: join(root, "generated", "good-skill"), expected: pinned } });
+    expect(swapCalls.some((call) => call[0] === "agent" && call[1] === "start")).toBe(false);
+    writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "canonical body\n");
+
+    writeFileSync(join(canonical, "SKILL.md"), "canonical drifted\n");
+    const driftCalls: string[][] = [];
+    const driftAttachments = fakeAttachments();
+    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: driftCalls }).cli, undefined, { attachments: driftAttachments }))
+      .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { profile: "primary-profile", path: canonical, expected: pinned } });
+    expect(driftCalls).toHaveLength(0);
+    expect(driftAttachments.ensureRecipient).not.toHaveBeenCalled();
+
+    // An external canonical source outside the approved set never launches.
+    writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ approvedSourceRoots: [join(outside, "elsewhere")], bundles: { "generated/good-skill": { source: canonical, treeHash: pinned } } }));
+    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli))
+      .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", details: { profile: "primary-profile" } });
+
+    // An unexpected IO failure is re-raised as itself, never relabeled as a
+    // skill-selection verdict. The denial is injected rather than produced with
+    // chmod 000, because root bypasses directory permissions and would make the
+    // assertion pass or fail on the runner's UID instead of on the behaviour.
+    rmSync(join(root, SKILL_BUNDLE_REGISTRY_FILE));
+    const denied = Object.assign(new Error("EACCES: permission denied, scandir"), { code: "EACCES" });
+    const readdir = vi.spyOn(fsPromises, "readdir").mockRejectedValue(denied);
+    try {
+      await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      readdir.mockRestore();
+    }
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it("keeps Claude plugin selection additive and leaves AGY ambient skills untouched", async () => {
+    const root = scopeRoot("claude");
+    mkdirSync(join(root, "role-plugin", "skills", "worker"), { recursive: true });
+    writeFileSync(join(root, "role-plugin", "skills", "worker", "SKILL.md"), "worker body\n");
+    const claudeProfile = scopedProfile(root, "claude-profile", "  pluginDirs: [./role-plugin]", [], "claude");
+    const claudeCalls: string[][] = [];
+    await launch({ name: "worker", profile: "claude-profile" }, catalog(claudeProfile), makeCli({ calls: claudeCalls }).cli);
+    const claudeArgv = claudeCalls.find((call) => call[0] === "agent" && call[1] === "start")!;
+    // Additive by construction: Claude has no exclusivity flag here, so the
+    // selected plugin loads on top of the viewer's ambient configuration.
+    expect(claudeArgv).toContain("--plugin-dir");
+    expect(claudeArgv[claudeArgv.indexOf("--plugin-dir") + 1]).toBe(join(root, "role-plugin"));
+    expect(claudeArgv).not.toContain("--no-skills");
+
+    const agyCalls: string[][] = [];
+    await launch({ name: "researcher", profile: "agy-profile", initialPrompt: "go" }, catalog(profile("agy-profile", "agy")), makeCli({ calls: agyCalls }).cli);
+    const agyArgv = agyCalls.find((call) => call[0] === "agent" && call[1] === "start")!;
+    // AGY has no per-session selector, so Herdr passes none and mutates no
+    // global or project skill/plugin state to fake one.
+    for (const flag of ["--skill", "--no-skills", "--plugin-dir", "--settings", "--config"]) expect(agyArgv).not.toContain(flag);
   });
 
   it("stops before mutation when the catalog is unavailable and preserves abort evidence", async () => {
@@ -3078,10 +3214,7 @@ describe("herdr_launch profile-only contract", () => {
     expect(supervision.bound).toHaveLength(0);
   });
 
-  it.each([
-    ["primary", catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi"))],
-    ["reachable fallback", catalog(profile("researcher-pi", "pi", ["researcher-agy"]), profile("researcher-agy", "agy"))]
-  ] as const)("rejects a promptless AGY %s before any mutation or reservation", async (_label, profiles) => {
+  it("rejects a promptless requested AGY profile before any mutation or reservation", async () => {
     const harness = makeCli();
     const attachments = fakeAttachments();
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
@@ -3089,7 +3222,7 @@ describe("herdr_launch profile-only contract", () => {
     const recipientRecord = vi.spyOn(recipients, "recordFor");
     const supervision = stubSupervision();
 
-    await expect(launch({ name: "worker", profile: _label === "primary" ? "researcher-agy" : "researcher-pi" }, profiles, harness.cli, promptSources, { attachments, recipients, supervision }))
+    await expect(launch({ name: "worker", profile: "researcher-agy" }, catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi")), harness.cli, promptSources, { attachments, recipients, supervision }))
       .rejects.toMatchObject({ code: "INVALID_INPUT", details: { phase: "resolve_profile", effectCertainty: "absent" } });
 
     expect(harness.calls).toHaveLength(0);
@@ -3100,6 +3233,22 @@ describe("herdr_launch profile-only contract", () => {
     expect(supervision.reserved).toHaveLength(0);
     expect(supervision.released).toHaveLength(0);
     expect(recipientRecord).not.toHaveBeenCalled();
+  });
+
+  it("launches a promptless non-AGY profile whose fallback chain reaches AGY", async () => {
+    const calls: string[][] = [];
+    const result = await launch({ name: "worker", profile: "worker-pi" }, catalog(profile("worker-pi", "pi", ["worker-agy"]), profile("worker-agy", "agy")), makeCli({ calls }).cli);
+
+    expect(result.details).toMatchObject({
+      kind: "pi",
+      initialPromptSent: false,
+      profile: { requested: "worker-pi", selected: "worker-pi", reachableNames: ["worker-pi", "worker-agy"], attempts: [{ profile: "worker-agy", outcome: "fallback_refused" }, { profile: "worker-pi", outcome: "selected" }] }
+    });
+    // The unlaunchable AGY fallback never reaches a start attempt.
+    const starts = calls.filter((call) => call[0] === "agent" && call[1] === "start");
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toContain("pi");
+    expect(starts.flat()).not.toContain("agy");
   });
 
   it("rejects malformed AGY interactive readiness before prompt bytes", async () => {
@@ -3638,7 +3787,7 @@ describe("herdr_launch profile-only contract", () => {
     ]);
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "pi")).toEqual([
       "agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--",
-      "--model", "test/model", "--thinking", "low", "--tools", "read", "--no-session", "--append-system-prompt", "/cache/body.md"
+      "--model", "test/model", "--thinking", "low", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/body.md"
     ]);
     expect(result.details).toMatchObject({ kind: "pi", profile: { requested: "primary", selected: "fallback" } });
   });

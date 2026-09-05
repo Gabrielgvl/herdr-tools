@@ -13,7 +13,7 @@ import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.j
 import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
-import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
+import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
@@ -302,6 +302,22 @@ class LaunchError extends Error {
   }
 }
 
+/**
+ * Fail-closed resource validation for one profile, with the skill-selection
+ * verdict carried through as a launch failure and any unexpected IO error
+ * re-raised as itself.
+ */
+async function assertResourceSelection(profile: Profile, runtime: RuntimeProfile): Promise<void> {
+  try {
+    await validateProfileResourceSelection(profile, runtime);
+  } catch (error) {
+    if (!(error instanceof SkillSelectionError)) throw error;
+    // `causeCode` keeps the skill-selection verdict legible when this runs after
+    // the first effect, where the outer handler reports `LAUNCH_FAILED`.
+    throw new LaunchError(error.code, error.message, { causeCode: error.code, profile: profile.name, ...error.details });
+  }
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -328,12 +344,12 @@ function validateParams(params: LaunchRequest): void {
   profileIdentifier(params.profile);
   if (params.overrides !== undefined) {
     if (!record(params.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
-    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort", "tools", "extensions", "skills", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
+    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort", "tools", "extensions", "permissionMode", "allowedTools", "disallowedTools", "addDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
     if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
     if (params.overrides.thinking !== undefined && (typeof params.overrides.thinking !== "string" || !THINKING_LEVELS.includes(params.overrides.thinking as typeof THINKING_LEVELS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.thinking is invalid");
     if (params.overrides.effort !== undefined && (typeof params.overrides.effort !== "string" || !CLAUDE_EFFORTS.includes(params.overrides.effort as typeof CLAUDE_EFFORTS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.effort is invalid");
     if (params.overrides.permissionMode !== undefined && (typeof params.overrides.permissionMode !== "string" || !CLAUDE_PERMISSION_MODES.includes(params.overrides.permissionMode as typeof CLAUDE_PERMISSION_MODES[number]))) throw new LaunchError("INVALID_INPUT", "overrides.permissionMode is invalid");
-    for (const key of ["tools", "extensions", "skills", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"] as const) {
+    for (const key of ["tools", "extensions", "allowedTools", "disallowedTools", "addDirs"] as const) {
       const value = params.overrides[key];
       if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0 || /[\0\r\n]/.test(item)))) throw new LaunchError("INVALID_INPUT", `overrides.${key} must be non-empty strings without NUL or newlines`);
     }
@@ -1868,16 +1884,36 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           if (!profile) throw new LaunchError("PROFILE_RESOLUTION_INVALID", `Resolved profile ${name} is unavailable`);
           return profile;
         });
-        if (params.initialPrompt === undefined && profiles.some((profile) => profile.runtime.kind === "agy")) {
-          throw new LaunchError("INVALID_INPUT", "AGY launches require initialPrompt");
+        // AGY's mandatory assignment is the initial prompt, so a promptless launch
+        // is refused only when AGY is the requested profile. A merely reachable AGY
+        // fallback is dropped from the launchable chain instead, because starting it
+        // without a prompt could never strengthen past provisional supervision, and
+        // refusing the whole request would block every promptless launch of a
+        // non-AGY chain such as `worker-pi -> worker-agy -> worker-claude`.
+        if (params.initialPrompt === undefined) {
+          if (profileResolution.profile.runtime.kind === "agy") throw new LaunchError("INVALID_INPUT", "AGY launches require initialPrompt");
+          for (const candidate of profiles) {
+            if (candidate.runtime.kind === "agy") attempts.push({ profile: candidate.name, outcome: "fallback_refused", errorCode: "INVALID_INPUT", message: "AGY fallback requires initialPrompt" });
+          }
+          profiles = profiles.filter((candidate) => candidate.runtime.kind !== "agy");
+        }
+        // Physical containment and generated-bundle freshness are validated for
+        // every reachable fallback profile before the first launch effect, so a
+        // symlink escape or a stale generated skill copy fails with no
+        // recipient, prompt source, reservation, or topology change at all.
+        // There is no automatic repair.
+        for (const profile of profiles) {
+          const overrides = profile.name === params.profile ? params.overrides : {};
+          const runtime = resolveProfileRuntime(profile, overrides);
+          effectiveRuntimes.set(profile.name, runtime);
+          await assertResourceSelection(profile, runtime);
         }
         recipientKey = mintRecipientKey();
         grant = await attachmentStore.ensureRecipient(recipientKey);
         const promptStore = deps.promptSources ?? defaultPromptSourceStore;
         for (const profile of profiles) {
           const overrides = profile.name === params.profile ? params.overrides : {};
-          const runtime = resolveProfileRuntime(profile, overrides);
-          effectiveRuntimes.set(profile.name, runtime);
+          const runtime = effectiveRuntimes.get(profile.name)!;
           const capability = attachmentCapability(profile, overrides);
           capabilities.set(profile.name, capability);
           // Any profile the fallback chain can start may be the one that receives the
@@ -1982,6 +2018,19 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         let startedAgent: StartedAgent | undefined;
         for (const profile of profiles) {
           const runtime = effectiveRuntimes.get(profile.name)!;
+          // Re-validated for this attempt immediately before its argv is built,
+          // because the preflight above is separated from the spawn by recipient
+          // creation, prompt-source writes, context resolution, supervision
+          // reservation, and topology mutation -- a window of seconds and several
+          // CLI round-trips in which a swapped skill tree or repointed symlink
+          // would otherwise reach the agent unchecked. This narrows that window
+          // to the gap between the last digest read and the child's own open();
+          // it does not close it, because the CLI accepts paths rather than open
+          // handles. The residual is bounded: winning it needs write access to
+          // the profile scope root or a canonical source tree, and anyone with
+          // that access can already edit the package's own code or registry, so
+          // the race grants no capability they lack.
+          await assertResourceSelection(profile, runtime);
           const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path)];
           const attemptStartedAt = clock.now();
           try {

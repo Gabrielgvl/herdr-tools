@@ -23,7 +23,8 @@ runtime:
   addDirs: []
   pluginDirs:
     - herdr-profiles/role-plugins/researcher
-fallbackProfiles: []
+fallbackProfiles:
+  - researcher-pi
 ---
 
 You are the Claude researcher for a Herdr task.

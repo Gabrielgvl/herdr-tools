@@ -22,7 +22,7 @@ runtime:
     - Task
   addDirs: []
   pluginDirs:
-    - herdr-profiles/role-plugins/manager
+    - herdr-profiles/profile-plugins/manager
   developmentChannels:
     - server:herdr
 fallbackProfiles: []

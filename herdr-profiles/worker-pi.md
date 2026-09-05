@@ -31,6 +31,13 @@ runtime:
   extensions: []
   skills:
     - herdr-profiles/role-plugins/worker/skills/worker
+    - herdr-profiles/role-plugins/worker/skills/tdd
+    - herdr-profiles/role-plugins/worker/skills/git-flow
+    - herdr-profiles/role-plugins/worker/skills/adr
+    - herdr-profiles/role-plugins/worker/skills/typescript
+    - herdr-profiles/role-plugins/worker/skills/delivery-assurance
+    - herdr-profiles/pi-skills/context-mode
+    - herdr-profiles/pi-skills/tmux-background-tasks
 fallbackProfiles:
   - worker-agy
 ---

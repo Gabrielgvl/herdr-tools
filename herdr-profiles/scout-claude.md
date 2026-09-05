@@ -21,7 +21,8 @@ runtime:
   addDirs: []
   pluginDirs:
     - herdr-profiles/role-plugins/scout
-fallbackProfiles: []
+fallbackProfiles:
+  - scout-pi
 ---
 
 You are the Claude scout for a Herdr task.

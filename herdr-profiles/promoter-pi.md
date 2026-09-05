@@ -6,16 +6,29 @@ sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna
-  thinking: high
+  thinking: max
   tools:
     - read
     - bash
     - grep
     - find
     - ls
+    - ctx_execute
+    - ctx_execute_file
+    - ctx_search
   extensions: []
   skills:
     - herdr-profiles/role-plugins/promoter/skills/promoter
+    - herdr-profiles/role-plugins/promoter/skills/git-flow
+    - herdr-profiles/role-plugins/promoter/skills/delivery-assurance
+    - herdr-profiles/role-plugins/promoter/skills/courier-pr-gates
+    - herdr-profiles/role-plugins/promoter/skills/dev-evidence-gate
+    - herdr-profiles/role-plugins/promoter/skills/release-pr-validation
+    - herdr-profiles/role-plugins/promoter/skills/shared-dev-deploy
+    - herdr-profiles/role-plugins/promoter/skills/authenticated-staging-smoke
+    - herdr-profiles/role-plugins/promoter/skills/services-ci-gates
+    - herdr-profiles/pi-skills/context-mode
+    - herdr-profiles/pi-skills/tmux-background-tasks
 fallbackProfiles:
   - promoter-claude
 ---

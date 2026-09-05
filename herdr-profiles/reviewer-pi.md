@@ -6,7 +6,7 @@ sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-sol
-  thinking: high
+  thinking: medium
   tools:
     - read
     - bash
@@ -25,6 +25,13 @@ runtime:
   extensions: []
   skills:
     - herdr-profiles/role-plugins/reviewer/skills/reviewer
+    - herdr-profiles/role-plugins/reviewer/skills/adr
+    - herdr-profiles/role-plugins/reviewer/skills/typescript
+    - herdr-profiles/role-plugins/reviewer/skills/delivery-assurance
+    - herdr-profiles/role-plugins/reviewer/skills/oracle
+    - herdr-profiles/role-plugins/reviewer/skills/pi-review-pr
+    - herdr-profiles/pi-skills/context-mode
+    - herdr-profiles/pi-skills/tmux-background-tasks
 fallbackProfiles:
   - reviewer-claude
 ---

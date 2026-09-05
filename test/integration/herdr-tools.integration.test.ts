@@ -575,17 +575,17 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const profileItems = resultObject(profiles.details).items;
     expect(Array.isArray(profileItems) ? profileItems : []).toHaveLength(17);
     expect(profileItems).toEqual(expect.arrayContaining([
-      expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: expect.arrayContaining(["herdr_tab"]), skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow")]) }),
+      expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "medium", tools: expect.arrayContaining(["herdr_tab"]), skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow")]) }),
       expect.objectContaining({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", fallbackProfiles: [] }),
-      expect.objectContaining({ name: "promoter-pi", kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "high", fallbackProfiles: ["promoter-claude"] }),
-      expect.objectContaining({ name: "scout-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["scout-pi"] }),
+      expect.objectContaining({ name: "promoter-pi", kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max", fallbackProfiles: ["promoter-claude"] }),
+      expect.objectContaining({ name: "scout-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["scout-claude"] }),
       expect.objectContaining({ name: "worker-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["worker-claude"] }),
-      expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-pi"] })
+      expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-claude"] })
     ]));
     const manager = await tool("herdr_inspect").execute("manager", { mode: "profile", profile: "manager-pi" }, signal(), undefined, toolContext());
-    expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: ["read", "grep", "find", "ls", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"], extensions: [], skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow")]), fallbackProfiles: [] });
+    expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "medium", tools: ["read", "grep", "find", "ls", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"], extensions: [], skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow")]), fallbackProfiles: [] });
     const managerClaude = await tool("herdr_inspect").execute("manager-claude", { mode: "profile", profile: "manager-claude" }, signal(), undefined, toolContext());
-    expect(resultObject(managerClaude.details).profile).toMatchObject({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "mcp__plugin_herdr-tools_herdr"], disallowedTools: ["Task"], pluginDirs: [expect.stringContaining("herdr-profiles/role-plugins/manager")] });
+    expect(resultObject(managerClaude.details).profile).toMatchObject({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "mcp__plugin_herdr-tools_herdr"], disallowedTools: ["Task"], pluginDirs: [expect.stringContaining("herdr-profiles/profile-plugins/manager")] });
     const workerAgy = await tool("herdr_inspect").execute("worker-agy", { mode: "profile", profile: "worker-agy" }, signal(), undefined, toolContext());
     expect(resultObject(workerAgy.details).profile).toMatchObject({ name: "worker-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", dangerouslySkipPermissions: true, fallbackProfiles: ["worker-claude"], reachableNames: ["worker-agy", "worker-claude"] });
     const inspected = await tool("herdr_inspect").execute("inspect", { mode: "collection", collection: "panes" }, signal(), undefined, toolContext());
@@ -707,8 +707,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         runtime: { kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true },
         permissions: { sessionPersistence: true, addDirs: [] },
         attempts: [{ profile: "researcher-agy", outcome: "selected" }],
-        fallbackProfiles: ["researcher-pi"],
-        reachableNames: ["researcher-agy", "researcher-pi", "researcher-claude"]
+        fallbackProfiles: ["researcher-claude"],
+        reachableNames: ["researcher-agy", "researcher-claude", "researcher-pi"]
       }
     });
     const baseline = resultObject(resultObject(provisionalJob.supervision).provisional).baseline as Record<string, unknown>;
@@ -768,7 +768,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(state.forceNextAgyStartFailure).toBe(false);
     expect(starts[0]).toEqual(expect.arrayContaining(["--kind", "agy", "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions"]));
     expect(starts[0]!.slice(-2)).toEqual(["--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
-    expect(starts[1]).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna"]));
+    expect(starts[1]).toEqual(expect.arrayContaining(["--kind", "claude", "--model", "claude-sonnet-5"]));
     const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
     expect(promptCalls).toHaveLength(1);
     expect(promptCalls[0]!.args).toEqual(["agent", "prompt", paneId, "--stdin"]);
@@ -776,18 +776,18 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(calls.findIndex((args) => args === starts[1])).toBeLessThan(calls.findIndex((args) => args[0] === "agent" && args[1] === "prompt"));
     expect(calls.filter((args) => (["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
     expect(details).toMatchObject({
-      kind: "pi",
+      kind: "claude",
       promptSubmitted: true,
       promptConsumption: "confirmed",
       recipientRegistered: true,
-      supervision: { state: "active", child: { paneId, agentKind: "pi", profileName: "researcher-pi" } },
+      supervision: { state: "active", child: { paneId, agentKind: "claude", profileName: "researcher-claude" } },
       profile: {
         requested: "researcher-agy",
-        selected: "researcher-pi",
-        runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna" },
+        selected: "researcher-claude",
+        runtime: { kind: "claude", model: "claude-sonnet-5" },
         attempts: [
           { profile: "researcher-agy", outcome: "agent_start_failed", errorCode: "agent_start_failed", message: "agent process exited before becoming interactive", postState: { pane_id: paneId, agent_status: "unknown" } },
-          { profile: "researcher-pi", outcome: "selected" }
+          { profile: "researcher-claude", outcome: "selected" }
         ]
       }
     });
@@ -882,6 +882,14 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(inline.details).toMatchObject({ initialPromptDelivery: "inline", initialPromptSubmission: { confirmed: true } });
     const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
     expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", "read,bash,grep,find,ls,ffgrep,fffind,ctx_execute,ctx_execute_file,ctx_search,web_search,source_check,fetch_content,get_search_content,edit,write,bash_bg,jobs,job_decide,monitor", "--skill", expect.stringContaining("herdr-profiles/role-plugins/worker/skills/worker"), "--append-system-prompt"]));
+    // Pi exact isolation is positional, so `arrayContaining` cannot assert it:
+    // exactly one `--no-skills` must precede every `--skill`, otherwise Pi
+    // discovers the ambient project/user catalog first and silently skips a
+    // selected generated copy whose skill name collides with an ambient one.
+    const skillIndexes = startArgs!.flatMap((arg, index) => (arg === "--skill" ? [index] : []));
+    expect(startArgs!.filter((arg) => arg === "--no-skills")).toEqual(["--no-skills"]);
+    expect(skillIndexes.length).toBeGreaterThan(0);
+    expect(Math.min(...skillIndexes)).toBeGreaterThan(startArgs!.indexOf("--no-skills"));
     expect(state.profilePromptContent).toContain("Use the worker role skill");
 
     const inlinePaneId = String(inline.details.paneId ?? resultObject(inline.details.created).paneId);

@@ -21,8 +21,9 @@ runtime:
   extensions: []
   skills:
     - herdr-profiles/role-plugins/scout/skills/scout
-fallbackProfiles:
-  - scout-claude
+    - herdr-profiles/pi-skills/context-mode
+    - herdr-profiles/pi-skills/tmux-background-tasks
+fallbackProfiles: []
 ---
 
 You are the Pi scout for a Herdr task.

@@ -25,8 +25,10 @@ runtime:
   extensions: []
   skills:
     - herdr-profiles/role-plugins/researcher/skills/researcher
-fallbackProfiles:
-  - researcher-claude
+    - herdr-profiles/role-plugins/researcher/skills/humanizer
+    - herdr-profiles/pi-skills/context-mode
+    - herdr-profiles/pi-skills/tmux-background-tasks
+fallbackProfiles: []
 ---
 
 You are the Pi researcher for a Herdr task.

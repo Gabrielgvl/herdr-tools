@@ -9,7 +9,7 @@ runtime:
   mode: plan
   addDirs: []
 fallbackProfiles:
-  - scout-pi
+  - scout-claude
 ---
 
 Catalog metadata only. Herdr does not deliver this profile body to AGY. Every AGY task must be self-contained and sent through Herdr's visible v1 provenance-wrapped assignment.

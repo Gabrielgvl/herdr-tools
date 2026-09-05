@@ -6,7 +6,7 @@ sessionPersistence: false
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-sol
-  thinking: high
+  thinking: medium
   tools:
     - read
     - grep
@@ -23,6 +23,12 @@ runtime:
   skills:
     - herdr-profiles/role-plugins/manager/skills/manager
     - herdr-profiles/role-plugins/manager/skills/harness-flow
+    - herdr-profiles/profile-plugins/manager/skills/herdr-manager
+    - herdr-profiles/profile-plugins/manager/skills/engineering-project-manager
+    - herdr-profiles/profile-plugins/manager/skills/oracle
+    - herdr-profiles/profile-plugins/manager/skills/pi-review-pr
+    - herdr-profiles/profile-plugins/manager/skills/decision-batch
+    - herdr-profiles/profile-plugins/manager/skills/delivery-assurance
 fallbackProfiles: []
 ---
 

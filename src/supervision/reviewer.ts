@@ -18,7 +18,6 @@ import type { SupervisionModelService } from "./model-service.js";
 /** The exact supervisor review model. Not configurable: see the module comment. */
 export const SUPERVISION_REVIEWER_MODEL = "openai-codex/gpt-5.6-luna";
 export const SUPERVISION_REVIEWER_THINKING = "max" as const;
-export const SUPERVISION_REVIEWER_MAX_TOKENS = 512;
 
 const MAX_PROMPT_BYTES = 16_000;
 
@@ -97,8 +96,9 @@ export class ModelSupervisionReviewer implements SupervisionReviewer {
         ...(resolved.apiKey === undefined ? {} : { apiKey: resolved.apiKey }),
         ...(resolved.headers === undefined ? {} : { headers: resolved.headers }),
         signal,
-        maxTokens: SUPERVISION_REVIEWER_MAX_TOKENS,
-        thinkingLevel: SUPERVISION_REVIEWER_THINKING,
+        // The option name the transport reads; one named for the thinking level
+        // is dropped. It sends no output-token limit, so none is requested here.
+        reasoningEffort: SUPERVISION_REVIEWER_THINKING,
       });
       if (signal.aborted || message.stopReason === "aborted") throw new ReviewerFailure("Supervision review aborted", { paneId: request.paneId, code: "ABORTED" });
       const parsed = strictResult(request.paneId, textFrom(message));

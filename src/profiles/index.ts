@@ -5,3 +5,4 @@ export * from "./resolution.js";
 export * from "./adapters.js";
 export * from "./prompt-file.js";
 export * from "./capability.js";
+export * from "./skill-bundles.js";

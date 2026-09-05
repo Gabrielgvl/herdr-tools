@@ -9,7 +9,6 @@ import {
 import {
   ModelSupervisionReviewer,
   needsManagerAttention,
-  SUPERVISION_REVIEWER_MAX_TOKENS,
   SUPERVISION_REVIEWER_MODEL,
   SUPERVISION_REVIEWER_THINKING,
 } from "../../src/supervision/reviewer.js";
@@ -58,8 +57,11 @@ describe("the supervision reviewer", () => {
     );
     await expect(reviewer.review(request, new AbortController().signal)).resolves.toEqual({ classification: "progress", summary: "moving" });
     expect(SUPERVISION_REVIEWER_MODEL).toBe("openai-codex/gpt-5.6-luna");
-    expect(calls[0]!.options).toMatchObject({ thinkingLevel: SUPERVISION_REVIEWER_THINKING, maxTokens: SUPERVISION_REVIEWER_MAX_TOKENS, apiKey: "k", headers: { a: "b" } });
+    expect(calls[0]!.options).toMatchObject({ reasoningEffort: SUPERVISION_REVIEWER_THINKING, apiKey: "k", headers: { a: "b" } });
     expect(SUPERVISION_REVIEWER_THINKING).toBe("max");
+    // The pinned level must travel under the name the transport reads; an
+    // option named for the thinking level is accepted by the type and dropped.
+    expect(calls[0]!.options).not.toHaveProperty("thinkingLevel");
   });
 
   it("omits credentials the service did not supply and bounds the prompt", async () => {
@@ -102,6 +104,39 @@ describe("the supervision reviewer", () => {
 
     const unresolvable = new ModelSupervisionReviewer({ resolve: async () => { throw new ReviewerFailure("no model"); } }, async () => message("{}"));
     await expect(unresolvable.review(request, new AbortController().signal)).rejects.toThrow(/no model/u);
+  });
+
+  it("reads a wrapped answer without relaxing the schema and names the shape of an unusable one", async () => {
+    const reviewerFor = (raw: string) => new ModelSupervisionReviewer({ resolve: async () => ({ model }) }, async () => message(raw));
+    const review = (raw: string) => reviewerFor(raw).review(request, new AbortController().signal);
+
+    // The recurring live failure: the intended object arrives inside a markdown
+    // fence after a sentence, which a raw `JSON.parse` of the whole text refused.
+    await expect(review("Here is my judgement.\n\n```json\n{\n  \"classification\": \"stalled\",\n  \"summary\": \"no new output for a full cadence\"\n}\n```\n"))
+      .resolves.toEqual({ classification: "stalled", summary: "no new output for a full cadence" });
+
+    // The `json` tag is optional, and a brace the child printed, echoed back
+    // inside the summary, must not end the object early.
+    const answer = JSON.stringify({ classification: "risk", summary: "child printed \"}\" and stopped" });
+    await expect(review(`Verdict:\n\`\`\`\n${answer}\n\`\`\`\nThat is my call.`)).resolves.toEqual({ classification: "risk", summary: "child printed \"}\" and stopped" });
+
+    // Recovering the fence must not accept a shape the contract refuses.
+    await expect(review("```json\n{\"classification\":\"progress\",\"summary\":\"x\",\"confidence\":0.9}\n```")).rejects.toThrow(/incompatible response/u);
+    await expect(review("```json\n{\"verdict\":\"progress\"}\n```")).rejects.toThrow(/incompatible response/u);
+
+    // An unusable response still fails closed, and the failure names its size and
+    // structure without echoing any transcript-derived text.
+    for (const [raw, shape] of [
+      ["  ", "empty response"],
+      ["the child seems fine", "20 chars, no JSON fence"],
+      ["I judge it {\"classification\":\"progress\",\"summary\":\"x\"}", "54 chars, no JSON fence"],
+      ["```json\n{oops}\n```", "18 chars, fenced body did not parse"],
+      ["```yaml\nclassification: progress\n```", "36 chars, fenced body did not parse"],
+      [`\`\`\`json\n${answer}\n\`\`\`\nor maybe\n\`\`\`json\n${answer}\n\`\`\``, "172 chars, no single JSON fence"],
+      ["```json\n{\"classification\": \"progress\"", "37 chars, no single JSON fence"],
+    ] as const) {
+      await expect(review(raw)).rejects.toMatchObject({ code: "REVIEWER_FAILED", message: `Reviewer returned malformed JSON (${shape})`, details: { responseShape: shape } });
+    }
   });
 
   it("wakes the manager only for the attention classifications", () => {

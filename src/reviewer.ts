@@ -38,7 +38,6 @@ export class ReviewerFailure extends Error {
 
 const MAX_PROMPT_BYTES = 16_000;
 const MAX_SUMMARY_CHARS = 500;
-const MAX_RESPONSE_CHARS = 2_000;
 
 export function modelFor(registry: ModelRegistrySeam, identifier: string): Model<Api> {
   if (identifier.length === 0 || /\s/.test(identifier) || identifier.includes(String.fromCharCode(0))) throw new ReviewerFailure("Configured reviewer model identifier is invalid", { model: identifier });
@@ -50,17 +49,73 @@ export function modelFor(registry: ModelRegistrySeam, identifier: string): Model
   return matches[0];
 }
 
+/**
+ * The reviewer's answer is only the assistant's text. Reasoning arrives as
+ * `thinking` parts and is dropped here. The text is not truncated: it is the
+ * parser's input, and clipping it turns a valid answer into a hard failure.
+ */
 export function textFrom(message: AssistantMessage): string {
-  return message.content.filter((part): part is TextContent => part.type === "text").map((part) => part.text).join("").slice(0, MAX_RESPONSE_CHARS);
+  return message.content.filter((part): part is TextContent => part.type === "text").map((part) => part.text).join("");
+}
+
+/**
+ * The body of the one markdown fence in the text, with an optional `json` tag
+ * removed. A chat model told to return one JSON object routinely wraps it in a
+ * fence and puts a sentence around it; that is the same intended answer, so it
+ * is recovered. Any other wrapper, and any text carrying a second fence, stays
+ * malformed. Scanned with `indexOf` rather than a pattern: this input is
+ * unbounded model text, and an anchored pattern around a lazy body backtracks.
+ */
+function fencedBody(raw: string): string | undefined {
+  const open = raw.indexOf("```");
+  if (open < 0) return undefined;
+  const close = raw.indexOf("```", open + 3);
+  if (close < 0 || raw.includes("```", close + 3)) return undefined;
+  const body = raw.slice(open + 3, close).trimStart();
+  return body.toLowerCase().startsWith("json") ? body.slice(4) : body;
+}
+
+/**
+ * The whole response is parsed first and, when it parses, it is the answer:
+ * every response that already reached the schema checks keeps its exact
+ * outcome, and no wrapper the contract refuses becomes acceptable. Only an
+ * unparseable response falls back to the fenced body, which then faces the
+ * unchanged schema checks below.
+ */
+function parsedResponse(raw: string, fenced: string | undefined): { value: unknown } | undefined {
+  for (const candidate of [raw, fenced]) {
+    if (candidate === undefined) continue;
+    try {
+      return { value: JSON.parse(candidate) };
+    } catch {
+      // Fall through to the fenced body, then to the malformed failure.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * A content-free description of an unparseable response. The reviewer's text is
+ * derived from a child's terminal transcript, so no part of it may reach an
+ * event, a job detail, or a host projection; the size and structure that name
+ * the defect can. `reviewer_degraded` carries only the failure message, so this
+ * goes in the message as well as the details.
+ */
+function responseShape(raw: string, fenced: string | undefined): string {
+  const chars = raw.trim().length;
+  if (chars === 0) return "empty response";
+  const structure = fenced !== undefined ? "fenced body did not parse" : raw.includes("```") ? "no single JSON fence" : "no JSON fence";
+  return `${chars} chars, ${structure}`;
 }
 
 export function strictResult(targetId: string, raw: string): ReviewerResult {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new ReviewerFailure("Reviewer returned malformed JSON", { targetId });
+  const fenced = fencedBody(raw);
+  const response = parsedResponse(raw, fenced);
+  if (response === undefined) {
+    const shape = responseShape(raw, fenced);
+    throw new ReviewerFailure(`Reviewer returned malformed JSON (${shape})`, { targetId, responseShape: shape });
   }
+  const parsed = response.value;
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new ReviewerFailure("Reviewer returned an incompatible response", { targetId });
   const value = parsed as Record<string, unknown>;
   const keys = Object.keys(value);
@@ -106,7 +161,9 @@ export class PiModelReviewer implements WaitReviewer {
         headers: auth.headers,
         signal,
         maxTokens: 256,
-        thinkingLevel: "low"
+        // The option name the transports read; one named for the thinking level
+        // is silently dropped, leaving the spec's fixed `low` unapplied.
+        reasoningEffort: "low"
       });
       if (signal.aborted || message.stopReason === "aborted") throw new ReviewerFailure("Reviewer operation aborted", { targetId: request.targetId, code: "ABORTED" });
       return strictResult(request.targetId, textFrom(message));

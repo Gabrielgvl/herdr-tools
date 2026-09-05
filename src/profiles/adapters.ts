@@ -51,14 +51,18 @@ function scopedValues(value: string[] | undefined, fallback: string[], field: st
   }
 }
 
+/** Skill selection belongs to the profile alone, for every runtime kind. */
+const PROFILE_ONLY_KEYS = ["skills", "pluginDirs"];
+
 function rejectIncompatible(kind: ProfileKind, overrides: Record<string, unknown>): void {
+  for (const key of PROFILE_ONLY_KEYS) if (Object.prototype.hasOwnProperty.call(overrides, key)) throw new ProfileAdapterError(`${key} is profile-only and cannot be overridden at launch`);
   if (kind === "agy") {
     for (const key of Object.keys(overrides)) if (key !== "model" && key !== "addDirs") throw new ProfileAdapterError(`${key} is only valid for AGY profiles`);
     return;
   }
   const invalid = kind === "pi"
-    ? ["effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"]
-    : ["thinking", "tools", "extensions", "skills"];
+    ? ["effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs"]
+    : ["thinking", "tools", "extensions"];
   for (const key of invalid) if (Object.prototype.hasOwnProperty.call(overrides, key)) throw new ProfileAdapterError(`${key} is only valid for ${kind === "pi" ? "Claude" : "Pi"} profiles`);
 }
 
@@ -105,7 +109,7 @@ export function resolvePiRuntime(profile: Extract<Profile["runtime"], { kind: "p
     thinking: thinking(overrides.thinking, profile.thinking),
     tools: values(overrides.tools, profile.tools),
     extensions: scopedValues(overrides.extensions, profile.extensions, "overrides.extensions", scopeRoot),
-    skills: scopedValues(overrides.skills, profile.skills, "overrides.skills", scopeRoot)
+    skills: [...profile.skills]
   };
 }
 
@@ -119,7 +123,7 @@ export function resolveClaudeRuntime(profile: Extract<Profile["runtime"], { kind
     allowedTools: values(overrides.allowedTools, profile.allowedTools),
     disallowedTools: values(overrides.disallowedTools, profile.disallowedTools),
     addDirs: scopedValues(overrides.addDirs, profile.addDirs, "overrides.addDirs", scopeRoot),
-    pluginDirs: scopedValues(overrides.pluginDirs, profile.pluginDirs, "overrides.pluginDirs", scopeRoot),
+    pluginDirs: [...profile.pluginDirs],
     developmentChannels: [...profile.developmentChannels]
   };
 }
@@ -140,13 +144,27 @@ export function resolveProfileRuntime(profile: Profile, overrides: RuntimeOverri
   return resolveAgyRuntime(profile.runtime, overrides as AgyRuntimeOverrides, profile.source.scopeRoot);
 }
 
+/**
+ * Pi is the only supported runtime with a native exact-selection primitive:
+ * `--no-skills` disables global/project/package skill discovery while explicit
+ * `--skill` entries still load. It is passed unconditionally, so an empty
+ * profile skill list means exactly no skills rather than ambient discovery.
+ */
 export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>, sessionPersistence: boolean, overrides: PiRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
   const effective = resolvePiRuntime(profile, overrides, scopeRoot);
-  const args = ["--model", effective.model, "--thinking", effective.thinking, ...commaSeparated("--tools", effective.tools), ...repeated("--extension", effective.extensions), ...repeated("--skill", effective.skills)];
+  const args = ["--model", effective.model, "--thinking", effective.thinking, ...commaSeparated("--tools", effective.tools), ...repeated("--extension", effective.extensions), "--no-skills", ...repeated("--skill", effective.skills)];
   if (!sessionPersistence) args.push("--no-session");
   return [...args, ...promptFileArg("--append-system-prompt", promptFilePath)];
 }
 
+/**
+ * Claude has no per-session "these skills and nothing else" primitive that
+ * Herdr can rely on today, so `--plugin-dir` is additive: the profile's
+ * selected plugin directory loads on top of whatever the viewer's user,
+ * project, and managed-policy configuration already provides. This is
+ * deliberately weaker than the Pi allowlist and must not be described as
+ * isolation.
+ */
 export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string, attachmentDirectory?: string): string[] {
   if (!sessionPersistence) throw new ProfileAdapterError("Claude profiles must set sessionPersistence to true for interactive launches");
   const effective = resolveClaudeRuntime(profile, overrides, scopeRoot);
@@ -154,6 +172,12 @@ export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "cl
   return [...args, ...promptFileArg("--append-system-prompt-file", promptFilePath)];
 }
 
+/**
+ * AGY exposes no session-scoped skill, plugin, or config selector, so it runs
+ * with whatever ambient skills the workspace and user already have. Herdr
+ * never mutates global or project skill/plugin state and never substitutes a
+ * synthetic workspace root to fake selection.
+ */
 export function buildAgyArgv(profile: Extract<Profile["runtime"], { kind: "agy" }>, sessionPersistence: boolean, overrides: AgyRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string, attachmentDirectory?: string): string[] {
   if (!sessionPersistence) throw new ProfileAdapterError("AGY profiles must set sessionPersistence to true for interactive launches");
   if (promptFilePath !== undefined) throw new ProfileAdapterError("AGY profiles do not accept prompt source files");

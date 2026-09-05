@@ -19,7 +19,8 @@ describe("Pi production reviewer adapter", () => {
     const controller = new AbortController();
     const result = await reviewer.review({ targetId: "p1", metadata: { agent_status: "working" }, transcriptDelta: ["new"] }, controller.signal);
     expect(result).toEqual({ targetId: "p1", classification: "progress", summary: "ok" });
-    expect(calls[0]).toMatchObject({ selected: model, context: { messages: [{ role: "user" }] }, options: { signal: controller.signal, maxTokens: 256, thinkingLevel: "low" } });
+    expect(calls[0]).toMatchObject({ selected: model, context: { messages: [{ role: "user" }] }, options: { signal: controller.signal, maxTokens: 256, reasoningEffort: "low" } });
+    expect((calls[0] as { options: Record<string, unknown> }).options).not.toHaveProperty("thinkingLevel");
     expect((calls[0] as { context: { messages: [{ content: string }] } }).context.messages[0].content).not.toContain("tools");
   });
 

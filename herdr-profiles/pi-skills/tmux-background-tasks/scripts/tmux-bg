@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PREFIX="pi-bg-"
+TMUX_BIN="${TMUX_BIN:-tmux}"
+
+fail() {
+  printf 'tmux-bg: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  tmux-bg start NAME CWD COMMAND
+  tmux-bg list
+  tmux-bg status TASK_ID
+  tmux-bg output TASK_ID [LINES]
+  tmux-bg kill TASK_ID
+  tmux-bg clean
+EOF
+  exit 2
+}
+
+tmux_cmd() {
+  if [[ -n "${PI_TMUX_SOCKET:-}" ]]; then
+    "$TMUX_BIN" -L "$PI_TMUX_SOCKET" "$@" || return $?
+  else
+    "$TMUX_BIN" "$@" || return $?
+  fi
+}
+
+require_tmux() {
+  local resolved
+  resolved="$(command -v "$TMUX_BIN" 2>/dev/null || true)"
+  [[ -n "$resolved" && -x "$resolved" ]] || fail "tmux is not installed or not executable: $TMUX_BIN"
+  TMUX_BIN="$resolved"
+}
+
+require_id() {
+  [[ "${1:-}" =~ ^pi-bg-[a-z0-9][a-z0-9-]*-[0-9]+-[0-9]+-[0-9]+$ ]] ||
+    fail "invalid task id: ${1:-<empty>}"
+}
+
+session_exists() {
+  tmux_cmd has-session -t "$1" 2>/dev/null
+}
+
+is_managed_session() {
+  session_exists "$1" &&
+    [[ "$(tmux_cmd show-options -v -t "$1" @pi_bg_managed 2>/dev/null || true)" == "1" ]]
+}
+
+pane_state() {
+  tmux_cmd display-message -p -t "$1" \
+    '#{pane_dead}|#{pane_dead_status}|#{pane_pid}|#{pane_current_command}' 2>/dev/null || return $?
+}
+
+start_task() {
+  [[ $# -eq 3 ]] || usage
+  local name="$1" cwd="$2" command="$3" slug id
+  [[ -n "${name//[[:space:]]/}" ]] || fail "task name must not be empty"
+  [[ -d "$cwd" ]] || fail "working directory does not exist: $cwd"
+  [[ -n "${command//[[:space:]]/}" ]] || fail "command must not be empty"
+
+  slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-32)"
+  [[ -n "$slug" ]] || fail "task name must contain a letter or number"
+  id="${PREFIX}${slug}-$(date +%s)-$$-$RANDOM"
+
+  tmux_cmd new-session -d -s "$id" -c "$cwd"
+  trap 'tmux_cmd kill-session -t "$id" 2>/dev/null || true' ERR
+  tmux_cmd set-option -t "$id" @pi_bg_managed 1
+  tmux_cmd set-option -w -t "$id" remain-on-exit on
+  tmux_cmd set-option -w -t "$id" remain-on-exit-format ''
+  tmux_cmd set-option -t "$id" history-limit 5000
+  tmux_cmd respawn-pane -k -t "$id" -c "$cwd" "$command"
+  trap - ERR
+  printf '%s\n' "$id"
+}
+
+status_task() {
+  [[ $# -eq 1 ]] || usage
+  local id="$1" state dead exit_code pid command
+  require_id "$id"
+  is_managed_session "$id" || fail "task not found: $id"
+  state="$(pane_state "$id")" || true
+  [[ "$state" == [01]'|'* ]] || fail "task not found: $id"
+  IFS='|' read -r dead exit_code pid command <<<"$state"
+  if [[ "$dead" == "1" ]]; then
+    printf 'id=%s status=done exit=%s\n' "$id" "${exit_code:-unknown}"
+  else
+    printf 'id=%s status=running pid=%s command=%s\n' "$id" "$pid" "$command"
+  fi
+}
+
+list_tasks() {
+  local managed id state
+  while IFS='|' read -r managed id; do
+    [[ "$managed" == "1" ]] || continue
+    state="$(status_task "$id" 2>/dev/null)" || continue
+    printf '%s\n' "$state"
+  done < <(tmux_cmd list-sessions -F '#{@pi_bg_managed}|#{session_name}' 2>/dev/null || true)
+}
+
+output_task() {
+  [[ $# -ge 1 && $# -le 2 ]] || usage
+  local id="$1" lines="${2:-200}"
+  require_id "$id"
+  [[ "$lines" =~ ^[0-9]+$ ]] && (( lines >= 1 && lines <= 10000 )) ||
+    fail "LINES must be an integer from 1 to 10000"
+  is_managed_session "$id" || fail "task not found: $id"
+  tmux_cmd capture-pane -p -J -t "$id" -S - |
+    awk '{ rows[NR]=$0; if ($0 !~ /^[[:space:]]*$/) last=NR } END { for (i=1; i<=last; i++) print rows[i] }' |
+    tail -n "$lines"
+}
+
+kill_task() {
+  [[ $# -eq 1 ]] || usage
+  local id="$1"
+  require_id "$id"
+  is_managed_session "$id" || fail "task not found: $id"
+  tmux_cmd kill-session -t "$id"
+  printf 'killed %s\n' "$id"
+}
+
+clean_tasks() {
+  local managed id state dead cleaned=0
+  while IFS='|' read -r managed id; do
+    [[ "$managed" == "1" ]] || continue
+    state="$(pane_state "$id")" || continue
+    IFS='|' read -r dead _ <<<"$state"
+    if [[ "$dead" == "1" ]]; then
+      tmux_cmd kill-session -t "$id"
+      ((cleaned += 1))
+    fi
+  done < <(tmux_cmd list-sessions -F '#{@pi_bg_managed}|#{session_name}' 2>/dev/null || true)
+  printf 'cleaned %d completed task(s)\n' "$cleaned"
+}
+
+require_tmux
+command="${1:-}"
+[[ $# -gt 0 ]] && shift || true
+case "$command" in
+  start) start_task "$@" ;;
+  list) list_tasks "$@" ;;
+  status) status_task "$@" ;;
+  output) output_task "$@" ;;
+  kill) kill_task "$@" ;;
+  clean) clean_tasks "$@" ;;
+  *) usage ;;
+esac

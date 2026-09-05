@@ -15,18 +15,20 @@ export const LaunchPlacementSchema = Type.Union([
 
 const ProfileValues = Type.Array(Identifier);
 
+/**
+ * Skill selection (`skills`, `pluginDirs`) is intentionally absent: it is owned
+ * by the profile so a caller cannot repoint a role at a sibling role's skills.
+ */
 export const ProfileLaunchOverridesSchema = Type.Object({
   model: Type.Optional(Identifier),
   thinking: Type.Optional(StringEnum(THINKING_LEVELS)),
   effort: Type.Optional(StringEnum(CLAUDE_EFFORTS)),
   tools: Type.Optional(ProfileValues),
   extensions: Type.Optional(ProfileValues),
-  skills: Type.Optional(ProfileValues),
   permissionMode: Type.Optional(StringEnum(CLAUDE_PERMISSION_MODES)),
   allowedTools: Type.Optional(ProfileValues),
   disallowedTools: Type.Optional(ProfileValues),
-  addDirs: Type.Optional(ProfileValues),
-  pluginDirs: Type.Optional(ProfileValues)
+  addDirs: Type.Optional(ProfileValues)
 }, { additionalProperties: false });
 
 const LaunchCommonProperties = {
@@ -58,12 +60,10 @@ export interface ProfileLaunchOverrides {
   effort?: ClaudeEffort;
   tools?: string[];
   extensions?: string[];
-  skills?: string[];
   permissionMode?: ClaudePermissionMode;
   allowedTools?: string[];
   disallowedTools?: string[];
   addDirs?: string[];
-  pluginDirs?: string[];
 }
 
 export type LaunchParams = Static<typeof LaunchParamsSchema>;

@@ -33,9 +33,9 @@ runtime:
   input is accepted, and mode is not launch-overrideable.
 - Only typed primary overrides `model` and `addDirs` are allowed. Overrides never leak
   into fallbacks; fallback profiles keep their own defaults.
-- `researcher-agy` uses `plan` and falls back to `researcher-pi`, yielding exactly
-  `researcher-agy -> researcher-pi -> researcher-claude`. `scout-agy` uses `plan` and
-  yields `scout-agy -> scout-pi -> scout-claude`. `worker-agy` uses `accept-edits` and
+- `researcher-agy` uses `plan` and falls back to `researcher-claude`, yielding exactly
+  `researcher-agy -> researcher-claude -> researcher-pi`. `scout-agy` uses `plan` and
+  yields `scout-agy -> scout-claude -> scout-pi`. `worker-agy` uses `accept-edits` and
   falls back to `worker-claude`; the implementation default `worker-pi` yields exactly
   `worker-pi -> worker-agy -> worker-claude`.
 - The required Markdown body remains catalog metadata. AGY receives repository

@@ -1,6 +1,6 @@
 {
   "herdr": {
-    "command": "node",
+    "command": "/home/gabriel/.volta/tools/image/node/25.9.0/bin/node",
     "args": ["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"]
   }
 }

@@ -144,7 +144,8 @@ function yamlValue(node: Node): unknown {
   return node.toJSON();
 }
 
-function frontmatter(text: string): { values: Record<string, unknown>; body: string } {
+/** Shared with skill-tree inspection: a `SKILL.md` carries the same YAML frontmatter shape. */
+export function parseFrontmatter(text: string): { values: Record<string, unknown>; body: string } {
   if (!text.startsWith("---\n") && !text.startsWith("---\r\n")) fail("profile must start with YAML frontmatter");
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
   if (!match) fail("profile frontmatter must have a closing delimiter and Markdown body");
@@ -157,7 +158,7 @@ function frontmatter(text: string): { values: Record<string, unknown>; body: str
 
 export function parseProfile(text: string, source: ProfileSource): Profile {
   if (Buffer.byteLength(text, "utf8") > MAX_PROFILE_BYTES) fail("profile exceeds the 64 KiB limit");
-  const { values, body } = frontmatter(text);
+  const { values, body } = parseFrontmatter(text);
   if (body.trim().length === 0 || body.includes("\0") || Buffer.byteLength(body, "utf8") > MAX_PROFILE_BODY_BYTES) fail("profile Markdown body must be non-empty, NUL-free, and at most 32 KiB");
   exactKeys(values, ["name", "description", "timeoutMinutes", "sessionPersistence", "runtime", "fallbackProfiles"], "profile");
   const name = stringField(values.name, "name");

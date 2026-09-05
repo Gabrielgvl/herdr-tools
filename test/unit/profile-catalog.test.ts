@@ -1,8 +1,8 @@
-import { access, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { AGY_MODES, attachmentCapability, buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
+import { AGY_MODES, attachmentCapability, buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, validateProfileResourceSelection, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
 import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
 import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE, type LaunchDependencies } from "../../src/tools/launch.js";
 import { createRuntime } from "../../index.js";
@@ -71,14 +71,17 @@ describe("profile catalog", () => {
     expect(() => parseProfile(profileText("claude-disabled", "claude").replace("sessionPersistence: true", "sessionPersistence: false"), source(root, "claude-disabled"))).toThrow(ProfileParseError);
     const resources = parseProfile(profileText("worker").replace("thinking: low", "thinking: low\n  tools: [read]\n  extensions: [./ext.ts]\n  skills: [./skills]"), source(root, "worker"));
     expect(resources.runtime).toMatchObject({ tools: ["read"], extensions: [join(root, "ext.ts")], skills: [join(root, "skills")] });
-    expect(buildProfileArgv(resources, { extensions: ["./override.ts"], skills: ["./override-skills"] })).toContain(join(root, "override.ts"));
-    expect(buildProfileArgv(resources, { extensions: ["./override.ts"], skills: ["./override-skills"] })).toContain(join(root, "override-skills"));
+    expect(buildProfileArgv(resources, { extensions: ["./override.ts"] })).toContain(join(root, "override.ts"));
+    // Skill selection is profile-only, so an override attempt is refused
+    // rather than silently repointing the role's allowlist.
+    expect(() => buildProfileArgv(resources, { skills: ["./override-skills"] } as never)).toThrow(/profile-only/);
+    expect(() => buildProfileArgv(claude, { pluginDirs: ["./override-plugin"] } as never)).toThrow(/profile-only/);
     expect(() => normalizeScopedResourcePath("", "resource", root)).toThrow(ProfileParseError);
     for (const path of ["/tmp/absolute.ts", "../outside.ts", "./nested//unsafe.ts", "C:\\outside.ts"]) {
       expect(() => parseProfile(profileText("worker").replace("thinking: low", `thinking: low\n  extensions: [${JSON.stringify(path)}]`), source(root, "worker"))).toThrow(ProfileParseError);
       expect(() => buildProfileArgv(resources, { extensions: [path] })).toThrow();
     }
-    expect(buildProfileArgv(resources, {}, "/tmp/prompt")).toEqual(["--model", "test/model", "--thinking", "low", "--tools", "read", "--extension", join(root, "ext.ts"), "--skill", join(root, "skills"), "--no-session", "--append-system-prompt", "/tmp/prompt"]);
+    expect(buildProfileArgv(resources, {}, "/tmp/prompt")).toEqual(["--model", "test/model", "--thinking", "low", "--tools", "read", "--extension", join(root, "ext.ts"), "--no-skills", "--skill", join(root, "skills"), "--no-session", "--append-system-prompt", "/tmp/prompt"]);
     const claudeResources = parseProfile(profileText("claude-resource", "claude").replace("effort: medium", "effort: medium\n  permissionMode: acceptEdits\n  allowedTools: [Read]\n  disallowedTools: [Bash]\n  addDirs: [./docs]\n  pluginDirs: [./plugin]"), source(root, "claude-resource"));
     expect(buildProfileArgv(claudeResources, {}, "/tmp/prompt")).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "acceptEdits", "--allowed-tools", "Read", "--disallowed-tools", "Bash", "--add-dir", join(root, "docs"), "--plugin-dir", join(root, "plugin"), "--append-system-prompt-file", "/tmp/prompt"]);
     expect(buildProfileArgv(claudeResources, {}, undefined, "/tmp/message-attachments/key")).toContain("/tmp/message-attachments/key");
@@ -276,11 +279,11 @@ describe("profile catalog", () => {
   it("builds only typed Pi and Claude flags", () => {
     const pi = parseProfile(profileText("worker"), source("/tmp/profile-scope", "worker"));
     const claude = parseProfile(profileText("reviewer", "claude"), source("/tmp/profile-scope", "reviewer"));
-    expect(buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { model: "override/model", thinking: "high" }, "system prompt")).toEqual(["--model", "override/model", "--thinking", "high", "--no-session", "--append-system-prompt", "system prompt"]);
+    expect(buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { model: "override/model", thinking: "high" }, "system prompt")).toEqual(["--model", "override/model", "--thinking", "high", "--no-skills", "--no-session", "--append-system-prompt", "system prompt"]);
     expect(buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, {}, "system prompt")).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "default", "--append-system-prompt-file", "system prompt"]);
     expect(buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, true)).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "default"]);
     expect(buildProfileArgv(claude)).not.toContain("--no-session-persistence");
-    expect(buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence)).toEqual(["--model", "test/model", "--thinking", "low", "--no-session"]);
+    expect(buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence)).toEqual(["--model", "test/model", "--thinking", "low", "--no-skills", "--no-session"]);
     const persisted = { ...pi, sessionPersistence: true };
     expect(buildProfileArgv(persisted)).not.toContain("--no-session");
     expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { model: "bad\nmodel" })).toThrow();
@@ -344,7 +347,8 @@ describe("profile catalog", () => {
       { name: "worker", profile: "worker", overrides: { model: "" } }, { name: "worker", profile: "worker", overrides: { tools: ["bad\nvalue"] } }, { name: "worker", kind: "pi", overrides: {} }
     ];
     for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams(value as never), `invalid case ${index}`).toThrow();
-    expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { thinking: "low", tools: ["read"], extensions: ["./ext"], skills: ["./skill"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."], pluginDirs: ["./plugin"] } } as never)).not.toThrow();
+    expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { thinking: "low", tools: ["read"], extensions: ["./ext"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."] } } as never)).not.toThrow();
+    for (const key of ["skills", "pluginDirs"]) expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { [key]: ["./selected"] } } as never)).toThrow(/Unknown profile override/);
   });
 
   it("launches a resolved profile through the existing placement path", async () => {
@@ -369,7 +373,7 @@ describe("profile catalog", () => {
     } } as unknown as HerdrCli;
     const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
     expect(promptSources.create).toHaveBeenCalledWith("\nBody for worker.\n");
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--no-skills", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
     expect(result.details).toMatchObject({ profile: { name: "worker", fallbackProfiles: [], timeoutMinutes: 30 }, kind: "pi" });
     const defaultCreate = vi.spyOn(defaultPromptSourceStore, "create").mockResolvedValue({ path: "/tmp/default-profile.md" });
     try {
@@ -542,6 +546,7 @@ describe("profile catalog", () => {
     expect(catalog.diagnostics).toEqual([]);
     const bundledRoot = catalog.effective.get("manager-pi")!.source.scopeRoot;
     const rolePluginRoot = join(bundledRoot, "herdr-profiles", "role-plugins");
+    const managerProfilePlugin = join(bundledRoot, "herdr-profiles", "profile-plugins", "manager");
     const roleNames = ["manager", "scout", "planner", "worker", "reviewer", "researcher", "promoter"];
     for (const role of roleNames) {
       const manifestPath = join(rolePluginRoot, role, ".claude-plugin", "plugin.json");
@@ -559,27 +564,59 @@ describe("profile catalog", () => {
       worker: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", "bash_bg", "jobs", "job_decide", "monitor"],
       reviewer: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content"],
       researcher: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content"],
-      promoter: ["read", "bash", "grep", "find", "ls"]
+      promoter: ["read", "bash", "grep", "find", "ls", "ctx_execute", "ctx_execute_file", "ctx_search"]
     } as const;
+    // The owner-approved role matrix. Every entry beyond the embedded role skill
+    // is a generated bundle pinned in `herdr-skill-bundles.json`; the two Pi-only
+    // globals live outside every plugin directory so no Claude role receives them.
+    // The manager role plugin is the globally installed `herdr-tools` package, so
+    // it keeps only its own two skills and the manager extras are generated into
+    // the separate session-only manager profile plugin.
+    const managerProfileSkills = ["herdr-manager", "engineering-project-manager", "oracle", "pi-review-pr", "decision-batch", "delivery-assurance"];
+    const rolePluginSkills = {
+      manager: ["manager", "harness-flow"],
+      scout: ["scout"],
+      planner: ["planner", "blueprint", "adr", "engineering-project-manager", "ticket-writer", "delivery-assurance", "humanizer"],
+      worker: ["worker", "tdd", "git-flow", "adr", "typescript", "delivery-assurance"],
+      reviewer: ["reviewer", "adr", "typescript", "delivery-assurance", "oracle", "pi-review-pr"],
+      researcher: ["researcher", "humanizer"],
+      promoter: ["promoter", "git-flow", "delivery-assurance", "courier-pr-gates", "dev-evidence-gate", "release-pr-validation", "shared-dev-deploy", "authenticated-staging-smoke", "services-ci-gates"]
+    } as const;
+    // `manager-pi` orchestrates without bash or ctx tools, so it takes neither
+    // global: a skill whose tools the profile withholds is dead weight in the
+    // allowlist, and widening the manager's tools to fix that is not allowed.
+    const piGlobalSkills = (role: string) => (role === "manager" ? [] : ["context-mode", "tmux-background-tasks"].map((skill) => join(bundledRoot, "herdr-profiles", "pi-skills", skill)));
+    const piSkills = (role: string) => [
+      ...rolePluginSkills[role as keyof typeof rolePluginSkills].map((skill) => join(rolePluginRoot, role, "skills", skill)),
+      // `manager-pi` reads the manager extras from the same generated profile
+      // plugin `manager-claude` loads, but keeps its own two canonical skills.
+      ...(role === "manager" ? managerProfileSkills.map((skill) => join(managerProfilePlugin, "skills", skill)) : []),
+      ...piGlobalSkills(role)
+    ];
     for (const role of roleNames) {
       const profile = catalog.effective.get(`${role}-pi`)!;
-      const skills = role === "manager"
-        ? [join(rolePluginRoot, "manager", "skills", "manager"), join(rolePluginRoot, "manager", "skills", "harness-flow")]
-        : [join(rolePluginRoot, role, "skills", role)];
-      expect(profile.runtime).toEqual({ kind: "pi", model: expect.any(String), thinking: expect.any(String), tools: [...piTools[role as keyof typeof piTools]], extensions: [], skills });
+      expect(profile.runtime).toEqual({ kind: "pi", model: expect.any(String), thinking: expect.any(String), tools: [...piTools[role as keyof typeof piTools]], extensions: [], skills: piSkills(role) });
       expect(profile.runtime.kind === "pi" && profile.runtime.tools.includes("Agent")).toBe(false);
+      // A Claude role sees exactly the plugin's own skill trees, so the matrix is
+      // asserted on disk as well as in the Pi allowlist.
+      expect((await readdir(join(rolePluginRoot, role, "skills"))).sort()).toEqual([...rolePluginSkills[role as keyof typeof rolePluginSkills]].sort());
+      await expect(validateProfileResourceSelection(profile, profile.runtime)).resolves.toBeUndefined();
+      await expect(validateProfileResourceSelection(catalog.effective.get(`${role}-claude`)!, catalog.effective.get(`${role}-claude`)!.runtime)).resolves.toBeUndefined();
     }
-    expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: [...piTools.manager], extensions: [], skills: [join(rolePluginRoot, "manager", "skills", "manager"), join(rolePluginRoot, "manager", "skills", "harness-flow")] });
+    // The only manager plugin directory `manager-claude` loads is the generated
+    // session-only one, and it holds the whole manager matrix.
+    expect((await readdir(join(managerProfilePlugin, "skills"))).sort()).toEqual([...rolePluginSkills.manager, ...managerProfileSkills].sort());
+    expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "medium", tools: [...piTools.manager], extensions: [], skills: piSkills("manager") });
     expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual([]);
     const managerClaude = catalog.effective.get("manager-claude")!;
     const managerClaudeTools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "mcp__plugin_herdr-tools_herdr"];
-    expect(managerClaude.runtime).toEqual({ kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: managerClaudeTools, disallowedTools: ["Task"], addDirs: [], pluginDirs: [join(rolePluginRoot, "manager")], developmentChannels: ["server:herdr"] });
+    expect(managerClaude.runtime).toEqual({ kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: managerClaudeTools, disallowedTools: ["Task"], addDirs: [], pluginDirs: [managerProfilePlugin], developmentChannels: ["server:herdr"] });
     expect(managerClaude.sessionPersistence).toBe(true);
     expect(managerClaude.timeoutMinutes).toBe(30);
     expect(managerClaude.fallbackProfiles).toEqual([]);
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.allowedTools).not.toEqual(expect.arrayContaining(["Bash", "Edit", "Write", "NotebookEdit"]));
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.disallowedTools).toEqual(["Task"]);
-    expect(buildProfileArgv(managerClaude)).toEqual(["--model", "claude-fable-5", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "manager"), "--dangerously-load-development-channels", "server:herdr"]);
+    expect(buildProfileArgv(managerClaude)).toEqual(["--model", "claude-fable-5", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", managerProfilePlugin, "--dangerously-load-development-channels", "server:herdr"]);
     expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
     expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-agy"]);
     const workerAgy = catalog.effective.get("worker-agy")!;
@@ -588,19 +625,19 @@ describe("profile catalog", () => {
     expect(resolveProfile("worker-pi", catalog).reachableNames).toEqual(["worker-pi", "worker-agy", "worker-claude"]);
     const scoutAgy = catalog.effective.get("scout-agy")!;
     expect(scoutAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", addDirs: [] });
-    expect(scoutAgy.fallbackProfiles).toEqual(["scout-pi"]);
-    expect(catalog.effective.get("scout-pi")?.fallbackProfiles).toEqual(["scout-claude"]);
-    expect(resolveProfile("scout-agy", catalog).reachableNames).toEqual(["scout-agy", "scout-pi", "scout-claude"]);
+    expect(scoutAgy.fallbackProfiles).toEqual(["scout-claude"]);
+    expect(catalog.effective.get("scout-claude")?.fallbackProfiles).toEqual(["scout-pi"]);
+    expect(resolveProfile("scout-agy", catalog).reachableNames).toEqual(["scout-agy", "scout-claude", "scout-pi"]);
     const researcherAgy = catalog.effective.get("researcher-agy")!;
     expect(researcherAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", addDirs: [] });
     expect(researcherAgy.sessionPersistence).toBe(true);
     expect(researcherAgy.timeoutMinutes).toBe(30);
-    expect(researcherAgy.fallbackProfiles).toEqual(["researcher-pi"]);
+    expect(researcherAgy.fallbackProfiles).toEqual(["researcher-claude"]);
     expect(researcherAgy.body).toBe("\nCatalog metadata only. Herdr does not deliver this profile body to AGY. Every AGY task must be self-contained and sent through Herdr's visible v1 provenance-wrapped assignment.\n");
     expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
-    expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-pi", "researcher-claude"]);
-    expect(resolveProfile("researcher-pi", catalog).reachableNames).toEqual(["researcher-pi", "researcher-claude"]);
-    expect(catalog.effective.get("promoter-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "high", tools: [...piTools.promoter], extensions: [], skills: [join(rolePluginRoot, "promoter", "skills", "promoter")] });
+    expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-claude", "researcher-pi"]);
+    expect(resolveProfile("researcher-claude", catalog).reachableNames).toEqual(["researcher-claude", "researcher-pi"]);
+    expect(catalog.effective.get("promoter-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max", tools: [...piTools.promoter], extensions: [], skills: piSkills("promoter") });
     expect(catalog.effective.get("promoter-pi")?.fallbackProfiles).toEqual(["promoter-claude"]);
     expect(resolveProfile("promoter-pi", catalog).reachableNames).toEqual(["promoter-pi", "promoter-claude"]);
 
@@ -643,8 +680,8 @@ describe("profile catalog", () => {
     const worker = catalog.effective.get("worker-pi")!;
     const reviewer = catalog.effective.get("reviewer-pi")!;
     const claudeWorker = catalog.effective.get("worker-claude")!;
-    expect(buildProfileArgv(manager)).toEqual(["--model", "openai-codex/gpt-5.6-sol", "--thinking", "high", "--tools", piTools.manager.join(","), "--skill", join(rolePluginRoot, "manager", "skills", "manager"), "--skill", join(rolePluginRoot, "manager", "skills", "harness-flow"), "--no-session"]);
-    expect(buildProfileArgv(worker)).toEqual(["--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", piTools.worker.join(","), "--skill", join(rolePluginRoot, "worker", "skills", "worker"), "--no-session"]);
+    expect(buildProfileArgv(manager)).toEqual(["--model", "openai-codex/gpt-5.6-sol", "--thinking", "medium", "--tools", piTools.manager.join(","), "--no-skills", ...piSkills("manager").flatMap((skill) => ["--skill", skill]), "--no-session"]);
+    expect(buildProfileArgv(worker)).toEqual(["--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", piTools.worker.join(","), "--no-skills", ...piSkills("worker").flatMap((skill) => ["--skill", skill]), "--no-session"]);
     expect(buildProfileArgv(reviewer)).not.toContain("edit");
     expect(buildProfileArgv(reviewer)).not.toContain("write");
 
@@ -654,6 +691,26 @@ describe("profile catalog", () => {
     }
 
     expect(buildProfileArgv(claudeWorker)).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "acceptEdits", ...claudeTools.worker.allowedTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "worker")]);
+  });
+
+  it("keeps every bundled Pi profile free of dead skill and thinking combinations", async () => {
+    const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
+    const catalog = await runtime.profiles.load();
+    // A selected skill whose tools the profile withholds can never run, so the
+    // matrix is invalid in both directions: drop the skill or grant the tools.
+    const skillTools: Record<string, string[]> = { "context-mode": ["ctx_execute", "ctx_execute_file", "ctx_search"], "tmux-background-tasks": ["bash"] };
+    // Owner item 75: Pi reasoning depth is a property of the model, not the role.
+    const modelThinking: Record<string, string> = { "openai-codex/gpt-5.6-luna": "max", "openai-codex/gpt-5.6-sol": "medium" };
+    const piProfiles = [...catalog.effective.values()].filter((profile) => profile.runtime.kind === "pi");
+    expect(piProfiles.length).toBe(7);
+    for (const profile of piProfiles) {
+      const runtimeProfile = profile.runtime as Extract<typeof profile.runtime, { kind: "pi" }>;
+      expect({ name: profile.name, thinking: runtimeProfile.thinking }).toEqual({ name: profile.name, thinking: modelThinking[runtimeProfile.model] ?? runtimeProfile.thinking });
+      for (const [skill, required] of Object.entries(skillTools)) {
+        if (!runtimeProfile.skills.some((path) => basename(path) === skill)) continue;
+        expect({ name: profile.name, missing: required.filter((tool) => !runtimeProfile.tools.includes(tool)) }).toEqual({ name: profile.name, missing: [] });
+      }
+    }
   });
 
   it("keeps profile launch and renderer failures explicit", async () => {

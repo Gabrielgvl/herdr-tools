@@ -1,4 +1,4 @@
-import { accessSync, constants, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,6 +93,10 @@ describe("supported stdio Node command", () => {
 });
 
 describe("Claude manager plugin package", () => {
+  // This package is installed globally through `.claude-plugin/marketplace.json`,
+  // so anything added here lands in every ordinary Claude session's namespace.
+  // The owner-approved manager profile extras therefore live in the separate
+  // session-only profile plugin below, never in this tree.
   it("contains only the manifest, server map, and manager skills", () => {
     expect(tree(packageRoot)).toEqual([
       ".claude-plugin/plugin.json",
@@ -151,6 +155,63 @@ describe("Claude manager plugin package", () => {
     expect(files.some((file) => file.startsWith("hooks/") || file.endsWith("settings.json"))).toBe(false);
     const contents = files.map((file) => readFileSync(join(packageRoot, file), "utf8")).join("\n");
     for (const forbidden of ["allowedTools", "disallowedTools", "permissionMode", "bypassPermissions", "acceptEdits", "\"hooks\"", "\"agents\""]) {
+      expect(contents).not.toContain(forbidden);
+    }
+  });
+});
+
+describe("generated manager profile plugin", () => {
+  const profileRoot = join(repoRoot, "herdr-profiles", "profile-plugins", "manager");
+  const profileManifest = JSON.parse(readFileSync(join(profileRoot, ".claude-plugin/plugin.json"), "utf8")) as Record<string, unknown>;
+
+  it("is a distinct plugin from the globally installable package", () => {
+    expect(profileRoot).not.toBe(packageRoot);
+    expect(profileManifest).toEqual({
+      name: "herdr-manager-profile",
+      description: "Session-only Herdr manager profile skills",
+      version: "1.0.0",
+      author: { name: "Herdr Tools" }
+    });
+    // A distinct name keeps the two plugins from colliding, and carrying no
+    // server map keeps the `mcp__plugin_herdr-tools_herdr__*` tool names owned
+    // by the one globally installed package.
+    expect(profileManifest.name).not.toBe(manifest.name);
+    expect(profileManifest.mcpServers).toBeUndefined();
+    expect(readdirSync(profileRoot).sort()).toEqual([".claude-plugin", "skills"]);
+  });
+
+  it("carries the manager role skill and its owner-approved extras as ordinary files", () => {
+    expect(tree(profileRoot)).toEqual([
+      ".claude-plugin/plugin.json",
+      "skills/decision-batch/SKILL.md",
+      "skills/delivery-assurance/SKILL.md",
+      "skills/engineering-project-manager/SKILL.md",
+      "skills/engineering-project-manager/references/default-output.md",
+      "skills/harness-flow/SKILL.md",
+      "skills/herdr-manager/SKILL.md",
+      "skills/herdr-manager/scripts/babysit.sh",
+      "skills/herdr-manager/scripts/review-watch.sh",
+      "skills/manager/SKILL.md",
+      "skills/oracle/SKILL.md",
+      "skills/pi-review-pr/SKILL.md"
+    ]);
+    // Generated, not linked: the copies are plain files, and the two
+    // package-owned skills are byte-identical to their tracked canonical source.
+    for (const relative of tree(profileRoot)) expect(lstatSync(join(profileRoot, relative)).isSymbolicLink()).toBe(false);
+    for (const name of ["manager", "harness-flow"]) {
+      expect(readFileSync(join(profileRoot, "skills", name, "SKILL.md"), "utf8")).toBe(readFileSync(join(packageRoot, "skills", name, "SKILL.md"), "utf8"));
+    }
+  });
+
+  it("is the only plugin directory the manager profiles point at, and ships no policy surface", () => {
+    const managerClaude = readFileSync(join(repoRoot, "herdr-profiles", "manager-claude.md"), "utf8");
+    expect(managerClaude).toContain("- herdr-profiles/profile-plugins/manager\n");
+    expect(managerClaude).not.toContain("- herdr-profiles/role-plugins/manager\n");
+    const marketplace = JSON.parse(readFileSync(join(repoRoot, ".claude-plugin/marketplace.json"), "utf8")) as { plugins: Array<{ source: string }> };
+    // The globally published plugin stays the minimal package, not this one.
+    expect(marketplace.plugins.map((plugin) => plugin.source)).toEqual(["./herdr-profiles/role-plugins/manager"]);
+    const contents = tree(profileRoot).map((file) => readFileSync(join(profileRoot, file), "utf8")).join("\n");
+    for (const forbidden of ["allowedTools", "disallowedTools", "permissionMode", "bypassPermissions", "\"hooks\"", "\"agents\"", "mcpServers"]) {
       expect(contents).not.toContain(forbidden);
     }
   });

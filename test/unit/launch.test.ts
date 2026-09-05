@@ -19,7 +19,8 @@ const testPreflight = async () => undefined;
 let lastSupervision: StubSupervision;
 const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight" | "supervision"> & Partial<Pick<LaunchDependencies, "preflight" | "supervision">>) => {
   lastSupervision = (deps.supervision as StubSupervision | undefined) ?? stubSupervision();
-  return createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight, supervision: lastSupervision });
+  const launchGate = deps.launchGate ?? (async () => ({ check: async () => undefined, release: async () => undefined }));
+  return createLaunchToolImplementation({ ...deps, launchGate, preflight: deps.preflight ?? testPreflight, supervision: lastSupervision });
 };
 const GRANT_PATH = "/cache/recipient";
 const fakeGrant = () => ({ path: GRANT_PATH, token: "grant-recipient", renew: async () => undefined, release: async () => undefined });
@@ -4133,5 +4134,67 @@ describe("herdr_launch automatic child supervision", () => {
     expect(harness.stdinInputs).toHaveLength(1);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
     expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
+  });
+
+  it("blocks before profile resolution when the launch lease holder dies", async () => {
+    const loads = vi.fn(async () => catalog(profile("worker")));
+    const harness = makeCli();
+    const gate = {
+      check: vi.fn(async () => { throw new Error("launch gate holder died after exclusive coordinator acquisition"); }),
+      release: vi.fn(async () => undefined)
+    };
+    const tool = createLaunchTool({
+      cli: harness.cli,
+      context,
+      cwd: "/repo",
+      profiles: { load: loads },
+      attachments: fakeAttachments(),
+      recipients: new RecipientRegistry(),
+      launchGate: async () => gate
+    });
+
+    await expect(tool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN" });
+    expect(loads).not.toHaveBeenCalled();
+    expect(harness.calls).toHaveLength(0);
+    expect(gate.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("rechecks the common gate before every fallback start", async () => {
+    const primary = profile("primary", "pi", ["fallback"]);
+    const fallback = profile("fallback", "claude");
+    const calls: string[][] = [];
+    let checks = 0;
+    const gate = {
+      check: vi.fn(async () => {
+        checks += 1;
+        if (checks >= 3) throw new Error("frozen");
+      }),
+      release: vi.fn(async () => undefined)
+    };
+    const harness = makeCli({
+      calls,
+      paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }],
+      start: (_argv, attempt) => {
+        if (attempt === 0) throw startFailure();
+        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } } });
+      }
+    });
+    const tool = createLaunchTool({
+      cli: harness.cli,
+      context,
+      cwd: "/repo",
+      profiles: { load: async () => catalog(primary, fallback) },
+      attachments: fakeAttachments(),
+      recipients: new RecipientRegistry(),
+      launchGate: async () => gate
+    });
+
+    const failure = await tool.execute("id", { name: "worker", profile: "primary" }, new AbortController().signal, undefined, extensionContext)
+      .catch((error: LaunchFailure) => error);
+    expect(failure).toMatchObject({ code: "LAUNCH_FAILED" });
+    expect(checks).toBe(3);
+    expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(gate.release).toHaveBeenCalledTimes(1);
   });
 });

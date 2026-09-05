@@ -19,6 +19,7 @@ import { modelSafeJson } from "../redaction.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
+import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -47,6 +48,8 @@ export interface LaunchDependencies {
   attachments?: AttachmentStore;
   recipients?: RecipientRegistry;
   clock?: LaunchClock;
+  /** Test hosts may provide the same fail-closed gate with disposable paths. */
+  launchGate?: () => Promise<LaunchGateLease>;
   /**
    * Required. Every successful launch creates supervision, so a host that
    * cannot supervise cannot launch. See ADR-019.
@@ -1826,6 +1829,14 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
     parameters: LaunchParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, ctx) {
       const params = rawParams as unknown as LaunchRequest;
+      let launchGate: LaunchGateLease | undefined;
+      try {
+        launchGate = await (deps.launchGate ?? (() => acquireLaunchGate()))();
+        await launchGate.check();
+      } catch {
+        await launchGate?.release().catch(() => undefined);
+        throw new LaunchError("PROFILE_LAUNCH_FROZEN", "Profile launch is frozen");
+      }
       // Establish the requested route before any precondition so every refusal names it.
       const requestedDelivery: MessageDelivery | undefined = record(params) && params.initialPrompt !== undefined
         ? (params.initialPromptDelivery === "attachment" ? "attachment" : "inline")
@@ -1965,8 +1976,12 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         }
       } catch (error) {
         const failure = withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published });
-        await grant?.release();
-        reservation?.release("launch_precondition_failed");
+        try {
+          await grant?.release();
+          reservation?.release("launch_precondition_failed");
+        } finally {
+          await launchGate?.release();
+        }
         throw earlyLaunchFailure(failure, phase);
       }
       let paneId: string | undefined;
@@ -2019,6 +2034,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         let startedAgent: StartedAgent | undefined;
         for (const profile of profiles) {
           const runtime = effectiveRuntimes.get(profile.name)!;
+          await launchGate!.check();
           // Re-validated for this attempt immediately before its argv is built,
           // because the preflight above is separated from the spawn by recipient
           // creation, prompt-source writes, context resolution, supervision
@@ -2316,7 +2332,11 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         }, initialPromptDelivery, published, reconciliation);
       } finally {
         // The launch window is over; the directory is kept only by its own content.
-        await grant?.release();
+        try {
+          await grant?.release();
+        } finally {
+          await launchGate?.release();
+        }
       }
     },
     renderCall(args, theme) {

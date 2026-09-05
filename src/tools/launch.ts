@@ -13,7 +13,7 @@ import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.j
 import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
-import { buildRuntimeArgv, defaultPromptSourceStore, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
+import { buildRuntimeArgv, defaultPromptSourceStore, RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
@@ -344,6 +344,7 @@ function validateParams(params: LaunchRequest): void {
   profileIdentifier(params.profile);
   if (params.overrides !== undefined) {
     if (!record(params.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
+    if (RESERVED_BUNDLED_PROFILE_NAMES.has(params.profile)) throw new LaunchError("INVALID_INPUT", `Reserved profile ${params.profile} does not accept runtime overrides`);
     for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort", "tools", "permissionMode", "allowedTools", "disallowedTools", "addDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
     if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
     if (params.overrides.thinking !== undefined && (typeof params.overrides.thinking !== "string" || !THINKING_LEVELS.includes(params.overrides.thinking as typeof THINKING_LEVELS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.thinking is invalid");

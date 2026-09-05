@@ -2269,6 +2269,8 @@ describe("herdr_launch profile-only contract", () => {
     ];
     for (const value of invalid) expect(() => validateLaunchParams(value as never)).toThrow();
     expect(() => validateLaunchParams({ ...valid, overrides: { model: "m", tools: [], allowedTools: [], disallowedTools: [], addDirs: [] }, placement: { mode: "same_tab" } })).not.toThrow();
+    expect(() => validateLaunchParams({ ...valid, profile: "promoter-pi", overrides: {} })).toThrow(/does not accept runtime overrides/);
+    expect(() => validateLaunchParams({ ...valid, profile: "promoter-claude", overrides: { model: "other" } })).toThrow(/does not accept runtime overrides/);
   });
 
   it("retains the failing phase and bounded CLI evidence at the launch boundary", async () => {

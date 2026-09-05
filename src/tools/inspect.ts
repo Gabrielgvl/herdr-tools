@@ -5,7 +5,7 @@ import { parseHealth } from "../health.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
 import { resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { formatCall, renderResultComponent, textComponent } from "../tui.js";
-import { resolveProfile, type Profile, type ProfileCandidate, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
+import { RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, type Profile, type ProfileCandidate, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
 import { boundedText } from "../job-registry.js";
 import { modelSafeJson } from "../redaction.js";
 
@@ -149,6 +149,7 @@ function compareCollectionBlockers(left: CollectionBlocker, right: CollectionBlo
 }
 
 function highestCollectionBlocker(catalog: ProfileCatalog, name: string, value: Profile | undefined, candidates: readonly ProfileCandidate[]): CollectionBlocker | undefined {
+  if (RESERVED_BUNDLED_PROFILE_NAMES.has(name) && value?.source.kind === "bundled") return { kind: "effective", precedence: value.source.precedence, profile: value };
   const blockers: CollectionBlocker[] = [];
   if (value) blockers.push({ kind: "effective", precedence: value.source.precedence, profile: value });
   const invalid = invalidCandidate(candidates);

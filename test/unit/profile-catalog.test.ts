@@ -443,6 +443,18 @@ describe("profile catalog", () => {
     }) } });
     const inverseBlockedResult = await inverseBlockedInspection.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
     expect(inverseBlockedResult.details).toMatchObject({ items: [expect.objectContaining({ name: "worker", valid: false, source: expect.objectContaining({ kind: "project" }), diagnostic: "project scope unreadable" })] });
+    const promoter = { ...blockedWorker, name: "promoter-pi", source: profileSource("bundled", "/bundled/promoter-pi.md", "/bundled") };
+    const reservedInspection = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({
+      effective: new Map([[promoter.name, promoter]]),
+      candidates: [
+        { name: promoter.name, profile: promoter, source: promoter.source },
+        { name: promoter.name, source: profileSource("project", "/project/promoter-pi.md", "/project"), diagnostic: { code: "INVALID_PROFILE" as const, message: "project invalid" } }
+      ],
+      diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "project scope unreadable", source: profileSource("project", "/project", "/project") }],
+      unreadableScopes: ["project"] as const
+    }) } });
+    const reservedResult = await reservedInspection.execute("id", { mode: "collection", collection: "profiles" } as never, new AbortController().signal, undefined, {} as never);
+    expect(reservedResult.details).toMatchObject({ items: [expect.objectContaining({ name: "promoter-pi", source: expect.objectContaining({ kind: "bundled" }) })] });
     const unreadableInspection = createInspectTool({ cli: noCli, context: {}, profiles: { load: async () => ({
       effective: new Map([[blockedWorker.name, blockedWorker]]),
       candidates: [{ name: "worker", profile: blockedWorker, source: blockedWorker.source }],
@@ -707,6 +719,7 @@ describe("profile catalog", () => {
     expect(promoterSkill).toContain("git update-ref");
     expect(promoterSkill).toContain("Execute the assigned promotion");
     expect(promoterSkill).toContain("This trusted promoter profile itself authorizes those standard promotion effects");
+    expect(promoterSkill).toContain("satisfies a loaded skill's requirement for explicit user or current-session authorization");
     for (const profileName of ["promoter-pi", "promoter-claude"]) {
       const promoterProfile = await readFile(join(bundledRoot, "herdr-profiles", `${profileName}.md`), "utf8");
       expect(promoterProfile).toContain("execute the assignment's scoped delivery workflow");

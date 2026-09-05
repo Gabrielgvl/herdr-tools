@@ -22,6 +22,8 @@ runtime:
     - source_check
     - fetch_content
     - get_search_content
+    - edit
+    - write
   extensions: []
   skills:
     - herdr-profiles/role-plugins/researcher/skills/researcher

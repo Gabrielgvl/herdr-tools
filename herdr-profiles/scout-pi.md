@@ -18,6 +18,8 @@ runtime:
     - ctx_execute
     - ctx_execute_file
     - ctx_search
+    - edit
+    - write
   extensions: []
   skills:
     - herdr-profiles/role-plugins/scout/skills/scout

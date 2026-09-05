@@ -1,0 +1,7 @@
+{
+  "name": "herdr-executor",
+  "description": "Profile-scoped Executor MCP gateway and usage skill",
+  "version": "1.0.0",
+  "author": { "name": "Herdr Tools" },
+  "mcpServers": "./mcp-servers.json"
+}

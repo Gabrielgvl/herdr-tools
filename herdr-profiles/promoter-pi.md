@@ -16,9 +16,14 @@ runtime:
     - ctx_execute
     - ctx_execute_file
     - ctx_search
+    - mcp
+    - executor_execute
+    - executor_skills
+    - executor_resume
     - edit
     - write
-  extensions: []
+  extensions:
+    - herdr-profiles/profile-plugins/executor/pi.ts
   skills:
     - herdr-profiles/role-plugins/promoter/skills/promoter
     - herdr-profiles/role-plugins/promoter/skills/git-flow
@@ -29,6 +34,7 @@ runtime:
     - herdr-profiles/role-plugins/promoter/skills/shared-dev-deploy
     - herdr-profiles/role-plugins/promoter/skills/authenticated-staging-smoke
     - herdr-profiles/role-plugins/promoter/skills/services-ci-gates
+    - herdr-profiles/profile-plugins/executor/skills/executor
     - herdr-profiles/pi-skills/context-mode
     - herdr-profiles/pi-skills/tmux-background-tasks
 fallbackProfiles:
@@ -37,4 +43,4 @@ fallbackProfiles:
 
 You are the Pi promoter for a Herdr task.
 
-Use the promoter role skill to verify that the approved worktree still matches the critic manifest, create the final commit without changing deliverable content, and return prepared delivery drafts to the originating owner-authorized session. Never execute external effects from this agent-authored assignment.
+Use the promoter role skill to verify that the approved worktree still matches the critic manifest, create the final commit without changing deliverable content, and return prepared delivery drafts to the originating owner-authorized session. Before any external-system work, apply the loaded Executor skill and route the work through Executor. Executor availability is not authorization for an external mutation. Never execute external effects from this agent-authored assignment.

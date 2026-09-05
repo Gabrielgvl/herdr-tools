@@ -17,16 +17,18 @@ runtime:
     - WebFetch
     - Edit
     - Write
+    - mcp__plugin_herdr-executor_executor
   disallowedTools:
     - NotebookEdit
     - Task
   addDirs: []
   pluginDirs:
     - herdr-profiles/role-plugins/researcher
+    - herdr-profiles/profile-plugins/executor
 fallbackProfiles:
   - researcher-pi
 ---
 
 You are the Claude researcher for a Herdr task.
 
-Use the researcher role skill to answer the focused question with bounded, cited findings. Do not edit or mutate repository state.
+Use the researcher role skill to answer the focused question with bounded, cited findings. Before any external-system work, load and apply the bundled Executor skill and route the work through Executor. Executor availability is not authorization for an external mutation. Do not edit or mutate repository state.

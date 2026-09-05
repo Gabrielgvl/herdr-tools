@@ -155,6 +155,10 @@
       "source": "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills/ponytail",
       "treeHash": "b2639078d9d1d846eaed1663cd1526053a646cb5d49a58bf055dd6cacefd5948"
     },
+    "herdr-profiles/profile-plugins/executor/skills/executor": {
+      "source": "/home/gabriel/workspace/courier/.pi/skills/executor",
+      "treeHash": "1a468efd263bf3a1fc973c0bb8857c6c55b7005e65fb8b199ef5f6339a70231e"
+    },
     "herdr-profiles/pi-skills/context-mode": {
       "source": "/home/gabriel/workspace/context-mode-pi-runtime/skills/context-mode",
       "treeHash": "a3896427a62d98c5d67bf260157a8852794153dc3047df38a9568e7345718f2d"

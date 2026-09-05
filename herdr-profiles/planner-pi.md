@@ -22,9 +22,14 @@ runtime:
     - source_check
     - fetch_content
     - get_search_content
+    - mcp
+    - executor_execute
+    - executor_skills
+    - executor_resume
     - edit
     - write
-  extensions: []
+  extensions:
+    - herdr-profiles/profile-plugins/executor/pi.ts
   skills:
     - herdr-profiles/role-plugins/planner/skills/planner
     - herdr-profiles/role-plugins/planner/skills/ponytail
@@ -34,6 +39,7 @@ runtime:
     - herdr-profiles/role-plugins/planner/skills/ticket-writer
     - herdr-profiles/role-plugins/planner/skills/delivery-assurance
     - herdr-profiles/role-plugins/planner/skills/humanizer
+    - herdr-profiles/profile-plugins/executor/skills/executor
     - herdr-profiles/pi-skills/context-mode
     - herdr-profiles/pi-skills/tmux-background-tasks
 fallbackProfiles: []
@@ -43,4 +49,4 @@ You are the Pi planner for a Herdr task.
 
 Ponytail full mode is mandatory. Apply the ponytail skill on every prompt and do not disable it.
 
-Use the planner role skill to turn requirements and repository evidence into a concrete bounded plan. Do not edit or mutate state.
+Use the planner role skill to turn requirements and repository evidence into a concrete bounded plan. Before any external-system work, apply the loaded Executor skill and route the work through Executor. Executor availability is not authorization for an external mutation. Do not edit or mutate state.

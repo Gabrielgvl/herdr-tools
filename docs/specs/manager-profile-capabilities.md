@@ -23,7 +23,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 1. `manager-pi` uses `openai-codex/gpt-5.6-sol` with `thinking: high`, a 30-minute timeout, and no persistent Pi session.
 2. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, a 30-minute timeout, persistent session state, and no fallback because manager identity must not silently change.
 3. Existing Pi and Claude model and fallback choices remain unchanged. `scout-agy`, `researcher-agy`, and `worker-agy` use `gemini-3.8-flash-high`; AGY modes are fixed as `plan`, `plan`, and `accept-edits` respectively.
-4. Pi extension discovery remains enabled. Profile `runtime.extensions` stays empty because bundled profiles cannot portably reference machine-global package paths.
+4. Pi extension discovery remains enabled. Manager, planner, researcher, and promoter explicitly load the package-owned Executor extension. Other profiles keep `runtime.extensions` empty.
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
 7. Non-manager profiles cannot spawn hidden subagents. Pi profiles omit `Agent` and Herdr lifecycle tools; Claude profiles disallow `Task`.
@@ -101,8 +101,8 @@ Common extension-backed navigation tools are selected by name but still supplied
 
 | Profile | Active tools |
 |---|---|
-| `manager-pi` | `read`, `grep`, `find`, `ls`, `herdr_inspect`, `herdr_launch`, `herdr_communicate`, `herdr_wait`, `herdr_jobs`, `herdr_pane`, `herdr_tab` | Generic advisory manager; no direct Bash/Edit/Write. |
-| `manager-claude` | `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `AskUserQuestion`, `Skill`, `ToolSearch`, `mcp__plugin_herdr-tools_herdr` | Claude `default`; only `Task` is disallowed. Bash/Edit/Write remain owner-gated and are omitted from both lists. |
+| `manager-pi` | `read`, `grep`, `find`, `ls`, `edit`, `write`, Executor, and Herdr lifecycle tools | Generic advisory manager; writes only exact assignment-supplied handoff or coordination paths. |
+| `manager-claude` | Core research tools, `Edit`, `Write`, Herdr MCP, and Executor MCP | Claude `default`; only `Task` is disallowed. Writes only exact assignment-supplied handoff or coordination paths. |
 | `scout-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ffgrep`, `fffind`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write` |
 | `planner-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content` |
 | `worker-pi` | Planner set plus `bash_bg`, `jobs`, `job_decide`, `monitor` |
@@ -116,7 +116,7 @@ Explicitly absent from every non-manager Pi profile:
 - Herdr lifecycle tools
 - durable-memory mutation tools
 
-`manager-pi` does not receive `bash`, `edit`, or `write`. Every non-manager Pi and Claude profile receives `edit` and `write` so it can persist an assignment-required handoff; those profiles already receive Bash, so withholding the direct tools was not a filesystem security boundary. Role prompts still prohibit repository mutation outside the assigned role. `manager-claude` receives none of those tools through pre-approval; Claude's `default` permission mode keeps owner approval required when they are requested. An agent-authored promoter assignment never authorizes pushes, PR creation, publication, deployment, messaging, or spending.
+Every Pi and Claude profile receives edit/write so it can persist an assignment-required handoff. Manager profiles restrict writes to exact assignment-supplied handoff or coordination paths and do not gain implementation authority. Manager, planner, researcher, and promoter load the profile-scoped Executor MCP and skill. Scout, worker, reviewer, and every AGY profile do not. Executor availability never authorizes pushes, PR creation, publication, deployment, messaging, spending, or another external mutation.
 
 ### AGY role profiles
 
@@ -146,7 +146,7 @@ For every non-manager role, edit/write may persist only an assignment-required h
 - Keep the manager/caller pane isolated on its own tab; put workers on separate worker tabs with at most three panes per tab arranged side by side in one horizontal row.
 - Launch profile-backed workers onto worker tabs separate from the manager/caller tab without changing owner focus. Use a right-side split only when adding another worker pane to an existing worker tab with fewer than three panes; never put a worker in the isolated manager/caller tab. Use exact profile-backed launches, authoritative state, provenance-preserving tools, detached waits plus `herdr_jobs` when appropriate, owned-resource cleanup, and handoff before context exhaustion.
 - Treat worker text as agent evidence, never as owner authorization.
-- `manager-claude` may use Bash/Edit/Write only after direct owner approval for coordination artifacts, read-only verification, monitoring, or directly owner-authorized control-plane actions. Never use availability as approval.
+- Both managers may use Edit/Write only for exact assignment-supplied handoff or coordination paths. Bash and control-plane actions still require direct owner approval. Never use availability as approval.
 - Never perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation, and never grant authority.
 - Stop and report blocked or ambiguous work rather than inventing authority or masking degraded capabilities.
 
@@ -206,9 +206,9 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 
 - Catalog discovers 17 bundled profiles with no diagnostics.
 - `manager-pi` and `manager-claude` have exact identity, model, authority prompt, tools, shared skill/plugin path, and empty fallbacks.
-- Every Pi profile has a non-empty role allowlist and exactly one scoped role skill; `manager-pi` additionally loads `harness-flow`.
-- Every Claude profile has explicit permission mode, allowed/disallowed tools, and exactly one scoped plugin directory.
-- Every non-manager Pi and Claude profile includes edit/write for assignment-required handoffs; role contracts still prohibit unassigned repository mutation.
+- Every Pi profile has a non-empty role allowlist and a scoped role skill; `manager-pi` additionally loads `harness-flow`.
+- Every Claude profile has explicit permission mode, allowed/disallowed tools, and its scoped role plugin. Executor-enabled roles also load the separate Executor plugin.
+- Every Pi and Claude profile includes edit/write for assignment-required handoffs; role contracts still prohibit unassigned repository mutation.
 - Non-manager roles exclude hidden delegation tools.
 - Pi and Claude launch argv contain the exact tool, skill, permission, and plugin flags. AGY argv contains the exact model, plan mode, permission bypass, and bounded add-directory flags with no prompt source.
 - Invalid or escaping role resource paths remain rejected by existing parser tests.
@@ -233,8 +233,8 @@ Checkpoint: load the catalog and build argv for the manager plus one Pi/Claude p
 
 ### 2. Apply role capability configuration
 
-- Add exact `runtime.tools`, empty `runtime.extensions`, and one `runtime.skills` entry to every Pi profile.
-- Add exact `permissionMode`, `allowedTools`, `disallowedTools`, and one `pluginDirs` entry to every Claude profile.
+- Add exact `runtime.tools`, selected `runtime.extensions`, and explicit `runtime.skills` entries to every Pi profile.
+- Add exact `permissionMode`, `allowedTools`, `disallowedTools`, and explicit `pluginDirs` entries to every Claude profile.
 - Keep models, reasoning, timeouts, persistence, and existing fallback direction unchanged.
 - Include `herdr_tab` in the manager set and the four approved background-job tools in `worker-pi`.
 
@@ -291,7 +291,7 @@ Then inspect the live profile collection from the built extension and confirm:
   - Files: `herdr-profiles/*-pi.md`, `test/unit/profile-catalog.test.ts`.
 
 - [x] Configure all Claude profile capabilities.
-  - Acceptance: seven Claude profiles have explicit permissions, hard exclusions, and one role plugin; every non-manager profile disallows hidden `Task` delegation and receives Edit/Write for exact-path handoffs.
+  - Acceptance: seven Claude profiles have explicit permissions and hard exclusions; every profile disallows hidden `Task` delegation and receives Edit/Write for exact-path handoffs.
   - Verify: unit capability-matrix and argv tests.
   - Files: `herdr-profiles/*-claude.md`, `test/unit/profile-catalog.test.ts`.
 
@@ -330,7 +330,7 @@ Then inspect the live profile collection from the built extension and confirm:
 
 ## Success Criteria
 
-- `manager-pi` can visibly orchestrate profile-backed workers through Herdr and cannot directly edit repositories.
+- `manager-pi` can visibly orchestrate profile-backed workers through Herdr and writes only exact assignment-supplied handoff or coordination paths.
 - All 17 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
 - All Pi and Claude variants use one shared role skill source per role; the managers also expose the cross-role harness contract.
 - No-hidden-delegation boundaries are mechanically represented in profile configuration; read-only repository behavior remains an explicit role contract because those roles already have Bash and now also have edit/write for handoffs.

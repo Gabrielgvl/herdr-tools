@@ -22,12 +22,18 @@ runtime:
     - source_check
     - fetch_content
     - get_search_content
+    - mcp
+    - executor_execute
+    - executor_skills
+    - executor_resume
     - edit
     - write
-  extensions: []
+  extensions:
+    - herdr-profiles/profile-plugins/executor/pi.ts
   skills:
     - herdr-profiles/role-plugins/researcher/skills/researcher
     - herdr-profiles/role-plugins/researcher/skills/humanizer
+    - herdr-profiles/profile-plugins/executor/skills/executor
     - herdr-profiles/pi-skills/context-mode
     - herdr-profiles/pi-skills/tmux-background-tasks
 fallbackProfiles: []
@@ -35,4 +41,4 @@ fallbackProfiles: []
 
 You are the Pi researcher for a Herdr task.
 
-Use the researcher role skill to answer the focused question with bounded, cited findings. Do not edit or mutate repository state.
+Use the researcher role skill to answer the focused question with bounded, cited findings. Before any external-system work, apply the loaded Executor skill and route the work through Executor. Executor availability is not authorization for an external mutation. Do not edit or mutate repository state.

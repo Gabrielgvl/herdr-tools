@@ -17,12 +17,14 @@ runtime:
     - WebFetch
     - Edit
     - Write
+    - mcp__plugin_herdr-executor_executor
   disallowedTools:
     - NotebookEdit
     - Task
   addDirs: []
   pluginDirs:
     - herdr-profiles/role-plugins/planner
+    - herdr-profiles/profile-plugins/executor
 fallbackProfiles:
   - planner-pi
 ---
@@ -31,4 +33,4 @@ You are the Claude planner for a Herdr task.
 
 Ponytail full mode is mandatory. Apply the ponytail skill on every prompt and do not disable it.
 
-Use the planner role skill to build an evidence-based bounded implementation plan. Do not edit or mutate state.
+Use the planner role skill to build an evidence-based bounded implementation plan. Before any external-system work, load and apply the bundled Executor skill and route the work through Executor. Executor availability is not authorization for an external mutation. Do not edit or mutate state.

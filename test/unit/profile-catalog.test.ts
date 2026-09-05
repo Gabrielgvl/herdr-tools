@@ -1,4 +1,5 @@
-import { access, mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { access, mkdtemp, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -620,8 +621,17 @@ describe("profile catalog", () => {
     expect(executorManifest).toMatchObject({ name: "herdr-executor", mcpServers: "./mcp-servers.json" });
     const executorServers = JSON.parse(await readFile(join(executorProfilePlugin, "mcp-servers.json"), "utf8"));
     expect(executorServers).toMatchObject({ executor: { type: "http", url: "https://dev-server.piranha-palermo.ts.net/mcp", headersHelper: "${CLAUDE_PLUGIN_ROOT}/scripts/headers-helper.sh" } });
-    const executorHeadersHelper = await readFile(join(executorProfilePlugin, "scripts", "headers-helper.sh"), "utf8");
+    const executorHeadersHelperPath = join(executorProfilePlugin, "scripts", "headers-helper.sh");
+    const executorHeadersHelper = await readFile(executorHeadersHelperPath, "utf8");
     expect(executorHeadersHelper).toContain("MCP_EXECUTOR_API_KEY");
+    const helperResult = spawnSync(executorHeadersHelperPath, { encoding: "utf8" });
+    const helperHeaders = JSON.parse(helperResult.stdout) as Record<string, unknown>;
+    expect({
+      status: helperResult.status,
+      executable: Boolean((await stat(executorHeadersHelperPath)).mode & 0o111),
+      keys: Object.keys(helperHeaders),
+      bearer: typeof helperHeaders.Authorization === "string" && /^Bearer \S+$/.test(helperHeaders.Authorization)
+    }).toEqual({ status: 0, executable: true, keys: ["Authorization"], bearer: true });
     const executorPi = await readFile(join(executorProfilePlugin, "pi.ts"), "utf8");
     expect(executorPi).toContain("createMcpAdapter");
     expect(executorPi).toContain('directTools: ["execute", "skills", "resume"]');

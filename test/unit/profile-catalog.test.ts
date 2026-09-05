@@ -547,6 +547,7 @@ describe("profile catalog", () => {
     const bundledRoot = catalog.effective.get("manager-pi")!.source.scopeRoot;
     const rolePluginRoot = join(bundledRoot, "herdr-profiles", "role-plugins");
     const managerProfilePlugin = join(bundledRoot, "herdr-profiles", "profile-plugins", "manager");
+    const ponytailRoles = new Set(["planner", "worker", "reviewer"]);
     const roleNames = ["manager", "scout", "planner", "worker", "reviewer", "researcher", "promoter"];
     for (const role of roleNames) {
       const manifestPath = join(rolePluginRoot, role, ".claude-plugin", "plugin.json");
@@ -576,9 +577,9 @@ describe("profile catalog", () => {
     const rolePluginSkills = {
       manager: ["manager", "harness-flow"],
       scout: ["scout"],
-      planner: ["planner", "blueprint", "adr", "engineering-project-manager", "ticket-writer", "delivery-assurance", "humanizer"],
-      worker: ["worker", "tdd", "git-flow", "adr", "typescript", "delivery-assurance"],
-      reviewer: ["reviewer", "adr", "typescript", "delivery-assurance", "oracle", "pi-review-pr"],
+      planner: ["planner", "ponytail", "blueprint", "adr", "engineering-project-manager", "ticket-writer", "delivery-assurance", "humanizer"],
+      worker: ["worker", "ponytail", "tdd", "git-flow", "adr", "typescript", "delivery-assurance"],
+      reviewer: ["reviewer", "ponytail", "adr", "typescript", "delivery-assurance", "oracle", "pi-review-pr"],
       researcher: ["researcher", "humanizer"],
       promoter: ["promoter", "git-flow", "delivery-assurance", "courier-pr-gates", "dev-evidence-gate", "release-pr-validation", "shared-dev-deploy", "authenticated-staging-smoke", "services-ci-gates"]
     } as const;
@@ -691,6 +692,12 @@ describe("profile catalog", () => {
     }
 
     expect(buildProfileArgv(claudeWorker)).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "acceptEdits", ...claudeTools.worker.allowedTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "worker")]);
+
+    for (const role of ponytailRoles) {
+      for (const runtime of ["pi", "claude"] as const) {
+        expect(catalog.effective.get(`${role}-${runtime}`)?.body).toContain("Ponytail full mode is mandatory");
+      }
+    }
   });
 
   it("keeps every bundled Pi profile free of dead skill and thinking combinations", async () => {

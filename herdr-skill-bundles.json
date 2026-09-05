@@ -4,6 +4,7 @@
     "/home/gabriel/.codex/skills",
     "/home/gabriel/.local/share/agent-skills",
     "/home/gabriel/.pi/agent/skills",
+    "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills",
     "/home/gabriel/workspace/context-mode-pi-runtime/skills",
     "/home/gabriel/workspace/courier/.agents/skills",
     "/home/gabriel/workspace/courier/.pi/skills",
@@ -66,6 +67,10 @@
       "source": "/home/gabriel/workspace/courier/.agents/skills/ticket-writer",
       "treeHash": "7478ef1e4ebdedcc047e568ed2082be331ed917c4e9449276a352590abee3ae9"
     },
+    "herdr-profiles/role-plugins/planner/skills/ponytail": {
+      "source": "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills/ponytail",
+      "treeHash": "b2639078d9d1d846eaed1663cd1526053a646cb5d49a58bf055dd6cacefd5948"
+    },
     "herdr-profiles/role-plugins/promoter/skills/authenticated-staging-smoke": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/authenticated-staging-smoke",
       "treeHash": "4f59efa8bcd296d146570182b5ff8951438af4a1f607c7c3dfd24a4505f64cc6"
@@ -122,6 +127,10 @@
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",
       "treeHash": "83d7d4a4aa865e4416a878e225401a5f5b2e9aad37bc5dc63ae4f02ebfdfd26c"
     },
+    "herdr-profiles/role-plugins/reviewer/skills/ponytail": {
+      "source": "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills/ponytail",
+      "treeHash": "b2639078d9d1d846eaed1663cd1526053a646cb5d49a58bf055dd6cacefd5948"
+    },
     "herdr-profiles/role-plugins/worker/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
       "treeHash": "87900775acfe58d086adeb0dabc2cacd03472199c41f4d9e31cf50a89511947f"
@@ -141,6 +150,10 @@
     "herdr-profiles/role-plugins/worker/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",
       "treeHash": "83d7d4a4aa865e4416a878e225401a5f5b2e9aad37bc5dc63ae4f02ebfdfd26c"
+    },
+    "herdr-profiles/role-plugins/worker/skills/ponytail": {
+      "source": "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills/ponytail",
+      "treeHash": "b2639078d9d1d846eaed1663cd1526053a646cb5d49a58bf055dd6cacefd5948"
     },
     "herdr-profiles/pi-skills/context-mode": {
       "source": "/home/gabriel/workspace/context-mode-pi-runtime/skills/context-mode",

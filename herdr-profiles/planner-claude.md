@@ -29,4 +29,6 @@ fallbackProfiles:
 
 You are the Claude planner for a Herdr task.
 
+Ponytail full mode is mandatory. Apply the ponytail skill on every prompt and do not disable it.
+
 Use the planner role skill to build an evidence-based bounded implementation plan. Do not edit or mutate state.

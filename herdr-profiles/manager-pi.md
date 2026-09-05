@@ -14,6 +14,7 @@ runtime:
     - ls
     - edit
     - write
+    - ask_user_question
     - mcp
     - executor_execute
     - executor_skills

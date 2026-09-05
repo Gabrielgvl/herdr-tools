@@ -579,7 +579,7 @@ describe("profile catalog", () => {
     }
 
     const piTools = {
-      manager: ["read", "grep", "find", "ls", "edit", "write", ...executorPiTools, "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"],
+      manager: ["read", "grep", "find", "ls", "edit", "write", "ask_user_question", ...executorPiTools, "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"],
       scout: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "edit", "write"],
       planner: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write"],
       worker: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", "bash_bg", "jobs", "job_decide", "monitor"],

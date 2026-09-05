@@ -36,7 +36,9 @@ Runs the local `pi-review` CLI (adversarial cross-model harness: agentic finder(
 
 ### Reading a verdict — mandatory
 
-`report.json` is authoritative. Never use a console summary, lane summary, or remembered worker report as the verdict. In the JSON schema, `verification` is an **object**, not a string: status, confidence, and reasoning are nested under it.
+`report.json` is authoritative for what pi-review reported. It is not an automatic must-fix list. Never use a console summary, lane summary, or remembered worker report as the verdict. In the JSON schema, `verification` is an **object**, not a string: status, confidence, and reasoning are nested under it.
+
+Independently question every reported item, including `CONFIRMED` items. Check the claim against the requirements, actual diff, surrounding code, tests, concrete impact, and assigned scope. Classify each item as `must-fix`, `follow-up`, `nit`, `defense-in-depth`, or `not-a-finding`, with a short rationale. Reported severity is evidence, not the final classification. Use `must-fix` only for a real, in-scope correctness, security, data-loss, contract, or acceptance-criteria failure. Do not block on style preferences, optional cleanup, speculative hardening, out-of-scope redesign, or theoretical defense-in-depth without a material threat. Preserve the harness verdict separately so independent judgment never rewrites what the report said.
 
 The wrong check below silently returns zero matches because it compares an object with a string; it can turn a blocked report into a false clean:
 
@@ -56,7 +58,7 @@ The cached report path is keyed by repository **or worktree** name. Use the repo
 
 7. **Report from the JSON without promoting refuted candidates**:
    - Verdict and one-line meaning. Include PR number/title/author in PR mode; include the document title and grounding repo in plan mode.
-   - Verified findings only: items whose verification is `CONFIRMED` and worth reporting. Include severity, title, `file:line`, refuter confidence, and one sentence of refuter reasoning.
+   - Verified findings only: items whose verification is `CONFIRMED` and worth reporting. Include severity, title, `file:line`, refuter confidence, one sentence of refuter reasoning, and your independent classification with rationale. A confirmed item may still be a follow-up, nit, defense-in-depth suggestion, or not a real finding.
    - Report `notes[]` briefly.
    - Count refuted candidates separately. Also report ledger-suppressed/dismissed items separately when present. Plan-mode JSON may retain refuted candidates in `findings[]`; never present them as verified findings.
    - Footer: cost (`stats.costUsd`), duration, and the report path printed on stderr (`~/.cache/pi-review/...`). For lifecycle-v3 also report `convergencePolicy` stop/anomaly counts, `convergenceDiscovery` completeness/novelty, and the `finalAudit` status/model. Never summarize a `BLOCK` audit as a clean review.

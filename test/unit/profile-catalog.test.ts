@@ -604,6 +604,13 @@ describe("profile catalog", () => {
       await expect(validateProfileResourceSelection(profile, profile.runtime)).resolves.toBeUndefined();
       await expect(validateProfileResourceSelection(catalog.effective.get(`${role}-claude`)!, catalog.effective.get(`${role}-claude`)!.runtime)).resolves.toBeUndefined();
     }
+    const reviewerRole = await readFile(join(rolePluginRoot, "reviewer", "skills", "reviewer", "SKILL.md"), "utf8");
+    expect(reviewerRole).toContain("not a verdict to repeat");
+    expect(reviewerRole).toContain("`must-fix`, `follow-up`, `nit`, `defense-in-depth`, or `not-a-finding`");
+    const piReviewSkill = await readFile(join(rolePluginRoot, "reviewer", "skills", "pi-review-pr", "SKILL.md"), "utf8");
+    expect(piReviewSkill).toContain("It is not an automatic must-fix list");
+    expect(piReviewSkill).toContain("Reported severity is evidence, not the final classification");
+
     // The only manager plugin directory `manager-claude` loads is the generated
     // session-only one, and it holds the whole manager matrix.
     expect((await readdir(join(managerProfilePlugin, "skills"))).sort()).toEqual([...rolePluginSkills.manager, ...managerProfileSkills].sort());

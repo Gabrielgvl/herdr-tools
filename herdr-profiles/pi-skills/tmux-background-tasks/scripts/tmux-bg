@@ -37,9 +37,340 @@ require_tmux() {
   TMUX_BIN="$resolved"
 }
 
+require_python() {
+  PYTHON_BIN="$(command -v python3 2>/dev/null || true)"
+  [[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]] || fail "python3 is required for private notification publication"
+}
+
 require_id() {
   [[ "${1:-}" =~ ^pi-bg-[a-z0-9][a-z0-9-]*-[0-9]+-[0-9]+-[0-9]+$ ]] ||
     fail "invalid task id: ${1:-<empty>}"
+}
+
+require_session_id() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] ||
+    fail "invalid Pi session id: ${1:-<empty>}"
+}
+
+require_absolute_executable() {
+  local path="$1" label="${2:-path}"
+  [[ "$path" == /* && -f "$path" && -x "$path" ]] || fail "$label must be an absolute executable file"
+}
+
+shell_quote() {
+  local value="$1"
+  value="${value//\'/\'\\\'\'}"
+  printf "'%s'" "$value"
+}
+
+# Test-only trace hooks are intentionally inert unless a test explicitly exports them.
+trace_test() {
+  if [[ -n "${PI_TMUX_BG_TRACE:-}" ]]; then
+    { printf '%s\n' "$*" >>"$PI_TMUX_BG_TRACE"; } 2>/dev/null || true
+  fi
+}
+
+# Ensure/check the four trusted outbox entries without following an existing entry.
+# Creation is component-by-component; no recursive mkdir is used.
+ensure_outbox_chain() {
+  local agent_dir="$1" pi_session_id="$2" create="$3"
+  require_python
+  "$PYTHON_BIN" - "$agent_dir" "$pi_session_id" "$create" <<'PY'
+import os
+import stat
+import sys
+
+agent_dir, session_id, create = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+if not os.path.isabs(agent_dir):
+    raise SystemExit("agent directory must be absolute")
+if not session_id:
+    raise SystemExit("session id is required")
+paths = [
+    agent_dir,
+    os.path.join(agent_dir, "tmux-bg"),
+    os.path.join(agent_dir, "tmux-bg", "outbox"),
+    os.path.join(agent_dir, "tmux-bg", "outbox", session_id),
+]
+uid = os.geteuid()
+
+def check(path, session):
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise SystemExit(f"notification path is not a directory: {path}")
+    if st.st_uid != uid:
+        raise SystemExit(f"notification path has the wrong owner: {path}")
+    if st.st_mode & 0o22:
+        raise SystemExit(f"notification path is writable by group or other: {path}")
+    if session and (st.st_mode & 0o777) != 0o700:
+        raise SystemExit(f"notification session directory is not mode 0700: {path}")
+    return st
+
+# The caller's immediate parent must exist; only the four named entries may be created.
+parent = os.path.dirname(agent_dir)
+try:
+    parent_stat = os.lstat(parent)
+except OSError as error:
+    raise SystemExit(f"notification parent is unavailable: {parent}") from error
+if not stat.S_ISDIR(parent_stat.st_mode):
+    raise SystemExit(f"notification parent is not a directory: {parent}")
+
+for index, path in enumerate(paths):
+    try:
+        check(path, index == 3)
+    except FileNotFoundError:
+        if not create:
+            raise SystemExit(f"notification path is missing: {path}")
+        if index and not os.path.isdir(paths[index - 1]):
+            raise SystemExit(f"notification parent disappeared: {paths[index - 1]}")
+        try:
+            old_umask = os.umask(0o077)
+            try:
+                os.mkdir(path, 0o700)
+            finally:
+                os.umask(old_umask)
+        except FileExistsError:
+            pass
+        check(path, index == 3)
+
+# A pre-existing session directory is narrowed to the required private mode without
+# following a symlink; all other entries are rejected rather than rewritten.
+session_path = paths[-1]
+st = check(session_path, True)
+if (st.st_mode & 0o777) != 0o700:
+    os.chmod(session_path, 0o700, follow_symlinks=False)
+    check(session_path, True)
+PY
+}
+
+# Capture the pre-launch identities so publication cannot be redirected to a
+# caller-owned replacement that happens to satisfy the same mode checks.
+capture_outbox_identity() {
+  local agent_dir="$1" pi_session_id="$2"
+  require_python
+  "$PYTHON_BIN" - "$agent_dir" "$pi_session_id" <<'PY'
+import os
+import stat
+import sys
+
+agent_dir, session_id = sys.argv[1:]
+paths = [
+    agent_dir,
+    os.path.join(agent_dir, "tmux-bg"),
+    os.path.join(agent_dir, "tmux-bg", "outbox"),
+    os.path.join(agent_dir, "tmux-bg", "outbox", session_id),
+]
+uid = os.geteuid()
+identities = []
+for index, path in enumerate(paths):
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o22:
+        raise SystemExit(f"notification path failed identity capture: {path}")
+    if index == 3 and (st.st_mode & 0o777) != 0o700:
+        raise SystemExit(f"notification session failed identity capture: {path}")
+    identities.append(f"{st.st_dev}:{st.st_ino}")
+print("|".join(identities))
+PY
+}
+
+# Publish one event while holding a descriptor for the validated session directory.
+publish_event() {
+  local agent_dir="$1" pi_session_id="$2" task_id="$3" event="$4" temp_name="$5" chain_identity="${6:-}"
+  require_python
+  "$PYTHON_BIN" - "$agent_dir" "$pi_session_id" "$task_id" "$event" "$temp_name" "$chain_identity" <<'PY'
+import json
+import os
+import stat
+import sys
+
+agent_dir, session_id, task_id, event, temp_name, expected_identity = sys.argv[1:]
+if not os.path.isabs(agent_dir):
+    raise SystemExit("agent directory must be absolute")
+paths = [
+    agent_dir,
+    os.path.join(agent_dir, "tmux-bg"),
+    os.path.join(agent_dir, "tmux-bg", "outbox"),
+    os.path.join(agent_dir, "tmux-bg", "outbox", session_id),
+]
+uid = os.geteuid()
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+if not hasattr(os, "O_NOFOLLOW"):
+    raise SystemExit("descriptor-relative no-follow publication is unavailable")
+flags |= os.O_NOFOLLOW
+
+def identity(st):
+    return (st.st_dev, st.st_ino, st.st_uid, st.st_mode & 0o7777)
+
+def secure_stat(path, session):
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o22:
+        raise SystemExit(f"notification path failed publication validation: {path}")
+    if session and (st.st_mode & 0o777) != 0o700:
+        raise SystemExit(f"notification session directory failed publication validation: {path}")
+    return st
+
+def inode_identity(st):
+    return f"{st.st_dev}:{st.st_ino}"
+
+expected = expected_identity.split("|") if expected_identity else []
+if expected and len(expected) != len(paths):
+    raise SystemExit("notification identity capture is malformed")
+
+if len(event.encode("utf-8")) + 1 > 8192:
+    raise SystemExit("notification event is too large")
+try:
+    parsed = json.loads(event)
+except Exception as error:
+    raise SystemExit("notification event is not JSON") from error
+if not isinstance(parsed, dict):
+    raise SystemExit("notification event is not an object")
+
+initial = [secure_stat(path, index == 3) for index, path in enumerate(paths)]
+if expected and [inode_identity(st) for st in initial] != expected:
+    raise SystemExit("notification path identity changed before publication")
+fds = []
+temporary_fd = None
+renamed = False
+fail_stage = os.environ.get("PI_TMUX_BG_TEST_FAIL_STAGE")
+
+def fail_if(stage):
+    if fail_stage == stage:
+        raise OSError(f"injected publication failure: {stage}")
+
+try:
+    for path, expected in zip(paths, initial):
+        fd = os.open(path, flags)
+        fds.append(fd)
+        actual = os.fstat(fd)
+        if identity(actual) != identity(expected) or not stat.S_ISDIR(actual.st_mode) or actual.st_uid != uid or actual.st_mode & 0o22:
+            raise SystemExit(f"notification path changed during publication: {path}")
+        if path == paths[-1] and (actual.st_mode & 0o777) != 0o700:
+            raise SystemExit(f"notification session directory changed during publication: {path}")
+
+    # A final pathname check detects replacement before the handles were acquired;
+    # after this point all mutation is relative to the held original directory fd.
+    for index, (path, expected) in enumerate(zip(paths, initial)):
+        current = secure_stat(path, index == 3)
+        if identity(current) != identity(expected):
+            raise SystemExit(f"notification path identity changed: {path}")
+
+    session_fd = fds[-1]
+    event_name = f"{task_id}.json"
+    data = (event + "\n").encode("utf-8")
+    temporary_fd = os.open(
+        temp_name,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=session_fd,
+    )
+    os.fchmod(temporary_fd, 0o600)
+    fail_if("write")
+    view = memoryview(data)
+    while view:
+        written = os.write(temporary_fd, view)
+        if written <= 0:
+            raise SystemExit("notification event write made no progress")
+        view = view[written:]
+    fail_if("fsync")
+    os.fsync(temporary_fd)
+    written_stat = os.fstat(temporary_fd)
+    if not stat.S_ISREG(written_stat.st_mode) or written_stat.st_uid != uid or (written_stat.st_mode & 0o7777) != 0o600 or written_stat.st_size != len(data):
+        raise SystemExit("notification temporary failed verification")
+    os.lseek(temporary_fd, 0, os.SEEK_SET)
+    fail_if("readback")
+    remaining = bytearray()
+    while len(remaining) < len(data):
+        chunk = os.read(temporary_fd, len(data) - len(remaining))
+        if not chunk:
+            break
+        remaining.extend(chunk)
+    if bytes(remaining) != data:
+        raise SystemExit("notification temporary readback failed")
+
+    fail_if("seam")
+    # This seam is only used by the isolated deterministic race test. Production
+    # launches never set PI_TMUX_BG_TEST_SEAM.
+    if os.environ.get("PI_TMUX_BG_TEST_SEAM") == "1":
+        gate = os.environ.get("PI_TMUX_BG_RENAME_GATE")
+        if gate:
+            with open(gate, "a", encoding="utf-8") as trace:
+                trace.write(f"rename-blocked {task_id} {event_name}\n")
+            release = os.environ.get("PI_TMUX_BG_RENAME_RELEASE")
+            if release:
+                with open(release, "rb") as fifo:
+                    fifo.read(1)
+
+    trace = os.environ.get("PI_TMUX_BG_TRACE")
+    if trace:
+        try:
+            with open(trace, "a", encoding="utf-8") as trace_file:
+                trace_file.write(f"rename task_id={task_id} event={event_name}\\n")
+        except OSError:
+            pass
+    fail_if("rename")
+    os.rename(temp_name, event_name, src_dir_fd=session_fd, dst_dir_fd=session_fd)
+    renamed = True
+finally:
+    if temporary_fd is not None:
+        try:
+            os.close(temporary_fd)
+        finally:
+            if not renamed:
+                try:
+                    os.unlink(temp_name, dir_fd=session_fd)
+                except OSError:
+                    pass
+    if fds:
+        for fd in reversed(fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+PY
+}
+
+complete_task() {
+  [[ $# -eq 5 ]] || exit 1
+  local task_id="$1" pi_session_id="$2" session_persisted="$3"
+  local pane_dead_status="$4" pane_dead_signal="$5"
+  require_id "$task_id"
+  require_session_id "$pi_session_id"
+  [[ "$session_persisted" == 0 || "$session_persisted" == 1 ]] || exit 1
+  local signal_json outcome exit_json signal_name exit_code agent_dir event temp_name chain_identity
+  if (( session_persisted )); then session_persisted_json=true; else session_persisted_json=false; fi
+  if [[ -n "$pane_dead_signal" ]]; then
+    [[ "$pane_dead_status" == "" || "$pane_dead_status" =~ ^[0-9]+$ || "$pane_dead_status" == -1 ]] || exit 1
+    if [[ "$pane_dead_status" =~ ^[0-9]+$ ]]; then
+      local status_num=$((10#$pane_dead_status))
+      (( status_num <= 255 )) || exit 1
+    fi
+    if [[ "$pane_dead_signal" =~ ^[0-9]+$ ]]; then
+      pane_dead_signal="$(kill -l "$pane_dead_signal" 2>/dev/null)" || exit 1
+    fi
+    signal_name="${pane_dead_signal#SIG}"
+    [[ "$signal_name" =~ ^[A-Za-z][A-Za-z0-9_+.-]*$ ]] || exit 1
+    kill -l "$signal_name" >/dev/null 2>&1 || exit 1
+    signal_json="\"$signal_name\""
+    outcome="failed"
+    exit_json="null"
+  else
+    [[ "$pane_dead_status" =~ ^[0-9]+$ ]] || exit 1
+    exit_code=$((10#$pane_dead_status))
+    (( exit_code <= 255 )) || exit 1
+    signal_json="null"
+    if (( exit_code == 0 )); then outcome="succeeded"; else outcome="failed"; fi
+    exit_json="$exit_code"
+  fi
+
+  agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+  [[ "$agent_dir" == /* ]] || exit 1
+  ensure_outbox_chain "$agent_dir" "$pi_session_id" 0 || exit 1
+  event="$(printf '{\"schemaVersion\":1,\"eventId\":\"tmux-bg:%s\",\"piSessionId\":\"%s\",\"sessionPersisted\":%s,\"taskId\":\"%s\",\"outcome\":\"%s\",\"exitCode\":%s,\"signal\":%s,\"completedAtEpochSec\":%s,\"outputRef\":{\"kind\":\"tmux-bg\",\"taskId\":\"%s\"}}' \
+    "$task_id" "$pi_session_id" "$session_persisted_json" "$task_id" "$outcome" "$exit_json" "$signal_json" "$(date +%s)" "$task_id")"
+  (( ${#event} + 1 <= 8192 )) || exit 1
+  temp_name=".$task_id.$$.$RANDOM.tmp"
+  trace_test "complete_task task_id=$task_id"
+  chain_identity="${PI_TMUX_BG_CHAIN_IDENTITY:-}"
+  publish_event "$agent_dir" "$pi_session_id" "$task_id" "$event" "$temp_name" "$chain_identity" || exit 1
 }
 
 session_exists() {
@@ -52,43 +383,121 @@ is_managed_session() {
 }
 
 pane_state() {
-  tmux_cmd display-message -p -t "$1" \
-    '#{pane_dead}|#{pane_dead_status}|#{pane_pid}|#{pane_current_command}' 2>/dev/null || return $?
+  tmux_cmd display-message -p -t "$1" '#{pane_dead}|#{pane_dead_status}|#{pane_pid}|#{pane_dead_signal}' 2>/dev/null || return $?
 }
 
 start_task() {
   [[ $# -eq 3 ]] || usage
   local name="$1" cwd="$2" command="$3" slug id
+  local pi_session_id="${PI_SESSION_ID:-}" session_persisted=0 notify_enabled=0
+  local agent_dir script_path default_shell shell_command
   [[ -n "${name//[[:space:]]/}" ]] || fail "task name must not be empty"
   [[ -d "$cwd" ]] || fail "working directory does not exist: $cwd"
   [[ -n "${command//[[:space:]]/}" ]] || fail "command must not be empty"
+
+  if [[ -n "$pi_session_id" ]]; then
+    require_session_id "$pi_session_id"
+    notify_enabled=1
+    [[ "${PI_SESSION_FILE+x}" ]] && session_persisted=1
+    agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+    [[ "$agent_dir" == /* ]] || fail "PI_CODING_AGENT_DIR must be an absolute path"
+    ensure_outbox_chain "$agent_dir" "$pi_session_id" 1 || fail "could not create notification outbox"
+    script_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+    require_absolute_executable "$script_path" "completion helper"
+    default_shell="$(tmux_cmd start-server \; show-options -gv default-shell 2>/dev/null || true)"
+    [[ "$default_shell" != *$'\n'* && -n "$default_shell" ]] || fail "could not determine tmux default shell"
+    require_absolute_executable "$default_shell" "tmux default shell"
+  fi
 
   slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-32)"
   [[ -n "$slug" ]] || fail "task name must contain a letter or number"
   id="${PREFIX}${slug}-$(date +%s)-$$-$RANDOM"
 
-  tmux_cmd new-session -d -s "$id" -c "$cwd"
   trap 'tmux_cmd kill-session -t "$id" 2>/dev/null || true' ERR
-  tmux_cmd set-option -t "$id" @pi_bg_managed 1
-  tmux_cmd set-option -w -t "$id" remain-on-exit on
-  tmux_cmd set-option -w -t "$id" remain-on-exit-format ''
-  tmux_cmd set-option -t "$id" history-limit 5000
-  tmux_cmd respawn-pane -k -t "$id" -c "$cwd" "$command"
+  if (( notify_enabled )); then
+    shell_command="exec $(shell_quote "$script_path") __run $(shell_quote "$id") $(shell_quote "$pi_session_id") $(shell_quote "$session_persisted") $(shell_quote "$agent_dir") $(shell_quote "$default_shell") $(shell_quote "$command")"
+    tmux_cmd new-session -d -s "$id" -c "$cwd" sleep 2147483647
+    tmux_cmd set-option -t "$id" @pi_bg_managed 1
+    tmux_cmd set-option -w -t "$id" remain-on-exit on
+    tmux_cmd set-option -w -t "$id" remain-on-exit-format ''
+    tmux_cmd set-option -t "$id" history-limit 5000
+    tmux_cmd set-option -p -t "$id" @pi_bg_public_command "$command"
+    tmux_cmd set-option -p -t "$id" @pi_bg_wrapper 1
+    tmux_cmd respawn-pane -k -t "$id" -c "$cwd" "$shell_command"
+  else
+    tmux_cmd new-session -d -s "$id" -c "$cwd"
+    tmux_cmd set-option -t "$id" @pi_bg_managed 1
+    tmux_cmd set-option -w -t "$id" remain-on-exit on
+    tmux_cmd set-option -w -t "$id" remain-on-exit-format ''
+    tmux_cmd set-option -t "$id" history-limit 5000
+    tmux_cmd respawn-pane -k -t "$id" -c "$cwd" "$command"
+  fi
   trap - ERR
   printf '%s\n' "$id"
 }
 
 status_task() {
   [[ $# -eq 1 ]] || usage
-  local id="$1" state dead exit_code pid command
+  local id="$1" state dead exit_code pid signal command wrapper event_result result_kind result_value result_signal_number
   require_id "$id"
   is_managed_session "$id" || fail "task not found: $id"
   state="$(pane_state "$id")" || true
   [[ "$state" == [01]'|'* ]] || fail "task not found: $id"
-  IFS='|' read -r dead exit_code pid command <<<"$state"
+  IFS='|' read -r dead exit_code pid signal <<<"$state"
   if [[ "$dead" == "1" ]]; then
+    wrapper="$(tmux_cmd show-options -p -v -t "$id" @pi_bg_wrapper 2>/dev/null || true)"
+    if [[ -z "$exit_code" && "$signal" =~ ^[0-9]+$ ]]; then
+      exit_code=$((128 + signal))
+    elif [[ -z "$exit_code" && -z "$signal" && "$wrapper" == "1" ]]; then
+      # tmux can briefly retain a dead pane before publishing a zero status;
+      # the wrapper's committed event is the same exact child result.
+      event_result="$(python3 - "$id" "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" <<'PY'
+import json
+import os
+import sys
+path = os.path.join(sys.argv[2], "tmux-bg", "outbox")
+for session in os.listdir(path):
+    candidate = os.path.join(path, session, f"{sys.argv[1]}.json")
+    try:
+        with open(candidate, encoding="utf-8") as handle:
+            event = json.load(handle)
+        if event.get("taskId") != sys.argv[1]:
+            continue
+        if isinstance(event.get("exitCode"), int):
+            print(f"exit|{event['exitCode']}")
+        elif isinstance(event.get("signal"), str):
+            print(f"signal|{event['signal']}")
+        break
+    except (OSError, ValueError):
+        continue
+PY
+      )" || true
+      IFS='|' read -r result_kind result_value <<<"$event_result"
+      if [[ "$result_kind" == "exit" && "$result_value" =~ ^[0-9]+$ ]]; then
+        exit_code="$result_value"
+      elif [[ "$result_kind" == "signal" ]]; then
+        result_signal_number="$(python3 - "${result_value#SIG}" <<'PY'
+import signal
+import sys
+try:
+    print(signal.Signals["SIG" + sys.argv[1]].value)
+except (KeyError, ValueError):
+    raise SystemExit(1)
+PY
+        )" || true
+        if [[ "$result_signal_number" =~ ^[0-9]+$ ]]; then
+          exit_code=$((128 + result_signal_number))
+        fi
+      fi
+    fi
     printf 'id=%s status=done exit=%s\n' "$id" "${exit_code:-unknown}"
   else
+    wrapper="$(tmux_cmd show-options -p -v -t "$id" @pi_bg_wrapper 2>/dev/null || true)"
+    if [[ "$wrapper" == "1" ]]; then
+      command="$(tmux_cmd show-options -p -v -t "$id" @pi_bg_public_command 2>/dev/null || true)"
+    else
+      command="$(tmux_cmd display-message -p -t "$id" '#{pane_current_command}' 2>/dev/null || true)"
+    fi
     printf 'id=%s status=running pid=%s command=%s\n' "$id" "$pid" "$command"
   fi
 }
@@ -137,9 +546,162 @@ clean_tasks() {
   printf 'cleaned %d completed task(s)\n' "$cleaned"
 }
 
-require_tmux
+signal_number() {
+  case "$1" in
+    HUP) printf '1\n' ;;
+    INT) printf '2\n' ;;
+    QUIT) printf '3\n' ;;
+    TERM) printf '15\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+run_task() {
+  [[ $# -eq 6 ]] || exit 1
+  local task_id="$1" pi_session_id="$2" session_persisted="$3" agent_dir="$4" default_shell="$5" command="$6"
+  local child_pid="" writer_pid="" writer_read_fd="" writer_control_fd="" ready_line=""
+  local child_status=0 event_status="" event_signal="" inferred_signal="" inferred_signal_number="" pending_signal="" chain_identity=""
+  local completion_committed=0 completion_suppressed=0
+  require_id "$task_id"
+  require_session_id "$pi_session_id"
+  [[ "$session_persisted" == 0 || "$session_persisted" == 1 ]] || exit 1
+  [[ -n "${command//[[:space:]]/}" ]] || exit 1
+  [[ "$agent_dir" == /* ]] || exit 1
+  require_absolute_executable "$default_shell" "tmux default shell"
+  ensure_outbox_chain "$agent_dir" "$pi_session_id" 0 || exit 1
+  chain_identity="$(capture_outbox_identity "$agent_dir" "$pi_session_id")" || exit 1
+  [[ "$chain_identity" =~ ^[0-9]+:[0-9]+(\|[0-9]+:[0-9]+){3}$ ]] || exit 1
+
+  restore_and_signal() {
+    local name="$1" number="${2:-}"
+    [[ "$number" =~ ^[0-9]+$ ]] || number="$(signal_number "$name")" || exit 1
+    trap - HUP INT QUIT TERM
+    kill -"$number" "$$" 2>/dev/null || exit $((128 + number))
+    exit $((128 + number))
+  }
+
+  close_writer_control() {
+    if [[ -n "$writer_control_fd" ]]; then
+      eval "exec ${writer_control_fd}>&-" || true
+      writer_control_fd=""
+    fi
+  }
+
+  handle_run_signal() {
+    local name="$1"
+    if (( completion_committed == 0 )); then
+      completion_suppressed=1
+      close_writer_control
+      if [[ "$writer_pid" =~ ^[0-9]+$ ]]; then
+        if wait "$writer_pid"; then :; else :; fi
+        writer_pid=""
+      fi
+      if [[ "$child_pid" =~ ^[0-9]+$ ]]; then
+        kill -"$name" "$child_pid" 2>/dev/null || true
+        if wait "$child_pid"; then :; else :; fi
+        child_pid=""
+      fi
+      restore_and_signal "$name"
+    fi
+    [[ -n "$pending_signal" ]] || pending_signal="$name"
+  }
+
+  trap 'handle_run_signal HUP' HUP
+  trap 'handle_run_signal INT' INT
+  trap 'handle_run_signal QUIT' QUIT
+  trap 'handle_run_signal TERM' TERM
+
+  "$default_shell" -c "$command" <&0 &
+  child_pid=$!
+  if wait "$child_pid"; then
+    child_status=$?
+  else
+    child_status=$?
+  fi
+  child_pid=""
+
+  if (( child_status <= 128 )); then
+    event_status="$child_status"
+  elif (( child_status <= 192 )); then
+    # ponytail: Bash cannot distinguish explicit exits 129..192 from signal-derived statuses. Use a raw waitid(2) runner if exact distinction becomes required.
+    if event_signal="$(kill -l "$((child_status - 128))" 2>/dev/null)"; then
+      event_signal="${event_signal#SIG}"
+      inferred_signal="$event_signal"
+      inferred_signal_number="$((child_status - 128))"
+    else
+      event_status="$child_status"
+    fi
+  else
+    event_status="$child_status"
+  fi
+
+  coproc completion_writer {
+    trap '' HUP INT QUIT TERM
+    printf 'READY\n'
+    local decision=""
+    if IFS= read -r decision; then
+      if [[ "$decision" == COMMIT ]]; then
+        PI_CODING_AGENT_DIR="$agent_dir" PI_TMUX_BG_CHAIN_IDENTITY="$chain_identity" complete_task "$task_id" "$pi_session_id" "$session_persisted" "$event_status" "$event_signal" || true
+      fi
+    fi
+  }
+  writer_pid="${completion_writer_PID:-}"
+  writer_read_fd="${completion_writer[0]:-}"
+  writer_control_fd="${completion_writer[1]:-}"
+
+  if IFS= read -r -u "$writer_read_fd" ready_line; then :; else ready_line=""; fi
+  if [[ "$ready_line" != READY ]]; then
+    close_writer_control
+    if [[ "$writer_pid" =~ ^[0-9]+$ ]]; then
+      if wait "$writer_pid"; then :; else :; fi
+      writer_pid=""
+    fi
+  else
+    # This arithmetic builtin is the parent-owned pre-writer commitment boundary.
+    if (( completion_committed = !completion_suppressed )); then :; fi
+    if (( completion_committed )); then
+      trace_test "completion_committed=1 task_id=$task_id"
+      printf 'COMMIT\n' >&"$writer_control_fd" || true
+      close_writer_control
+      local writer_status=0
+      while [[ "$writer_pid" =~ ^[0-9]+$ ]]; do
+        if wait "$writer_pid"; then
+          writer_status=0
+          writer_pid=""
+        else
+          writer_status=$?
+          if kill -0 "$writer_pid" 2>/dev/null; then
+            continue
+          fi
+          writer_pid=""
+        fi
+      done
+      : "$writer_status"
+    else
+      close_writer_control
+    fi
+  fi
+
+  if [[ -n "$pending_signal" ]]; then
+    restore_and_signal "$pending_signal"
+  elif [[ -n "$inferred_signal" ]]; then
+    restore_and_signal "$inferred_signal" "$inferred_signal_number"
+  else
+    exit "$child_status"
+  fi
+}
+
 command="${1:-}"
 [[ $# -gt 0 ]] && shift || true
+if [[ "$command" == __complete ]]; then
+  complete_task "$@"
+  exit 0
+fi
+if [[ "$command" == __run ]]; then
+  run_task "$@"
+  exit 0
+fi
+require_tmux
 case "$command" in
   start) start_task "$@" ;;
   list) list_tasks "$@" ;;

@@ -165,7 +165,7 @@
     },
     "herdr-profiles/pi-skills/tmux-background-tasks": {
       "source": "/home/gabriel/.pi/agent/skills/tmux-background-tasks",
-      "treeHash": "5013ca27fc00ce779ffff8a4cf5bacdf4a564926943f898d4c834cc3b43d20a8"
+      "treeHash": "20f05eb716e42c6ede3dab161c724da53aeb6dc4c69533c6c9a7e6de137a3521"
     }
   }
 }

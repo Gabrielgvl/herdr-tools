@@ -28,8 +28,7 @@ runtime:
     - executor_resume
     - edit
     - write
-  extensions:
-    - herdr-profiles/profile-plugins/executor/pi.ts
+  extensions: []
   skills:
     - herdr-profiles/role-plugins/researcher/skills/researcher
     - herdr-profiles/role-plugins/researcher/skills/humanizer

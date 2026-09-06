@@ -22,8 +22,7 @@ runtime:
     - executor_resume
     - edit
     - write
-  extensions:
-    - herdr-profiles/profile-plugins/executor/pi.ts
+  extensions: []
   skills:
     - herdr-profiles/role-plugins/promoter/skills/promoter
     - herdr-profiles/role-plugins/promoter/skills/git-flow

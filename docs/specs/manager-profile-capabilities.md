@@ -23,7 +23,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 1. `manager-pi` uses `openai-codex/gpt-5.6-sol` with `thinking: high`, a 30-minute timeout, and no persistent Pi session.
 2. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, a 30-minute timeout, persistent session state, and no fallback because manager identity must not silently change.
 3. Existing Pi and Claude model and fallback choices remain unchanged. `scout-agy`, `researcher-agy`, and `worker-agy` use `gemini-3.8-flash-high`; AGY modes are fixed as `plan`, `plan`, and `accept-edits` respectively.
-4. Pi extension discovery remains enabled. Manager, planner, researcher, and promoter explicitly load the package-owned Executor extension. Other profiles keep `runtime.extensions` empty.
+4. Pi extension discovery remains enabled. The globally configured `pi-mcp-adapter` provides Executor; manager, planner, researcher, and promoter allowlist its tools and load its skill. Every Pi profile keeps `runtime.extensions` empty to avoid duplicate adapter registration.
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
 7. Non-manager profiles cannot spawn hidden subagents. Pi profiles omit `Agent` and Herdr lifecycle tools; Claude profiles disallow `Task`.
@@ -116,7 +116,7 @@ Explicitly absent from every non-manager Pi profile:
 - Herdr lifecycle tools
 - durable-memory mutation tools
 
-Every Pi and Claude profile receives edit/write so it can persist an assignment-required handoff. Manager profiles restrict writes to exact assignment-supplied handoff or coordination paths and do not gain implementation authority. Manager, planner, researcher, and promoter load the profile-scoped Executor MCP and skill. Scout, worker, reviewer, and every AGY profile do not. Executor availability itself never authorizes an external mutation; the trusted promoter profile authorizes only its standard gated delivery workflow for the exact reviewed manifest and targets.
+Every Pi and Claude profile receives edit/write so it can persist an assignment-required handoff. Manager profiles restrict writes to exact assignment-supplied handoff or coordination paths and do not gain implementation authority. Manager, planner, researcher, and promoter load the Executor skill and allowlist its tools; Pi uses the global adapter while Claude loads the profile-scoped plugin. Scout, worker, reviewer, and every AGY profile do not expose Executor tools. Executor availability itself never authorizes an external mutation; the trusted promoter profile authorizes only its standard gated delivery workflow for the exact reviewed manifest and targets.
 
 ### AGY role profiles
 

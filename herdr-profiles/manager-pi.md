@@ -26,8 +26,7 @@ runtime:
     - herdr_jobs
     - herdr_pane
     - herdr_tab
-  extensions:
-    - herdr-profiles/profile-plugins/executor/pi.ts
+  extensions: []
   skills:
     - herdr-profiles/role-plugins/manager/skills/manager
     - herdr-profiles/role-plugins/manager/skills/harness-flow

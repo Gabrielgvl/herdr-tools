@@ -617,7 +617,7 @@ describe("profile catalog", () => {
     ];
     for (const role of roleNames) {
       const profile = catalog.effective.get(`${role}-pi`)!;
-      expect(profile.runtime).toEqual({ kind: "pi", model: expect.any(String), thinking: expect.any(String), tools: [...piTools[role as keyof typeof piTools]], extensions: executorRoles.has(role) ? [join(executorProfilePlugin, "pi.ts")] : [], skills: piSkills(role) });
+      expect(profile.runtime).toEqual({ kind: "pi", model: expect.any(String), thinking: expect.any(String), tools: [...piTools[role as keyof typeof piTools]], extensions: [], skills: piSkills(role) });
       expect(profile.runtime.kind === "pi" && profile.runtime.tools.includes("Agent")).toBe(false);
       // A Claude role sees exactly the plugin's own skill trees, so the matrix is
       // asserted on disk as well as in the Pi allowlist.
@@ -647,10 +647,7 @@ describe("profile catalog", () => {
       keys: Object.keys(helperHeaders),
       bearer: typeof helperHeaders.Authorization === "string" && /^Bearer \S+$/.test(helperHeaders.Authorization)
     }).toEqual({ status: 0, executable: true, keys: ["Authorization"], bearer: true });
-    const executorPi = await readFile(join(executorProfilePlugin, "pi.ts"), "utf8");
-    expect(executorPi).toContain("createMcpAdapter");
-    expect(executorPi).toContain('directTools: ["execute", "skills", "resume"]');
-    expect(executorPi).toContain("MCP_EXECUTOR_API_KEY");
+    await expect(access(join(executorProfilePlugin, "pi.ts"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await readdir(join(executorProfilePlugin, "skills"))).sort()).toEqual(["executor"]);
     const executorSkill = await readFile(join(executorProfilePlugin, "skills", "executor", "SKILL.md"), "utf8");
     expect(executorSkill).toContain("`executor_execute`, `executor_skills`, and `executor_resume`");
@@ -661,7 +658,7 @@ describe("profile catalog", () => {
     expect((await readdir(join(managerProfilePlugin, "skills"))).sort()).toEqual([...rolePluginSkills.manager, ...managerProfileSkills].sort());
     const managerRole = await readFile(join(rolePluginRoot, "manager", "skills", "manager", "SKILL.md"), "utf8");
     expect(managerRole).toContain("Both managers receive Edit and Write only for an exact assignment-supplied handoff or coordination path");
-    expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "medium", tools: [...piTools.manager], extensions: [join(executorProfilePlugin, "pi.ts")], skills: piSkills("manager") });
+    expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "medium", tools: [...piTools.manager], extensions: [], skills: piSkills("manager") });
     expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual([]);
     const managerClaude = catalog.effective.get("manager-claude")!;
     const managerClaudeTools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "Edit", "Write", "mcp__plugin_herdr-tools_herdr", executorClaudeTool];
@@ -693,7 +690,7 @@ describe("profile catalog", () => {
     expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-claude", "researcher-pi"]);
     expect(resolveProfile("researcher-claude", catalog).reachableNames).toEqual(["researcher-claude", "researcher-pi"]);
-    expect(catalog.effective.get("promoter-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max", tools: [...piTools.promoter], extensions: [join(executorProfilePlugin, "pi.ts")], skills: piSkills("promoter") });
+    expect(catalog.effective.get("promoter-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max", tools: [...piTools.promoter], extensions: [], skills: piSkills("promoter") });
     expect(catalog.effective.get("promoter-pi")?.fallbackProfiles).toEqual(["promoter-claude"]);
     expect(resolveProfile("promoter-pi", catalog).reachableNames).toEqual(["promoter-pi", "promoter-claude"]);
 
@@ -742,7 +739,7 @@ describe("profile catalog", () => {
     const manager = catalog.effective.get("manager-pi")!;
     const worker = catalog.effective.get("worker-pi")!;
     const claudeWorker = catalog.effective.get("worker-claude")!;
-    expect(buildProfileArgv(manager)).toEqual(["--model", "openai-codex/gpt-5.6-sol", "--thinking", "medium", "--tools", piTools.manager.join(","), "--extension", join(executorProfilePlugin, "pi.ts"), "--no-skills", ...piSkills("manager").flatMap((skill) => ["--skill", skill]), "--no-session"]);
+    expect(buildProfileArgv(manager)).toEqual(["--model", "openai-codex/gpt-5.6-sol", "--thinking", "medium", "--tools", piTools.manager.join(","), "--no-skills", ...piSkills("manager").flatMap((skill) => ["--skill", skill]), "--no-session"]);
     expect(buildProfileArgv(worker)).toEqual(["--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", piTools.worker.join(","), "--no-skills", ...piSkills("worker").flatMap((skill) => ["--skill", skill]), "--no-session"]);
     for (const profileName of ["worker-pi", "worker-claude"]) {
       const workerProfile = await readFile(join(bundledRoot, "herdr-profiles", `${profileName}.md`), "utf8");

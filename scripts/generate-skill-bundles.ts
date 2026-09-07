@@ -2,9 +2,8 @@ import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateSkillBundles, SKILL_BUNDLE_REGISTRY_FILE } from "../src/profiles/skill-bundles.js";
 
-// Build/install-time materialization of the package-owned generated skill
-// bundles declared in <package root>/herdr-skill-bundles.json. Launch never
-// generates or repairs; it only validates.
+// Explicit materialization of the package-owned generated skill bundles.
+// Bundled launch preflight also refreshes canonical drift automatically.
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 try {
   const generations = await generateSkillBundles(packageRoot, "bundled");

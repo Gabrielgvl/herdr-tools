@@ -28,6 +28,8 @@ export interface LaunchGateOptions {
   freezePath?: string;
   lockPath?: string;
   deadlineMs?: number;
+  exclusive?: boolean;
+  nonblock?: boolean;
 }
 
 function uid(): number {
@@ -144,7 +146,8 @@ export async function acquireLaunchGate(options: LaunchGateOptions = {}): Promis
 
   let child: ChildProcessWithoutNullStreams;
   try {
-    child = spawn("flock", ["--shared", "--nonblock", lockPath, "--command", LOCK_COMMAND], {
+    const lockArgs = [options.exclusive ? "--exclusive" : "--shared", ...(options.nonblock === false ? [] : ["--nonblock"]), lockPath, "--command", LOCK_COMMAND];
+    child = spawn("flock", lockArgs, {
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch {

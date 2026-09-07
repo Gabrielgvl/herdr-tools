@@ -1,15 +1,16 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { acquireLaunchGate } from "../tools/launch-freeze.js";
 import { normalizeScopedResourcePath, parseFrontmatter } from "./parser.js";
 import type { Profile, ProfileSourceKind, RuntimeProfile } from "./types.js";
 
 /**
  * Generated skill bundles let a profile select a canonical skill that lives
  * outside its own scope root without ever widening the containment boundary:
- * the canonical tree is copied whole into the profile scope at build time and
- * pinned by a deterministic tree hash. Launch only validates; it never
- * generates, repairs, or dereferences anything.
+ * the canonical tree is copied whole into the profile scope and pinned by a
+ * deterministic tree hash. Build materializes every bundle. Bundled launches
+ * also refresh canonical drift before their first effect.
  */
 export const SKILL_BUNDLE_REGISTRY_FILE = "herdr-skill-bundles.json";
 
@@ -165,6 +166,17 @@ function approvedSourceRoots(value: unknown): string[] {
  * authoritative entry (`package.json`, this registry, `src`, `test`), before
  * any removal or rename can run.
  */
+function overlaps(left: string, right: string): boolean {
+  return !escapes(left, right) || !escapes(right, left);
+}
+
+function assertBundlePathsDisjoint(target: string, source: string, key: string): void {
+  const staging = `${target}.herdr-staging`;
+  if (overlaps(target, source) || overlaps(staging, source)) {
+    fail("PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", "skill bundle source, target, and staging paths must be disjoint", { key, source, target, staging });
+  }
+}
+
 function generatedTarget(scopeRoot: string, key: string): string {
   const root = resolve(scopeRoot);
   let target: string;
@@ -192,6 +204,7 @@ function registryRecord(scopeRoot: string, sourceKind: ProfileSourceKind, roots:
     } catch (error) {
       fail("PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", (error as Error).message, { key });
     }
+    assertBundlePathsDisjoint(target, resolvedSource, key);
     return [target, { key, source: resolvedSource, treeHash }];
   }
   // An external canonical source is a trust decision, not a path convenience.
@@ -201,6 +214,7 @@ function registryRecord(scopeRoot: string, sourceKind: ProfileSourceKind, roots:
   if (sourceKind === "project") fail("PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", "a project-scope skill bundle source must be relative to the project scope root", { key, source });
   const external = resolve(source);
   if (!roots.some((root) => strictlyInside(root, external))) fail("PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", "skill bundle source is outside every approved source root", { key, source: external, approvedSourceRoots: roots });
+  assertBundlePathsDisjoint(target, external, key);
   return [target, { key, source: external, treeHash }];
 }
 
@@ -357,11 +371,7 @@ async function selectedSkillNames(tree: string): Promise<string[]> {
   return names.length > 0 ? names : [basename(tree)];
 }
 
-/**
- * Fail-closed validation of one reachable profile's resource selection. Callers
- * must run this for every reachable fallback profile before the first launch
- * effect, because there is no automatic repair.
- */
+/** Fail-closed validation of one reachable profile's resource selection. */
 export async function validateProfileResourceSelection(profile: Profile, runtime: RuntimeProfile): Promise<void> {
   const scopeRoot = profile.source.scopeRoot;
   for (const path of scopedResourcePaths(runtime)) await assertPhysicalContainment(path, scopeRoot, "runtime resource");
@@ -390,23 +400,27 @@ export async function validateProfileResourceSelection(profile: Profile, runtime
   }
 }
 
-/** Rewrites only the pins, in place, so the registry's reviewed policy and its declared key order survive a repin. */
+/** Atomically rewrites only pins while preserving reviewed policy and key order. */
 async function writePins(scopeRoot: string, pins: ReadonlyMap<string, string>): Promise<void> {
   const path = join(resolve(scopeRoot), SKILL_BUNDLE_REGISTRY_FILE);
+  const staging = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const mode = (await fs.stat(path)).mode & 0o777;
   const document = JSON.parse(await fs.readFile(path, "utf8")) as { bundles: Record<string, { source: string; treeHash: string }> };
   for (const [key, treeHash] of pins) document.bundles[key].treeHash = treeHash;
-  await fs.writeFile(path, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+  try {
+    await fs.writeFile(staging, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", mode });
+    await fs.rename(staging, path);
+  } finally {
+    await fs.rm(staging, { force: true });
+  }
 }
 
 /**
- * Build/install-time generation. Generated content is disposable and is never
- * hand-edited or produced during a launch. The pin is a derived build artifact:
- * generation recomputes it from the canonical source at that moment, so the
- * reviewed policy in the registry is the target/source/approved-root mapping,
- * and the pin's job is to fail launch closed on any drift or tampering that
- * happens *after* the build.
+ * Generated content is disposable and never hand-edited. Build and bundled
+ * launch refreshes recompute it from the canonical source. The reviewed policy
+ * remains the registry's target, source, and approved-root mapping.
  */
-export async function generateSkillBundles(scopeRoot: string, sourceKind: ProfileSourceKind): Promise<SkillBundleGeneration[]> {
+async function generateSkillBundlesUnlocked(scopeRoot: string, sourceKind: ProfileSourceKind): Promise<SkillBundleGeneration[]> {
   const root = resolve(scopeRoot);
   const registry = await loadSkillBundleRegistry(root, sourceKind);
   // Every target is proven replaceable before the first destructive step, so a
@@ -425,19 +439,36 @@ export async function generateSkillBundles(scopeRoot: string, sourceKind: Profil
     }
     if (!stat.isDirectory()) fail("PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", "skill bundle target exists and is not a generated directory", { path: target });
   }
-  const generations: SkillBundleGeneration[] = [];
-  const pins = new Map<string, string>();
+  const physicalRoot = await fs.realpath(root);
+  const plans: Array<{ target: string; staging: string; physicalTarget: string; physicalStaging: string; record: SkillBundleRecord; physicalSource: string; treeHash: string }> = [];
   for (const [target, record] of registry.bundles) {
-    const physical = await resolveCanonicalSourceTree(record, registry, root);
-    const treeHash = await skillTreeDigest(physical);
-    const staging = `${target}.herdr-staging`;
-    await fs.rm(staging, { recursive: true, force: true });
+    const physicalSource = await resolveCanonicalSourceTree(record, registry, root);
     await fs.mkdir(dirname(target), { recursive: true });
+    const physicalTarget = join(await fs.realpath(dirname(target)), basename(target));
+    if (escapes(physicalRoot, physicalTarget)) fail("PROFILE_SKILL_PATH_ESCAPES_SCOPE", "skill bundle target escapes its scope root", { path: target, resolved: physicalTarget, scopeRoot: physicalRoot });
+    plans.push({ target, staging: `${target}.herdr-staging`, physicalTarget, physicalStaging: `${physicalTarget}.herdr-staging`, record, physicalSource, treeHash: await skillTreeDigest(physicalSource) });
+  }
+
+  // ponytail: O(n²) over the package registry's few dozen entries. Resolve all
+  // paths before mutation so one bundle can never overwrite another's source.
+  const writable = plans.flatMap((plan) => [{ key: plan.record.key, path: plan.physicalTarget }, { key: plan.record.key, path: plan.physicalStaging }]);
+  for (let left = 0; left < writable.length; left += 1) {
+    for (let right = left + 1; right < writable.length; right += 1) {
+      if (overlaps(writable[left].path, writable[right].path)) fail("PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", "skill bundle targets and staging paths must be physically disjoint", { left: writable[left], right: writable[right] });
+    }
+    for (const plan of plans) {
+      if (overlaps(writable[left].path, plan.physicalSource)) fail("PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", "skill bundle source, target, and staging paths must be physically disjoint", { writable: writable[left], source: { key: plan.record.key, path: plan.physicalSource } });
+    }
+  }
+
+  const generations: SkillBundleGeneration[] = [];
+  for (const { target, staging, record, physicalSource, treeHash } of plans) {
+    await fs.rm(staging, { recursive: true, force: true });
     try {
       // An ordinary whole-tree copy: the source tree has already been proven
       // free of symlinks and non-regular files by the digest above, so the
       // generated output is plain directories and plain files.
-      await fs.cp(physical, staging, { recursive: true, dereference: false });
+      await fs.cp(physicalSource, staging, { recursive: true, dereference: false });
       const copied = await skillTreeDigest(staging);
       /* c8 ignore next -- a whole-tree copy of an already-digested plain tree can only differ if the source changed mid-build, which launch then catches against the pin. */
       if (copied !== treeHash) fail("PROFILE_SKILL_BUNDLE_STALE", "generated skill bundle copy does not match its canonical source", { path: target, expected: treeHash, actual: copied });
@@ -446,9 +477,86 @@ export async function generateSkillBundles(scopeRoot: string, sourceKind: Profil
     } finally {
       await fs.rm(staging, { recursive: true, force: true });
     }
-    if (treeHash !== record.treeHash) pins.set(record.key, treeHash);
-    generations.push({ target, source: record.source, physicalSource: physical, treeHash, ...(treeHash === record.treeHash ? {} : { repinnedFrom: record.treeHash }) });
+    if (treeHash !== record.treeHash) await writePins(root, new Map([[record.key, treeHash]]));
+    generations.push({ target, source: record.source, physicalSource, treeHash, ...(treeHash === record.treeHash ? {} : { repinnedFrom: record.treeHash }) });
   }
-  if (pins.size > 0) await writePins(root, pins);
   return generations;
+}
+
+async function withBundleLock<T>(scopeRoot: string, action: () => Promise<T>): Promise<T> {
+  const root = resolve(scopeRoot);
+  const lockRoot = join(root, ".herdr-locks");
+  let lock;
+  try {
+    await fs.mkdir(lockRoot, { recursive: true, mode: 0o700 });
+    lock = await acquireLaunchGate({
+      lockPath: join(lockRoot, "skill-bundles.lock"),
+      freezePath: join(lockRoot, "skill-bundles.freeze"),
+      deadlineMs: 30_000,
+      exclusive: true,
+      nonblock: false
+    });
+  } catch (cause) {
+    return fail("PROFILE_SKILL_BUNDLE_STALE", "skill bundle refresh lock is unavailable", { scopeRoot: root, cause: String(cause) });
+  }
+  try {
+    return await action();
+  } finally {
+    await lock.release();
+  }
+}
+
+export async function generateSkillBundles(scopeRoot: string, sourceKind: ProfileSourceKind): Promise<SkillBundleGeneration[]> {
+  return withBundleLock(scopeRoot, () => generateSkillBundlesUnlocked(scopeRoot, sourceKind));
+}
+
+/**
+ * Accept owner edits to canonical skills at bundled launch time. A modified
+ * generated copy still fails closed, and user or project profiles never write.
+ */
+export async function refreshBundledProfileResourceSelection(profile: Profile, runtime: RuntimeProfile): Promise<void> {
+  if (profile.source.kind !== "bundled") return validateProfileResourceSelection(profile, runtime);
+  try {
+    await validateProfileResourceSelection(profile, runtime);
+    return;
+  } catch (error) {
+    if (!(error instanceof SkillSelectionError)) throw error;
+    if (error.code !== "PROFILE_SKILL_BUNDLE_STALE") {
+      const path = error.details.path;
+      const registry = await loadSkillBundleRegistry(profile.source.scopeRoot, "bundled");
+      if ((error.code !== "PROFILE_SKILL_TREE_UNSAFE" && error.code !== "PROFILE_SKILL_PATH_ESCAPES_SCOPE") || typeof path !== "string" || !registry.bundles.has(resolve(path))) throw error;
+      try {
+        await fs.lstat(path);
+        throw error;
+      } catch (statError) {
+        if (!statError || typeof statError !== "object" || !("code" in statError) || statError.code !== "ENOENT") throw error;
+      }
+    }
+  }
+
+  await withBundleLock(profile.source.scopeRoot, async () => {
+    const registry = await loadSkillBundleRegistry(profile.source.scopeRoot, "bundled");
+    for (const [target, record] of registry.bundles) {
+      const physical = await resolveCanonicalSourceTree(record, registry, profile.source.scopeRoot);
+      const canonical = await skillTreeDigest(physical);
+      let generated: string | undefined;
+      try {
+        generated = await skillTreeDigest(target);
+      } catch (targetError) {
+        try {
+          await fs.lstat(target);
+        } catch (statError) {
+          if (statError && typeof statError === "object" && "code" in statError && statError.code === "ENOENT") continue;
+        }
+        throw targetError;
+      }
+      // A prior interrupted refresh may leave either the old pinned copy or the
+      // new canonical copy. Any third set of bytes is an untrusted edit.
+      if (generated !== undefined && generated !== record.treeHash && generated !== canonical) {
+        fail("PROFILE_SKILL_BUNDLE_STALE", "generated skill bundle matches neither its pin nor canonical source", { path: target, expected: record.treeHash, canonical, actual: generated });
+      }
+    }
+    await generateSkillBundlesUnlocked(profile.source.scopeRoot, "bundled");
+  });
+  await validateProfileResourceSelection(profile, runtime);
 }

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.herdr-staging/
+.herdr-locks/
 coverage/
 .env
 .env.*

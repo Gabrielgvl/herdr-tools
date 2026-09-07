@@ -3038,14 +3038,19 @@ describe("herdr_launch profile-only contract", () => {
       .rejects.toMatchObject({ code: "PROFILE_SKILL_PATH_ESCAPES_SCOPE", details: { profile: "escaping-profile" } });
     expect(chainCalls).toHaveLength(0);
 
-    // A generated bundle whose copy no longer matches its pin is stale, not repaired.
+    // A generated bundle whose copy no longer matches its pin or canonical
+    // source is stale, not repaired.
     const soloProfile = catalog(scopedProfile(root, "primary-profile", "  skills: [./generated/good-skill]"));
-    writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ bundles: { "generated/good-skill": { source: "./generated/good-skill", treeHash: "0".repeat(64) } } }));
+    mkdirSync(join(root, "canonical-good-skill"));
+    writeFileSync(join(root, "canonical-good-skill", "SKILL.md"), "good body\n");
+    const goodPin = await skillTreeDigest(join(root, "canonical-good-skill"));
+    writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "tampered\n");
+    writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ bundles: { "generated/good-skill": { source: "./canonical-good-skill", treeHash: goodPin } } }));
     const staleCalls: string[][] = [];
     const staleAttachments = fakeAttachments();
     const stalePromptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
     await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: staleCalls }).cli, stalePromptSources, { attachments: staleAttachments }))
-      .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { profile: "primary-profile", path: join(root, "generated", "good-skill"), expected: "0".repeat(64) } });
+      .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { profile: "primary-profile", path: join(root, "generated", "good-skill"), expected: goodPin } });
     expect(staleCalls).toHaveLength(0);
     expect(staleAttachments.ensureRecipient).not.toHaveBeenCalled();
     expect(stalePromptSources.create).not.toHaveBeenCalled();
@@ -3079,16 +3084,22 @@ describe("herdr_launch profile-only contract", () => {
     expect(swapCalls.some((call) => call[0] === "agent" && call[1] === "start")).toBe(false);
     writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "canonical body\n");
 
+    // Owner edits to a bundled canonical skill are refreshed automatically
+    // before launch effects, so profile changes do not require a server reload.
     writeFileSync(join(canonical, "SKILL.md"), "canonical drifted\n");
+    const drifted = await skillTreeDigest(canonical);
     const driftCalls: string[][] = [];
-    const driftAttachments = fakeAttachments();
-    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: driftCalls }).cli, undefined, { attachments: driftAttachments }))
-      .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { profile: "primary-profile", path: canonical, expected: pinned } });
-    expect(driftCalls).toHaveLength(0);
-    expect(driftAttachments.ensureRecipient).not.toHaveBeenCalled();
+    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: driftCalls }).cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
+    expect(await skillTreeDigest(join(root, "generated", "good-skill"))).toBe(drifted);
+
+    // A process interrupted between removing and renaming a target leaves it
+    // missing; the next preflight restores it from the pinned canonical tree.
+    rmSync(join(root, "generated", "good-skill"), { recursive: true });
+    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
+    expect(await skillTreeDigest(join(root, "generated", "good-skill"))).toBe(drifted);
 
     // An external canonical source outside the approved set never launches.
-    writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ approvedSourceRoots: [join(outside, "elsewhere")], bundles: { "generated/good-skill": { source: canonical, treeHash: pinned } } }));
+    writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ approvedSourceRoots: [join(outside, "elsewhere")], bundles: { "generated/good-skill": { source: canonical, treeHash: drifted } } }));
     await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli))
       .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", details: { profile: "primary-profile" } });
 

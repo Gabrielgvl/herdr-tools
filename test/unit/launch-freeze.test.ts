@@ -49,6 +49,17 @@ describe("profile launch freeze gate", () => {
     }
   });
 
+  it("can hold the same gate exclusively", async () => {
+    const fixture = await paths();
+    const gate = await acquireLaunchGate({ freezePath: fixture.freeze, lockPath: fixture.lock, exclusive: true });
+    try {
+      await expect(acquireLaunchGate({ freezePath: fixture.freeze, lockPath: fixture.lock, deadlineMs: 50 })).rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN" });
+    } finally {
+      await gate.release();
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("rechecks the switch while the shared lock is held", async () => {
     const fixture = await paths();
     const gate = await acquireLaunchGate({ freezePath: fixture.freeze, lockPath: fixture.lock });

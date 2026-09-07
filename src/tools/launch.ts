@@ -13,7 +13,7 @@ import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.j
 import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
-import { buildRuntimeArgv, defaultPromptSourceStore, RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
+import { buildRuntimeArgv, defaultPromptSourceStore, refreshBundledProfileResourceSelection, RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
@@ -310,9 +310,9 @@ class LaunchError extends Error {
  * verdict carried through as a launch failure and any unexpected IO error
  * re-raised as itself.
  */
-async function assertResourceSelection(profile: Profile, runtime: RuntimeProfile): Promise<void> {
+async function assertResourceSelection(profile: Profile, runtime: RuntimeProfile, refresh = false): Promise<void> {
   try {
-    await validateProfileResourceSelection(profile, runtime);
+    await (refresh ? refreshBundledProfileResourceSelection(profile, runtime) : validateProfileResourceSelection(profile, runtime));
   } catch (error) {
     if (!(error instanceof SkillSelectionError)) throw error;
     // `causeCode` keeps the skill-selection verdict legible when this runs after
@@ -1909,16 +1909,14 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           }
           profiles = profiles.filter((candidate) => candidate.runtime.kind !== "agy");
         }
-        // Physical containment and generated-bundle freshness are validated for
-        // every reachable fallback profile before the first launch effect, so a
-        // symlink escape or a stale generated skill copy fails with no
-        // recipient, prompt source, reservation, or topology change at all.
-        // There is no automatic repair.
+        // Every reachable fallback profile is checked before the first launch
+        // effect. Bundled canonical edits are materialized here; unsafe trees
+        // and edited generated copies still fail before any effect.
         for (const profile of profiles) {
           const overrides = profile.name === params.profile ? params.overrides : {};
           const runtime = resolveProfileRuntime(profile, overrides);
           effectiveRuntimes.set(profile.name, runtime);
-          await assertResourceSelection(profile, runtime);
+          await assertResourceSelection(profile, runtime, true);
         }
         recipientKey = mintRecipientKey();
         grant = await attachmentStore.ensureRecipient(recipientKey);

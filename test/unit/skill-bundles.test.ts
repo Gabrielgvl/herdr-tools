@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { assertPhysicalContainment, generateSkillBundles, loadSkillBundleRegistry, parseProfile, profileSource, resolveCanonicalSourceTree, resolveProfileRuntime, skillTreeDigest, SKILL_BUNDLE_REGISTRY_FILE, validateProfileResourceSelection } from "../../src/profiles/index.js";
+import { assertPhysicalContainment, generateSkillBundles, loadSkillBundleRegistry, parseProfile, profileSource, refreshBundledProfileResourceSelection, resolveCanonicalSourceTree, resolveProfileRuntime, skillTreeDigest, SKILL_BUNDLE_REGISTRY_FILE, validateProfileResourceSelection } from "../../src/profiles/index.js";
 
 function scope(label: string): string {
   return mkdtempSync(join(tmpdir(), `herdr-bundle-${label}-`));
@@ -19,8 +19,8 @@ function skillTree(root: string, name: string, body = "canonical body\n"): strin
   return path;
 }
 
-function piProfile(root: string, name: string, resources: string) {
-  return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: false\nruntime:\n  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]\n${resources}\nfallbackProfiles: []\n---\n\nBody for ${name}.\n`, profileSource("bundled", join(root, `${name}.md`), root));
+function piProfile(root: string, name: string, resources: string, sourceKind: "bundled" | "user" | "project" = "bundled") {
+  return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: false\nruntime:\n  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]\n${resources}\nfallbackProfiles: []\n---\n\nBody for ${name}.\n`, profileSource(sourceKind, join(root, `${name}.md`), root));
 }
 
 function registry(root: string, value: unknown): void {
@@ -202,26 +202,32 @@ describe("generated skill bundles", () => {
     expect(pins(root)).toEqual({ [key]: pin });
     expect(readFileSync(join(target, "references", "notes.md"), "utf8")).toBe("notes\n");
 
-    // Deterministic: a second generation from the same source reproduces the
-    // same digest and moves no pin.
-    expect(await generateSkillBundles(root, "bundled")).toEqual([{ target, source: canonical, physicalSource: canonical, treeHash: pin }]);
+    // Deterministic and serialized: concurrent generators reproduce the same
+    // digest without sharing a staging directory.
+    const concurrent = await Promise.all([generateSkillBundles(root, "bundled"), generateSkillBundles(root, "bundled")]);
+    expect(concurrent).toEqual([
+      [{ target, source: canonical, physicalSource: canonical, treeHash: pin }],
+      [{ target, source: canonical, physicalSource: canonical, treeHash: pin }]
+    ]);
     expect(pins(root)).toEqual({ [key]: pin });
 
     const bundled = piProfile(root, "bundled-profile", `  skills: [./${key}]`);
     await expect(validateProfileResourceSelection(bundled, bundled.runtime)).resolves.toBeUndefined();
 
-    // A tampered generated copy is stale, never repaired at launch.
+    // A tampered generated copy is stale and is never repaired at launch.
     writeFileSync(join(target, "SKILL.md"), "tampered\n");
-    await expect(validateProfileResourceSelection(bundled, bundled.runtime)).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { path: target, expected: pin } });
+    await expect(refreshBundledProfileResourceSelection(bundled, bundled.runtime)).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { path: target, expected: pin } });
+    expect(readFileSync(join(target, "SKILL.md"), "utf8")).toBe("tampered\n");
     await generateSkillBundles(root, "bundled");
-    await expect(validateProfileResourceSelection(bundled, bundled.runtime)).resolves.toBeUndefined();
 
-    // Canonical drift fails launch closed while the committed copy and pin are
-    // both still internally consistent; only a rebuild repins and re-materializes.
+    // Canonical drift remains validation-only for user profiles, but bundled
+    // launch refreshes and repins it before the first effect.
     writeFileSync(join(canonical, "SKILL.md"), "canonical drifted\n");
     const drifted = await skillTreeDigest(canonical);
-    await expect(validateProfileResourceSelection(bundled, bundled.runtime)).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { path: canonical, expected: pin, actual: drifted } });
-    expect(await generateSkillBundles(root, "bundled")).toEqual([{ target, source: canonical, physicalSource: canonical, treeHash: drifted, repinnedFrom: pin }]);
+    const user = piProfile(root, "user-profile", `  skills: [./${key}]`, "user");
+    await expect(refreshBundledProfileResourceSelection(user, user.runtime)).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { path: canonical, expected: pin, actual: drifted } });
+    expect(pins(root)).toEqual({ [key]: pin });
+    await expect(refreshBundledProfileResourceSelection(bundled, bundled.runtime)).resolves.toBeUndefined();
     expect(pins(root)).toEqual({ [key]: drifted });
     await expect(validateProfileResourceSelection(bundled, bundled.runtime)).resolves.toBeUndefined();
 
@@ -229,6 +235,50 @@ describe("generated skill bundles", () => {
     renameSync(canonical, join(approved, "moved"));
     await expect(validateProfileResourceSelection(bundled, bundled.runtime)).rejects.toMatchObject({ code: "PROFILE_SKILL_TREE_UNSAFE", details: { path: canonical } });
     await expect(generateSkillBundles(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_TREE_UNSAFE", details: { path: canonical } });
+  });
+
+  it("keeps completed bundle replacements consistent when a later source fails", async () => {
+    const root = scope("partial");
+    const approved = scope("partial-canonical");
+    const first = skillTree(approved, "first");
+    const second = skillTree(approved, "second");
+    const firstKey = "generated/first";
+    const secondKey = "generated/second";
+    registry(root, { approvedSourceRoots: [approved], bundles: {
+      [firstKey]: { source: first, treeHash: "0".repeat(64) },
+      [secondKey]: { source: second, treeHash: "0".repeat(64) }
+    } });
+    await generateSkillBundles(root, "bundled");
+
+    writeFileSync(join(first, "SKILL.md"), "first changed\n");
+    rmSync(second, { recursive: true });
+    await expect(generateSkillBundles(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_TREE_UNSAFE", details: { path: second } });
+    expect(await skillTreeDigest(join(root, firstKey))).toBe(pins(root)[firstKey]);
+  });
+
+  it("rejects physical overlap across different bundle records before mutation", async () => {
+    const root = scope("cross-overlap");
+    const canonical = skillTree(join(root, "canonical"), "first");
+    const firstTarget = skillTree(join(root, "generated"), "first");
+    const nestedSource = skillTree(firstTarget, "nested");
+    registry(root, { bundles: {
+      "generated/first": { source: "./canonical/first", treeHash: "0".repeat(64) },
+      "generated/second": { source: "./generated/first/nested", treeHash: "0".repeat(64) }
+    } });
+    await expect(generateSkillBundles(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_REGISTRY_INVALID" });
+    expect(existsSync(nestedSource)).toBe(true);
+    expect(existsSync(canonical)).toBe(true);
+
+    const sharedParent = join(root, "shared-targets");
+    mkdirSync(sharedParent);
+    symlinkSync(sharedParent, join(root, "left"), "dir");
+    symlinkSync(sharedParent, join(root, "right"), "dir");
+    registry(root, { bundles: {
+      "left/skill": { source: "./canonical/first", treeHash: "0".repeat(64) },
+      "right/skill": { source: "./generated/first/nested", treeHash: "0".repeat(64) }
+    } });
+    await expect(generateSkillBundles(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_REGISTRY_INVALID" });
+    expect(existsSync(join(sharedParent, "skill"))).toBe(false);
   });
 
   it("keeps the package registry generated, pinned, and sourced from the approved canonical trees", async () => {
@@ -425,6 +475,18 @@ describe("generated skill bundles", () => {
     registry(root, { bundles: { "herdr-profiles/pi-skills/worker": { source: "./canonical/worker", treeHash: "0".repeat(64) } } });
     const [generation] = await generateSkillBundles(root, "bundled");
     expect(generation).toMatchObject({ physicalSource: canonical, treeHash: await skillTreeDigest(canonical) });
+
+    const target = join(root, "herdr-profiles", "pi-skills", "worker");
+    for (const source of ["./herdr-profiles/pi-skills/worker", "./herdr-profiles/pi-skills/worker/source", "./herdr-profiles/pi-skills/worker.herdr-staging"]) {
+      registry(root, { bundles: { "herdr-profiles/pi-skills/worker": { source, treeHash: "0".repeat(64) } } });
+      await expect(loadSkillBundleRegistry(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_REGISTRY_INVALID" });
+    }
+    registry(root, { approvedSourceRoots: [root], bundles: { "herdr-profiles/pi-skills/worker": { source: target, treeHash: "0".repeat(64) } } });
+    await expect(loadSkillBundleRegistry(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_REGISTRY_INVALID" });
+
+    symlinkSync(target, join(root, "alias"), "dir");
+    registry(root, { bundles: { "herdr-profiles/pi-skills/worker": { source: "./alias", treeHash: "0".repeat(64) } } });
+    await expect(generateSkillBundles(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_REGISTRY_INVALID" });
 
     // A relative source that leaves the scope root is refused lexically, and one
     // that leaves it only through a symlink is refused physically.

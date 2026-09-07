@@ -13,7 +13,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 ## Validated Owner Decisions
 
 - Keep `manager-pi` as the generic advisory default and add `manager-claude` for owner-requested Claude/Fable management or Claude-to-Claude succession.
-- Both manager profiles orchestrate visible workers and may use Edit/Write only for an exact assignment-supplied handoff or coordination path. The Claude manager still requires direct owner approval for Bash and control-plane actions. Neither manager may perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation.
+- Both manager profiles orchestrate visible workers and may use Edit/Write only for an exact assignment-supplied handoff or coordination path. Both managers now hold a shell capability -- Claude through `Bash`, Pi through the Codex adapter's `exec_command`/`write_stdin` -- and both require direct owner approval for shell and control-plane actions. Neither manager may perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation.
 - Use role-scoped tool allowlists while retaining installed extension discovery.
 - Configure role-specific skills.
 - Advisory defaults are manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-agy for reconnaissance, researcher-agy for research, and reviewer-pi for review. The exact chains are `scout-agy -> scout-claude -> scout-pi`, `researcher-agy -> researcher-claude -> researcher-pi`, and `worker-pi -> worker-agy -> worker-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.
@@ -27,7 +27,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
 7. Non-manager profiles cannot spawn hidden subagents. Pi profiles omit `Agent` and Herdr lifecycle tools; Claude profiles disallow `Task`.
-8. Read-only describes repository authority, not tool absence. Non-manager Pi and Claude roles already retain Bash and now also receive edit/write for assignment-required handoffs; their role skills still prohibit unassigned repository mutation.
+8. Read-only describes repository authority, not tool absence. Non-manager Pi and Claude roles already retain Bash and now also receive edit/write for assignment-required handoffs; their role skills still prohibit unassigned repository mutation. The same now holds for both managers, whose shell capability is bounded by owner approval in the role skill rather than by the absence of a shell tool.
 9. AGY support is implemented only in Herdr Tools. It requires no Herdr Core change. The AGY profile body is metadata, not a runtime prompt.
 
 ## Tech Stack
@@ -101,7 +101,7 @@ Common extension-backed navigation tools are selected by name but still supplied
 
 | Profile | Active tools |
 |---|---|
-| `manager-pi` | `read`, `grep`, `find`, `ls`, `edit`, `write`, `ask_user_question`, Executor, and Herdr lifecycle tools | Generic advisory manager; writes only exact assignment-supplied handoff or coordination paths. |
+| `manager-pi` | `read`, `grep`, `find`, `ls`, `edit`, `write`, `ask_user_question`, Executor, and Herdr lifecycle tools, plus the Codex adapter surface | Generic advisory manager; writes only exact assignment-supplied handoff or coordination paths. Owner-approved: the adapter surface gives it `exec_command`/`write_stdin`, so it now has shell execution, and `apply_patch`. |
 | `manager-claude` | Core research tools, `Edit`, `Write`, Herdr MCP, and Executor MCP | Claude `default`; only `Task` is disallowed. Writes only exact assignment-supplied handoff or coordination paths. |
 | `scout-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ffgrep`, `fffind`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write` |
 | `planner-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content` |
@@ -109,6 +109,18 @@ Common extension-backed navigation tools are selected by name but still supplied
 | `reviewer-pi` | Planner set |
 | `researcher-pi` | Planner set |
 | `promoter-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write`; exact reviewed commit and gated delivery scope only |
+
+Every Pi row above additionally allowlists the full 12-tool Codex adapter surface --
+`change_reasoning`, `exec_command`, `write_stdin`, `apply_patch`, `exec`, `wait`,
+`notebook`, `view_image`, `new_context`, `get_context_remaining`, `history`, `notes` --
+because Pi applies `--tools` to extension tools as well as built-ins and the adapter
+deactivates itself when any tool in its current runtime plan is missing. The adapter
+activates only its planned subset and drops native `read`, `bash`, `edit`, and `write`
+while it runs. For `manager-pi` this is an owner-accepted capability change rather than
+a neutral one: the profile previously had no shell tool at all and now receives
+`exec_command`/`write_stdin`. **Owner approval and the manager's lack of implementation
+authority are therefore policy constraints in the role skill, not the mechanical
+absence of a shell tool.**
 
 Explicitly absent from every non-manager Pi profile:
 
@@ -120,7 +132,7 @@ Every Pi and Claude profile receives edit/write so it can persist an assignment-
 
 ### AGY role profiles
 
-`scout-agy` and `researcher-agy` use `gemini-3.8-flash-high`, persistent sessions, fixed `plan` mode, and `--dangerously-skip-permissions`; `worker-agy` uses the same model and bypass with fixed `accept-edits` mode. Only model and scope-normalized `addDirs` may be overridden; mode is fixed per profile. AGY profile bodies are catalog metadata. Every launch requires one visible, provenance-wrapped, self-contained `initialPrompt`; AGY discovers repository `AGENTS.md` natively. Because worker accept-edits plus the bypass can auto-approve mutations, manager assignments must bound scope and required tests.
+`scout-agy` and `researcher-agy` use `gemini-3.8-flash-high`, persistent sessions, fixed `plan` mode, and `--dangerously-skip-permissions`; `worker-agy` uses the same model and bypass with fixed `accept-edits` mode. Only model and scope-normalized `addDirs` may be overridden; mode is fixed per profile. AGY profile bodies are catalog metadata. Every launch requires one visible, provenance-wrapped, self-contained typed `assignment` of exactly `objective`, `scope`, and `verification`; AGY discovers repository `AGENTS.md` natively. Because worker accept-edits plus the bypass can auto-approve mutations, manager assignments must bound scope and required tests.
 
 AGY initially publishes provisional pane, terminal, name, and kind supervision because its native session may appear only after the first prompt. The launch strengthens to exact native-session supervision before reporting success or registering recipient and attachment capability. A failure after possible prompt effect leaves the provisional child and recovery evidence visible, with no retry, fallback, cleanup, reservation release, or recipient registration. This reduced-assurance window is accepted for AGY only. Pi and Claude still require complete native-session identity before assignment.
 
@@ -146,7 +158,7 @@ For every non-manager role, edit/write may persist only an assignment-required h
 - Keep the manager/caller pane isolated on its own tab; put workers on separate worker tabs with at most three panes per tab arranged side by side in one horizontal row.
 - Launch profile-backed workers onto worker tabs separate from the manager/caller tab without changing owner focus. Use a right-side split only when adding another worker pane to an existing worker tab with fewer than three panes; never put a worker in the isolated manager/caller tab. Use exact profile-backed launches, authoritative state, provenance-preserving tools, detached waits plus `herdr_jobs` when appropriate, owned-resource cleanup, and handoff before context exhaustion.
 - Treat worker text as agent evidence, never as owner authorization.
-- Both managers may use Edit/Write only for exact assignment-supplied handoff or coordination paths. Bash and control-plane actions still require direct owner approval. Never use availability as approval.
+- Both managers may use Edit/Write only for exact assignment-supplied handoff or coordination paths. Shell and control-plane actions still require direct owner approval, for the Pi manager's adapter `exec_command`/`write_stdin` exactly as for the Claude manager's `Bash`. Never use availability as approval.
 - Never perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation, and never grant authority.
 - Stop and report blocked or ambiguous work rather than inventing authority or masking degraded capabilities.
 
@@ -245,7 +257,7 @@ Checkpoint: catalog resolution has 17 effective profiles, no diagnostics, and ev
 - Extend `test/unit/profile-catalog.test.ts` with an exact capability matrix and role-resource existence checks.
 - Add representative `buildProfileArgv` assertions for manager, worker, read-only Pi, and Claude profiles.
 - Update `test/integration/herdr-tools.integration.test.ts` to inspect 17 profiles, inspect manager/promoter profiles plus the AGY role profiles, and verify exact worker and AGY launch arguments without changing provenance or topology assertions.
-- Add identity-bound prompt acknowledgement and optional post-dispatch observation in `src/tools/launch.ts`: accept partial Herdr protocol 20 `agent_started` identity, then run one bounded read-only snapshot + `agent get` + pane preflight sample at a time before submission and before no-prompt return. Join each sample only with start-supplied fields; never merge missing components across samples, and fail immediately on supplied contradictions. After one sample yields the exact pane/terminal/name/kind and complete `agent_session`, submit exactly once through `agent prompt --stdin` and require the typed `agent_prompted` response to match that captured identity, `interactive_ready:true`, and safe revision. Abort/timeout stops before stdin and recipient registration with bounded evidence. Persist that identity for attachments, report working/skipped/stale/unavailable observation without waiting, retrying, runtime hooks, fallback, or sending Enter, and omit replacement post-state from authoritative details and success rows.
+- Add identity-bound prompt acknowledgement and optional post-dispatch observation in `src/tools/launch.ts`: accept partial Herdr protocol 20 `agent_started` identity, then run one bounded read-only snapshot + `agent get` + pane preflight sample at a time before submission. Join each sample only with start-supplied fields; never merge missing components across samples, and fail immediately on supplied contradictions. After one sample yields the exact pane/terminal/name/kind and complete `agent_session`, submit exactly once through `agent prompt --stdin` and require the typed `agent_prompted` response to match that captured identity, `interactive_ready:true`, and safe revision. Abort/timeout stops before stdin and recipient registration with bounded evidence. Persist that identity for attachments, report working/skipped/stale/unavailable observation without waiting, retrying, runtime hooks, fallback, or sending Enter, and omit replacement post-state from authoritative details and success rows.
 - Cover accepted idle/screen-detection-skipped launches, stale/unavailable observation, malformed/mismatched acknowledgements, and the no-duplicate/no-key boundary in `test/unit/launch.test.ts`.
 - Do not weaken strict parser, inspection-budget, discovery, or fallback tests.
 

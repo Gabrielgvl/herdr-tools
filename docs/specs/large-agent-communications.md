@@ -6,8 +6,8 @@ Let one Herdr agent send a large text message to another exact Herdr agent witho
 changing Herdr core, without truncating the payload, and without ever handing a
 recipient a reference it cannot read.
 
-Today `herdr_communicate` (`prompt`/`steer`) and `herdr_launch.initialPrompt` embed
-the whole v1 envelope in a single `herdr agent prompt` argv argument. That argument
+Before this change, `herdr_communicate` (`prompt`/`steer`) and the `herdr_launch`
+assignment embedded the whole v1 envelope in a single `herdr agent prompt` argv argument. That argument
 is bounded by the operating system (Linux caps one argument at 128 KiB), is visible
 to any local process listing, and offers no way to hand a recipient a plan, diff, or
 review body that does not belong inline in a prompt.
@@ -45,7 +45,7 @@ for each other.
   an oversized `inline` request fails, and an `attachment` request to a recipient
   whose file-read capability is not known fails. Neither failure sends bytes.
 - Both entry points are covered: `herdr_communicate` (`prompt` and `steer`) and
-  `herdr_launch.initialPrompt`. Named-key delivery is control input, is never
+  `herdr_launch.assignment`. Named-key delivery is control input, is never
   wrapped, and gains nothing here.
 - Mandatory v1 provenance is preserved. The envelope gains additive fields; the
   sentinel, version, `from`, `kind`, and `authority` lines keep their meaning and
@@ -94,7 +94,7 @@ No text delivery uses `--wait`, `--until`, or a synthesized Enter. For
 are the complete identity source: one strict join must establish the exact pane ID,
 terminal ID, agent name/kind, and complete `agent_session`, while every supplied field
 must agree and omitted/null fields remain absent. For a Pi or Claude
-`herdr_launch.initialPrompt`, real Herdr protocol 20 `agent_started` records may omit
+`herdr_launch.assignment`, real Herdr protocol 20 `agent_started` records may omit
 identity fields. Launch therefore runs one bounded, read-only identity-readiness
 preflight with short polling before dispatch or recipient registration. Every sample
 freshly reads snapshot, `agent get`, and pane, and joins that one sample only with fields
@@ -208,7 +208,7 @@ Rules:
   the computed digest, the exact byte count, and an ISO-8601 UTC expiry. No caller
   text reaches a header line, so the existing single-line normalization guarantee
   against field injection is preserved.
-- `kind` keeps its current meaning: `assignment` for `herdr_launch.initialPrompt`,
+- `kind` keeps its current meaning: `assignment` for `herdr_launch.assignment`,
   `prompt` or `steer` for `herdr_communicate`.
 - The attachment route sends no sender-authored text inline. An optional bounded
   inline preface is deferred.
@@ -383,12 +383,16 @@ before every attachment send.
 ### `herdr_launch`
 
 ```text
-{ ..., initialPrompt?: string, initialPromptDelivery?: "inline" | "attachment" }
+{ ..., assignment: { objective: string, scope: string, verification: string }, assignmentDelivery?: "inline" | "attachment" }
 ```
 
-- `initialPromptDelivery` defaults to `inline` and is only valid with
-  `initialPrompt`; otherwise `INVALID_INPUT`.
-- `initialPromptDelivery: "attachment"` requires every profile in the resolved
+- `assignment` is mandatory and carries exactly `objective`, `scope`, and
+  `verification`, each a non-empty string without NUL; a missing, empty, extra, or
+  legacy `initialPrompt`/`initialPromptDelivery` field is `INVALID_INPUT`. The three
+  fields render in that fixed order, and the rendered payload's UTF-8 size is the
+  single authority for the selected delivery bound.
+- `assignmentDelivery` defaults to `inline`.
+- `assignmentDelivery: "attachment"` requires every profile in the resolved
   fallback chain to be attachment-capable. An incapable profile fails with
   `ATTACHMENT_TARGET_UNVERIFIED` while the profile is resolved, before any topology
   mutation.
@@ -398,11 +402,10 @@ before every attachment send.
   `--add-dir` grant where required → create pane/tab → start agent → run runtime-specific
   readiness → send exactly one identity-bound envelope over `--stdin` → validate the
   typed acknowledgement → confirm semantics. AGY creates no profile-body prompt source,
-  requires `initialPrompt`, publishes provisional supervision before submission, and
+  requires the same typed `assignment`, publishes provisional supervision before submission, and
   strengthens to the official native session before recipient registration or later
   attachment delivery. The fresh joined
-  identity is mandatory for Pi and Claude even when no initial prompt is requested,
-  and the same full
+  identity is mandatory for Pi and Claude on every launch, and the same full
   pane/terminal/name/kind/session binding is persisted in the recipient registry;
   `agent_id` is diagnostic only. Building profile argv therefore moves after the
   recipient key is minted. A newly-created pane has no authoritative pane ID before
@@ -509,7 +512,7 @@ src/profiles/capability.ts      attachmentCapability(profile, overrides)
 src/profiles/adapters.ts        extension-owned Claude --add-dir grant
 src/provenance.ts               v1 delivery and attachment header lines
 src/schemas.ts                  herdr_communicate delivery field
-src/launch-schema.ts            initialPromptDelivery field
+src/launch-schema.ts            assignment and assignmentDelivery fields
 src/tools/communicate.ts        route selection, capability recheck, publish, send
 src/tools/launch.ts             pre-mutation publish ordering and argv grant
 src/tui.ts                      delivery-aware call/result rows

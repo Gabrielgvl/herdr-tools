@@ -24,6 +24,23 @@ runtime:
     - get_search_content
     - edit
     - write
+    # Codex adapter (pi-codex-conversion) tool surface. Pi applies --tools to
+    # extension tools too, so the adapter reports "Codex adapter off:
+    # unavailable tools" unless every tool it owns is allowlisted here. The
+    # adapter itself decides which of these are active and drops native
+    # read/bash/edit/write while it runs.
+    - change_reasoning
+    - exec_command
+    - write_stdin
+    - apply_patch
+    - exec
+    - wait
+    - notebook
+    - view_image
+    - new_context
+    - get_context_remaining
+    - history
+    - notes
   extensions: []
   skills:
     - herdr-profiles/role-plugins/reviewer/skills/reviewer

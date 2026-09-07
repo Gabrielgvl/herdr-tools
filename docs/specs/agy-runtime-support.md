@@ -23,8 +23,11 @@ runtime:
   addDirs: []
 ```
 
-- An AGY launch **requires `initialPrompt`**. A promptless AGY launch is rejected before
-  mutation.
+- An AGY launch **requires the mandatory typed `assignment`** of exactly `objective`,
+  `scope`, and `verification`, like every other launch. A missing, malformed, or extra
+  assignment field is rejected before mutation. There is no promptless launch path and
+  no AGY-specific prompt requirement any more, so no AGY fallback is pruned from a
+  launchable chain.
 - `sessionPersistence: true` is required. AGY has no non-persistent flag.
 - The fixed argv is `--model <model> --mode <profile.mode> --dangerously-skip-permissions`,
   where the required fixed mode is exactly `plan` or `accept-edits`, followed by
@@ -165,7 +168,7 @@ provisional job is not exact coverage.
 
 | Scenario | Required deterministic result |
 | --- | --- |
-| Promptless AGY launch | Reject before mutation. Start, focus, prompt, reservation, cleanup, fallback, and recipient calls are all zero. |
+| AGY launch with a missing or malformed `assignment` | Reject before mutation. Start, focus, prompt, reservation, cleanup, fallback, and recipient calls are all zero. |
 | Missing pre-session `agent_session` for AGY | Accept only the AGY readiness sample and publish provisional state. No exact coverage is exposed before strengthening. |
 | Missing pre-session `agent_session` for Pi or Claude | Preserve their current strict readiness requirement. Reject before assignment and never enter the AGY provisional path. |
 | Assignment submission | Dispatch exactly one `herdr agent prompt <pane> --stdin` submission. Never send a second prompt, separate Enter, wait, or recovery submission. |
@@ -258,7 +261,7 @@ the provisional supervisor and its recovery handle without exact coverage.
 Files: `src/tools/launch.ts`, `src/tools/inspect.ts`, `src/launch-schema.ts`,
 `test/unit/launch.test.ts`, `test/unit/inspect.test.ts`.
 
-Require AGY `initialPrompt`; implement the pre-prompt reduced-assurance baseline, one
+Require the typed `assignment`; implement the pre-prompt reduced-assurance baseline, one
 submission, 5-second native-session/lifecycle confirmation, strengthen-before-success,
 recipient ordering, and exact zero-effect fallback. Implement every row of the
 deterministic safety matrix above as call-count and published-state assertions. Keep

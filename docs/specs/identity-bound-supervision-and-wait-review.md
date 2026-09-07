@@ -100,7 +100,7 @@ Degradation does not transfer semantic review ownership back to `herdr_wait`. Th
 
 `promptSubmitted` remains the narrower typed-acknowledgement fact. It must not be inferred from `assignmentState`. A transport failure after prompt dispatch can therefore have `promptSubmitted: false` and `assignmentState: "unconfirmed"` when delivery may still have occurred.
 
-A launch without `initialPrompt` has no `assignmentState`.
+Every launch carries the mandatory typed `assignment`, so every successful launch reports an `assignmentState`.
 
 ### 4.4 Semantic review ownership
 
@@ -130,7 +130,7 @@ The successful path is ordered as follows:
 4. Bind the supervisor in `supervision_bind` immediately after readiness returns the exact captured identity and lifecycle anchor. Bind preparation validates an authoritative snapshot and drains all queued pre-bind evidence without publishing `active` or `degraded`; the public view remains `reserved` unless that evidence settles it. The operation succeeds only if the exact child is still live and the supervisor remains non-settled after the drain; its commit then publishes the selected profile, selected kind, and `request.targetIds: [capturedIdentity.paneId]` before bound state.
 5. Apply optional focus only after that committed bind returns successfully.
 6. If requested, submit the provenance-wrapped assignment exactly once and run the existing bounded semantic confirmation loop.
-7. Register the recipient only after assignment confirmation, or after readiness for a no-prompt launch.
+7. Register the recipient only after assignment confirmation.
 8. Return launch success only after all required gates complete.
 
 `supervision_bind` moves before `focus` and `prompt_verification`. No second bind phase remains after prompt confirmation.
@@ -187,7 +187,7 @@ If the supervisor independently observes release, replacement, loss, or pane clo
 
 ### 5.5 Successful assignment
 
-A prompt launch can return success only after semantic confirmation. Its rich details include `assignmentState: "confirmed"`, `promptConsumption: "confirmed"`, and the active supervisor details. A no-prompt launch keeps the existing readiness-only assignment behavior and omits `assignmentState`.
+A prompt launch can return success only after semantic confirmation. Its rich details include `assignmentState: "confirmed"`, `promptConsumption: "confirmed"`, and the active supervisor details.
 
 ## 6. Launch model and Pi UI contract
 
@@ -553,7 +553,7 @@ The existing redaction and bounding rules remain mandatory.
 - **AC-L9:** The MCP adapter publishes the fixed fields and no attached launch details. Malformed conditional fields suppress the diagnostic rather than weakening validation.
 - **AC-L10:** Pi renders the exact compact assignment-unconfirmed row and does not render a success or generic unsupervised state.
 - **AC-L11:** Recipient registration and launch success occur only after semantic confirmation. Integration code performs no marker, wait, communicate, or other dependent assertion after an unconfirmed assignment.
-- **AC-L12:** A no-prompt launch remains supervised and succeeds after readiness, binding, optional focus, and recipient registration without an assignment state.
+- **AC-L12:** A launch missing the mandatory typed `assignment`, or supplying an empty, NUL-bearing, extra, or legacy `initialPrompt`/`initialPromptDelivery` field, is rejected before any mutation, reservation, or attachment publication.
 - **AC-L13:** Queued pane closure, release, proven replacement, or identity-loss evidence that settles during bind makes bind reject. Launch emits `SUPERVISION_UNCONFIRMED`, dispatches no prompt, and cannot report or retain a successful bound state.
 
 ### Wait review ownership

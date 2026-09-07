@@ -8,6 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import extension, { CORE_TOOL_NAMES } from "../../index.js";
 import { spawnWithStdin } from "../../src/exec-stdin.js";
+import { renderAssignment } from "../../src/launch-schema.js";
 import { stopDisposableServer, waitForCondition } from "./disposable-session.js";
 
 interface ExecutableTool {
@@ -583,7 +584,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-claude"] })
     ]));
     const manager = await tool("herdr_inspect").execute("manager", { mode: "profile", profile: "manager-pi" }, signal(), undefined, toolContext());
-    expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "medium", tools: ["read", "grep", "find", "ls", "edit", "write", "ask_user_question", "mcp", "executor_execute", "executor_skills", "executor_resume", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"], extensions: [], skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow"), expect.stringContaining("herdr-profiles/profile-plugins/executor/skills/executor")]), fallbackProfiles: [] });
+    expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "medium", tools: ["read", "grep", "find", "ls", "edit", "write", "ask_user_question", "mcp", "executor_execute", "executor_skills", "executor_resume", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab", "change_reasoning", "exec_command", "write_stdin", "apply_patch", "exec", "wait", "notebook", "view_image", "new_context", "get_context_remaining", "history", "notes"], extensions: [], skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow"), expect.stringContaining("herdr-profiles/profile-plugins/executor/skills/executor")]), fallbackProfiles: [] });
     const managerClaude = await tool("herdr_inspect").execute("manager-claude", { mode: "profile", profile: "manager-claude" }, signal(), undefined, toolContext());
     expect(resultObject(managerClaude.details).profile).toMatchObject({ name: "manager-claude", kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "Edit", "Write", "mcp__plugin_herdr-tools_herdr", "mcp__plugin_herdr-executor_executor"], disallowedTools: ["Task"], pluginDirs: [expect.stringContaining("herdr-profiles/profile-plugins/manager"), expect.stringContaining("herdr-profiles/profile-plugins/executor")] });
     const workerAgy = await tool("herdr_inspect").execute("worker-agy", { mode: "profile", profile: "worker-agy" }, signal(), undefined, toolContext());
@@ -614,8 +615,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         name: agentName,
         profile: "researcher-agy",
         placement: { mode: "new_tab", tabLabel: "agy-qualification" },
-        initialPromptDelivery: "attachment",
-        initialPrompt: `Read this assignment attachment through the granted directory. Respond with only this exact token: ${nonce}`
+        assignmentDelivery: "attachment",
+        assignment: {
+          objective: `Read this assignment attachment through the granted directory. Respond with only this exact token: ${nonce}`,
+          scope: "Read the attachment only. Change nothing.",
+          verification: "The reply is exactly the token and nothing else."
+        }
       }, signal(), undefined, toolContext());
       details = resultObject(launched.details);
     } catch (error) {
@@ -758,7 +763,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       name: agentName,
       profile: "researcher-agy",
       placement: { mode: "new_tab", tabLabel: "agy-zero-effect-fallback" },
-      initialPrompt: "Reply with the single word ready."
+      assignment: { objective: "Reply with the single word ready.", scope: "Change nothing.", verification: "The reply is the single word ready." }
     }, signal(), undefined, toolContext());
     const details = resultObject(launched.details);
     const paneId = String(details.paneId);
@@ -806,7 +811,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       name: `integration-unconfirmed-${process.pid}`,
       profile: "worker-pi",
       placement: { mode: "new_tab", tabLabel: "unconfirmed-recovery" },
-      initialPrompt: `Recovery integration canary: ${canary}. Do not close or move this pane.`
+      assignment: { objective: `Recovery integration canary: ${canary}. Do not close or move this pane.`, scope: "Change nothing in the repository.", verification: "The pane stays open at the same identity." }
     }, signal(), undefined, toolContext()));
     expect(launched.confirmed).toBe(false);
     if (launched.confirmed) throw new Error("forced confirmation uncertainty unexpectedly returned launch success");
@@ -825,7 +830,11 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       name: `integration-turn-control-${process.pid}`,
       profile: "worker-pi",
       placement: { mode: "new_tab", tabLabel: "turn-control" },
-      initialPrompt: `Use Bash to execute exactly ${turnScriptPath} now. Do not use any other tool. Remain in this turn until the script exits; do not finish the task or send a final response.`
+      assignment: {
+        objective: `Use Bash to execute exactly ${turnScriptPath} now. Do not use any other tool. Remain in this turn until the script exits; do not finish the task or send a final response.`,
+        scope: `Run only ${turnScriptPath}. Use no other tool and change nothing else.`,
+        verification: "The turn stays open until the script exits."
+      }
     }, signal(), undefined, toolContext()));
     if (!launched.confirmed) return;
     expect(await waitForMarker(turnMarkerPath, turnMarker, 60_000), "turn-control fixture did not reach its deterministic sleep command").toBe(true);
@@ -877,11 +886,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   it("routes wrapped text over the session-bound stdin transport and publishes exact artifacts", async () => {
     if (state.unconfirmedRecoveries.length >= 2) return;
     const inlineBody = ["integration assignment", ...Array.from({ length: 320 }, (_value, index) => `long assignment line ${index}`)].join("\n");
-    const inline = await deliverLaunch("pi-inline-launch", "integration assignment", () => tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, initialPrompt: inlineBody }, signal(), undefined, toolContext()));
+    const inlineAssignment = { objective: inlineBody, scope: "Change nothing.", verification: "No verification is required for this transport smoke." };
+    const inline = await deliverLaunch("pi-inline-launch", "integration assignment", () => tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "profile-launch" }, assignment: inlineAssignment }, signal(), undefined, toolContext()));
     if (!inline.confirmed) return;
     expect(inline.details).toMatchObject({ initialPromptDelivery: "inline", initialPromptSubmission: { confirmed: true } });
     const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
-    expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", "read,bash,grep,find,ls,ffgrep,fffind,ctx_execute,ctx_execute_file,ctx_search,web_search,source_check,fetch_content,get_search_content,edit,write,bash_bg,jobs,job_decide,monitor", "--skill", expect.stringContaining("herdr-profiles/role-plugins/worker/skills/worker"), "--append-system-prompt"]));
+    expect(startArgs).toEqual(expect.arrayContaining(["--kind", "pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", "read,bash,grep,find,ls,ffgrep,fffind,ctx_execute,ctx_execute_file,ctx_search,web_search,source_check,fetch_content,get_search_content,edit,write,bash_bg,jobs,job_decide,monitor,change_reasoning,exec_command,write_stdin,apply_patch,exec,wait,notebook,view_image,new_context,get_context_remaining,history,notes", "--skill", expect.stringContaining("herdr-profiles/role-plugins/worker/skills/worker"), "--append-system-prompt"]));
     // Pi exact isolation is positional, so `arrayContaining` cannot assert it:
     // exactly one `--no-skills` must precede every `--skill`, otherwise Pi
     // discovers the ambient project/user catalog first and silently skips a
@@ -903,14 +913,16 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     await closeConfirmedFixturePane("pi-inline-launch", inline.details);
 
     const body = `Transport smoke body.\n${"detail line\n".repeat(200)}`;
-    const attachmentLaunch = await deliverLaunch("pi-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-pi-attachment", { name: "integration-pi-attach", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "pi-attachment" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
+    const bodyAssignment = { objective: body, scope: "Change nothing.", verification: "No verification is required for this transport smoke." };
+    const attachmentLaunch = await deliverLaunch("pi-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-pi-attachment", { name: "integration-pi-attach", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "pi-attachment" }, assignment: bodyAssignment, assignmentDelivery: "attachment" }, signal(), undefined, toolContext()));
     if (!attachmentLaunch.confirmed) return;
     const attachment = resultObject(attachmentLaunch.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
     expect(attachmentLaunch.details).toMatchObject({ initialPromptDelivery: "attachment" });
-    expect(await readFile(String(attachment.path), "utf8")).toBe(body);
-    expect(createHash("sha256").update(body, "utf8").digest("hex")).toBe(attachment.sha256);
-    expect(attachment.bytes).toBe(Buffer.byteLength(body, "utf8"));
+    const renderedBody = renderAssignment(bodyAssignment);
+    expect(await readFile(String(attachment.path), "utf8")).toBe(renderedBody);
+    expect(createHash("sha256").update(renderedBody, "utf8").digest("hex")).toBe(attachment.sha256);
+    expect(attachment.bytes).toBe(Buffer.byteLength(renderedBody, "utf8"));
     expect((await stat(String(attachment.path))).mode & 0o777).toBe(0o600);
     const envelope = state.stdinCalls.find((call) => call.input.includes(String(attachment.path)));
     expect(envelope, `pi-attachment-launch did not record its stdin submission (phase=${String(attachmentLaunch.details.phase)})`).toBeDefined();
@@ -937,7 +949,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       "Then stop. Do not change anything else and do not reply."
     ].join("\n");
 
-    const launched = await deliverLaunch("pi-acceptance-launch", nonce, () => tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "accept-pi" }, initialPrompt: body, initialPromptDelivery: "attachment" }, signal(), undefined, toolContext()));
+    const launched = await deliverLaunch("pi-acceptance-launch", nonce, () => tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", placement: { mode: "new_tab", tabLabel: "accept-pi" }, assignment: { objective: body, scope: `Write only ${markerPath}. Change nothing else.`, verification: `${markerPath} contains exactly the token.` }, assignmentDelivery: "attachment" }, signal(), undefined, toolContext()));
     if (!launched.confirmed) return;
     const attachment = resultObject(launched.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
@@ -958,7 +970,17 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       "Then stop. Do not change anything else and do not reply."
     ].join("\n");
 
-    const launched = await tool("herdr_launch").execute("accept-claude", { name: "integration-accept-claude", profile: "worker-claude", overrides: { permissionMode: "bypassPermissions" }, placement: { mode: "new_tab", tabLabel: "accept-claude" } }, signal(), undefined, toolContext());
+    const launched = await tool("herdr_launch").execute("accept-claude", {
+      name: "integration-accept-claude",
+      profile: "worker-claude",
+      overrides: { permissionMode: "bypassPermissions" },
+      placement: { mode: "new_tab", tabLabel: "accept-claude" },
+      assignment: {
+        objective: "Stand by in this pane for one follow-up assignment attachment, then carry it out exactly as written.",
+        scope: "Change nothing until that follow-up arrives, and then change only what it names.",
+        verification: "The follow-up assignment's own verification is the only check for this launch."
+      }
+    }, signal(), undefined, toolContext());
     const details = resultObject(launched.details);
     expect(details).toMatchObject({ recipient: { capable: true, kind: "claude", profileName: "worker-claude" } });
     const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-accept-claude"));

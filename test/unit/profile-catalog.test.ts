@@ -32,6 +32,24 @@ const testPreflight = async () => undefined;
 const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight" | "supervision"> & Partial<Pick<LaunchDependencies, "preflight" | "supervision">>) => createLaunchToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight, supervision: deps.supervision ?? stubSupervision() });
 
 const noCli = { runJson: async () => { throw new Error("CLI must not be called"); }, runText: async () => { throw new Error("CLI must not be called"); } } as unknown as HerdrCli;
+/**
+ * The Codex adapter (`pi-codex-conversion`) owned tool surface, in the adapter's
+ * own `ALL_ADAPTER_TOOL_NAMES` order. Pi applies the `--tools` allowlist to
+ * extension tools as well as built-ins, and the adapter deactivates itself when
+ * any tool in its *current runtime plan* is missing from the resulting registry.
+ * The plan is a mode- and config-dependent subset of these names, so all twelve
+ * are allowlisted to keep every user-selectable adapter mode reachable rather
+ * than because any single plan needs all of them. Availability is not
+ * activation: the adapter activates only its planned subset and drops native
+ * read/bash/edit/write while it runs.
+ */
+const CODEX_ADAPTER_PI_TOOLS = ["change_reasoning", "exec_command", "write_stdin", "apply_patch", "exec", "wait", "notebook", "view_image", "new_context", "get_context_remaining", "history", "notes"] as const;
+/** Every launch carries the mandatory typed assignment. */
+const ASSIGNMENT = { objective: "do the work", scope: "only this module", verification: "run the tests" };
+/** The pre-prompt idle readiness baseline, then the advanced post-prompt sample. */
+const lifecycle = (advanced: number): Record<string, unknown> => advanced === 0
+  ? { agent_status: "idle", state_change_seq: 7, revision: 3, interactive_ready: true }
+  : { agent_status: "working", state_change_seq: 8, revision: 4, interactive_ready: true };
 
 describe("profile catalog", () => {
   it("fits inspection values without invalid JSON or losing protected evidence", () => {
@@ -350,9 +368,12 @@ describe("profile catalog", () => {
       { name: "worker", profile: "worker", overrides: null }, { name: "worker", profile: "worker", overrides: { unknown: "x" } },
       { name: "worker", profile: "worker", overrides: { model: "" } }, { name: "worker", profile: "worker", overrides: { tools: ["bad\nvalue"] } }, { name: "worker", kind: "pi", overrides: {} }
     ];
-    for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams(value as never), `invalid case ${index}`).toThrow();
-    expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { thinking: "low", tools: ["read"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."] } } as never)).not.toThrow();
-    for (const key of ["extensions", "skills", "pluginDirs"]) expect(() => validateLaunchParams({ name: "worker", profile: "worker", overrides: { [key]: ["./selected"] } } as never)).toThrow(/Unknown profile override/);
+    for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams({ ...(value as Record<string, unknown>), assignment: ASSIGNMENT } as never), `invalid case ${index}`).toThrow();
+    // The typed assignment is itself required, so every case above is invalid without it too.
+    for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams(value as never), `promptless case ${index}`).toThrow();
+    expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: ASSIGNMENT, overrides: { thinking: "low", tools: ["read"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."] } } as never)).not.toThrow();
+    expect(() => validateLaunchParams({ name: "worker", profile: "worker" } as never)).toThrow(/assignment/);
+    for (const key of ["extensions", "skills", "pluginDirs"]) expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: ASSIGNMENT, overrides: { [key]: ["./selected"] } } as never)).toThrow(/Unknown profile override/);
   });
 
   it("launches a resolved profile through the existing placement path", async () => {
@@ -363,6 +384,7 @@ describe("profile catalog", () => {
     const promptSources = { create: vi.fn(async (body: string) => ({ path: `/tmp/profile-${Buffer.byteLength(body, "utf8")}.md` })) };
     let started = false;
     let lastName = "worker";
+    let prompted = false;
     const identity = { terminal_id: "terminal-a", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-a" } };
     const cli = { runJson: async (argv: string[]) => {
       calls.push(argv);
@@ -370,18 +392,25 @@ describe("profile catalog", () => {
       if (argv[0] === "api") return { id: "snapshot", result: started ? { ...snapshot, snapshot: { ...snapshot.snapshot, panes: [...snapshot.snapshot.panes, { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent_name: lastName, agent: "pi", ...identity }], agents: [{ pane_id: "w:p2", name: lastName, agent: "pi", ...identity }] } } : snapshot };
       if (argv[0] === "pane" && argv[1] === "split") return { id: "split", result: { pane: { pane_id: "w:p2", tab_id: "w:t" } } };
       if (argv[0] === "pane" && argv[1] === "rename") return { id: "rename", result: {} };
-      if (argv[0] === "agent" && argv[1] === "start") { started = true; lastName = argv[2]!; return { id: "start", result: { agent: { name: argv[2], pane_id: "w:p2", agent: "pi", ...identity } } }; }
-      if (argv[0] === "agent" && argv[1] === "get") return { id: "agent-get", result: { agent: { name: lastName, pane_id: "w:p2", agent: "pi", ...identity } } };
-      if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent_name: lastName, agent: "pi", ...identity, agent_status: "idle" } } };
+      if (argv[0] === "agent" && argv[1] === "start") { started = true; prompted = false; lastName = argv[2]!; return { id: "start", result: { agent: { name: argv[2], pane_id: "w:p2", agent: "pi", ...identity } } }; }
+      if (argv[0] === "agent" && argv[1] === "get") return { id: "agent-get", result: { agent: { name: lastName, pane_id: "w:p2", agent: "pi", ...identity, ...lifecycle(prompted ? 1 : 0) } } };
+      if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent_name: lastName, agent: "pi", ...identity, ...lifecycle(prompted ? 1 : 0) } } };
       throw new Error(`unexpected ${argv.join(" ")}`);
+    }, runJsonWithStdin: async (argv: string[]) => {
+      calls.push(argv);
+      // The acknowledgement reports the pre-advance baseline; only the reads
+      // after it advance, which is what the confirmation loop looks for.
+      const acknowledgement = { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { name: lastName, pane_id: "w:p2", agent: "pi", ...identity, ...lifecycle(0), screen_detection_skipped: true } } };
+      prompted = true;
+      return acknowledgement;
     } } as unknown as HerdrCli;
-    const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
+    const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
     expect(promptSources.create).toHaveBeenCalledWith("\nBody for worker.\n");
     expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--no-skills", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
     expect(result.details).toMatchObject({ profile: { name: "worker", fallbackProfiles: [], timeoutMinutes: 30 }, kind: "pi" });
     const defaultCreate = vi.spyOn(defaultPromptSourceStore, "create").mockResolvedValue({ path: "/tmp/default-profile.md" });
     try {
-      await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-default", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
+      await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-default", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
       expect(defaultCreate).toHaveBeenCalledWith("\nBody for worker.\n");
     } finally {
       defaultCreate.mockRestore();
@@ -392,13 +421,13 @@ describe("profile catalog", () => {
     // The store failure is a foreign error, so the launch boundary rethrows a
     // typed LaunchError instead of the original: the model contract is the code,
     // the failed phase, and the no-effect diagnostic, never the store's own text.
-    const storeRejection = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never).then(() => undefined, (error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    const storeRejection = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never).then(() => undefined, (error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(storeRejection).toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "resolve_profile", causeCode: "CLI_PROTOCOL_ERROR", effectCertainty: "absent", agentStarted: false, promptSubmitted: false, recipientRegistered: false } });
     expect(launchDiagnostic(storeRejection!)).toEqual({ code: "CLI_PROTOCOL_ERROR", phase: "resolve_profile", created: {}, agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.noEffect });
     expect(storeRejection!.message).not.toContain(storeFailure.message);
     expect(calls).toHaveLength(callsBeforeFailure);
     const invalidPathCalls = calls.length;
-    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => ({ path: "/tmp/invalid\nprofile.md" }) }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-3", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE", details: { causeCode: "INVALID_PROFILE_OVERRIDE" } });
+    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => ({ path: "/tmp/invalid\nprofile.md" }) }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-3", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE", details: { causeCode: "INVALID_PROFILE_OVERRIDE" } });
     expect(calls).toHaveLength(invalidPathCalls);
   });
 
@@ -579,14 +608,21 @@ describe("profile catalog", () => {
     }
 
     const piTools = {
-      manager: ["read", "grep", "find", "ls", "edit", "write", "ask_user_question", ...executorPiTools, "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"],
-      scout: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "edit", "write"],
-      planner: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write"],
-      worker: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", "bash_bg", "jobs", "job_decide", "monitor"],
-      reviewer: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write"],
-      researcher: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write"],
-      promoter: ["read", "bash", "grep", "find", "ls", "ctx_execute", "ctx_execute_file", "ctx_search", ...executorPiTools, "edit", "write"]
+      manager: ["read", "grep", "find", "ls", "edit", "write", "ask_user_question", ...executorPiTools, "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab", ...CODEX_ADAPTER_PI_TOOLS],
+      scout: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "edit", "write", ...CODEX_ADAPTER_PI_TOOLS],
+      planner: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write", ...CODEX_ADAPTER_PI_TOOLS],
+      worker: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", "bash_bg", "jobs", "job_decide", "monitor", ...CODEX_ADAPTER_PI_TOOLS],
+      reviewer: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", ...CODEX_ADAPTER_PI_TOOLS],
+      researcher: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write", ...CODEX_ADAPTER_PI_TOOLS],
+      promoter: ["read", "bash", "grep", "find", "ls", "ctx_execute", "ctx_execute_file", "ctx_search", ...executorPiTools, "edit", "write", ...CODEX_ADAPTER_PI_TOOLS]
     } as const;
+    // Every bundled Pi profile allowlists the whole owned Codex adapter surface,
+    // in the adapter's own order. Any plan tool Pi filters out of the registry
+    // deactivates the adapter, so allowlisting the full surface keeps every
+    // selectable mode's plan satisfiable.
+    for (const role of roleNames) {
+      expect(piTools[role as keyof typeof piTools].slice(-CODEX_ADAPTER_PI_TOOLS.length), `${role} adapter tools`).toEqual([...CODEX_ADAPTER_PI_TOOLS]);
+    }
     // The owner-approved role matrix. Every entry beyond the embedded role skill
     // is a generated bundle pinned in `herdr-skill-bundles.json`; the two Pi-only
     // globals live outside every plugin directory so no Claude role receives them.
@@ -777,9 +813,9 @@ describe("profile catalog", () => {
 
   it("keeps profile launch and renderer failures explicit", async () => {
     const launchTool = createLaunchTool({ cli: noCli as never, context: {}, profiles: undefined });
-    await expect(launchTool.execute("id", { name: "worker", profile: "worker" } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
+    await expect(launchTool.execute("id", { name: "worker", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
     const rendered = launchTool.renderCall?.({ name: "worker", profile: "worker" } as never, {} as never, {} as never);
-    expect(rendered?.render(80)).toEqual(["herdr_launch · worker · worker"]);
+    expect(rendered?.render(80)).toEqual(["herdr_launch · worker · inline · worker"]);
     rendered?.invalidate();
   });
 

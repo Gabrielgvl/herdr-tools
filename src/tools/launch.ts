@@ -12,7 +12,7 @@ import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
-import { LaunchParamsSchema, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
+import { LAUNCH_ASSIGNMENT_FIELDS, LaunchParamsSchema, renderAssignment, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, refreshBundledProfileResourceSelection, RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
@@ -342,7 +342,7 @@ function validateParams(params: LaunchRequest): void {
   if (typeof params.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
     throw new LaunchError("INVALID_INPUT", "name must start with a lowercase letter and contain only lowercase letters, digits, - or _ (1-32 characters)");
   }
-  const allowedKeys = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "initialPrompt", "initialPromptDelivery"]);
+  const allowedKeys = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery"]);
   for (const key of Object.keys(params)) if (!allowedKeys.has(key)) throw new LaunchError("INVALID_INPUT", `Unknown launch field: ${key}`);
   profileIdentifier(params.profile);
   if (params.overrides !== undefined) {
@@ -360,14 +360,24 @@ function validateParams(params: LaunchRequest): void {
   }
   if (params.label !== undefined) identifier(params.label, "label");
   if (params.cwd !== undefined) identifier(params.cwd, "cwd");
-  if (params.initialPrompt !== undefined && (typeof params.initialPrompt !== "string" || params.initialPrompt.length === 0 || /\0/.test(params.initialPrompt))) {
-    throw new LaunchError("INVALID_INPUT", "initialPrompt must be a non-empty string without NUL");
+  // Every launch carries the typed assignment, so it is validated in full here,
+  // before the preflight and before any topology or prompt mutation.
+  const assignment = params.assignment;
+  if (!record(assignment)) throw new LaunchError("INVALID_INPUT", "assignment must be an object with objective, scope and verification");
+  for (const key of Object.keys(assignment)) {
+    if (!(LAUNCH_ASSIGNMENT_FIELDS as readonly string[]).includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown assignment field: ${key}`);
   }
-  if (params.initialPromptDelivery !== undefined && params.initialPromptDelivery !== "inline" && params.initialPromptDelivery !== "attachment") {
-    throw new LaunchError("INVALID_INPUT", "initialPromptDelivery must be inline or attachment");
+  // Shape only. Size has exactly one authority -- the UTF-8 byte length of the
+  // rendered assignment against the selected delivery bound -- so no per-field
+  // limit is repeated here to pre-empt it with a weaker error.
+  for (const field of LAUNCH_ASSIGNMENT_FIELDS) {
+    const value = assignment[field];
+    if (typeof value !== "string" || value.length === 0 || /\0/.test(value)) {
+      throw new LaunchError("INVALID_INPUT", `assignment.${field} must be a non-empty string without NUL`);
+    }
   }
-  if (params.initialPrompt === undefined && params.initialPromptDelivery !== undefined) {
-    throw new LaunchError("INVALID_INPUT", "initialPromptDelivery requires initialPrompt");
+  if (params.assignmentDelivery !== undefined && params.assignmentDelivery !== "inline" && params.assignmentDelivery !== "attachment") {
+    throw new LaunchError("INVALID_INPUT", "assignmentDelivery must be inline or attachment");
   }
   if (params.focus !== undefined && typeof params.focus !== "boolean") throw new LaunchError("INVALID_INPUT", "focus must be a boolean");
   const placement = params.placement;
@@ -1262,16 +1272,6 @@ async function waitForLaunchReadiness(
   }
 }
 
-/**
- * The authoritative agent record's lifecycle counter, where it supplied one. A
- * launch with no `initialPrompt` has no readiness baseline, so this is the only
- * source, and an absent counter is recorded as absent rather than defaulted.
- */
-function readinessStateChangeSeq(agent: Record<string, unknown>): number | undefined {
-  const candidate = agent.state_change_seq;
-  return typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : undefined;
-}
-
 function compactConfirmationObservation(observation: PromptObservation | undefined): PromptConfirmationEvidence["last"] | undefined {
   if (!observation) return undefined;
   return {
@@ -1838,13 +1838,12 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         throw new LaunchError("PROFILE_LAUNCH_FROZEN", "Profile launch is frozen");
       }
       // Establish the requested route before any precondition so every refusal names it.
-      const requestedDelivery: MessageDelivery | undefined = record(params) && params.initialPrompt !== undefined
-        ? (params.initialPromptDelivery === "attachment" ? "attachment" : "inline")
-        : undefined;
+      const requestedDelivery: MessageDelivery = record(params) && params.assignmentDelivery === "attachment" ? "attachment" : "inline";
       const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
       const attachmentStore = deps.attachments ?? defaultAttachmentStore;
       const clock = deps.clock ?? realLaunchClock;
       let initialPromptDelivery: MessageDelivery | undefined;
+      let assignmentText: string | undefined;
       let profileResolution: ProfileResolution | undefined;
       let profiles: Profile[] = [];
       const promptPaths = new Map<string, string>();
@@ -1878,10 +1877,11 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       try {
         validateParams(params);
         initialPromptDelivery = requestedDelivery;
-        if (params.initialPrompt !== undefined) {
-          assertMessageText(params.initialPrompt);
-          assertDeliverySize(params.initialPrompt, initialPromptDelivery!);
-        }
+        // The rendered payload, not any single field, is what the delivery
+        // route has to carry, so the size bound is checked after rendering.
+        assignmentText = renderAssignment(params.assignment);
+        assertMessageText(assignmentText);
+        assertDeliverySize(assignmentText, initialPromptDelivery);
         await deps.preflight(abortSignal);
         cwd = params.cwd ?? deps.cwd ?? ctx.cwd;
         identifier(cwd, "cwd");
@@ -1896,19 +1896,10 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           if (!profile) throw new LaunchError("PROFILE_RESOLUTION_INVALID", `Resolved profile ${name} is unavailable`);
           return profile;
         });
-        // AGY's mandatory assignment is the initial prompt, so a promptless launch
-        // is refused only when AGY is the requested profile. A merely reachable AGY
-        // fallback is dropped from the launchable chain instead, because starting it
-        // without a prompt could never strengthen past provisional supervision, and
-        // refusing the whole request would block every promptless launch of a
-        // non-AGY chain such as `worker-pi -> worker-agy -> worker-claude`.
-        if (params.initialPrompt === undefined) {
-          if (profileResolution.profile.runtime.kind === "agy") throw new LaunchError("INVALID_INPUT", "AGY launches require initialPrompt");
-          for (const candidate of profiles) {
-            if (candidate.runtime.kind === "agy") attempts.push({ profile: candidate.name, outcome: "fallback_refused", errorCode: "INVALID_INPUT", message: "AGY fallback requires initialPrompt" });
-          }
-          profiles = profiles.filter((candidate) => candidate.runtime.kind !== "agy");
-        }
+        // AGY's mandatory self-contained assignment is the initial prompt. The
+        // typed assignment is required for every launch, so no profile in the
+        // chain -- AGY included -- can ever be started without one, and the old
+        // promptless AGY refusal and fallback pruning no longer have a case.
         // Every reachable fallback profile is checked before the first launch
         // effect. Bundled canonical edits are materialized here; unsafe trees
         // and edited generated copies still fail before any effect.
@@ -1941,7 +1932,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         topologyBaseline = snapshot;
         effectiveContext = effective.context;
         const currentContext = effective.context;
-        sender = params.initialPrompt !== undefined ? resolveSender(snapshot, currentContext.paneId) : undefined;
+        sender = resolveSender(snapshot, currentContext.paneId);
         if (existingAgentNames(snapshot).filter((name) => name === params.name).length > 0) {
           throw new LaunchError("INVALID_INPUT", `Agent name is already in use: ${params.name}`);
         }
@@ -1951,7 +1942,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           phase = "attachment_publish";
           progress(onUpdate, phase, created);
           published = await attachmentStore.publish({
-            body: params.initialPrompt!,
+            body: assignmentText,
             recipientKey,
             ...(existingTarget?.paneId ? { recipientPaneId: existingTarget.paneId } : {}),
             recipientAgentName: params.name,
@@ -2082,11 +2073,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (agentId) created.agentId = agentId;
         phase = "ready";
         progress(onUpdate, phase, created);
-        if (params.initialPrompt !== undefined) {
-          // Keep the grant alive while the selected start attempt's remaining
-          // absolute startup budget is spent on read-only readiness sampling.
-          await grant?.renew();
-        }
+        // Keep the grant alive while the selected start attempt's remaining
+        // absolute startup budget is spent on read-only readiness sampling.
+        await grant?.renew();
         const ready = await waitForLaunchReadiness(
           deps.cli,
           resolvedPaneId,
@@ -2095,7 +2084,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           chosenRuntime.kind,
           chosenAgent,
           selectedAttemptStartedAt!,
-          params.initialPrompt !== undefined,
+          true,
           clock,
           chosenRuntime.kind === "agy"
         );
@@ -2105,7 +2094,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         agentId ??= idFrom(ready.agent, "agent_id") ?? idFrom(ready.agent, "id") ?? idFrom(ready.pane, "agent_id");
         phase = "supervision_bind";
         progress(onUpdate, phase, created);
-        const stateChangeSeq = ready.baseline?.stateChangeSeq ?? readinessStateChangeSeq(ready.agent);
+        // Every launch requires the readiness baseline, so the anchor always
+        // comes from the same coherent sample that captured identity.
+        const stateChangeSeq = ready.baseline!.stateChangeSeq;
         try {
           // AGY publishes only reduced evidence before assignment. Existing
           // runtimes keep their exact pre-prompt session binding unchanged.
@@ -2120,7 +2111,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             };
           } else {
             const exactIdentity = capturedIdentity as PromptTargetIdentity;
-            await reservation!.bind({ identity: exactIdentity, profileName: chosenProfile.name, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) });
+            await reservation!.bind({ identity: exactIdentity, profileName: chosenProfile.name, stateChangeSeq });
             boundSupervision = {
               jobId: reservation!.jobId,
               state: "active",
@@ -2143,93 +2134,87 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         }
         if (agentId) created.agentId = agentId;
 
-        let initialPromptSent = false;
-        let promptConsumption: PromptConsumption | undefined;
         let initialPromptSubmission: PromptSubmissionEvidence | undefined;
         let initialPromptObservation: PromptObservation | undefined;
         let promptConfirmation: PromptConfirmationEvidence | undefined;
         let postState: Record<string, unknown> | undefined = ready.pane;
-        if (params.initialPrompt !== undefined) {
-          assignmentState = "unconfirmed";
-          // Readiness returned this baseline from the same coherent sample that
-          // captured identity; there is no later one-shot baseline read.
-          const baseline = ready.baseline!;
-          const envelope = initialPromptDelivery === "attachment"
-            ? buildEnvelope(sender!, "assignment", params.initialPrompt, "attachment", { ...published!, encoding: "utf-8" })
-            : buildEnvelope(sender!, "assignment", params.initialPrompt, "inline");
-          phase = "prompt_verification";
-          progress(onUpdate, phase, created);
-          const promptSubmissionStartedAt = clock.now();
-          let agyAcknowledgement: AgyPromptAcknowledgement | undefined;
-          try {
-            const promptResponse = await dispatchMutation(() => runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal));
-            promptSubmitted = true;
-            if (chosenRuntime.kind === "agy") {
-              agyAcknowledgement = parseAgyPromptAcknowledgement(promptResponse, capturedIdentity as ProvisionalSupervisedIdentity);
-              agyInitialPromptSubmission = agyPromptSubmissionEvidence(agyAcknowledgement);
-            } else {
-              initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity as PromptTargetIdentity);
-            }
-          } finally {
-            timing.promptSubmissionAckMs = monotonicDurationMs(clock, promptSubmissionStartedAt);
-          }
-
+        assignmentState = "unconfirmed";
+        // Readiness returned this baseline from the same coherent sample that
+        // captured identity; there is no later one-shot baseline read.
+        const baseline = ready.baseline!;
+        const envelope = initialPromptDelivery === "attachment"
+          ? buildEnvelope(sender!, "assignment", assignmentText!, "attachment", { ...published!, encoding: "utf-8" })
+          : buildEnvelope(sender!, "assignment", assignmentText!, "inline");
+        phase = "prompt_verification";
+        progress(onUpdate, phase, created);
+        const promptSubmissionStartedAt = clock.now();
+        let agyAcknowledgement: AgyPromptAcknowledgement | undefined;
+        try {
+          const promptResponse = await dispatchMutation(() => runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal));
+          promptSubmitted = true;
           if (chosenRuntime.kind === "agy") {
-            const confirmationStartedAt = clock.now();
-            try {
-              const confirmed = await confirmAgyNativeSession(deps.cli, abortSignal, agyAcknowledgement!, baseline, clock, confirmationStartedAt);
-              initialPromptSubmission = confirmed.submission;
-              initialPromptObservation = confirmed.observation;
-              promptConfirmation = confirmed.confirmation;
-              timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
-              postState = confirmed.pane;
-              capturedIdentity = confirmed.identity;
-              agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
-              phase = "supervision_bind";
-              progress(onUpdate, phase, created);
-              await reservation!.strengthen({ identity: confirmed.identity, profileName: chosenProfile.name, stateChangeSeq: confirmed.observation.stateChangeSeq });
-              boundSupervision = {
-                jobId: reservation!.jobId,
-                state: "active",
-                child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, profileName: chosenProfile.name }
-              };
-              phase = "prompt_verification";
-            } catch (error) {
-              const errorDetails = record(error) && record(error.details) ? error.details : undefined;
-              const confirmation = errorDetails?.promptConfirmation;
-              if (record(confirmation) && typeof confirmation.elapsedMs === "number") timing.postAckConfirmationMs = confirmation.elapsedMs;
-              throw error;
-            }
+            agyAcknowledgement = parseAgyPromptAcknowledgement(promptResponse, capturedIdentity as ProvisionalSupervisedIdentity);
+            agyInitialPromptSubmission = agyPromptSubmissionEvidence(agyAcknowledgement);
           } else {
-            const confirmationStartedAt = clock.now();
-            try {
-              const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt);
-              initialPromptObservation = confirmed.observation;
-              promptConfirmation = confirmed.confirmation;
-              timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
-              postState = confirmed.pane;
-              agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
-            } catch (error) {
-              const errorDetails = record(error) && record(error.details) ? error.details : undefined;
-              const confirmation = errorDetails?.promptConfirmation;
-              if (record(confirmation) && typeof confirmation.elapsedMs === "number") timing.postAckConfirmationMs = confirmation.elapsedMs;
-              if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") {
-                throw new LaunchError(error.code, error.message, {
-                  ...error.details,
-                  paneId: resolvedPaneId,
-                  supervisorJobId: reservation!.jobId,
-                  assignmentState: "unconfirmed",
-                  supervision: boundSupervision!,
-                });
-              }
-              throw error;
-            }
+            initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity as PromptTargetIdentity);
           }
-          promptConsumption = "confirmed";
-          assignmentState = "confirmed";
-          initialPromptSent = true;
-          if (agentId) created.agentId = agentId;
+        } finally {
+          timing.promptSubmissionAckMs = monotonicDurationMs(clock, promptSubmissionStartedAt);
         }
+
+        if (chosenRuntime.kind === "agy") {
+          const confirmationStartedAt = clock.now();
+          try {
+            const confirmed = await confirmAgyNativeSession(deps.cli, abortSignal, agyAcknowledgement!, baseline, clock, confirmationStartedAt);
+            initialPromptSubmission = confirmed.submission;
+            initialPromptObservation = confirmed.observation;
+            promptConfirmation = confirmed.confirmation;
+            timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
+            postState = confirmed.pane;
+            capturedIdentity = confirmed.identity;
+            agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+            phase = "supervision_bind";
+            progress(onUpdate, phase, created);
+            await reservation!.strengthen({ identity: confirmed.identity, profileName: chosenProfile.name, stateChangeSeq: confirmed.observation.stateChangeSeq });
+            boundSupervision = {
+              jobId: reservation!.jobId,
+              state: "active",
+              child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, profileName: chosenProfile.name }
+            };
+            phase = "prompt_verification";
+          } catch (error) {
+            const errorDetails = record(error) && record(error.details) ? error.details : undefined;
+            const confirmation = errorDetails?.promptConfirmation;
+            if (record(confirmation) && typeof confirmation.elapsedMs === "number") timing.postAckConfirmationMs = confirmation.elapsedMs;
+            throw error;
+          }
+        } else {
+          const confirmationStartedAt = clock.now();
+          try {
+            const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt);
+            initialPromptObservation = confirmed.observation;
+            promptConfirmation = confirmed.confirmation;
+            timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
+            postState = confirmed.pane;
+            agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+          } catch (error) {
+            const errorDetails = record(error) && record(error.details) ? error.details : undefined;
+            const confirmation = errorDetails?.promptConfirmation;
+            if (record(confirmation) && typeof confirmation.elapsedMs === "number") timing.postAckConfirmationMs = confirmation.elapsedMs;
+            if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") {
+              throw new LaunchError(error.code, error.message, {
+                ...error.details,
+                paneId: resolvedPaneId,
+                supervisorJobId: reservation!.jobId,
+                assignmentState: "unconfirmed",
+                supervision: boundSupervision!,
+              });
+            }
+            throw error;
+          }
+        }
+        assignmentState = "confirmed";
+        if (agentId) created.agentId = agentId;
         const exactIdentity = capturedIdentity as PromptTargetIdentity;
         const authoritativeName = exactIdentity.agentName;
         const capability = capabilities.get(chosenProfile.name)!;
@@ -2250,21 +2235,20 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           ...(agentId ? { agentId } : {}),
           postState: boundAgentSessionStrings(modelSafeJson(postState)) as Record<string, unknown>,
           agentStarted,
-          initialPromptSent,
+          initialPromptSent: true,
           promptSubmitted,
           recipientRegistered,
           readiness,
-          ...(params.initialPrompt === undefined ? {} : { promptConsumption, assignmentState: assignmentState! }),
-          ...(initialPromptDelivery ? { initialPromptDelivery } : {}),
+          promptConsumption: "confirmed",
+          assignmentState: assignmentState!,
+          initialPromptDelivery: initialPromptDelivery!,
           ...(initialPromptSubmission ? { initialPromptSubmission: compactPromptSubmission(initialPromptSubmission) } : {}),
           ...(initialPromptObservation ? { initialPromptObservation } : {}),
           ...(promptConfirmation ? { promptConfirmation } : {}),
           timing,
-          ...(sender ? {
-            sender: { paneId: sender.paneId, display: sender.display, source: sender.source },
-            envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },
-            ...(published ? { attachment: published } : {})
-          } : {}),
+          sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
+          envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },
+          ...(published ? { attachment: published } : {}),
           recipient,
           effectCertainty: "confirmed",
           supervision: boundSupervision!,
@@ -2338,8 +2322,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       }
     },
     renderCall(args, theme) {
-      const delivery = args.initialPrompt !== undefined ? args.initialPromptDelivery ?? "inline" : undefined;
-      return textComponent(formatCall("herdr_launch", delivery ? `${args.profile} · ${delivery}` : args.profile, args.name), theme, "accent");
+      const delivery = args.assignmentDelivery ?? "inline";
+      return textComponent(formatCall("herdr_launch", `${args.profile} · ${delivery}`, args.name), theme, "accent");
     },
     renderResult(result, options, theme) {
       return renderResultComponent("launch", result, options, theme, result.details?.paneId);

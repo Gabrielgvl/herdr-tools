@@ -160,7 +160,7 @@ describe("MCP host capability proxy", () => {
     const fallbackCommunicate = createCommunicateTool({ cli, context, preflight: createPreflight(cli) });
     await fallbackCommunicate.execute("id", { target: "w:p2", operation: "keys", keys: ["enter"] } as never, undefined, undefined, hostContext(host));
     const fallbackLaunch = createLaunchTool({ cli, context, preflight: createPreflight(cli), supervision: stubSupervision() });
-    await fallbackLaunch.execute("id", { name: "worker", profile: "worker-pi" } as never, signal, undefined, hostContext(host)).catch(() => undefined);
+    await fallbackLaunch.execute("id", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } } as never, signal, undefined, hostContext(host)).catch(() => undefined);
     expect([...new Set(reads)].sort()).toEqual(["cwd", "signal"]);
   });
 });

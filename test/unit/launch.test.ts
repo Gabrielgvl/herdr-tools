@@ -6,7 +6,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
 import { errorOutcome } from "../../src/mcp/adapter.js";
 import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
-import { LaunchParamsSchema, type LaunchParams } from "../../src/launch-schema.js";
+import { LaunchParamsSchema, renderAssignment, type LaunchAssignment, type LaunchParams } from "../../src/launch-schema.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
 import { parseProfile, profileSource, skillTreeDigest, SKILL_BUNDLE_REGISTRY_FILE, type ProfileCatalog } from "../../src/profiles/index.js";
@@ -53,7 +53,9 @@ const startFailure = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "agent pro
   stderrTruncated: false,
   errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } }
 });
-const envelope = (payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`;
+/** Every launch carries the typed assignment; only the objective varies per case. */
+const assign = (objective: string): LaunchAssignment => ({ objective, scope: "assigned scope", verification: "assigned verification" });
+const envelope = (objective: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${renderAssignment(assign(objective))}`;
 const PROMPT_ARGV = (paneId: string) => ["agent", "prompt", paneId, "--stdin"];
 
 function launchDiagnostic(error: unknown): Record<string, unknown> {
@@ -71,6 +73,14 @@ const observedAgent = (state: string | undefined, stateChangeSeq: number | undef
   ...(stateChangeSeq === undefined ? {} : { state_change_seq: stateChangeSeq }),
   revision
 });
+/**
+ * Every launch now submits its assignment, so a hand-rolled CLI stub must serve
+ * one idle readiness baseline and then an advanced sample the confirmation can
+ * accept. `reads` counts that stub's own reads of the same record kind.
+ */
+const lifecycleFor = (reads: number): Record<string, unknown> => reads === 0
+  ? { agent_status: "idle", state_change_seq: 7, revision: 3, interactive_ready: true }
+  : { agent_status: "working", state_change_seq: 8, revision: 4, interactive_ready: true };
 const observedPane = (state: string | undefined, stateChangeSeq: number | undefined, revision = 3): Record<string, unknown> => ({
   pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "pi", terminal_id: "terminal-0", agent_session: TEST_SESSION,
   ...(state === undefined ? {} : { agent_status: state }),
@@ -276,6 +286,19 @@ function configureFreshIdentitySamples(harness: ReturnType<typeof makeCli>, samp
   });
 }
 
+/**
+ * A hand-rolled stub that intercepts `agent start` never lets `makeCli` learn
+ * the started identity, so its prompt acknowledgement has to be stubbed too or
+ * it cannot match the captured target.
+ */
+function stubPromptTransport(harness: ReturnType<typeof makeCli>, agent: Record<string, unknown>): void {
+  harness.cli.runJsonWithStdin = vi.fn<NonNullable<LaunchCli["runJsonWithStdin"]>>(async (argv, input) => {
+    harness.calls.push(argv);
+    harness.stdinInputs.push(input);
+    return ok("cli:agent:prompt", { type: "agent_prompted", agent: { ...agent, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 7, screen_detection_skipped: true } });
+  });
+}
+
 function launch(
   params: LaunchParams,
   profiles: ProfileCatalog,
@@ -320,19 +343,15 @@ function agySafetySupervision(strengthenFailure?: Error) {
 
 describe("herdr_launch evidence redaction", () => {
   it("strips environment values from the authoritative post-state at every depth", async () => {
-    const leaky = {
-      pane_id: "w1:p2",
-      tab_id: "w1:t1",
-      workspace_id: "w1",
-      agent: "pi",
-      agent_status: "working",
+    const leakage = {
       environment: { SECRET: "pane-secret" },
       env_vars: { SECRET: "vars-secret" },
       history: [{ env: { SECRET: "array-secret" } }, { child: { environment_overrides: { SECRET: "deep-secret" } } }]
     };
-    const result = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli({ paneStates: [leaky, leaky] }).cli);
-    expect(result.details).toMatchObject({ operation: "launch", outcome: "launched", paneId: "w1:p2", readiness: { baselineRequired: false }, promptSubmitted: false, recipientRegistered: true });
-    expect(result.details?.postState).toEqual({ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", agent_status: "working", history: [{}, { child: {} }] });
+    const confirmed = observedPane("working", 8, 4);
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli({ paneStates: [{ ...observedPane("idle", 7), ...leakage }, { ...confirmed, ...leakage }] }).cli);
+    expect(result.details).toMatchObject({ operation: "launch", outcome: "launched", paneId: "w1:p2", readiness: { baselineRequired: true }, promptSubmitted: true, recipientRegistered: true });
+    expect(result.details?.postState).toEqual({ ...confirmed, history: [{}, { child: {} }] });
     expect(JSON.stringify(result)).not.toContain("secret");
   });
 });
@@ -347,7 +366,7 @@ describe("herdr_launch profile-only contract", () => {
         { name: "worker", kind: "pi", terminalId: "terminal-0", agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } }
       ]);
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "delayed" }, catalog(profile("worker")), harness.cli, undefined, { recipients });
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("delayed") }, catalog(profile("worker")), harness.cli, undefined, { recipients });
       await vi.advanceTimersByTimeAsync(5_300);
       const result = await pending;
       expect(result.details).toMatchObject({
@@ -391,7 +410,7 @@ describe("herdr_launch profile-only contract", () => {
       return result;
     });
 
-    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "timed" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock });
+    const result = await launch({ name: "worker", profile: "worker", assignment: assign("timed") }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock });
     expect(result.details).toMatchObject({
       readiness: { elapsedMs: 72 },
       promptConfirmation: { elapsedMs: 48 },
@@ -424,7 +443,7 @@ describe("herdr_launch profile-only contract", () => {
       };
     });
 
-    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "timed parse" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock });
+    const result = await launch({ name: "worker", profile: "worker", assignment: assign("timed parse") }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock });
     expect(result.details).toMatchObject({
       promptSubmitted: true,
       initialPromptSubmission: { confirmed: true },
@@ -455,7 +474,7 @@ describe("herdr_launch profile-only contract", () => {
       };
     });
 
-    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "timed bad parse" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })
+    const failure = await launch({ name: "worker", profile: "worker", assignment: assign("timed bad parse") }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })
       .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -501,7 +520,7 @@ describe("herdr_launch profile-only contract", () => {
       return result;
     });
 
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "timed failure" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("timed failure") }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: {
         causeCode: "PROMPT_UNCONFIRMED",
@@ -525,7 +544,7 @@ describe("herdr_launch profile-only contract", () => {
         return ok("start", { agent });
       }
     });
-    const failure = await launch({ name: "worker", profile: "primary", placement: { mode: "new_tab", tabLabel: "workers" }, initialPrompt: "must not send" }, catalog(primary, fallback), harness.cli, undefined, { clock: phaseClock.clock })
+    const failure = await launch({ name: "worker", profile: "primary", placement: { mode: "new_tab", tabLabel: "workers" }, assignment: assign("must not send") }, catalog(primary, fallback), harness.cli, undefined, { clock: phaseClock.clock })
       .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -552,7 +571,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "agent" && argv[1] === "start") phaseClock.advance(120_123);
       return result;
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "no readiness budget" }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("no readiness budget") }, catalog(profile("worker")), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
       code: "READY_TIMEOUT",
       details: {
         causeCode: "READY_TIMEOUT",
@@ -571,7 +590,7 @@ describe("herdr_launch profile-only contract", () => {
         { name: null, kind: null, terminalId: null, agentSession: null },
         { name: "worker", kind: "pi", terminalId: "terminal-0", agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } }
       ]);
-      const resultPromise = launch({ name: "worker", profile: "worker", initialPrompt: "null then ready" }, catalog(profile("worker")), harness.cli);
+      const resultPromise = launch({ name: "worker", profile: "worker", assignment: assign("null then ready") }, catalog(profile("worker")), harness.cli);
       await vi.advanceTimersByTimeAsync(100);
       const result = await resultPromise;
       expect(result.details).toMatchObject({ readiness: { baselineRequired: true, samples: 2, lastPendingReason: expect.stringContaining("identity_incomplete") }, promptSubmitted: true, recipientRegistered: true });
@@ -583,7 +602,7 @@ describe("herdr_launch profile-only contract", () => {
 
   it("rejects malformed start-record lifecycle values before readiness and reconciles the started pane", async () => {
     const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("idle", 7), revision: "invalid" } }) });
-    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+    const failure = await (launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>);
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -605,7 +624,7 @@ describe("herdr_launch profile-only contract", () => {
 
   it("validates but does not use stale start-record lifecycle values as the prompt anchor", async () => {
     const harness = makeCli({ start: () => ok("start", { agent: { ...observedAgent("working", 1, 1), screen_detection_skipped: true } }) });
-    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "fresh anchor" }, catalog(profile("worker")), harness.cli);
+    const result = await launch({ name: "worker", profile: "worker", assignment: assign("fresh anchor") }, catalog(profile("worker")), harness.cli);
     expect(result.details).toMatchObject({
       readiness: { samples: 1, baselineRequired: true },
       promptConfirmation: { baseline: { state: "idle", stateChangeSeq: 7, revision: 3 } },
@@ -642,7 +661,7 @@ describe("herdr_launch profile-only contract", () => {
           }
         };
       });
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "skew then ready" }, catalog(profile("worker")), harness.cli);
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("skew then ready") }, catalog(profile("worker")), harness.cli);
       await vi.waitFor(() => expect(harness.calls.filter((call) => call[0] === "pane" && call[1] === "get")).toHaveLength(1), { timeout: 1_000, interval: 1 });
       expect(harness.stdinInputs).toHaveLength(0);
       await vi.advanceTimersByTimeAsync(100);
@@ -675,7 +694,7 @@ describe("herdr_launch profile-only contract", () => {
         { name: "worker", kind: "pi", agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } }
       ]);
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "no carry" }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("no carry") }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
       const failure = expect(pending).rejects.toMatchObject({
         code: "READY_TIMEOUT",
         details: {
@@ -701,7 +720,7 @@ describe("herdr_launch profile-only contract", () => {
         paneStates: [observedPane("idle", 7), observedPane("idle", 7), observedPane("working", 8, 4)]
       });
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "delayed working" }, catalog(profile("worker")), harness.cli, undefined, { recipients });
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("delayed working") }, catalog(profile("worker")), harness.cli, undefined, { recipients });
       await vi.advanceTimersByTimeAsync(100);
       const result = await pending;
       expect(result.details).toMatchObject({
@@ -723,7 +742,7 @@ describe("herdr_launch profile-only contract", () => {
       agentStates: [{ ...observedAgent("idle", 7), screen_detection_skipped: true }, observedAgent("idle", 8, 4)],
       paneStates: [observedPane("idle", 7), observedPane("idle", 8, 4)]
     });
-    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "fast turn" }, catalog(profile("worker")), harness.cli);
+    const result = await launch({ name: "worker", profile: "worker", assignment: assign("fast turn") }, catalog(profile("worker")), harness.cli);
     expect(result.details).toMatchObject({
       promptSubmitted: true,
       promptConsumption: "confirmed",
@@ -749,7 +768,7 @@ describe("herdr_launch profile-only contract", () => {
       })
     } as unknown as AbortSignal;
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments() });
-    const failure = await tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "confirm once" }, signal, undefined, extensionContext)
+    const failure = await tool.execute("id", { name: "worker", profile: "worker", assignment: assign("confirm once") }, signal, undefined, extensionContext)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -768,7 +787,7 @@ describe("herdr_launch profile-only contract", () => {
       })
     } as unknown as AbortSignal;
     const plainTool = createLaunchTool({ cli: plainHarness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments() });
-    await expect(plainTool.execute("id", { name: "worker", profile: "worker", initialPrompt: "confirm once" }, plainSignal, undefined, extensionContext))
+    await expect(plainTool.execute("id", { name: "worker", profile: "worker", assignment: assign("confirm once") }, plainSignal, undefined, extensionContext))
       .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeMessage: "plain confirmation failure", promptSubmitted: true } });
   });
 
@@ -789,7 +808,7 @@ describe("herdr_launch profile-only contract", () => {
         paneStates: [observedPane("idle", 99, 99)]
       });
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "no baseline" }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("no baseline") }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
       const failure = expect(pending).rejects.toMatchObject({
         code: "READY_TIMEOUT",
         details: {
@@ -819,7 +838,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       const recipients = new RecipientRegistry();
       const supervision = stubSupervision({ jobId: `job_timeout_${state}` });
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: `unchanged ${state}` }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision });
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign(`unchanged ${state}`) }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision });
       const failure = expect(pending).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: {
@@ -866,7 +885,7 @@ describe("herdr_launch profile-only contract", () => {
         agentStates: [observedAgent("idle", 7), observedAgent("idle", 7)],
         paneStates: [observedPane("idle", 7), observedPane("working", 8, 4)]
       });
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "skew" }, catalog(profile("worker")), harness.cli);
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("skew") }, catalog(profile("worker")), harness.cli);
       const failure = expect(pending).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: {
@@ -891,7 +910,7 @@ describe("herdr_launch profile-only contract", () => {
       paneStates: [observedPane("idle", 7), postPane]
     });
     const recipients = new RecipientRegistry();
-    const failure = await (launch({ name: "worker", profile: "worker", initialPrompt: "fail closed" }, catalog(profile("worker")), harness.cli, undefined, { recipients })
+    const failure = await (launch({ name: "worker", profile: "worker", assignment: assign("fail closed") }, catalog(profile("worker")), harness.cli, undefined, { recipients })
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>);
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -920,7 +939,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "pane" && argv[1] === "get" && paneReads++ === 1) return ok("pane-post", result);
       return base(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "bad pane" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("bad pane") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode: "PROMPT_UNCONFIRMED", phase: "prompt_verification", assignmentState: "unconfirmed", paneId: "w1:p2", supervision: { state: "active" }, promptSubmitted: true, promptConfirmation: { reason: "read_failed", sourceCode } }
     });
@@ -937,7 +956,7 @@ describe("herdr_launch profile-only contract", () => {
       paneStates: [observedPane("idle", 7), replacementPane]
     });
     const recipients = new RecipientRegistry();
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "replacement" }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("replacement") }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason: "identity_changed", samples: 1, sourceCode: "POSTSTATE_IDENTITY_CHANGED" } }
     });
@@ -953,7 +972,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "agent" && argv[1] === "get" && agentReads++ > 0) return ok("agent-missing", { agent: null });
       return base(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "missing agent" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("missing agent") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode: "PROMPT_UNCONFIRMED", promptConfirmation: { reason: "identity_unavailable", sourceCode: "TARGET_IDENTITY_UNAVAILABLE", samples: 1 } }
     });
@@ -968,7 +987,7 @@ describe("herdr_launch profile-only contract", () => {
       configureFreshIdentitySamples(harness, [{ name: "worker", kind: "pi" }]);
       const recipients = new RecipientRegistry();
       const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
-      const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "abort" }, controller.signal, undefined, extensionContext);
+      const pending = tool.execute("id", { name: "worker", profile: "worker", assignment: assign("abort") }, controller.signal, undefined, extensionContext);
       await vi.waitFor(() => expect(harness.calls).toContainEqual(["pane", "get", "w1:p2"]), { timeout: 1_000, interval: 1 });
       controller.abort();
       await expect(pending).rejects.toMatchObject({
@@ -1005,7 +1024,7 @@ describe("herdr_launch profile-only contract", () => {
         return base(argv, signal, preserve);
       });
       const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-      const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "abort" }, controller.signal, undefined, extensionContext);
+      const pending = tool.execute("id", { name: "worker", profile: "worker", assignment: assign("abort") }, controller.signal, undefined, extensionContext);
       await vi.waitFor(() => expect(harness.calls).toContainEqual(["pane", "get", "w1:p2"]), { timeout: 1_000, interval: 1 });
       controller.abort();
       await expect(pending).rejects.toMatchObject({ code: "ABORTED", details: { reconciliation: { snapshot: "present", effectCertainty: "partial" } } });
@@ -1033,7 +1052,7 @@ describe("herdr_launch profile-only contract", () => {
         return base(argv, signal, preserve);
       });
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "primary", placement: { mode: "existing_pane", target: "caller" }, focus: true, initialPrompt: "do not mutate" }, catalog(primary, fallback), harness.cli, undefined, { recipients, clock: budget.clock });
+      const pending = launch({ name: "worker", profile: "primary", placement: { mode: "existing_pane", target: "caller" }, focus: true, assignment: assign("do not mutate") }, catalog(primary, fallback), harness.cli, undefined, { recipients, clock: budget.clock });
       const failure = expect(pending).rejects.toMatchObject({
         code: "READY_TIMEOUT",
         details: { causeCode: "READY_TIMEOUT", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { baselineRequired: true } }
@@ -1066,7 +1085,7 @@ describe("herdr_launch profile-only contract", () => {
         return base(argv, signal, preserve);
       });
       const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), clock: budget.clock });
-      const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "race" }, controller.signal, undefined, extensionContext);
+      const pending = tool.execute("id", { name: "worker", profile: "worker", assignment: assign("race") }, controller.signal, undefined, extensionContext);
       const failure = expect(pending).rejects.toMatchObject({ code: "READY_TIMEOUT", details: { causeCode: "READY_TIMEOUT", readiness: { elapsedMs: expect.any(Number) } } });
       await vi.waitFor(() => expect(abortScheduled).toBe(true), { timeout: 1_000, interval: 1 });
       budget.advance(100);
@@ -1092,7 +1111,7 @@ describe("herdr_launch profile-only contract", () => {
         return base(argv, signal, preserve);
       });
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "slow but valid" }, catalog(profile("worker")), harness.cli, undefined, { recipients });
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("slow but valid") }, catalog(profile("worker")), harness.cli, undefined, { recipients });
       await vi.waitFor(() => expect(apiReads).toBe(2), { timeout: 1_000, interval: 1 });
       await vi.advanceTimersByTimeAsync(5_500);
       releaseFresh(await base(["api", "snapshot"], new AbortController().signal));
@@ -1121,7 +1140,7 @@ describe("herdr_launch profile-only contract", () => {
         return base(argv, signal, preserve);
       });
       const recipients = new RecipientRegistry();
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "must not dispatch" }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("must not dispatch") }, catalog(profile("worker")), harness.cli, undefined, { recipients, clock: budget.clock });
       const expectation = expect(pending).rejects.toMatchObject({
         code: "READY_TIMEOUT",
         details: {
@@ -1156,7 +1175,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "agent" && argv[1] === "start") budget.consumeStartBudget();
       return base(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "no budget" }, catalog(profile("worker")), harness.cli, undefined, { clock: budget.clock })).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("no budget") }, catalog(profile("worker")), harness.cli, undefined, { clock: budget.clock })).rejects.toMatchObject({
       code: "READY_TIMEOUT",
       details: { causeCode: "READY_TIMEOUT", phase: "ready", agentStarted: true, promptSubmitted: false, readiness: { elapsedMs: 120_000, samples: 0, lastPendingReason: "readiness_budget_exhausted_before_sample" } }
     });
@@ -1175,7 +1194,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "api" && apiReads++ === 1) budget.advance(100);
       return result;
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "late sample" }, catalog(profile("worker")), harness.cli, undefined, { clock: budget.clock })).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("late sample") }, catalog(profile("worker")), harness.cli, undefined, { clock: budget.clock })).rejects.toMatchObject({
       code: "READY_TIMEOUT",
       details: { causeCode: "READY_TIMEOUT", phase: "ready", readiness: { elapsedMs: 120_000, samples: 1, baselineRequired: true } }
     });
@@ -1194,7 +1213,7 @@ describe("herdr_launch profile-only contract", () => {
     });
     const recipients = new RecipientRegistry();
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
-    await expect(tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "must not dispatch" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({
+    await expect(tool.execute("id", { name: "worker", profile: "worker", assignment: assign("must not dispatch") }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({
       code: "ABORTED",
       details: { causeCode: "ABORTED", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 0, baselineRequired: true } }
     });
@@ -1217,7 +1236,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       const recipients = new RecipientRegistry();
       const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
-      const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "caller abort" }, controller.signal, undefined, extensionContext);
+      const pending = tool.execute("id", { name: "worker", profile: "worker", assignment: assign("caller abort") }, controller.signal, undefined, extensionContext);
       const expectation = expect(pending).rejects.toMatchObject({
         code: "ABORTED",
         details: { causeCode: "ABORTED", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 1, baselineRequired: true, records: expect.any(Array) } }
@@ -1250,7 +1269,7 @@ describe("herdr_launch profile-only contract", () => {
       if (started && (argv[0] === "api" || argv[0] === "pane" || argv[0] === "agent")) throw Object.assign(new Error("reconciliation unavailable"), { code: "CLI_PROTOCOL_ERROR" });
       return base(argv, signal, preserve);
     });
-    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+    const failure = await (launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>);
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -1289,7 +1308,7 @@ describe("herdr_launch profile-only contract", () => {
       profiles: { load: async () => catalog(profile("worker")) },
       attachments: fakeAttachments()
     });
-    const failure = await tool.execute("id", { name: "worker", profile: "worker", focus: true }, new AbortController().signal, undefined, extensionContext)
+    const failure = await tool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker", focus: true }, new AbortController().signal, undefined, extensionContext)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -1334,7 +1353,7 @@ describe("herdr_launch profile-only contract", () => {
       profiles: { load: async () => catalog(profile("worker")) },
       attachments: fakeAttachments()
     });
-    const fallbackFailure = await fallbackTool.execute("id", { name: "worker", profile: "worker", focus: true }, new AbortController().signal, undefined, extensionContext)
+    const fallbackFailure = await fallbackTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker", focus: true }, new AbortController().signal, undefined, extensionContext)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect((fallbackFailure.details.reconciliation as Record<string, unknown>).readFailures).toEqual(["reconciliation:READ_FAILED"]);
   });
@@ -1369,7 +1388,7 @@ describe("herdr_launch profile-only contract", () => {
     const outputRead = vi.fn(async () => canaries.join("\n"));
     Object.defineProperty(harness.cli, "runText", { configurable: true, value: outputRead });
     const supervision = stubSupervision({ jobId: "job_output_redacted" });
-    const failure = await (launch({ name: "worker", profile: "worker", initialPrompt: canaries[0] }, catalog(profile("worker")), harness.cli, undefined, { supervision }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+    const failure = await (launch({ name: "worker", profile: "worker", assignment: assign(canaries[0]) }, catalog(profile("worker")), harness.cli, undefined, { supervision }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
 
     expect(failure).toMatchObject({
@@ -1406,14 +1425,14 @@ describe("herdr_launch profile-only contract", () => {
   it("sanitizes diagnostic fallback fields without exposing malformed preflight errors", async () => {
     const malformed = Object.assign(new Error("\u0001\u007f"), { code: "\u0001\u007f", details: { causeCode: "preflight-cause", environment: { SECRET: "must-not-be-model-visible" } } });
     const malformedTool = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw malformed; } });
-    const malformedFailure = await (malformedTool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+    const malformedFailure = await (malformedTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(malformedFailure).toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "validate", causeCode: "preflight-cause", effectCertainty: "absent" } });
     expect(launchDiagnostic(malformedFailure)).toMatchObject({ code: "LAUNCH_FAILED", phase: "validate", effectCertainty: "absent", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.noEffect });
     expect(malformedFailure.message).not.toContain("must-not-be-model-visible");
 
     const rawTool = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw "raw preflight failure"; } });
-    const rawFailure = await (rawTool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+    const rawFailure = await (rawTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(rawFailure).toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "validate", effectCertainty: "absent" } });
     expect(launchDiagnostic(rawFailure)).toMatchObject({ code: "CLI_PROTOCOL_ERROR", phase: "validate", effectCertainty: "absent" });
@@ -1439,7 +1458,7 @@ describe("herdr_launch profile-only contract", () => {
       if (started && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent });
       return base(argv, signal, preserve);
     });
-    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+    const failure = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     const reconciliation = failure.details.reconciliation as Record<string, unknown>;
     expect(reconciliation).toMatchObject({ effectCertainty: "partial", pane: "present", agent: "present", paneId: "w1:p2", agentName: "worker" });
@@ -1473,7 +1492,7 @@ describe("herdr_launch profile-only contract", () => {
         if (started && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent });
         return base(argv, signal, preserve);
       });
-      const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+      const failure = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
         .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
       expect(failure.details).toMatchObject({ created: { agentId: expected }, reconciliation: { effectCertainty: "partial", agentId: expected } });
       const reconciliation = failure.details.reconciliation as Record<string, unknown>;
@@ -1496,14 +1515,14 @@ describe("herdr_launch profile-only contract", () => {
       if (started && argv[0] === "pane" && argv[1] === "get") return ok("malformed-pane", { pane: "invalid" });
       return base(argv, signal, preserve);
     });
-    const failure = await (launch({ name: "worker", profile: "worker", focus: true }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+    const failure = await (launch({ assignment: assign("go"), name: "worker", profile: "worker", focus: true }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "partial", readFailures: expect.arrayContaining(["pane:READ_MALFORMED"]) } });
   });
 
   it("falls back to the extension working directory when launch cwd is omitted", async () => {
     const tool = createLaunchTool({ cli: makeCli().cli, context, profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    const result = await tool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, { cwd: "/context-cwd" } as ExtensionContext);
+    const result = await tool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, { cwd: "/context-cwd" } as ExtensionContext);
     expect(result.details).toMatchObject({ outcome: "launched", paneId: "w1:p2" });
   });
 
@@ -1521,7 +1540,7 @@ describe("herdr_launch profile-only contract", () => {
       if (started && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent: null });
       return base(argv, signal, preserve);
     });
-    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+    const failure = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "partial", pane: "present", agent: "absent" } });
   });
@@ -1539,7 +1558,7 @@ describe("herdr_launch profile-only contract", () => {
       return base(argv, signal, preserve);
     });
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    const failure = await tool.execute("id", { name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, controller.signal, undefined, extensionContext)
+    const failure = await tool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, controller.signal, undefined, extensionContext)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.details).toMatchObject({ phase: "placement", created: { tabId: "w1:t2" }, reconciliation: { effectCertainty: "unknown", snapshot: "present", pane: "unknown", agent: "unknown", tabId: "w1:t2" } });
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "start")).toBe(false);
@@ -1566,7 +1585,7 @@ describe("herdr_launch profile-only contract", () => {
       if (placementAttempted && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent: { pane_id: "w1:p3", name: "worker" } });
       return base(argv, signal, preserve);
     });
-    const failure = await launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), harness.cli)
+    const failure = await launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.details).toMatchObject({ phase: "placement", reconciliation: { effectCertainty: "partial", snapshot: "present", pane: "present", agent: "present", paneId: "w1:p3", tabId: "w1:t2" } });
   });
@@ -1578,7 +1597,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "pane" && argv[1] === "split") return ok("split", { pane: { pane_id: "w1:p2" } });
       return base(argv, signal, preserve);
     });
-    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+    const failure = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.details).toMatchObject({ reconciliation: { effectCertainty: "partial", pane: "present", agent: "present", paneId: "w1:p2", tabId: "w1:t1" } });
   });
@@ -1598,7 +1617,7 @@ describe("herdr_launch profile-only contract", () => {
         if (started && argv[0] === "api") return new Promise<never>(() => undefined);
         return base(argv, signal, preserve);
       });
-      const pending = launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli);
+      const pending = launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli);
       const failurePromise = pending.catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
       await vi.advanceTimersByTimeAsync(5_000);
       const failure = await failurePromise;
@@ -1620,7 +1639,7 @@ describe("herdr_launch profile-only contract", () => {
       if (focusFailed && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent: { ...observedAgent("idle", 7), agent_id: "post-agent" } });
       return base(argv, signal, preserve);
     });
-    const failure = await (launch({ name: "worker", profile: "worker", focus: true }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+    const failure = await (launch({ assignment: assign("go"), name: "worker", profile: "worker", focus: true }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.details).toMatchObject({ created: { agentId: "start-agent" }, reconciliation: { effectCertainty: "partial", agentId: "post-agent" } });
   });
@@ -1648,7 +1667,7 @@ describe("herdr_launch profile-only contract", () => {
         errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: `backend rejected the command: ${SECRET}` } }
       }); }
     });
-    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+    const failure = await (launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     // The model sees the fixed summary, the typed code, and the diagnostic; the
     // backend's own words never appear in the message or the diagnostic payload.
@@ -1668,7 +1687,7 @@ describe("herdr_launch profile-only contract", () => {
     const HOSTILE_CODE = "😀".repeat(40);
     const harness = makeCli();
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw Object.assign(new Error(`preflight refused for token ${HOSTILE_CODE}`), { code: HOSTILE_CODE }); } });
-    const failure = await (tool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+    const failure = await (tool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure.code).toBe("LAUNCH_FAILED");
     expect(failure.message).not.toContain(HOSTILE_CODE);
@@ -1681,7 +1700,7 @@ describe("herdr_launch profile-only contract", () => {
 
     // A cause with neither a usable code nor prose contributes neither field.
     const blankTool = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw Object.assign(new Error(""), { code: "" }); } });
-    const blank = await (blankTool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
+    const blank = await (blankTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(blank.code).toBe("LAUNCH_FAILED");
     expect(blank.details).toMatchObject({ causeCode: "LAUNCH_FAILED" });
@@ -1707,7 +1726,7 @@ describe("herdr_launch profile-only contract", () => {
         }
         return base(argv, signal, preserve);
       });
-      const pending = launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+      const pending = launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
         .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
       await vi.waitFor(() => expect(readSignals).toHaveLength(1), { timeout: 1_000, interval: 1 });
       expect(readSignals[0]!.aborted).toBe(false);
@@ -1740,7 +1759,7 @@ describe("herdr_launch profile-only contract", () => {
       if (startFailed && argv[0] === "agent" && argv[1] === "get") return ok("reconciled-agent", { agent: null });
       return base(argv, signal, preserve);
     });
-    const failure = await (launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
+    const failure = await (launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> }) as unknown as Promise<Error & { code: string; details: Record<string, unknown> }>);
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -1753,13 +1772,13 @@ describe("herdr_launch profile-only contract", () => {
 
   it("does not reconcile validation or preflight failures before any mutation", async () => {
     const validationCalls: string[][] = [];
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "x".repeat(16 * 1024 + 1) }, catalog(profile("worker")), makeCli({ calls: validationCalls }).cli)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE_FOR_INLINE" });
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("x".repeat(16 * 1024 + 1)) }, catalog(profile("worker")), makeCli({ calls: validationCalls }).cli)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE_FOR_INLINE" });
     expect(validationCalls).toHaveLength(0);
 
     const preflightCalls: string[][] = [];
     const preflightCli = makeCli({ calls: preflightCalls });
     const preflightTool = createLaunchTool({ cli: preflightCli.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw Object.assign(new Error("health unavailable"), { code: "BACKEND_UNAVAILABLE" }); } });
-    await expect(preflightTool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "BACKEND_UNAVAILABLE" });
+    await expect(preflightTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "BACKEND_UNAVAILABLE" });
     expect(preflightCalls).toHaveLength(0);
   });
 
@@ -1769,7 +1788,7 @@ describe("herdr_launch profile-only contract", () => {
     const controller = new AbortController();
     controller.abort();
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    const failure = await tool.execute("id", { name: "worker", profile: "worker" }, controller.signal, undefined, extensionContext)
+    const failure = await tool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, controller.signal, undefined, extensionContext)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(failure).toMatchObject({ code: "ABORTED", details: { effectCertainty: "absent" } });
     expect(failure.details).not.toHaveProperty("reconciliation");
@@ -1791,7 +1810,7 @@ describe("herdr_launch profile-only contract", () => {
       if (source === "pane" && argv[0] === "pane" && argv[1] === "get") return ok("pane-malformed", result);
       return base(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "malformed record" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("malformed record") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode, phase: "ready", readiness: { samples: 1, baselineRequired: true } }
     });
@@ -1811,7 +1830,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "api" && apiReads++ === 1) throw readFailure;
       return base(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "read failure" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("read failure") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode: "CLI_PROTOCOL_ERROR", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 1, records: [] } }
     });
@@ -1837,7 +1856,7 @@ describe("herdr_launch profile-only contract", () => {
       }
       return base(argv, signal, preserve);
     });
-    const failure = await (launch({ name: "worker", profile: "worker", initialPrompt: "read failure" }, catalog(profile("worker")), harness.cli)
+    const failure = await (launch({ name: "worker", profile: "worker", assignment: assign("read failure") }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as { code: string; details: Record<string, unknown> }) as unknown as Promise<{ code: string; details: Record<string, unknown> }>);
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -1874,7 +1893,7 @@ describe("herdr_launch profile-only contract", () => {
       }
       return result;
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "pane failure" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("pane failure") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: {
         causeCode: "CLI_PROTOCOL_ERROR",
@@ -1903,7 +1922,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "api" && apiReads++ === 1) throw Object.assign(new Error(sourceCode), { code: sourceCode });
       return base(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "read timeout" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("read timeout") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: {
         causeCode,
@@ -1927,7 +1946,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "api" && apiReads++ === 2) throw Object.assign(new Error("later sample failed"), { code: "CLI_PROTOCOL_ERROR" });
         return base(argv, signal, preserve);
       });
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "read failure after pending" }, catalog(profile("worker")), harness.cli);
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("read failure after pending") }, catalog(profile("worker")), harness.cli);
       const failure = expect(pending).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: { causeCode: "CLI_PROTOCOL_ERROR", phase: "ready", readiness: { samples: 2, records: [] } }
@@ -1950,7 +1969,7 @@ describe("herdr_launch profile-only contract", () => {
     }
     cursor.secretLeaf = "must-not-survive";
     const harness = makeCli({ agentStates: [{ ...observedAgent("idle", 7), terminal_id: deep }], paneStates: [observedPane("idle", 7)] });
-    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "deep malformed" }, catalog(profile("worker")), harness.cli)
+    const failure = await launch({ name: "worker", profile: "worker", assignment: assign("deep malformed") }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -1989,7 +2008,7 @@ describe("herdr_launch profile-only contract", () => {
       prototype: { value: hugeArray, enumerable: true }
     });
     const harness = makeCli({ agentStates: [malformed], paneStates: [{ ...observedPane("idle", 7), agent_session: inheritedSession }] });
-    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "huge malformed" }, catalog(profile("worker")), harness.cli)
+    const failure = await launch({ name: "worker", profile: "worker", assignment: assign("huge malformed") }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
     const readiness = failure.details.readiness as { records: Record<string, unknown>[] };
     const projected = readiness.records.find((candidate) => candidate.source === "agent_get")!;
@@ -2035,7 +2054,7 @@ describe("herdr_launch profile-only contract", () => {
       const agents = Array.from({ length: 10_000 }, () => ({ ...duplicate }));
       return { ...result, result: { ...value, snapshot: { ...value.snapshot, agents } } };
     });
-    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "duplicates" }, catalog(profile("worker")), harness.cli)
+    const failure = await launch({ name: "worker", profile: "worker", assignment: assign("duplicates") }, catalog(profile("worker")), harness.cli)
       .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
     expect(failure).toMatchObject({
       code: "LAUNCH_FAILED",
@@ -2054,7 +2073,7 @@ describe("herdr_launch profile-only contract", () => {
     const malformed = { ...observedAgent("idle", 7), terminal_id: 42 };
     const harness = makeCli({ agentStates: [malformed], paneStates: [observedPane("idle", 7)] });
     const recipients = new RecipientRegistry();
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "malformed" }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("malformed") }, catalog(profile("worker")), harness.cli, undefined, { recipients })).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 1, baselineRequired: true } }
     });
@@ -2073,7 +2092,7 @@ describe("herdr_launch profile-only contract", () => {
     ["screen detection diagnostic", { ...observedAgent("idle", 7), screen_detection_skipped: "yes" }]
   ] as const)("rejects malformed non-null readiness %s", async (_label, malformed) => {
     const harness = makeCli({ agentStates: [malformed], paneStates: [observedPane("idle", 7)] });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "malformed metadata" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("malformed metadata") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1, baselineRequired: true } }
     });
@@ -2085,11 +2104,11 @@ describe("herdr_launch profile-only contract", () => {
     ["state sequence", { state_change_seq: "7" }],
     ["revision", { revision: -1 }],
     ["screen detection diagnostic", { screen_detection_skipped: "yes" }]
-  ] as const)("rejects malformed no-prompt %s lifecycle evidence", async (_label, patch) => {
+  ] as const)("rejects malformed %s lifecycle evidence", async (_label, patch) => {
     const harness = makeCli({ agentStates: [{ ...observedAgent("idle", 7), ...patch }], paneStates: [observedPane("idle", 7)] });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
-      details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", promptSubmitted: false, readiness: { samples: 1, baselineRequired: false } }
+      details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", promptSubmitted: false, readiness: { samples: 1, baselineRequired: true } }
     });
     expect(harness.stdinInputs).toHaveLength(0);
   });
@@ -2110,7 +2129,7 @@ describe("herdr_launch profile-only contract", () => {
           return base(argv, signal, preserve);
         });
       }
-      const pending = launch({ name: "worker", profile: "worker", initialPrompt: "pending sample" }, catalog(profile("worker")), harness.cli);
+      const pending = launch({ name: "worker", profile: "worker", assignment: assign("pending sample") }, catalog(profile("worker")), harness.cli);
       await vi.advanceTimersByTimeAsync(100);
       const result = await pending;
       expect(result.details).toMatchObject({ readiness: { samples: 2, lastPendingReason: expect.any(String), baselineRequired: true }, promptSubmitted: true, promptConsumption: "confirmed" });
@@ -2128,9 +2147,9 @@ describe("herdr_launch profile-only contract", () => {
         : ok("start", { agent: { name: null, pane_id: null, agent: null, terminal_id: null, agent_session: null } })
     });
     configureFreshIdentitySamples(harness, [{ name: "worker", kind: variant === "kind/session contradiction" ? undefined : "claude", terminalId: "terminal-0", agentSession: session }]);
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
-      details: { causeCode: "TARGET_IDENTITY_CHANGED", phase: "ready", readiness: { samples: 1, baselineRequired: false } }
+      details: { causeCode: "TARGET_IDENTITY_CHANGED", phase: "ready", readiness: { samples: 1, baselineRequired: true } }
     });
     expect(harness.stdinInputs).toHaveLength(0);
   });
@@ -2146,7 +2165,7 @@ describe("herdr_launch profile-only contract", () => {
       const duplicate = value.snapshot.agents.find((agent) => agent.pane_id === "w1:p2")!;
       return { ...result, result: { ...value, snapshot: { ...value.snapshot, agents: [...value.snapshot.agents, { ...duplicate }] } } };
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "duplicate" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("duplicate") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1, records: expect.any(Array) } }
     });
@@ -2172,7 +2191,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "agent" && argv[1] === "get" && apiReads > 1) return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-other", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-sample" } } });
       return base(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "replacement" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("replacement") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
     expect(harness.stdinInputs).toHaveLength(0);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(0);
   });
@@ -2208,7 +2227,7 @@ describe("herdr_launch profile-only contract", () => {
       return base(argv, signal, preserve);
     });
     const recipients = new RecipientRegistry();
-    const failure = await (launch({ name: "worker", profile: "worker", initialPrompt: "must not dispatch" }, catalog(profile("worker")), harness.cli, undefined, { recipients }).catch((error: unknown) => error as { code?: string; details?: Record<string, unknown> }) as unknown as Promise<{ code?: string; details?: Record<string, unknown> }>);
+    const failure = await (launch({ name: "worker", profile: "worker", assignment: assign("must not dispatch") }, catalog(profile("worker")), harness.cli, undefined, { recipients }).catch((error: unknown) => error as { code?: string; details?: Record<string, unknown> }) as unknown as Promise<{ code?: string; details?: Record<string, unknown> }>);
     expect(failure).toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
     const details = failure.details!;
     expect(details.expected).toHaveLength(256);
@@ -2234,7 +2253,7 @@ describe("herdr_launch profile-only contract", () => {
       if (apiReads > 1 && argv[0] === "pane" && argv[1] === "get") return ok("pane-get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", ...replacement, agent_name: replacement.name } });
       return base(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
     expect(harness.stdinInputs).toHaveLength(0);
   });
 
@@ -2247,11 +2266,69 @@ describe("herdr_launch profile-only contract", () => {
       { name: "worker", profile: "worker", env: { X: "y" } },
       { name: "worker", profile: "worker", kind: "pi" }
     ]) expect(() => validateLaunchParams(value as never)).toThrow();
-    expect(() => validateLaunchParams({ name: "worker", profile: "worker" })).not.toThrow();
+    expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: assign("go") })).not.toThrow();
+  });
+
+  it("requires exactly the typed objective, scope and verification assignment", () => {
+    const base = { name: "worker", profile: "worker" };
+    expect(LaunchParamsSchema).toMatchObject({
+      required: expect.arrayContaining(["name", "profile", "assignment"]),
+      properties: {
+        assignment: {
+          type: "object",
+          additionalProperties: false,
+          required: ["objective", "scope", "verification"],
+          properties: {
+            objective: { type: "string", minLength: 1 },
+            scope: { type: "string", minLength: 1 },
+            verification: { type: "string", minLength: 1 }
+          }
+        },
+        assignmentDelivery: { enum: ["inline", "attachment"] }
+      }
+    });
+    expect(LaunchParamsSchema.properties).not.toHaveProperty("initialPrompt");
+    expect(LaunchParamsSchema.properties).not.toHaveProperty("initialPromptDelivery");
+    expect(Object.keys(LaunchParamsSchema.properties.assignment.properties)).toEqual(["objective", "scope", "verification"]);
+
+    const full = assign("objective text");
+    for (const value of [
+      // Missing altogether, wrong container, and a legacy free-form prompt.
+      base,
+      { ...base, assignment: null }, { ...base, assignment: "objective text" }, { ...base, assignment: [full] },
+      { ...base, initialPrompt: "objective text" }, { ...base, initialPrompt: "objective text", initialPromptDelivery: "inline" },
+      { ...base, assignment: full, initialPrompt: "objective text" },
+      // One missing field, one empty field, one NUL field, one non-string field, per field.
+      ...(["objective", "scope", "verification"] as const).flatMap((field) => [
+        { ...base, assignment: { ...full, [field]: undefined } },
+        { ...base, assignment: Object.fromEntries(Object.entries(full).filter(([key]) => key !== field)) },
+        { ...base, assignment: { ...full, [field]: "" } },
+        { ...base, assignment: { ...full, [field]: "with \0 nul" } },
+        { ...base, assignment: { ...full, [field]: 1 } },
+        { ...base, assignment: { ...full, [field]: ["text"] } }
+      ]),
+      // Extras are refused rather than ignored.
+      { ...base, assignment: { ...full, extra: "text" } },
+      { ...base, assignment: { ...full, initialPrompt: "text" } },
+      { ...base, assignmentDelivery: "attachment" },
+      { ...base, assignment: full, assignmentDelivery: "elsewhere" }
+    ]) expect(() => validateLaunchParams(value as never)).toThrow(/INVALID|assignment|Unknown/i);
+
+    expect(() => validateLaunchParams({ ...base, assignment: full } as never)).not.toThrow();
+    expect(() => validateLaunchParams({ ...base, assignment: full, assignmentDelivery: "inline" } as never)).not.toThrow();
+    expect(() => validateLaunchParams({ ...base, assignment: full, assignmentDelivery: "attachment" } as never)).not.toThrow();
+  });
+
+  it("renders the assignment deterministically as objective, scope, then verification", () => {
+    const assignment = { objective: "do the thing", scope: "only these files", verification: "run the tests" };
+    expect(renderAssignment(assignment)).toBe("Objective:\ndo the thing\n\nScope:\nonly these files\n\nVerification:\nrun the tests");
+    // Field order in the caller's object never changes the rendering.
+    expect(renderAssignment({ verification: "run the tests", scope: "only these files", objective: "do the thing" })).toBe(renderAssignment(assignment));
+    expect(renderAssignment(assignment)).toBe(renderAssignment({ ...assignment }));
   });
 
   it("fails closed for malformed direct calls and every placement shape", () => {
-    const valid = { name: "worker", profile: "worker" };
+    const valid = { name: "worker", profile: "worker", assignment: assign("go") };
     const invalid: unknown[] = [
       null, {}, { ...valid, name: "" }, { ...valid, name: "Bad" }, { ...valid, name: "x".repeat(33) },
       { ...valid, unknown: true }, { ...valid, profile: "" }, { ...valid, profile: "bad\nprofile" },
@@ -2261,8 +2338,8 @@ describe("herdr_launch profile-only contract", () => {
       ...["tools", "allowedTools", "disallowedTools", "addDirs"].map((key) => ({ ...valid, overrides: { [key]: 1 } })),
       // Resource selection is profile-only, so these are unknown launch overrides.
       ...["extensions", "skills", "pluginDirs"].map((key) => ({ ...valid, overrides: { [key]: ["./skill"] } })),
-      { ...valid, label: "" }, { ...valid, cwd: "" }, { ...valid, initialPrompt: "" }, { ...valid, initialPrompt: 1 }, { ...valid, focus: 1 },
-      { ...valid, initialPrompt: "go", initialPromptDelivery: "elsewhere" }, { ...valid, initialPromptDelivery: "attachment" },
+      { ...valid, label: "" }, { ...valid, cwd: "" }, { ...valid, focus: 1 },
+      { ...valid, assignmentDelivery: "elsewhere" },
       { ...valid, placement: null }, { ...valid, placement: 1 }, { ...valid, placement: { mode: "same_tab", extra: true } },
       { ...valid, placement: { mode: "new_tab" } }, { ...valid, placement: { mode: "new_tab", tabLabel: "agents", extra: true } },
       { ...valid, placement: { mode: "existing_pane" } }, { ...valid, placement: { mode: "existing_pane", target: "target", extra: true } },
@@ -2290,7 +2367,7 @@ describe("herdr_launch profile-only contract", () => {
     const base = harness.cli.runJson;
     harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? Promise.reject(failure) : base(argv, signal, preserve));
 
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: {
         phase: "placement",
@@ -2306,24 +2383,24 @@ describe("herdr_launch profile-only contract", () => {
     const noEvidence = makeCli();
     const noEvidenceBase = noEvidence.cli.runJson;
     noEvidence.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? Promise.reject({ details: {} }) : noEvidenceBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), noEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), noEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR" } });
 
     const detailsOnly = makeCli();
     const detailsOnlyBase = detailsOnly.cli.runJson;
     detailsOnly.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? Promise.reject({ details: { stderr: "placement evidence" } }) : detailsOnlyBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), detailsOnly.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR", cliFailure: { details: { stderr: "placement evidence" } } } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), detailsOnly.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR", cliFailure: { details: { stderr: "placement evidence" } } } });
 
     const messageOnly = makeCli();
     const messageOnlyBase = messageOnly.cli.runJson;
     messageOnly.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? Promise.reject(Object.assign(new Error("placement message"), { details: {} })) : messageOnlyBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), messageOnly.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR", cliFailure: { message: "placement message" } } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(profile("worker")), messageOnly.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "placement", causeCode: "CLI_PROTOCOL_ERROR", cliFailure: { message: "placement message" } } });
   });
 
   it("covers exact startup identities, pane variants, prompt acknowledgement, and terminal renderers", async () => {
     const worker = profile("worker");
     for (const startResult of [null, {}, { agent: {} }, { agent: null }]) {
       const harness = makeCli({ start: () => ok("start", startResult) });
-      const pending = launch({ name: "worker", profile: "worker" }, catalog(worker), harness.cli);
+      const pending = launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), harness.cli);
       if (startResult === null || (typeof startResult === "object" && startResult !== null && "agent" in startResult && startResult.agent === null)) {
         await expect(pending).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
       } else {
@@ -2341,30 +2418,30 @@ describe("herdr_launch profile-only contract", () => {
       const harness = makeCli();
       const base = harness.cli.runJson;
       harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "agent" && argv[1] === "start" ? ok("start", { agent }) : base(argv, signal, preserve));
-      await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
       expect(harness.calls.filter((call) => call[0] === "pane" && call[1] === "get")).toHaveLength(1);
     }
 
     const terminalOnly = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-worker" } }) });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), terminalOnly.cli)).resolves.toMatchObject({ details: { outcome: "launched", paneId: "w1:p2" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), terminalOnly.cli)).resolves.toMatchObject({ details: { outcome: "launched", paneId: "w1:p2" } });
     const explicitAgentId = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", agent_id: "agent-worker", terminal_id: "terminal-worker", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-worker" } } }) });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), explicitAgentId.cli)).resolves.toMatchObject({ details: { agentId: "agent-worker" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), explicitAgentId.cli)).resolves.toMatchObject({ details: { agentId: "agent-worker" } });
     const directStartRecord = makeCli({ start: () => ok("start", { name: "worker", pane_id: "w1:p2", agent: "pi" }) });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), directStartRecord.cli)).resolves.toMatchObject({ details: { outcome: "launched" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), directStartRecord.cli)).resolves.toMatchObject({ details: { outcome: "launched" } });
 
     const paneVariants = [{ pane: { pane_id: "w1:p2", tab_id: "w1:t1" } }, { root_pane: { pane_id: "w1:p2", tab_id: "w1:t1" } }, { new_pane: { pane_id: "w1:p2" } }, { child_pane: { pane_id: "w1:p2" } }, { created_pane: { pane_id: "w1:p2" } }, { pane_id: "w1:p2", tab_id: "w1:t1" }];
     for (const placement of paneVariants) {
       const harness = makeCli();
       const base = harness.cli.runJson;
       harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "split" ? ok("split", placement) : base(argv, signal, preserve));
-      await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), harness.cli)).resolves.toMatchObject({ details: { paneId: "w1:p2" } });
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), harness.cli)).resolves.toMatchObject({ details: { paneId: "w1:p2" } });
     }
 
     for (const placement of [null, {}, { pane: null }, { pane_id: "" }]) {
       const malformed = makeCli();
       const malformedBase = malformed.cli.runJson;
       malformed.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "split" ? ok("split", placement) : malformedBase(argv, signal, preserve));
-      await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), malformed.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), malformed.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
     }
 
     {
@@ -2372,7 +2449,7 @@ describe("herdr_launch profile-only contract", () => {
         agentStates: [observedAgent("idle", 7), observedAgent("idle", 8, 4)],
         paneStates: [observedPane("idle", 7), observedPane("working", 900, 4)]
       });
-      const result = await launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli);
+      const result = await launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(worker), harness.cli);
       expect(result.details).toMatchObject({ initialPromptSent: true, promptSubmitted: true, promptConsumption: "confirmed", initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: "w1:p2", interactiveReady: true, revision: 3, screenDetectionSkipped: true }, initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8, revision: 4, screenDetectionSkipped: true, consumption: "confirmed" } });
       expect(harness.calls).toContainEqual(["agent", "prompt", "w1:p2", "--stdin"]);
       expect(harness.calls.some((call) => call[1] === "send-keys" || call[1] === "wait")).toBe(false);
@@ -2387,7 +2464,7 @@ describe("herdr_launch profile-only contract", () => {
           return ok("start", { agent: observedAgent("idle", 7) });
         }
       });
-      const registrationPending = launch({ name: "worker", profile: "worker", initialPrompt: "registration lag" }, catalog(worker), registrationLag.cli, undefined, { clock: registrationBudget.clock });
+      const registrationPending = launch({ name: "worker", profile: "worker", assignment: assign("registration lag") }, catalog(worker), registrationLag.cli, undefined, { clock: registrationBudget.clock });
       const registrationFailure = expect(registrationPending).rejects.toMatchObject({
         code: "READY_TIMEOUT",
         details: { causeCode: "READY_TIMEOUT", phase: "ready", readiness: { lastPendingReason: expect.stringContaining("agent_get_identity_incomplete") } }
@@ -2407,7 +2484,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get") return ok("pane-get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_session: { source: 1, agent: null, kind: {}, value: undefined }, agent_status: "idle" } });
         return missingBase(argv, signal, preserve);
       });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "malformed fresh agent record" }, catalog(worker), missingIdentity.cli)).rejects.toMatchObject({
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("malformed fresh agent record") }, catalog(worker), missingIdentity.cli)).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1 } }
       });
@@ -2421,18 +2498,18 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: null });
         return missingAgentBase(argv, signal, preserve);
       });
-      const missingAgentPending = launch({ name: "worker", profile: "worker", initialPrompt: "missing agent record" }, catalog(worker), missingAgentRecord.cli, undefined, { clock: missingAgentBudget.clock });
+      const missingAgentPending = launch({ name: "worker", profile: "worker", assignment: assign("missing agent record") }, catalog(worker), missingAgentRecord.cli, undefined, { clock: missingAgentBudget.clock });
       const missingAgentExpectation = expect(missingAgentPending).rejects.toMatchObject({ code: "READY_TIMEOUT", details: { causeCode: "READY_TIMEOUT", readiness: { lastPendingReason: expect.stringContaining("agent_get_record_missing") } } });
       await vi.advanceTimersByTimeAsync(200);
       await missingAgentExpectation;
       expect(missingAgentRecord.stdinInputs).toHaveLength(0);
 
       const missingStartedTerminal = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "missing started terminal" }, catalog(worker), missingStartedTerminal.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptSubmission: { confirmed: true } } });
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("missing started terminal") }, catalog(worker), missingStartedTerminal.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptSubmission: { confirmed: true } } });
       expect(missingStartedTerminal.stdinInputs).toHaveLength(1);
 
       const missingStartedSession = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-worker" } }) });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "missing started session" }, catalog(worker), missingStartedSession.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptSubmission: { confirmed: true } } });
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("missing started session") }, catalog(worker), missingStartedSession.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptSubmission: { confirmed: true } } });
       expect(missingStartedSession.stdinInputs).toHaveLength(1);
       vi.useRealTimers();
 
@@ -2442,7 +2519,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-0", agent_session: { source: "pi", agent: "pi", kind: "id", value: "replacement" } } });
         return replacementBase(argv, signal, preserve);
       });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "must not send" }, catalog(worker), replacementIdentity.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("must not send") }, catalog(worker), replacementIdentity.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
       expect(replacementIdentity.stdinInputs).toHaveLength(0);
 
       const mismatchedAck = makeCli();
@@ -2451,7 +2528,7 @@ describe("herdr_launch profile-only contract", () => {
         mismatchedAck.stdinInputs.push(input);
         return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-replacement", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-0" }, agent_status: "idle", interactive_ready: true, revision: 3 } });
       });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "ack mismatch" }, catalog(worker), mismatchedAck.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("ack mismatch") }, catalog(worker), mismatchedAck.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
       expect(mismatchedAck.stdinInputs).toHaveLength(1);
       expect(mismatchedAck.calls.some((call) => call[1] === "send-keys" || call[1] === "wait")).toBe(false);
 
@@ -2462,7 +2539,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get") return ok("pane-get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "pi", terminal_id: "terminal-replacement", agent_session: { source: "pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working", revision: 3 } });
         return terminalBase(argv, signal, preserve);
       });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "terminal replacement" }, catalog(worker), terminalReplacement.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("terminal replacement") }, catalog(worker), terminalReplacement.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
       expect(terminalReplacement.stdinInputs).toHaveLength(0);
 
       const freshReplacement = makeCli();
@@ -2480,7 +2557,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get" && freshAgentReads > 0) return ok("pane-replacement", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "pi", terminal_id: "terminal-replacement", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working" } });
         return freshReplacementBase(argv, signal, preserve);
       });
-      await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), freshReplacement.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), freshReplacement.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
 
       const postStateReplacement = makeCli();
       const postStateBase = postStateReplacement.cli.runJson;
@@ -2490,7 +2567,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get" && postAgentReads > 1) return ok("pane-post", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "pi", terminal_id: "terminal-replacement", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working", revision: 4 } });
         return postStateBase(argv, signal, preserve);
       });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "post replacement" }, catalog(worker), postStateReplacement.cli)).rejects.toMatchObject({
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("post replacement") }, catalog(worker), postStateReplacement.cli)).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", initialPromptSubmission: { confirmed: true }, initialPromptObservation: { status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence: { records: expect.any(Array) } } }
       });
@@ -2512,7 +2589,7 @@ describe("herdr_launch profile-only contract", () => {
         }
         return postAgentIdBase(argv, signal, preserve);
       });
-      const postAgentIdResult = await launch({ name: "worker", profile: "worker", initialPrompt: "post id" }, catalog(worker), postAgentId.cli);
+      const postAgentIdResult = await launch({ name: "worker", profile: "worker", assignment: assign("post id") }, catalog(worker), postAgentId.cli);
       expect(postAgentIdResult.details).toMatchObject({ agentId: "post-agent-id", initialPromptSubmission: { confirmed: true } });
 
       const startedSessionReplacement = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-0", agent_session: { source: "pi", agent: "pi", kind: "id", value: "started" } } }) });
@@ -2522,7 +2599,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get") return ok("pane-get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "pi", terminal_id: "terminal-0", agent_session: { source: "pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working", revision: 3 } });
         return startedBase(argv, signal, preserve);
       });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "session replacement" }, catalog(worker), startedSessionReplacement.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("session replacement") }, catalog(worker), startedSessionReplacement.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
       expect(startedSessionReplacement.stdinInputs).toHaveLength(0);
     }
 
@@ -2534,7 +2611,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "pane" && argv[1] === "get" && paneReads++ > 0) throw Object.assign(new Error("observation unavailable"), { code: "CLI_PROTOCOL_ERROR" });
         return base.call(harness.cli, argv, signal, preserve);
       });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli)).rejects.toMatchObject({
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(worker), harness.cli)).rejects.toMatchObject({
         code: "LAUNCH_FAILED", details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConfirmation: { reason: "read_failed", sourceCode: "CLI_PROTOCOL_ERROR" } }
       });
       expect(harness.stdinInputs).toHaveLength(1);
@@ -2543,7 +2620,7 @@ describe("herdr_launch profile-only contract", () => {
       const stringBase = stringFailure.cli.runJson;
       let stringPaneReads = 0;
       stringFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" && stringPaneReads++ > 0 ? Promise.reject("observation unavailable") : stringBase.call(stringFailure.cli, argv, signal, preserve));
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), stringFailure.cli)).rejects.toMatchObject({
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(worker), stringFailure.cli)).rejects.toMatchObject({
         code: "LAUNCH_FAILED", details: { causeCode: "PROMPT_UNCONFIRMED", promptConfirmation: { reason: "read_failed", sourceCode: "POSTSTATE_UNAVAILABLE" } }
       });
 
@@ -2551,7 +2628,7 @@ describe("herdr_launch profile-only contract", () => {
       const abortBase = aborted.cli.runJson;
       let abortedPaneReads = 0;
       aborted.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" && abortedPaneReads++ > 0 ? Promise.reject(Object.assign(new Error("aborted"), { code: "ABORTED" })) : abortBase.call(aborted.cli, argv, signal, preserve));
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), aborted.cli)).rejects.toMatchObject({
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(worker), aborted.cli)).rejects.toMatchObject({
         code: "LAUNCH_FAILED", details: { causeCode: "PROMPT_UNCONFIRMED", promptConfirmation: { reason: "read_failed", sourceCode: "ABORTED" } }
       });
     }
@@ -2564,7 +2641,7 @@ describe("herdr_launch profile-only contract", () => {
         phaseClock.advance(29);
         throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery" });
       });
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(worker), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(worker), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: { causeCode: "CLI_PROTOCOL_ERROR", promptSubmitted: false, timing: { promptSubmissionAckMs: 29 } }
       });
@@ -2579,7 +2656,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "agent" && argv[1] === "start") throw startFailure();
       return safeBase(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), safeEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), safeEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
 
     const tool = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo", profiles: { load: async () => catalog(worker) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
     const rendered = tool.renderResult?.({ content: [], details: { operation: "launch", outcome: "launched", paneId: "w1:p2" }, isError: false } as never, {} as never, {} as never, {} as never);
@@ -2588,57 +2665,60 @@ describe("herdr_launch profile-only contract", () => {
     const malformedPane = makeCli();
     const malformedBase = malformedPane.cli.runJson;
     malformedPane.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? ok("get", null) : malformedBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), malformedPane.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), malformedPane.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
 
     const mismatchPane = makeCli();
     const mismatchBase = mismatchPane.cli.runJson;
     mismatchPane.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? ok("get", { pane: { pane_id: "wrong" } }) : mismatchBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), mismatchPane.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED", phase: "ready" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), mismatchPane.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED", phase: "ready" } });
 
     for (const placement of [null, {}, { tab: {} }, { tab: { tab_id: "" } }]) {
       const tabHarness = makeCli();
       const tabBase = tabHarness.cli.runJson;
       tabHarness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "tab" && argv[1] === "create" ? ok("tab", placement) : tabBase(argv, signal, preserve));
-      await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(worker), tabHarness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(worker), tabHarness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
     }
 
     const tabLookup = makeCli();
     const tabLookupBase = tabLookup.cli.runJson;
     let tabLookupStarted = false;
+    let tabLookupAgentReads = 0;
+    let tabLookupPaneReads = 0;
     const tabLookupIdentity = { terminal_id: "terminal-tab", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-tab" } };
     tabLookup.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
       if (argv[0] === "api" && tabLookupStarted) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, pane_id: "w1:p3", tab_id: "w1:t2", agent_name: "worker", agent: "pi", ...tabLookupIdentity }], agents: [{ pane_id: "w1:p3", name: "worker", agent: "pi", ...tabLookupIdentity }] } });
       if (argv[0] === "tab" && argv[1] === "create") return ok("tab", { tab: { tab_id: "w1:t2" } });
       if (argv[0] === "tab" && argv[1] === "get") return ok("tab", { rootPane: { pane_id: "w1:p3", tab_id: "w1:t2" } });
       if (argv[0] === "agent" && argv[1] === "start") { tabLookupStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p3", agent: "pi", ...tabLookupIdentity } }); }
-      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { pane_id: "w1:p3", name: "worker", agent: "pi", ...tabLookupIdentity } });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1", agent: "pi", ...tabLookupIdentity, agent_status: "idle" } });
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { pane_id: "w1:p3", name: "worker", agent: "pi", ...tabLookupIdentity, ...lifecycleFor(tabLookupAgentReads++) } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p3", tab_id: "w1:t2", workspace_id: "w1", agent: "pi", ...tabLookupIdentity, ...lifecycleFor(tabLookupPaneReads++) } });
       return tabLookupBase(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(worker), tabLookup.cli)).resolves.toMatchObject({ details: { paneId: "w1:p3" } });
+    stubPromptTransport(tabLookup, { name: "worker", pane_id: "w1:p3", agent: "pi", ...tabLookupIdentity });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" } }, catalog(worker), tabLookup.cli)).resolves.toMatchObject({ details: { paneId: "w1:p3" } });
 
     const nonNamedAgent = makeCli();
     const nonNamedBase = nonNamedAgent.cli.runJson;
     let nonNamedApiReads = 0;
     nonNamedAgent.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "api" && nonNamedApiReads++ === 0 ? ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, agents: [{ pane_id: "w1:p9" }] } }) : nonNamedBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), nonNamedAgent.cli)).resolves.toMatchObject({ details: { name: "worker" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), nonNamedAgent.cli)).resolves.toMatchObject({ details: { name: "worker" } });
 
     const duplicate = makeCli();
     const duplicateBase = duplicate.cli.runJson;
     duplicate.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "api" ? ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, agents: [{ pane_id: "w1:p9", name: "worker" }] } }) : duplicateBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), duplicate.cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), duplicate.cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
 
     const stringNamedPane = makeCli();
     const stringNamedBase = stringNamedPane.cli.runJson;
     let stringNamedApiReads = 0;
     stringNamedPane.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "api" && stringNamedApiReads++ === 0 ? ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", agent: "other" }] } }) : stringNamedBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), stringNamedPane.cli)).resolves.toMatchObject({ details: { name: "worker" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), stringNamedPane.cli)).resolves.toMatchObject({ details: { name: "worker" } });
 
     const namedPane = makeCli();
     const namedBase = namedPane.cli.runJson;
     let namedApiReads = 0;
     namedPane.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "api" && namedApiReads++ === 0 ? ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", agent_name: "other" }] } }) : namedBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(worker), namedPane.cli)).resolves.toMatchObject({ details: { name: "worker" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(worker), namedPane.cli)).resolves.toMatchObject({ details: { name: "worker" } });
   });
 
   it("covers guarded fallback, focus, and authoritative post-state refusals", async () => {
@@ -2648,11 +2728,11 @@ describe("herdr_launch profile-only contract", () => {
     const readFailure = makeCli({ start: () => { throw startFailure(); } });
     const readBase = readFailure.cli.runJson;
     readFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? Promise.reject(new Error("read failed")) : readBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), readFailure.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE", details: { causeCode: "POSTSTATE_UNAVAILABLE", startFailureCode: "agent_start_failed" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, fallback), readFailure.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE", details: { causeCode: "POSTSTATE_UNAVAILABLE", startFailureCode: "agent_start_failed" } });
     const readStringFailure = makeCli({ start: () => { throw startFailure(); } });
     const readStringBase = readStringFailure.cli.runJson;
     readStringFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? Promise.reject("read failed") : readStringBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), readStringFailure.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, fallback), readStringFailure.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
 
     const aborted = new AbortController();
     const abortHarness = makeCli();
@@ -2661,23 +2741,26 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "pane" && argv[1] === "split") { aborted.abort(); return abortBase(argv, signal, preserve); }
       return abortBase(argv, signal, preserve);
     });
-    await expect(createLaunchTool({ cli: abortHarness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() }).execute("id", { name: "worker", profile: "worker" }, aborted.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+    await expect(createLaunchTool({ cli: abortHarness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() }).execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, aborted.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
 
     const exhausted = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" }, { pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" }], start: () => { throw startFailure(); } });
-    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), exhausted.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_start_failed", attempts: expect.arrayContaining([expect.objectContaining({ profile: "fallback" })]) } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, fallback), exhausted.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_start_failed", attempts: expect.arrayContaining([expect.objectContaining({ profile: "fallback" })]) } });
 
     const focused = makeCli();
     const focusedBase = focused.cli.runJson;
     let focusedStarted = false;
+    let focusedAgentReads = 0;
+    let focusedPaneReads = 0;
     const focusedIdentity = { terminal_id: "terminal-focused", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-focused" } };
     focused.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
       if (argv[0] === "api" && focusedStarted) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, pane_id: "w1:p1", agent_name: "worker", agent: "pi", ...focusedIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...focusedIdentity }] } });
       if (argv[0] === "agent" && argv[1] === "start") { focusedStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusedIdentity } }); }
-      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusedIdentity } });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...focusedIdentity, agent_status: "idle" } });
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusedIdentity, ...lifecycleFor(focusedAgentReads++) } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...focusedIdentity, ...lifecycleFor(focusedPaneReads++) } });
       return focusedBase(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focused.cli)).resolves.toMatchObject({ details: { paneId: "w1:p1" } });
+    stubPromptTransport(focused, { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusedIdentity });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focused.cli)).resolves.toMatchObject({ details: { paneId: "w1:p1" } });
     expect(focused.calls).toContainEqual(["agent", "focus", "w1:p1"]);
     const focusFailure = makeCli();
     const focusBase = focusFailure.cli.runJson;
@@ -2686,26 +2769,26 @@ describe("herdr_launch profile-only contract", () => {
     focusFailure.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
       if (argv[0] === "api" && focusStarted) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, agent_name: "worker", agent: "pi", ...focusIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...focusIdentity }] } });
       if (argv[0] === "agent" && argv[1] === "start") { focusStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusIdentity } }); }
-      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusIdentity } });
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...focusIdentity, ...lifecycleFor(0) } });
       if (argv[0] === "agent" && argv[1] === "focus") throw Object.assign(new Error("focus timeout"), { code: "CLI_TIMEOUT" });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...focusIdentity, agent_status: "idle" } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...focusIdentity, ...lifecycleFor(0) } });
       return focusBase(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focusFailure.cli)).rejects.toMatchObject({
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" }, focus: true }, catalog(profile("worker")), focusFailure.cli)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
-      details: { phase: "focus", causeCode: "CLI_TIMEOUT", readiness: { baselineRequired: false } }
+      details: { phase: "focus", causeCode: "CLI_TIMEOUT", readiness: { baselineRequired: true } }
     });
 
     const idlePrompt = makeCli({
       agentStates: [observedAgent("idle", 7), observedAgent("idle", 8, 4)],
       paneStates: [observedPane("idle", 7), observedPane("working", 900, 4)]
     });
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), idlePrompt.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, promptConsumption: "confirmed", initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8 } } });
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(profile("worker")), idlePrompt.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, promptConsumption: "confirmed", initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8 } } });
 
     const genericPostState = makeCli();
     const genericPostBase = genericPostState.cli.runJson;
     genericPostState.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" ? Promise.reject(Object.assign(new Error("post-state unavailable"), { code: "POSTSTATE_UNAVAILABLE" })) : genericPostBase(argv, signal, preserve));
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), genericPostState.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), genericPostState.cli)).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
 
     vi.useFakeTimers();
     const noNameBudget = fakeStartBudgetClock();
@@ -2716,8 +2799,8 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "idle" } });
       return noNameBase(argv, signal, preserve);
     });
-    const noNamePending = launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), noName.cli, undefined, { clock: noNameBudget.clock });
-    const noNameExpectation = expect(noNamePending).rejects.toMatchObject({ code: "READY_TIMEOUT", details: { causeCode: "READY_TIMEOUT", readiness: { samples: expect.any(Number), baselineRequired: false } } });
+    const noNamePending = launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), noName.cli, undefined, { clock: noNameBudget.clock });
+    const noNameExpectation = expect(noNamePending).rejects.toMatchObject({ code: "READY_TIMEOUT", details: { causeCode: "READY_TIMEOUT", readiness: { samples: expect.any(Number), baselineRequired: true } } });
     await vi.advanceTimersByTimeAsync(200);
     await noNameExpectation;
     vi.useRealTimers();
@@ -2728,10 +2811,10 @@ describe("herdr_launch profile-only contract", () => {
     let fallbackReads = 0;
     const originalGet = disappearingMap.get.bind(disappearingMap);
     disappearingMap.get = ((name: string) => name === disappearingFallback.name && fallbackReads++ > 0 ? undefined : originalGet(name)) as typeof disappearingMap.get;
-    await expect(launch({ name: "worker", profile: "disappearing-root" }, { effective: disappearingMap, candidates: [], diagnostics: [] }, makeCli().cli)).rejects.toMatchObject({ code: "PROFILE_RESOLUTION_INVALID" });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "disappearing-root" }, { effective: disappearingMap, candidates: [], diagnostics: [] }, makeCli().cli)).rejects.toMatchObject({ code: "PROFILE_RESOLUTION_INVALID" });
 
     const stringFailure = makeCli({ start: () => { throw "string failure"; } });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), stringFailure.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), stringFailure.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
 
     const nestedEvidence = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" }] });
     const nestedBase = nestedEvidence.cli.runJson;
@@ -2739,7 +2822,7 @@ describe("herdr_launch profile-only contract", () => {
       if (argv[0] === "agent" && argv[1] === "start") throw startFailure();
       return nestedBase(argv, signal, preserve);
     });
-    await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), nestedEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), nestedEvidence.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
 
     for (const error of [
       Object.assign(new Error("bad"), { code: "CLI_PROTOCOL_ERROR" }),
@@ -2751,7 +2834,7 @@ describe("herdr_launch profile-only contract", () => {
     ]) {
       const promptFailure = makeCli();
       promptFailure.cli.runJsonWithStdin = vi.fn(async () => Promise.reject(error));
-      await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), promptFailure.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(profile("worker")), promptFailure.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
       expect(promptFailure.calls.some((call) => call[1] === "send-keys")).toBe(false);
     }
   });
@@ -2759,7 +2842,7 @@ describe("herdr_launch profile-only contract", () => {
   it("refuses to deliver a prompt when the stdin transport is unavailable", async () => {
     const unavailable = makeCli();
     delete (unavailable.cli as { runJsonWithStdin?: unknown }).runJsonWithStdin;
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "go" }, catalog(profile("worker")), unavailable.cli))
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(profile("worker")), unavailable.cli))
       .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_INCOMPATIBLE" } });
   });
 
@@ -2776,7 +2859,7 @@ describe("herdr_launch profile-only contract", () => {
     const recipients = new RecipientRegistry();
     const supervision = stubSupervision({ jobId: "job_abort_supervisor" });
     const tool = createLaunchTool({ cli: aborted.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) }, attachments: fakeAttachments(), recipients, supervision });
-    await expect(tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "go" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({
+    await expect(tool.execute("id", { name: "worker", profile: "worker", assignment: assign("go") }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({
       code: "LAUNCH_FAILED",
       details: {
         causeCode: "PROMPT_UNCONFIRMED",
@@ -2810,7 +2893,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       const recipients = new RecipientRegistry();
       const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients });
-      const pending = tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "abort read" }, controller.signal, undefined, extensionContext)
+      const pending = tool.execute("id", { name: "worker", profile: "worker", assignment: assign("abort read") }, controller.signal, undefined, extensionContext)
         .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
       await vi.waitFor(() => expect(agentReads).toBe(2), { timeout: 1_000, interval: 1 });
       controller.abort();
@@ -2832,11 +2915,11 @@ describe("herdr_launch profile-only contract", () => {
     const withContextSignal = makeCli();
     const contextSignal = new AbortController().signal;
     const contextTool = createLaunchTool({ cli: withContextSignal.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    await expect(contextTool.execute("id", { name: "worker", profile: "worker" }, undefined, undefined, { ...extensionContext, signal: contextSignal } as ExtensionContext)).resolves.toMatchObject({ details: { outcome: "launched" } });
+    await expect(contextTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, undefined, undefined, { ...extensionContext, signal: contextSignal } as ExtensionContext)).resolves.toMatchObject({ details: { outcome: "launched" } });
 
     const withoutSignal = makeCli();
     const freshTool = createLaunchTool({ cli: withoutSignal.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    await expect(freshTool.execute("id", { name: "worker", profile: "worker" }, undefined, undefined, { cwd: "/repo", hasUI: false } as ExtensionContext)).resolves.toMatchObject({ details: { outcome: "launched" } });
+    await expect(freshTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, undefined, undefined, { cwd: "/repo", hasUI: false } as ExtensionContext)).resolves.toMatchObject({ details: { outcome: "launched" } });
   });
 
   it("publishes an attachment before placement, grants its directory, and registers the recipient", async () => {
@@ -2844,9 +2927,9 @@ describe("herdr_launch profile-only contract", () => {
     const attachments = fakeAttachments();
     const recipients = new RecipientRegistry();
     const claude = profile("worker-claude", "claude");
-    const result = await launch({ name: "worker", profile: "worker-claude", initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(claude), harness.cli, undefined, { attachments, recipients });
+    const result = await launch({ name: "worker", profile: "worker-claude", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(claude), harness.cli, undefined, { attachments, recipients });
     expect(attachments.ensureRecipient).toHaveBeenCalledTimes(1);
-    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: "body", operation: "assignment", recipientAgentName: "worker" }));
+    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: renderAssignment(assign("body")), operation: "assignment", recipientAgentName: "worker" }));
     expect(harness.calls).toContainEqual(PROMPT_ARGV("w1:p2"));
     expect(harness.calls.find((call) => call[1] === "start")).toEqual(expect.arrayContaining(["--add-dir", GRANT_PATH]));
     expect(harness.stdinInputs[0]).toContain("delivery: attachment");
@@ -2862,14 +2945,14 @@ describe("herdr_launch profile-only contract", () => {
   it("records an incapable recipient for an inline launch without refusing it", async () => {
     const recipients = new RecipientRegistry();
     const restricted = profile("restricted", "claude");
-    await launch({ name: "worker", profile: "restricted", overrides: { disallowedTools: ["Read"] } }, catalog(restricted), makeCli().cli, undefined, { recipients });
+    await launch({ assignment: assign("go"), name: "worker", profile: "restricted", overrides: { disallowedTools: ["Read"] } }, catalog(restricted), makeCli().cli, undefined, { recipients });
     expect(recipients.get("w1:p2")).toMatchObject({ capable: false, reason: "Claude profile disallows Read" });
   });
 
   it("rejects an incapable attachment profile, in the chain or after overrides, before topology mutation", async () => {
     const calls: string[][] = [];
     const restricted = profile("restricted", "claude");
-    await expect(launch({ name: "worker", profile: "restricted", overrides: { disallowedTools: ["Read"] }, initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(restricted), makeCli({ calls }).cli))
+    await expect(launch({ name: "worker", profile: "restricted", overrides: { disallowedTools: ["Read"] }, assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(restricted), makeCli({ calls }).cli))
       .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { profile: "restricted", reason: "Claude profile disallows Read", delivery: "attachment", phase: "resolve_profile" } });
     expect(calls).toHaveLength(0);
 
@@ -2877,7 +2960,7 @@ describe("herdr_launch profile-only contract", () => {
     const primary = profile("primary", "claude", ["incapable-fallback"]);
     const incapableFallback = profile("incapable-fallback", "pi");
     const withoutRead = { ...incapableFallback, runtime: { ...incapableFallback.runtime, tools: ["bash"] } } as typeof incapableFallback;
-    await expect(launch({ name: "worker", profile: "primary", initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(primary, withoutRead), makeCli({ calls: chainCalls }).cli))
+    await expect(launch({ name: "worker", profile: "primary", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(primary, withoutRead), makeCli({ calls: chainCalls }).cli))
       .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { profile: "incapable-fallback", reason: "Pi profile excludes the local read tool" } });
     expect(chainCalls).toHaveLength(0);
   });
@@ -2896,7 +2979,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: null });
         return base(argv, signal, preserve);
       });
-      const pending = launch({ name: "worker", profile: "worker-claude", initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), harness.cli, undefined, { attachments, clock: budget.clock });
+      const pending = launch({ name: "worker", profile: "worker-claude", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), harness.cli, undefined, { attachments, clock: budget.clock });
       const failure = expect(pending).rejects.toMatchObject({
         code: "READY_TIMEOUT",
         details: {
@@ -2925,7 +3008,7 @@ describe("herdr_launch profile-only contract", () => {
     const attachments = fakeAttachments({ ensureRecipient: vi.fn(async () => grant) });
     const sendFailure = makeCli();
     sendFailure.cli.runJsonWithStdin = vi.fn(async () => { throw Object.assign(new Error("submission failed"), { code: "CLI_TIMEOUT" }); });
-    await expect(launch({ name: "worker", profile: "worker-claude", initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), sendFailure.cli, undefined, { attachments }))
+    await expect(launch({ name: "worker", profile: "worker-claude", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), sendFailure.cli, undefined, { attachments }))
       .rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: { causeCode: "CLI_TIMEOUT", phase: "prompt_verification", delivery: "attachment", initialPromptDelivery: "attachment", attachmentRetained: true, attachment: { attachmentId: "attachment-1" } }
@@ -2941,7 +3024,7 @@ describe("herdr_launch profile-only contract", () => {
       publish: vi.fn(async () => { throw Object.assign(new Error("quota"), { code: "ATTACHMENT_QUOTA_EXCEEDED", details: { operation: "quota" } }); })
     });
     const publishFailure = makeCli();
-    await expect(launch({ name: "worker", profile: "worker-claude", initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), publishFailure.cli, undefined, { attachments }))
+    await expect(launch({ name: "worker", profile: "worker-claude", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), publishFailure.cli, undefined, { attachments }))
       .rejects.toMatchObject({ code: "ATTACHMENT_QUOTA_EXCEEDED", details: { operation: "quota", delivery: "attachment", phase: "attachment_publish" } });
     expect(publishFailure.calls.some((call) => call[0] === "pane" && call[1] === "split")).toBe(false);
     expect(released).toEqual(["release"]);
@@ -2971,19 +3054,19 @@ describe("herdr_launch profile-only contract", () => {
       promptSubmitted = true;
       return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p1", agent: "claude", terminal_id: "terminal-existing-attachment", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-existing-attachment" }, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } });
     });
-    const result = await launch({ name: "worker", profile: "worker-claude", placement: { mode: "existing_pane", target: "caller" }, initialPrompt: "body", initialPromptDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), existingPane.cli, undefined, { attachments });
+    const result = await launch({ name: "worker", profile: "worker-claude", placement: { mode: "existing_pane", target: "caller" }, assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), existingPane.cli, undefined, { attachments });
     expect(recipientPanes).toEqual(["w1:p1"]);
     expect(result.details).toMatchObject({ paneId: "w1:p1", initialPromptDelivery: "attachment" });
   });
 
   it("refuses payloads beyond the delivery bound before any mutation", async () => {
     const inlineCalls: string[][] = [];
-    await expect(launch({ name: "worker", profile: "worker", initialPrompt: "x".repeat(16 * 1024 + 1) }, catalog(profile("worker")), makeCli({ calls: inlineCalls }).cli))
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign("x".repeat(16 * 1024 + 1)) }, catalog(profile("worker")), makeCli({ calls: inlineCalls }).cli))
       .rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE_FOR_INLINE", details: { delivery: "inline" } });
     expect(inlineCalls).toHaveLength(0);
 
     const attachmentCalls: string[][] = [];
-    await expect(launch({ name: "worker", profile: "worker-claude", initialPrompt: "x".repeat(1024 * 1024 + 1), initialPromptDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), makeCli({ calls: attachmentCalls }).cli))
+    await expect(launch({ name: "worker", profile: "worker-claude", assignment: assign("x".repeat(1024 * 1024 + 1)), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), makeCli({ calls: attachmentCalls }).cli))
       .rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE", details: { delivery: "attachment" } });
     expect(attachmentCalls).toHaveLength(0);
   });
@@ -2992,7 +3075,7 @@ describe("herdr_launch profile-only contract", () => {
     const worker = profile("custom-profile");
     const calls: string[][] = [];
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/custom.md" })) };
-    const result = await launch({ name: "worker", profile: "custom-profile", overrides: { model: "override/model", thinking: "high" } }, catalog(worker), makeCli({ calls }).cli, promptSources);
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "custom-profile", overrides: { model: "override/model", thinking: "high" } }, catalog(worker), makeCli({ calls }).cli, promptSources);
     expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/custom.md"]);
     expect(result.details).toMatchObject({ profile: { name: "custom-profile", requested: "custom-profile", selected: "custom-profile", source: { path: "/profiles/custom-profile.md" }, timeoutMinutes: 30, runtime: { kind: "pi", model: "override/model", thinking: "high" }, permissions: { sessionPersistence: false, tools: ["read"], extensions: [], skills: [] }, attempts: [{ profile: "custom-profile", outcome: "selected" }] } });
   });
@@ -3004,11 +3087,11 @@ describe("herdr_launch profile-only contract", () => {
     writeFileSync(join(root, "base-extension.ts"), "export default 0;\n");
     const resourceProfile = scopedProfile(root, "resource-profile", "  extensions: [./base-extension.ts]\n  skills: [./base-skill]");
     const calls: string[][] = [];
-    const result = await launch({ name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "grep"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "grep"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
     expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,grep", "--extension", join(root, "base-extension.ts"), "--no-skills", "--skill", join(root, "base-skill"), "--no-session", "--append-system-prompt", "/cache/body.md"]);
     expect(result.details).toMatchObject({ profile: { runtime: { model: "override/model", thinking: "high" }, permissions: { tools: ["read", "grep"], extensions: [join(root, "base-extension.ts")], skills: [join(root, "base-skill")] } } });
     for (const key of ["extensions", "skills"]) {
-      await expect(launch({ name: "worker", profile: "resource-profile", overrides: { [key]: ["./base-skill"] } as never }, catalog(resourceProfile), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "resource-profile", overrides: { [key]: ["./base-skill"] } as never }, catalog(resourceProfile), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     }
   });
 
@@ -3022,7 +3105,7 @@ describe("herdr_launch profile-only contract", () => {
     const calls: string[][] = [];
     const attachments = fakeAttachments();
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
-    await expect(launch({ name: "worker", profile: "escaping-profile" }, catalog(escaping), makeCli({ calls }).cli, promptSources, { attachments }))
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "escaping-profile" }, catalog(escaping), makeCli({ calls }).cli, promptSources, { attachments }))
       .rejects.toMatchObject({ code: "PROFILE_SKILL_PATH_ESCAPES_SCOPE", details: { profile: "escaping-profile" } });
     expect(calls).toHaveLength(0);
     expect(attachments.ensureRecipient).not.toHaveBeenCalled();
@@ -3034,7 +3117,7 @@ describe("herdr_launch profile-only contract", () => {
     writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "good body\n");
     const primary = scopedProfile(root, "primary-profile", "  skills: [./generated/good-skill]", ["escaping-profile"]);
     const chainCalls: string[][] = [];
-    await expect(launch({ name: "worker", profile: "primary-profile" }, catalog(primary, escaping), makeCli({ calls: chainCalls }).cli))
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, catalog(primary, escaping), makeCli({ calls: chainCalls }).cli))
       .rejects.toMatchObject({ code: "PROFILE_SKILL_PATH_ESCAPES_SCOPE", details: { profile: "escaping-profile" } });
     expect(chainCalls).toHaveLength(0);
 
@@ -3049,7 +3132,7 @@ describe("herdr_launch profile-only contract", () => {
     const staleCalls: string[][] = [];
     const staleAttachments = fakeAttachments();
     const stalePromptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
-    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: staleCalls }).cli, stalePromptSources, { attachments: staleAttachments }))
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: staleCalls }).cli, stalePromptSources, { attachments: staleAttachments }))
       .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE", details: { profile: "primary-profile", path: join(root, "generated", "good-skill"), expected: goodPin } });
     expect(staleCalls).toHaveLength(0);
     expect(staleAttachments.ensureRecipient).not.toHaveBeenCalled();
@@ -3064,7 +3147,7 @@ describe("herdr_launch profile-only contract", () => {
     writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "canonical body\n");
     const pinned = await skillTreeDigest(canonical);
     writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ approvedSourceRoots: [outside], bundles: { "generated/good-skill": { source: canonical, treeHash: pinned } } }));
-    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
 
     // A swap that lands after preflight but before the agent starts never
     // reaches the CLI: the attempt revalidates immediately before its argv, so
@@ -3079,7 +3162,7 @@ describe("herdr_launch profile-only contract", () => {
         return swapped.cli.runJson(argv, signal, preserveCompletedMutation);
       }
     };
-    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, swapCli))
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, soloProfile, swapCli))
       .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "PROFILE_SKILL_BUNDLE_STALE", profile: "primary-profile", path: join(root, "generated", "good-skill"), expected: pinned } });
     expect(swapCalls.some((call) => call[0] === "agent" && call[1] === "start")).toBe(false);
     writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "canonical body\n");
@@ -3089,18 +3172,18 @@ describe("herdr_launch profile-only contract", () => {
     writeFileSync(join(canonical, "SKILL.md"), "canonical drifted\n");
     const drifted = await skillTreeDigest(canonical);
     const driftCalls: string[][] = [];
-    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: driftCalls }).cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, soloProfile, makeCli({ calls: driftCalls }).cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
     expect(await skillTreeDigest(join(root, "generated", "good-skill"))).toBe(drifted);
 
     // A process interrupted between removing and renaming a target leaves it
     // missing; the next preflight restores it from the pinned canonical tree.
     rmSync(join(root, "generated", "good-skill"), { recursive: true });
-    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).resolves.toMatchObject({ details: { profile: { selected: "primary-profile" } } });
     expect(await skillTreeDigest(join(root, "generated", "good-skill"))).toBe(drifted);
 
     // An external canonical source outside the approved set never launches.
     writeFileSync(join(root, SKILL_BUNDLE_REGISTRY_FILE), JSON.stringify({ approvedSourceRoots: [join(outside, "elsewhere")], bundles: { "generated/good-skill": { source: canonical, treeHash: drifted } } }));
-    await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli))
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli))
       .rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_REGISTRY_INVALID", details: { profile: "primary-profile" } });
 
     // An unexpected IO failure is re-raised as itself, never relabeled as a
@@ -3111,7 +3194,7 @@ describe("herdr_launch profile-only contract", () => {
     const denied = Object.assign(new Error("EACCES: permission denied, scandir"), { code: "EACCES" });
     const readdir = vi.spyOn(fsPromises, "readdir").mockRejectedValue(denied);
     try {
-      await expect(launch({ name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).rejects.toMatchObject({ code: "EACCES" });
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, soloProfile, makeCli().cli)).rejects.toMatchObject({ code: "EACCES" });
     } finally {
       readdir.mockRestore();
     }
@@ -3124,7 +3207,7 @@ describe("herdr_launch profile-only contract", () => {
     writeFileSync(join(root, "role-plugin", "skills", "worker", "SKILL.md"), "worker body\n");
     const claudeProfile = scopedProfile(root, "claude-profile", "  pluginDirs: [./role-plugin]", [], "claude");
     const claudeCalls: string[][] = [];
-    await launch({ name: "worker", profile: "claude-profile" }, catalog(claudeProfile), makeCli({ calls: claudeCalls }).cli);
+    await launch({ assignment: assign("go"), name: "worker", profile: "claude-profile" }, catalog(claudeProfile), makeCli({ calls: claudeCalls }).cli);
     const claudeArgv = claudeCalls.find((call) => call[0] === "agent" && call[1] === "start")!;
     // Additive by construction: Claude has no exclusivity flag here, so the
     // selected plugin loads on top of the viewer's ambient configuration.
@@ -3133,7 +3216,7 @@ describe("herdr_launch profile-only contract", () => {
     expect(claudeArgv).not.toContain("--no-skills");
 
     const agyCalls: string[][] = [];
-    await launch({ name: "researcher", profile: "agy-profile", initialPrompt: "go" }, catalog(profile("agy-profile", "agy")), makeCli({ calls: agyCalls }).cli);
+    await launch({ name: "researcher", profile: "agy-profile", assignment: assign("go") }, catalog(profile("agy-profile", "agy")), makeCli({ calls: agyCalls }).cli);
     const agyArgv = agyCalls.find((call) => call[0] === "agent" && call[1] === "start")!;
     // AGY has no per-session selector, so Herdr passes none and mutates no
     // global or project skill/plugin state to fake one.
@@ -3142,13 +3225,13 @@ describe("herdr_launch profile-only contract", () => {
 
   it("stops before mutation when the catalog is unavailable and preserves abort evidence", async () => {
     const noProfiles = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo" });
-    await expect(noProfiles.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
+    await expect(noProfiles.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
 
     const preAborted = new AbortController();
     preAborted.abort();
     const preWorker = profile("pre-worker");
     const preTool = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo", profiles: { load: async () => catalog(preWorker) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    await expect(preTool.execute("id", { name: "worker", profile: "pre-worker" }, preAborted.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+    await expect(preTool.execute("id", { assignment: assign("go"), name: "worker", profile: "pre-worker" }, preAborted.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
 
     const controller = new AbortController();
     const worker = profile("worker");
@@ -3159,7 +3242,7 @@ describe("herdr_launch profile-only contract", () => {
       return base(argv, signal, preserve);
     });
     const abortTool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(worker) }, promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    await expect(abortTool.execute("id", { name: "worker", profile: "worker" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+    await expect(abortTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, controller.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
   });
 
   it("keeps prompt source creation and provenance before topology mutation", async () => {
@@ -3171,7 +3254,7 @@ describe("herdr_launch profile-only contract", () => {
       runJson: vi.fn(async (argv, signal, preserve) => { order.push(argv.slice(0, 2).join(" ")); return base.cli.runJson(argv, signal, preserve); }),
       runJsonWithStdin: vi.fn(async (argv, input, signal, preserve) => { order.push(argv.slice(0, 2).join(" ")); return base.cli.runJsonWithStdin!(argv, input, signal, preserve); })
     };
-    const result = await launch({ name: "worker", profile: "worker", initialPrompt: "begin" }, catalog(worker), cli, promptSources);
+    const result = await launch({ name: "worker", profile: "worker", assignment: assign("begin") }, catalog(worker), cli, promptSources);
     expect(order.slice(0, 5)).toEqual(["source", "pane current", "api snapshot", "pane split", "pane rename"]);
     // The wrapped envelope travels over stdin, never in argv.
     expect(base.calls).toContainEqual(PROMPT_ARGV("w1:p2"));
@@ -3189,7 +3272,7 @@ describe("herdr_launch profile-only contract", () => {
       return baseStdin(argv, input, signal, preserve);
     });
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    await tool.execute("id", { name: "worker", profile: "worker", initialPrompt: "phase" }, new AbortController().signal, (update) => {
+    await tool.execute("id", { name: "worker", profile: "worker", assignment: assign("phase") }, new AbortController().signal, (update) => {
       if (typeof update.details?.phase === "string") updates.push(update.details.phase);
     }, extensionContext);
     expect(updates).toContain("ready");
@@ -3201,7 +3284,10 @@ describe("herdr_launch profile-only contract", () => {
     const first = profile("primary", "pi", ["fallback"]);
     const second = profile("fallback", "claude");
     const calls: string[][] = [];
-    const result = await launch({ name: "worker", profile: "primary", overrides: { model: "override/model", thinking: "high" } }, catalog(first, second), makeCli({ calls, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }] , start: (argv, attempt) => {
+    const fallbackPane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } };
+    // First pane read proves no agent survived the failed attempt; the next two
+    // are the selected attempt's readiness baseline and confirmation samples.
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "primary", overrides: { model: "override/model", thinking: "high" } }, catalog(first, second), makeCli({ calls, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }, { ...fallbackPane, ...lifecycleFor(0) }, { ...fallbackPane, ...lifecycleFor(1) }] , start: (argv, attempt) => {
       if (attempt === 0) throw startFailure();
       return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } } });
     }}).cli);
@@ -3221,7 +3307,7 @@ describe("herdr_launch profile-only contract", () => {
     });
     const supervision = stubSupervision();
 
-    await expect(launch({ name: "worker", profile: `worker-${kind}`, initialPrompt: "strict" }, catalog(profile(`worker-${kind}`, kind)), harness.cli, undefined, { supervision, clock: clockControl.clock }))
+    await expect(launch({ name: "worker", profile: `worker-${kind}`, assignment: assign("strict") }, catalog(profile(`worker-${kind}`, kind)), harness.cli, undefined, { supervision, clock: clockControl.clock }))
       .rejects.toMatchObject({ code: "READY_TIMEOUT", details: { phase: "ready", promptSubmitted: false, recipientRegistered: false } });
 
     expect(harness.stdinInputs).toHaveLength(0);
@@ -3229,16 +3315,25 @@ describe("herdr_launch profile-only contract", () => {
     expect(supervision.bound).toHaveLength(0);
   });
 
-  it("rejects a promptless requested AGY profile before any mutation or reservation", async () => {
+  it.each([
+    ["missing", undefined],
+    ["empty objective", { objective: "", scope: "s", verification: "v" }],
+    ["missing verification", { objective: "o", scope: "s" }],
+    ["extra field", { objective: "o", scope: "s", verification: "v", extra: "e" }],
+    ["legacy free-form prompt", undefined]
+  ] as const)("rejects a launch with a %s assignment before any mutation or reservation", async (label, assignment) => {
     const harness = makeCli();
     const attachments = fakeAttachments();
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
     const recipients = new RecipientRegistry();
     const recipientRecord = vi.spyOn(recipients, "recordFor");
     const supervision = stubSupervision();
+    const params = label === "legacy free-form prompt"
+      ? { name: "worker", profile: "researcher-agy", initialPrompt: "research" }
+      : { name: "worker", profile: "researcher-agy", ...(assignment === undefined ? {} : { assignment }) };
 
-    await expect(launch({ name: "worker", profile: "researcher-agy" }, catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi")), harness.cli, promptSources, { attachments, recipients, supervision }))
-      .rejects.toMatchObject({ code: "INVALID_INPUT", details: { phase: "resolve_profile", effectCertainty: "absent" } });
+    await expect(launch(params as never, catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi")), harness.cli, promptSources, { attachments, recipients, supervision }))
+      .rejects.toMatchObject({ code: "INVALID_INPUT", details: { phase: "validate", effectCertainty: "absent" } });
 
     expect(harness.calls).toHaveLength(0);
     expect(harness.stdinInputs).toHaveLength(0);
@@ -3250,16 +3345,17 @@ describe("herdr_launch profile-only contract", () => {
     expect(recipientRecord).not.toHaveBeenCalled();
   });
 
-  it("launches a promptless non-AGY profile whose fallback chain reaches AGY", async () => {
+  it("keeps an AGY fallback launchable because every launch carries its assignment", async () => {
     const calls: string[][] = [];
-    const result = await launch({ name: "worker", profile: "worker-pi" }, catalog(profile("worker-pi", "pi", ["worker-agy"]), profile("worker-agy", "agy")), makeCli({ calls }).cli);
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker-pi" }, catalog(profile("worker-pi", "pi", ["worker-agy"]), profile("worker-agy", "agy")), makeCli({ calls }).cli);
 
     expect(result.details).toMatchObject({
       kind: "pi",
-      initialPromptSent: false,
-      profile: { requested: "worker-pi", selected: "worker-pi", reachableNames: ["worker-pi", "worker-agy"], attempts: [{ profile: "worker-agy", outcome: "fallback_refused" }, { profile: "worker-pi", outcome: "selected" }] }
+      initialPromptSent: true,
+      profile: { requested: "worker-pi", selected: "worker-pi", reachableNames: ["worker-pi", "worker-agy"], attempts: [{ profile: "worker-pi", outcome: "selected" }] }
     });
-    // The unlaunchable AGY fallback never reaches a start attempt.
+    // The AGY fallback is no longer pruned, and the primary still starts first.
+    expect(result.details?.profile?.attempts.some((attempt) => attempt.outcome === "fallback_refused")).toBe(false);
     const starts = calls.filter((call) => call[0] === "agent" && call[1] === "start");
     expect(starts).toHaveLength(1);
     expect(starts[0]).toContain("pi");
@@ -3285,7 +3381,7 @@ describe("herdr_launch profile-only contract", () => {
     });
     const supervision = stubSupervision();
 
-    await expect(launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision }))
+    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision }))
       .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", promptSubmitted: false } });
     expect(harness.stdinInputs).toHaveLength(0);
     expect(supervision.provisionalBound).toHaveLength(0);
@@ -3317,7 +3413,7 @@ describe("herdr_launch profile-only contract", () => {
         return response;
       });
 
-      const pending = launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli);
+      const pending = launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli);
       await vi.advanceTimersByTimeAsync(100);
       await expect(pending).resolves.toMatchObject({ details: { readiness: { samples: 2 }, promptConsumption: "confirmed" } });
       expect(harness.stdinInputs).toHaveLength(1);
@@ -3342,7 +3438,7 @@ describe("herdr_launch profile-only contract", () => {
     const recipients = new RecipientRegistry();
     const supervision = stubSupervision();
 
-    await expect(launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { recipients, supervision }))
+    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { recipients, supervision }))
       .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "prompt_verification", promptSubmitted: true, recipientRegistered: false } });
     expect(harness.stdinInputs).toHaveLength(1);
     expect(supervision.provisionalBound).toHaveLength(1);
@@ -3387,7 +3483,7 @@ describe("herdr_launch profile-only contract", () => {
         return response;
       });
 
-      const pending = launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision });
+      const pending = launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision });
       await vi.advanceTimersByTimeAsync(100);
       expect(supervision.strengthened).toHaveLength(0);
       await vi.advanceTimersByTimeAsync(100);
@@ -3437,7 +3533,7 @@ describe("herdr_launch profile-only contract", () => {
         return response;
       });
 
-      const pending = launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli);
+      const pending = launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli);
       await vi.advanceTimersByTimeAsync(100);
       await expect(pending).resolves.toMatchObject({ details: {
         initialPromptObservation: { status: "working", stateChangeSeq: 8, revision: 4, screenDetectionSkipped: true },
@@ -3476,7 +3572,7 @@ describe("herdr_launch profile-only contract", () => {
       });
 
       const pending = launch(
-        { name: "worker", profile: "researcher-agy", initialPrompt: "research" },
+        { name: "worker", profile: "researcher-agy", assignment: assign("research") },
         catalog(profile("researcher-agy", "agy")),
         harness.cli,
         undefined,
@@ -3529,7 +3625,7 @@ describe("herdr_launch profile-only contract", () => {
       return response;
     });
 
-    await expect(launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli))
+    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli))
       .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "prompt_verification", promptSubmitted: true, recipientRegistered: false } });
     expect(harness.stdinInputs).toHaveLength(1);
   });
@@ -3565,7 +3661,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("researcher-agy", "agy")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
 
-      const outcome = expect(tool.execute("id", { name: "worker", profile: "researcher-agy", initialPrompt: "research" }, controller.signal, undefined, extensionContext))
+      const outcome = expect(tool.execute("id", { name: "worker", profile: "researcher-agy", assignment: assign("research") }, controller.signal, undefined, extensionContext))
         .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { initialPromptObservation: { stateChangeSeq: 7 }, promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED" }, promptSubmitted: true } });
       await vi.waitFor(() => expect(abortScheduled).toBe(true), { interval: 1 });
       await vi.advanceTimersByTimeAsync(50);
@@ -3579,7 +3675,7 @@ describe("herdr_launch profile-only contract", () => {
   it("preserves bounded AGY acknowledgement evidence when strengthening throws an untyped error", async () => {
     const harness = makeCli({ omitFreshAgentSession: true });
     const supervision = stubSupervision({ onStrengthen: () => { throw new Error("strengthen failed"); } });
-    const failure = await launch({ name: "worker", profile: "researcher-agy", initialPrompt: "prompt-secret" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision })
+    const failure = await launch({ name: "worker", profile: "researcher-agy", assignment: assign("prompt-secret") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision })
       .catch((error: LaunchFailure) => error);
     expect(failure).toMatchObject({ code: "LAUNCH_FAILED", details: {
       phase: "supervision_bind",
@@ -3669,7 +3765,7 @@ describe("herdr_launch profile-only contract", () => {
     });
 
     const failure = await launch(
-      { name: "worker", profile: "researcher-agy", initialPrompt: "research" },
+      { name: "worker", profile: "researcher-agy", assignment: assign("research") },
       catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi")),
       harness.cli,
       undefined,
@@ -3716,7 +3812,7 @@ describe("herdr_launch profile-only contract", () => {
       return RecipientRegistry.prototype.recordFor.call(recipients, ...args);
     });
 
-    const result = await launch({ name: "worker", profile: "researcher-agy", initialPrompt: "research" }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision, recipients });
+    const result = await launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision, recipients });
 
     expect(harness.stdinInputs).toEqual([envelope("research")]);
     expect(supervision.provisionalBound).toEqual([{
@@ -3749,7 +3845,7 @@ describe("herdr_launch profile-only contract", () => {
       },
     });
 
-    const result = await launch({ name: "worker", profile: primary.name, initialPrompt: "research" }, catalog(primary, fallback), harness.cli, undefined, { supervision });
+    const result = await launch({ name: "worker", profile: primary.name, assignment: assign("research") }, catalog(primary, fallback), harness.cli, undefined, { supervision });
 
     expect(supervision.reserved).toEqual([{ agentName: "worker", agentKind: primaryKind, profileName: primary.name }]);
     expect(supervision.provisionalBound).toEqual([{
@@ -3768,12 +3864,12 @@ describe("herdr_launch profile-only contract", () => {
   it("uses the selected AGY profile mode for launch and rejects mode overrides", async () => {
     const workerAgy = profile("worker-agy", "agy", [], "accept-edits");
     const harness = makeCli();
-    const result = await launch({ name: "worker", profile: "worker-agy", initialPrompt: "implement" }, catalog(workerAgy), harness.cli);
+    const result = await launch({ name: "worker", profile: "worker-agy", assignment: assign("implement") }, catalog(workerAgy), harness.cli);
     const start = harness.calls.find((call) => call[0] === "agent" && call[1] === "start");
     expect(start).toEqual(expect.arrayContaining(["--model", "gemini-3.8-flash-high", "--mode", "accept-edits", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]));
     expect(start).not.toContain("plan");
     expect(result.details).toMatchObject({ kind: "agy", profile: { name: "worker-agy", runtime: { mode: "accept-edits", dangerouslySkipPermissions: true } } });
-    await expect(launch({ name: "worker", profile: "worker-agy", initialPrompt: "implement", overrides: { mode: "plan" } as never }, catalog(workerAgy), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(launch({ name: "worker", profile: "worker-agy", assignment: assign("implement"), overrides: { mode: "plan" } as never }, catalog(workerAgy), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
   });
 
   it("keeps AGY bodies as metadata and starts an AGY fallback without a prompt source", async () => {
@@ -3793,7 +3889,7 @@ describe("herdr_launch profile-only contract", () => {
         return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" } } });
       }
     });
-    const result = await launch({ name: "worker", profile: "primary", initialPrompt: "research" }, catalog(primary, fallback), harness.cli, promptSources);
+    const result = await launch({ name: "worker", profile: "primary", assignment: assign("research") }, catalog(primary, fallback), harness.cli, promptSources);
 
     expect(promptSources.create).toHaveBeenCalledTimes(1);
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "agy")).toEqual([
@@ -3811,7 +3907,7 @@ describe("herdr_launch profile-only contract", () => {
     const primary = profile("primary", "pi", ["fallback"]);
     const fallback = profile("fallback", "pi");
     const mismatched = makeCli({ start: () => { throw startFailure(); }, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", agent_session: { source: "\u0000", agent: "\u0001", kind: "\u0002", value: "\u0003" }, agent_status: "working", status: "\u0000" }] });
-    const mismatchedFailure = await launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), mismatched.cli)
+    const mismatchedFailure = await launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, fallback), mismatched.cli)
       .catch((error: unknown) => error as { code: string; details: Record<string, unknown> });
     expect(mismatchedFailure).toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "agent_start_failed" } });
     expect((((mismatchedFailure.details as Record<string, unknown>).attempts as Array<Record<string, unknown>>)[0]!).postState).toEqual({
@@ -3824,12 +3920,12 @@ describe("herdr_launch profile-only contract", () => {
     expect(mismatched.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
 
     const wrongMessage = makeCli({ start: () => { throw Object.assign(new Error("other failure"), { code: "agent_start_failed" }); } });
-    const wrongMessageFailure = await launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), wrongMessage.cli).catch((error: unknown) => error as { details: Record<string, unknown> });
+    const wrongMessageFailure = await launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, fallback), wrongMessage.cli).catch((error: unknown) => error as { details: Record<string, unknown> });
     expect(wrongMessageFailure).toMatchObject({ code: "LAUNCH_FAILED", details: { reconciliation: { snapshot: "present" } } });
     expect(wrongMessage.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
     expect(wrongMessage.calls.filter((call) => call[0] === "pane" && call[1] === "get")).toHaveLength(1);
     const malformedEnvelope = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "failure", { exitCode: 1, killed: false, stderrTruncated: false, stderr: "{" }); } });
-    await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), malformedEnvelope.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, fallback), malformedEnvelope.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
 
     for (const errorEnvelope of [
       { id: "cli:agent:other", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } },
@@ -3837,7 +3933,7 @@ describe("herdr_launch profile-only contract", () => {
       { id: "cli:agent:start", error: { code: "agent_start_failed", message: "process exited before becoming interactive" } }
     ]) {
       const invalid = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "failure", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope }); } });
-      await expect(launch({ name: "worker", profile: "primary" }, catalog(primary, fallback), invalid.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, fallback), invalid.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
       expect(invalid.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
     }
   });
@@ -3857,7 +3953,7 @@ describe("herdr_launch profile-only contract", () => {
         errorEnvelope: { id: "cli:agent:start", error: { code: backendCode, message: "agent target pane is not an available shell" } }
       });
       const harness = makeCli({ start: () => { throw failure; } });
-      await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: {
           phase: "agent_start",
@@ -3876,7 +3972,7 @@ describe("herdr_launch profile-only contract", () => {
 
     for (const errorEnvelope of [null, { id: 1, error: {} }, { id: "cli:agent:start", error: [] }, { id: "cli:agent:start", error: { code: 1, message: false } }]) {
       const malformed = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "generic failure", { killed: false, errorEnvelope }); } });
-      await expect(launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), malformed.cli)).rejects.toMatchObject({
+      await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), malformed.cli)).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: { causeCode: "CLI_PROTOCOL_ERROR" }
       });
@@ -3886,32 +3982,36 @@ describe("herdr_launch profile-only contract", () => {
   it("preserves all placement modes without exposing raw environment launch", async () => {
     const worker = profile("worker");
     const newTab = makeCli();
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" }, focus: true }, catalog(worker), newTab.cli)).resolves.toMatchObject({ details: { placement: { mode: "new_tab", tabLabel: "agents" }, tabId: "w1:t2", paneId: "w1:p3" } });
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "new_tab", tabLabel: "agents" }, focus: true }, catalog(worker), newTab.cli)).resolves.toMatchObject({ details: { placement: { mode: "new_tab", tabLabel: "agents" }, tabId: "w1:t2", paneId: "w1:p3" } });
     expect(newTab.calls).toContainEqual(["tab", "create", "--workspace", "w1", "--cwd", "/repo", "--label", "agents", "--no-focus"]);
     expect(newTab.calls).toContainEqual(["agent", "focus", "w1:p3"]);
 
     const existing = { ...snapshot, panes: [{ ...snapshot.panes[0]!, label: "target" }] };
     const existingIdentity = { terminal_id: "terminal-existing", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing" } };
     let existingStarted = false;
-    const existingCli: LaunchCli = { runJson: vi.fn(async (argv) => {
+    let existingAgentReads = 0;
+    let existingPaneReads = 0;
+    const existingAgent = { name: "worker", pane_id: "w1:p1", agent: "pi", ...existingIdentity };
+    const existingCli: LaunchCli = {
+      runJsonWithStdin: vi.fn(async () => ok("cli:agent:prompt", { type: "agent_prompted", agent: { ...existingAgent, ...lifecycleFor(0), screen_detection_skipped: true } })),
+      runJson: vi.fn(async (argv) => {
       if (argv[0] === "pane" && argv[1] === "current") return ok("current", { type: "pane_current", pane: existing.panes[0] });
       if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: existingStarted ? { ...existing, panes: [{ ...existing.panes[0]!, agent_name: "worker", agent: "pi", ...existingIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...existingIdentity }] } : existing });
       if (argv[0] === "agent" && argv[1] === "start") { existingStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...existingIdentity } }); }
-      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...existingIdentity } });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...existingIdentity, agent_status: "idle" } });
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { ...existingAgent, ...lifecycleFor(existingAgentReads++) } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...existingIdentity, ...lifecycleFor(existingPaneReads++) } });
       throw new Error(`unexpected ${argv.join(" ")}`);
-    }) };
-    await expect(launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "target" } }, catalog(worker), existingCli)).resolves.toMatchObject({ details: { paneId: "w1:p1" } });
+      })
+    };
+    await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "target" } }, catalog(worker), existingCli)).resolves.toMatchObject({ details: { paneId: "w1:p1" } });
     expect((existingCli.runJson as ReturnType<typeof vi.fn>).mock.calls.some((call) => call[0][0] === "pane" && call[0][1] === "split")).toBe(false);
   });
 
   it("renders the requested profile and keeps communication independent", () => {
     const tool = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-    const call = tool.renderCall?.({ name: "worker", profile: "worker" } as never, {} as never, {} as never);
-    expect(call?.render(80)).toEqual(["herdr_launch · worker · worker"]);
-    const inlineCall = tool.renderCall?.({ name: "worker", profile: "worker", initialPrompt: "go" } as never, {} as never, {} as never);
+    const inlineCall = tool.renderCall?.({ name: "worker", profile: "worker", assignment: assign("go") } as never, {} as never, {} as never);
     expect(inlineCall?.render(80)).toEqual(["herdr_launch · worker · inline · worker"]);
-    const attachmentCall = tool.renderCall?.({ name: "worker", profile: "worker", initialPrompt: "go", initialPromptDelivery: "attachment" } as never, {} as never, {} as never);
+    const attachmentCall = tool.renderCall?.({ name: "worker", profile: "worker", assignment: assign("go"), assignmentDelivery: "attachment" } as never, {} as never, {} as never);
     expect(attachmentCall?.render(80)).toEqual(["herdr_launch · worker · attachment · worker"]);
   });
 });
@@ -3922,7 +4022,7 @@ describe("herdr_launch automatic child supervision", () => {
   it("reserves before any topology mutation and returns the stable supervisor job id", async () => {
     const supervision = stubSupervision({ jobId: "job_sup_1" });
     const harness = makeCli();
-    const result = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision });
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision });
     expect(supervision.reserved).toEqual([{ agentName: "worker", agentKind: "pi", profileName: "worker" }]);
     expect(supervision.bound).toHaveLength(1);
     expect(supervision.bound[0]!.identity).toMatchObject({ paneId: "w1:p2", agentName: "worker", agentKind: "pi" });
@@ -3934,28 +4034,32 @@ describe("herdr_launch automatic child supervision", () => {
     expect((result.content[0] as { text: string }).text).toContain("supervisor job_sup_1");
   });
 
-  it("supervises a launch with no initialPrompt and one into an existing pane", async () => {
-    const noPrompt = stubSupervision();
-    const noPromptResult = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: noPrompt });
-    expect(noPrompt.bound).toHaveLength(1);
-    expect(noPromptResult.details).not.toHaveProperty("assignmentState");
-    // No prompt means no readiness baseline, so the anchor takes the agent record's counter.
-    expect(noPrompt.bound[0]!.stateChangeSeq).toBe(7);
+  it("supervises an inline launch and one into an existing pane", async () => {
+    const inline = stubSupervision();
+    const inlineResult = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: inline });
+    expect(inline.bound).toHaveLength(1);
+    // Every launch delivers its assignment, so consumption is always reported.
+    expect(inlineResult.details).toMatchObject({ assignmentState: "confirmed" });
+    // The anchor takes the readiness baseline's counter from the same sample.
+    expect(inline.bound[0]!.stateChangeSeq).toBe(7);
 
     // An existing-pane launch is supervised on the same contract.
     const existing = stubSupervision();
     const reused = makeCli();
     const reusedBase = reused.cli.runJson;
     let started = false;
+    let reusedAgentReads = 0;
+    let reusedPaneReads = 0;
     const reusedIdentity = { terminal_id: "terminal-existing", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-existing" } };
     reused.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signalValue, preserve) => {
       if (argv[0] === "api" && started) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, agent_name: "worker", agent: "pi", ...reusedIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...reusedIdentity }] } });
       if (argv[0] === "agent" && argv[1] === "start") { started = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...reusedIdentity } }); }
-      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...reusedIdentity, agent_status: "idle", state_change_seq: 7, revision: 3 } });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...reusedIdentity, agent_status: "idle", state_change_seq: 7, revision: 3 } });
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...reusedIdentity, ...lifecycleFor(reusedAgentReads++) } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", ...reusedIdentity, ...lifecycleFor(reusedPaneReads++) } });
       return reusedBase(argv, signalValue, preserve);
     });
-    await launch({ name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" } }, catalog(profile("worker")), reused.cli, undefined, { supervision: existing });
+    stubPromptTransport(reused, { name: "worker", pane_id: "w1:p1", agent: "pi", ...reusedIdentity });
+    await launch({ assignment: assign("go"), name: "worker", profile: "worker", placement: { mode: "existing_pane", target: "caller" } }, catalog(profile("worker")), reused.cli, undefined, { supervision: existing });
     expect(existing.bound).toHaveLength(1);
     expect(existing.bound[0]!.identity.paneId).toBe("w1:p1");
   });
@@ -3963,7 +4067,7 @@ describe("herdr_launch automatic child supervision", () => {
   it("refuses the launch with no effect when supervision cannot be reserved", async () => {
     const supervision = stubSupervision({ reserveError: Object.assign(new Error("no socket"), { code: "SUPERVISION_SOCKET_UNAVAILABLE" }) });
     const harness = makeCli();
-    const failure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    const failure = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
     expect(failure.code).toBe("SUPERVISION_UNAVAILABLE");
     expect(failure.details).toMatchObject({ phase: "supervision_reserve", effectCertainty: "absent", agentStarted: false, causeCode: "SUPERVISION_SOCKET_UNAVAILABLE" });
     // No topology command ran at all.
@@ -3982,7 +4086,7 @@ describe("herdr_launch automatic child supervision", () => {
     }) });
     const harness = makeCli();
     const recipients = new RecipientRegistry();
-    const failure = await launch({ name: "worker", profile: "worker", focus: true, initialPrompt: "must not dispatch" }, catalog(profile("worker")), harness.cli, undefined, { supervision, recipients }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    const failure = await launch({ name: "worker", profile: "worker", focus: true, assignment: assign("must not dispatch") }, catalog(profile("worker")), harness.cli, undefined, { supervision, recipients }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
     expect(failure.details).toMatchObject({
       phase: "supervision_bind",
       causeCode: "SUPERVISION_UNCONFIRMED",
@@ -4004,12 +4108,12 @@ describe("herdr_launch automatic child supervision", () => {
 
   it("classifies an untyped reserve failure and rethrows a non-binding failure unchanged", async () => {
     const untyped = stubSupervision({ reserveError: new Error("plain failure") });
-    const reserveFailure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: untyped }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    const reserveFailure = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: untyped }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
     expect(reserveFailure.details).toMatchObject({ causeCode: "SUPERVISION_UNAVAILABLE", phase: "supervision_reserve" });
 
     // A failure that is not a binding refusal is not reshaped into one.
     const foreign = stubSupervision({ bindError: Object.assign(new Error("monitor gone"), { code: "SUPERVISION_SOCKET_CLOSED" }) });
-    const bindFailure = await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: foreign }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    const bindFailure = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: foreign }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
     expect(bindFailure.details).toMatchObject({ phase: "supervision_bind", causeCode: "SUPERVISION_SOCKET_CLOSED" });
     expect(bindFailure.details).not.toHaveProperty("supervisionEvidence");
   });
@@ -4043,7 +4147,7 @@ describe("herdr_launch automatic child supervision", () => {
       return base(argv, signalValue, preserve);
     });
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, promptSources: { create: async () => ({ path: "/cache/body.md" }) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), supervision });
-    await expect(tool.execute("id", { name: "worker", profile: "worker" } as never, controller.signal, undefined, extensionContext)).rejects.toBeDefined();
+    await expect(tool.execute("id", { name: "worker", profile: "worker", assignment: assign("go") } as never, controller.signal, undefined, extensionContext)).rejects.toBeDefined();
     expect(supervision.released).toEqual(["launch_failed_supervision_bind"]);
   });
 
@@ -4051,8 +4155,12 @@ describe("herdr_launch automatic child supervision", () => {
     const supervision = stubSupervision();
     const first = profile("primary", "pi", ["fallback"]);
     const second = profile("fallback", "claude");
-    const result = await launch({ name: "worker", profile: "primary" }, catalog(first, second), makeCli({
-      paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }],
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(first, second), makeCli({
+      paneStates: [
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" }, ...lifecycleFor(0) },
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" }, ...lifecycleFor(1) }
+      ],
       start: (_argv, attempt) => {
         if (attempt === 0) throw startFailure();
         return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } } });
@@ -4069,7 +4177,7 @@ describe("herdr_launch automatic child supervision", () => {
   it("releases the reservation when the launch fails after reserving", async () => {
     const supervision = stubSupervision();
     const harness = makeCli({ start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 2, killed: false }); } });
-    await launch({ name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch(() => undefined);
+    await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch(() => undefined);
     expect(supervision.released).toEqual(["launch_failed_agent_start"]);
     expect(supervision.bound).toEqual([]);
   });
@@ -4081,7 +4189,7 @@ describe("herdr_launch automatic child supervision", () => {
       expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
       expect(harness.stdinInputs).toHaveLength(0);
     } });
-    const result = await launch({ name: "worker", profile: "worker", focus: true, initialPrompt: "go" }, catalog(profile("worker")), harness.cli, undefined, { supervision });
+    const result = await launch({ name: "worker", profile: "worker", focus: true, assignment: assign("go") }, catalog(profile("worker")), harness.cli, undefined, { supervision });
     expect(result.details).toMatchObject({ promptConsumption: "confirmed", assignmentState: "confirmed", supervision: { jobId: supervision.jobId } });
     expect(harness.stdinInputs).toHaveLength(1);
     expect(supervision.bindAttempts).toHaveLength(1);
@@ -4103,7 +4211,7 @@ describe("herdr_launch automatic child supervision", () => {
       return base(argv, signal, preserve);
     });
     const supervision = stubSupervision({ jobId: "job_focus_retained" });
-    const failure = await launch({ name: "worker", profile: "worker", focus: true, initialPrompt: "must remain private" }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    const failure = await launch({ name: "worker", profile: "worker", focus: true, assignment: assign("must remain private") }, catalog(profile("worker")), harness.cli, undefined, { supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
     expect(failure.details).toMatchObject({ phase: "focus", paneId: "w1:p2", supervisorJobId: "job_focus_retained", supervision: { jobId: "job_focus_retained", state: "active" }, promptSubmitted: false, recipientRegistered: false });
     expect(failure.details).not.toHaveProperty("assignmentState");
     expect(supervision.bound).toHaveLength(1);
@@ -4121,7 +4229,7 @@ describe("herdr_launch automatic child supervision", () => {
     });
     const recipients = new RecipientRegistry();
     const supervision = stubSupervision({ jobId: "job_ack_retained" });
-    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "private-prompt-canary" }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    const failure = await launch({ name: "worker", profile: "worker", assignment: assign("private-prompt-canary") }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
     expect(failure.details).toMatchObject({ phase: "prompt_verification", assignmentState: "unconfirmed", paneId: "w1:p2", supervisorJobId: "job_ack_retained", supervision: { jobId: "job_ack_retained", state: "active" }, promptSubmitted: true, recipientRegistered: false });
     expect(supervision.bound).toHaveLength(1);
     expect(supervision.released).toEqual([]);
@@ -4138,7 +4246,7 @@ describe("herdr_launch automatic child supervision", () => {
     const recipients = new RecipientRegistry();
     vi.spyOn(recipients, "recordFor").mockImplementation(() => { throw new Error("recipient registry unavailable"); });
     const supervision = stubSupervision({ jobId: "job_recipient_retained" });
-    const failure = await launch({ name: "worker", profile: "worker", initialPrompt: "one prompt" }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
+    const failure = await launch({ name: "worker", profile: "worker", assignment: assign("one prompt") }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
     expect(failure.details).toMatchObject({ phase: "prompt_verification", assignmentState: "confirmed", paneId: "w1:p2", supervisorJobId: "job_recipient_retained", supervision: { jobId: "job_recipient_retained", state: "active" }, promptSubmitted: true, recipientRegistered: false });
     expect(supervision.bound).toHaveLength(1);
     expect(supervision.released).toEqual([]);
@@ -4164,7 +4272,7 @@ describe("herdr_launch automatic child supervision", () => {
       launchGate: async () => gate
     });
 
-    await expect(tool.execute("id", { name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext))
+    await expect(tool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext))
       .rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN" });
     expect(loads).not.toHaveBeenCalled();
     expect(harness.calls).toHaveLength(0);
@@ -4201,7 +4309,7 @@ describe("herdr_launch automatic child supervision", () => {
       launchGate: async () => gate
     });
 
-    const failure = await tool.execute("id", { name: "worker", profile: "primary" }, new AbortController().signal, undefined, extensionContext)
+    const failure = await tool.execute("id", { assignment: assign("go"), name: "worker", profile: "primary" }, new AbortController().signal, undefined, extensionContext)
       .catch((error: LaunchFailure) => error);
     expect(failure).toMatchObject({ code: "LAUNCH_FAILED" });
     expect(checks).toBe(3);

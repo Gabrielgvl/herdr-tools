@@ -170,8 +170,14 @@ describe("MCP published schema parity", () => {
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: true }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi" }, true],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", extra: true }, false]
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } }, true],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, extra: true }, false],
+      // The typed assignment is required, exact, and non-empty.
+      ["herdr_launch", { name: "worker", profile: "worker-pi" }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s" } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "", scope: "s", verification: "v" } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v", extra: "e" } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", initialPrompt: "o" }, false]
     ];
     for (const [name, args, accepted] of cases) {
       const definition = surface.definitions.find((candidate) => candidate.name === name)!;
@@ -205,13 +211,42 @@ describe("MCP argument validation", () => {
     expect((body.details as { errors: Array<Record<string, string>> }).errors[0]).toMatchObject({ keyword: expect.any(String) as unknown as string, message: expect.any(String) as unknown as string });
   });
 
+  /**
+   * The rendered assignment's UTF-8 byte length is the only size authority. A
+   * per-field `maxLength` in the public schema would fail an oversized field as
+   * `INVALID_INPUT` during MCP validation, before rendering, so the caller's
+   * error code would depend on which limit was crossed first.
+   */
+  it("lets an oversized assignment field reach the launch tool and reports PAYLOAD_TOO_LARGE before mutation", async () => {
+    const args = {
+      name: "worker",
+      profile: "worker-pi",
+      assignmentDelivery: "attachment",
+      assignment: { objective: "x".repeat(1024 * 1024 + 1), scope: "bounded", verification: "bounded" }
+    };
+    const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
+    // No schema gate on field size, so the request is not turned into INVALID_INPUT.
+    expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, args)).toBe(true);
+    expect(Value.Check(definition.parameters, args)).toBe(true);
+
+    const outcome = await callTool({ surface: realSurface(), name: "herdr_launch", args, host, callId: "c", queue: new SequentialToolQueue() });
+    expect(outcome.isError).toBe(true);
+    expect(payload(outcome)).toMatchObject({
+      code: "PAYLOAD_TOO_LARGE",
+      details: {
+        tool: "herdr_launch",
+        diagnostic: { code: "PAYLOAD_TOO_LARGE", phase: "validate", created: {}, agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent" }
+      }
+    });
+  });
+
   it("rejects invalid arguments for every union and object schema before execution", async () => {
     const surface = realSurface();
     const rejected: Array<[string, unknown]> = [
       ["herdr_communicate", { target: "w:p2", operation: "prompt" }],
       ["herdr_wait", { targets: [], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }],
       ["herdr_jobs", { operation: "get" }],
-      ["herdr_launch", { name: "Worker", profile: "worker-pi" }],
+      ["herdr_launch", { name: "Worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } }],
       ["herdr_pane", { operation: "split" }],
       ["herdr_tab", { operation: "create" }]
     ];

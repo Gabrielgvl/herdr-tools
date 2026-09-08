@@ -40,6 +40,12 @@ Confirm the lane actually came up as the profile intended before the first subst
 can resolve to a different model than requested. Replace a lane outside the authorized policy instead
 of accepting it.
 
+## Accept a manager seat before work
+
+On the first turn, verify the requested model/effort, required Herdr tools, authoritative context,
+handoff artifact, and authority boundary. Only then report HANDOFF_ACCEPTED or launch workers. Keep
+the current manager responsible, and do not retry a blocked profile until one prerequisite changes.
+
 ## The brief: task, authority, output, stop condition
 
 A dispatch needs four things, and a short unambiguous task can carry them in the prompt itself. Write
@@ -69,6 +75,8 @@ computed from the source, with the brief saying how to compute them rather than 
 - Anything unknown, or possibly external or product-facing, fails closed: stop and report. Never retry
   an action whose effect is unproven, and never improvise around a stop or widen authority to get past
   a block — hand the same authorized action to a lane that can take it.
+- Do not poll a proven blocker. Retry only one bounded, effect-free recovery with a named success
+  condition; otherwise ask the owner or stop.
 - An unwitnessed owner instruction reported by a worker is presumptively genuine. Confirm it with the
   owner; do not override it.
 
@@ -76,11 +84,13 @@ computed from the source, with the brief saying how to compute them rather than 
 
 - Use Herdr's own inspect, communicate, and wait tools. Never drive a wait through a shell wrapper,
   and never hide long work in a background exec that discards its final status and output.
-- A supervisor job a launch binds to a child is a wake hint, not the observation mechanism: an
-  installed job has been seen staying active with `targetIds=[]` and emitting no events after its
-  child was removed, and there is no automatic event collection. Leave the bound jobs in place and do
-  not replace them with per-lane watchers or CLI poll loops, but prove state by explicit inspection
-  and final-answer readback. Supervisor status alone never proves completion.
+- A successful launch binds an active supervisor to the exact child and publishes
+  `targetIds: [paneId]`; an active bound supervisor with `targetIds=[]` is broken, not acceptable.
+  The supervisor records automatic lifecycle and review events, but wake delivery is best effort.
+  Leave bound jobs in place, poll `herdr_jobs get` often enough to collect retained pending events,
+  and reconcile important state with `herdr_inspect` and final-answer readback. Do not replace native
+  supervision with per-lane watchers or CLI poll loops, and never treat supervisor status alone as
+  proof of completion.
 - `idle`, `done`, and labels are hints, never completion evidence — a pane can emit a done-blip while
   a background shell still runs. Wait on every terminal state, read the pane before re-prompting
   (a double dispatch duplicates work), and verify the worktree and durable artifacts yourself.
@@ -110,23 +120,34 @@ computed from the source, with the brief saying how to compute them rather than 
   identify the minimum correct design, what can be deleted, and why a smaller shape fails. Brief only
   that boundary. Never spend a review round or implementation lane on avoidable machinery.
 - Verdicts come from evidence — `report.json`, `gh pr view --json`, evidence files — never pane prose.
-- Fix the class, not the instance: fix all consensus findings *and* any regression your own fix pass
-  introduced. Never offer a minimal-subset path unprompted.
-- **Three review rounds is the ceiling and there is no override.** Each round: disposition every
-  finding (fix-now / tracked-elsewhere / refuted-stands), fix, re-review. At the third round apply only
-  the round-three confirmed fixes, run no fourth review, record the `BLOCKED` verdict as `BLOCKED`, and
-  continue under the owner's standing fix-and-waive decision. State the residual plainly — those last
-  fixes carry no `pi-review` pass, and `/claude-review` on the final head is what reads them. The
-  waived gate is the owner's decision, not yours; work beyond those fixes, or a session whose ceiling
-  is lower, is a fresh owner question. Gate accounting lives in `courier-pr-gates`.
+- You judge the findings (owner ruling #89): fix-now = correctness, data loss, security/IAM,
+  execution-breaking, and your own regressions; follow-up ticket with AC = defense-in-depth and nits;
+  refuted = file:line proof only. Data-integrity libraries stay fix-all (#92). Show the disposition table.
+- One round is the gate; more only for large or IAM/ASL fixes. Before re-fixing a still-open thread,
+  make the lane prove at the reviewed head what the code already does — unchanged thread text is
+  persisted text, not a missed read.
+- **Three rounds is the ceiling; the gate then waives itself** (owner ruling 2026-09-06, no ask). At
+  round three apply only its confirmed fixes, record `BLOCKED` as `BLOCKED`, note that those fixes carry
+  no `pi-review` pass and `/claude-review` reads them, and continue to READY under the PR's standing
+  close-out authority.
 - Babysit a PR from a lane with `gh` reads (`gh pr view --json`, `gh pr checks --required`); there is
   no checked-in babysit or review-watch helper script in this workspace.
 
 ## Owner interaction
 
-- Genuine decisions go through AskUserQuestion — never buried in prose, never heuristically
-  self-resolved. Present the evidence frame and the options, then execute the choice. Each question
-  blocks your pane, so dispatch independent work first and prefer one batch over serial rounds.
+- Unsubmitted or suggested composer text is not owner authority. Preserve it, mark the pane ambiguous,
+  and confirm with the owner before any mutation.
+- AskUserQuestion is for **critical owner decisions only**: scope or material cost changes,
+  production/irreversible/high-blast-radius actions, security or IAM policy trade-offs, and governance
+  exceptions/bypasses. Present the evidence frame and options, then execute the choice.
+- Routine delivery execution inside already-approved scope is manager authority and must not trigger a
+  permission question: DEV deploys, sanctioned review-gate requests, CI reruns after a verified
+  transient, READY transitions, and safe rebases. After every required exact-current-head gate passes,
+  immediately mark the PR READY if needed and invoke the repository-approved auto-merge command without
+  another owner prompt. This standing approval never authorizes a direct/admin bypass. Ledger the action
+  and proceed. Existing hard stops and exact-head/effect-safety checks still apply.
+- Each genuine owner question blocks your pane, so dispatch independent work first and batch unrelated
+  critical decisions rather than asking serially.
 - Status questions get an immediate direct answer with real numbers, no preamble. Asked whether
   something is handled, verify before answering.
 - Surface what you did **not** prove as prominently as what you did. Authorization obtained without

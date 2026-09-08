@@ -136,7 +136,7 @@ src/supervision/
   monitor.ts     SessionEventMonitor: one connection, bootstrap, reconnect, fan-out
   identity.ts    exact child identity, continuity, and move-continuity rules
   events.ts      transition folding, material-wake classification, opaque event IDs
-  reviewer.ts    supervisor reviewer (gpt-5.6-luna, thinking=max) + model service seam
+  reviewer.ts    supervisor reviewer (gpt-5.6-sol, thinking=max) + model service seam
   notify.ts      ManagerNotifier: Pi sendMessage and Claude Channel implementations
   supervisor.ts  one child's state machine, cadence, degradation, receipts
   registry.ts    SupervisionRegistry: reserve → bind → settle, job ownership
@@ -326,7 +326,7 @@ supervisor job settles immediately after the wake.
 
 - Cadence: `settings.wait.reviewCadenceMinutes` (default 5), measured from the start of a
   **continuous** `working` run. Any transition out of `working` resets the timer.
-- Model: exactly `openai-codex/gpt-5.6-luna`, `thinkingLevel: "max"`. This is a module
+- Model: exactly `openai-codex/gpt-5.6-sol`, `thinkingLevel: "max"`. This is a module
   constant, not a setting: the setting `wait.reviewerModel` continues to govern the
   explicit `herdr_wait` reviewer, which stays Luna at `low`.
 - Evidence: bounded compact pane metadata plus the transcript delta since the previous
@@ -487,8 +487,14 @@ Delivery is **wake/report only**, best effort, never a gate, never retried.
   `notifications/claude/channel` with bounded `content` and `meta`. There is no delivery
   acknowledgement and no Herdr agent prompt injection.
 
-`manager-claude` opts in locally with the documented development-channel flag, using the
-plugin's own MCP server key:
+`manager-claude` no longer opts in. It declares no `runtime.developmentChannels`, so no
+`--dangerously-load-development-channels` opt-in is emitted, and the session raises neither
+the organization-policy warning nor the missing-MCP-server warning at startup. Claude manager
+wakes are recovered by `herdr_jobs` polling, which returns pending events by opaque ID and
+marks exactly those observed.
+
+Generic support for the flag remains, so any profile may still opt in by declaring a tagged
+entry:
 
 ```
 --dangerously-load-development-channels server:herdr
@@ -496,10 +502,10 @@ plugin's own MCP server key:
 
 The flag is hidden from `claude --help` in 2.1.252 but is a real root-command option, and
 `--channels` is proven to require a tagged `server:<name>` or `plugin:<name>@<marketplace>`
-entry. The entry is declared in the profile as `runtime.developmentChannels` rather than
-hard-coded in the adapter, and it is validated as a tagged entry at profile-parse time, so a
-different install can correct it without a code change. It is profile-only: a launch override
-must not be able to open an inbound channel the profile did not declare. See §16.
+entry. Entries are declared in the profile as `runtime.developmentChannels` rather than
+hard-coded in the adapter, and are validated as tagged entries at profile-parse time, so a
+different install can opt in without a code change. The field is profile-only: a launch
+override must not be able to open an inbound channel the profile did not declare. See §16.
 
 ## 13. Settings
 
@@ -525,13 +531,16 @@ operation. No compatibility shim preserves the old wording.
 
 ## 16. Known risks
 
-- **R1 — channel delivery.** `--dangerously-load-development-channels` is proven to exist
-  and to parse on Claude 2.1.252, and the entry `server:herdr` matches the plugin's own MCP
-  server key. End-to-end channel delivery is **not** proven here: it additionally requires the
-  organization's `channelsEnabled` managed setting, which this repository can neither set nor
-  observe. Mitigation: the entry is declarative profile data, delivery is best effort by
-  contract, soft receipts make every event recoverable through `herdr_jobs get`, and Pi
-  delivery is unaffected.
+- **R1 — channel delivery (retired for `manager-claude`).** `--dangerously-load-development-channels`
+  is proven to exist and to parse on Claude 2.1.252, and the entry `server:herdr` matches the
+  plugin's own MCP server key, but end-to-end channel delivery was never proven here: it also
+  requires the organization's `channelsEnabled` managed setting, which this repository can
+  neither set nor observe, and the unproven opt-in additionally produced org-policy and
+  missing-MCP-server warnings at startup. `manager-claude` therefore declares no channels, and
+  its wakes are recovered by `herdr_jobs` polling. The risk applies only to a profile that
+  chooses to opt in; soft receipts make every *retained* event recoverable through `herdr_jobs get`
+  while `truncatedEvents` reports evictions from the bounded log, and Pi delivery is
+  unaffected.
 - **R2 — replay volume and observer load.** A long-lived Herdr session replays a large log
   on every connect and reconnect, and `pane.updated` fires on output changes for every pane
   in the session. The monitor parses each line under a per-line bound and discards

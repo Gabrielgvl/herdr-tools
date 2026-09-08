@@ -236,7 +236,7 @@ describe("Herdr manager conduct skill", () => {
       ["detached waits", /Every `herdr_wait` call is detached/],
       ["detached polling", /Poll the returned job ID with `herdr_jobs`/],
       ["owned cleanup only", /Close only panes and tabs this session created and still owns/],
-      ["external model selection", /`claude-fable-5`/],
+      ["external model selection", /The profile selects the rolling `fable` alias/],
       ["model mismatch stops", /report the mismatch and stop/],
       ["manager mutation boundary", /Both managers receive Edit and Write only for an exact assignment-supplied handoff or coordination path/],
       ["isolated manager topology", /manager\/caller pane stays isolated/],

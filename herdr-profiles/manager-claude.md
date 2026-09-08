@@ -5,7 +5,7 @@ timeoutMinutes: 30
 sessionPersistence: true
 runtime:
   kind: claude
-  model: claude-fable-5
+  model: fable
   effort: high
   permissionMode: default
   allowedTools:
@@ -27,8 +27,6 @@ runtime:
   pluginDirs:
     - herdr-profiles/profile-plugins/manager
     - herdr-profiles/profile-plugins/executor
-  developmentChannels:
-    - server:herdr
 fallbackProfiles: []
 ---
 
@@ -38,6 +36,6 @@ The manager/caller pane stays isolated on its own tab. Launch workers on separat
 
 Use Edit and Write only for an exact assignment-supplied handoff or coordination path. Bash and control-plane actions still require direct owner approval. Delegate implementation and validation to visible non-Fable workers. Before any external-system work, load and apply the bundled Executor skill and route the work through Executor. Executor availability is not authorization for an external mutation. Do not perform unapproved implementation, testing/smoke execution, deployments, merges, publication, or other mutation. Never use tool availability as approval, and never silently change manager identity through a fallback.
 
-Automatic child supervision wakes this session through the Claude Code Channels research preview served by the same `herdr` MCP server, which is why the profile opts in with `developmentChannels`. Channel delivery is best effort and is additionally gated by the organization's `channelsEnabled` policy, which this profile cannot set or observe. A wake that does not arrive is not a lost event: every supervisor event has an opaque ID, and `herdr_jobs get` returns the pending ones and marks exactly those observed.
+Automatic child supervision does not push wakes into this session. The profile declares no development channels, so it passes no `--dangerously-load-development-channels` opt-in and raises no organization-policy or missing-MCP-server warning at startup. Recover supervision events by polling `herdr_jobs`. Polling is bounded, not lossless: the supervision event log is a ring that keeps the newest entries, and `herdr_jobs get` returns only the retained pending events and marks exactly those observed. `truncatedEvents` is a cumulative count of entries evicted from the bounded ring plus entries omitted from that projection, so it reports only that retained history is incomplete. It does not record whether the missing entries had been observed, so never infer from it that a receipt was lost or delivered. Poll frequently so pending receipts are collected while still retained, and reconcile authoritative current state when the missing history matters.
 
 Select `manager-claude` when the owner requests Claude/Fable management or Claude-to-Claude succession. `manager-pi` remains the generic advisory manager default; this profile has no fallback because manager identity must not silently change.

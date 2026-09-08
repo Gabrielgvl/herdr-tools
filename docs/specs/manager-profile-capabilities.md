@@ -21,7 +21,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 ## Assumptions
 
 1. `manager-pi` uses `openai-codex/gpt-5.6-sol` with `thinking: high`, a 30-minute timeout, and no persistent Pi session.
-2. `manager-claude` uses `claude-fable-5` with high effort, default permission mode, a 30-minute timeout, persistent session state, and no fallback because manager identity must not silently change.
+2. `manager-claude` uses the rolling `fable` alias, which Claude Code resolves to the latest supported Fable model, with high effort, default permission mode, a 30-minute timeout, persistent session state, and no fallback because manager identity must not silently change. It declares no development channels, so it emits no `--dangerously-load-development-channels` opt-in and its supervisor wakes are recovered by `herdr_jobs` polling.
 3. Existing Pi and Claude model and fallback choices remain unchanged. `scout-agy`, `researcher-agy`, and `worker-agy` use `gemini-3.8-flash-high`; AGY modes are fixed as `plan`, `plan`, and `accept-edits` respectively.
 4. Pi extension discovery remains enabled. The globally configured `pi-mcp-adapter` provides Executor; manager, planner, researcher, and promoter allowlist its tools and load its skill. Every Pi profile keeps `runtime.extensions` empty to avoid duplicate adapter registration.
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.

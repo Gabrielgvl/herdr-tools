@@ -1,13 +1,17 @@
 ---
 name: oracle
-description: "Oracle second-model review: bundle prompts/files, debug, refactor, design."
+description: "Use for Oracle second-model reviews and remote Mac canaries."
 ---
 
 # Oracle (CLI) — best use
 
 ## Routing
 
-Use Oracle for critical-plan reviews. Treat a plan as critical when it is explicitly marked critical or when it covers an irreversible or high-blast-radius architecture, security or IAM, infrastructure or deployment, production, or data-migration decision. Ordinary plan reviews and code reviews use `pi-review` instead.
+Use Oracle for critical-plan reviews. Treat a plan as critical when it is
+explicitly marked critical or when it covers an irreversible or
+high-blast-radius architecture, security or IAM, infrastructure or
+deployment, production, or data-migration decision. Ordinary plan reviews and
+code reviews use `pi-review` instead.
 
 ## Mandatory simplicity instruction
 
@@ -54,100 +58,103 @@ The Mac service uses its own isolated persistent profile at
 `/health` endpoint on port `9473`. Never point Oracle at
 `/Users/gabrieldelima/.hermes-authenticated-browser`: that profile is owned by the
 job-autopilot browser manager, whose deterministic cleanup may stop its exact-profile
-Chrome process. Use the upstream GPT-5.6
-commands below. Before a run, fail fast if `oracle --version` differs between the
-client and `/health.version`; update both sides together rather than applying a
-compatibility fallback.
+Chrome process. Gabriel's current approved browser target is **ChatGPT Latest with Extra High**:
+`--model gpt-6 --browser-thinking-time extra-high`. In the localized picker, the
+Latest option is displayed as `Recente`; this is model evidence, while `Extra alto`
+is only effort evidence. Extra High is the default. Escalate the same `gpt-6` run to
+Pro with `--browser-thinking-time pro` only when the assignment or owner explicitly
+requires Pro. Pro consumes a separate limited quota; complexity alone is not
+authorization, and an agent must never infer permission from task scope or a failed
+Extra High run.
+Before a run, fail fast if `oracle --version` differs between the client and
+`/health.version`; update both sides together rather than applying a compatibility
+fallback. Also run a no-cost parser probe for the exact Latest command. Never
+silently fall back to GPT-5.6 Sol, Pro, API, or a local browser.
 
-A live remote run on this deployment successfully used `gpt-5.6-sol` with
-`--browser-thinking-time extra-high`. Explicit `--browser-thinking-time pro`
-must fail closed unless the exact selected `Pro` label and verified Sol model are
-freshly observed before submission. English `Pro, 5 of 5` and Portuguese
-`Pro, 5 de 5` qualify because the selected label is exact; position alone never
-proves Pro. Do not bypass this gate or silently downgrade a Pro request.
+Preflight is one bounded gate. On failure, report and stop; do not hunt builds, reinstall, restart, or
+poll inside the review. Repair is separate owner-authorized work, and review resumes only after fresh
+version equality and parser proof.
 
 ### macOS passkey and picker regressions
 
-- The Portuguese Intelligence picker may expose effort as a five-position slider instead of separate effort chips. If a Pro run fails closed with `chip not found` and the diagnostic shows `Extra alto, 4 de 5`, do not downgrade or bypass evidence. On the isolated Oracle tab only, focus the slider's `role="menuitem"` with `aria-label="Potência"`, send one trusted `ArrowRight`, and require all of: slider `aria-valuenow="4"` equals `aria-valuemax="4"`, fresh text `Pro, 5 de 5`, selected `GPT-5.6 Sol` radio, then a closed-menu composer pill exactly `Pro`. Position alone is insufficient. Retry the same deterministic synthesis slug only when the failed attempt was pre-submit.
-- Launch the isolated manual-login Chrome through macOS LaunchServices (`open -na ... --args`), not a raw spawned Chromium root. Preserve the Oracle profile, and do not copy passkeys or profile files. Avoid `--use-mock-keychain`, `--password-store=basic`, `--disable-sync`, and unrelated extension-disable flags; they can make passkeys unavailable even though Bluetooth and macOS permissions are correct.
-- A GPT-5.6 Sol `extra-high` run must not enter the strict Pro-evidence path. The browser implementation has both an initial selection assertion and a fresh pre-submit assertion. Gate both on `thinkingTime === "pro"`. If Extra High fails with `requested effort Pro`, test the direct assertion and the submission wrapper separately before redeploying.
-- Verify a repair with a real remote canary and stored session evidence: completed status, requested `thinkingTime`, `resolvedLabel: "GPT-5.6 Sol"`, `modelSelection.verified: true`, and the persisted transcript marker.
+- `Entendido` alongside real options (`Recente`, `GPT-5.6 Sol`, etc.) can be the Portuguese request-rate modal, not a coachmark or matcher bug. Inspect the dialog text: `Excesso de solicitações`, `solicitações rápido demais`, or `Limitamos temporariamente o acesso às suas conversas` is a real transient throttle. Detect it as `chatgpt-throttled`, do not dismiss/bypass it, close orphan tabs, wait for cooldown, and retry only a claim proven pre-submit. Keep `Latest`/`Recente`; do not add a model fallback.
+- Hidden macOS runs have three independent focus paths. A Linux-side `--browser-hide-window` is insufficient because the remote service strips client host-control fields. Start the Mac host with `oracle serve --browser-hide-window`, and resolve serve options with Commander's `optsWithGlobals()`—when the same option exists globally and on `serve`, the action's child-only options report `browserHideWindow=false` even though argv contains the flag. Launch headful Chrome through LaunchServices with `open -g -n ... --args` plus the off-screen position; raw Chrome spawn activates the app. Create isolated tabs with browser-level `Target.createTarget({ background: true })`; the `/json/new`/`CDP.New` endpoint activates even an already-running off-screen Chrome. Do not call `Page.bringToFront()` before trusted clicks. Verify with a live frontmost-app monitor spanning both a fresh service/Chrome launch and a complete Oracle request; process argv or off-screen geometry alone is not proof. For batch reviewers, use one active session and keep starts at least 600 seconds apart; 300-second starts empirically triggered the Portuguese rate modal on roughly every third request.
+- The Portuguese Intelligence picker may expose effort as a five-position slider instead of separate effort chips. If a Pro run fails closed with `chip not found` and the diagnostic shows `Extra alto, 4 de 5`, do not downgrade or bypass evidence. First check `trailingCount` in the picker diagnostic JSON: `chip not found` with `trailingCount: 0` means the effort pill itself was never claimed — an entry-button localization gap (next bullet), not a slider-selection problem; the ArrowRight slider workaround does not apply and will not help. Only when the pill was claimed does the slider workaround apply: on the isolated Oracle tab only, focus the slider's `role="menuitem"` with `aria-label="Potência"`, send one trusted `ArrowRight`, and require all of: slider `aria-valuenow="4"` equals `aria-valuemax="4"`, fresh text `Pro, 5 de 5`, selected `Latest` or `Recente` radio, then a closed-menu composer pill exactly `Pro`. Position alone is insufficient. Retry the same deterministic synthesis slug only when the failed attempt was pre-submit.
+- Entry-button localization gap (observed 2026-09-02, PT UI): the effort opener button can be labeled `Esforço de raciocínio` (localized; the English pill bears the `thinking` token). `findComposerEffortPill` claims a pill only via the token `thinking`, a pure effort-tier label, or Pro-model context, so this localized pill is never claimed; the run falls to the legacy trailing path (`trailingCount: 0`) and dies `chip not found` before any slider fix is reached. The in-expression `normalize()` also does not fold Latin accents (only ä/ö/ü/ß), so `esforço` becomes `esfor o` — adding a Portuguese token alone is NOT enough; accent folding must be added too. The root-cause fix belongs in the picker's pill matcher + normalize, not in the slider logic. The fix has THREE layers, not two: pill tokens, accent folding, AND PT tier tokens in `LEVEL_TOKENS` — an extra-high run failing `selection-unverified` on an open slider is the tier-token layer ("Extra alto" has no accent; accent folding does not fix it).
+- Python runner deployment pitfall: `uv pip install --reinstall .` may hardlink packaged prompt templates from uv's cache, while the fail-closed runner requires `st_nlink == 1`; the CLI then reports only `review failed` before any Oracle request. Install with `uv pip install --link-mode=copy --reinstall .` and verify both installed `prompts/*.md` have link count 1 before a live run.
+- Deployment clobber between private builds (observed 2026-09-02): two diverged private fix branches were each deployed to the Mac, and the later install silently reverted the earlier one's fixes because its base predated them. `oracle --version` and `/health` parity (both `0.18.0`) does NOT prove code parity between private builds. After any Mac redeploy, grep the deployed dist over SSH (read-only) for the specific fix markers of ALL known private fixes (e.g. `thinkingTime !== "pro"` guard, `(?:of|de)` ordinal regex, PT tier tokens). Before building a new private Oracle build, run `git worktree list` and check every other private fix branch for commits your base lacks (`git log <base>..<branch> --oneline`); merge or rebase them in first, or ship them together.
+- Live canary vs offline validation: the unit-test fixtures use English labels (`"Power"`, `"High, 3 of 5"`), so a green offline suite does NOT prove localized entry buttons are recognized. A picker-localization fix is only verified by a real remote canary reaching the picker (watch `modelButton.text`/`trailingCount` in the diagnostic). Canaries that abort with `ETIMEDOUT` before submission validated nothing.
+- Launch the isolated manual-login Chrome through macOS LaunchServices (`open -g -n -a ... --args`), not a raw spawned Chromium root; `-g` is required to avoid activation. Preserve the Oracle profile, and do not copy passkeys or profile files. Avoid `--use-mock-keychain`, `--password-store=basic`, `--disable-sync`, and unrelated extension-disable flags; they can make passkeys unavailable even though Bluetooth and macOS permissions are correct.
+- A Latest `extra-high` run must not enter the strict Pro-evidence path. The browser implementation has both an initial selection assertion and a fresh pre-submit assertion. Gate both on `thinkingTime === "pro"`. If Extra High fails with `requested effort Pro`, test the direct assertion and the submission wrapper separately before redeploying.
+- Verify a repair with a real remote canary and stored session evidence: completed status, requested `thinkingTime: "extra-high"`, a fresh `Latest`/`Recente` resolved label, `modelSelection.verified: true`, and the persisted transcript marker.
+
+### Mac sleep vs canary gating
+
+This is a bounded setup step before Oracle preflight, not recovery from a failed
+preflight. If the Mac is known to be asleep, wake it before starting preflight;
+once preflight starts, any `ETIMEDOUT` is reported and stops the run. To wake it:
+when `wakeonlan`/`etherwake` are absent from the host, send the magic packet
+with a stdlib one-liner (`python3` broadcasting `b'\xff'*6 +
+bytes.fromhex('b0be83724a3f')*16` to `192.168.15.255:9`), then poll SSH for
+~60s — verified working. Note WOL wakes the Mac but the lid stays closed
+(`AppleClamshellState` still `Yes`): the canary can only run once the lid is
+physically opened. Gate the canary on BOTH
+conditions, not just reachability: SSH reachable AND `AppleClamshellState` lid
+open AND the `oracle serve` listener (port 9473) up. Then start a short
+`caffeinate -dimsu` on the Mac immediately before the run. Pitfall when
+probing the lid state over SSH: the remote awk command embedded in a
+single-quoted bash script needs exactly ONE backslash before `$2`
+(`print \$2`); double-escaping (`\\$2`) silently yields an empty value, so the
+gate never fires and the monitor loops forever. Test the exact inner command
+standalone before leaving a long-running monitor.
 
 ### Remote concurrency and recovery
 
 - The Mac bridge admits concurrent HTTP runs; the browser lease registry permits at most three ChatGPT tabs. Additional runs wait for a lease instead of returning global `busy`. Queue order follows lease acquisition races, so the waiter is not necessarily the fourth process launched.
+- Picker overlays can silently restore the old server-level single-flight guard even while the browser registry still reports `3 max`. Before deploying an overlay, require zero `let busy = false`/HTTP `busy` markers in `dist/src/remote/server.js`; after deployment, prove a peak of three established runs, three isolated results, and released leases.
 - Before reinstalling or restarting the service, inspect established connections on port `9473` and identify their local Oracle PIDs/slugs. Do not interrupt an active Herdr manager run. Stage the package first, then restart only after the bridge is quiescent.
 - A stale `chatgpt.com/` target with `document.readyState=loading` and no composer can cause `Page did not reach ready state in time`. Inspect every CDP target and close only the exact stale target; preserve completed conversations and the authenticated profile.
 - ChatGPT can leave `[data-testid=stop-button]` active after the expected answer is already visible. Treat that as a provider-stream stall, not evidence that bridge concurrency failed. If the client becomes orphaned, identify the exact canary target by its unique marker, close only that target, and verify both the server-side failed-run/released-lease log and `/status` health before continuing.
 - Capture service output with a private Screen logfile when debugging crashes, and redact the access token from every displayed command or log.
 
-## Main use case (browser, GPT-5.6)
+## Main use case (browser, ChatGPT Latest Extra High)
 
-Use browser mode with GPT-5.6 when the ChatGPT account exposes it. `GPT-5.6 Sol`
-is the model; Extra High and Pro are distinct effort levels in the Intelligence
-picker, not separate model IDs. Use `--model gpt-5.6-sol` for both and select the
-effort explicitly with `--browser-thinking-time extra-high|pro`.
+Use browser mode with ChatGPT Latest and Extra High for Gabriel's Oracle work. Model
+and effort are separate invariants: use `--model gpt-6` (mapped to the localized
+`Latest`/`Recente` picker option) and `--browser-thinking-time extra-high`. Pro is
+not the default because it consumes a separate limited quota.
 
 Recommended defaults:
 
 - Engine: browser (`--engine browser`)
-- Base Sol: `--model gpt-5.6-sol`
-- Base Sol maximum reasoning: `--browser-thinking-time extra-high` (Extra High)
-- Explicit Pro effort on GPT-5.6 Sol: `--browser-thinking-time pro` (fails closed if Pro cannot be confirmed)
-- Browser GPT-5.5 with Pro effort: `--model gpt-5.5 --browser-thinking-time pro`
-- API Pro maximum reasoning: `--model gpt-5.6-sol --reasoning-mode pro --reasoning-effort max`
-- Fallback: explicitly use `--model gpt-5.5-pro` when GPT-5.6 is unavailable
+- Model: `--model gpt-6` → ChatGPT `Latest` / `Recente`
+- Effort: `--browser-thinking-time extra-high`
+- Exceptional-complexity escalation: `--browser-thinking-time pro`
 - Attachments: directories/globs plus excludes; never attach secrets by default
+- No fallback: do not switch models, use a paid API, or use a local browser; Pro is only the deliberate escalation above
 
-GPT-5.6 availability is account-dependent. Confirm the base Sol picker and
-retain model-selection evidence. A bare `Pro` picker label proves picker
-selection but does not, by itself, prove the server-side Pro generation.
+Before long work, require a no-cost parser probe and one bounded live canary
+proving the localized `Latest`/`Recente` model label plus Extra High effort. A
+selected effort label alone is not model evidence. Do not use
+`--browser-model-strategy current` to bypass model verification.
 
-## GPT-5.6 model selection
-
-This version supports GPT-5.6 on both surfaces, but Pro selection differs:
-
-- `gpt-5.6`: follow the GPT-5.6 family default
-- `gpt-5.6-sol`: pin ChatGPT's `GPT-5.6 Sol` entry
-- Browser: `gpt-5-pro` selects ChatGPT's `Pro` target
-- API: `--reasoning-mode pro` enables Pro execution on `gpt-5.6-sol`; pair it with `--reasoning-effort max` for maximum reasoning
-
-For base Sol, use:
+Use:
 
 ```bash
-oracle --engine browser --browser-manual-login --model gpt-5.6-sol \
+oracle --engine browser --model gpt-6 \
   --browser-thinking-time extra-high \
   -p "<task>" --file "src/**"
 ```
 
-For GPT-5.6 Sol Pro through the Responses API, use:
-
-```bash
-oracle --engine api --model gpt-5.6-sol \
-  --reasoning-mode pro \
-  --reasoning-effort max \
-  -p "<task>" --file "src/**"
-```
-
-Do not use `--model "GPT-5.6 Sol Pro"`. Pro is intentionally handled as a
-browser picker target and an API reasoning mode. Browser label validation rejects unknown future
-variants such as `gpt-5.6-luna` instead of silently falling back to Sol; API
-runs preserve such provider model IDs unchanged.
-
-Browser mode maps these aliases to ChatGPT's Sol picker. API and multi-model
-runs preserve the corresponding first-party OpenAI model IDs; provider-qualified
-and unrelated custom IDs remain pass-through values.
-
-The GPT-5.6 browser support depends on the unified Intelligence picker. It
-recognizes the current English and Chinese effort labels, avoids matching
-`高` inside `极高`, and re-queries the composer pill after React replaces it so
-selection verification cannot rely on a detached stale node.
+Do not infer an API model ID or Pro mapping from the browser label. Use an API
+route only when Gabriel explicitly requests it and the provider exposes a
+verified contract.
 
 ## Golden path
 
 1. Pick the smallest file set that still contains the truth.
 2. Preview the bundle with `--dry-run` and `--files-report`.
-3. Use browser mode for GPT-5.6; use API only when explicitly intended.
+3. Use browser mode with ChatGPT Latest Extra High; use API only when explicitly intended.
 4. If a run detaches or times out, reattach to the stored session instead of
    starting a duplicate.
 
@@ -158,13 +165,15 @@ selection verification cannot rely on a detached stale node.
 
 - Preview without calling a model:
   - `npx -y @steipete/oracle --dry-run summary -p "<task>" --file "src/**" --file "!**/*.test.*"`
+
+- Preview full bundle:
   - `npx -y @steipete/oracle --dry-run full -p "<task>" --file "src/**"`
 
 - Inspect token usage:
   - `npx -y @steipete/oracle --dry-run summary --files-report -p "<task>" --file "src/**"`
 
 - Browser run:
-  - `oracle --engine browser --browser-manual-login --model gpt-5.6-sol --browser-thinking-time extra-high -p "<task>" --file "src/**"`
+  - `oracle --engine browser --model gpt-6 --browser-thinking-time extra-high -p "<task>" --file "src/**"`
 
 - Manual paste fallback:
   - `npx -y @steipete/oracle --render-markdown --copy-markdown -p "<task>" --file "src/**"`
@@ -179,7 +188,7 @@ selection verification cannot rely on a detached stale node.
 comma-separated entries.
 
 - Include: `--file "src/**"`, `--file src/index.ts`, `--file docs --file README.md`
-- Exclude: prefix a pattern with `!`, for example `--file "!src/**/*.test.ts"`
+- Exclude: prefix a pattern with `!`, for example `--file "!src/**/*.test.*"`
 - Default ignored directories: `node_modules`, `dist`, `coverage`, `.git`,
   `.turbo`, `.next`, `build`, and `tmp`
 - Globs honor `.gitignore` and do not follow symlinks.
@@ -242,12 +251,16 @@ derives the HTTP timeout unless `--http-timeout` is supplied.
   genuinely new identical run is intended.
 - Successful non-project browser one-shots are archived automatically by
   default; override with `--browser-archive never|always`.
+- For automated review pipelines, use `--browser-archive always` for disposable
+  batch chats only after local artifacts are saved; keep synthesis chats on
+  `never` when they remain useful. Require verified archive or already-archived
+  UI evidence rather than trusting a click or navigation alone.
 
 ## Prompt template
 
 Oracle starts with zero project knowledge. Include:
 
-- Project briefing: stack, services, build/test commands, and platform constraints
+- Project briefing: stack, services, build commands, and platform constraints
 - Where things live: entrypoints, configs, key modules, and dependency boundaries
 - Exact question, prior attempts, and verbatim error text
 - Constraints such as API compatibility, performance budgets, and files not to change
@@ -257,19 +270,3 @@ For a long investigation, make the prompt restorable: put a 6–30 sentence
 briefing at the top, concrete reproduction and errors in the middle, and attach
 all context files required by a fresh model at the bottom. Oracle runs are
 one-shot; the model does not remember prior runs.
-
-## Always ask for simplifications (ruling `oracle-always-ask-for-simplifications`, owner 2026-09-04)
-
-Every Oracle request carries an explicit numbered question asking for **the simplest sufficient design and what can be REMOVED**, not only a list of defects. Report those simplifications next to the verdict.
-
-When Oracle is required for a critical plan or explicitly selected for a design consult, use it before the implementation brief rather than after machinery has been designed or built. Record Oracle's recommended minimum, deletions, and rejected complexity, then make those the implementation boundary.
-
-A consult is cheap and differently shaped from a review: use a short prompt, the fewest files that contain the truth, and questions such as "is this needed?", "what is the smallest root-cause fix?", and "what can be removed?" Cap the requested answer near 1,500 words.
-
-## Operational facts for browser runs (verified 2026-09-03/04, this deployment)
-
-- **Sessions persist no ChatGPT conversation URL.** `oracle --followup <slug>` fails with "does not contain a ChatGPT conversation URL", and run-time `--browser-follow-up` is unavailable once a run completes. A follow-up is therefore a **fresh Pro one-shot with the prior run's `transcript.md` attached** — the same carry-forward pattern successive review rounds already use. This is not a re-run of an answered question, so the reattach-never-rerun rule does not bind.
-- **Many attachments need a longer upload window.** With ~10 attachments (~264 KB) the composer send button never became clickable inside the default 45 s and the run failed **pre-submit** (nothing submitted, no Pro downgrade). `ORACLE_BROWSER_ATTACHMENT_TIMEOUT=5m` fixes it; the flag is absent from `--help` but maps to `browserConfig.attachmentTimeoutMs` and is allowlisted by the Mac service. Set it from the start on any multi-attachment run. A pre-submit failure is the one case where retrying the same deterministic slug is sanctioned.
-- **Oracle auto-bundles large attachment sets** (observed at 14 files / ~376 KB) into a single concatenated text document with per-file delimiters, without `--browser-bundle-files`. It still verifies per-file SHA-256 pins; say so in the report rather than dropping evidence to stay under the threshold.
-- **Pro evidence has two shapes.** The literal `Pro, 5 of 5` / `Pro, 5 de 5` string is emitted only on the pt-BR slider path. On the already-selected chip path the evidence is `thinkingTime: "pro"` in the session config plus `modelSelection{resolvedLabel:"GPT-5.6 Sol", verified:true, source:"chatgpt-model-picker"}` and the picker line "Thinking time: Pro (already selected)". Absence of the literal string is **not** a downgrade; Oracle's own fail-closed gate not tripping is the signal that matters. Record whichever shape appeared.
-- **Pin every attachment by SHA-256 immediately before the run** and re-pin from the current head when code moved; a stale pin invalidates the whole review's grounding.

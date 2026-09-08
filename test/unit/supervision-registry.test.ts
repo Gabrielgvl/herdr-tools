@@ -66,7 +66,7 @@ describe("the supervision registry", () => {
       // No pane exists at reservation time, so no target id is back-dated into the request.
       targetIds: [],
       child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
-      settings: { reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max", reviewCadenceMinutes: 5 },
+      settings: { reviewerModel: "openai-codex/gpt-5.6-sol", reviewerThinking: "max", reviewCadenceMinutes: 5 },
     });
     expect(detail.request.target_generation_refs?.[0]).toMatch(/^target_generation_/u);
     f.supervision.shutdown();
@@ -255,7 +255,7 @@ describe("the supervision registry", () => {
   it("keeps a host with no model service visibly degraded rather than silently unreviewed", async () => {
     const f = fixture();
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    expect(f.jobs.get(reservation.jobId)?.supervision?.reviewer).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max", degraded: false });
+    expect(f.jobs.get(reservation.jobId)?.supervision?.reviewer).toMatchObject({ model: "openai-codex/gpt-5.6-sol", thinking: "max", degraded: false });
     // The default reviewer for a host without a model service always fails.
     const registry = f.supervision as unknown as { reviewer(): SupervisionReviewer };
     await expect(registry.reviewer().review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: {}, transcriptDelta: [] }, new AbortController().signal))

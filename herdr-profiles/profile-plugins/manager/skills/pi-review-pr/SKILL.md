@@ -81,7 +81,7 @@ When the user asks to post inline comments on a Notion blueprint:
 - **Never post PR comments, reviews, approvals, or plan-document comments unless the user explicitly asks in the current session.** Reading is fine; writing to GitHub, Notion, or another source is a separate user-initiated action. For a GitHub PR comment, use `gh pr comment <n> --body-file <outdir>/comment.md` with the artifact written next to `report.md`.
 - Never modify the PR branch or local checkout. `pi-review pr` works in a disposable worktree by design; `pi-review plan` is also review-only and must not rewrite the source document.
 - Findings come from the report verbatim. Do not add your own findings to the pi-review findings list. If asked for your own opinion, separate it clearly.
-- Never run two `pi-review pr` commands for the same repo concurrently; they serialize on `protocol.lock`. Avoid concurrent plan runs in the same repo as well unless the CLI explicitly documents them as safe.
+- Serialize `pi-review` runs within one repository. The repository-wide `protocol.lock` can reject contention during any journal transaction, including after model work, so same-repository concurrency can waste spend and abort a review. Reviews in different repositories may run concurrently.
 
 ## Re-review loops (fix → re-run → repeat)
 
@@ -164,7 +164,7 @@ pi-review runs a **convergence protocol**: every finding becomes a durable *thre
 
 - **Freeze the branch while a run is in flight.** Amending, rebasing, or force-pushing the reviewed branch mid-run kills the run with `ERROR: reconcile headSha mismatch` and its model spend is lost (aicodeflow 2026-07-23: an amend during round 5 wasted the whole round). Land every commit BEFORE launching, and queue further edits until the report returns.
 
-- **Ops notes.** Runs on the SAME repo serialize on `protocol.lock` — never launch two `pi-review pr` runs for one repo concurrently (the second dies with a lock error). Check semantic-matching health with `pi-review calibrate status` (matcher + adjudicator must show CALIBRATED; artifacts live machine-wide in `~/.local/share/pi-review/calibration/`); a degraded role warns on stderr at run start with the exact `pi-review calibrate protocol --role <role>` remediation — calibrate before spending on a review, since without the matcher, drifted threads can't close and dismissal suppression narrows to exact-id.
+- **Ops notes.** Serialize all `pi-review` operations within one repository; different repositories may run concurrently. Check semantic-matching health with `pi-review calibrate status` (matcher + adjudicator must show CALIBRATED; artifacts live machine-wide in `~/.local/share/pi-review/calibration/`); a degraded role warns on stderr at run start with the exact `pi-review calibrate protocol --role <role>` remediation — calibrate before spending on a review, since without the matcher, drifted threads can't close and dismissal suppression narrows to exact-id.
 
 - **Failure mode observed 2026-07-16 (why this section exists).** Two PRs were fixed and re-run without ever submitting responses. Every following invocation re-listed the same threads and stayed `BLOCKED` — the verdict was gated on stale thread artifacts, not live code findings, and a post-fix rebase then blocked the responses path too (this predated `--rebased`).
 
@@ -224,4 +224,13 @@ pi-review runs a **convergence protocol**: every finding becomes a durable *thre
 - **Admitted models are configuration.** `--models` ids must be active in pi-review's configuration (`~/workspace/pi-review/src/config.mjs`; "invalid reviewer[0] model (… is not active in any configuration)" is a pre-spend rejection). Verified 2026-09-03: `opencode-go/deepseek-v4-flash` works as a full-diff finder (~$0.06/round); `opencode-go/glm-5.3-flash` is the reserved independent final-audit model (ADR-0010) and must NOT be seated as a finder; the Cursor Opus route (`cursor/claude-4.6-opus[-thinking]`) emits output the strict finder parser rejects; matcher and adjudicator are calibrated on `openai-codex/gpt-5.6-luna:high` — changing their id decalibrates them (a Codex quota hit there needs an owner decision, not a config edit).
 - **Codex usage limits surface as parse errors.** A finder trace ending in `"stopReason":"error","errorMessage":"Codex error: The usage limit has been reached"` produces `[parse:<model>] unparseable reviewer output after retry` (exit 2). Read the trace dir before retrying.
 - **Abandoned-attempt ceiling.** After three aborted attempts in a session the CLI requires `--override-abandoned-attempts "<reason>"`; the reason must state the real attempt count and any spend — do not reuse a reason written before a paid attempt.
-- **Never two `pi-review pr` runs for one repo at once**, even from different lanes: check `pgrep -fa 'pi-review pr'` and `protocol.lock` before launching; wait bounded, then stop.
+- **Concurrent runs.** Never run concurrent operations within the same repository. The repository-wide lock may contend after model work, so serialize PR, plan, and session operations rather than relying on retry. Different repositories may run concurrently.
+
+## Lessons 2026-09-06 (fixed bundles)
+
+- `responses.rN.json`: `headSha` = the reviewed round's head; every `bundles[].commit` = the current PR head; `expectedRevision` from the last report. Mix-ups fail pre-spend: `response headSha mismatch`, `fixed response commit must descend from envelope headSha`. Write the bundle after the last amend.
+- Copy `reviewSessionId` and `reviewInvocationId` byte-for-byte from the authoritative previous `report.json`. `reviewInvocationId` must be the full UUID, never the 8-character display prefix. A prefix passes casual inspection but fails pre-spend with `response session/invocation mismatch`. Before invoking, compare both fields for exact equality against the previous report, not with `startswith`.
+- Each bundle's `rootCause`, `intendedInvariant`, and `validationEvidence` is capped at 2,000 characters. Validate those lengths before invoking. A larger field fails pre-spend, so do not rely on JSON/schema shape alone.
+- Rebased since the last round → `--rebased`. The session is keyed per PR number, so a retargeted stacked PR keeps its rounds.
+- Unchanged thread text across rounds is persisted text, not a missed read (`traces/adjudicator-*.jsonl`). Before re-fixing a still-open thread, get file:line proof at the reviewed head.
+- Runner clone with `staging` checked out: `git pull --ff-only origin staging` before each run.

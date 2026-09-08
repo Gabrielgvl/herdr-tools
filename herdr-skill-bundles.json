@@ -13,7 +13,7 @@
   "bundles": {
     "herdr-profiles/profile-plugins/manager/skills/manager": {
       "source": "./herdr-profiles/role-plugins/manager/skills/manager",
-      "treeHash": "6844607da9d4d64f05d380b838f67c8c90fcacce980846b8e079dd176a9ca7ca"
+      "treeHash": "8e18ad8edca787d5b98509f2bd5f4ab3ca9f4600b78baff8d3a739ffcb88e210"
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",
@@ -29,19 +29,19 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/engineering-project-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/engineering-project-manager",
-      "treeHash": "ba8f3be92b32a4a314dce5a750b7d2de5edff446d307a5002aaabec5afd97d8e"
+      "treeHash": "c785a5e19179a2f790b214a27a75e43de9735d6c28ce9ff00ff7b8b4eeb3bdaf"
     },
     "herdr-profiles/profile-plugins/manager/skills/herdr-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/herdr-manager",
-      "treeHash": "bb0fe0507f5facfe9c85fdbe5a49aa593a4df484d71d9ebdd7dc2eefdff4d0b0"
+      "treeHash": "5da886e9d30fe64dd4cfc617281840fcda6495e707fd888b50af487b128fdd45"
     },
     "herdr-profiles/profile-plugins/manager/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "2cc2ceecefed320027b8485ce9bd0d3d98904f05cb03c05f169e4d520d0e8c10"
+      "treeHash": "d68a425d40821b2b2d841bf447417588af6bbe4be5c7d37b49288eb2562b7d2b"
     },
     "herdr-profiles/profile-plugins/manager/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "9b620cba963c972ad706bc6211f44addcf2f6b981e573da4b5066ddad0929ba2"
+      "treeHash": "43644ca6b0a7d39a02d844a6fc8c7475c460683d6ba09baf279d63ef8e5612d7"
     },
     "herdr-profiles/role-plugins/planner/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -57,7 +57,7 @@
     },
     "herdr-profiles/role-plugins/planner/skills/engineering-project-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/engineering-project-manager",
-      "treeHash": "ba8f3be92b32a4a314dce5a750b7d2de5edff446d307a5002aaabec5afd97d8e"
+      "treeHash": "c785a5e19179a2f790b214a27a75e43de9735d6c28ce9ff00ff7b8b4eeb3bdaf"
     },
     "herdr-profiles/role-plugins/planner/skills/humanizer": {
       "source": "/home/gabriel/.codex/skills/humanizer",
@@ -69,7 +69,7 @@
     },
     "herdr-profiles/role-plugins/planner/skills/ponytail": {
       "source": "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills/ponytail",
-      "treeHash": "b2639078d9d1d846eaed1663cd1526053a646cb5d49a58bf055dd6cacefd5948"
+      "treeHash": "63be84c701fa7e28447afe64fa6add09454c8dfa96b4a19503725ec7f00e8bf3"
     },
     "herdr-profiles/role-plugins/promoter/skills/authenticated-staging-smoke": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/authenticated-staging-smoke",
@@ -117,11 +117,11 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "2cc2ceecefed320027b8485ce9bd0d3d98904f05cb03c05f169e4d520d0e8c10"
+      "treeHash": "d68a425d40821b2b2d841bf447417588af6bbe4be5c7d37b49288eb2562b7d2b"
     },
     "herdr-profiles/role-plugins/reviewer/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "9b620cba963c972ad706bc6211f44addcf2f6b981e573da4b5066ddad0929ba2"
+      "treeHash": "43644ca6b0a7d39a02d844a6fc8c7475c460683d6ba09baf279d63ef8e5612d7"
     },
     "herdr-profiles/role-plugins/reviewer/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",
@@ -129,7 +129,7 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/ponytail": {
       "source": "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills/ponytail",
-      "treeHash": "b2639078d9d1d846eaed1663cd1526053a646cb5d49a58bf055dd6cacefd5948"
+      "treeHash": "63be84c701fa7e28447afe64fa6add09454c8dfa96b4a19503725ec7f00e8bf3"
     },
     "herdr-profiles/role-plugins/worker/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -153,7 +153,7 @@
     },
     "herdr-profiles/role-plugins/worker/skills/ponytail": {
       "source": "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills/ponytail",
-      "treeHash": "b2639078d9d1d846eaed1663cd1526053a646cb5d49a58bf055dd6cacefd5948"
+      "treeHash": "63be84c701fa7e28447afe64fa6add09454c8dfa96b4a19503725ec7f00e8bf3"
     },
     "herdr-profiles/profile-plugins/executor/skills/executor": {
       "source": "/home/gabriel/workspace/courier/.pi/skills/executor",

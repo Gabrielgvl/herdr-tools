@@ -33,6 +33,9 @@ expected — to recommend exact ticket or status updates.
 
 Separate **confirmed** facts from **likely** inferences throughout.
 
+For rollout, migration, infrastructure, and retirement work, report implementation and operational
+state separately. A merged PR or Linear Done state does not prove cutover or retirement.
+
 ## Accepted inputs
 
 Start from one of these:
@@ -166,6 +169,9 @@ Detect and classify these Linear ↔ git/GitHub mismatches. Each has a
 | WIP on wrong branch | Uncommitted changes on a branch not matching any active ticket | ❓ Note — surface it |
 | Shadow work | Local branch has no matching Linear ticket | ❓ Flag — untracked work |
 | Stale blocker | Blocking ticket is Done but dependency edge still exists | 🧹 Low — remove the edge |
+| Done but operationally open | Done while required rollout, soak, drain, or retirement evidence is incomplete | 🔴 High — restore operational ownership |
+| Unanchored qualification | A required soak or health window has no proven start time | 🔴 High — report NOT_PROVEN and identify the anchoring evidence |
+| Savings without evidence | Savings are claimed without resource-absence or billing evidence | ⚠️ Medium — label forecast, not realized savings |
 
 ---
 
@@ -196,6 +202,9 @@ Detect and classify these Linear ↔ git/GitHub mismatches. Each has a
 | 🧹 Needs Cleanup | Merged but not closed, closed but branch live, stale blocker edge |
 | ❓ Spec Incomplete | Missing description or acceptance criteria |
 | 👻 Shadow Work | Local branch with no matching Linear ticket |
+
+For operational work, also report the furthest proven phase: IMPLEMENTED, ACTIVATED, QUALIFIED,
+DRAINED, RETIRED, or COST_CONFIRMED. Missing evidence leaves later phases NOT_PROVEN.
 
 ---
 

@@ -20,7 +20,7 @@ The manager is a normal interactive Claude session in a Herdr pane, not a native
 - All Claude waits are detached and polled through `herdr_jobs`. The adapter performs no self-communication and no automatic turn injection.
 - Profile discovery behavior is unchanged for this slice. The MCP runtime uses the manager session's authoritative project directory, never a plugin installation directory and never a directory derived from the module path. The `manager-claude` profile and the interactive plugin use the same manager plugin and shared skill.
 - The manager plugin is self-contained under `herdr-profiles/role-plugins/manager/`: stable `herdr-tools` manifest and `herdr` server identity, the local MCP registration, and the shared manager skill. The `manager-claude` profile keeps `default` permission mode, pre-approves only its core/research/Herdr namespace, disallows only `Task`, and leaves Bash/Edit/Write owner-gated.
-- Primary model selection stays a launch/user configuration concern: the manager is started with `--model claude-fable-5` or switched with `/model fable`. The skill reports a mismatch and stops; it never claims enforcement.
+- Primary model selection stays a launch/user configuration concern: the manager is started with `--model fable`, the rolling alias Claude Code resolves to the latest supported Fable model, or switched with `/model fable`. The skill reports a mismatch and stops; it never claims enforcement.
 - Unit coverage stays at 100% for the coverage-included sources. Integration uses only the disposable named session `herdr-tools-integration` and never the live workspace.
 
 This slice is the Claude-to-Herdr control bridge and the manager plugin consolidation authorized for the primary interactive manager session and the explicit `manager-claude` profile. The ask-first gate remains in force for any Claude worker profile with Herdr lifecycle tools.
@@ -235,7 +235,7 @@ HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration -- --session herdr-tools-
 Manager session startup, from the manager's project directory inside a Herdr pane:
 
 ```bash
-claude --model claude-fable-5 \
+claude --model fable \
   --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/role-plugins/manager
 ```
 

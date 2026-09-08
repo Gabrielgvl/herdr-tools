@@ -698,14 +698,19 @@ describe("profile catalog", () => {
     expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual([]);
     const managerClaude = catalog.effective.get("manager-claude")!;
     const managerClaudeTools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "Edit", "Write", "mcp__plugin_herdr-tools_herdr", executorClaudeTool];
-    expect(managerClaude.runtime).toEqual({ kind: "claude", model: "claude-fable-5", effort: "high", permissionMode: "default", allowedTools: managerClaudeTools, disallowedTools: ["Task"], addDirs: [], pluginDirs: [managerProfilePlugin, executorProfilePlugin], developmentChannels: ["server:herdr"] });
+    expect(managerClaude.runtime).toEqual({ kind: "claude", model: "fable", effort: "high", permissionMode: "default", allowedTools: managerClaudeTools, disallowedTools: ["Task"], addDirs: [], pluginDirs: [managerProfilePlugin, executorProfilePlugin], developmentChannels: [] });
+    // The rolling alias tracks the latest supported Fable model, and the profile
+    // opts into no development channel, so no inbound-channel flag is emitted.
+    expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.developmentChannels).toEqual([]);
+    expect(buildProfileArgv(managerClaude)).not.toEqual(expect.arrayContaining(["--dangerously-load-development-channels"]));
+    expect(buildProfileArgv(managerClaude)).not.toEqual(expect.arrayContaining(["server:herdr"]));
     expect(managerClaude.sessionPersistence).toBe(true);
     expect(managerClaude.timeoutMinutes).toBe(30);
     expect(managerClaude.fallbackProfiles).toEqual([]);
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.allowedTools).toEqual(expect.arrayContaining(["Edit", "Write"]));
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.allowedTools).not.toEqual(expect.arrayContaining(["Bash", "NotebookEdit"]));
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.disallowedTools).toEqual(["Task"]);
-    expect(buildProfileArgv(managerClaude)).toEqual(["--model", "claude-fable-5", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", managerProfilePlugin, "--plugin-dir", executorProfilePlugin, "--dangerously-load-development-channels", "server:herdr"]);
+    expect(buildProfileArgv(managerClaude)).toEqual(["--model", "fable", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", managerProfilePlugin, "--plugin-dir", executorProfilePlugin]);
     expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
     expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-agy"]);
     const workerAgy = catalog.effective.get("worker-agy")!;

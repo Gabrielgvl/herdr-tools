@@ -56,7 +56,7 @@ describe("the supervision reviewer", () => {
       async (selected, _context, options) => { calls.push({ model: selected as Model<Api>, options: options as Record<string, unknown> }); return message(JSON.stringify({ classification: "progress", summary: "moving" })); },
     );
     await expect(reviewer.review(request, new AbortController().signal)).resolves.toEqual({ classification: "progress", summary: "moving" });
-    expect(SUPERVISION_REVIEWER_MODEL).toBe("openai-codex/gpt-5.6-luna");
+    expect(SUPERVISION_REVIEWER_MODEL).toBe("openai-codex/gpt-5.6-sol");
     expect(calls[0]!.options).toMatchObject({ reasoningEffort: SUPERVISION_REVIEWER_THINKING, apiKey: "k", headers: { a: "b" } });
     expect(SUPERVISION_REVIEWER_THINKING).toBe("max");
     // The pinned level must travel under the name the transport reads; an

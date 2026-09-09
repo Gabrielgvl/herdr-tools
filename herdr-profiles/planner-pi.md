@@ -2,11 +2,11 @@
 name: planner-pi
 description: Plan implementation work from repository evidence and explicit constraints.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: pi
-  model: openai-codex/gpt-5.6-sol
-  thinking: medium
+  model: openai-codex/gpt-6-astra
+  thinking: xhigh
   tools:
     - read
     - bash

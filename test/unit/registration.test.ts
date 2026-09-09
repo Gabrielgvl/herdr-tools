@@ -121,7 +121,7 @@ describe("global extension registration", () => {
   });
 
   it("creates a compatibility preflight for the registered CLI", async () => {
-    const exec = vi.fn<PiExec>().mockResolvedValue({ stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true } }), stderr: "", code: 0, killed: false });
+    const exec = vi.fn<PiExec>().mockResolvedValue({ stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } }), stderr: "", code: 0, killed: false });
     await expect(createPreflight(new HerdrCli(exec))(new AbortController().signal)).resolves.toBeUndefined();
     expect(exec).toHaveBeenCalledWith("herdr", ["status", "--json"], expect.anything());
   });

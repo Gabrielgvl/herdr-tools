@@ -43,7 +43,7 @@ function rawPane(overrides: Record<string, unknown> = {}): Record<string, unknow
 }
 
 function snapshot(panes: Record<string, unknown>[], agents: Record<string, unknown>[]): HerdrSnapshot {
-  return parseSnapshotResult({ type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents } });
+  return parseSnapshotResult({ type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 22, workspaces: [], tabs: [], panes, agents } });
 }
 
 function agyPane(overrides: Record<string, unknown> = {}): Record<string, unknown> {

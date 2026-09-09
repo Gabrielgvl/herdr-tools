@@ -94,7 +94,7 @@ describe("the session event monitor", () => {
     expect(peer.requests).toEqual(["session.snapshot", "events.subscribe"]);
 
     // An explicit reconciliation is still a unary read on its own connection.
-    expect((await monitor.snapshot()).protocol).toBe(20);
+    expect((await monitor.snapshot()).protocol).toBe(22);
     expect(connect).toHaveBeenCalledTimes(3);
     expect(peer.requests).toEqual(["session.snapshot", "events.subscribe", "session.snapshot"]);
     monitor.stop();

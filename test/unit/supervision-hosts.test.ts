@@ -10,7 +10,7 @@ import type { SupervisedIdentity } from "../../src/supervision/identity.js";
 const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
 const pane = { pane_id: "p1", terminal_id: "t1", tab_id: "t", workspace_id: "w", agent_status: "idle", revision: 3, agent: "pi", agent_session: session };
-const snapshot = { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes: [pane], agents: [{ pane_id: "p1", name: "worker" }] } };
+const snapshot = { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 22, workspaces: [], tabs: [], panes: [pane], agents: [{ pane_id: "p1", name: "worker" }] } };
 
 const servers: Server[] = [];
 const directories: string[] = [];

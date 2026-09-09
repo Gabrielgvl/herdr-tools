@@ -204,6 +204,12 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   onSignal("SIGINT", () => { void shutdown(); });
   onSignal("SIGTERM", () => { void shutdown(); });
 
-  await server.connect(deps.transport ?? new StdioServerTransport());
+  const transport = deps.transport ?? new StdioServerTransport();
+  if (!deps.transport) {
+    const onClientDisconnect = () => { void shutdown(); };
+    process.stdin.once("end", onClientDisconnect);
+    process.stdin.once("close", onClientDisconnect);
+  }
+  await server.connect(transport);
   return { server, surface, jobs, supervision, ownership, context: startup.context, projectDir: startup.projectDir, shutdown };
 }

@@ -20,7 +20,7 @@ The seven public tools are unchanged: `herdr_inspect`, `herdr_communicate`, `her
 ## 2. Protocol facts this design is built on
 
 These were established against the installed Herdr 0.8.2 (`herdr api schema --json`,
-protocol 20) and by probing the live local socket. They are load-bearing; a future Herdr
+protocol 22) and by probing the live local socket. They are load-bearing; a future Herdr
 that breaks them breaks supervision loudly rather than silently.
 
 **F1 — transport.** The socket at `HERDR_SOCKET_PATH` speaks newline-delimited JSON.
@@ -136,7 +136,7 @@ src/supervision/
   monitor.ts     SessionEventMonitor: one connection, bootstrap, reconnect, fan-out
   identity.ts    exact child identity, continuity, and move-continuity rules
   events.ts      transition folding, material-wake classification, opaque event IDs
-  reviewer.ts    supervisor reviewer (gpt-5.6-sol, thinking=max) + model service seam
+  reviewer.ts    supervisor reviewer (gpt-5.6-luna, thinking=max) + model service seam
   notify.ts      ManagerNotifier: Pi sendMessage and Claude Channel implementations
   supervisor.ts  one child's state machine, cadence, degradation, receipts
   registry.ts    SupervisionRegistry: reserve → bind → settle, job ownership
@@ -326,7 +326,7 @@ supervisor job settles immediately after the wake.
 
 - Cadence: `settings.wait.reviewCadenceMinutes` (default 5), measured from the start of a
   **continuous** `working` run. Any transition out of `working` resets the timer.
-- Model: exactly `openai-codex/gpt-5.6-sol`, `thinkingLevel: "max"`. This is a module
+- Model: exactly `openai-codex/gpt-5.6-luna`, `thinkingLevel: "max"`. This is a module
   constant, not a setting: the setting `wait.reviewerModel` continues to govern the
   explicit `herdr_wait` reviewer, which stays Luna at `low`.
 - Evidence: bounded compact pane metadata plus the transcript delta since the previous
@@ -538,9 +538,8 @@ operation. No compatibility shim preserves the old wording.
   neither set nor observe, and the unproven opt-in additionally produced org-policy and
   missing-MCP-server warnings at startup. `manager-claude` therefore declares no channels, and
   its wakes are recovered by `herdr_jobs` polling. The risk applies only to a profile that
-  chooses to opt in; soft receipts make every *retained* event recoverable through `herdr_jobs get`
-  while `truncatedEvents` reports evictions from the bounded log, and Pi delivery is
-  unaffected.
+  chooses to opt in; soft receipts make every event recoverable through `herdr_jobs get`, and
+  Pi delivery is unaffected.
 - **R2 — replay volume and observer load.** A long-lived Herdr session replays a large log
   on every connect and reconnect, and `pane.updated` fires on output changes for every pane
   in the session. The monitor parses each line under a per-line bound and discards

@@ -7,7 +7,7 @@ import { parseProfile, profileSource, type ProfileCatalog } from "../../src/prof
 
 const snapshot: HerdrSnapshot = {
   version: "0.8.0",
-  protocol: 20,
+  protocol: 22,
   workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
   tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
   panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle", agent_name: "caller" }],
@@ -54,7 +54,7 @@ describe("herdr_inspect", () => {
     expect(content).toMatchObject({ modelVisible: true, operation: "inspect", kind: "target", context: { injected: context, effective: context, rebound: false, attempts: 1 } });
     expect(result.details.recentUnwrappedLines).toEqual(Array.from({ length: 100 }, (_, i) => `line-${i + 38}`));
     expect(calls).toContainEqual(["pane", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "100", "--format", "text"]);
-    const healthCli = new HerdrCli(vi.fn<PiExec>().mockResolvedValue({ stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "stopped" } }), stderr: "", code: 0, killed: false }));
+    const healthCli = new HerdrCli(vi.fn<PiExec>().mockResolvedValue({ stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 22 }, server: { status: "stopped" } }), stderr: "", code: 0, killed: false }));
     await expect(createInspectTool({ cli: healthCli, context }).execute("id", { mode: "health" } as never, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { kind: "health" } });
   });
 
@@ -77,14 +77,14 @@ describe("herdr_inspect", () => {
     expect(Buffer.byteLength(contentText(collection), "utf8")).toBeLessThanOrEqual(MAX_INSPECT_CONTENT_BYTES);
 
     const healthExec = vi.fn<PiExec>().mockResolvedValue({
-      stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true, socket: "/secret/socket" } }),
+      stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true, socket: "/secret/socket" } }),
       stderr: "",
       code: 0,
       killed: false
     });
     const healthResult = await createInspectTool({ cli: new HerdrCli(healthExec), context, environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true, secret: "health-secret" } as never }).execute("id", { mode: "health" } as never, new AbortController().signal, undefined, extensionContext);
     const healthContent = JSON.parse(contentText(healthResult)) as Record<string, unknown>;
-    expect(healthContent).toMatchObject({ modelVisible: true, kind: "health", client: { protocol: 20 }, server: { status: "running", protocol: 20 }, socketReachable: true, compatible: true, environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true } });
+    expect(healthContent).toMatchObject({ modelVisible: true, kind: "health", client: { protocol: 22 }, server: { status: "running", protocol: 22 }, socketReachable: true, compatible: true, environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true } });
     expect(JSON.stringify(healthContent)).not.toContain("/secret/socket");
     expect(JSON.stringify(healthContent)).not.toContain("health-secret");
     expect(Buffer.byteLength(contentText(healthResult), "utf8")).toBeLessThanOrEqual(MAX_INSPECT_CONTENT_BYTES);
@@ -193,13 +193,13 @@ describe("herdr_inspect", () => {
 
   it("reports health without exposing the socket path", async () => {
     const exec = vi.fn<PiExec>().mockResolvedValue({
-      stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true, socket: "/secret/socket" } }),
+      stdout: JSON.stringify({ client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true, socket: "/secret/socket" } }),
       stderr: "",
       code: 0,
       killed: false
     });
     const result = await execute(new HerdrCli(exec), { mode: "health" });
-    expect(result.details).toMatchObject({ kind: "health", client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20 }, compatible: true, socketReachable: true });
+    expect(result.details).toMatchObject({ kind: "health", client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22 }, compatible: true, socketReachable: true });
     expect(JSON.stringify(result.details)).not.toContain("/secret/socket");
   });
 
@@ -250,7 +250,7 @@ describe("herdr_inspect", () => {
   });
 
   it("rejects malformed health output and reports an incompatible running state", async () => {
-    for (const stdout of ["not-json", "null", JSON.stringify({ client: {}, server: {} }), JSON.stringify({ client: { version: "0.8.0", protocol: 20 }, server: { status: "stopped", version: "0.8.0", protocol: 20, compatible: false } })]) {
+    for (const stdout of ["not-json", "null", JSON.stringify({ client: {}, server: {} }), JSON.stringify({ client: { version: "0.8.0", protocol: 22 }, server: { status: "stopped", version: "0.8.0", protocol: 22, compatible: false } })]) {
       const exec = vi.fn<PiExec>().mockResolvedValue({ stdout, stderr: "", code: 0, killed: false });
       if (stdout.includes('"compatible":false')) {
         await expect(execute(new HerdrCli(exec), { mode: "health" })).resolves.toMatchObject({ details: { socketReachable: false, compatible: false } });

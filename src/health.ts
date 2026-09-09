@@ -15,7 +15,7 @@ export type CompatibilityPreflight = (signal: AbortSignal) => Promise<void>;
 
 export const MAX_HEALTH_VERSION_LENGTH = 128;
 export const MAX_HEALTH_STATUS_LENGTH = 64;
-export const REQUIRED_HERDR_PROTOCOL = 20;
+export const REQUIRED_HERDR_PROTOCOL = 22;
 
 function validVersion(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_HEALTH_VERSION_LENGTH;

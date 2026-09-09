@@ -8,7 +8,7 @@ const injected: CurrentContext = { workspaceId: "w1", tabId: "w1:t1", paneId: "w
 function snapshotFor(overrides: Partial<HerdrSnapshot> = {}): HerdrSnapshot {
   return {
     version: "0.8.2",
-    protocol: 20,
+    protocol: 22,
     workspaces: [
       { workspace_id: "w1", label: "one" },
       { workspace_id: "w2", label: "two" }

@@ -5,7 +5,7 @@ import type { HerdrSnapshot, PaneRecord } from "../../src/targets.js";
 function snapshot(pane: PaneRecord, agents: HerdrSnapshot["agents"] = []): HerdrSnapshot {
   return {
     version: "0.8.0",
-    protocol: 20,
+    protocol: 22,
     workspaces: [{ workspace_id: "w1", label: "workspace" }],
     tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main" }],
     panes: [pane],

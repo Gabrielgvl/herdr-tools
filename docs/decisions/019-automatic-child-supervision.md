@@ -6,12 +6,6 @@ Accepted. Extends ADR-002 (detached wait jobs) and ADR-018 (detached-only wait A
 second job kind, and removes the "never call Herdr's socket directly" constraint recorded in
 `SPEC.md`.
 
-Superseded in part by ADR-023: the `manager-claude` development-channel opt-in recorded below
-is retired, and Claude manager wakes are recovered by bounded `herdr_jobs` polling instead. The
-supervisor reviewer model recorded below is now `openai-codex/gpt-5.6-sol` at `thinking: "max"`;
-the exact-model and module-constant decisions themselves are unchanged. The body is preserved as
-the historical record.
-
 ## Date
 
 2026-08-31

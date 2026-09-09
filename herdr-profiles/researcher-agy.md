@@ -5,7 +5,7 @@ timeoutMinutes: 30
 sessionPersistence: true
 runtime:
   kind: agy
-  model: gemini-3.8-flash-high
+  model: gemini-3.8-flash-low
   mode: plan
   addDirs: []
 fallbackProfiles:

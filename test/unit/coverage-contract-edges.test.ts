@@ -34,7 +34,7 @@ const supervisorRequest: SupervisorJobRequestSnapshot = {
 const session = { source: "pi", agent: "pi", kind: "id", value: "session-1" };
 
 function snapshot(panes: Record<string, unknown>[], agents: Record<string, unknown>[]): HerdrSnapshot {
-  return { version: "1", protocol: 20, workspaces: [], tabs: [], panes, agents } as unknown as HerdrSnapshot;
+  return { version: "1", protocol: 22, workspaces: [], tabs: [], panes, agents } as unknown as HerdrSnapshot;
 }
 
 function pane(overrides: Record<string, unknown> = {}): Record<string, unknown> {

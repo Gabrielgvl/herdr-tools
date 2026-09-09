@@ -25,9 +25,9 @@ for each other.
 ## Validated product decisions
 
 - Herdr Core is not changed. No Rust work, no new CLI surface, no new Herdr API.
-- `researcher-agy` is the research default and uses `gemini-3.8-flash-high` with
+- `researcher-agy` is the research default and uses `gemini-3.8-flash-low` with
   fixed `--mode plan` and `--dangerously-skip-permissions`. `scout-agy` is the
-  reconnaissance default with `--mode plan` and chain `scout-agy -> scout-claude ->
+  reconnaissance default, also uses `gemini-3.8-flash-low`, with `--mode plan` and chain `scout-agy -> scout-claude ->
   scout-pi`; `worker-pi` remains the implementation default and chains through
   `worker-agy` with fixed `--mode accept-edits` before `worker-claude`. Researcher's
   exact chain is `researcher-agy -> researcher-claude -> researcher-pi`. Primary
@@ -94,7 +94,7 @@ No text delivery uses `--wait`, `--until`, or a synthesized Enter. For
 are the complete identity source: one strict join must establish the exact pane ID,
 terminal ID, agent name/kind, and complete `agent_session`, while every supplied field
 must agree and omitted/null fields remain absent. For a Pi or Claude
-`herdr_launch.assignment`, real Herdr protocol 20 `agent_started` records may omit
+`herdr_launch.assignment`, real Herdr protocol 22 `agent_started` records may omit
 identity fields. Launch therefore runs one bounded, read-only identity-readiness
 preflight with short polling before dispatch or recipient registration. Every sample
 freshly reads snapshot, `agent get`, and pane, and joins that one sample only with fields

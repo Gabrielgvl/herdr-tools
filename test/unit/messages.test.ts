@@ -16,7 +16,7 @@ const targetIdentity = { terminal_id: "term-worker", agent_session: { source: "h
 const agySession = { source: "agy", agent: "agy", kind: "id", value: "session-agy" };
 const snapshot: HerdrSnapshot = {
   version: "0.8.0",
-  protocol: 20,
+  protocol: 22,
   workspaces: [],
   tabs: [],
   panes: [{ pane_id: "w:p1", tab_id: "w:t1", workspace_id: "w1", agent_name: "worker", agent_id: "agent-1", agent: "pi", ...targetIdentity }],

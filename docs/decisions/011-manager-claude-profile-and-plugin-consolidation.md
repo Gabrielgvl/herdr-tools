@@ -3,9 +3,6 @@
 ## Status
 
 Accepted; supersedes only the manager-claude rejection portions of ADR-007 and ADR-010.
-Superseded in part by ADR-023: the `model: claude-fable-5` clause of the exact runtime
-contract below is retired in favour of the rolling `fable` alias. The body is preserved as
-the historical record; every other clause stands.
 
 ## Date
 

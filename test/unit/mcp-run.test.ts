@@ -51,7 +51,7 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 
 const { runHerdrMcpServer, packageRoot, refusalLine, fatalLine, MCP_SERVER_NAME } = await import("../../src/mcp/run.js");
 
-const health = { client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true } };
+const health = { client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } };
 const snapshot = {
   type: "session_snapshot",
   snapshot: {
@@ -273,6 +273,7 @@ describe("MCP server startup", () => {
 
   it("uses the stdio transport and process signal handlers when none are injected", async () => {
     const once = vi.spyOn(process, "once").mockReturnValue(process);
+    const stdinOnce = vi.spyOn(process.stdin, "once").mockReturnValue(process.stdin);
     const exits: number[] = [];
     const handle = await runHerdrMcpServer({
       env,
@@ -284,9 +285,10 @@ describe("MCP server startup", () => {
     expect(stdioTransports).toHaveLength(1);
     expect(stdioTransports[0]).toMatchObject({ started: true });
     expect(once.mock.calls.map((call) => call[0])).toEqual(["SIGINT", "SIGTERM"]);
-    await handle!.shutdown();
+    expect(stdinOnce.mock.calls.map((call) => call[0])).toEqual(["end", "close"]);
+    for (const [, listener] of stdinOnce.mock.calls) listener();
+    await vi.waitFor(() => expect(exits).toEqual([0]));
     expect(stdioTransports[0]).toMatchObject({ closed: true });
-    expect(exits).toEqual([0]);
   });
 });
 

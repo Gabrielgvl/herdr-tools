@@ -2,11 +2,11 @@
 name: manager-pi
 description: Visible Herdr orchestration, scoped Executor access, and evidence synthesis.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: pi
-  model: openai-codex/gpt-5.6-sol
-  thinking: medium
+  model: openai-codex/gpt-6-astra
+  thinking: low
   tools:
     - read
     - grep

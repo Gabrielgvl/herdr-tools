@@ -54,7 +54,7 @@ function agyAgentRecord(overrides: Record<string, unknown> = {}): Record<string,
 }
 
 function snapshot(panes: Array<Record<string, unknown>>, agents: Array<Record<string, unknown>> = [{ pane_id: "p1", name: "worker" }]): HerdrSnapshot {
-  return parseSnapshotResult({ type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents } });
+  return parseSnapshotResult({ type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 22, workspaces: [], tabs: [], panes, agents } });
 }
 
 /** Events reach a supervisor already validated by the protocol boundary. */

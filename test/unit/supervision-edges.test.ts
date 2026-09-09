@@ -31,7 +31,7 @@ function paneRecord(status = "working", revision = 5, paneId = "p1"): Record<str
 }
 
 function snapshot(panes: Array<Record<string, unknown>>, agents: Array<Record<string, unknown>> = [{ pane_id: "p1", name: "worker" }]): HerdrSnapshot {
-  return parseSnapshotResult({ type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents } });
+  return parseSnapshotResult({ type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 22, workspaces: [], tabs: [], panes, agents } });
 }
 
 /** Events reach a supervisor already validated by the protocol boundary. */
@@ -469,7 +469,7 @@ describe("review-round remediations", () => {
         type: "session_snapshot",
         snapshot: {
           version: "0.8.2",
-          protocol: 20,
+          protocol: 22,
           workspaces: [],
           tabs: [],
           panes: [{ pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "idle", revision: 5, agent: "claude", agent_session: claudeSession }],

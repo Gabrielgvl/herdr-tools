@@ -37,7 +37,7 @@ function snapshot(pane: Record<string, unknown> | null = workerPane("working"), 
   const effectiveAgent = agent === null || pane === null ? undefined : agent ?? workerAgent(String(pane.agent_status ?? "working"), safeSeq(pane.state_change_seq));
   return {
     version: "0.8.2",
-    protocol: 20,
+    protocol: 22,
     workspaces: [{ workspace_id: "w1", label: "workspace" }],
     tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main" }],
     panes: [callerPane, ...(pane ? [pane as never] : [])],

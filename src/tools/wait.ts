@@ -651,7 +651,7 @@ async function readNativeTarget(
     control?.check();
     checkAbort(signal);
     const { record, status } = nativeAgentRecord(raw, item.target.paneId!);
-    // Herdr protocol 20's wait_matched event carries the matched pane/status but
+    // Herdr protocol 22's wait_matched event carries the matched pane/status but
     // not always the complete occupant identity. Fresh pane/agent records supply
     // the resolved metadata and bind partial events to the captured occupant.
     const pane = await readFreshPane(cli, item.target.paneId!, signal, control);

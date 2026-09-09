@@ -14,7 +14,7 @@ import { CommunicateParamsSchema } from "../../src/schemas.js";
 import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE } from "../../src/tools/launch.js";
 import { stubSupervision } from "./supervision-fixtures.js";
 
-const health = { client: { version: "0.8.0", protocol: 20 }, server: { status: "running", version: "0.8.0", protocol: 20, compatible: true } };
+const health = { client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } };
 const snapshot = {
   type: "session_snapshot",
   snapshot: {

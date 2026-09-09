@@ -166,7 +166,7 @@ function agentStatus(value: unknown): SupervisionAgentStatus {
   return value as SupervisionAgentStatus;
 }
 
-/** Validate a `PaneInfo`. Every field required by protocol 20 must be present and usable. */
+/** Validate a `PaneInfo`. Every field required by protocol 22 must be present and usable. */
 export function parsePaneRecord(value: unknown): SupervisionPaneRecord {
   if (!record(value)) throw new SupervisionProtocolError("Herdr pane record is malformed", { field: "pane" });
   return {

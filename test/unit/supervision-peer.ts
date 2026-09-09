@@ -35,7 +35,7 @@ export interface ScriptedServerOptions {
 
 export const emptySnapshotResult = {
   type: "session_snapshot",
-  snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes: [], agents: [] },
+  snapshot: { version: "0.8.2", protocol: 22, workspaces: [], tabs: [], panes: [], agents: [] },
 };
 
 export function scriptedServer(options: ScriptedServerOptions = {}): ScriptedServer {

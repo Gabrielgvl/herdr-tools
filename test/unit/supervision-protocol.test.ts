@@ -57,7 +57,7 @@ describe("supervision socket protocol", () => {
     expect(() => parseSocketLine(`"${"x".repeat(SUPERVISION_MAX_LINE_BYTES)}"`)).toThrow(/accepted bound/u);
   });
 
-  it("validates a pane record and rejects every field protocol 20 requires", () => {
+  it("validates a pane record and rejects every field protocol 22 requires", () => {
     expect(parsePaneRecord(pane)).toEqual({
       paneId: "p1", terminalId: "t1", tabId: "tab1", workspaceId: "w1",
       agentStatus: "working", revision: 7, agentKind: "pi",

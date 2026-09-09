@@ -2,7 +2,7 @@
 name: promoter-pi
 description: Commit reviewed work and prepare its authorized delivery.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna

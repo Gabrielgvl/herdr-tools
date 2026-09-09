@@ -2,11 +2,11 @@
 name: researcher-pi
 description: Research a focused technical question and return bounded cited findings.
 timeoutMinutes: 30
-sessionPersistence: false
+sessionPersistence: true
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna
-  thinking: max
+  thinking: high
   tools:
     - read
     - bash

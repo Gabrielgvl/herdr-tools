@@ -17,7 +17,7 @@ const basePane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label:
 const callerPane = { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" };
 const baseSnapshot: HerdrSnapshot = {
   version: "0.8.0",
-  protocol: 20,
+  protocol: 22,
   workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
   tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
   panes: [callerPane, basePane],

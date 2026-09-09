@@ -17,7 +17,7 @@ const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThink
 const pane = { pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "working", revision: 3, agent: "pi", agent_session: session };
 
 function snapshotResult(panes: Array<Record<string, unknown>>, agents: Array<Record<string, unknown>> = panes.some((item) => item.pane_id === "p1") ? [{ pane_id: "p1", name: "worker" }] : []): unknown {
-  return { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 20, workspaces: [], tabs: [], panes, agents } };
+  return { type: "session_snapshot", snapshot: { version: "0.8.2", protocol: 22, workspaces: [], tabs: [], panes, agents } };
 }
 
 function agyPane(overrides: Record<string, unknown> = {}): Record<string, unknown> {

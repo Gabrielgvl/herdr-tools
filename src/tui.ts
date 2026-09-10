@@ -112,8 +112,10 @@ function assignmentUnconfirmedRow(details: ResultDetails | undefined): string | 
     || !compactIdentifier(details.paneId)
     || !record(details.supervision)) return undefined;
   const supervision = details.supervision;
-  if (supervision.state !== "active" || !compactIdentifier(supervision.jobId) || !record(supervision.child)) return undefined;
-  if (supervision.child.paneId !== details.paneId) return undefined;
+  if (supervision.state !== "active") return undefined;
+  if (!compactIdentifier(supervision.jobId)) return undefined;
+  const child = supervision.child;
+  if (!record(child) || child.paneId !== details.paneId) return undefined;
   if (details.supervisorJobId !== undefined && details.supervisorJobId !== supervision.jobId) return undefined;
   return `error LAUNCH_FAILED · assignment unconfirmed · ${details.paneId} · supervisor ${supervision.jobId}`;
 }

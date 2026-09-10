@@ -7,9 +7,8 @@ import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import extension, { CORE_TOOL_NAMES } from "../../index.js";
-import { spawnWithStdin } from "../../src/exec-stdin.js";
 import { renderAssignment } from "../../src/launch-schema.js";
-import { stopDisposableServer, waitForCondition } from "./disposable-session.js";
+import { startDisposableSocketProxy, stopDisposableServer, waitForCondition } from "./disposable-session.js";
 
 interface ExecutableTool {
   name: string;
@@ -37,6 +36,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     server?: ChildProcess;
     sessionStarted: boolean;
     socketPath?: string;
+    socketProxy?: { path: string; requests: Array<{ id: string; method: string; target?: string; text?: string }>; close(): Promise<void> };
     savedSocketPath?: string;
     fixtureCreated: boolean;
     baseline?: { workspaces: string[]; tabs: string[]; panes: string[] };
@@ -44,19 +44,18 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     commands: string[];
     handlers: string[];
     cliCalls: string[][];
-    stdinCalls: Array<{ args: string[]; input: string }>;
     toolCalls: Array<{ name: string; id: string }>;
     profilePromptContent: string;
     attachmentPaths: string[];
     forceNextPromptConfirmationFailure: boolean;
     promptConfirmationFailurePaneId?: string;
-    unconfirmedRecoveries: Array<{ paneId: string; supervisorJobId: string }>;
+    forceNextAgyStartFailure: boolean;
     captureAgyPrePromptFor?: string;
     agyPrePromptJob?: Record<string, unknown>;
     agyPrePromptAgent?: Record<string, unknown>;
     agyPrePromptRecipientFailureCode?: string;
-    forceNextAgyStartFailure: boolean;
-  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], stdinCalls: [], toolCalls: [], profilePromptContent: "", attachmentPaths: [], forceNextPromptConfirmationFailure: false, unconfirmedRecoveries: [], forceNextAgyStartFailure: false };
+    unconfirmedRecoveries: Array<{ paneId: string; supervisorJobId: string }>;
+  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], toolCalls: [], profilePromptContent: "", attachmentPaths: [], forceNextPromptConfirmationFailure: false, forceNextAgyStartFailure: false, unconfirmedRecoveries: [] };
 
   const run = async (...args: string[]): Promise<unknown> => {
     // The suite sets HERDR_SOCKET_PATH so the extension's supervision monitor
@@ -176,7 +175,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     } catch (error) {
       const failure = error as { code?: string; details?: Record<string, unknown> };
       if (failure.details === undefined) throw error;
-      // Argv-path failures keep bounded CLI text; stdin deliveries are non-textual by design.
+      // Argv-path failures keep bounded CLI text; prompt deliveries are non-textual by design.
       const evidence = [failure.details.stdout, failure.details.stderr].filter((value) => typeof value === "string" && value.length > 0).join(" | ").slice(0, 600).replace(/\s+/gu, " ");
       const attachment = resultObject(failure.details.attachment ?? {});
       if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
@@ -190,7 +189,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     label: string,
     details: Record<string, unknown>,
     promptCanary: string,
-    stdinStart: number,
+    promptStart: number,
     cliStart: number,
     toolCallStart: number
   ): Promise<void> => {
@@ -219,9 +218,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(launchSupervision.jobId).toBe(supervisorJobId);
     expect(launchChild.paneId).toBe(paneId);
 
-    const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
+    const promptCalls = state.socketProxy?.requests.slice(promptStart) ?? [];
     expect(promptCalls).toHaveLength(1);
-    expect(promptCalls[0]!.args).toEqual(["agent", "prompt", paneId, "--stdin"]);
+    expect(promptCalls[0]!.method).toBe("agent.prompt");
+    expect(promptCalls[0]!.target).toBe(paneId);
     expect(state.toolCalls.slice(toolCallStart).map(({ name }) => name).filter((name) => name === "herdr_wait" || name === "herdr_communicate")).toEqual([]);
 
     const launchCliCalls = state.cliCalls.slice(cliStart);
@@ -298,7 +298,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
   const deliverLaunch = async (label: string, promptCanary: string, call: () => Promise<{ details?: Record<string, unknown> }>): Promise<LaunchDelivery> => {
     const startedAt = performance.now();
-    const stdinStart = state.stdinCalls.length;
+    const promptStart = state.socketProxy?.requests.length ?? 0;
     const cliStart = state.cliCalls.length;
     const toolCallStart = state.toolCalls.length;
     try {
@@ -314,7 +314,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) }
       });
       assertLaunchPhaseTiming(details, wallElapsedMs, false);
-      expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
+      expect((state.socketProxy?.requests.slice(promptStart) ?? [])).toHaveLength(1);
       process.stderr.write(`INTEGRATION_LAUNCH_READINESS ${label} ${JSON.stringify(readinessDiagnostic(details))}\n`);
       process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
       return { confirmed: true, details };
@@ -337,9 +337,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
         created: expect.any(Object)
       });
-      expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
+      expect((state.socketProxy?.requests.slice(promptStart) ?? [])).toHaveLength(1);
       assertLaunchPhaseTiming(failure.details, elapsedMs, resultObject(failure.details.promptConfirmation).reason === "timeout");
-      await assertUnconfirmedRecovery(label, failure.details, promptCanary, stdinStart, cliStart, toolCallStart);
+      await assertUnconfirmedRecovery(label, failure.details, promptCanary, promptStart, cliStart, toolCallStart);
       // The helper performed only read-only recovery diagnostics. Callers return
       // immediately, so no marker, wait, communication, retry, or cleanup follows.
       return { confirmed: false, details: failure.details };
@@ -413,6 +413,30 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         // harness injects that session's socket exactly as Herdr injects a pane's.
         expect(typeof started.socket_path).toBe("string");
         state.socketPath = String(started.socket_path);
+        state.socketProxy = await startDisposableSocketProxy(state.socketPath, join(state.cwd, "herdr-prompt.sock"), {
+          onRequest: async (request) => {
+            if (request.method === "agent.prompt" && state.forceNextPromptConfirmationFailure && request.target) {
+              state.forceNextPromptConfirmationFailure = false;
+              state.promptConfirmationFailurePaneId = request.target;
+            }
+            if (request.method === "agent.prompt" && state.captureAgyPrePromptFor && request.target) {
+              const agentName = state.captureAgyPrePromptFor;
+              const listed = resultObject((await tool("herdr_jobs").execute("agy-pre-prompt-jobs", { operation: "list", kind: "supervisor" }, signal(), undefined, toolContext())).details);
+              const summaries = Array.isArray(listed.jobs) ? listed.jobs.map((value) => resultObject(value)) : [];
+              const summary = summaries.find((job) => Array.isArray(job.targets) && job.targets.length === 1 && job.targets[0] === agentName);
+              if (!summary || typeof summary.jobId !== "string") throw new Error("AGY provisional supervisor job was not published before prompt socket submission");
+              state.agyPrePromptJob = resultObject((await tool("herdr_jobs").execute("agy-pre-prompt-job", { operation: "get", jobId: summary.jobId }, signal(), undefined, toolContext())).details);
+              const live = resultObject(resultObject(await runNamed(["agent", "get", request.target])).result);
+              state.agyPrePromptAgent = resultObject(live.agent ?? live);
+              try {
+                await tool("herdr_communicate").execute("agy-pre-prompt-recipient", { target: request.target, operation: "prompt", text: "must not publish", delivery: "attachment" }, signal(), undefined, toolContext());
+              } catch (error) {
+                state.agyPrePromptRecipientFailureCode = (error as { code?: string }).code;
+              }
+              state.captureAgyPrePromptFor = undefined;
+            }
+          }
+        });
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -442,19 +466,14 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         if (args[0] === "agent" && args[1] === "start") {
           const promptFlag = args.indexOf("--append-system-prompt");
           if (promptFlag >= 0 && typeof args[promptFlag + 1] === "string") state.profilePromptContent = await readFile(args[promptFlag + 1]!, "utf8");
-          if (state.forceNextAgyStartFailure && args[args.indexOf("--kind") + 1] === "agy") {
-            state.forceNextAgyStartFailure = false;
-            return {
-              stdout: "",
-              stderr: JSON.stringify({ id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } }),
-              code: 1,
-              killed: false
-            };
-          }
         }
         if (args[0] === "agent" && args[1] === "get" && args[2] === state.promptConfirmationFailurePaneId) {
           state.promptConfirmationFailurePaneId = undefined;
           return { stdout: "", stderr: "forced disposable confirmation read failure", code: 1, killed: false };
+        }
+        if (state.forceNextAgyStartFailure && args[0] === "agent" && args[1] === "start" && args[args.indexOf("--kind") + 1] === "agy") {
+          state.forceNextAgyStartFailure = false;
+          return { stdout: "", stderr: JSON.stringify({ id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } }), code: 1, killed: false };
         }
         try {
           const result = await execFileAsync(command, ["--session", REQUIRED_SESSION, ...args], {
@@ -477,34 +496,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
           return { stdout: String(failed.stdout ?? ""), stderr: String(failed.stderr ?? failed.message), code: failed.code ?? 1, killed: failed.killed ?? false };
         }
       },
-      // Stdin deliveries must reach the same disposable named session as pi.exec.
-      async execStdin(command: string, args: string[], input: string, options?: { signal?: AbortSignal; timeout?: number }) {
-        expect(command).toBe("herdr");
-        state.cliCalls.push([...args]);
-        if (state.captureAgyPrePromptFor && args[0] === "agent" && args[1] === "prompt" && typeof args[2] === "string") {
-          const agentName = state.captureAgyPrePromptFor;
-          const listed = resultObject((await tool("herdr_jobs").execute("agy-pre-prompt-jobs", { operation: "list", kind: "supervisor" }, signal(), undefined, toolContext())).details);
-          const summaries = Array.isArray(listed.jobs) ? listed.jobs.map(resultObject) : [];
-          const summary = summaries.find((job) => Array.isArray(job.targets) && job.targets.length === 1 && job.targets[0] === agentName);
-          if (!summary || typeof summary.jobId !== "string") throw new Error("AGY provisional supervisor job was not published before stdin submission");
-          state.agyPrePromptJob = resultObject((await tool("herdr_jobs").execute("agy-pre-prompt-job", { operation: "get", jobId: summary.jobId }, signal(), undefined, toolContext())).details);
-          const live = resultObject(resultObject(await runNamed(["agent", "get", args[2]])).result);
-          state.agyPrePromptAgent = resultObject(live.agent ?? live);
-          try {
-            await tool("herdr_communicate").execute("agy-pre-prompt-recipient", { target: args[2], operation: "prompt", text: "must not publish", delivery: "attachment" }, signal(), undefined, toolContext());
-          } catch (error) {
-            state.agyPrePromptRecipientFailureCode = (error as { code?: string }).code;
-          }
-          state.captureAgyPrePromptFor = undefined;
-        }
-        state.stdinCalls.push({ args: [...args], input });
-        const result = await spawnWithStdin(command, ["--session", REQUIRED_SESSION, ...args], input, { signal: options?.signal, timeout: options?.timeout });
-        if (state.forceNextPromptConfirmationFailure && args[0] === "agent" && args[1] === "prompt" && typeof args[2] === "string") {
-          state.forceNextPromptConfirmationFailure = false;
-          state.promptConfirmationFailurePaneId = args[2];
-        }
-        return result;
-      },
       registerTool(registered: unknown) {
         const executable = registered as ExecutableTool;
         state.registered.set(executable.name, executable);
@@ -524,7 +515,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     process.env.HERDR_PANE_ID = state.rootPaneId;
     // The supervision monitor reads this lazily on its first reservation, so the
     // disposable session's socket stays set for the life of the suite.
-    process.env.HERDR_SOCKET_PATH = state.socketPath;
+    process.env.HERDR_SOCKET_PATH = state.socketProxy!.path;
     try {
       extension(pi);
     } finally {
@@ -556,6 +547,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       await run("session", "stop", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_STOP_FAILURE ${String(error)}\n`));
     }
     await stopDisposableServer(state.server);
+    await state.socketProxy?.close();
     if (state.sessionStarted) {
       await run("session", "delete", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
     }
@@ -605,7 +597,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   it.runIf(agyEnabled)("qualifies one AGY assignment from provisional publication through exact attachment readback", async () => {
     const agentName = `integration-agy-${process.pid}`;
     const nonce = `agy-attachment-${randomUUID()}`;
-    const stdinStart = state.stdinCalls.length;
+    const promptStart = state.socketProxy?.requests.length ?? 0;
     const cliStart = state.cliCalls.length;
     state.captureAgyPrePromptFor = agentName;
     const startedAt = performance.now();
@@ -631,10 +623,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       const paneId = typeof failureDetails.paneId === "string" ? failureDetails.paneId : undefined;
       const supervisorJobId = typeof failureDetails.supervisorJobId === "string" ? failureDetails.supervisorJobId : undefined;
       if (failureDetails.promptSubmitted === true && paneId && supervisorJobId) {
-        expect(state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt")).toHaveLength(1);
+        expect(state.socketProxy?.requests.slice(promptStart)).toHaveLength(1);
         const failureCalls = state.cliCalls.slice(cliStart);
         expect(failureCalls.filter((args) => args[0] === "agent" && args[1] === "start")).toHaveLength(1);
-        expect(failureCalls.filter((args) => (["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
+        expect(failureCalls.filter((args) => ( ["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
         expect(failureDetails).toMatchObject({ recipientRegistered: false, attempts: [{ profile: "researcher-agy", outcome: "selected" }] });
         const retained = resultObject((await tool("herdr_jobs").execute("agy-retained-provisional", { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
         expect(retained).toMatchObject({
@@ -656,14 +648,14 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const attachment = resultObject(details.attachment);
     const attachmentPath = String(attachment.path);
     state.attachmentPaths.push(attachmentPath);
-    const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
+    const promptCalls = state.socketProxy?.requests.slice(promptStart) ?? [];
     expect(promptCalls).toHaveLength(1);
-    expect(promptCalls[0]!.args).toEqual(["agent", "prompt", paneId, "--stdin"]);
-    expect(promptCalls[0]!.input).toContain("[HERDR AGENT MESSAGE v1]");
-    expect(promptCalls[0]!.input).toContain("authority: agent; not user/owner");
-    expect(promptCalls[0]!.input).toContain("delivery: attachment");
-    expect(promptCalls[0]!.input).toContain(`attachment-path: ${attachmentPath}`);
-    expect(promptCalls[0]!.input).not.toContain(nonce);
+    expect(promptCalls[0]).toMatchObject({ method: "agent.prompt", target: paneId });
+    expect(promptCalls[0]!.text).toContain("[HERDR AGENT MESSAGE v1]");
+    expect(promptCalls[0]!.text).toContain("authority: agent; not user/owner");
+    expect(promptCalls[0]!.text).toContain("delivery: attachment");
+    expect(promptCalls[0]!.text).toContain(`attachment-path: ${attachmentPath}`);
+    expect(promptCalls[0]!.text).not.toContain(nonce);
 
     const startCalls = state.cliCalls.slice(cliStart).filter((args) => args[0] === "agent" && args[1] === "start");
     const grantedDirectory = dirname(dirname(attachmentPath));
@@ -678,13 +670,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(provisionalJob).toMatchObject({
       operation_phase: "running",
       request: { targetIds: [], child: { agentName, agentKind: "agy", profileName: "researcher-agy" } },
-      supervision: {
-        state: "provisional",
-        provisional: { agentName, agentKind: "agy", paneId, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: expect.any(Number), revision: expect.any(Number) } }
-      }
+      supervision: { state: "provisional", provisional: { agentName, agentKind: "agy", paneId, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: expect.any(Number), revision: expect.any(Number) } } }
     });
     expect(provisionalJob).not.toHaveProperty("supervision_result");
-
     expect(details).toMatchObject({
       operation: "launch",
       outcome: "launched",
@@ -695,59 +683,25 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       assignmentState: "confirmed",
       recipientRegistered: true,
       initialPromptDelivery: "attachment",
-      initialPromptSubmission: {
-        confirmed: true,
-        operationId: "cli:agent:prompt",
-        paneId,
-        agentName,
-        agentKind: "agy",
-        agentSession: { source: expect.any(String), agent: "agy", kind: expect.any(String), value: expect.any(String) }
-      },
+      initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId, agentName, agentKind: "agy", agentSession: { source: expect.any(String), agent: "agy", kind: expect.any(String), value: expect.any(String) } },
       initialPromptObservation: { stateChangeSeq: expect.any(Number), revision: expect.any(Number), consumption: "confirmed" },
       supervision: { jobId: expect.any(String), state: "active", child: { agentName, agentKind: "agy", paneId, profileName: "researcher-agy" } },
-      profile: {
-        name: "researcher-agy",
-        requested: "researcher-agy",
-        selected: "researcher-agy",
-        runtime: { kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true },
-        permissions: { sessionPersistence: true, addDirs: [] },
-        attempts: [{ profile: "researcher-agy", outcome: "selected" }],
-        fallbackProfiles: ["researcher-claude"],
-        reachableNames: ["researcher-agy", "researcher-claude", "researcher-pi"]
-      }
+      profile: { name: "researcher-agy", requested: "researcher-agy", selected: "researcher-agy", runtime: { kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true }, permissions: { sessionPersistence: true, addDirs: [] }, attempts: [{ profile: "researcher-agy", outcome: "selected" }], fallbackProfiles: ["researcher-claude"], reachableNames: ["researcher-agy", "researcher-claude", "researcher-pi"] }
     });
     const baseline = resultObject(resultObject(provisionalJob.supervision).provisional).baseline as Record<string, unknown>;
     const observation = resultObject(details.initialPromptObservation);
     expect(Number(observation.stateChangeSeq)).toBeGreaterThan(Number(baseline.stateChangeSeq));
     expect(Number(observation.revision)).toBeGreaterThanOrEqual(Number(baseline.revision));
-
     const supervisorJobId = String(resultObject(details.supervision).jobId);
     const strengthened = resultObject((await tool("herdr_jobs").execute("agy-strengthened", { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
-    expect(strengthened).toMatchObject({
-      operation_phase: "running",
-      request: { targetIds: [paneId], child: { agentName, agentKind: "agy", profileName: "researcher-agy" } },
-      supervision: { state: "active", child: { agentName, agentKind: "agy", paneId, profileName: "researcher-agy" } }
-    });
+    expect(strengthened).toMatchObject({ operation_phase: "running", request: { targetIds: [paneId], child: { agentName, agentKind: "agy", profileName: "researcher-agy" } }, supervision: { state: "active", child: { agentName, agentKind: "agy", paneId, profileName: "researcher-agy" } } });
     expect(resultObject(strengthened.supervision)).not.toHaveProperty("provisional");
-
-    const wait = await tool("herdr_wait").execute("agy-attachment-readback", {
-      targets: [paneId],
-      match: "any",
-      condition: { kind: "output", match: { kind: "literal", value: nonce } },
-      timeoutMs: ACCEPTANCE_DEADLINE_MS,
-      label: "AGY attachment nonce readback"
-    }, signal(), undefined, toolContext());
+    const wait = await tool("herdr_wait").execute("agy-attachment-readback", { targets: [paneId], match: "any", condition: { kind: "output", match: { kind: "literal", value: nonce } }, timeoutMs: ACCEPTANCE_DEADLINE_MS, label: "AGY attachment nonce readback" }, signal(), undefined, toolContext());
     const waitJobId = String(resultObject(wait.details).jobId);
-    const settled = await waitForCondition(
-      async () => resultObject((await tool("herdr_jobs").execute("agy-readback-job", { operation: "get", jobId: waitJobId }, signal(), undefined, toolContext())).details),
-      (job) => job.operation_phase === "settled",
-      ACCEPTANCE_DEADLINE_MS,
-      500
-    );
+    const settled = await waitForCondition(async () => resultObject((await tool("herdr_jobs").execute("agy-readback-job", { operation: "get", jobId: waitJobId }, signal(), undefined, toolContext())).details), (job) => job?.operation_phase === "settled", ACCEPTANCE_DEADLINE_MS, 500);
     expect(settled).toMatchObject({ operation_phase: "settled", wait_result: "condition_met", result: { matched: true } });
     expect(await readFile(attachmentPath, "utf8")).toContain(nonce);
     expect(dirname(dirname(attachmentPath))).toBe(grantedDirectory);
-
     await closeConfirmedFixturePane("agy-qualification", details);
     const proofPath = process.env.HERDR_TOOLS_AGY_INTEGRATION_PROOF;
     if (!proofPath) throw new Error("AGY integration proof path was not supplied by the integration runner");
@@ -757,7 +711,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   it.runIf(agyEnabled)("falls back from AGY only after an exact pre-interactive zero-effect failure", async () => {
     const agentName = `integration-agy-fallback-${process.pid}`;
     const cliStart = state.cliCalls.length;
-    const stdinStart = state.stdinCalls.length;
+    const promptStart = state.socketProxy?.requests.length ?? 0;
     state.forceNextAgyStartFailure = true;
     const launched = await tool("herdr_launch").execute("agy-zero-effect-fallback", {
       name: agentName,
@@ -774,28 +728,13 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(starts[0]).toEqual(expect.arrayContaining(["--kind", "agy", "--model", "gemini-3.8-flash-low", "--mode", "plan", "--dangerously-skip-permissions"]));
     expect(starts[0]!.slice(-2)).toEqual(["--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     expect(starts[1]).toEqual(expect.arrayContaining(["--kind", "claude", "--model", "claude-sonnet-5"]));
-    const promptCalls = state.stdinCalls.slice(stdinStart).filter(({ args }) => args[0] === "agent" && args[1] === "prompt");
+    const promptCalls = state.socketProxy?.requests.slice(promptStart) ?? [];
     expect(promptCalls).toHaveLength(1);
-    expect(promptCalls[0]!.args).toEqual(["agent", "prompt", paneId, "--stdin"]);
+    expect(promptCalls[0]).toMatchObject({ method: "agent.prompt", target: paneId });
     expect(calls.findIndex((args) => args === starts[0])).toBeLessThan(calls.findIndex((args) => args === starts[1]));
     expect(calls.findIndex((args) => args === starts[1])).toBeLessThan(calls.findIndex((args) => args[0] === "agent" && args[1] === "prompt"));
     expect(calls.filter((args) => (["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
-    expect(details).toMatchObject({
-      kind: "claude",
-      promptSubmitted: true,
-      promptConsumption: "confirmed",
-      recipientRegistered: true,
-      supervision: { state: "active", child: { paneId, agentKind: "claude", profileName: "researcher-claude" } },
-      profile: {
-        requested: "researcher-agy",
-        selected: "researcher-claude",
-        runtime: { kind: "claude", model: "claude-sonnet-5" },
-        attempts: [
-          { profile: "researcher-agy", outcome: "agent_start_failed", errorCode: "agent_start_failed", message: "agent process exited before becoming interactive", postState: { pane_id: paneId, agent_status: "unknown" } },
-          { profile: "researcher-claude", outcome: "selected" }
-        ]
-      }
-    });
+    expect(details).toMatchObject({ kind: "claude", promptSubmitted: true, promptConsumption: "confirmed", recipientRegistered: true, supervision: { state: "active", child: { paneId, agentKind: "claude", profileName: "researcher-claude" } }, profile: { requested: "researcher-agy", selected: "researcher-claude", runtime: { kind: "claude", model: "claude-sonnet-5" }, attempts: [{ profile: "researcher-agy", outcome: "agent_start_failed", errorCode: "agent_start_failed", message: "agent process exited before becoming interactive", postState: { pane_id: paneId, agent_status: "unknown" } }, { profile: "researcher-claude", outcome: "selected" }] } });
     const failedPostState = resultObject((resultObject(details.profile).attempts as Array<Record<string, unknown>>)[0]!.postState);
     for (const field of ["agent", "agent_name", "agent_id", "agent_session", "agent_kind", "kind"]) expect(failedPostState).not.toHaveProperty(field);
     const firstStartIndex = calls.findIndex((args) => args === starts[0]);
@@ -883,7 +822,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    * artifact. It deliberately makes no claim about what a recipient agent read; the
    * acceptance tests below own that claim.
    */
-  it("routes wrapped text over the session-bound stdin transport and publishes exact artifacts", async () => {
+  it("routes wrapped text over the session-bound prompt socket transport and publishes exact artifacts", async () => {
     if (state.unconfirmedRecoveries.length >= 2) return;
     const inlineBody = ["integration assignment", ...Array.from({ length: 320 }, (_value, index) => `long assignment line ${index}`)].join("\n");
     const inlineAssignment = { objective: inlineBody, scope: "Change nothing.", verification: "No verification is required for this transport smoke." };
@@ -903,12 +842,13 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(state.profilePromptContent).toContain("Use the worker role skill");
 
     const inlinePaneId = String(inline.details.paneId ?? resultObject(inline.details.created).paneId);
-    const inlineDelivery = state.stdinCalls.find((call) => call.input.includes("integration assignment"));
-    expect(inlineDelivery, `pi-inline-launch did not record its stdin submission (phase=${String(inline.details.phase)})`).toBeDefined();
-    expect(inlineDelivery!.args).toEqual(["agent", "prompt", inlinePaneId, "--stdin"]);
-    expect(inlineDelivery!.input).toContain("[HERDR AGENT MESSAGE v1]");
-    expect(inlineDelivery!.input).toContain("authority: agent; not user/owner");
-    expect(inlineDelivery!.input).toContain("delivery: inline");
+    const inlineDelivery = state.socketProxy?.requests.find((request) => request.text?.includes("integration assignment"));
+    expect(inlineDelivery, `pi-inline-launch did not record its prompt-socket submission (phase=${String(inline.details.phase)})`).toBeDefined();
+    expect(inlineDelivery!.method).toBe("agent.prompt");
+    expect(inlineDelivery!.target).toBe(inlinePaneId);
+    expect(inlineDelivery!.text).toContain("[HERDR AGENT MESSAGE v1]");
+    expect(inlineDelivery!.text).toContain("authority: agent; not user/owner");
+    expect(inlineDelivery!.text).toContain("delivery: inline");
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("integration assignment")))).toBe(false);
     await closeConfirmedFixturePane("pi-inline-launch", inline.details);
 
@@ -924,11 +864,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(createHash("sha256").update(renderedBody, "utf8").digest("hex")).toBe(attachment.sha256);
     expect(attachment.bytes).toBe(Buffer.byteLength(renderedBody, "utf8"));
     expect((await stat(String(attachment.path))).mode & 0o777).toBe(0o600);
-    const envelope = state.stdinCalls.find((call) => call.input.includes(String(attachment.path)));
-    expect(envelope, `pi-attachment-launch did not record its stdin submission (phase=${String(attachmentLaunch.details.phase)})`).toBeDefined();
-    expect(envelope!.input).toContain("delivery: attachment");
-    expect(envelope!.input).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
-    expect(envelope!.input).not.toContain("detail line");
+    const envelope = state.socketProxy?.requests.find((request) => request.text?.includes(String(attachment.path)));
+    expect(envelope, `pi-attachment-launch did not record its prompt-socket submission (phase=${String(attachmentLaunch.details.phase)})`).toBeDefined();
+    expect(envelope!.method).toBe("agent.prompt");
+    expect(envelope!.text).toContain("delivery: attachment");
+    expect(envelope!.text).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
+    expect(envelope!.text).not.toContain("detail line");
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("detail line")))).toBe(false);
     await closeConfirmedFixturePane("pi-attachment-launch", attachmentLaunch.details);
   }, 240_000);

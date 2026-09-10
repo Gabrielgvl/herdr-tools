@@ -1,6 +1,6 @@
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
-import { spawnWithStdin, type StdinExec, type StdinExecResult } from "./exec-stdin.js";
+import { createAgentPromptClient, type AgentPromptClient } from "./agent-prompt.js";
 
 export type PiExec = (command: string, args: string[], options: ExecOptions) => Promise<ExecResult>;
 
@@ -37,6 +37,7 @@ export interface CliTextResult {
 }
 
 const MAX_EVIDENCE_BYTES = 50_000;
+export const MAX_SCHEMA_BYTES = 524_288;
 const MAX_ERROR_FIELD_BYTES = 4_096;
 export const HERDR_AGENT_START_TIMEOUT_MS = 120_000;
 export const HERDR_AGENT_START_EXEC_MARGIN_MS = 5_000;
@@ -69,37 +70,7 @@ function parseErrorEnvelope(value: string): HerdrErrorEnvelope | undefined {
   return id && code && message ? { id, error: { code, message } } : undefined;
 }
 
-/** Classify a rejected `--stdin` invocation from process text that is never exposed. */
-function stdinRejected(result: ExecResult): boolean {
-  const evidence = `${result.stdout}\n${result.stderr}`.toLowerCase();
-  return evidence.includes("--stdin") && /(unknown|unrecognized|unexpected|invalid|unsupported|option|argument|usage)/u.test(evidence);
-}
-
-/**
- * Stdin deliveries carry sender-authored message bodies, which a failing CLI may echo in
- * part. Their evidence is therefore fixed and non-textual: presence, exact byte size, and
- * truncation only.
- */
-function nonTextualEvidence(value: string, limit: number, field: "stdout" | "stderr"): Record<string, unknown> {
-  const size = Buffer.byteLength(value, "utf8");
-  return {
-    [`${field}Present`]: size > 0,
-    [`${field}Bytes`]: size,
-    [`${field}Truncated`]: size > limit
-  };
-}
-
-function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES, input?: string): CliProtocolError {
-  if (input !== undefined) {
-    const code: CliFailureCode = result.killed ? "CLI_TIMEOUT" : stdinRejected(result) ? "CLI_INCOMPATIBLE" : "CLI_PROTOCOL_ERROR";
-    return new CliProtocolError(code, code === "CLI_INCOMPATIBLE" ? "Herdr CLI does not support stdin prompt delivery" : "Herdr CLI did not return a usable response", {
-      exitCode: result.code,
-      killed: result.killed,
-      evidence: "omitted_for_stdin_delivery",
-      ...nonTextualEvidence(result.stdout, limit, "stdout"),
-      ...nonTextualEvidence(result.stderr, limit, "stderr")
-    });
-  }
+function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES): CliProtocolError {
   const stdout = boundedEvidence(result.stdout, limit);
   const stderr = boundedEvidence(result.stderr, limit);
   const stderrEnvelope = !result.killed && !stderr.truncated ? parseErrorEnvelope(result.stderr) : undefined;
@@ -131,14 +102,12 @@ function failureFromExec(result: ExecResult, limit = MAX_EVIDENCE_BYTES, input?:
   });
 }
 
-function parseEnvelope(stdout: string, evidenceLimit = MAX_EVIDENCE_BYTES, input?: string): JsonEnvelope {
+function parseEnvelope(stdout: string, evidenceLimit = MAX_EVIDENCE_BYTES): JsonEnvelope {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned malformed JSON", input !== undefined
-      ? { evidence: "omitted_for_stdin_delivery", ...nonTextualEvidence(stdout, evidenceLimit, "stdout") }
-      : { stdout: boundedEvidence(stdout, evidenceLimit).value });
+    throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned malformed JSON", { stdout: boundedEvidence(stdout, evidenceLimit).value });
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI returned a non-object envelope");
@@ -152,16 +121,6 @@ function parseEnvelope(stdout: string, evidenceLimit = MAX_EVIDENCE_BYTES, input
     throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI envelope is missing required fields");
   }
   return { id: candidate.id, result: candidate.result };
-}
-
-function normalizeCompletedStdinResult(result: ExecResult, preserveCompletedMutation: boolean): ExecResult {
-  if (!preserveCompletedMutation || result.code !== 0 || !result.killed) return result;
-  const evidence = result as StdinExecResult;
-  // A code-0 close with no signal and an unsuccessful kill call proves that abort
-  // landed after the child had completed but before Node emitted `close`. Do not
-  // discard its acknowledgement because a stale killed flag would force a retry.
-  if (evidence.signalCode === null && evidence.killDelivered === false) return { ...result, killed: false };
-  return result;
 }
 
 function requestedTimeout(argv: string[], fallback: number): number {
@@ -185,28 +144,44 @@ export class HerdrCli {
   /** Current Herdr exposes occupant-pinned `agent wait` for state predicates. */
   readonly supportsNativeAgentWait = true;
 
+  private readonly agentPrompts: AgentPromptClient;
+
   constructor(
     private readonly exec: PiExec,
     private readonly timeout = 10_000,
     private readonly evidenceLimit = MAX_EVIDENCE_BYTES,
-    private readonly stdinExec: StdinExec = spawnWithStdin
-  ) {}
+    agentPrompts: AgentPromptClient = createAgentPromptClient()
+  ) { this.agentPrompts = agentPrompts; }
 
   async runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<JsonEnvelope> {
     return this.runJsonInternal(argv, signal, preserveCompletedMutation);
   }
 
-  async runJsonWithStdin(argv: string[], input: string, signal: AbortSignal, preserveCompletedMutation = true): Promise<JsonEnvelope> {
-    // stdin is reserved for prompt mutations. A valid response remains usable
-    // when the caller aborts after the child has completed, so callers do not
-    // lose the only acknowledgement or retry an already-submitted body.
-    return this.runJsonInternal(argv, signal, preserveCompletedMutation, input);
+  async prompt(target: string, text: string, signal: AbortSignal): Promise<JsonEnvelope> {
+    return this.agentPrompts.prompt(target, text, signal);
   }
 
-  private async runJsonInternal(argv: string[], signal: AbortSignal, preserveCompletedMutation = false, input?: string): Promise<JsonEnvelope> {
-    const result = await this.runRaw(argv, signal, preserveCompletedMutation, input);
-    if (result.code !== 0 || result.killed) throw failureFromExec(result, this.evidenceLimit, input);
-    return parseEnvelope(result.stdout, this.evidenceLimit, input);
+  async pingPromptEndpoint(signal: AbortSignal): Promise<void> {
+    await this.agentPrompts.ping(signal);
+  }
+
+  closePromptTransport(): void {
+    this.agentPrompts.close?.();
+  }
+
+  async readApiSchema(signal: AbortSignal): Promise<string> {
+    const result = await this.runRaw(["api", "schema", "--json"], signal);
+    if (result.code !== 0 || result.killed) throw failureFromExec(result, MAX_SCHEMA_BYTES);
+    if (Buffer.byteLength(result.stdout, "utf8") > MAX_SCHEMA_BYTES) {
+      throw new CliProtocolError("CLI_OUTPUT_OVERFLOW", "Herdr API schema exceeds the accepted bound", { limitBytes: MAX_SCHEMA_BYTES });
+    }
+    return result.stdout;
+  }
+
+  private async runJsonInternal(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<JsonEnvelope> {
+    const result = await this.runRaw(argv, signal, preserveCompletedMutation);
+    if (result.code !== 0 || result.killed) throw failureFromExec(result, this.evidenceLimit);
+    return parseEnvelope(result.stdout, this.evidenceLimit);
   }
 
   async runTextResult(argv: string[], signal: AbortSignal): Promise<CliTextResult> {
@@ -232,7 +207,7 @@ export class HerdrCli {
     return output.truncated ? `${output.value}\n[output truncated]` : output.value;
   }
 
-  private async runRaw(argv: string[], signal: AbortSignal, preserveCompletedMutation = false, input?: string): Promise<ExecResult> {
+  private async runRaw(argv: string[], signal: AbortSignal, preserveCompletedMutation = false): Promise<ExecResult> {
     if (signal.aborted) throw new CliProtocolError("ABORTED", "Operation aborted");
     try {
       const timeout = argv[0] === "agent" && argv[1] === "start"
@@ -240,12 +215,9 @@ export class HerdrCli {
         : argv[0] === "agent" && argv[1] === "wait"
           ? requestedAgentWaitTimeout(argv, this.timeout) + HERDR_AGENT_WAIT_EXEC_MARGIN_MS
           : this.timeout;
-      const result = input === undefined
-        ? await this.exec("herdr", argv, { signal, timeout })
-        : await this.stdinExec("herdr", argv, input, { signal, timeout });
-      const normalized = input === undefined ? result : normalizeCompletedStdinResult(result, preserveCompletedMutation);
+      const result = await this.exec("herdr", argv, { signal, timeout });
       if (signal.aborted && !preserveCompletedMutation) throw new CliProtocolError("ABORTED", "Operation aborted");
-      return normalized;
+      return result;
     } catch (error) {
       if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
         throw new CliProtocolError("ABORTED", "Operation aborted");

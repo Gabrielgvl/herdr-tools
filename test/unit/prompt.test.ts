@@ -15,7 +15,7 @@ const agent = {
   screen_detection_skipped: true
 };
 
-const response = (result: unknown, id = "cli:agent:prompt"): JsonEnvelope => ({ id, result });
+const response = (result: unknown, id = "herdr-tools-request-1"): JsonEnvelope => ({ id, result });
 const expected = { paneId: "w1:p2", terminalId: "term-worker", agentName: "worker", agentKind: "pi", agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-worker" } };
 
 function validSubmission(overrides: Record<string, unknown> = {}): PromptSubmissionEvidence {
@@ -26,7 +26,7 @@ describe("prompt submission acknowledgement", () => {
   it("accepts the exact Herdr acknowledgement and retains safe observation metadata", () => {
     expect(validSubmission()).toEqual({
       confirmed: true,
-      operationId: "cli:agent:prompt",
+      operationId: "herdr-tools-request-1",
       paneId: "w1:p2",
       agentName: "worker",
       agentKind: "pi",
@@ -42,7 +42,6 @@ describe("prompt submission acknowledgement", () => {
   });
 
   it.each([
-    ["wrong operation ID", response({ type: "agent_prompted", agent }, "cli:agent:other")],
     ["missing result", response(undefined)],
     ["wrong result type", response({ type: "other", agent })],
     ["missing agent", response({ type: "agent_prompted" })],
@@ -50,6 +49,11 @@ describe("prompt submission acknowledgement", () => {
     ["array agent", response({ type: "agent_prompted", agent: [] })]
   ])("rejects %s before claiming delivery", (_label, envelope) => {
     expect(() => parsePromptSubmission(envelope, expected)).toThrowError(CliProtocolError);
+  });
+
+  it("can enforce the request ID supplied by the socket transport", () => {
+    expect(() => parsePromptSubmission(response({ type: "agent_prompted", agent }, "other-request"), expected, "herdr-tools-request-1")).toThrowError(CliProtocolError);
+    expect(parsePromptSubmission(response({ type: "agent_prompted", agent }, "herdr-tools-request-1"), expected, "herdr-tools-request-1").operationId).toBe("herdr-tools-request-1");
   });
 
   it.each([

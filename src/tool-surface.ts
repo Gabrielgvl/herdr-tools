@@ -71,7 +71,7 @@ export function readInjectedContext(env: NodeJS.ProcessEnv = process.env): Injec
 
 /** Herdr CLI compatibility stays a per-call preflight for every host. */
 export function createPreflight(cli: HealthCli): CompatibilityPreflight {
-  return (signal) => preflightCompatibility(cli, signal).then(() => undefined);
+  return (signal, requirement) => preflightCompatibility(cli, signal, requirement).then(() => undefined);
 }
 
 /**

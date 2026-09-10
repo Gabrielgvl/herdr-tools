@@ -1,6 +1,7 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { CliProtocolError, HerdrCli, type PiExec } from "../../src/cli.js";
-import { mapPreflightFailure, MAX_HEALTH_STATUS_LENGTH, MAX_HEALTH_VERSION_LENGTH, parseHealth, preflightCompatibility, REQUIRED_HERDR_PROTOCOL } from "../../src/health.js";
+import { mapPreflightFailure, MAX_HEALTH_STATUS_LENGTH, MAX_HEALTH_VERSION_LENGTH, parseHealth, preflightCompatibility, preflightPromptCompatibility, REQUIRED_ENDPOINT_PROTOCOL_GENERATION, REQUIRED_HERDR_PROTOCOL, REQUIRED_HERDR_VERSION, validateAgentPromptSchema } from "../../src/health.js";
 import { createPaneTool } from "../../src/tools/pane.js";
 
 const healthy = JSON.stringify({
@@ -11,6 +12,18 @@ const healthy = JSON.stringify({
 const context = { workspaceId: "w1", tabId: "t1", paneId: "p1" };
 const validHealthClient = { version: "0.8.0", protocol: 22 };
 const validHealthServer = { status: "running", version: "0.8.0", protocol: 22 };
+const installedPromptSchema = readFileSync(new URL("../fixtures/herdr-0.9-protocol22.json", import.meta.url), "utf8");
+const promptHealthy = JSON.stringify({
+  client: { version: REQUIRED_HERDR_VERSION, protocol: REQUIRED_HERDR_PROTOCOL, endpoint_protocol_generation: REQUIRED_ENDPOINT_PROTOCOL_GENERATION },
+  server: {
+    status: "running",
+    version: REQUIRED_HERDR_VERSION,
+    protocol: REQUIRED_HERDR_PROTOCOL,
+    compatible: true,
+    endpoint_compatible: true,
+    capabilities: { endpoint_protocol_generation: REQUIRED_ENDPOINT_PROTOCOL_GENERATION }
+  }
+});
 
 function healthDetails(client: unknown = validHealthClient, server: unknown = validHealthServer, overrides: Record<string, unknown> = {}) {
   return { client, server, socketReachable: true, compatible: true, ...overrides };
@@ -92,6 +105,21 @@ describe("Herdr compatibility preflight", () => {
     const { promise, calls } = productionRename(degraded);
     await expect(promise).rejects.toMatchObject({ code: "BACKEND_UNAVAILABLE" });
     expect(calls).toEqual([["status", "--json"]]);
+  });
+
+  it("treats null endpoint metadata as absent and rejects malformed capabilities", () => {
+    expect(parseHealth(JSON.stringify({
+      client: { version: "0.9.0", protocol: 22, endpoint_protocol_generation: null },
+      server: { status: "stopped", version: null, protocol: null, compatible: null, endpoint_compatible: null, capabilities: { endpoint_protocol_generation: null } }
+    }))).toEqual({
+      client: { version: "0.9.0", protocol: 22 },
+      server: { status: "stopped" },
+      socketReachable: false
+    });
+    expect(() => parseHealth(JSON.stringify({
+      client: { version: "0.9.0", protocol: 22 },
+      server: { status: "stopped", capabilities: "malformed" }
+    }))).toThrowError(expect.objectContaining({ code: "CLI_INCOMPATIBLE" }));
   });
 
   it("keeps stopped and incompatible preflight errors bounded to typed health", async () => {
@@ -265,6 +293,21 @@ describe("Herdr compatibility preflight", () => {
     expect(mapPreflightFailure(new CliProtocolError("CLI_NOT_FOUND", "missing"))).toMatchObject({ code: "CLI_INCOMPATIBLE" });
   });
 
+  it("retains only valid prompt dispatch evidence while mapping preflight failures", () => {
+    const mapped = mapPreflightFailure(new CliProtocolError("CLI_INCOMPATIBLE", "incompatible", {
+      promptDispatch: { state: "acknowledged", requestId: "request-1", body: "secret" }
+    }));
+    expect(mapped.details).toEqual({ promptDispatch: { state: "acknowledged", requestId: "request-1" } });
+    const bounded = mapPreflightFailure(new CliProtocolError("CLI_INCOMPATIBLE", "incompatible", {
+      promptDispatch: { state: "unknown", requestId: "x".repeat(257) }
+    }));
+    expect(bounded.details).toEqual({ promptDispatch: { state: "unknown" } });
+    expect(mapPreflightFailure(new CliProtocolError("CLI_OUTPUT_OVERFLOW", "overflow")).code).toBe("CLI_INCOMPATIBLE");
+    expect(mapPreflightFailure({ code: "ABORTED" })).toMatchObject({ code: "ABORTED" });
+    expect(mapPreflightFailure({ code: "SUPERVISION_SOCKET_UNAVAILABLE" })).toMatchObject({ code: "BACKEND_UNAVAILABLE" });
+    expect(mapPreflightFailure({ code: "BACKEND_UNAVAILABLE" })).toMatchObject({ code: "BACKEND_UNAVAILABLE" });
+  });
+
   it.each([
     ["CLI_NOT_FOUND", new CliProtocolError("CLI_NOT_FOUND", "missing"), "CLI_INCOMPATIBLE"],
     ["CLI_TIMEOUT", new CliProtocolError("CLI_TIMEOUT", "timed out"), "BACKEND_UNAVAILABLE"],
@@ -285,5 +328,80 @@ describe("Herdr compatibility preflight", () => {
     await expect(tool.execute("id", { operation: "rename", target: "p1", label: "new" } as never, new AbortController().signal, undefined, { cwd: "/repo", signal: new AbortController().signal } as never)).rejects.toMatchObject({ code: "BACKEND_UNAVAILABLE" });
     expect(preflight).toHaveBeenCalledOnce();
     expect(runJson).not.toHaveBeenCalled();
+  });
+});
+
+describe("agent.prompt compatibility preflight", () => {
+  it("parses the installed 0.9 endpoint fields and validates the minimal schema fixture", () => {
+    expect(parseHealth(promptHealthy)).toEqual({
+      client: { version: REQUIRED_HERDR_VERSION, protocol: REQUIRED_HERDR_PROTOCOL, endpointProtocolGeneration: REQUIRED_ENDPOINT_PROTOCOL_GENERATION },
+      server: { status: "running", version: REQUIRED_HERDR_VERSION, protocol: REQUIRED_HERDR_PROTOCOL, endpointCompatible: true, endpointProtocolGeneration: REQUIRED_ENDPOINT_PROTOCOL_GENERATION },
+      socketReachable: true,
+      compatible: true
+    });
+    expect(() => validateAgentPromptSchema(installedPromptSchema)).not.toThrow();
+  });
+
+  it("runs status, schema, and one ping before allowing prompt transport", async () => {
+    const calls: string[] = [];
+    const cli = {
+      runText: vi.fn(async (argv: string[]) => { calls.push(argv.join(" ")); return promptHealthy; }),
+      readApiSchema: vi.fn(async () => { calls.push("api schema"); return installedPromptSchema; }),
+      pingPromptEndpoint: vi.fn(async () => { calls.push("ping"); })
+    };
+    await expect(preflightPromptCompatibility(cli, new AbortController().signal)).resolves.toMatchObject({ server: { endpointCompatible: true, endpointProtocolGeneration: 1 } });
+    expect(calls).toEqual(["status --json", "api schema", "ping"]);
+    expect(cli.pingPromptEndpoint).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["client generation", { client: { endpoint_protocol_generation: 2 } }],
+    ["server endpoint compatibility", { server: { endpoint_compatible: false } }],
+    ["server generation", { server: { capabilities: { endpoint_protocol_generation: 2 } } }],
+    ["runtime version", { server: { version: "0.9.1" } }]
+  ] as const)("rejects a prompt endpoint with the wrong %s before schema or ping", async (_label, patch) => {
+    const base = JSON.parse(promptHealthy) as { client: Record<string, unknown>; server: Record<string, unknown> };
+    if ("client" in patch) Object.assign(base.client, patch.client);
+    else Object.assign(base.server, patch.server);
+    const cli = {
+      runText: vi.fn(async () => JSON.stringify(base)),
+      readApiSchema: vi.fn(async () => installedPromptSchema),
+      pingPromptEndpoint: vi.fn(async () => undefined)
+    };
+    await expect(preflightPromptCompatibility(cli, new AbortController().signal)).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
+    expect(cli.readApiSchema).not.toHaveBeenCalled();
+    expect(cli.pingPromptEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for an incompatible schema or ping without retaining backend text", async () => {
+    const badSchema = {
+      runText: vi.fn(async () => promptHealthy),
+      readApiSchema: vi.fn(async () => installedPromptSchema.replace('"agent.prompt"', '"agent.other"')),
+      pingPromptEndpoint: vi.fn(async () => undefined)
+    };
+    await expect(preflightPromptCompatibility(badSchema, new AbortController().signal)).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
+    const badPing = {
+      runText: vi.fn(async () => promptHealthy),
+      readApiSchema: vi.fn(async () => installedPromptSchema),
+      pingPromptEndpoint: vi.fn(async () => { throw Object.assign(new Error("secret backend prompt body"), { code: "CLI_PROTOCOL_ERROR", details: { request: "body" } }); })
+    };
+    const failure = await preflightPromptCompatibility(badPing, new AbortController().signal).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "CLI_INCOMPATIBLE" });
+    expect(JSON.stringify(failure)).not.toContain("secret backend prompt body");
+    expect(JSON.stringify(failure)).not.toContain("body");
+  });
+
+  it("rejects malformed prompt schema roots before inspecting variants", () => {
+    const missingVariants = JSON.parse(installedPromptSchema) as { schemas: { request: { oneOf?: unknown }; success_response: { $defs: { ResponseResult: { oneOf?: unknown } } } } };
+    missingVariants.schemas.request.oneOf = {};
+    missingVariants.schemas.success_response.$defs.ResponseResult.oneOf = {};
+    for (const schema of [
+      "not-json",
+      "{}",
+      JSON.stringify({ protocol: 22, schema_version: 1, schemas: { request: {}, success_response: {} } }),
+      JSON.stringify(missingVariants)
+    ]) {
+      expect(() => validateAgentPromptSchema(schema)).toThrowError(expect.objectContaining({ code: "CLI_INCOMPATIBLE" }));
+    }
   });
 });

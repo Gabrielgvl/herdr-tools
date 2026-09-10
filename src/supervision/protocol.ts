@@ -40,8 +40,31 @@ export type SupervisionEventKind = (typeof SUPERVISION_EVENT_KINDS)[number];
 /** Event kinds that carry a full `PaneInfo` and can therefore be revision-anchored. */
 export const PANE_RECORD_EVENT_KINDS = ["pane_updated", "pane_moved"] as const;
 
-/** The longest single NDJSON line this client will accept from the server. */
+/** The largest complete newline-delimited JSON frame, including its delimiter. */
 export const SUPERVISION_MAX_LINE_BYTES = 262_144;
+
+function usableRequestString(value: unknown, field: string): value is string {
+  if (typeof value !== "string" || value.length === 0 || /[\0\r\n]/u.test(value)) {
+    throw new SupervisionProtocolError("Herdr socket request field is malformed", { field });
+  }
+  return true;
+}
+
+export function encodeSocketRequest(id: string, method: string, params: Record<string, unknown>): string {
+  usableRequestString(id, "id");
+  usableRequestString(method, "method");
+  if (!record(params)) throw new SupervisionProtocolError("Herdr socket request params are malformed");
+  let frame: string;
+  try {
+    frame = `${JSON.stringify({ id, method, params })}\n`;
+  } catch {
+    throw new SupervisionProtocolError("Herdr socket request is not serializable");
+  }
+  if (Buffer.byteLength(frame, "utf8") > SUPERVISION_MAX_LINE_BYTES) {
+    throw new SupervisionProtocolError("Herdr socket request exceeds the accepted bound", { limitBytes: SUPERVISION_MAX_LINE_BYTES });
+  }
+  return frame;
+}
 
 export class SupervisionProtocolError extends Error {
   readonly code = "SUPERVISION_PROTOCOL_ERROR" as const;
@@ -219,6 +242,9 @@ export function parseSocketLine(line: string): SupervisionSocketLine {
   if (!record(parsed)) throw new SupervisionProtocolError("Herdr socket line is not an object");
   if (own(parsed, "id")) {
     const id = requiredString(parsed.id, "id");
+    if (own(parsed, "result") && own(parsed, "error")) {
+      throw new SupervisionProtocolError("Herdr socket reply carries both result and error", { id });
+    }
     if (own(parsed, "error")) {
       if (!record(parsed.error)) throw new SupervisionProtocolError("Herdr socket error is malformed", { field: "error" });
       return { kind: "failure", id, error: { code: requiredString(parsed.error.code, "error.code"), message: requiredString(parsed.error.message, "error.message") } };

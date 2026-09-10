@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { CliProtocolError, HerdrCli, type PiExec } from "../../src/cli.js";
-import type { StdinExec } from "../../src/exec-stdin.js";
+import type { AgentPromptClient } from "../../src/agent-prompt.js";
 
 const signal = new AbortController().signal;
 
@@ -9,6 +9,35 @@ function response(stdout: string, code = 0, stderr = "", killed = false) {
 }
 
 describe("HerdrCli", () => {
+  it("delegates prompt and ping to the injected socket client without using CLI exec", async () => {
+    const prompts: AgentPromptClient = {
+      prompt: vi.fn(async () => ({ id: "request-1", result: { type: "agent_prompted", agent: {} } })),
+      ping: vi.fn(async () => undefined)
+    };
+    const exec = vi.fn<PiExec>();
+    const cli = new HerdrCli(exec, 1000, 1000, prompts);
+    await expect(cli.prompt("w1:p1", "body", signal)).resolves.toMatchObject({ id: "request-1" });
+    await expect(cli.pingPromptEndpoint(signal)).resolves.toBeUndefined();
+    expect(prompts.prompt).toHaveBeenCalledWith("w1:p1", "body", signal);
+    expect(prompts.ping).toHaveBeenCalledWith(signal);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("reads the bounded installed schema through the CLI without retaining oversized output", async () => {
+    const exec = vi.fn<PiExec>().mockResolvedValue(response("schema"));
+    await expect(new HerdrCli(exec).readApiSchema(signal)).resolves.toBe("schema");
+    expect(exec).toHaveBeenCalledWith("herdr", ["api", "schema", "--json"], { signal, timeout: 10_000 });
+    const oversized = vi.fn<PiExec>().mockResolvedValue(response("x".repeat(524_289)));
+    await expect(new HerdrCli(oversized).readApiSchema(signal)).rejects.toMatchObject({ code: "CLI_OUTPUT_OVERFLOW", details: { limitBytes: 524_288 } });
+  });
+
+  it("maps failed schema commands to bounded typed failures", async () => {
+    const failed = vi.fn<PiExec>().mockResolvedValue(response("secret schema", 2, "backend secret"));
+    await expect(new HerdrCli(failed).readApiSchema(signal)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { exitCode: 2 } });
+    const killed = vi.fn<PiExec>().mockResolvedValue(response("partial", 137, "timed out", true));
+    await expect(new HerdrCli(killed).readApiSchema(signal)).rejects.toMatchObject({ code: "CLI_TIMEOUT", details: { killed: true } });
+  });
+
   it("uses pi.exec with herdr and an argv array, signal, and bounded timeout", async () => {
     const exec = vi.fn<PiExec>().mockResolvedValue(response('{"id":"req-1","result":{"ok":true}}'));
     const cli = new HerdrCli(exec, 4321);
@@ -54,21 +83,6 @@ describe("HerdrCli", () => {
       return response('{"id":"split","result":{"pane":{"pane_id":"p2"}}}');
     });
     await expect(new HerdrCli(exec).runJson(["pane", "split"], controller.signal, true)).resolves.toMatchObject({ result: { pane: { pane_id: "p2" } } });
-  });
-
-  it("preserves a completed stdin response when abort arrives after execution", async () => {
-    const controller = new AbortController();
-    const stdinExec = vi.fn<StdinExec>().mockImplementation(async () => {
-      controller.abort();
-      return response('{"id":"cli:agent:prompt","result":{"type":"agent_prompted"}}');
-    });
-    await expect(new HerdrCli(vi.fn<PiExec>(), 1000, 1000, stdinExec).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], "body", controller.signal)).resolves.toEqual({ id: "cli:agent:prompt", result: { type: "agent_prompted" } });
-    expect(stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin"], "body", { signal: controller.signal, timeout: 1000 });
-
-    const staleKilledFlag = vi.fn<StdinExec>().mockResolvedValue({ ...response('{"id":"cli:agent:prompt","result":{"type":"agent_prompted"}}'), killed: true, signalCode: null, killDelivered: false });
-    await expect(new HerdrCli(vi.fn<PiExec>(), 1000, 1000, staleKilledFlag).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], "body", new AbortController().signal)).resolves.toMatchObject({ id: "cli:agent:prompt" });
-    const signalled = vi.fn<StdinExec>().mockResolvedValue({ ...response('{"id":"cli:agent:prompt","result":{"type":"agent_prompted"}}'), killed: true, signalCode: "SIGTERM", killDelivered: true });
-    await expect(new HerdrCli(vi.fn<PiExec>(), 1000, 1000, signalled).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], "body", new AbortController().signal)).rejects.toMatchObject({ code: "CLI_TIMEOUT" });
   });
 
   it("rejects malformed JSON envelopes and preserves bounded evidence", async () => {
@@ -199,77 +213,6 @@ describe("HerdrCli", () => {
 
     const stringFailure = vi.fn<PiExec>().mockRejectedValue("missing executable");
     await expect(new HerdrCli(stringFailure).runText(["status"], signal)).rejects.toMatchObject({ code: "CLI_NOT_FOUND", details: { cause: "missing executable" } });
-  });
-
-  it("uses the narrow stdin executor without placing the payload in argv", async () => {
-    const input = "payload that must stay out of argv";
-    const exec = vi.fn<PiExec>().mockResolvedValue(response('{"id":"prompt","result":{"ok":true}}'));
-    const stdinExec = vi.fn<StdinExec>().mockResolvedValue(response('{"id":"prompt","result":{"ok":true}}'));
-    const cli = new HerdrCli(exec, 1000, 1000, stdinExec);
-    await expect(cli.runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], input, signal)).resolves.toMatchObject({ id: "prompt" });
-    expect(exec).not.toHaveBeenCalled();
-    expect(stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin"], input, { signal, timeout: 1000 });
-
-    const incompatible = vi.fn<StdinExec>().mockResolvedValue(response("", 2, "unknown option --stdin; payload that must stay out of argv"));
-    await expect(new HerdrCli(exec, 1000, 1000, incompatible).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], input, signal)).rejects.toMatchObject({
-      code: "CLI_INCOMPATIBLE",
-      details: { evidence: "omitted_for_stdin_delivery", exitCode: 2, stderrPresent: true, stdoutPresent: false, stdoutBytes: 0 }
-    });
-  });
-
-  it("never exposes stdout or stderr text for stdin deliveries, including partial echoes", async () => {
-    const input = "line one of the plan\nline two of the plan\nline three of the plan";
-    const partialEcho = `error near "${input.slice(0, 24)}" while submitting`;
-    const exec = vi.fn<PiExec>().mockResolvedValue(response(""));
-
-    const failing = vi.fn<StdinExec>().mockResolvedValue(response(partialEcho.slice(0, 12), 1, partialEcho));
-    const failure = await new HerdrCli(exec, 1000, 40, failing).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], input, signal).catch((error: CliProtocolError) => error);
-    expect(failure).toBeInstanceOf(CliProtocolError);
-    const failureDetails = (failure as CliProtocolError).details;
-    expect(failureDetails).toEqual({
-      exitCode: 1,
-      killed: false,
-      evidence: "omitted_for_stdin_delivery",
-      stdoutPresent: true,
-      stdoutBytes: 12,
-      stdoutTruncated: false,
-      stderrPresent: true,
-      stderrBytes: Buffer.byteLength(partialEcho, "utf8"),
-      stderrTruncated: true
-    });
-    expect(JSON.stringify(failureDetails)).not.toContain(input.slice(0, 12));
-
-    const malformed = vi.fn<StdinExec>().mockResolvedValue(response(`not json: ${input}`));
-    const parseFailure = await new HerdrCli(exec, 1000, 1000, malformed).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], input, signal).catch((error: CliProtocolError) => error);
-    expect((parseFailure as CliProtocolError).code).toBe("CLI_PROTOCOL_ERROR");
-    expect((parseFailure as CliProtocolError).details).toEqual({ evidence: "omitted_for_stdin_delivery", stdoutPresent: true, stdoutBytes: Buffer.byteLength(`not json: ${input}`, "utf8"), stdoutTruncated: false });
-    expect(JSON.stringify((parseFailure as CliProtocolError).details)).not.toContain("line one");
-
-    const killed = vi.fn<StdinExec>().mockResolvedValue(response("", 1, "", true));
-    await expect(new HerdrCli(exec, 1000, 1000, killed).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], input, signal)).rejects.toMatchObject({ code: "CLI_TIMEOUT", details: { killed: true, stderrPresent: false } });
-
-    const argvFailure = vi.fn<PiExec>().mockResolvedValue(response("plain text", 1, "plain error"));
-    await expect(new HerdrCli(argvFailure).runJson(["pane", "get", "w1:p1"], signal)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { stdout: "plain text", stderr: "plain error" } });
-  });
-
-  it("keeps prompt-stall stderr body-free and does not retain observation hints", async () => {
-    const stall = JSON.stringify({ id: "cli:agent:prompt", error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained 7" } });
-    const input = "body that must never appear";
-    const stdin = vi.fn<StdinExec>().mockResolvedValue(response(`echo ${input}`, 1, stall));
-    const failure = await new HerdrCli(vi.fn<PiExec>(), 1000, 1000, stdin).runJsonWithStdin(["agent", "prompt", "w1:p2", "--stdin"], input, signal).catch((error: CliProtocolError) => error);
-    expect((failure as CliProtocolError).details).toEqual({
-      exitCode: 1,
-      killed: false,
-      evidence: "omitted_for_stdin_delivery",
-      stdoutPresent: true,
-      stdoutBytes: Buffer.byteLength(`echo ${input}`, "utf8"),
-      stdoutTruncated: false,
-      stderrPresent: true,
-      stderrBytes: Buffer.byteLength(stall, "utf8"),
-      stderrTruncated: false
-    });
-    expect(JSON.stringify((failure as CliProtocolError).details)).not.toContain(input);
-    expect((failure as CliProtocolError).details).not.toHaveProperty("promptStallStateChangeSeq");
   });
 
   it("passes the caller signal to every call and reports cancellation", async () => {

@@ -81,6 +81,18 @@ describe("supervision socket framing and correlation", () => {
     socket.close();
   });
 
+  it("issues a caller-correlated request ID and reports the write boundary", async () => {
+    const stream = fakeStream();
+    const socket = new SupervisionSocket(stream, 1_000);
+    let writeInvoked = false;
+    const pending = socket.requestCorrelated("request-17", "agent.prompt", { target: "w1:p1", text: "hello" }, () => { writeInvoked = true; });
+    expect(writeInvoked).toBe(true);
+    expect(JSON.parse(stream.written[0]!)).toEqual({ id: "request-17", method: "agent.prompt", params: { target: "w1:p1", text: "hello" } });
+    stream.push(`${JSON.stringify({ id: "request-17", result: { type: "agent_prompted", agent: {} } })}\n`);
+    await expect(pending).resolves.toEqual({ id: "request-17", result: { type: "agent_prompted", agent: {} } });
+    socket.close();
+  });
+
   it("times out a request without leaving the connection unusable", async () => {
     const stream = fakeStream();
     const socket = new SupervisionSocket(stream, 5);
@@ -137,6 +149,13 @@ describe("supervision socket framing and correlation", () => {
     oversized.push("x".repeat(SUPERVISION_MAX_LINE_BYTES + 1));
     expect(closed[0]).toBeInstanceOf(SupervisionProtocolError);
 
+    const oversizedFrame = fakeStream();
+    const frameSocket = new SupervisionSocket(oversizedFrame, 1_000);
+    const frameClosed: Error[] = [];
+    frameSocket.onClose((error) => frameClosed.push(error));
+    oversizedFrame.push(`${"x".repeat(SUPERVISION_MAX_LINE_BYTES)}\n`);
+    expect(frameClosed[0]).toBeInstanceOf(SupervisionProtocolError);
+
     const dropped = fakeStream();
     const third = new SupervisionSocket(dropped, 1_000);
     const inflight = third.request("ping", {});
@@ -160,6 +179,29 @@ describe("supervision socket framing and correlation", () => {
     stream.push(`${JSON.stringify({ id: "herdr-tools-1", result: { type: "pong" } })}\n`);
     await expect(subscribing).rejects.toBeInstanceOf(SupervisionProtocolError);
     socket.close();
+  });
+
+  it("refuses malformed or duplicate correlated requests before writing", async () => {
+    const stream = fakeStream();
+    const socket = new SupervisionSocket(stream, 1_000);
+    await expect(socket.requestCorrelated("bad\nid", "ping", {})).rejects.toBeInstanceOf(SupervisionProtocolError);
+    const pending = socket.requestCorrelated("request-1", "ping", {});
+    await expect(socket.requestCorrelated("request-1", "ping", {})).rejects.toMatchObject({ code: "SUPERVISION_PROTOCOL_ERROR" });
+    await expect(socket.request("ping", null as never)).rejects.toMatchObject({ code: "SUPERVISION_PROTOCOL_ERROR" });
+    socket.close();
+    await expect(pending).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
+  });
+
+  it("turns write failures into socket closure errors", async () => {
+    const errorStream = fakeStream();
+    errorStream.write = () => { throw new Error("write failed"); };
+    const errorSocket = new SupervisionSocket(errorStream, 1_000);
+    await expect(errorSocket.request("ping", {})).rejects.toThrow("write failed");
+
+    const valueStream = fakeStream();
+    valueStream.write = () => { throw "write failed"; };
+    const valueSocket = new SupervisionSocket(valueStream, 1_000);
+    await expect(valueSocket.request("ping", {})).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
   });
 });
 

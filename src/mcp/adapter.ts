@@ -73,6 +73,10 @@ function bytes(value: string): number {
   return Buffer.byteLength(value, "utf8");
 }
 
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function singleLine(value: string, limit: number): string {
   return [...value]
     .map((character) => {
@@ -304,6 +308,47 @@ function launchDiagnosticPayload(message: string): Record<string, unknown> | und
   };
 }
 
+function promptDispatchPayload(value: unknown): Record<string, unknown> | undefined {
+  if (!record(value) || !["not_written", "rejected", "acknowledged", "unknown"].includes(value.state as string)) return undefined;
+  const requestId = value.requestId === undefined ? undefined : launchDiagnosticId(value.requestId);
+  return {
+    state: value.state,
+    ...(requestId === undefined ? {} : { requestId })
+  };
+}
+
+/** Keep the recovery handles a failed launch already proved, without exposing its cause details. */
+function launchRecoveryDetails(details: unknown): Record<string, unknown> {
+  if (!record(details)) return {};
+  const recovery: Record<string, unknown> = {};
+  for (const field of ["paneId", "supervisorJobId"] as const) {
+    const value = launchDiagnosticId(details[field]);
+    if (value !== undefined) recovery[field] = value;
+  }
+  const dispatch = promptDispatchPayload(details.promptDispatch);
+  if (dispatch !== undefined) recovery.promptDispatch = dispatch;
+  if (details.attachmentRetained === true) recovery.attachmentRetained = true;
+  if (record(details.attachment)) {
+    const attachment = details.attachment;
+    const attachmentId = launchDiagnosticId(attachment.attachmentId);
+    const path = launchDiagnosticId(attachment.path);
+    const size = attachment.bytes;
+    const sha256 = attachment.sha256;
+    const expiresAt = launchDiagnosticId(attachment.expiresAt);
+    if (attachmentId !== undefined && path !== undefined && typeof size === "number" && Number.isSafeInteger(size) && size >= 1 && typeof sha256 === "string" && /^[0-9a-f]{64}$/u.test(sha256) && expiresAt !== undefined) {
+      recovery.attachment = {
+        attachmentId,
+        path,
+        bytes: size,
+        sha256,
+        expiresAt,
+        ...(launchDiagnosticId(attachment.recipientPaneId) === undefined ? {} : { recipientPaneId: launchDiagnosticId(attachment.recipientPaneId) })
+      };
+    }
+  }
+  return recovery;
+}
+
 /**
  * Typed tool failures are model-visible tool results, never protocol errors.
  *
@@ -320,7 +365,7 @@ export function errorOutcome(code: string, message: string, details?: unknown, t
     // carries the sole fixed-shape model diagnostic. Never forward the attached
     // details: they include raw cause and backend evidence by design.
     const diagnostic = launchDiagnosticPayload(message);
-    const launchDetails = { tool: toolName, ...(diagnostic === undefined ? {} : { diagnostic }) };
+    const launchDetails = { tool: toolName, ...(diagnostic === undefined ? {} : { diagnostic, ...launchRecoveryDetails(details) }) };
     return { content: [{ type: "text", text: JSON.stringify({ ...head, details: launchDetails }) }], isError: true };
   }
   const safeDetails = modelSafeJson(details);

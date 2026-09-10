@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -7,6 +7,9 @@ import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CORE_TOOL_NAMES } from "../../src/tool-surface.js";
 import type { PiExec } from "../../src/cli.js";
+import type { AgentPromptClient } from "../../src/agent-prompt.js";
+import { RecipientRegistry } from "../../src/messages/recipients.js";
+import type { AttachmentStore, PublishedAttachment } from "../../src/messages/store.js";
 import { AdapterContractError } from "../../src/mcp/adapter.js";
 import type * as AdapterModule from "../../src/mcp/adapter.js";
 import { StartupRefusal } from "../../src/mcp/host.js";
@@ -51,7 +54,11 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 
 const { runHerdrMcpServer, packageRoot, refusalLine, fatalLine, MCP_SERVER_NAME } = await import("../../src/mcp/run.js");
 
-const health = { client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } };
+const health = {
+  client: { version: "0.9.0", protocol: 22, endpoint_protocol_generation: 1 },
+  server: { status: "running", version: "0.9.0", protocol: 22, compatible: true, endpoint_compatible: true, capabilities: { endpoint_protocol_generation: 1 } }
+};
+const promptSchema = readFileSync(new URL("../fixtures/herdr-0.9-protocol22.json", import.meta.url), "utf8");
 const snapshot = {
   type: "session_snapshot",
   snapshot: {
@@ -84,6 +91,7 @@ function fakeExec(): { exec: PiExec; calls: string[][] } {
     calls.push(argv);
     if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: live.snapshot.panes[0] });
+    if (argv[0] === "api" && argv[1] === "schema") return { stdout: promptSchema, stderr: "", code: 0, killed: false };
     if (argv[0] === "api") return envelope("snapshot", live);
     if (argv[0] === "agent" && argv[1] === "wait") return envelope("agent-wait", { agent: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
     if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
@@ -115,6 +123,11 @@ async function start(overrides: Partial<Parameters<typeof runHerdrMcpServer>[0]>
   const exits: number[] = [];
   const errors: string[] = [];
   const signals: string[] = [];
+  const promptClient: AgentPromptClient = {
+    prompt: vi.fn(async () => ({ id: "request-1", result: { type: "agent_prompted", agent: {} } })),
+    ping: vi.fn(async () => undefined),
+    close: vi.fn()
+  };
   const handle = await runHerdrMcpServer({
     env,
     exec,
@@ -124,6 +137,7 @@ async function start(overrides: Partial<Parameters<typeof runHerdrMcpServer>[0]>
     writeStderr: (line) => errors.push(line),
     exit: (code) => exits.push(code),
     onSignal: (signal) => signals.push(signal),
+    promptClient,
     ...overrides
   });
   if (!handle) throw new Error("server did not start");
@@ -330,7 +344,7 @@ describe("MCP tool serving", () => {
     await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.operation_phase).toBe("settled"));
     results.push(detached, await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "get", jobId } }));
     for (const result of results) {
-      expect(result.isError, textOf(result)).toBeUndefined();
+      expect(result.isError).toBeUndefined();
       expect(textOf(result)).not.toContain("run-secret");
     }
     // The pane evidence itself still reaches the model.
@@ -437,6 +451,63 @@ describe("MCP wait and job semantics", () => {
 });
 
 describe("MCP server lifecycle", () => {
+  it("wires attachment delivery capabilities into the host surface and clears the server registry", async () => {
+    const published: PublishedAttachment = {
+      attachmentId: "attachment-test-12345678",
+      path: "/tmp/herdr-mcp-attachment-test/body.txt",
+      bytes: 13,
+      sha256: "a".repeat(64),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      recipientPaneId: "w:p2"
+    };
+    const attachments: AttachmentStore = {
+      root: "/tmp/herdr-mcp-attachment-test",
+      recipientDirectory: (recipientKey) => `/tmp/herdr-mcp-attachment-test/${recipientKey}`,
+      ensureRecipient: vi.fn(async () => ({ path: "/tmp/herdr-mcp-attachment-test/recipient", token: "grant-token", renew: async () => undefined, release: async () => undefined })),
+      publish: vi.fn(async () => published)
+    };
+    const recipients = new RecipientRegistry();
+    recipients.register({
+      paneId: "w:p2",
+      terminalId: "term-worker",
+      agentName: "worker",
+      agentKind: "pi",
+      agentSession: { source: "pi", agent: "pi", kind: "id", value: "worker-session" },
+      recipientKey: "recipient-test-12345678",
+      profileName: "worker-pi",
+      kind: "pi",
+      capable: true,
+      reason: "test capability"
+    });
+    const promptClient: AgentPromptClient = {
+      prompt: vi.fn(async () => ({
+        id: "attachment-request",
+        result: {
+          type: "agent_prompted",
+          agent: {
+            pane_id: "w:p2",
+            terminal_id: "term-worker",
+            agent_name: "worker",
+            agent: "pi",
+            agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" },
+            interactive_ready: true,
+            revision: 1,
+            state_change_seq: 1
+          }
+        }
+      })),
+      ping: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const harness = await start({ attachments, recipients, promptClient });
+    const result = await harness.client.callTool({ name: "herdr_communicate", arguments: { target: "w:p2", operation: "steer", delivery: "attachment", text: "complete body" } });
+    expect(result.isError).toBeUndefined();
+    expect(attachments.publish).toHaveBeenCalledTimes(1);
+    expect(harness.handle.recipients).toBe(recipients);
+    await harness.handle.shutdown();
+    expect(recipients.size).toBe(0);
+  });
+
   it("marks jobs shut down, resets ownership, and exits zero exactly once", async () => {
     const harness = await start();
     const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } });

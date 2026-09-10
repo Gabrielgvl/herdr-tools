@@ -1,7 +1,11 @@
 import { EventEmitter } from "node:events";
+import { createConnection, createServer, type Server } from "node:net";
 import type { ChildProcess } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { stopDisposableServer } from "../integration/disposable-session.js";
+import { startDisposableSocketProxy, stopDisposableServer } from "../integration/disposable-session.js";
 
 describe("disposable integration server cleanup", () => {
   it("waits for the named server child to close before returning", async () => {
@@ -29,5 +33,42 @@ describe("disposable integration server cleanup", () => {
     await stopDisposableServer(child as ChildProcess);
 
     expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("forwards one complete prompt frame and records its target and body", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "herdr-socket-proxy-test-"));
+    const backendPath = join(directory, "backend.sock");
+    const proxyPath = join(directory, "proxy.sock");
+    let backend: Server | undefined;
+    try {
+      backend = createServer((client) => {
+        client.on("data", (chunk) => client.write(chunk));
+      });
+      await new Promise<void>((resolve, reject) => {
+        backend!.once("error", reject);
+        backend!.listen(backendPath, resolve);
+      });
+      const seen: string[] = [];
+    const proxy = await startDisposableSocketProxy(backendPath, proxyPath, { onRequest: (request) => { seen.push(JSON.stringify(request)); } });
+      const client = createConnection({ path: proxy.path });
+      const response = new Promise<string>((resolve, reject) => {
+        let output = "";
+        client.on("data", (chunk) => {
+          output += chunk.toString("utf8");
+          if (output.includes("\n")) resolve(output);
+        });
+        client.once("error", reject);
+      });
+      const frame = `${JSON.stringify({ id: "socket-test-1", method: "agent.prompt", params: { target: "w1:p1", text: "receipt-body" } })}\n`;
+      client.write(frame.slice(0, 17));
+      client.write(frame.slice(17));
+      await expect(response).resolves.toBe(frame);
+      await vi.waitFor(() => expect(seen).toEqual([JSON.stringify({ id: "socket-test-1", method: "agent.prompt", target: "w1:p1", text: "receipt-body" })]));
+      client.destroy();
+      await proxy.close();
+    } finally {
+      await new Promise<void>((resolve) => backend?.close(() => resolve()) ?? resolve());
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

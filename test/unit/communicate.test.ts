@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { AgentPromptError, type AgentPromptClient } from "../../src/agent-prompt.js";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
-import type { StdinExec } from "../../src/exec-stdin.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
 import { compactPane, createCommunicateTool as createCommunicateToolImplementation, paneFrom, type CommunicateDependencies } from "../../src/tools/communicate.js";
@@ -9,8 +9,6 @@ import { CommunicateParamsSchema } from "../../src/schemas.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 
 const targetIdentity = { terminal_id: "term-reviewer", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-reviewer" } };
-const agySession = { source: "agy", agent: "agy", kind: "id", value: "session-agy" };
-const agyRecipientDirectory = "/cache/agy-recipient-key";
 // Herdr 0.8.2 pane records do not repeat agent_name; the paired agent and
 // identity reads provide the complementary fields used by prompt delivery.
 const basePane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "reviewer", agent_id: "agent-7", agent_status: "idle", agent: "pi", ...targetIdentity };
@@ -30,16 +28,17 @@ const createCommunicateTool = (deps: Omit<CommunicateDependencies, "preflight"> 
 
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
 const senderEnvelope = (kind: "prompt" | "steer", payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: ${kind}\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`;
-const stdinResponse = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
+const execResponse = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
 const extensionContext = { signal: undefined, hasUI: false } as unknown as ExtensionContext;
 
 type State = "idle" | "working" | "blocked" | "done" | "unknown" | "malformed";
 
 function makeCli(initial: State = "idle", options: { postState?: State } = {}) {
   const calls: string[][] = [];
-  const stdinInputs: string[] = [];
+  const promptInputs: string[] = [];
   const states: State[] = [];
   let state = initial;
+  let mutationSubmitted = false;
   const response = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
   const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
     if (argv[0] === "pane" && argv[1] === "current") return response("current", { type: "pane_current", pane: callerPane });
@@ -48,28 +47,30 @@ function makeCli(initial: State = "idle", options: { postState?: State } = {}) {
       return response("snapshot-1", { snapshot: { ...baseSnapshot, panes: [{ ...callerPane }, { ...basePane, agent_status: state }], agents: [{ ...baseSnapshot.agents[0]! }, { ...baseSnapshot.agents[1]!, agent_status: state }] }, type: "session_snapshot" });
     }
     if (argv[0] === "agent" && argv[1] === "get") {
-      const readState = options.postState && calls.filter((call) => call[0] === "agent" && call[1] === "get").length > 1 ? options.postState : state;
+      const readState = options.postState && mutationSubmitted ? options.postState : state;
       return response("agent-get", { agent: { pane_id: "w1:p2", name: "reviewer", agent: "pi", agent_status: readState, ...targetIdentity } });
     }
     if (argv[0] === "pane" && argv[1] === "get") {
-      const readState = options.postState && calls.filter((call) => call[0] === "pane" && call[1] === "get").length > 1 ? options.postState : state;
+      const readState = options.postState && mutationSubmitted ? options.postState : state;
       states.push(readState);
       const pane = readState === "malformed" ? { ...basePane, agent_status: undefined } : { ...basePane, agent_status: readState };
       return response(`pane-${states.length}`, { pane });
     }
     if (argv[0] === "agent" && argv[1] === "send-keys") {
+      mutationSubmitted = true;
       state = argv[3] === "esc" ? "idle" : "working";
       return response("interrupt-1", { ok: true });
     }
     if (argv[0] === "agent" && argv[1] === "prompt") {
-      throw new Error("text prompt must use the stdin executor");
+      throw new Error("text prompt must use the prompt socket client");
     }
     throw new Error(`unexpected argv ${argv.join(" ")}`);
   });
-  const stdinExec = vi.fn<StdinExec>().mockImplementation(async (_command, _argv, input) => {
-    stdinInputs.push(input);
+  const prompt = vi.fn<AgentPromptClient["prompt"]>().mockImplementation(async (_target, input) => {
+    promptInputs.push(input);
+    mutationSubmitted = true;
     state = "working";
-    return response("cli:agent:prompt", {
+    return { id: "cli:agent:prompt", result: {
       type: "agent_prompted",
       agent: {
         name: "reviewer",
@@ -82,38 +83,10 @@ function makeCli(initial: State = "idle", options: { postState?: State } = {}) {
         state_change_seq: 1,
         screen_detection_skipped: true
       }
-    });
+    } };
   });
-  return { cli: new HerdrCli(exec, 10_000, 50_000, stdinExec), calls, stdinInputs, exec, stdinExec };
-}
-
-function makeAgyCli(session = agySession) {
-  const harness = makeCli();
-  const pane = { ...basePane, agent: "agy", terminal_id: "term-agy", agent_session: session };
-  const agent = { ...baseSnapshot.agents[1]!, agent: "agy", terminal_id: "term-agy", agent_session: session };
-  harness.cli.runJson = vi.fn(async (argv) => {
-    if (argv[0] === "pane" && argv[1] === "current") return { id: "current-agy", result: { type: "pane_current", pane: callerPane } };
-    if (argv[0] === "api") return { id: "snapshot-agy", result: { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, pane], agents: [baseSnapshot.agents[0]!, agent] } } };
-    if (argv[0] === "agent" && argv[1] === "get") return { id: "agent-agy", result: { agent } };
-    if (argv[0] === "pane" && argv[1] === "get") return { id: "pane-agy", result: { pane } };
-    throw new Error(`unexpected argv ${argv.join(" ")}`);
-  });
-  harness.cli.runJsonWithStdin = vi.fn(async () => ({
-    id: "cli:agent:prompt",
-    result: { type: "agent_prompted", agent: { ...agent, interactive_ready: true, revision: 3, state_change_seq: 2 } }
-  }));
-  return harness;
-}
-
-function registerAgyRecipient(registry: RecipientRegistry, capable = true) {
-  return registry.recordFor(
-    "researcher-agy",
-    "w1:p2",
-    "agy-recipient-key",
-    { kind: "agy", capable, reason: capable ? "read" : "missing read capability" },
-    { paneId: "w1:p2", terminalId: "term-agy", agentName: "reviewer", agentKind: "agy", agentSession: agySession, agentId: "agent-7" },
-    { agyStrengthened: true, attachmentDirectory: agyRecipientDirectory }
-  );
+  const promptClient: AgentPromptClient = { prompt, ping: vi.fn(async () => undefined) };
+  return { cli: new HerdrCli(exec, 10_000, 50_000, promptClient), calls, promptInputs, exec, promptClient, prompt };
 }
 
 function execute(cli: HerdrCli, params: Record<string, unknown>, signal: AbortSignal = new AbortController().signal) {
@@ -129,11 +102,13 @@ describe("herdr_communicate", () => {
       ["agent", "get", "w1:p2"],
       ["pane", "get", "w1:p2"],
       ["agent", "get", "w1:p2"],
+      ["pane", "get", "w1:p2"],
+      ["agent", "get", "w1:p2"],
       ["pane", "get", "w1:p2"]
     ]);
-    expect(harness.stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin"], senderEnvelope("steer", "new direction"), expect.anything());
+    expect(harness.prompt).toHaveBeenCalledWith("w1:p2", senderEnvelope("steer", "new direction"), expect.anything());
     expect(harness.calls.some((call) => call.includes("esc"))).toBe(false);
-    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: state }, postState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt", screenDetectionSkipped: true }, observation: { status: "working", state: "working", screenDetectionSkipped: true }, operationIds: { prompt: "cli:agent:prompt", postState: "pane-2" } });
+    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: state }, postState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt", screenDetectionSkipped: true }, promptDispatch: { state: "acknowledged", requestId: "cli:agent:prompt" }, observation: { status: "working", state: "working", screenDetectionSkipped: true }, operationIds: { prompt: "cli:agent:prompt", postState: "pane-3" } });
   });
 
   it("steers a working agent by submitting directly without interrupting", async () => {
@@ -144,11 +119,22 @@ describe("herdr_communicate", () => {
       ["agent", "get", "w1:p2"],
       ["pane", "get", "w1:p2"],
       ["agent", "get", "w1:p2"],
+      ["pane", "get", "w1:p2"],
+      ["agent", "get", "w1:p2"],
       ["pane", "get", "w1:p2"]
     ]);
-    expect(harness.stdinExec).toHaveBeenCalledWith("herdr", ["agent", "prompt", "w1:p2", "--stdin"], senderEnvelope("steer", "replace direction"), expect.anything());
+    expect(harness.prompt).toHaveBeenCalledWith("w1:p2", senderEnvelope("steer", "replace direction"), expect.anything());
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "send-keys")).toBe(false);
-    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt" }, observation: { status: "working", screenDetectionSkipped: true }, operationIds: { prompt: "cli:agent:prompt", postState: "pane-2" } });
+    expect(result.details).toMatchObject({ route: "steer_direct", preState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt" }, promptDispatch: { state: "acknowledged", requestId: "cli:agent:prompt" }, observation: { status: "working", screenDetectionSkipped: true }, operationIds: { prompt: "cli:agent:prompt", postState: "pane-3" } });
+  });
+
+  it("runs the prompt endpoint preflight before a text mutation", async () => {
+    const harness = makeCli();
+    const signal = new AbortController().signal;
+    const preflight = vi.fn(async () => undefined);
+    await createCommunicateTool({ cli: harness.cli, context, preflight }).execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, signal, undefined, extensionContext);
+    expect(preflight).toHaveBeenCalledWith(signal, "agent.prompt");
+    expect(preflight.mock.invocationCallOrder[0]).toBeLessThan(harness.prompt.mock.invocationCallOrder[0]!);
   });
 
   it("requires complete pre-submission identity and sends no bytes for missing or replaced records", async () => {
@@ -165,7 +151,7 @@ describe("herdr_communicate", () => {
         return base.call(harness.cli, argv, signal, preserve);
       });
       await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "must not send" })).rejects.toMatchObject({ code: expect.stringMatching(/TARGET_IDENTITY|CLI_PROTOCOL/) });
-      expect(harness.stdinExec).not.toHaveBeenCalled();
+      expect(harness.prompt).not.toHaveBeenCalled();
     }
   });
 
@@ -173,6 +159,16 @@ describe("herdr_communicate", () => {
     const harness = makeCli("working");
     await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code: "TARGET_BUSY" });
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
+  });
+
+  it.each([
+    ["blocked", "TARGET_BLOCKED"],
+    ["unknown", "TARGET_STATE_UNKNOWN"],
+    ["malformed", "TARGET_STATE_UNAVAILABLE"]
+  ] as const)("refuses normal prompt against %s without prompt bytes", async (state, code) => {
+    const harness = makeCli(state);
+    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code });
+    expect(harness.prompt).not.toHaveBeenCalled();
   });
 
   it("rejects text self-targeting before pane read or send", async () => {
@@ -189,7 +185,7 @@ describe("herdr_communicate", () => {
   it("fails with unavailable sender before any send when caller is absent", async () => {
     const harness = makeCli();
     harness.exec.mockImplementation(async (_command, argv) => {
-      if (argv[0] === "pane" && argv[1] === "current") return stdinResponse("current", { type: "pane_current", pane: callerPane });
+      if (argv[0] === "pane" && argv[1] === "current") return execResponse("current", { type: "pane_current", pane: callerPane });
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [basePane] } } }), stderr: "", code: 0, killed: false };
       throw new Error(`unexpected mutation: ${argv.join(" ")}`);
     });
@@ -205,15 +201,15 @@ describe("herdr_communicate", () => {
       return base.call(harness.cli, argv, signal, preserve);
     });
     await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "must not send" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
-    expect(harness.stdinExec).not.toHaveBeenCalled();
+    expect(harness.prompt).not.toHaveBeenCalled();
   });
 
   it("prompts idle directly and returns bounded operation IDs and states", async () => {
     const harness = makeCli();
     const result = await execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" });
     expect(harness.calls[2]).toEqual(["pane", "get", "w1:p2"]);
-    expect(harness.stdinInputs).toEqual([senderEnvelope("prompt", "hello")]);
-    expect(result.details).toMatchObject({ operation: "prompt", delivery: "inline", route: "prompt_direct", preState: { agent_status: "idle" }, postState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt", revision: 3 }, observation: { status: "working", state: "working", screenDetectionSkipped: true }, operationIds: { snapshot: "snapshot-1", preState: "pane-1", prompt: "cli:agent:prompt", postState: "pane-2" }, envelope: { version: "v1", kind: "prompt", delivery: "inline" } });
+    expect(harness.promptInputs).toEqual([senderEnvelope("prompt", "hello")]);
+    expect(result.details).toMatchObject({ operation: "prompt", delivery: "inline", route: "prompt_direct", preState: { agent_status: "idle" }, postState: { agent_status: "working" }, submission: { confirmed: true, operationId: "cli:agent:prompt", revision: 3 }, promptDispatch: { state: "acknowledged", requestId: "cli:agent:prompt" }, observation: { status: "working", state: "working", screenDetectionSkipped: true }, operationIds: { snapshot: "snapshot-1", preState: "pane-1", prompt: "cli:agent:prompt", postState: "pane-3" }, envelope: { version: "v1", kind: "prompt", delivery: "inline" } });
     expect(JSON.stringify(result)).not.toContain("environment");
   });
 
@@ -277,14 +273,14 @@ describe("herdr_communicate", () => {
     const replacementBase = replacement.cli.runJson;
     let agentReads = 0;
     replacement.cli.runJson = vi.fn(async (argv, signal, preserve) => {
-      if (argv[0] === "agent" && argv[1] === "get" && agentReads++ > 0) return { id: "agent-get-replacement", result: { agent: { pane_id: "w1:p2", name: "reviewer", agent: "pi", terminal_id: "term-reviewer", agent_session: { source: "pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working" } } };
+      if (argv[0] === "agent" && argv[1] === "get" && agentReads++ > 1) return { id: "agent-get-replacement", result: { agent: { pane_id: "w1:p2", name: "reviewer", agent: "pi", terminal_id: "term-reviewer", agent_session: { source: "pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working" } } };
       return replacementBase.call(replacement.cli, argv, signal, preserve);
     });
     const replacementResult = await execute(replacement.cli, { target: "reviewer", operation: "prompt", text: "hello" });
     expect(replacementResult).toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence: { records: expect.any(Array) } } } });
     expect(replacementResult.details).not.toHaveProperty("postState");
     expect(JSON.stringify(replacementResult.content)).not.toContain("working");
-    expect(replacement.stdinExec).toHaveBeenCalledTimes(1);
+    expect(replacement.prompt).toHaveBeenCalledTimes(1);
   });
 
   it("keeps post-state identity fail-closed while ignoring pane lifecycle skew", async () => {
@@ -292,7 +288,7 @@ describe("herdr_communicate", () => {
     const malformedBase = malformedPost.cli.runJson;
     let paneReads = 0;
     malformedPost.cli.runJson = vi.fn(async (argv, signal, preserve) => {
-      if (argv[0] === "pane" && argv[1] === "get" && paneReads++ > 0) return { id: "pane-post", result: { pane: { ...basePane, agent_status: undefined } } };
+      if (argv[0] === "pane" && argv[1] === "get" && paneReads++ > 1) return { id: "pane-post", result: { pane: { ...basePane, agent_status: undefined } } };
       return malformedBase.call(malformedPost.cli, argv, signal, preserve);
     });
     await expect(execute(malformedPost.cli, { target: "reviewer", operation: "steer", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "working", state: "working" } } });
@@ -301,7 +297,7 @@ describe("herdr_communicate", () => {
     const replacementBase = replacementPost.cli.runJson;
     let replacementReads = 0;
     replacementPost.cli.runJson = vi.fn(async (argv, signal, preserve) => {
-      if (argv[0] === "agent" && argv[1] === "get" && replacementReads++ > 0) return { id: "agent-post", result: { agent: { pane_id: "w1:p2", name: "reviewer", agent: "pi", terminal_id: "term-reviewer", agent_session: { source: "pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working" } } };
+      if (argv[0] === "agent" && argv[1] === "get" && replacementReads++ > 1) return { id: "agent-post", result: { agent: { pane_id: "w1:p2", name: "reviewer", agent: "pi", terminal_id: "term-reviewer", agent_session: { source: "pi", agent: "pi", kind: "id", value: "replacement" }, agent_status: "working" } } };
       return replacementBase.call(replacementPost.cli, argv, signal, preserve);
     });
     const replacementPostResult = await execute(replacementPost.cli, { target: "reviewer", operation: "steer", text: "hello" });
@@ -315,33 +311,35 @@ describe("herdr_communicate", () => {
     const base = harness.cli.runJson;
     let paneReads = 0;
     harness.cli.runJson = vi.fn(async (argv, signal, preserve) => {
-      if (argv[0] === "pane" && argv[1] === "get" && paneReads++ > 0) throw Object.assign(new Error("post read unavailable"), { code: "CLI_PROTOCOL_ERROR" });
+      if (argv[0] === "pane" && argv[1] === "get" && paneReads++ > 1) throw Object.assign(new Error("post read unavailable"), { code: "CLI_PROTOCOL_ERROR" });
       return base.call(harness.cli, argv, signal, preserve);
     });
     await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true, operationId: "cli:agent:prompt" }, observation: { status: "unavailable", code: "CLI_PROTOCOL_ERROR" } } });
-    expect(harness.stdinExec).toHaveBeenCalledTimes(1);
+    expect(harness.prompt).toHaveBeenCalledTimes(1);
 
     const stringFailure = makeCli();
     const stringBase = stringFailure.cli.runJson;
     let stringReads = 0;
-    stringFailure.cli.runJson = vi.fn(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" && stringReads++ > 0 ? Promise.reject("observation unavailable") : stringBase.call(stringFailure.cli, argv, signal, preserve));
+    stringFailure.cli.runJson = vi.fn(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" && stringReads++ > 1 ? Promise.reject("observation unavailable") : stringBase.call(stringFailure.cli, argv, signal, preserve));
     await expect(execute(stringFailure.cli, { target: "reviewer", operation: "prompt", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "unavailable", code: "POSTSTATE_UNAVAILABLE" } } });
 
     const aborted = makeCli();
     const abortBase = aborted.cli.runJson;
     let abortReads = 0;
-    aborted.cli.runJson = vi.fn(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" && abortReads++ > 0 ? Promise.reject(Object.assign(new Error("aborted"), { code: "ABORTED" })) : abortBase.call(aborted.cli, argv, signal, preserve));
+    aborted.cli.runJson = vi.fn(async (argv, signal, preserve) => argv[0] === "pane" && argv[1] === "get" && abortReads++ > 1 ? Promise.reject(Object.assign(new Error("aborted"), { code: "ABORTED" })) : abortBase.call(aborted.cli, argv, signal, preserve));
     await expect(execute(aborted.cli, { target: "reviewer", operation: "prompt", text: "hello" })).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "unavailable", code: "ABORTED" } } });
-    expect(aborted.stdinExec).toHaveBeenCalledTimes(1);
+    expect(aborted.prompt).toHaveBeenCalledTimes(1);
   });
 
   it.each(["prompt", "steer"] as const)("preserves an acknowledgement when %s transport aborts after exactly one submission", async (operation) => {
     const controller = new AbortController();
     const harness = makeCli();
-    harness.stdinExec.mockImplementation(async (_command, _argv, input) => {
-      harness.stdinInputs.push(input);
+    harness.prompt.mockImplementation(async (_target, input) => {
+      harness.promptInputs.push(input);
       controller.abort();
-      return stdinResponse("cli:agent:prompt", {
+      return {
+        id: "cli:agent:prompt",
+        result: {
         type: "agent_prompted",
         agent: {
           name: "reviewer",
@@ -352,11 +350,12 @@ describe("herdr_communicate", () => {
           revision: 3,
           screen_detection_skipped: true
         }
-      });
+        }
+      };
     });
     await expect(execute(harness.cli, { target: "reviewer", operation, text: "abort after acknowledgement" }, controller.signal)).resolves.toMatchObject({ details: { submission: { confirmed: true }, observation: { status: "unavailable", code: "ABORTED" } } });
-    expect(harness.stdinExec).toHaveBeenCalledTimes(1);
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.prompt).toHaveBeenCalledTimes(1);
+    expect(harness.promptInputs).toHaveLength(1);
   });
 
   it("bounds long acknowledgement identity mismatches and nested protocol evidence", async () => {
@@ -377,13 +376,14 @@ describe("herdr_communicate", () => {
       if (argv[0] === "pane" && argv[1] === "get") return { id: "pane-long", result: { pane: { ...basePane, ...captured } } };
       return base.call(harness.cli, argv, signal, preserve);
     });
-    harness.stdinExec.mockImplementation(async (_command, _argv, input) => {
-      harness.stdinInputs.push(input);
-      return stdinResponse("cli:agent:prompt", { type: "agent_prompted", agent: { name: "reviewer", pane_id: "w1:p2", agent: "pi", ...returned, interactive_ready: true, revision: 3 } });
+    harness.prompt.mockImplementation(async (_target, input) => {
+      harness.promptInputs.push(input);
+      return { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { name: "reviewer", pane_id: "w1:p2", agent: "pi", ...returned, interactive_ready: true, revision: 3 } } };
     });
     const failure = await (execute(harness.cli, { target: "reviewer", operation: "prompt", text: "ack mismatch" }).catch((error: unknown) => error as { code?: string; details?: Record<string, unknown> }) as unknown as Promise<{ code?: string; details?: Record<string, unknown> }>);
     expect(failure).toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { delivery: "inline", route: "prompt_direct", phase: "send" } });
     const details = failure.details!;
+    expect(details.promptDispatch).toEqual({ state: "unknown", requestId: "cli:agent:prompt" });
     expect(details.expectedTerminalId).toHaveLength(256);
     expect(details.actualTerminalId).toHaveLength(256);
     expect((details.expectedAgentSession as Record<string, string>).value).toHaveLength(256);
@@ -398,6 +398,18 @@ describe("herdr_communicate", () => {
       return { stdout: JSON.stringify({ id: "pane", result: { pane: null } }), stderr: "", code: 0, killed: false };
     });
     await expect(execute(new HerdrCli(exec), { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR" });
+  });
+
+  it("fails closed when the fresh agent record is missing", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let agentReads = 0;
+    harness.cli.runJson = vi.fn(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "get" && agentReads++ === 0) return { id: "agent-missing", result: { agent: null } };
+      return base.call(harness.cli, argv, signal, preserve);
+    });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "must not send" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    expect(harness.prompt).not.toHaveBeenCalled();
   });
 
   it("rejects missing authoritative identifiers and identity mismatches before bytes", async () => {
@@ -441,8 +453,8 @@ describe("herdr_communicate", () => {
     const tool = createCommunicateTool({ cli: harness.cli, context, attachments, recipients });
     const result = await tool.execute("id", { target: "reviewer", operation: "prompt", text: "attachment body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
     expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: "attachment body", recipientKey: "recipient-key", recipientPaneId: "w1:p2" }));
-    expect(harness.stdinInputs[0]).toContain("delivery: attachment");
-    expect(harness.stdinInputs[0]).not.toContain("attachment body");
+    expect(harness.promptInputs[0]).toContain("delivery: attachment");
+    expect(harness.promptInputs[0]).not.toContain("attachment body");
     expect(result.details).toMatchObject({ delivery: "attachment", attachment: { attachmentId: "attachment-1", bytes: 15 } });
 
     const unverifiedStore = { ...attachments, publish: vi.fn() } as unknown as AttachmentStore;
@@ -450,38 +462,67 @@ describe("herdr_communicate", () => {
     expect(unverifiedStore.publish).not.toHaveBeenCalled();
   });
 
-  it("delivers AGY attachments only for strengthened exact identity and its granted directory", async () => {
-    const attachment = { target: "reviewer", operation: "prompt" as const, text: "body", delivery: "attachment" as const };
+  it.each([["AGY", "agy", "AGY_UNQUALIFIED"], ["Claude", "claude", "CLAUDE_UNQUALIFIED"]] as const)("rejects %s %s before attachment publication or prompt send", async (_label, kind, code) => {
+    const harness = makeCli();
+    const targetPane = { ...basePane, agent: kind, terminal_id: `term-${kind}`, agent_session: { source: kind, agent: kind, kind: "id", value: `session-${kind}` } };
+    const targetAgent = { ...baseSnapshot.agents[1]!, agent: kind, terminal_id: `term-${kind}`, agent_session: targetPane.agent_session };
+    const baseExec = harness.exec.getMockImplementation()!;
+    harness.exec.mockImplementation(async (_command, argv, options) => {
+      if (argv[0] === "api") return execResponse(`snapshot-${kind}`, { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
+      return baseExec(_command, argv, options);
+    });
+    const publish = vi.fn();
+    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
     const recipients = new RecipientRegistry();
-    registerAgyRecipient(recipients);
-    const publish = vi.fn(async () => ({ attachmentId: "attachment-agy", path: `${agyRecipientDirectory}/attachment-agy/body.txt`, bytes: 4, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
-    const attachments = { root: "/cache", recipientDirectory: () => agyRecipientDirectory, ensureRecipient: async (key: string) => fakeGrant(key), publish } as AttachmentStore;
-    const exact = makeAgyCli();
-
-    await expect(createCommunicateTool({ cli: exact.cli, context, attachments, recipients }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
-      .resolves.toMatchObject({ details: { delivery: "attachment", attachment: { attachmentId: "attachment-agy" } } });
-    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ recipientKey: "agy-recipient-key", expectedRecipientDirectory: agyRecipientDirectory }));
-    expect(exact.cli.runJsonWithStdin).toHaveBeenCalledTimes(1);
-
-    for (const failure of [
-      { registry: new RecipientRegistry(), cli: makeAgyCli().cli, directory: agyRecipientDirectory },
-      { registry: (() => { const value = new RecipientRegistry(); registerAgyRecipient(value, false); return value; })(), cli: makeAgyCli().cli, directory: agyRecipientDirectory },
-      { registry: recipients, cli: makeAgyCli({ ...agySession, value: "replacement" }).cli, directory: agyRecipientDirectory },
-      { registry: recipients, cli: makeAgyCli().cli, directory: "/cache/wrong-recipient" }
-    ]) {
-      const refusedPublish = vi.fn();
-      const refusedStore = { ...attachments, recipientDirectory: () => failure.directory, publish: refusedPublish } as unknown as AttachmentStore;
-      await expect(createCommunicateTool({ cli: failure.cli, context, attachments: refusedStore, recipients: failure.registry }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
-        .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED" });
-      expect(refusedPublish).not.toHaveBeenCalled();
-      expect(failure.cli.runJsonWithStdin).not.toHaveBeenCalled();
+    for (const operation of ["prompt", "steer"] as const) {
+      await expect(createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation, text: "blocked", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
+        .rejects.toMatchObject({ code, details: { phase: "resolve_target", delivery: "attachment", route: `${operation}_direct` } });
     }
+    expect(publish).not.toHaveBeenCalled();
+    expect(harness.prompt).not.toHaveBeenCalled();
+  });
 
-    const wrongPublication = { ...attachments, publish: vi.fn(async () => ({ attachmentId: "attachment-agy", path: "/cache/wrong/attachment-agy/body.txt", bytes: 4, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" })) } as AttachmentStore;
-    const wrongPath = makeAgyCli();
-    await expect(createCommunicateTool({ cli: wrongPath.cli, context, attachments: wrongPublication, recipients }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { phase: "publish", attachmentRetained: true } });
-    expect(wrongPath.cli.runJsonWithStdin).not.toHaveBeenCalled();
+  it.each([["AGY", "agy", "AGY_UNQUALIFIED"], ["Claude", "claude", "CLAUDE_UNQUALIFIED"]] as const)("rejects a partial %s %s identity before the strict join", async (_label, kind, code) => {
+    const harness = makeCli();
+    const targetPane = { ...basePane, agent: kind };
+    delete (targetPane as Record<string, unknown>).agent_session;
+    const targetAgent = { ...baseSnapshot.agents[1]!, agent: kind };
+    delete (targetAgent as Record<string, unknown>).agent_session;
+    const baseExec = harness.exec.getMockImplementation()!;
+    harness.exec.mockImplementation(async (_command, argv, options) => {
+      if (argv[0] === "api") return execResponse(`snapshot-${kind}-partial`, { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
+      return baseExec(_command, argv, options);
+    });
+    for (const operation of ["prompt", "steer"] as const) {
+      await expect(execute(harness.cli, { target: "reviewer", operation, text: "blocked" })).rejects.toMatchObject({ code });
+    }
+    expect(harness.prompt).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["AGY", "agy", "AGY_UNQUALIFIED", "prompt", "inline"], ["AGY", "agy", "AGY_UNQUALIFIED", "prompt", "attachment"],
+    ["AGY", "agy", "AGY_UNQUALIFIED", "steer", "inline"], ["AGY", "agy", "AGY_UNQUALIFIED", "steer", "attachment"],
+    ["Claude", "claude", "CLAUDE_UNQUALIFIED", "prompt", "inline"], ["Claude", "claude", "CLAUDE_UNQUALIFIED", "prompt", "attachment"],
+    ["Claude", "claude", "CLAUDE_UNQUALIFIED", "steer", "inline"], ["Claude", "claude", "CLAUDE_UNQUALIFIED", "steer", "attachment"]
+  ] as const)("rejects a %s final-read replacement before %s %s delivery", async (_label, kind, code, operation, delivery) => {
+    const harness = makeCli();
+    const baseRun = harness.cli.runJson;
+    let agentReads = 0;
+    harness.cli.runJson = vi.fn(async (argv, signal, preserve) => {
+      if (argv[0] === "agent" && argv[1] === "get" && agentReads++ === 1) {
+        return { id: `agent-final-${kind}`, result: { agent: { pane_id: "w1:p2", name: "reviewer", agent: kind, terminal_id: `term-${kind}`, agent_session: { source: kind, agent: kind, kind: "id", value: `session-${kind}` }, agent_status: "idle" } } };
+      }
+      return baseRun.call(harness.cli, argv, signal, preserve);
+    });
+    const publish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/recipient-key/body.txt", bytes: 7, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
+    const attachments: AttachmentStore = { root: "/cache", recipientDirectory: (key) => `/cache/${key}`, ensureRecipient: async (key) => fakeGrant(key), publish };
+    const recipients = new RecipientRegistry();
+    if (delivery === "attachment") recipients.register({ paneId: "w1:p2", terminalId: "term-reviewer", agentName: "reviewer", agentKind: "pi", agentSession: targetIdentity.agent_session, recipientKey: "recipient-key", profileName: "worker-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-7" });
+    const tool = createCommunicateTool({ cli: harness.cli, context, attachments, recipients });
+    await expect(tool.execute("id", { target: "reviewer", operation, text: "blocked", ...(delivery === "attachment" ? { delivery } : {}) }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code, details: { phase: "pre_state" } });
+    expect(harness.prompt).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it("refuses attachment delivery for unregistered, incapable, and identity-mismatched recipients", async () => {
@@ -521,11 +562,11 @@ describe("herdr_communicate", () => {
     const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish: async () => published } as unknown as AttachmentStore;
 
     const sendFailure = makeCli();
-    sendFailure.stdinExec.mockImplementation(async () => ({ stdout: "", stderr: "submission refused", code: 1, killed: false }));
+    sendFailure.prompt.mockRejectedValue(Object.assign(new Error("submission refused"), { code: "CLI_PROTOCOL_ERROR", details: { promptDispatch: { state: "unknown", requestId: "request-unknown" } } }));
     const sendError = await createCommunicateTool({ cli: sendFailure.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext).catch((error: { code?: string; details?: Record<string, unknown> }) => error);
     expect(sendError).toMatchObject({
       code: "CLI_PROTOCOL_ERROR",
-      details: { evidence: "omitted_for_stdin_delivery", delivery: "attachment", route: "prompt_direct", phase: "send", attachmentRetained: true, attachment: { attachmentId: "attachment-1", path: published.path } }
+      details: { promptDispatch: { state: "unknown", requestId: "request-unknown" }, delivery: "attachment", route: "prompt_direct", phase: "send", attachmentRetained: true, attachment: { attachmentId: "attachment-1", path: published.path } }
     });
     expect(JSON.stringify(sendError)).not.toContain("submission refused");
 
@@ -539,13 +580,24 @@ describe("herdr_communicate", () => {
 
     const keysFailure = makeCli();
     keysFailure.exec.mockImplementation(async (_command, argv) => {
-      if (argv[0] === "pane" && argv[1] === "current") return stdinResponse("current", { type: "pane_current", pane: callerPane });
+      if (argv[0] === "pane" && argv[1] === "current") return execResponse("current", { type: "pane_current", pane: callerPane });
       if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot-1", result: { type: "session_snapshot", snapshot: baseSnapshot } }), stderr: "", code: 0, killed: false };
       if (argv[0] === "pane") return { stdout: JSON.stringify({ id: "pane-1", result: { pane: { ...basePane, agent_status: "idle" } } }), stderr: "", code: 0, killed: false };
       return { stdout: "", stderr: "keys rejected", code: 1, killed: false };
     });
     await expect(createCommunicateTool({ cli: keysFailure.cli, context }).execute("id", { target: "reviewer", operation: "keys", keys: ["enter"] }, new AbortController().signal, undefined, extensionContext))
       .rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "send" } });
+  });
+
+  it.each([
+    ["not_written", "BACKEND_UNAVAILABLE", undefined],
+    ["rejected", "TARGET_BLOCKED", "request-rejected"],
+    ["unknown", "PROMPT_DISPATCH_UNKNOWN", "request-unknown"]
+  ] as const)("retains %s prompt dispatch evidence without retrying", async (state, code, requestId) => {
+    const harness = makeCli();
+    harness.prompt.mockRejectedValue(new AgentPromptError(code, "safe prompt dispatch failure", { state, ...(requestId ? { requestId } : {}) }));
+    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code, details: { promptDispatch: { state, ...(requestId ? { requestId } : {}) } } });
+    expect(harness.prompt).toHaveBeenCalledTimes(1);
   });
 
   it("rejects oversized inline text before any Herdr call and rejects delivery on keys", async () => {

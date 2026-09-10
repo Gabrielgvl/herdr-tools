@@ -159,7 +159,7 @@ describe("MCP host capability proxy", () => {
     // The proxy must still serve both fields when a tool falls back to the host.
     const fallbackCommunicate = createCommunicateTool({ cli, context, preflight: createPreflight(cli) });
     await fallbackCommunicate.execute("id", { target: "w:p2", operation: "keys", keys: ["enter"] } as never, undefined, undefined, hostContext(host));
-    const fallbackLaunch = createLaunchTool({ cli, context, preflight: createPreflight(cli), supervision: stubSupervision() });
+    const fallbackLaunch = createLaunchTool({ cli, context, preflight: async () => undefined, supervision: stubSupervision() });
     await fallbackLaunch.execute("id", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } } as never, signal, undefined, hostContext(host)).catch(() => undefined);
     expect([...new Set(reads)].sort()).toEqual(["cwd", "signal"]);
   });

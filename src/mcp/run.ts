@@ -6,7 +6,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { HerdrCli, type PiExec } from "../cli.js";
+import type { AgentPromptClient } from "../agent-prompt.js";
+import { createAgentPromptClient } from "../agent-prompt.js";
 import { JobRegistry } from "../job-registry.js";
+import { RecipientRegistry } from "../messages/recipients.js";
+import { defaultAttachmentStore, type AttachmentStore } from "../messages/store.js";
 import { resetOwnership, RuntimeOwnership } from "../ownership.js";
 import { discoverProfiles } from "../profiles/discovery.js";
 import type { ProfileCatalog } from "../profiles/types.js";
@@ -30,6 +34,9 @@ export interface McpRunDependencies {
   env?: NodeJS.ProcessEnv;
   stat?: (path: string) => Promise<DirectoryStat>;
   exec?: PiExec;
+  promptClient?: AgentPromptClient;
+  attachments?: AttachmentStore;
+  recipients?: RecipientRegistry;
   transport?: Transport;
   profiles?: { load: () => Promise<ProfileCatalog> };
   settingsLoader?: () => Promise<Settings>;
@@ -45,6 +52,8 @@ export interface HerdrMcpServer {
   readonly jobs: JobRegistry;
   readonly supervision: SupervisionRegistry;
   readonly ownership: RuntimeOwnership;
+  readonly attachments: AttachmentStore;
+  readonly recipients: RecipientRegistry;
   readonly context: CurrentContext;
   readonly projectDir: string;
   shutdown(): Promise<void>;
@@ -119,7 +128,10 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   }
 
   const root = packageRoot(import.meta.url, deps.fileExists);
-  const cli = new HerdrCli(deps.exec ?? createNodeExec({ cwd: startup.projectDir }));
+  const promptClient = deps.promptClient ?? createAgentPromptClient({ env: deps.env ?? process.env });
+  const cli = new HerdrCli(deps.exec ?? createNodeExec({ cwd: startup.projectDir }), 10_000, 50_000, promptClient);
+  const attachments = deps.attachments ?? defaultAttachmentStore;
+  const recipients = deps.recipients ?? new RecipientRegistry();
   const ownership = new RuntimeOwnership();
   const jobs = new JobRegistry();
   // The Channels research preview has no delivery acknowledgement, so the
@@ -146,6 +158,8 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     profiles: deps.profiles ?? { load: () => discoverProfiles({ bundledDir: join(root, BUNDLED_PROFILES_DIRECTORY), bundledScopeRoot: root, projectCwd: startup.projectDir }) },
     ownership,
     cwd: startup.projectDir,
+    attachments,
+    recipients,
     supervision,
     // Model-backed wait review is a Pi capability. Failing closed here keeps a
     // wait beyond the configured review cadence from running unsupervised.
@@ -192,8 +206,10 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     // Closed before the registry and the transport, so a call still waiting for
     // its turn is refused instead of mutating during teardown.
     queue.close();
+    cli.closePromptTransport();
     supervision.shutdown();
     jobs.shutdown();
+    recipients.reset();
     resetOwnership(ownership);
     await server.close();
     exit(0);
@@ -211,5 +227,5 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     process.stdin.once("close", onClientDisconnect);
   }
   await server.connect(transport);
-  return { server, surface, jobs, supervision, ownership, context: startup.context, projectDir: startup.projectDir, shutdown };
+  return { server, surface, jobs, supervision, ownership, attachments, recipients, context: startup.context, projectDir: startup.projectDir, shutdown };
 }

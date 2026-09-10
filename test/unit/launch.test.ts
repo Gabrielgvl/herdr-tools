@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
+import { AgentPromptError } from "../../src/agent-prompt.js";
+import { CliProtocolError } from "../../src/cli.js";
 import { errorOutcome } from "../../src/mcp/adapter.js";
 import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LaunchParamsSchema, renderAssignment, type LaunchAssignment, type LaunchParams } from "../../src/launch-schema.js";
@@ -56,7 +57,7 @@ const startFailure = () => new CliProtocolError("CLI_PROTOCOL_ERROR", "agent pro
 /** Every launch carries the typed assignment; only the objective varies per case. */
 const assign = (objective: string): LaunchAssignment => ({ objective, scope: "assigned scope", verification: "assigned verification" });
 const envelope = (objective: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: assignment\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${renderAssignment(assign(objective))}`;
-const PROMPT_ARGV = (paneId: string) => ["agent", "prompt", paneId, "--stdin"];
+const PROMPT_CALL = (paneId: string) => ["agent", "prompt", paneId];
 
 function launchDiagnostic(error: unknown): Record<string, unknown> {
   if (!(error instanceof Error)) throw new Error("expected an Error");
@@ -113,9 +114,9 @@ function catalog(...profiles: ReturnType<typeof profile>[]): ProfileCatalog {
   return { effective: new Map(profiles.map((item) => [item.name, item])), candidates: [], diagnostics: [] };
 }
 
-function makeCli(options: { start?: (argv: string[], attempt: number) => unknown; agentStates?: Array<Record<string, unknown>>; paneStates?: Array<Record<string, unknown>>; calls?: string[][]; stdinInputs?: string[]; snapshot?: HerdrSnapshot; omitFreshAgentSession?: boolean } = {}) {
+function makeCli(options: { start?: (argv: string[], attempt: number) => unknown; agentStates?: Array<Record<string, unknown>>; paneStates?: Array<Record<string, unknown>>; calls?: string[][]; promptInputs?: string[]; snapshot?: HerdrSnapshot; omitFreshAgentSession?: boolean } = {}) {
   const calls = options.calls ?? [];
-  const stdinInputs = options.stdinInputs ?? [];
+  const promptInputs = options.promptInputs ?? [];
   const liveSnapshot = options.snapshot ?? snapshot;
   let agentReads = 0;
   let paneReads = 0;
@@ -133,14 +134,11 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
     return withoutSession;
   };
   const cli: LaunchCli = {
-    runJsonWithStdin: vi.fn<NonNullable<LaunchCli["runJsonWithStdin"]>>(async (argv, input) => {
-      calls.push(argv);
-      stdinInputs.push(input);
-      if (argv[0] === "agent" && argv[1] === "prompt") {
-        promptSubmitted = true;
-        return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: lastName, pane_id: lastPaneId, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 7, screen_detection_skipped: true } });
-      }
-      throw new Error(`unexpected stdin argv: ${argv.join(" ")}`);
+    prompt: vi.fn<LaunchCli["prompt"]>(async (target, text) => {
+      calls.push(PROMPT_CALL(target));
+      promptInputs.push(text);
+      promptSubmitted = true;
+      return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: lastName, pane_id: lastPaneId, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 7, screen_detection_skipped: true } });
     }),
     runJson: vi.fn<LaunchCli["runJson"]>(async (argv) => {
       calls.push(argv);
@@ -189,7 +187,6 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
         }
         return ok("start", { agent: { name: lastName, pane_id: lastPaneId, agent: argv[4], terminal_id: lastTerminalId, agent_session: lastAgentSession } });
       }
-      if (argv[0] === "agent" && argv[1] === "prompt") return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: lastName, pane_id: lastPaneId, agent: lastKind, terminal_id: lastTerminalId, agent_session: lastAgentSession, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 7, screen_detection_skipped: true } });
       if (argv[0] === "agent" && argv[1] === "focus") return ok("focus", {});
       if (argv[0] === "agent" && argv[1] === "get") {
         const configured = options.agentStates && options.agentStates.length > 0
@@ -218,7 +215,7 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
     })
   };
-  return { cli, calls, stdinInputs };
+  return { cli, calls, promptInputs };
 }
 
 type LaunchIdentitySample = {
@@ -280,8 +277,8 @@ function configureFreshIdentitySamples(harness: ReturnType<typeof makeCli>, samp
       const sample = records(current);
       return { ...result, result: { ...value, snapshot: { ...value.snapshot, panes: [...value.snapshot.panes.filter((pane) => pane.pane_id !== "w1:p2"), sample.pane], agents: [...value.snapshot.agents.filter((agent) => agent.pane_id !== "w1:p2"), sample.agent] } } };
     }
-    if (current && argv[0] === "agent" && argv[1] === "get" && harness.stdinInputs.length === 0) { harness.calls.push(argv); return ok("agent-get", { agent: records(current).agent }); }
-    if (current && argv[0] === "pane" && argv[1] === "get" && harness.stdinInputs.length === 0) { harness.calls.push(argv); return ok("pane-get", { pane: records(current).pane }); }
+    if (current && argv[0] === "agent" && argv[1] === "get" && harness.promptInputs.length === 0) { harness.calls.push(argv); return ok("agent-get", { agent: records(current).agent }); }
+    if (current && argv[0] === "pane" && argv[1] === "get" && harness.promptInputs.length === 0) { harness.calls.push(argv); return ok("pane-get", { pane: records(current).pane }); }
     return base(argv, signal, preserve);
   });
 }
@@ -292,9 +289,9 @@ function configureFreshIdentitySamples(harness: ReturnType<typeof makeCli>, samp
  * it cannot match the captured target.
  */
 function stubPromptTransport(harness: ReturnType<typeof makeCli>, agent: Record<string, unknown>): void {
-  harness.cli.runJsonWithStdin = vi.fn<NonNullable<LaunchCli["runJsonWithStdin"]>>(async (argv, input) => {
-    harness.calls.push(argv);
-    harness.stdinInputs.push(input);
+  harness.cli.prompt = vi.fn<LaunchCli["prompt"]>(async (target, text) => {
+    harness.calls.push(PROMPT_CALL(target));
+    harness.promptInputs.push(text);
     return ok("cli:agent:prompt", { type: "agent_prompted", agent: { ...agent, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 7, screen_detection_skipped: true } });
   });
 }
@@ -318,27 +315,6 @@ function launch(
     ...(extras.clock === undefined ? {} : { clock: extras.clock })
   });
   return tool.execute("id", params, new AbortController().signal, undefined, extensionContext);
-}
-
-function agySafetySupervision(strengthenFailure?: Error) {
-  let publishedView: Record<string, unknown> = { operation_phase: "running", state: "reserved", targetIds: [], live: true, cancellable: false };
-  const supervision = stubSupervision({
-    onProvisionalBind: (binding) => {
-      publishedView = {
-        operation_phase: "running",
-        state: "provisional",
-        targetIds: [],
-        live: true,
-        cancellable: false,
-        provisional: { ...binding.identity, profileName: binding.profileName, baseline: binding.baseline }
-      };
-    },
-    onStrengthen: (binding) => {
-      if (strengthenFailure) throw strengthenFailure;
-      publishedView = { operation_phase: "running", state: "active", targetIds: [binding.identity.paneId], live: true, cancellable: false, child: binding.identity };
-    }
-  });
-  return { supervision, publishedView: () => publishedView };
 }
 
 describe("herdr_launch evidence redaction", () => {
@@ -376,7 +352,7 @@ describe("herdr_launch profile-only contract", () => {
         recipient: { paneId: "w1:p2", agentName: "worker" }
       });
       expect(result.details?.readiness?.elapsedMs).toBeGreaterThan(5_000);
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
       expect(recipients.get("w1:p2")).toMatchObject({ paneId: "w1:p2", agentName: "worker" });
     } finally {
@@ -397,15 +373,15 @@ describe("herdr_launch profile-only contract", () => {
       } else if (selected && argv[0] === "api") {
         phaseClock.advance(11);
       } else if (selected && argv[0] === "agent" && argv[1] === "get") {
-        phaseClock.advance(harness.stdinInputs.length === 0 ? 13 : 19);
+        phaseClock.advance(harness.promptInputs.length === 0 ? 13 : 19);
       } else if (selected && argv[0] === "pane" && argv[1] === "get") {
-        phaseClock.advance(harness.stdinInputs.length === 0 ? 17 : 29);
+        phaseClock.advance(harness.promptInputs.length === 0 ? 17 : 29);
       }
       return result;
     });
-    const baseStdin = harness.cli.runJsonWithStdin!;
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-      const result = await baseStdin(argv, input, signal, preserve);
+    const basePrompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn(async (target, text, signal) => {
+      const result = await basePrompt(target, text, signal);
       phaseClock.advance(23);
       return result;
     });
@@ -425,9 +401,9 @@ describe("herdr_launch profile-only contract", () => {
   it("includes typed acknowledgement parsing and identity validation in submission timing", async () => {
     const phaseClock = fakeManualClock();
     const harness = makeCli();
-    const baseStdin = harness.cli.runJsonWithStdin!;
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-      const response = await baseStdin(argv, input, signal, preserve);
+    const basePrompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn(async (target, text, signal) => {
+      const response = await basePrompt(target, text, signal);
       phaseClock.advance(23);
       const result = response.result;
       let parseDelayApplied = false;
@@ -449,21 +425,21 @@ describe("herdr_launch profile-only contract", () => {
       initialPromptSubmission: { confirmed: true },
       timing: { promptSubmissionAckMs: 40 }
     });
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
   });
 
-  it("preserves submitted effect and parse duration when acknowledgement identity validation fails", async () => {
+  it("keeps an identity-invalid socket reply unknown without claiming prompt submission", async () => {
     const phaseClock = fakeManualClock();
     const harness = makeCli();
-    const baseStdin = harness.cli.runJsonWithStdin!;
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-      const response = await baseStdin(argv, input, signal, preserve);
+    const basePrompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn(async (target, text, signal) => {
+      const response = await basePrompt(target, text, signal);
       phaseClock.advance(23);
       const result = response.result as { type: string; agent: Record<string, unknown> };
       const mismatched = { ...result, agent: { ...result.agent, terminal_id: "terminal-replacement" } };
       let parseDelayApplied = false;
       return {
-        id: response.id,
+        id: "request-after-write",
         get result() {
           if (!parseDelayApplied) {
             parseDelayApplied = true;
@@ -482,13 +458,14 @@ describe("herdr_launch profile-only contract", () => {
         causeCode: "CLI_PROTOCOL_ERROR",
         phase: "prompt_verification",
         agentStarted: true,
-        promptSubmitted: true,
+        promptSubmitted: false,
+        promptDispatch: { state: "unknown", requestId: "request-after-write" },
         recipientRegistered: false,
         timing: { promptSubmissionAckMs: 40 }
       }
     });
     expect(failure.details).not.toHaveProperty("initialPromptSubmission");
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
   });
 
   it("preserves all independent monotonic phase durations on post-ack failure", async () => {
@@ -509,13 +486,13 @@ describe("herdr_launch profile-only contract", () => {
       const result = await base(argv, signal, preserve);
       if (argv[0] === "agent" && argv[1] === "start") selected = true;
       else if (selected && argv[0] === "api") phaseClock.advance(11);
-      else if (selected && argv[0] === "agent" && argv[1] === "get") phaseClock.advance(harness.stdinInputs.length === 0 ? 13 : 19);
-      else if (selected && argv[0] === "pane" && argv[1] === "get") phaseClock.advance(harness.stdinInputs.length === 0 ? 17 : 29);
+      else if (selected && argv[0] === "agent" && argv[1] === "get") phaseClock.advance(harness.promptInputs.length === 0 ? 13 : 19);
+      else if (selected && argv[0] === "pane" && argv[1] === "get") phaseClock.advance(harness.promptInputs.length === 0 ? 17 : 29);
       return result;
     });
-    const baseStdin = harness.cli.runJsonWithStdin!;
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-      const result = await baseStdin(argv, input, signal, preserve);
+    const basePrompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn(async (target, text, signal) => {
+      const result = await basePrompt(target, text, signal);
       phaseClock.advance(23);
       return result;
     });
@@ -559,7 +536,7 @@ describe("herdr_launch profile-only contract", () => {
       }
     });
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("does not clamp selected-start readiness timing to the configured budget", async () => {
@@ -579,7 +556,7 @@ describe("herdr_launch profile-only contract", () => {
         timing: { selectedStartReadinessMs: 120_123 }
       }
     });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("treats missing and null noncontradictory startup metadata as pending only inside readiness", async () => {
@@ -594,7 +571,7 @@ describe("herdr_launch profile-only contract", () => {
       await vi.advanceTimersByTimeAsync(100);
       const result = await resultPromise;
       expect(result.details).toMatchObject({ readiness: { baselineRequired: true, samples: 2, lastPendingReason: expect.stringContaining("identity_incomplete") }, promptSubmitted: true, recipientRegistered: true });
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -632,7 +609,7 @@ describe("herdr_launch profile-only contract", () => {
       promptConsumption: "confirmed"
     });
     expect(result.details?.promptConfirmation?.baseline).not.toHaveProperty("screenDetectionSkipped");
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
   });
 
   it("resamples same-identity lifecycle skew before submitting the prompt", async () => {
@@ -663,7 +640,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       const pending = launch({ name: "worker", profile: "worker", assignment: assign("skew then ready") }, catalog(profile("worker")), harness.cli);
       await vi.waitFor(() => expect(harness.calls.filter((call) => call[0] === "pane" && call[1] === "get")).toHaveLength(1), { timeout: 1_000, interval: 1 });
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
       await vi.advanceTimersByTimeAsync(100);
       const result = await pending;
       expect(result.details).toMatchObject({
@@ -673,7 +650,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       expect(result.details?.readiness?.lastPendingReason).toContain("lifecycle_skew:snapshot_agent:state_change_seq");
       expect(result.details?.readiness?.lastPendingReason).toContain("lifecycle_skew:pane_get:revision");
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -705,7 +682,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       await vi.advanceTimersByTimeAsync(300);
       await failure;
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
       expect(recipients.get("w1:p2")).toBeUndefined();
     } finally {
       vi.useRealTimers();
@@ -730,7 +707,7 @@ describe("herdr_launch profile-only contract", () => {
         initialPromptObservation: { status: "working", consumption: "confirmed" },
         promptConfirmation: { reason: "working", samples: 2, baseline: { stateChangeSeq: 7, revision: 3 }, last: { state: "working", stateChangeSeq: 8, revision: 4 } }
       });
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
       expect(recipients.get("w1:p2")).toBeDefined();
     } finally {
       vi.useRealTimers();
@@ -749,7 +726,7 @@ describe("herdr_launch profile-only contract", () => {
       initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8, consumption: "confirmed" },
       promptConfirmation: { reason: "state_change_seq_advanced", samples: 1, baseline: { stateChangeSeq: 7, screenDetectionSkipped: true }, last: { stateChangeSeq: 8 } }
     });
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
   });
 
   it("rethrows a non-PROMPT_UNCONFIRMED post-ack confirmation failure", async () => {
@@ -822,7 +799,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       await vi.advanceTimersByTimeAsync(200);
       await failure;
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
       expect(recipients.get("w1:p2")).toBeUndefined();
     } finally {
       vi.useRealTimers();
@@ -867,7 +844,7 @@ describe("herdr_launch profile-only contract", () => {
       await failure;
       const promptCalls = harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt");
       expect(promptCalls).toHaveLength(1);
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
       expect(recipients.get("w1:p2")).toBeUndefined();
       expect(supervision.bindAttempts).toHaveLength(1);
@@ -895,7 +872,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       await vi.advanceTimersByTimeAsync(5_100);
       await failure;
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -924,7 +901,7 @@ describe("herdr_launch profile-only contract", () => {
       recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed,
     });
     expect(failure.message).toContain(LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed);
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
 
@@ -943,7 +920,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode: "PROMPT_UNCONFIRMED", phase: "prompt_verification", assignmentState: "unconfirmed", paneId: "w1:p2", supervision: { state: "active" }, promptSubmitted: true, promptConfirmation: { reason: "read_failed", sourceCode } }
     });
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
     expect(lastSupervision.bound).toHaveLength(1);
     expect(lastSupervision.released).toEqual([]);
   });
@@ -960,7 +937,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason: "identity_changed", samples: 1, sourceCode: "POSTSTATE_IDENTITY_CHANGED" } }
     });
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
 
@@ -976,7 +953,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode: "PROMPT_UNCONFIRMED", promptConfirmation: { reason: "identity_unavailable", sourceCode: "TARGET_IDENTITY_UNAVAILABLE", samples: 1 } }
     });
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
   });
 
   it("aborts read-only readiness with partial-effect evidence before prompt bytes or recipient registration", async () => {
@@ -1002,7 +979,7 @@ describe("herdr_launch profile-only contract", () => {
           created: { paneId: "w1:p2", tabId: "w1:t1" }
         }
       });
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
       expect(recipients.get("w1:p2")).toBeUndefined();
     } finally {
       vi.useRealTimers();
@@ -1061,7 +1038,7 @@ describe("herdr_launch profile-only contract", () => {
       await failure;
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
       expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "focus")).toBe(false);
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
       expect(recipients.get("w1:p1")).toBeUndefined();
     } finally {
       vi.useRealTimers();
@@ -1092,7 +1069,7 @@ describe("herdr_launch profile-only contract", () => {
       await vi.advanceTimersByTimeAsync(100);
       controller.abort();
       await failure;
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
@@ -1117,7 +1094,7 @@ describe("herdr_launch profile-only contract", () => {
       releaseFresh(await base(["api", "snapshot"], new AbortController().signal));
       const result = await pending;
       expect(result.details).toMatchObject({ initialPromptSent: true, recipient: { paneId: "w1:p2" } });
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
       expect(recipients.get("w1:p2")).toBeDefined();
       expect(vi.getTimerCount()).toBe(0);
     } finally {
@@ -1155,7 +1132,7 @@ describe("herdr_launch profile-only contract", () => {
       await vi.waitFor(() => expect(apiReads).toBe(2), { timeout: 1_000, interval: 1 });
       await vi.advanceTimersByTimeAsync(100);
       await expectation;
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
       expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
       expect(recipients.get("w1:p2")).toBeUndefined();
@@ -1180,7 +1157,7 @@ describe("herdr_launch profile-only contract", () => {
       details: { causeCode: "READY_TIMEOUT", phase: "ready", agentStarted: true, promptSubmitted: false, readiness: { elapsedMs: 120_000, samples: 0, lastPendingReason: "readiness_budget_exhausted_before_sample" } }
     });
     expect(harness.calls.filter((call) => call[0] === "api")).toHaveLength(2);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("rejects a sample that resolves only after the monotonic absolute deadline", async () => {
@@ -1199,7 +1176,7 @@ describe("herdr_launch profile-only contract", () => {
       details: { causeCode: "READY_TIMEOUT", phase: "ready", readiness: { elapsedMs: 120_000, samples: 1, baselineRequired: true } }
     });
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "get")).toHaveLength(1);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("preserves a successful start when the caller is already aborted at readiness", async () => {
@@ -1217,7 +1194,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "ABORTED",
       details: { causeCode: "ABORTED", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 0, baselineRequired: true } }
     });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
 
@@ -1246,7 +1223,7 @@ describe("herdr_launch profile-only contract", () => {
       controller.abort();
       vi.advanceTimersByTime(5_000);
       await expectation;
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
       expect(recipients.get("w1:p2")).toBeUndefined();
       expect(vi.getTimerCount()).toBe(0);
       releaseFresh(await base(["api", "snapshot"], new AbortController().signal));
@@ -1369,10 +1346,10 @@ describe("herdr_launch profile-only contract", () => {
     ];
     const harness = makeCli();
     const runJson = harness.cli.runJson;
-    const runJsonWithStdin = harness.cli.runJsonWithStdin!;
+    const basePrompt = harness.cli.prompt;
     let promptAcknowledged = false;
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-      const result = await runJsonWithStdin(argv, input, signal, preserve);
+    harness.cli.prompt = vi.fn(async (target, text, signal) => {
+      const result = await basePrompt(target, text, signal);
       promptAcknowledged = true;
       return result;
     });
@@ -1777,9 +1754,15 @@ describe("herdr_launch profile-only contract", () => {
 
     const preflightCalls: string[][] = [];
     const preflightCli = makeCli({ calls: preflightCalls });
-    const preflightTool = createLaunchTool({ cli: preflightCli.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry(), preflight: async () => { throw Object.assign(new Error("health unavailable"), { code: "BACKEND_UNAVAILABLE" }); } });
+    const preflight = vi.fn(async (_signal: AbortSignal, requirement?: "agent.prompt") => {
+      expect(requirement).toBe("agent.prompt");
+      throw Object.assign(new Error("health unavailable"), { code: "BACKEND_UNAVAILABLE" });
+    });
+    const attachments = fakeAttachments();
+    const preflightTool = createLaunchTool({ cli: preflightCli.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments, recipients: new RecipientRegistry(), preflight });
     await expect(preflightTool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "BACKEND_UNAVAILABLE" });
     expect(preflightCalls).toHaveLength(0);
+    expect(attachments.ensureRecipient).not.toHaveBeenCalled();
   });
 
   it("does not reconcile when the caller is aborted before the first topology mutation", async () => {
@@ -1814,7 +1797,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode, phase: "ready", readiness: { samples: 1, baselineRequired: true } }
     });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it.each([
@@ -1834,7 +1817,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode: "CLI_PROTOCOL_ERROR", phase: "ready", agentStarted: true, promptSubmitted: false, recipientRegistered: false, readiness: { samples: 1, records: [] } }
     });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("preserves bounded CliProtocolError evidence through readiness and final launch wrapping", async () => {
@@ -1908,7 +1891,7 @@ describe("herdr_launch profile-only contract", () => {
     const readinessReads = harness.calls.filter((call) => call[0] === "api" || (call[0] === "agent" && call[1] === "get") || (call[0] === "pane" && call[1] === "get"));
     expect(readinessReads.slice(-6, -3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
     expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["pane", "get"], ["agent", "get"]]);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it.each([
@@ -1932,7 +1915,7 @@ describe("herdr_launch profile-only contract", () => {
         ...(sourceCode === "READY_TIMEOUT" ? { sourceCode: "READY_TIMEOUT" } : {})
       }
     });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("clears prior-sample records before a later readiness read failure", async () => {
@@ -1953,7 +1936,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       await vi.advanceTimersByTimeAsync(100);
       await failure;
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
@@ -1981,7 +1964,7 @@ describe("herdr_launch profile-only contract", () => {
     const serialized = JSON.stringify(failure.details);
     expect(serialized.length).toBeLessThan(5_000);
     expect(serialized).not.toContain("must-not-survive");
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("retains only fixed readiness fields and markers from huge malformed records", async () => {
@@ -2066,7 +2049,7 @@ describe("herdr_launch profile-only contract", () => {
     const records = (failure.details.readiness as { records: unknown[] }).records;
     expect(records).toHaveLength(4);
     expect(JSON.stringify(failure.details).length).toBeLessThan(5_000);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("rejects malformed readiness metadata after one complete ordered sample", async () => {
@@ -2080,7 +2063,7 @@ describe("herdr_launch profile-only contract", () => {
     const readinessReads = harness.calls.filter((call) => call[0] === "api" || (call[0] === "agent" && call[1] === "get") || (call[0] === "pane" && call[1] === "get"));
     expect(readinessReads.slice(-6, -3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
     expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["pane", "get"], ["agent", "get"]]);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
 
@@ -2096,7 +2079,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1, baselineRequired: true } }
     });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it.each([
@@ -2110,7 +2093,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", promptSubmitted: false, readiness: { samples: 1, baselineRequired: true } }
     });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it.each(["agent pane ID", "pane record"] as const)("keeps a missing %s pending in one sample, then uses only the next complete sample", async (missing) => {
@@ -2133,7 +2116,7 @@ describe("herdr_launch profile-only contract", () => {
       await vi.advanceTimersByTimeAsync(100);
       const result = await pending;
       expect(result.details).toMatchObject({ readiness: { samples: 2, lastPendingReason: expect.any(String), baselineRequired: true }, promptSubmitted: true, promptConsumption: "confirmed" });
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -2151,7 +2134,7 @@ describe("herdr_launch profile-only contract", () => {
       code: "LAUNCH_FAILED",
       details: { causeCode: "TARGET_IDENTITY_CHANGED", phase: "ready", readiness: { samples: 1, baselineRequired: true } }
     });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("rejects duplicate target records without polling or submitting", async () => {
@@ -2172,7 +2155,7 @@ describe("herdr_launch profile-only contract", () => {
     const readinessReads = harness.calls.filter((call) => call[0] === "api" || (call[0] === "agent" && call[1] === "get") || (call[0] === "pane" && call[1] === "get"));
     expect(readinessReads.slice(-6, -3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["agent", "get"], ["pane", "get"]]);
     expect(readinessReads.slice(-3).map((call) => call.slice(0, 2))).toEqual([["api", "snapshot"], ["pane", "get"], ["agent", "get"]]);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
   });
 
@@ -2192,7 +2175,7 @@ describe("herdr_launch profile-only contract", () => {
       return base(argv, signal, preserve);
     });
     await expect(launch({ name: "worker", profile: "worker", assignment: assign("replacement") }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(0);
   });
 
@@ -2233,7 +2216,7 @@ describe("herdr_launch profile-only contract", () => {
     expect(details.expected).toHaveLength(256);
     expect(details.actual).toHaveLength(256);
     expect(JSON.stringify(details)).not.toContain("-terminal-expected");
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(recipients.get("w1:p2")).toBeUndefined();
   });
 
@@ -2254,7 +2237,7 @@ describe("herdr_launch profile-only contract", () => {
       return base(argv, signal, preserve);
     });
     await expect(launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
   });
 
   it("rejects raw kind, argv, and env schemas", () => {
@@ -2357,7 +2340,7 @@ describe("herdr_launch profile-only contract", () => {
       stdoutBytes: 0,
       stderrBytes: 123,
       killed: false,
-      evidence: "omitted_for_stdin_delivery",
+      evidence: "omitted_for_prompt_delivery",
       stdout: "",
       stderr: JSON.stringify({ id: "cli:tab:create", error: { code: "tab_create_failed", message: "disposable placement failed" } }),
       stdoutTruncated: false,
@@ -2375,7 +2358,7 @@ describe("herdr_launch profile-only contract", () => {
         cliFailure: {
           code: "CLI_PROTOCOL_ERROR",
           message: "Herdr CLI did not return a usable response",
-          details: { exitCode: 1, stdoutBytes: 0, stderrBytes: 123, killed: false, evidence: "omitted_for_stdin_delivery", stdout: "", stderr: failure.details.stderr, stdoutTruncated: false, stderrTruncated: false }
+          details: { exitCode: 1, stdoutBytes: 0, stderrBytes: 123, killed: false, evidence: "omitted_for_prompt_delivery", stdout: "", stderr: failure.details.stderr, stdoutTruncated: false, stderrTruncated: false }
         }
       }
     });
@@ -2450,10 +2433,10 @@ describe("herdr_launch profile-only contract", () => {
         paneStates: [observedPane("idle", 7), observedPane("working", 900, 4)]
       });
       const result = await launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(worker), harness.cli);
-      expect(result.details).toMatchObject({ initialPromptSent: true, promptSubmitted: true, promptConsumption: "confirmed", initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: "w1:p2", interactiveReady: true, revision: 3, screenDetectionSkipped: true }, initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8, revision: 4, screenDetectionSkipped: true, consumption: "confirmed" } });
-      expect(harness.calls).toContainEqual(["agent", "prompt", "w1:p2", "--stdin"]);
+      expect(result.details).toMatchObject({ initialPromptSent: true, promptSubmitted: true, promptDispatch: { state: "acknowledged", requestId: "cli:agent:prompt" }, promptConsumption: "confirmed", initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: "w1:p2", interactiveReady: true, revision: 3, screenDetectionSkipped: true }, initialPromptObservation: { status: "not_working", state: "idle", stateChangeSeq: 8, revision: 4, screenDetectionSkipped: true, consumption: "confirmed" } });
+      expect(harness.calls).toContainEqual(PROMPT_CALL("w1:p2"));
       expect(harness.calls.some((call) => call[1] === "send-keys" || call[1] === "wait")).toBe(false);
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
 
       vi.useFakeTimers();
       const registrationBudget = fakeStartBudgetClock();
@@ -2471,7 +2454,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       await vi.advanceTimersByTimeAsync(200);
       await registrationFailure;
-      expect(registrationLag.stdinInputs).toHaveLength(0);
+      expect(registrationLag.promptInputs).toHaveLength(0);
       const missingIdentity = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
       const missingBase = missingIdentity.cli.runJson;
       missingIdentity.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
@@ -2488,7 +2471,7 @@ describe("herdr_launch profile-only contract", () => {
         code: "LAUNCH_FAILED",
         details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", readiness: { samples: 1 } }
       });
-      expect(missingIdentity.stdinInputs).toHaveLength(0);
+      expect(missingIdentity.promptInputs).toHaveLength(0);
 
       const missingAgentBudget = fakeStartBudgetClock();
       const missingAgentRecord = makeCli();
@@ -2502,15 +2485,15 @@ describe("herdr_launch profile-only contract", () => {
       const missingAgentExpectation = expect(missingAgentPending).rejects.toMatchObject({ code: "READY_TIMEOUT", details: { causeCode: "READY_TIMEOUT", readiness: { lastPendingReason: expect.stringContaining("agent_get_record_missing") } } });
       await vi.advanceTimersByTimeAsync(200);
       await missingAgentExpectation;
-      expect(missingAgentRecord.stdinInputs).toHaveLength(0);
+      expect(missingAgentRecord.promptInputs).toHaveLength(0);
 
       const missingStartedTerminal = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi" } }) });
       await expect(launch({ name: "worker", profile: "worker", assignment: assign("missing started terminal") }, catalog(worker), missingStartedTerminal.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptSubmission: { confirmed: true } } });
-      expect(missingStartedTerminal.stdinInputs).toHaveLength(1);
+      expect(missingStartedTerminal.promptInputs).toHaveLength(1);
 
       const missingStartedSession = makeCli({ start: () => ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-worker" } }) });
       await expect(launch({ name: "worker", profile: "worker", assignment: assign("missing started session") }, catalog(worker), missingStartedSession.cli)).resolves.toMatchObject({ details: { initialPromptSent: true, initialPromptSubmission: { confirmed: true } } });
-      expect(missingStartedSession.stdinInputs).toHaveLength(1);
+      expect(missingStartedSession.promptInputs).toHaveLength(1);
       vi.useRealTimers();
 
       const replacementIdentity = makeCli();
@@ -2520,16 +2503,16 @@ describe("herdr_launch profile-only contract", () => {
         return replacementBase(argv, signal, preserve);
       });
       await expect(launch({ name: "worker", profile: "worker", assignment: assign("must not send") }, catalog(worker), replacementIdentity.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
-      expect(replacementIdentity.stdinInputs).toHaveLength(0);
+      expect(replacementIdentity.promptInputs).toHaveLength(0);
 
       const mismatchedAck = makeCli();
-      mismatchedAck.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
-        mismatchedAck.calls.push(argv);
-        mismatchedAck.stdinInputs.push(input);
-        return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-replacement", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-0" }, agent_status: "idle", interactive_ready: true, revision: 3 } });
+      mismatchedAck.cli.prompt = vi.fn(async (target, text) => {
+        mismatchedAck.calls.push(PROMPT_CALL(target));
+        mismatchedAck.promptInputs.push(text);
+        return ok("request-mismatch", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-replacement", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-0" }, agent_status: "idle", interactive_ready: true, revision: 3 } });
       });
-      await expect(launch({ name: "worker", profile: "worker", assignment: assign("ack mismatch") }, catalog(worker), mismatchedAck.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR" } });
-      expect(mismatchedAck.stdinInputs).toHaveLength(1);
+      await expect(launch({ name: "worker", profile: "worker", assignment: assign("ack mismatch") }, catalog(worker), mismatchedAck.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_PROTOCOL_ERROR", promptSubmitted: false, promptDispatch: { state: "unknown", requestId: "request-mismatch" } } });
+      expect(mismatchedAck.promptInputs).toHaveLength(1);
       expect(mismatchedAck.calls.some((call) => call[1] === "send-keys" || call[1] === "wait")).toBe(false);
 
       const terminalReplacement = makeCli();
@@ -2540,7 +2523,7 @@ describe("herdr_launch profile-only contract", () => {
         return terminalBase(argv, signal, preserve);
       });
       await expect(launch({ name: "worker", profile: "worker", assignment: assign("terminal replacement") }, catalog(worker), terminalReplacement.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
-      expect(terminalReplacement.stdinInputs).toHaveLength(0);
+      expect(terminalReplacement.promptInputs).toHaveLength(0);
 
       const freshReplacement = makeCli();
       const freshReplacementBase = freshReplacement.cli.runJson;
@@ -2571,7 +2554,7 @@ describe("herdr_launch profile-only contract", () => {
         code: "LAUNCH_FAILED",
         details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", initialPromptSubmission: { confirmed: true }, initialPromptObservation: { status: "unavailable", code: "POSTSTATE_IDENTITY_CHANGED", evidence: { records: expect.any(Array) } } }
       });
-      expect(postStateReplacement.stdinInputs).toHaveLength(1);
+      expect(postStateReplacement.promptInputs).toHaveLength(1);
       const postPromptIndex = postStateReplacement.calls.findIndex((call) => call[0] === "agent" && call[1] === "prompt");
       expect(postStateReplacement.calls.slice(0, postPromptIndex)).toContainEqual(["api", "snapshot"]);
       expect(postStateReplacement.calls.slice(0, postPromptIndex)).toContainEqual(["agent", "get", "w1:p2"]);
@@ -2600,7 +2583,7 @@ describe("herdr_launch profile-only contract", () => {
         return startedBase(argv, signal, preserve);
       });
       await expect(launch({ name: "worker", profile: "worker", assignment: assign("session replacement") }, catalog(worker), startedSessionReplacement.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_CHANGED" } });
-      expect(startedSessionReplacement.stdinInputs).toHaveLength(0);
+      expect(startedSessionReplacement.promptInputs).toHaveLength(0);
     }
 
     {
@@ -2614,7 +2597,7 @@ describe("herdr_launch profile-only contract", () => {
       await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(worker), harness.cli)).rejects.toMatchObject({
         code: "LAUNCH_FAILED", details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConfirmation: { reason: "read_failed", sourceCode: "CLI_PROTOCOL_ERROR" } }
       });
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
 
       const stringFailure = makeCli();
       const stringBase = stringFailure.cli.runJson;
@@ -2636,10 +2619,10 @@ describe("herdr_launch profile-only contract", () => {
     {
       const phaseClock = fakeManualClock();
       const harness = makeCli();
-      harness.cli.runJsonWithStdin = vi.fn(async (_argv, input) => {
-        harness.stdinInputs.push(input);
+      harness.cli.prompt = vi.fn(async (_argv, input) => {
+        harness.promptInputs.push(input);
         phaseClock.advance(29);
-        throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", { exitCode: 1, killed: false, evidence: "omitted_for_stdin_delivery" });
+        throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Herdr CLI did not return a usable response", { exitCode: 1, killed: false, evidence: "omitted_for_prompt_delivery" });
       });
       await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(worker), harness.cli, undefined, { clock: phaseClock.clock })).rejects.toMatchObject({
         code: "LAUNCH_FAILED",
@@ -2647,7 +2630,7 @@ describe("herdr_launch profile-only contract", () => {
       });
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "send-keys")).toHaveLength(0);
       expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "wait")).toHaveLength(0);
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
     }
 
     const safeEvidence = makeCli({ paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown", agent_id: 1, status: {} }] });
@@ -2833,26 +2816,48 @@ describe("herdr_launch profile-only contract", () => {
       new Error("plain")
     ]) {
       const promptFailure = makeCli();
-      promptFailure.cli.runJsonWithStdin = vi.fn(async () => Promise.reject(error));
+      promptFailure.cli.prompt = vi.fn(async () => Promise.reject(error));
       await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(profile("worker")), promptFailure.cli)).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
       expect(promptFailure.calls.some((call) => call[1] === "send-keys")).toBe(false);
     }
   });
 
-  it("refuses to deliver a prompt when the stdin transport is unavailable", async () => {
+  it("refuses to deliver a prompt when the prompt transport is unavailable", async () => {
     const unavailable = makeCli();
-    delete (unavailable.cli as { runJsonWithStdin?: unknown }).runJsonWithStdin;
+    delete (unavailable.cli as { prompt?: unknown }).prompt;
     await expect(launch({ name: "worker", profile: "worker", assignment: assign("go") }, catalog(profile("worker")), unavailable.cli))
-      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "CLI_INCOMPATIBLE" } });
+      .rejects.toMatchObject({ code: "CLI_INCOMPATIBLE", details: { causeCode: "CLI_INCOMPATIBLE", effectCertainty: "absent" } });
+  });
+
+  it.each([
+    ["before write", new AgentPromptError("BACKEND_UNAVAILABLE", "safe transport failure", { state: "not_written" }), "not_written", undefined],
+    ["after write", new AgentPromptError("PROMPT_DISPATCH_UNKNOWN", "safe transport failure", { state: "unknown", requestId: "request-after-write" }), "unknown", "request-after-write"]
+  ] as const)("preserves native prompt dispatch evidence when it fails %s", async (_label, error, state, requestId) => {
+    const harness = makeCli();
+    harness.cli.prompt = vi.fn(async () => { throw error; });
+    const supervision = stubSupervision({ jobId: `job_${state}` });
+    const failure = await launch({ name: "worker", profile: "worker", assignment: assign("dispatch boundary") }, catalog(profile("worker")), harness.cli, undefined, { supervision })
+      .catch((value: unknown) => value as LaunchFailure);
+    expect(failure).toMatchObject({
+      code: "LAUNCH_FAILED",
+      details: {
+        promptSubmitted: false,
+        promptDispatch: { state, ...(requestId === undefined ? {} : { requestId }) },
+        assignmentState: "unconfirmed",
+        supervision: { jobId: supervision.jobId, state: "active" }
+      }
+    });
+    expect(harness.cli.prompt).toHaveBeenCalledTimes(1);
+    expect(supervision.released).toEqual([]);
   });
 
   it("preserves a completed launch prompt acknowledgement when abort arrives after submission", async () => {
     const controller = new AbortController();
     const aborted = makeCli();
-    aborted.cli.runJsonWithStdin = vi.fn(async (argv, input, _signal, preserveCompletedMutation) => {
-      aborted.calls.push(argv);
-      aborted.stdinInputs.push(input);
-      expect(preserveCompletedMutation).toBe(true);
+    aborted.cli.prompt = vi.fn(async (target, text, signal) => {
+      aborted.calls.push(PROMPT_CALL(target));
+      aborted.promptInputs.push(text);
+      expect(signal).toBe(controller.signal);
       controller.abort();
       return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-0", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" }, interactive_ready: true, revision: 3 } });
     });
@@ -2874,7 +2879,7 @@ describe("herdr_launch profile-only contract", () => {
         created: { paneId: "w1:p2", tabId: "w1:t1" }
       }
     });
-    expect(aborted.stdinInputs).toHaveLength(1);
+    expect(aborted.promptInputs).toHaveLength(1);
     expect(recipients.get("w1:p2")).toBeUndefined();
     expect(supervision.bindAttempts).toHaveLength(1);
     expect(supervision.released).toEqual([]);
@@ -2904,7 +2909,7 @@ describe("herdr_launch profile-only contract", () => {
         code: "LAUNCH_FAILED",
         details: { causeCode: "PROMPT_UNCONFIRMED", promptSubmitted: true, promptConsumption: "unconfirmed", promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED", samples: 1 } }
       });
-      expect(harness.stdinInputs).toHaveLength(1);
+      expect(harness.promptInputs).toHaveLength(1);
       expect(recipients.get("w1:p2")).toBeUndefined();
     } finally {
       vi.useRealTimers();
@@ -2926,38 +2931,38 @@ describe("herdr_launch profile-only contract", () => {
     const harness = makeCli();
     const attachments = fakeAttachments();
     const recipients = new RecipientRegistry();
-    const claude = profile("worker-claude", "claude");
-    const result = await launch({ name: "worker", profile: "worker-claude", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(claude), harness.cli, undefined, { attachments, recipients });
+    const worker = profile("worker-pi", "pi");
+    const result = await launch({ name: "worker", profile: "worker-pi", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(worker), harness.cli, undefined, { attachments, recipients });
     expect(attachments.ensureRecipient).toHaveBeenCalledTimes(1);
     expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: renderAssignment(assign("body")), operation: "assignment", recipientAgentName: "worker" }));
-    expect(harness.calls).toContainEqual(PROMPT_ARGV("w1:p2"));
-    expect(harness.calls.find((call) => call[1] === "start")).toEqual(expect.arrayContaining(["--add-dir", GRANT_PATH]));
-    expect(harness.stdinInputs[0]).toContain("delivery: attachment");
+    expect(harness.calls).toContainEqual(PROMPT_CALL("w1:p2"));
+    expect(harness.calls.find((call) => call[1] === "start")).toEqual(expect.arrayContaining(["--append-system-prompt", "/cache/body.md"]));
+    expect(harness.promptInputs[0]).toContain("delivery: attachment");
     expect(result.details).toMatchObject({
       initialPromptDelivery: "attachment",
       attachment: { attachmentId: "attachment-1" },
       envelope: { delivery: "attachment" },
-      recipient: { paneId: "w1:p2", profileName: "worker-claude", capable: true, kind: "claude" }
+      recipient: { paneId: "w1:p2", profileName: "worker-pi", capable: true, kind: "pi" }
     });
     expect(recipients.get("w1:p2")).toMatchObject({ capable: true });
   });
 
   it("records an incapable recipient for an inline launch without refusing it", async () => {
     const recipients = new RecipientRegistry();
-    const restricted = profile("restricted", "claude");
-    await launch({ assignment: assign("go"), name: "worker", profile: "restricted", overrides: { disallowedTools: ["Read"] } }, catalog(restricted), makeCli().cli, undefined, { recipients });
-    expect(recipients.get("w1:p2")).toMatchObject({ capable: false, reason: "Claude profile disallows Read" });
+    const restricted = profile("restricted", "pi");
+    await launch({ assignment: assign("go"), name: "worker", profile: "restricted", overrides: { tools: ["bash"] } }, catalog(restricted), makeCli().cli, undefined, { recipients });
+    expect(recipients.get("w1:p2")).toMatchObject({ capable: false, reason: "Pi profile excludes the local read tool" });
   });
 
   it("rejects an incapable attachment profile, in the chain or after overrides, before topology mutation", async () => {
     const calls: string[][] = [];
-    const restricted = profile("restricted", "claude");
-    await expect(launch({ name: "worker", profile: "restricted", overrides: { disallowedTools: ["Read"] }, assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(restricted), makeCli({ calls }).cli))
-      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { profile: "restricted", reason: "Claude profile disallows Read", delivery: "attachment", phase: "resolve_profile" } });
+    const restricted = profile("restricted", "pi");
+    await expect(launch({ name: "worker", profile: "restricted", overrides: { tools: ["bash"] }, assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(restricted), makeCli({ calls }).cli))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { profile: "restricted", reason: "Pi profile excludes the local read tool", delivery: "attachment", phase: "resolve_profile" } });
     expect(calls).toHaveLength(0);
 
     const chainCalls: string[][] = [];
-    const primary = profile("primary", "claude", ["incapable-fallback"]);
+    const primary = profile("primary", "pi", ["incapable-fallback"]);
     const incapableFallback = profile("incapable-fallback", "pi");
     const withoutRead = { ...incapableFallback, runtime: { ...incapableFallback.runtime, tools: ["bash"] } } as typeof incapableFallback;
     await expect(launch({ name: "worker", profile: "primary", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(primary, withoutRead), makeCli({ calls: chainCalls }).cli))
@@ -2979,7 +2984,7 @@ describe("herdr_launch profile-only contract", () => {
         if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: null });
         return base(argv, signal, preserve);
       });
-      const pending = launch({ name: "worker", profile: "worker-claude", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), harness.cli, undefined, { attachments, clock: budget.clock });
+    const pending = launch({ name: "worker", profile: "worker-pi", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-pi", "pi")), harness.cli, undefined, { attachments, clock: budget.clock });
       const failure = expect(pending).rejects.toMatchObject({
         code: "READY_TIMEOUT",
         details: {
@@ -2996,7 +3001,7 @@ describe("herdr_launch profile-only contract", () => {
       await vi.advanceTimersByTimeAsync(200);
       await failure;
       expect(released).toEqual(["renew", "release"]);
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
@@ -3007,8 +3012,8 @@ describe("herdr_launch profile-only contract", () => {
     const grant = { path: GRANT_PATH, token: "grant-recipient", renew: async () => { released.push("renew"); }, release: async () => { released.push("release"); } };
     const attachments = fakeAttachments({ ensureRecipient: vi.fn(async () => grant) });
     const sendFailure = makeCli();
-    sendFailure.cli.runJsonWithStdin = vi.fn(async () => { throw Object.assign(new Error("submission failed"), { code: "CLI_TIMEOUT" }); });
-    await expect(launch({ name: "worker", profile: "worker-claude", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), sendFailure.cli, undefined, { attachments }))
+    sendFailure.cli.prompt = vi.fn(async () => { throw Object.assign(new Error("submission failed"), { code: "CLI_TIMEOUT" }); });
+    await expect(launch({ name: "worker", profile: "worker-pi", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-pi", "pi")), sendFailure.cli, undefined, { attachments }))
       .rejects.toMatchObject({
         code: "LAUNCH_FAILED",
         details: { causeCode: "CLI_TIMEOUT", phase: "prompt_verification", delivery: "attachment", initialPromptDelivery: "attachment", attachmentRetained: true, attachment: { attachmentId: "attachment-1" } }
@@ -3024,7 +3029,7 @@ describe("herdr_launch profile-only contract", () => {
       publish: vi.fn(async () => { throw Object.assign(new Error("quota"), { code: "ATTACHMENT_QUOTA_EXCEEDED", details: { operation: "quota" } }); })
     });
     const publishFailure = makeCli();
-    await expect(launch({ name: "worker", profile: "worker-claude", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), publishFailure.cli, undefined, { attachments }))
+    await expect(launch({ name: "worker", profile: "worker-pi", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-pi", "pi")), publishFailure.cli, undefined, { attachments }))
       .rejects.toMatchObject({ code: "ATTACHMENT_QUOTA_EXCEEDED", details: { operation: "quota", delivery: "attachment", phase: "attachment_publish" } });
     expect(publishFailure.calls.some((call) => call[0] === "pane" && call[1] === "split")).toBe(false);
     expect(released).toEqual(["release"]);
@@ -3037,24 +3042,24 @@ describe("herdr_launch profile-only contract", () => {
     const existingBase = existingPane.cli.runJson;
     let existingStarted = false;
     let promptSubmitted = false;
-    const existingIdentity = { terminal_id: "terminal-existing-attachment", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-existing-attachment" } };
+    const existingIdentity = { terminal_id: "terminal-existing-attachment", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing-attachment" } };
     existingPane.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
       const status = promptSubmitted ? "working" : "idle";
       const stateChangeSeq = promptSubmitted ? 2 : 1;
       const revision = promptSubmitted ? 4 : 3;
-      if (argv[0] === "api" && existingStarted) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, pane_id: "w1:p1", agent_name: "worker", agent: "claude", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "claude", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision }] } });
-      if (argv[0] === "agent" && argv[1] === "start") { existingStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "claude", ...existingIdentity } }); }
-      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { pane_id: "w1:p1", name: "worker", agent: "claude", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision } });
-      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "claude", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision } });
+      if (argv[0] === "api" && existingStarted) return ok("snapshot", { type: "session_snapshot", snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0]!, pane_id: "w1:p1", agent_name: "worker", agent: "pi", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision }] } });
+      if (argv[0] === "agent" && argv[1] === "start") { existingStarted = true; return ok("start", { agent: { name: "worker", pane_id: "w1:p1", agent: "pi", ...existingIdentity } }); }
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: { pane_id: "w1:p1", name: "worker", agent: "pi", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision } });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", agent_name: "worker", agent: "pi", ...existingIdentity, agent_status: status, state_change_seq: stateChangeSeq, revision } });
       return existingBase(argv, signal, preserve);
     });
-    existingPane.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
-      existingPane.calls.push(argv);
-      existingPane.stdinInputs.push(input);
+    existingPane.cli.prompt = vi.fn(async (target, text) => {
+      existingPane.calls.push(PROMPT_CALL(target));
+      existingPane.promptInputs.push(text);
       promptSubmitted = true;
-      return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p1", agent: "claude", terminal_id: "terminal-existing-attachment", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-existing-attachment" }, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } });
+      return ok("cli:agent:prompt", { type: "agent_prompted", agent: { name: "worker", pane_id: "w1:p1", agent: "pi", terminal_id: "terminal-existing-attachment", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing-attachment" }, agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } });
     });
-    const result = await launch({ name: "worker", profile: "worker-claude", placement: { mode: "existing_pane", target: "caller" }, assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), existingPane.cli, undefined, { attachments });
+    const result = await launch({ name: "worker", profile: "worker-pi", placement: { mode: "existing_pane", target: "caller" }, assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(profile("worker-pi", "pi")), existingPane.cli, undefined, { attachments });
     expect(recipientPanes).toEqual(["w1:p1"]);
     expect(result.details).toMatchObject({ paneId: "w1:p1", initialPromptDelivery: "attachment" });
   });
@@ -3066,7 +3071,7 @@ describe("herdr_launch profile-only contract", () => {
     expect(inlineCalls).toHaveLength(0);
 
     const attachmentCalls: string[][] = [];
-    await expect(launch({ name: "worker", profile: "worker-claude", assignment: assign("x".repeat(1024 * 1024 + 1)), assignmentDelivery: "attachment" }, catalog(profile("worker-claude", "claude")), makeCli({ calls: attachmentCalls }).cli))
+    await expect(launch({ name: "worker", profile: "worker-pi", assignment: assign("x".repeat(1024 * 1024 + 1)), assignmentDelivery: "attachment" }, catalog(profile("worker-pi", "pi")), makeCli({ calls: attachmentCalls }).cli))
       .rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE", details: { delivery: "attachment" } });
     expect(attachmentCalls).toHaveLength(0);
   });
@@ -3160,7 +3165,8 @@ describe("herdr_launch profile-only contract", () => {
         // validation-to-spawn window the old single preflight left open.
         if (argv[0] === "pane" && argv[1] === "rename") writeFileSync(join(root, "generated", "good-skill", "SKILL.md"), "swapped after validation\n");
         return swapped.cli.runJson(argv, signal, preserveCompletedMutation);
-      }
+      },
+      prompt: swapped.cli.prompt
     };
     await expect(launch({ assignment: assign("go"), name: "worker", profile: "primary-profile" }, soloProfile, swapCli))
       .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "PROFILE_SKILL_BUNDLE_STALE", profile: "primary-profile", path: join(root, "generated", "good-skill"), expected: pinned } });
@@ -3201,28 +3207,6 @@ describe("herdr_launch profile-only contract", () => {
     rmSync(outside, { recursive: true, force: true });
   });
 
-  it("keeps Claude plugin selection additive and leaves AGY ambient skills untouched", async () => {
-    const root = scopeRoot("claude");
-    mkdirSync(join(root, "role-plugin", "skills", "worker"), { recursive: true });
-    writeFileSync(join(root, "role-plugin", "skills", "worker", "SKILL.md"), "worker body\n");
-    const claudeProfile = scopedProfile(root, "claude-profile", "  pluginDirs: [./role-plugin]", [], "claude");
-    const claudeCalls: string[][] = [];
-    await launch({ assignment: assign("go"), name: "worker", profile: "claude-profile" }, catalog(claudeProfile), makeCli({ calls: claudeCalls }).cli);
-    const claudeArgv = claudeCalls.find((call) => call[0] === "agent" && call[1] === "start")!;
-    // Additive by construction: Claude has no exclusivity flag here, so the
-    // selected plugin loads on top of the viewer's ambient configuration.
-    expect(claudeArgv).toContain("--plugin-dir");
-    expect(claudeArgv[claudeArgv.indexOf("--plugin-dir") + 1]).toBe(join(root, "role-plugin"));
-    expect(claudeArgv).not.toContain("--no-skills");
-
-    const agyCalls: string[][] = [];
-    await launch({ name: "researcher", profile: "agy-profile", assignment: assign("go") }, catalog(profile("agy-profile", "agy")), makeCli({ calls: agyCalls }).cli);
-    const agyArgv = agyCalls.find((call) => call[0] === "agent" && call[1] === "start")!;
-    // AGY has no per-session selector, so Herdr passes none and mutates no
-    // global or project skill/plugin state to fake one.
-    for (const flag of ["--skill", "--no-skills", "--plugin-dir", "--settings", "--config"]) expect(agyArgv).not.toContain(flag);
-  });
-
   it("stops before mutation when the catalog is unavailable and preserves abort evidence", async () => {
     const noProfiles = createLaunchTool({ cli: makeCli().cli, context, cwd: "/repo" });
     await expect(noProfiles.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
@@ -3252,24 +3236,24 @@ describe("herdr_launch profile-only contract", () => {
     const base = makeCli();
     const cli: LaunchCli = {
       runJson: vi.fn(async (argv, signal, preserve) => { order.push(argv.slice(0, 2).join(" ")); return base.cli.runJson(argv, signal, preserve); }),
-      runJsonWithStdin: vi.fn(async (argv, input, signal, preserve) => { order.push(argv.slice(0, 2).join(" ")); return base.cli.runJsonWithStdin!(argv, input, signal, preserve); })
+      prompt: vi.fn(async (target, text, signal) => { order.push("agent prompt"); return base.cli.prompt(target, text, signal); })
     };
     const result = await launch({ name: "worker", profile: "worker", assignment: assign("begin") }, catalog(worker), cli, promptSources);
     expect(order.slice(0, 5)).toEqual(["source", "pane current", "api snapshot", "pane split", "pane rename"]);
-    // The wrapped envelope travels over stdin, never in argv.
-    expect(base.calls).toContainEqual(PROMPT_ARGV("w1:p2"));
-    expect(base.stdinInputs).toEqual([envelope("begin")]);
+    // The wrapped envelope travels over the prompt client, never in argv.
+    expect(base.calls).toContainEqual(PROMPT_CALL("w1:p2"));
+    expect(base.promptInputs).toEqual([envelope("begin")]);
     expect(base.calls.flat()).not.toContain(envelope("begin"));
     expect(result.details).toMatchObject({ initialPromptSent: true, initialPromptDelivery: "inline", envelope: { version: "v1", kind: "assignment", delivery: "inline" } });
   });
 
-  it("moves prompt_verification immediately before the single stdin submission", async () => {
+  it("moves prompt_verification immediately before the single prompt submission", async () => {
     const updates: string[] = [];
     const harness = makeCli();
-    const baseStdin = harness.cli.runJsonWithStdin!;
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
+    const basePrompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn(async (target, text, signal) => {
       expect(updates.at(-1)).toBe("prompt_verification");
-      return baseStdin(argv, input, signal, preserve);
+      return basePrompt(target, text, signal);
     });
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
     await tool.execute("id", { name: "worker", profile: "worker", assignment: assign("phase") }, new AbortController().signal, (update) => {
@@ -3277,32 +3261,32 @@ describe("herdr_launch profile-only contract", () => {
     }, extensionContext);
     expect(updates).toContain("ready");
     expect(updates.filter((phase) => phase === "prompt_verification")).toHaveLength(1);
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
   });
 
   it("falls back only after exact typed start failure and authoritative no-agent proof", async () => {
     const first = profile("primary", "pi", ["fallback"]);
-    const second = profile("fallback", "claude");
+    const second = profile("fallback", "pi");
     const calls: string[][] = [];
-    const fallbackPane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } };
+    const fallbackPane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" } };
     // First pane read proves no agent survived the failed attempt; the next two
     // are the selected attempt's readiness baseline and confirmation samples.
     const result = await launch({ assignment: assign("go"), name: "worker", profile: "primary", overrides: { model: "override/model", thinking: "high" } }, catalog(first, second), makeCli({ calls, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }, { ...fallbackPane, ...lifecycleFor(0) }, { ...fallbackPane, ...lifecycleFor(1) }] , start: (argv, attempt) => {
       if (attempt === 0) throw startFailure();
-      return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } } });
+      return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" } } });
     }}).cli);
-    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "claude")).toEqual(["agent", "start", "worker", "--kind", "claude", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "claude/test", "--effort", "medium", "--permission-mode", "dontAsk", "--allowed-tools", "Read", "--disallowed-tools", "Edit", "--add-dir", GRANT_PATH, "--append-system-prompt-file", "/cache/body.md"]);
+    expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")[1]).toEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/body.md"]);
     expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
-    expect(result.details).toMatchObject({ kind: "claude", profile: { requested: "primary", selected: "fallback", attempts: [{ profile: "primary", outcome: "agent_start_failed", errorCode: "agent_start_failed" }, { profile: "fallback", outcome: "selected" }] } });
+    expect(result.details).toMatchObject({ kind: "pi", profile: { requested: "primary", selected: "fallback", attempts: [{ profile: "primary", outcome: "agent_start_failed", errorCode: "agent_start_failed" }, { profile: "fallback", outcome: "selected" }] } });
   });
 
-  it.each(["pi", "claude"] as const)("keeps missing pre-prompt native sessions strict for %s", async (kind) => {
+  it.each(["pi"] as const)("keeps missing pre-prompt native sessions strict for %s", async (kind) => {
     const clockControl = fakeManualClock();
     const harness = makeCli({ omitFreshAgentSession: true });
     const base = harness.cli.runJson;
     harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
       const response = await base(argv, signal, preserve);
-      if (harness.stdinInputs.length === 0 && argv[0] === "pane" && argv[1] === "get") clockControl.advance(120_001);
+      if (harness.promptInputs.length === 0 && argv[0] === "pane" && argv[1] === "get") clockControl.advance(120_001);
       return response;
     });
     const supervision = stubSupervision();
@@ -3310,7 +3294,7 @@ describe("herdr_launch profile-only contract", () => {
     await expect(launch({ name: "worker", profile: `worker-${kind}`, assignment: assign("strict") }, catalog(profile(`worker-${kind}`, kind)), harness.cli, undefined, { supervision, clock: clockControl.clock }))
       .rejects.toMatchObject({ code: "READY_TIMEOUT", details: { phase: "ready", promptSubmitted: false, recipientRegistered: false } });
 
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(supervision.provisionalBound).toHaveLength(0);
     expect(supervision.bound).toHaveLength(0);
   });
@@ -3336,7 +3320,7 @@ describe("herdr_launch profile-only contract", () => {
       .rejects.toMatchObject({ code: "INVALID_INPUT", details: { phase: "validate", effectCertainty: "absent" } });
 
     expect(harness.calls).toHaveLength(0);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(promptSources.create).not.toHaveBeenCalled();
     expect(attachments.ensureRecipient).not.toHaveBeenCalled();
     expect(attachments.publish).not.toHaveBeenCalled();
@@ -3345,562 +3329,72 @@ describe("herdr_launch profile-only contract", () => {
     expect(recipientRecord).not.toHaveBeenCalled();
   });
 
-  it("keeps an AGY fallback launchable because every launch carries its assignment", async () => {
-    const calls: string[][] = [];
-    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker-pi" }, catalog(profile("worker-pi", "pi", ["worker-agy"]), profile("worker-agy", "agy")), makeCli({ calls }).cli);
-
-    expect(result.details).toMatchObject({
-      kind: "pi",
-      initialPromptSent: true,
-      profile: { requested: "worker-pi", selected: "worker-pi", reachableNames: ["worker-pi", "worker-agy"], attempts: [{ profile: "worker-pi", outcome: "selected" }] }
-    });
-    // The AGY fallback is no longer pruned, and the primary still starts first.
-    expect(result.details?.profile?.attempts.some((attempt) => attempt.outcome === "fallback_refused")).toBe(false);
-    const starts = calls.filter((call) => call[0] === "agent" && call[1] === "start");
-    expect(starts).toHaveLength(1);
-    expect(starts[0]).toContain("pi");
-    expect(starts.flat()).not.toContain("agy");
-  });
-
-  it("rejects malformed AGY interactive readiness before prompt bytes", async () => {
-    const harness = makeCli({ omitFreshAgentSession: true });
-    const base = harness.cli.runJson;
-    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-      const response = structuredClone(await base(argv, signal, preserve));
-      if (!harness.calls.some((call) => call[0] === "agent" && call[1] === "start")) return response;
-      const result = response.result as Record<string, unknown>;
-      const records = argv[0] === "api"
-        ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
-        : argv[0] === "agent" && argv[1] === "get"
-          ? [result.agent as Record<string, unknown>]
-          : argv[0] === "pane" && argv[1] === "get"
-            ? [result.pane as Record<string, unknown>]
-            : [];
-      for (const record of records) record.interactive_ready = "yes";
-      return response;
-    });
-    const supervision = stubSupervision();
-
-    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision }))
-      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "TARGET_IDENTITY_UNAVAILABLE", phase: "ready", promptSubmitted: false } });
-    expect(harness.stdinInputs).toHaveLength(0);
-    expect(supervision.provisionalBound).toHaveLength(0);
-  });
-
-  it.each(["identity", "missing_interactive", "not_interactive"] as const)("resamples recoverable AGY readiness evidence for %s", async (scenario) => {
-    vi.useFakeTimers();
-    try {
-      const harness = makeCli({ omitFreshAgentSession: true });
-      const base = harness.cli.runJson;
-      let sample = 0;
-      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-        const response = structuredClone(await base(argv, signal, preserve));
-        if (harness.calls.some((call) => call[0] === "agent" && call[1] === "start") && argv[0] === "api") sample += 1;
-        if (sample !== 1) return response;
-        const result = response.result as Record<string, unknown>;
-        const records = argv[0] === "api"
-          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
-          : argv[0] === "agent" && argv[1] === "get"
-            ? [result.agent as Record<string, unknown>]
-            : argv[0] === "pane" && argv[1] === "get"
-              ? [result.pane as Record<string, unknown>]
-              : [];
-        for (const record of records) {
-          if (scenario === "identity") delete record.terminal_id;
-          if (scenario === "missing_interactive") delete record.interactive_ready;
-          if (scenario === "not_interactive") record.interactive_ready = false;
-        }
-        return response;
-      });
-
-      const pending = launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli);
-      await vi.advanceTimersByTimeAsync(100);
-      await expect(pending).resolves.toMatchObject({ details: { readiness: { samples: 2 }, promptConsumption: "confirmed" } });
-      expect(harness.stdinInputs).toHaveLength(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it.each([
-    ["incompatible envelope", (response: JsonEnvelope) => { response.id = "wrong"; }],
-    ["malformed identity", (response: JsonEnvelope) => { ((response.result as { agent: Record<string, unknown> }).agent).terminal_id = {}; }],
-    ["missing interactive proof", (response: JsonEnvelope) => { ((response.result as { agent: Record<string, unknown> }).agent).interactive_ready = false; }],
-    ["missing revision", (response: JsonEnvelope) => { delete ((response.result as { agent: Record<string, unknown> }).agent).revision; }]
-  ] as const)("rejects an AGY acknowledgement with %s after one submission", async (_label, mutate) => {
-    const harness = makeCli({ omitFreshAgentSession: true });
-    const baseStdin = harness.cli.runJsonWithStdin!;
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-      const response = structuredClone(await baseStdin(argv, input, signal, preserve));
-      mutate(response);
-      return response;
-    });
-    const recipients = new RecipientRegistry();
-    const supervision = stubSupervision();
-
-    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { recipients, supervision }))
-      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "prompt_verification", promptSubmitted: true, recipientRegistered: false } });
-    expect(harness.stdinInputs).toHaveLength(1);
-    expect(supervision.provisionalBound).toHaveLength(1);
-    expect(recipients.size).toBe(0);
-  });
-
-  it.each(["missing_session", "stale_lifecycle"] as const)("resamples AGY confirmation after %s and an advanced unknown state", async (scenario) => {
-    vi.useFakeTimers();
-    try {
-      const harness = makeCli({ omitFreshAgentSession: true });
-      const baseRun = harness.cli.runJson;
-      const baseStdin = harness.cli.runJsonWithStdin!;
-      const supervision = stubSupervision();
-      let confirmationSample = 0;
-      harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-        const response = structuredClone(await baseStdin(argv, input, signal, preserve));
-        const agent = (response.result as { agent: Record<string, unknown> }).agent;
-        delete agent.agent_session;
-        delete agent.state_change_seq;
-        delete agent.screen_detection_skipped;
-        return response;
-      });
-      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-        const response = structuredClone(await baseRun(argv, signal, preserve));
-        if (harness.stdinInputs.length === 0) return response;
-        if (argv[0] === "api") confirmationSample += 1;
-        const result = response.result as Record<string, unknown>;
-        const records = argv[0] === "api"
-          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
-          : argv[0] === "agent" && argv[1] === "get"
-            ? [result.agent as Record<string, unknown>]
-            : argv[0] === "pane" && argv[1] === "get"
-              ? [result.pane as Record<string, unknown>]
-              : [];
-        for (const record of records) {
-          if (confirmationSample === 1 && scenario === "missing_session") delete record.agent_session;
-          record.agent_status = confirmationSample === 1 ? "idle" : confirmationSample === 2 ? "unknown" : scenario === "stale_lifecycle" ? "blocked" : "working";
-          record.state_change_seq = confirmationSample === 1 ? 7 : 8;
-          record.revision = confirmationSample === 1 ? 3 : 4;
-          record.screen_detection_skipped = true;
-        }
-        return response;
-      });
-
-      const pending = launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision });
-      await vi.advanceTimersByTimeAsync(100);
-      expect(supervision.strengthened).toHaveLength(0);
-      await vi.advanceTimersByTimeAsync(100);
-      await expect(pending).resolves.toMatchObject({ details: {
-        promptConsumption: "confirmed",
-        initialPromptSubmission: { confirmed: true },
-        initialPromptObservation: scenario === "stale_lifecycle"
-          ? { status: "not_working", state: "blocked", stateChangeSeq: 8 }
-          : { status: "working", state: "working", stateChangeSeq: 8 },
-        promptConfirmation: { reason: scenario === "stale_lifecycle" ? "state_change_seq_advanced" : "working", samples: 3 }
-      } });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("resamples incomplete agent lifecycle while ignoring same-identity lifecycle and screen-diagnostic skew", async () => {
-    vi.useFakeTimers();
-    try {
-      const harness = makeCli({ omitFreshAgentSession: true });
-      const base = harness.cli.runJson;
-      let confirmationSample = 0;
-      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-        const response = structuredClone(await base(argv, signal, preserve));
-        if (harness.stdinInputs.length === 0) return response;
-        if (argv[0] === "api") confirmationSample += 1;
-        const result = response.result as Record<string, unknown>;
-        const records = argv[0] === "api"
-          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
-          : argv[0] === "agent" && argv[1] === "get"
-            ? [result.agent as Record<string, unknown>]
-            : argv[0] === "pane" && argv[1] === "get"
-              ? [result.pane as Record<string, unknown>]
-              : [];
-        for (const item of records) {
-          const authoritative = argv[0] === "agent" && argv[1] === "get";
-          item.agent_status = authoritative ? "working" : "idle";
-          item.state_change_seq = authoritative ? 8 : 7;
-          item.revision = authoritative ? 4 : 3;
-          item.screen_detection_skipped = authoritative;
-          if (authoritative && confirmationSample === 1) {
-            delete item.agent_status;
-            delete item.state_change_seq;
-            delete item.revision;
-          }
-        }
-        return response;
-      });
-
-      const pending = launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli);
-      await vi.advanceTimersByTimeAsync(100);
-      await expect(pending).resolves.toMatchObject({ details: {
-        initialPromptObservation: { status: "working", stateChangeSeq: 8, revision: 4, screenDetectionSkipped: true },
-        promptConfirmation: { samples: 2 }
-      } });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it.each(["advanced_unknown", "incomplete_lifecycle", "ack_revision_regression"] as const)("keeps AGY confirmation unconfirmed through timeout for %s", async (scenario) => {
-    vi.useFakeTimers();
-    try {
-      const harness = makeCli({ omitFreshAgentSession: true });
-      const baseRun = harness.cli.runJson;
-      const baseStdin = harness.cli.runJsonWithStdin!;
-      const recipients = new RecipientRegistry();
-      const supervision = stubSupervision();
-      harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-        const response = structuredClone(await baseStdin(argv, input, signal, preserve));
-        if (scenario === "ack_revision_regression") (response.result as { agent: Record<string, unknown> }).agent.revision = 10;
-        return response;
-      });
-      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-        const response = structuredClone(await baseRun(argv, signal, preserve));
-        if (harness.stdinInputs.length === 0) return response;
-        const result = response.result as Record<string, unknown>;
-        if (argv[0] === "agent" && argv[1] === "get") {
-          const agent = result.agent as Record<string, unknown>;
-          agent.agent_status = scenario === "advanced_unknown" ? "unknown" : "working";
-          agent.state_change_seq = 8;
-          agent.revision = 4;
-          if (scenario === "incomplete_lifecycle") delete agent.revision;
-        }
-        return response;
-      });
-
-      const pending = launch(
-        { name: "worker", profile: "researcher-agy", assignment: assign("research") },
-        catalog(profile("researcher-agy", "agy")),
-        harness.cli,
-        undefined,
-        { clock: { now: () => Date.now() }, recipients, supervision }
-      ).catch((error: LaunchFailure) => error);
-      await vi.advanceTimersByTimeAsync(5_000);
-      const failure = await pending;
-
-      expect(failure).toMatchObject({ code: "LAUNCH_FAILED", details: {
-        causeCode: "PROMPT_UNCONFIRMED",
-        phase: "prompt_verification",
-        assignmentState: "unconfirmed",
-        promptSubmitted: true,
-        promptConsumption: "unconfirmed",
-        initialPromptSubmission: { operationId: "cli:agent:prompt", paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy", revision: scenario === "ack_revision_regression" ? 10 : 3 },
-        initialPromptObservation: scenario === "advanced_unknown"
-          ? { status: "unknown", state: "unknown", stateChangeSeq: 8, revision: 4 }
-          : scenario === "incomplete_lifecycle"
-            ? { status: "working", state: "working", stateChangeSeq: 8 }
-            : { status: "working", state: "working", stateChangeSeq: 8, revision: 4 },
-        promptConfirmation: { reason: "timeout", samples: expect.any(Number), baseline: { revision: 3 } }
-      } });
-      expect((failure.details.promptConfirmation as { samples: number }).samples).toBeGreaterThan(1);
-      expect(harness.stdinInputs).toHaveLength(1);
-      expect(supervision.strengthened).toHaveLength(0);
-      expect(recipients.size).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it.each(["snapshot_target_missing", "direct_pane_missing", "agent_missing", "string_read_failure", "untyped_inner_failure"] as const)("fails AGY confirmation closed for %s", async (scenario) => {
-    const harness = makeCli({ omitFreshAgentSession: true });
-    const base = harness.cli.runJson;
-    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-      if (harness.stdinInputs.length > 0 && scenario === "string_read_failure" && argv[0] === "api") throw "unavailable";
-      const response = structuredClone(await base(argv, signal, preserve));
-      if (harness.stdinInputs.length === 0) return response;
-      const result = response.result as Record<string, unknown>;
-      if (scenario === "snapshot_target_missing" && argv[0] === "api") {
-        const current = result.snapshot as HerdrSnapshot;
-        current.panes = current.panes.filter((item) => item.pane_id !== "w1:p2");
-        current.agents = current.agents.filter((item) => item.pane_id !== "w1:p2");
-      }
-      if (scenario === "direct_pane_missing" && argv[0] === "agent" && argv[1] === "get") delete (result.agent as Record<string, unknown>).pane_id;
-      if (scenario === "agent_missing" && argv[0] === "agent" && argv[1] === "get") result.agent = null;
-      if (scenario === "untyped_inner_failure" && argv[0] === "agent" && argv[1] === "get") {
-        result.agent = new Proxy(result.agent as Record<string, unknown>, { getOwnPropertyDescriptor: () => { throw new Error("untyped identity read"); } });
-      }
-      return response;
-    });
-
-    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli))
-      .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "prompt_verification", promptSubmitted: true, recipientRegistered: false } });
-    expect(harness.stdinInputs).toHaveLength(1);
-  });
-
-  it("reports caller cancellation after observing stale AGY confirmation", async () => {
-    vi.useFakeTimers();
-    try {
-      const controller = new AbortController();
-      const harness = makeCli({ omitFreshAgentSession: true });
-      const base = harness.cli.runJson;
-      let abortScheduled = false;
-      harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-        const response = structuredClone(await base(argv, signal, preserve));
-        if (harness.stdinInputs.length === 0) return response;
-        const result = response.result as Record<string, unknown>;
-        const records = argv[0] === "api"
-          ? [...((result.snapshot as HerdrSnapshot).panes), ...((result.snapshot as HerdrSnapshot).agents)].filter((item) => item.pane_id === "w1:p2")
-          : argv[0] === "agent" && argv[1] === "get"
-            ? [result.agent as Record<string, unknown>]
-            : argv[0] === "pane" && argv[1] === "get"
-              ? [result.pane as Record<string, unknown>]
-              : [];
-        for (const record of records) {
-          record.agent_status = "idle";
-          record.state_change_seq = 7;
-          record.revision = 3;
-        }
-        if (argv[0] === "pane" && argv[1] === "get" && !abortScheduled) {
-          abortScheduled = true;
-          setTimeout(() => controller.abort(), 50);
-        }
-        return response;
-      });
-      const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("researcher-agy", "agy")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
-
-      const outcome = expect(tool.execute("id", { name: "worker", profile: "researcher-agy", assignment: assign("research") }, controller.signal, undefined, extensionContext))
-        .rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { initialPromptObservation: { stateChangeSeq: 7 }, promptConfirmation: { reason: "caller_aborted", sourceCode: "ABORTED" }, promptSubmitted: true } });
-      await vi.waitFor(() => expect(abortScheduled).toBe(true), { interval: 1 });
-      await vi.advanceTimersByTimeAsync(50);
-      await outcome;
-      expect(harness.stdinInputs).toHaveLength(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("preserves bounded AGY acknowledgement evidence when strengthening throws an untyped error", async () => {
-    const harness = makeCli({ omitFreshAgentSession: true });
-    const supervision = stubSupervision({ onStrengthen: () => { throw new Error("strengthen failed"); } });
-    const failure = await launch({ name: "worker", profile: "researcher-agy", assignment: assign("prompt-secret") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision })
-      .catch((error: LaunchFailure) => error);
-    expect(failure).toMatchObject({ code: "LAUNCH_FAILED", details: {
-      phase: "supervision_bind",
-      promptSubmitted: true,
-      initialPromptSubmission: { confirmed: true, operationId: "cli:agent:prompt", paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy", revision: 3 }
-    } });
-    expect(JSON.stringify(failure.details)).not.toContain("prompt-secret");
-    expect(harness.stdinInputs).toHaveLength(1);
-  });
-
-  it.each([
-    ["acknowledgement identity mismatch", "ack_mismatch"],
-    ["prompt transport failure", "transport"],
-    ["fresh occupant replacement", "identity_mismatch"],
-    ["duplicate pane evidence", "duplicate"],
-    ["duplicate agent evidence", "duplicate_agent"],
-    ["failed authoritative read", "read_failed"],
-    ["contradictory authoritative read", "contradictory"],
-    ["missing native session timeout", "missing_session"],
-    ["malformed native session", "malformed_session"],
-    ["changed native session", "changed_session"],
-    ["missing authoritative revision", "missing_revision"],
-    ["malformed authoritative revision", "malformed_revision"],
-    ["lifecycle sequence does not advance", "stale_sequence"],
-    ["revision regression", "revision_regression"],
-    ["moved authoritative occupant", "moved_occupant"],
-    ["atomic strengthening publication failure", "strengthening"]
-  ] as const)("retains AGY provisional publication after %s", async (_label, scenario) => {
-    const clockControl = fakeManualClock();
-    const harness = makeCli({ omitFreshAgentSession: true });
-    const baseRun = harness.cli.runJson;
-    const baseStdin = harness.cli.runJsonWithStdin!;
-    const strengtheningFailure = scenario === "strengthening"
-      ? new SupervisionBindError("publication failed", { cause: "publication_failed" })
-      : undefined;
-    const safety = agySafetySupervision(strengtheningFailure);
+  it.each(["inline", "attachment"] as const)("rejects a direct AGY %s launch before any effect", async (assignmentDelivery) => {
+    const harness = makeCli();
+    const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
     const attachments = fakeAttachments();
     const recipients = new RecipientRegistry();
-    const recipientRecord = vi.spyOn(recipients, "recordFor");
-
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input, signal, preserve) => {
-      if (scenario === "transport") {
-        harness.calls.push(argv);
-        harness.stdinInputs.push(input);
-        throw Object.assign(new Error("transport result unknown"), { code: "CLI_PROTOCOL_ERROR" });
-      }
-      const response = structuredClone(await baseStdin(argv, input, signal, preserve));
-      if (scenario === "ack_mismatch") {
-        const agent = (response.result as { agent: Record<string, unknown> }).agent;
-        agent.terminal_id = "terminal-replaced";
-      }
-      return response;
-    });
-
-    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
-      const afterPrompt = harness.stdinInputs.length > 0;
-      if (afterPrompt && scenario === "read_failed" && argv[0] === "api") throw Object.assign(new Error("snapshot unavailable"), { code: "CLI_PROTOCOL_ERROR" });
-      const response = structuredClone(await baseRun(argv, signal, preserve));
-      if (!afterPrompt || !(["api", "agent", "pane"] as const).includes(argv[0] as "api" | "agent" | "pane")) return response;
-
-      const result = response.result as Record<string, unknown>;
-      const records: Record<string, unknown>[] = [];
-      if (argv[0] === "api") {
-        const current = (result.snapshot as HerdrSnapshot);
-        records.push(...current.panes.filter((item) => item.pane_id === "w1:p2"), ...current.agents.filter((item) => item.pane_id === "w1:p2"));
-        if (scenario === "duplicate") current.panes.push({ ...current.panes.find((item) => item.pane_id === "w1:p2")! });
-        if (scenario === "duplicate_agent") current.agents.push({ ...current.agents.find((item) => item.pane_id === "w1:p2")! });
-        if (scenario === "contradictory") current.agents.find((item) => item.pane_id === "w1:p2")!.terminal_id = "terminal-contradiction";
-      } else if (argv[0] === "agent" && argv[1] === "get") {
-        records.push(result.agent as Record<string, unknown>);
-      } else if (argv[0] === "pane" && argv[1] === "get") {
-        records.push(result.pane as Record<string, unknown>);
-      }
-      for (const item of records) {
-        if (scenario === "identity_mismatch") item.terminal_id = "terminal-replaced";
-        if (scenario === "missing_session") delete item.agent_session;
-        if (scenario === "malformed_session") item.agent_session = "malformed";
-        if (scenario === "changed_session") item.agent_session = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-changed" };
-        if (scenario === "missing_revision") delete item.revision;
-        if (scenario === "malformed_revision") item.revision = "malformed";
-        if (scenario === "stale_sequence") { item.state_change_seq = 7; item.revision = 4; }
-        if (scenario === "revision_regression") item.revision = 2;
-        if (scenario === "moved_occupant") item.pane_id = "w1:p3";
-      }
-      if (argv[0] === "pane" && argv[1] === "get" && ["missing_session", "missing_revision", "stale_sequence", "revision_regression"].includes(scenario)) clockControl.advance(5_001);
-      return response;
-    });
-
-    const failure = await launch(
-      { name: "worker", profile: "researcher-agy", assignment: assign("research") },
-      catalog(profile("researcher-agy", "agy", ["researcher-pi"]), profile("researcher-pi")),
-      harness.cli,
-      undefined,
-      { attachments, recipients, supervision: safety.supervision, clock: clockControl.clock }
-    ).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
-
-    expect(failure.code).not.toBeUndefined();
-    if (scenario !== "ack_mismatch" && scenario !== "transport") {
-      expect(failure.details.initialPromptSubmission).toMatchObject({
-        confirmed: true,
-        operationId: "cli:agent:prompt",
-        paneId: "w1:p2",
-        terminalId: "terminal-0",
-        agentName: "worker",
-        agentKind: "agy",
-        revision: 3
-      });
-    }
-    expect(harness.stdinInputs).toHaveLength(1);
-    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
-    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
-    expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill" || call[1] === "send-keys")).toBe(false);
-    expect(safety.supervision.provisionalBound).toHaveLength(1);
-    expect(safety.supervision.released).toEqual([]);
-    expect(safety.publishedView()).toMatchObject({ operation_phase: "running", state: "provisional", targetIds: [], live: true, cancellable: false, provisional: { paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy" } });
-    expect(recipientRecord).not.toHaveBeenCalled();
-    expect(recipients.get("w1:p2")).toBeUndefined();
-    expect(attachments.publish).not.toHaveBeenCalled();
-  });
-
-  it("publishes AGY provisionally before one prompt, then strengthens before recipient registration", async () => {
-    const order: string[] = [];
-    const harness = makeCli();
-    const supervision = stubSupervision({
-      onProvisionalBind: () => {
-        order.push("provisional");
-        expect(harness.stdinInputs).toHaveLength(0);
-      },
-      onStrengthen: () => { order.push("strengthen"); }
-    });
-    const recipients = new RecipientRegistry();
-    vi.spyOn(recipients, "recordFor").mockImplementation((...args) => {
-      order.push("recipient");
-      return RecipientRegistry.prototype.recordFor.call(recipients, ...args);
-    });
-
-    const result = await launch({ name: "worker", profile: "researcher-agy", assignment: assign("research") }, catalog(profile("researcher-agy", "agy")), harness.cli, undefined, { supervision, recipients });
-
-    expect(harness.stdinInputs).toEqual([envelope("research")]);
-    expect(supervision.provisionalBound).toEqual([{
-      identity: { paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy" },
-      profileName: "researcher-agy",
-      baseline: { state: "idle", stateChangeSeq: 7, revision: 3 }
-    }]);
-    expect(supervision.strengthened[0]!.identity).toMatchObject({ paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "agy", agentSession: { agent: "agy", value: "session-0" } });
-    expect(order).toEqual(["provisional", "strengthen", "recipient"]);
-    expect(recipients.get("w1:p2")).toMatchObject({ kind: "agy", agyStrengthened: true, attachmentDirectory: GRANT_PATH });
-    expect(supervision.bound).toHaveLength(0);
-    expect(supervision.released).toEqual([]);
-    expect(result.details).toMatchObject({ kind: "agy", promptConsumption: "confirmed", assignmentState: "confirmed", supervision: { state: "active", child: { agentKind: "agy" } } });
-  });
-
-  it.each(["pi", "claude"] as const)("binds a zero-effect %s startup fallback to AGY provisionally", async (primaryKind) => {
-    const primary = profile(`primary-${primaryKind}`, primaryKind, ["fallback-agy"]);
-    const fallback = profile("fallback-agy", "agy");
     const supervision = stubSupervision();
-    const harness = makeCli({
-      omitFreshAgentSession: true,
-      paneStates: [
-        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "agy", terminal_id: "terminal-1", agent_status: "idle", state_change_seq: 7, revision: 3 },
-        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "agy", terminal_id: "terminal-1", agent_session: { source: "herdr:agy", agent: "agy", kind: "id", value: "session-1" }, agent_status: "working", state_change_seq: 8, revision: 4 },
-      ],
-      start: (argv, attempt) => {
-        if (attempt === 0) throw startFailure();
-        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: argv[4], terminal_id: "terminal-1" } });
-      },
-    });
-
-    const result = await launch({ name: "worker", profile: primary.name, assignment: assign("research") }, catalog(primary, fallback), harness.cli, undefined, { supervision });
-
-    expect(supervision.reserved).toEqual([{ agentName: "worker", agentKind: primaryKind, profileName: primary.name }]);
-    expect(supervision.provisionalBound).toEqual([{
-      identity: { paneId: "w1:p2", terminalId: "terminal-1", agentName: "worker", agentKind: "agy" },
-      profileName: "fallback-agy",
-      baseline: { state: "idle", stateChangeSeq: 7, revision: 3 },
-    }]);
-    expect(supervision.strengthened).toHaveLength(1);
-    expect(supervision.bound).toEqual([]);
-    expect(supervision.released).toEqual([]);
-    expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
-    expect(harness.stdinInputs).toEqual([envelope("research")]);
-    expect(result.details).toMatchObject({ kind: "agy", profile: { requested: primary.name, selected: "fallback-agy" }, promptConsumption: "confirmed", assignmentState: "confirmed" });
+    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research"), assignmentDelivery }, catalog(profile("researcher-agy", "agy")), harness.cli, promptSources, { attachments, recipients, supervision }))
+      .rejects.toMatchObject({ code: "AGY_UNQUALIFIED", details: { causeCode: "AGY_UNQUALIFIED", phase: "resolve_profile", agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent" } });
+    expect(harness.calls).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
+    expect(promptSources.create).not.toHaveBeenCalled();
+    expect(attachments.ensureRecipient).not.toHaveBeenCalled();
+    expect(attachments.publish).not.toHaveBeenCalled();
+    expect(supervision.reserved).toHaveLength(0);
+    expect(supervision.released).toHaveLength(0);
   });
 
-  it("uses the selected AGY profile mode for launch and rejects mode overrides", async () => {
-    const workerAgy = profile("worker-agy", "agy", [], "accept-edits");
+  it.each(["inline", "attachment"] as const)("rejects a direct Claude %s launch before any effect", async (assignmentDelivery) => {
     const harness = makeCli();
-    const result = await launch({ name: "worker", profile: "worker-agy", assignment: assign("implement") }, catalog(workerAgy), harness.cli);
-    const start = harness.calls.find((call) => call[0] === "agent" && call[1] === "start");
-    expect(start).toEqual(expect.arrayContaining(["--model", "gemini-3.8-flash-high", "--mode", "accept-edits", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]));
-    expect(start).not.toContain("plan");
-    expect(result.details).toMatchObject({ kind: "agy", profile: { name: "worker-agy", runtime: { mode: "accept-edits", dangerouslySkipPermissions: true } } });
-    await expect(launch({ name: "worker", profile: "worker-agy", assignment: assign("implement"), overrides: { mode: "plan" } as never }, catalog(workerAgy), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
+    const attachments = fakeAttachments();
+    const recipients = new RecipientRegistry();
+    const supervision = stubSupervision();
+    await expect(launch({ name: "worker", profile: "worker-claude", assignment: assign("research"), assignmentDelivery }, catalog(profile("worker-claude", "claude")), harness.cli, promptSources, { attachments, recipients, supervision }))
+      .rejects.toMatchObject({ code: "CLAUDE_UNQUALIFIED", details: { causeCode: "CLAUDE_UNQUALIFIED", profile: "worker-claude", phase: "resolve_profile", agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent" } });
+    expect(harness.calls).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
+    expect(promptSources.create).not.toHaveBeenCalled();
+    expect(attachments.ensureRecipient).not.toHaveBeenCalled();
+    expect(attachments.publish).not.toHaveBeenCalled();
+    expect(supervision.reserved).toHaveLength(0);
   });
 
-  it("keeps AGY bodies as metadata and starts an AGY fallback without a prompt source", async () => {
-    const primary = profile("primary", "agy", ["fallback"]);
-    const fallback = profile("fallback", "pi");
+  it("refuses Claude and AGY fallbacks without blocking an allowed Pi primary", async () => {
     const calls: string[][] = [];
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
-    const harness = makeCli({
-      calls,
-      paneStates: [
-        { pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" },
-        { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" }, agent_status: "idle", state_change_seq: 7, revision: 3 },
-        { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" }, agent_status: "working", state_change_seq: 8, revision: 4 }
-      ],
-      start: (_argv, attempt) => {
-        if (attempt === 0) throw startFailure();
-        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" } } });
-      }
-    });
-    const result = await launch({ name: "worker", profile: "primary", assignment: assign("research") }, catalog(primary, fallback), harness.cli, promptSources);
-
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker-pi" }, catalog(profile("worker-pi", "pi", ["worker-agy", "worker-claude"]), profile("worker-agy", "agy"), profile("worker-claude", "claude")), makeCli({ calls }).cli, promptSources);
+    expect(result.details).toMatchObject({ kind: "pi", initialPromptSent: true, profile: { requested: "worker-pi", selected: "worker-pi", reachableNames: ["worker-pi", "worker-agy", "worker-claude"], attempts: expect.arrayContaining([
+      expect.objectContaining({ profile: "worker-agy", outcome: "fallback_refused", errorCode: "AGY_UNQUALIFIED" }),
+      expect.objectContaining({ profile: "worker-claude", outcome: "fallback_refused", errorCode: "CLAUDE_UNQUALIFIED" })
+    ]) } });
     expect(promptSources.create).toHaveBeenCalledTimes(1);
-    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "agy")).toEqual([
-      "agent", "start", "worker", "--kind", "agy", "--pane", "w1:p2", "--timeout", "120000", "--",
-      "--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", GRANT_PATH, "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."
-    ]);
-    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "pi")).toEqual([
-      "agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--",
-      "--model", "test/model", "--thinking", "low", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/body.md"
-    ]);
-    expect(result.details).toMatchObject({ kind: "pi", profile: { requested: "primary", selected: "fallback" } });
+    expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(calls.flat()).not.toContain("agy");
+    expect(calls.flat()).not.toContain("claude");
+  });
+
+  it("tries an allowed fallback after a safe Pi start failure, never an AGY fallback", async () => {
+    const primary = profile("primary", "pi", ["blocked-agy", "fallback"]);
+    const blocked = profile("blocked-agy", "agy");
+    const fallback = profile("fallback", "pi");
+    const calls: string[][] = [];
+    const fallbackPane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" }, agent_status: "idle", state_change_seq: 7, revision: 3 };
+    const confirmedPane = { ...fallbackPane, agent_status: "working", state_change_seq: 8, revision: 4 };
+    const harness = makeCli({ calls, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }, fallbackPane, confirmedPane], start: (argv, attempt) => {
+      if (attempt === 0) throw startFailure();
+      return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: fallbackPane.agent_session } });
+    }});
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, blocked, fallback), harness.cli);
+    const starts = calls.filter((call) => call[0] === "agent" && call[1] === "start");
+    expect(starts.map((call) => call[4])).toEqual(["pi", "pi"]);
+    expect(result.details).toMatchObject({ kind: "pi", profile: { selected: "fallback", attempts: expect.arrayContaining([
+      expect.objectContaining({ profile: "blocked-agy", outcome: "fallback_refused", errorCode: "AGY_UNQUALIFIED" }),
+      expect.objectContaining({ profile: "primary", outcome: "agent_start_failed" }),
+      expect.objectContaining({ profile: "fallback", outcome: "selected" })
+    ]) } });
   });
 
   it("refuses fallback for mismatched errors, uncertain post-state, or an occupied pane", async () => {
@@ -3993,7 +3487,7 @@ describe("herdr_launch profile-only contract", () => {
     let existingPaneReads = 0;
     const existingAgent = { name: "worker", pane_id: "w1:p1", agent: "pi", ...existingIdentity };
     const existingCli: LaunchCli = {
-      runJsonWithStdin: vi.fn(async () => ok("cli:agent:prompt", { type: "agent_prompted", agent: { ...existingAgent, ...lifecycleFor(0), screen_detection_skipped: true } })),
+      prompt: vi.fn(async () => ok("cli:agent:prompt", { type: "agent_prompted", agent: { ...existingAgent, ...lifecycleFor(0), screen_detection_skipped: true } })),
       runJson: vi.fn(async (argv) => {
       if (argv[0] === "pane" && argv[1] === "current") return ok("current", { type: "pane_current", pane: existing.panes[0] });
       if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: existingStarted ? { ...existing, panes: [{ ...existing.panes[0]!, agent_name: "worker", agent: "pi", ...existingIdentity }], agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", ...existingIdentity }] } : existing });
@@ -4101,7 +3595,7 @@ describe("herdr_launch automatic child supervision", () => {
     expect(supervision.released).toEqual(["launch_failed_supervision_bind"]);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
     expect(harness.calls.some((call) => call[0] === "agent" && (call[1] === "focus" || call[1] === "prompt"))).toBe(false);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(recipients.get("w1:p2")).toBeUndefined();
     expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
   });
@@ -4140,7 +3634,7 @@ describe("herdr_launch automatic child supervision", () => {
     const harness = makeCli();
     const base = harness.cli.runJson;
     harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signalValue, preserve) => {
-      if (argv[0] === "api" && harness.stdinInputs.length === 0 && readSignals.length === 0 && supervision.released.length > 0) {
+      if (argv[0] === "api" && harness.promptInputs.length === 0 && readSignals.length === 0 && supervision.released.length > 0) {
         readSignals.push(signalValue);
         controller.abort();
       }
@@ -4154,24 +3648,24 @@ describe("herdr_launch automatic child supervision", () => {
   it("binds the profile that actually started the child after a fallback", async () => {
     const supervision = stubSupervision();
     const first = profile("primary", "pi", ["fallback"]);
-    const second = profile("fallback", "claude");
+    const second = profile("fallback", "pi");
     const result = await launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(first, second), makeCli({
       paneStates: [
         { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" }, ...lifecycleFor(0) },
-        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" }, ...lifecycleFor(1) }
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" }, ...lifecycleFor(0) },
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" }, ...lifecycleFor(1) }
       ],
       start: (_argv, attempt) => {
         if (attempt === 0) throw startFailure();
-        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } } });
+        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" } } });
       }
     }).cli, undefined, { supervision });
     // The reservation names the requested root, because it is taken before the
     // fallback chain runs; the binding names the profile that actually started.
     expect(supervision.reserved).toEqual([{ agentName: "worker", agentKind: "pi", profileName: "primary" }]);
     expect(supervision.bound[0]!.profileName).toBe("fallback");
-    expect(supervision.bound[0]!.identity.agentKind).toBe("claude");
-    expect(result.details).toMatchObject({ profile: { selected: "fallback" }, supervision: { child: { profileName: "fallback", agentKind: "claude" } } });
+    expect(supervision.bound[0]!.identity.agentKind).toBe("pi");
+    expect(result.details).toMatchObject({ profile: { selected: "fallback" }, supervision: { child: { profileName: "fallback", agentKind: "pi" } } });
   });
 
   it("releases the reservation when the launch fails after reserving", async () => {
@@ -4187,11 +3681,11 @@ describe("herdr_launch automatic child supervision", () => {
     const supervision = stubSupervision({ onBind: () => {
       expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "focus")).toBe(false);
       expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
-      expect(harness.stdinInputs).toHaveLength(0);
+      expect(harness.promptInputs).toHaveLength(0);
     } });
     const result = await launch({ name: "worker", profile: "worker", focus: true, assignment: assign("go") }, catalog(profile("worker")), harness.cli, undefined, { supervision });
     expect(result.details).toMatchObject({ promptConsumption: "confirmed", assignmentState: "confirmed", supervision: { jobId: supervision.jobId } });
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
     expect(supervision.bindAttempts).toHaveLength(1);
     expect(supervision.bound).toHaveLength(1);
     expect(supervision.released).toEqual([]);
@@ -4216,24 +3710,24 @@ describe("herdr_launch automatic child supervision", () => {
     expect(failure.details).not.toHaveProperty("assignmentState");
     expect(supervision.bound).toHaveLength(1);
     expect(supervision.released).toEqual([]);
-    expect(harness.stdinInputs).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
     expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
   });
 
   it("retains bound supervision after one prompt when acknowledgement parsing fails", async () => {
     const harness = makeCli();
-    harness.cli.runJsonWithStdin = vi.fn(async (argv, input) => {
-      harness.calls.push(argv);
-      harness.stdinInputs.push(input);
+    harness.cli.prompt = vi.fn(async (target, text) => {
+      harness.calls.push(PROMPT_CALL(target));
+      harness.promptInputs.push(text);
       return ok("cli:agent:prompt", { type: "malformed_acknowledgement" });
     });
     const recipients = new RecipientRegistry();
     const supervision = stubSupervision({ jobId: "job_ack_retained" });
     const failure = await launch({ name: "worker", profile: "worker", assignment: assign("private-prompt-canary") }, catalog(profile("worker")), harness.cli, undefined, { recipients, supervision }).catch((error: LaunchFailure) => error) as unknown as LaunchFailure;
-    expect(failure.details).toMatchObject({ phase: "prompt_verification", assignmentState: "unconfirmed", paneId: "w1:p2", supervisorJobId: "job_ack_retained", supervision: { jobId: "job_ack_retained", state: "active" }, promptSubmitted: true, recipientRegistered: false });
+    expect(failure.details).toMatchObject({ phase: "prompt_verification", assignmentState: "unconfirmed", paneId: "w1:p2", supervisorJobId: "job_ack_retained", supervision: { jobId: "job_ack_retained", state: "active" }, promptSubmitted: false, promptDispatch: { state: "unknown", requestId: "cli:agent:prompt" }, recipientRegistered: false });
     expect(supervision.bound).toHaveLength(1);
     expect(supervision.released).toEqual([]);
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
     expect(harness.calls.some((call) => call[1] === "send-keys" || call[1] === "close" || call[1] === "kill")).toBe(false);
@@ -4250,7 +3744,7 @@ describe("herdr_launch automatic child supervision", () => {
     expect(failure.details).toMatchObject({ phase: "prompt_verification", assignmentState: "confirmed", paneId: "w1:p2", supervisorJobId: "job_recipient_retained", supervision: { jobId: "job_recipient_retained", state: "active" }, promptSubmitted: true, recipientRegistered: false });
     expect(supervision.bound).toHaveLength(1);
     expect(supervision.released).toEqual([]);
-    expect(harness.stdinInputs).toHaveLength(1);
+    expect(harness.promptInputs).toHaveLength(1);
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "prompt")).toHaveLength(1);
     expect(harness.calls.some((call) => call[1] === "close" || call[1] === "kill")).toBe(false);
   });
@@ -4281,7 +3775,7 @@ describe("herdr_launch automatic child supervision", () => {
 
   it("rechecks the common gate before every fallback start", async () => {
     const primary = profile("primary", "pi", ["fallback"]);
-    const fallback = profile("fallback", "claude");
+    const fallback = profile("fallback", "pi");
     const calls: string[][] = [];
     let checks = 0;
     const gate = {
@@ -4296,7 +3790,7 @@ describe("herdr_launch automatic child supervision", () => {
       paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }],
       start: (_argv, attempt) => {
         if (attempt === 0) throw startFailure();
-        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "claude", agent: "claude", kind: "id", value: "session-fallback" } } });
+        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" } } });
       }
     });
     const tool = createLaunchTool({

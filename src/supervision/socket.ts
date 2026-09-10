@@ -1,15 +1,17 @@
 /**
  * The newline-delimited JSON client for the local Herdr socket.
  *
- * This is supervision's only transport and it is read-only: it issues
- * `session.snapshot` and `events.subscribe` and consumes the pushed lifecycle
- * stream. Every mutation in this repository still goes through the Herdr CLI.
+ * Supervision uses this transport for read-only snapshots and subscriptions;
+ * the prompt foundation also uses its bounded correlated unary request path.
+ * Callers choose the fresh connection and mutation policy rather than this
+ * framing layer becoming a generic RPC client.
  */
 
 import { createConnection } from "node:net";
 import { StringDecoder } from "node:string_decoder";
 import {
   assertSubscriptionAck,
+  encodeSocketRequest,
   parseSocketLine,
   subscribeParams,
   SupervisionProtocolError,
@@ -44,8 +46,11 @@ export class SupervisionSocketError extends Error {
 export class SupervisionRequestError extends Error {
   readonly code = "SUPERVISION_REQUEST_FAILED" as const;
 
-  constructor(readonly herdrCode: string, message: string) {
-    super(message);
+  constructor(readonly herdrCode: string, _message: string) {
+    // The backend's message is untrusted and may contain terminal text or
+    // caller-authored input. Callers use the typed Herdr code instead.
+    void _message;
+    super("Herdr socket request was rejected");
     this.name = "SupervisionRequestError";
   }
 }
@@ -89,12 +94,12 @@ export function createNodeSupervisionConnect(connectTimeoutMs = SUPERVISION_CONN
       socket.destroy();
       reject(new SupervisionSocketError("SUPERVISION_SOCKET_UNAVAILABLE", "Herdr socket did not connect within the bound"));
     }, connectTimeoutMs);
-    socket.once("error", (error: Error) => {
+    socket.once("error", () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
-      reject(new SupervisionSocketError("SUPERVISION_SOCKET_UNAVAILABLE", "Herdr socket could not be opened", { cause: error.message }));
+      reject(new SupervisionSocketError("SUPERVISION_SOCKET_UNAVAILABLE", "Herdr socket could not be opened"));
     });
     socket.once("connect", () => {
       if (settled) return;
@@ -118,6 +123,11 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+export interface CorrelatedSocketReply {
+  id: string;
+  result: unknown;
 }
 
 /**
@@ -156,6 +166,10 @@ export class SupervisionSocket {
     while (index >= 0) {
       const line = this.buffer.slice(0, index);
       this.buffer = this.buffer.slice(index + 1);
+      if (Buffer.byteLength(line, "utf8") + 1 > SUPERVISION_MAX_LINE_BYTES) {
+        this.fail(new SupervisionProtocolError("Herdr socket frame exceeds the accepted bound", { limitBytes: SUPERVISION_MAX_LINE_BYTES }));
+        return;
+      }
       if (line.trim().length > 0) {
         if (!this.consume(line)) return;
       }
@@ -228,9 +242,23 @@ export class SupervisionSocket {
     return this.issue(method, params);
   }
 
-  private issue(method: string, params: Record<string, unknown>, mark?: (id: string) => void): Promise<unknown> {
+  async requestCorrelated(id: string, method: string, params: Record<string, unknown>, onWrite?: () => void): Promise<CorrelatedSocketReply> {
+    if (id.length === 0 || /[\0\r\n]/u.test(id)) {
+      throw new SupervisionProtocolError("Herdr socket request id is malformed");
+    }
+    return { id, result: await this.issue(method, params, undefined, id, onWrite) };
+  }
+
+  private issue(method: string, params: Record<string, unknown>, mark?: (id: string) => void, requestedId?: string, onWrite?: () => void): Promise<unknown> {
     if (this.closed) return Promise.reject(this.closedError);
-    const id = `herdr-tools-${++this.nextId}`;
+    const id = requestedId ?? `herdr-tools-${++this.nextId}`;
+    if (this.pending.has(id)) return Promise.reject(new SupervisionProtocolError("Herdr socket request id is already pending", { id }));
+    let frame: string;
+    try {
+      frame = encodeSocketRequest(id, method, params);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     mark?.(id);
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -238,7 +266,12 @@ export class SupervisionSocket {
         reject(new SupervisionSocketError("SUPERVISION_REQUEST_TIMEOUT", "Herdr socket request timed out", { method }));
       }, this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.stream.write(`${JSON.stringify({ id, method, params })}\n`);
+      try {
+        onWrite?.();
+        this.stream.write(frame);
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new SupervisionSocketError("SUPERVISION_SOCKET_CLOSED", "Herdr socket write failed"));
+      }
     });
   }
 

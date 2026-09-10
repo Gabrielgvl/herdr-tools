@@ -1,11 +1,12 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli, JsonEnvelope } from "../cli.js";
+import type { PromptDispatchEvidence } from "../agent-prompt.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
-import { classifyPromptObservation, compactPromptSubmission, requirePromptTargetIdentity, parsePromptSubmission, PromptIdentityError, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
-import { publishedAttachmentMatchesDirectory, type AttachmentStore, type PublishedAttachment } from "../messages/store.js";
+import { classifyPromptObservation, compactPromptSubmission, parsePromptTargetIdentityFields, requirePromptTargetIdentity, parsePromptSubmission, PromptIdentityError, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
+import type { AttachmentStore, PublishedAttachment } from "../messages/store.js";
 import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
@@ -26,6 +27,7 @@ export interface LegacyCommunicateDetails {
   preState: Record<string, unknown>;
   postState?: Record<string, unknown>;
   submission?: PromptSubmissionEvidence;
+  promptDispatch?: PromptDispatchEvidence;
   observation?: PromptObservation;
   operationIds: {
     snapshot?: string;
@@ -109,6 +111,19 @@ function snapshotIdentityRecords(snapshot: HerdrSnapshot, paneId: string): Recor
   return [panes[0]!, agents[0]!];
 }
 
+/** Unqualified text recipients are blocked before attachment or prompt effects. */
+function assertQualifiedPromptTarget(records: readonly Record<string, unknown>[], paneId: string): void {
+  for (const value of records) {
+    const fields = parsePromptTargetIdentityFields(value, paneId);
+    if (fields.agentKind === "agy" || fields.agentSession?.agent === "agy") {
+      throw Object.assign(new Error("AGY text delivery is not qualified"), { code: "AGY_UNQUALIFIED", details: { target: paneId } });
+    }
+    if (fields.agentKind === "claude" || fields.agentSession?.agent === "claude") {
+      throw Object.assign(new Error("Claude text delivery is not qualified"), { code: "CLAUDE_UNQUALIFIED", details: { target: paneId } });
+    }
+  }
+}
+
 function stateOf(pane: Record<string, unknown>): CommunicateState {
   const state = pane.agent_status;
   if (typeof state !== "string" || !VALID_STATES.has(state as CommunicateState)) {
@@ -123,6 +138,15 @@ function assertSendableState(pane: Record<string, unknown>): CommunicateState {
     throw Object.assign(new Error("Target state is unknown; no communication was sent"), { code: "TARGET_STATE_UNKNOWN", details: { target: pane.pane_id, state } });
   }
   return state;
+}
+
+function assertPromptState(pane: Record<string, unknown>, state: CommunicateState): void {
+  if (state === "working") {
+    throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: pane.pane_id, state } });
+  }
+  if (state === "blocked") {
+    throw Object.assign(new Error("Target is blocked; normal prompt refuses delivery"), { code: "TARGET_BLOCKED", details: { target: pane.pane_id, state } });
+  }
 }
 
 function assertPostState(pane: Record<string, unknown>): CommunicateState {
@@ -153,9 +177,9 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       // Establish the route before any precondition so every refusal names it.
       const legacyParams = params as Exclude<CommunicateParams, { operation: "cancel" | "interrupt" }>;
       const delivery: MessageDelivery | undefined = legacyParams.operation === "keys" ? undefined : (legacyParams.delivery === "attachment" ? "attachment" : "inline");
+      const route: CommunicateRoute | undefined = legacyParams.operation === "keys" ? undefined : (legacyParams.operation === "steer" ? "steer_direct" : "prompt_direct");
       let prompt: JsonEnvelope | undefined;
       let keys: JsonEnvelope | undefined;
-      let route: CommunicateRoute | undefined;
       let published: PublishedAttachment | undefined;
       let phase: CommunicatePhase = "validate";
       let snapshotOperationId: string | undefined;
@@ -170,6 +194,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       let after: Record<string, unknown> | undefined;
       let afterState: CommunicateState | undefined;
       let submission: PromptSubmissionEvidence | undefined;
+      let promptDispatch: PromptDispatchEvidence | undefined;
       let observation: PromptObservation | undefined;
       let contextDiagnostics: ContextResolutionDiagnostics | undefined;
       try {
@@ -185,7 +210,8 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         }
 
         phase = "resolve_target";
-        await deps.preflight(activeSignal);
+        if (legacyParams.operation === "keys") await deps.preflight(activeSignal);
+        else await deps.preflight(activeSignal, "agent.prompt");
         const effective = await contextResolver(activeSignal);
         contextDiagnostics = effective.diagnostics;
         snapshotOperationId = effective.operationIds.snapshot;
@@ -198,9 +224,14 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         if (sender && target.paneId === sender.paneId) {
           throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: target.paneId } });
         }
+        if (legacyParams.operation !== "keys") {
+          assertQualifiedPromptTarget([
+            ...snapshot.panes.filter((pane) => pane.pane_id === target.paneId),
+            ...snapshot.agents.filter((agent) => agent.pane_id === target.paneId)
+          ], target.paneId!);
+        }
         let recipientKey: string | undefined;
         let recipientAgentName: string | undefined;
-        let recipientAttachmentDirectory: string | undefined;
         let recipientRecord: ReturnType<RecipientRegistry["get"]>;
         if (delivery === "attachment") {
           phase = "verify_recipient";
@@ -214,18 +245,6 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           }
           recipientKey = recipientRecord!.recipientKey;
           recipientAgentName = verification.identity.agentName;
-          if (recipientRecord!.kind === "agy") {
-            recipientAttachmentDirectory = recipientRecord!.attachmentDirectory;
-            let currentDirectory: string | undefined;
-            try {
-              currentDirectory = deps.attachments.recipientDirectory(recipientKey);
-            } catch {
-              // Report every store/key disagreement as an unavailable capability.
-            }
-            if (currentDirectory !== recipientAttachmentDirectory) {
-              throw Object.assign(new Error("Attachment target directory is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: "recipient attachment directory does not match the current store" } });
-            }
-          }
         }
         phase = "pre_state";
         if (params.operation !== "keys") {
@@ -234,48 +253,67 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
         before = paneFrom(preEnvelope.result, target.paneId!);
         const beforeState = assertSendableState(before);
-        if (legacyParams.operation === "prompt" && beforeState === "working") {
-          throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: target.paneId, state: beforeState } });
-        }
+        if (legacyParams.operation === "prompt") assertPromptState(before, beforeState);
         if (params.operation !== "keys") {
-          promptIdentity = requirePromptTargetIdentity([
+          const preIdentityRecords = [
             ...snapshotIdentityRecords(snapshot, target.paneId!),
             agentFrom(preAgentEnvelope!.result),
             before
-          ], target.paneId!);
+          ];
+          assertQualifiedPromptTarget(preIdentityRecords, target.paneId!);
+          promptIdentity = requirePromptTargetIdentity(preIdentityRecords, target.paneId!);
         }
 
         if (legacyParams.operation === "keys") {
           phase = "send";
           keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...legacyParams.keys], activeSignal);
         } else {
-          route = legacyParams.operation === "steer" ? "steer_direct" : "prompt_direct";
+          const verifyFreshPromptTarget = async (): Promise<{ identity: PromptTargetIdentity; pane: Record<string, unknown> }> => {
+            phase = "pre_state";
+            const finalAgentEnvelope = await deps.cli.runJson(["agent", "get", target.paneId!], activeSignal);
+            const finalEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
+            const finalPane = paneFrom(finalEnvelope.result, target.paneId!);
+            const finalState = assertSendableState(finalPane);
+            if (legacyParams.operation === "prompt") assertPromptState(finalPane, finalState);
+            const finalIdentityRecords = [
+              ...snapshotIdentityRecords(snapshot, target.paneId!),
+              agentFrom(finalAgentEnvelope.result),
+              finalPane
+            ];
+            assertQualifiedPromptTarget(finalIdentityRecords, target.paneId!);
+            const identity = requirePromptTargetIdentity(finalIdentityRecords, target.paneId!);
+            return { identity, pane: finalPane };
+          };
+          // Check the fresh occupant before attachment publication as well as
+          // immediately before the prompt. This keeps an AGY replacement from
+          // receiving a published body while still retaining any race evidence.
+          promptIdentity = (await verifyFreshPromptTarget()).identity;
           if (delivery === "attachment") {
             phase = "publish";
             published = await deps.attachments!.publish({
               body: legacyParams.text,
               recipientKey: recipientKey!,
-              ...(recipientAttachmentDirectory ? { expectedRecipientDirectory: recipientAttachmentDirectory } : {}),
               recipientPaneId: target.paneId,
               recipientAgentName,
               senderPaneId: sender!.paneId,
               senderDisplay: sender!.display,
               operation: legacyParams.operation
             });
-            if (recipientAttachmentDirectory && !publishedAttachmentMatchesDirectory(published, recipientAttachmentDirectory)) {
-              throw Object.assign(new Error("Published attachment directory is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: "published attachment does not match the registered recipient directory" } });
-            }
+            promptIdentity = (await verifyFreshPromptTarget()).identity;
           }
+          phase = "send";
           const envelope = delivery === "attachment"
             ? buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "attachment", { ...published!, encoding: "utf-8" })
             : buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "inline");
-          const promptArgs = ["agent", "prompt", target.paneId!, "--stdin"];
-          phase = "send";
-          // The stdin command is a completed mutation once its response arrives.
-          // Preserve that response if the caller aborts in the same turn; only
-          // the later observation is optional after acknowledgement parsing.
-          prompt = await deps.cli.runJsonWithStdin(promptArgs, envelope, activeSignal, true);
-          submission = parsePromptSubmission(prompt, promptIdentity!);
+          prompt = await deps.cli.prompt(target.paneId!, envelope, activeSignal);
+          const requestId = prompt.id;
+          try {
+            submission = parsePromptSubmission(prompt, promptIdentity!);
+          } catch (error) {
+            promptDispatch = { state: "unknown", requestId };
+            throw error;
+          }
+          promptDispatch = { state: "acknowledged", requestId };
         }
 
         phase = "post_state";
@@ -321,7 +359,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           observation = unavailablePromptObservation(error);
         }
       } catch (error) {
-        throw withDeliveryFailureEvidence(error, { delivery, route, phase, published });
+        throw withDeliveryFailureEvidence(error, { delivery, route, phase, published, promptDispatch });
       }
 
       const details: CommunicateDetails = {
@@ -334,6 +372,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         preState: compactPane(before),
         ...(after ? { postState: compactPane(after) } : {}),
         ...(submission ? { submission: compactPromptSubmission(submission) } : {}),
+        ...(promptDispatch ? { promptDispatch } : {}),
         ...(observation ? { observation } : {}),
         operationIds: {
           snapshot: snapshotOperationId!,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assertSubscriptionAck,
+  encodeSocketRequest,
   isPaneRecordEvent,
   parseAgentSession,
   parsePaneRecord,
@@ -26,6 +27,18 @@ const pane = {
 };
 
 describe("supervision socket protocol", () => {
+  it("encodes bounded request frames without accepting control fields or oversized complete frames", () => {
+    const frame = encodeSocketRequest("request-1", "agent.prompt", { target: "w1:p1", text: "hello" });
+    expect(JSON.parse(frame)).toEqual({ id: "request-1", method: "agent.prompt", params: { target: "w1:p1", text: "hello" } });
+    expect(Buffer.byteLength(frame, "utf8")).toBeLessThanOrEqual(SUPERVISION_MAX_LINE_BYTES);
+    expect(() => encodeSocketRequest("request\n1", "ping", {})).toThrow(SupervisionProtocolError);
+    expect(() => encodeSocketRequest("request-1", "ping", null as never)).toThrow(/params are malformed/u);
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(() => encodeSocketRequest("request-1", "ping", circular)).toThrow(/not serializable/u);
+    expect(() => encodeSocketRequest("request-1", "agent.prompt", { text: "x".repeat(SUPERVISION_MAX_LINE_BYTES) })).toThrow(/accepted bound/u);
+  });
+
   it("publishes exactly the fixed global subscription set", () => {
     expect(subscribeParams()).toEqual({ subscriptions: SUPERVISION_SUBSCRIPTIONS.map((type) => ({ type })) });
     expect(SUPERVISION_SUBSCRIPTIONS).not.toContain("pane.agent_status_changed");
@@ -47,6 +60,7 @@ describe("supervision socket protocol", () => {
       [JSON.stringify({ id: "1" }), "neither result nor error"],
       [JSON.stringify({ id: "1", error: "nope" }), "error is malformed"],
       [JSON.stringify({ id: "1", error: { code: 1, message: "m" } }), "usable identifier"],
+      [JSON.stringify({ id: "1", result: {}, error: { code: "bad", message: "m" } }), "both result and error"],
       [JSON.stringify({ other: 1 }), "neither a reply nor an event"],
       [JSON.stringify({ event: "pane_updated", data: [] }), "event data is malformed"],
     ];

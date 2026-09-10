@@ -172,6 +172,25 @@ describe("large message limits and recipient capabilities", () => {
     expect((withDeliveryFailureEvidence(untyped, { phase: "publish" }) as typeof untyped).details).toEqual({ phase: "publish" });
     const arrayDetails = Object.assign(new Error("array details"), { details: ["ignored"] });
     expect((withDeliveryFailureEvidence(arrayDetails, { delivery: "inline" }) as typeof arrayDetails).details).toEqual({ delivery: "inline" });
+
+    const unsafeDispatch = Object.assign(new Error("transport text"), { details: { promptDispatch: { state: "unknown", requestId: "request-1", body: "secret prompt" } } });
+    const safeDispatch = withDeliveryFailureEvidence(unsafeDispatch, {}) as typeof unsafeDispatch;
+    expect(safeDispatch.details).toEqual({ promptDispatch: { state: "unknown", requestId: "request-1" } });
+    expect(JSON.stringify(safeDispatch.details)).not.toContain("secret prompt");
+
+    for (const promptDispatch of [
+      { state: "invalid" },
+      { state: "acknowledged" },
+      { state: "rejected", requestId: "" },
+      { state: "unknown", requestId: "x".repeat(257) },
+      { state: "not_written", requestId: "bad\nrequest" }
+    ]) {
+      const failure = Object.assign(new Error("dispatch"), { details: { promptDispatch } });
+      const expected = ["not_written", "rejected", "acknowledged", "unknown"].includes(promptDispatch.state)
+        ? { promptDispatch: { state: promptDispatch.state } }
+        : {};
+      expect((withDeliveryFailureEvidence(failure, {}) as typeof failure).details).toEqual(expected);
+    }
   });
 });
 

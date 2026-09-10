@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HerdrCli } from "./src/cli.js";
+import { createAgentPromptClient, type AgentPromptClient } from "./src/agent-prompt.js";
 import { createPreflight, createToolSurface, readInjectedContext } from "./src/tool-surface.js";
-import type { StdinExec } from "./src/exec-stdin.js";
 import { defaultAttachmentStore, type AttachmentStore } from "./src/messages/store.js";
 import { RecipientRegistry } from "./src/messages/recipients.js";
 import { boundedText, JobRegistry, type JobDetail } from "./src/job-registry.js";
@@ -96,12 +96,12 @@ export function notificationForJob(detail: JobDetail): { content: string; detail
 }
 
 export interface RuntimeOptions {
-  stdinExecutor?: StdinExec;
+  promptClient?: AgentPromptClient;
   attachments?: AttachmentStore;
   recipients?: RecipientRegistry;
 }
 
-export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<ExtensionAPI, "sendMessage">> & { execStdin?: StdinExec }, env: NodeJS.ProcessEnv = process.env, options: RuntimeOptions = {}): ExtensionRuntime {
+export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<ExtensionAPI, "sendMessage">>, env: NodeJS.ProcessEnv = process.env, options: RuntimeOptions = {}): ExtensionRuntime {
   const injected = readInjectedContext(env);
   const uiRef: { current?: WaitJobsUi } = {};
   const jobs = new JobRegistry({
@@ -118,7 +118,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   });
   const waitJobsUi = new WaitJobsUi(jobs);
   uiRef.current = waitJobsUi;
-  const cli = new HerdrCli(pi.exec.bind(pi), 10_000, 50_000, options.stdinExecutor ?? pi.execStdin);
+  const cli = new HerdrCli(pi.exec.bind(pi), 10_000, 50_000, options.promptClient ?? createAgentPromptClient({ env }));
   // The Pi host only learns its model registry once a session context exists, so
   // the supervision reviewer resolves through this holder rather than a
   // construction-time value.
@@ -160,6 +160,7 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     runtime.waitJobsUi.endSession();
+    runtime.cli.closePromptTransport();
     runtime.supervision.shutdown();
     runtime.jobs.shutdown();
     runtime.recipients.reset();

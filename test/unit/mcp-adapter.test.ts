@@ -156,6 +156,8 @@ describe("MCP published schema parity", () => {
       ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi" }, true],
       ["herdr_communicate", { target: "w:p2", operation: "cancel" }, true],
       ["herdr_communicate", { target: "w:p2", operation: "interrupt" }, true],
+      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["escape"] }, true],
+      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["not-a-supported-key"] }, false],
       ["herdr_communicate", { target: "w:p2", operation: "cancel", extra: true }, false],
       ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi", keys: ["enter"] }, false],
       ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["enter"], text: "hi" }, false],
@@ -479,6 +481,77 @@ describe("MCP error mapping", () => {
     const text = outcome.content.map((block) => block.text).join("\n");
     for (const secret of secrets) expect(text).not.toContain(secret);
     expect(Buffer.byteLength(JSON.stringify(diagnostic), "utf8")).toBeLessThan(8_192);
+  });
+
+  it("retains only verified launch recovery handles when projecting an unknown prompt", () => {
+    const diagnostic = {
+      code: "LAUNCH_FAILED",
+      phase: "prompt_verification",
+      created: { paneId: "w:p2" },
+      paneId: "w:p2",
+      supervisorJobId: "job_supervisor_2",
+      assignmentState: "unconfirmed",
+      agentStarted: true,
+      promptSubmitted: false,
+      recipientRegistered: false,
+      effectCertainty: "unknown",
+      recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
+    };
+    const attachment = { attachmentId: "attachment-1", path: "/cache/recipient/attachment-1/body.txt", bytes: 17, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w:p2" };
+    const outcome = errorOutcome(
+      "LAUNCH_FAILED",
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`,
+      {
+        paneId: "w:p2",
+        supervisorJobId: "job_supervisor_2",
+        promptDispatch: { state: "unknown", requestId: "request-17" },
+        attachmentRetained: true,
+        attachment,
+        causeMessage: "private prompt body",
+        recipientGrant: { path: "/cache/recipient" }
+      },
+      "herdr_launch"
+    );
+    expect(payload(outcome).details).toEqual({
+      tool: "herdr_launch",
+      diagnostic,
+      paneId: "w:p2",
+      supervisorJobId: "job_supervisor_2",
+      promptDispatch: { state: "unknown", requestId: "request-17" },
+      attachmentRetained: true,
+      attachment
+    });
+    expect(outcome.content[0]!.text).not.toContain("private prompt body");
+    expect(outcome.content[0]!.text).not.toContain("recipientGrant");
+  });
+
+  it("omits absent optional launch recovery identifiers", () => {
+    const diagnostic = {
+      code: "LAUNCH_FAILED",
+      phase: "prompt_verification",
+      created: { paneId: "w:p2" },
+      agentStarted: true,
+      promptSubmitted: true,
+      recipientRegistered: false,
+      effectCertainty: "unknown",
+      recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
+    };
+    const attachment = { attachmentId: "attachment-1", path: "/cache/body.txt", bytes: 1, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" };
+    const outcome = errorOutcome(
+      "LAUNCH_FAILED",
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`,
+      { promptDispatch: { state: "acknowledged" }, attachmentRetained: true, attachment },
+      "herdr_launch"
+    );
+    expect(payload(outcome).details).toEqual({ tool: "herdr_launch", diagnostic, promptDispatch: { state: "acknowledged" }, attachmentRetained: true, attachment });
+
+    const invalidAttachment = errorOutcome(
+      "LAUNCH_FAILED",
+      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`,
+      { attachment: { ...attachment, bytes: 0 } },
+      "herdr_launch"
+    );
+    expect(payload(invalidAttachment).details).toEqual({ tool: "herdr_launch", diagnostic });
   });
 
   it("rejects malformed launch diagnostics instead of publishing arbitrary attached data", () => {

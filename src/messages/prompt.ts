@@ -317,12 +317,20 @@ function promptProtocolError(message: string, details: Record<string, unknown> =
 }
 
 /**
- * A successful stdin command is only a delivery acknowledgement when Herdr returns
- * its typed prompt envelope and the returned process identity is exactly the one
- * captured before submission. No terminal text or sender-authored body is retained.
+ * A successful prompt request is only a delivery acknowledgement when Herdr
+ * returns its typed prompt envelope and the returned process identity is exactly
+ * the one captured before submission. The socket owns request correlation; this
+ * parser retains the actual correlated ID rather than inventing a CLI operation
+ * ID. No terminal text or sender-authored body is retained.
  */
-export function parsePromptSubmission(response: JsonEnvelope, expected: PromptSubmissionExpectation): PromptSubmissionEvidence {
-  if (response.id !== "cli:agent:prompt" || !record(response.result) || response.result.type !== "agent_prompted" || !record(response.result.agent)) {
+export function parsePromptSubmission(response: JsonEnvelope, expected: PromptSubmissionExpectation, expectedRequestId?: string): PromptSubmissionEvidence {
+  if (typeof response.id !== "string"
+    || response.id.length === 0
+    || /[\0\r\n]/u.test(response.id)
+    || (expectedRequestId !== undefined && response.id !== expectedRequestId)
+    || !record(response.result)
+    || response.result.type !== "agent_prompted"
+    || !record(response.result.agent)) {
     promptProtocolError("Herdr prompt acknowledgement is incompatible");
   }
   const agent = response.result.agent;

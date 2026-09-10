@@ -396,8 +396,8 @@ describe("profile catalog", () => {
       if (argv[0] === "agent" && argv[1] === "get") return { id: "agent-get", result: { agent: { name: lastName, pane_id: "w:p2", agent: "pi", ...identity, ...lifecycle(prompted ? 1 : 0) } } };
       if (argv[0] === "pane" && argv[1] === "get") return { id: "get", result: { pane: { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", agent_name: lastName, agent: "pi", ...identity, ...lifecycle(prompted ? 1 : 0) } } };
       throw new Error(`unexpected ${argv.join(" ")}`);
-    }, runJsonWithStdin: async (argv: string[]) => {
-      calls.push(argv);
+    }, prompt: async () => {
+      calls.push(["agent", "prompt", "w:p2"]);
       // The acknowledgement reports the pre-advance baseline; only the reads
       // after it advance, which is what the confirmation loop looks for.
       const acknowledgement = { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { name: lastName, pane_id: "w:p2", agent: "pi", ...identity, ...lifecycle(0), screen_detection_skipped: true } } };
@@ -819,7 +819,13 @@ describe("profile catalog", () => {
   });
 
   it("keeps profile launch and renderer failures explicit", async () => {
-    const launchTool = createLaunchTool({ cli: noCli as never, context: {}, profiles: undefined });
+    const launchTool = createLaunchToolImplementation({
+      cli: { ...noCli, prompt: async () => { throw new Error("prompt must not be called"); } } as never,
+      context: {},
+      profiles: undefined,
+      preflight: testPreflight,
+      supervision: stubSupervision()
+    });
     await expect(launchTool.execute("id", { name: "worker", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
     const rendered = launchTool.renderCall?.({ name: "worker", profile: "worker" } as never, {} as never, {} as never);
     expect(rendered?.render(80)).toEqual(["herdr_launch · worker · inline · worker"]);

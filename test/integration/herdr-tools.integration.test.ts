@@ -566,14 +566,16 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
     const profiles = await tool("herdr_inspect").execute("profiles", { mode: "collection", collection: "profiles" }, signal(), undefined, toolContext());
     const profileItems = resultObject(profiles.details).items;
-    expect(Array.isArray(profileItems) ? profileItems : []).toHaveLength(17);
+    expect(Array.isArray(profileItems) ? profileItems : []).toHaveLength(19);
     expect(profileItems).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-6-astra", thinking: "low", tools: expect.arrayContaining(["herdr_tab"]), skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow")]) }),
       expect.objectContaining({ name: "manager-claude", kind: "claude", model: "fable", effort: "high", permissionMode: "default", fallbackProfiles: [] }),
       expect.objectContaining({ name: "promoter-pi", kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max", fallbackProfiles: ["promoter-claude"] }),
       expect.objectContaining({ name: "scout-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["scout-claude"] }),
       expect.objectContaining({ name: "worker-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["worker-claude"] }),
-      expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-claude"] })
+      expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-claude"] }),
+      expect.objectContaining({ name: "worker-devin", kind: "devin", model: "swe-2-max", permissionMode: "dangerous", fallbackProfiles: ["worker-agy"] }),
+      expect.objectContaining({ name: "reviewer-devin", kind: "devin", model: "swe-2-max", permissionMode: "dangerous", fallbackProfiles: ["reviewer-pi"] })
     ]));
     const manager = await tool("herdr_inspect").execute("manager", { mode: "profile", profile: "manager-pi" }, signal(), undefined, toolContext());
     expect(resultObject(manager.details).profile).toMatchObject({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-6-astra", thinking: "low", tools: ["read", "grep", "find", "ls", "edit", "write", "ask_user_question", "mcp", "executor_execute", "executor_skills", "executor_resume", "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab", "change_reasoning", "exec_command", "write_stdin", "apply_patch", "exec", "wait", "notebook", "view_image", "new_context", "get_context_remaining", "history", "notes"], extensions: [], skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow"), expect.stringContaining("herdr-profiles/profile-plugins/executor/skills/executor")]), fallbackProfiles: [] });

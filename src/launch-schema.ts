@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type ThinkingLevel } from "./profiles/types.js";
+import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, DEVIN_PERMISSION_MODES, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type DevinPermissionMode, type ThinkingLevel } from "./profiles/types.js";
 import { type MessageDelivery } from "./messages/limits.js";
 
 const AgentName = Type.String({ minLength: 1, maxLength: 32, pattern: "^[a-z][a-z0-9_-]{0,31}$" });
@@ -24,7 +24,7 @@ export const ProfileLaunchOverridesSchema = Type.Object({
   thinking: Type.Optional(StringEnum(THINKING_LEVELS)),
   effort: Type.Optional(StringEnum(CLAUDE_EFFORTS)),
   tools: Type.Optional(ProfileValues),
-  permissionMode: Type.Optional(StringEnum(CLAUDE_PERMISSION_MODES)),
+  permissionMode: Type.Optional(StringEnum([...CLAUDE_PERMISSION_MODES, ...DEVIN_PERMISSION_MODES])),
   allowedTools: Type.Optional(ProfileValues),
   disallowedTools: Type.Optional(ProfileValues),
   addDirs: Type.Optional(ProfileValues)
@@ -79,7 +79,7 @@ export interface ProfileLaunchOverrides {
   thinking?: ThinkingLevel;
   effort?: ClaudeEffort;
   tools?: string[];
-  permissionMode?: ClaudePermissionMode;
+  permissionMode?: ClaudePermissionMode | DevinPermissionMode;
   allowedTools?: string[];
   disallowedTools?: string[];
   addDirs?: string[];

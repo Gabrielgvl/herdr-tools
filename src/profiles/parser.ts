@@ -4,6 +4,7 @@ import {
   AGY_MODES,
   CLAUDE_EFFORTS,
   CLAUDE_PERMISSION_MODES,
+  DEVIN_PERMISSION_MODES,
   MAX_PROFILE_BODY_BYTES,
   MAX_PROFILE_BYTES,
   PROFILE_KINDS,
@@ -11,6 +12,7 @@ import {
   type AgyMode,
   type ClaudeEffort,
   type ClaudePermissionMode,
+  type DevinPermissionMode,
   type ProfileKind,
   type Profile,
   type ProfileSource,
@@ -87,7 +89,7 @@ function resourcePaths(value: unknown, field: string, scopeRoot: string): string
 
 function parseRuntime(value: unknown, scopeRoot: string): RuntimeProfile {
   if (!record(value)) fail("runtime must be an object");
-  if (!PROFILE_KINDS.includes(value.kind as ProfileKind)) fail("runtime.kind must be pi, claude, or agy");
+  if (!PROFILE_KINDS.includes(value.kind as ProfileKind)) fail("runtime.kind must be pi, claude, agy, or devin");
   if (value.kind === "pi") {
     exactKeys(value, ["kind", "model", "thinking", "tools", "extensions", "skills"], "runtime");
     if (!THINKING_LEVELS.includes(value.thinking as ThinkingLevel)) fail("runtime.thinking is invalid");
@@ -97,6 +99,12 @@ function parseRuntime(value: unknown, scopeRoot: string): RuntimeProfile {
     exactKeys(value, ["kind", "model", "mode", "addDirs"], "runtime");
     if (!AGY_MODES.includes(value.mode as AgyMode)) fail("runtime.mode is invalid");
     return { kind: "agy", model: stringField(value.model, "runtime.model"), mode: value.mode as AgyMode, addDirs: resourcePaths(value.addDirs, "runtime.addDirs", scopeRoot) };
+  }
+  if (value.kind === "devin") {
+    exactKeys(value, ["kind", "model", "permissionMode"], "runtime");
+    const mode = value.permissionMode ?? "normal";
+    if (!DEVIN_PERMISSION_MODES.includes(mode as DevinPermissionMode)) fail("runtime.permissionMode is invalid");
+    return { kind: "devin", model: stringField(value.model, "runtime.model"), permissionMode: mode as DevinPermissionMode };
   }
   exactKeys(value, ["kind", "model", "effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs", "developmentChannels"], "runtime");
   if (!CLAUDE_EFFORTS.includes(value.effort as ClaudeEffort)) fail("runtime.effort is invalid");
@@ -172,6 +180,7 @@ export function parseProfile(text: string, source: ProfileSource): Profile {
   const runtime = parseRuntime(values.runtime, source.scopeRoot);
   if (runtime.kind === "claude" && values.sessionPersistence === false) fail("Claude profiles must set sessionPersistence to true for interactive launches");
   if (runtime.kind === "agy" && values.sessionPersistence === false) fail("AGY profiles must set sessionPersistence to true for interactive launches");
+  if (runtime.kind === "devin" && values.sessionPersistence === false) fail("Devin profiles must set sessionPersistence to true for interactive launches");
   return { name, description: stringField(values.description, "description"), timeoutMinutes: values.timeoutMinutes as number, sessionPersistence: values.sessionPersistence, runtime, fallbackProfiles, body, source };
 }
 

@@ -311,14 +311,15 @@ export async function resolveCanonicalSourceTree(record: SkillBundleRecord, regi
 function scopedResourcePaths(runtime: RuntimeProfile): string[] {
   if (runtime.kind === "pi") return [...runtime.extensions, ...runtime.skills];
   if (runtime.kind === "claude") return [...runtime.addDirs, ...runtime.pluginDirs];
-  return [...runtime.addDirs];
+  if (runtime.kind === "agy") return [...runtime.addDirs];
+  return [];
 }
 
 /**
  * The skill trees a runtime actually loads. Pi receives an exact allowlist of
  * skill directories; Claude receives selected plugin directories additively.
- * AGY has no per-session selector, so it contributes none and Herdr never
- * mutates global or project skill state to compensate.
+ * AGY and Devin have no per-session selector, so they contribute none and
+ * Herdr never mutates global or project skill state to compensate.
  */
 function selectedSkillTrees(runtime: RuntimeProfile): string[] {
   if (runtime.kind === "pi") return [...runtime.skills];

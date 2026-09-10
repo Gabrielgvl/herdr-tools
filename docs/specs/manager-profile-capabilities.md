@@ -16,7 +16,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 - Both manager profiles orchestrate visible workers and may use Edit/Write only for an exact assignment-supplied handoff or coordination path. Both managers now hold a shell capability -- Claude through `Bash`, Pi through the Codex adapter's `exec_command`/`write_stdin` -- and both require direct owner approval for shell and control-plane actions. Neither manager may perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation.
 - Use role-scoped tool allowlists while retaining installed extension discovery.
 - Configure role-specific skills.
-- Advisory defaults are manager-pi for generic management, worker-pi for implementation, planner-claude first with planner-pi fallback for planning, scout-agy for reconnaissance, researcher-agy for research, and reviewer-pi for review. The exact chains are `scout-agy -> scout-claude -> scout-pi`, `researcher-agy -> researcher-claude -> researcher-pi`, and `worker-pi -> worker-agy -> worker-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.
+- Advisory defaults are manager-pi for generic management, worker-devin for implementation, planner-claude first with planner-pi fallback for planning, scout-agy for reconnaissance, researcher-agy for research, and reviewer-devin for review. The exact chains are `scout-agy -> scout-claude -> scout-pi`, `researcher-agy -> researcher-claude -> researcher-pi`, `worker-devin -> worker-agy -> worker-claude`, and `reviewer-devin -> reviewer-pi -> reviewer-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.
 
 ## Assumptions
 
@@ -106,6 +106,8 @@ Common extension-backed navigation tools are selected by name but still supplied
 | `scout-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ffgrep`, `fffind`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write` |
 | `planner-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content` |
 | `worker-pi` | Planner set plus `bash_bg`, `jobs`, `job_decide`, `monitor` |
+| `worker-devin` | Devin runtime with `dangerous` permission mode; no per-session tool or skill selector |
+| `reviewer-devin` | Devin runtime with `dangerous` permission mode; read-only reviewer by assignment |
 | `reviewer-pi` | Planner set |
 | `researcher-pi` | Planner set |
 | `promoter-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write`; exact reviewed commit and gated delivery scope only |
@@ -134,7 +136,11 @@ Every Pi and Claude profile receives edit/write so it can persist an assignment-
 
 `scout-agy` and `researcher-agy` use `gemini-3.8-flash-low`, persistent sessions, fixed `plan` mode, and `--dangerously-skip-permissions`; `worker-agy` uses `gemini-3.8-flash-high` with the same bypass and fixed `accept-edits` mode. Only model and scope-normalized `addDirs` may be overridden; mode is fixed per profile. AGY profile bodies are catalog metadata. Every launch requires one visible, provenance-wrapped, self-contained typed `assignment` of exactly `objective`, `scope`, and `verification`; AGY discovers repository `AGENTS.md` natively. Because worker accept-edits plus the bypass can auto-approve mutations, manager assignments must bound scope and required tests.
 
-AGY initially publishes provisional pane, terminal, name, and kind supervision because its native session may appear only after the first prompt. The launch strengthens to exact native-session supervision before reporting success or registering recipient and attachment capability. A failure after possible prompt effect leaves the provisional child and recovery evidence visible, with no retry, fallback, cleanup, reservation release, or recipient registration. This reduced-assurance window is accepted for AGY only. Pi and Claude still require complete native-session identity before assignment.
+AGY initially publishes provisional pane, terminal, name, and kind supervision because its native session may appear only after the first prompt. The launch strengthens to exact native-session supervision before reporting success or registering recipient and attachment capability. A failure after possible prompt effect leaves the provisional child and recovery evidence visible, with no retry, fallback, cleanup, reservation release, or recipient registration. This reduced-assurance window is accepted for AGY only. Pi, Claude, and Devin still require complete native-session identity before assignment.
+
+### Devin role profiles
+
+`worker-devin` is the implementation default. It launches Devin with `--model swe-2-max --permission-mode dangerous` and falls back to `worker-agy`, yielding exactly `worker-devin -> worker-agy -> worker-claude`; `worker-pi` remains selectable when the owner requests the Pi runtime explicitly. `reviewer-devin` is the review default with the same Devin runtime and `reviewer-devin -> reviewer-pi -> reviewer-claude`; its assignment and profile body are explicitly read-only, and it never approves or promotes its own work. Reasoning depth rides on the selected model tier because the Devin CLI exposes no effort flag, and sessions always persist. Only `model` and `permissionMode` may be overridden; `permissionMode` accepts the canonical `normal`, `accept-edits`, `smart`, and `dangerous` values (`autonomous` is not expressible because it requires `--sandbox`). Devin profile bodies are catalog metadata, so every launch requires the same visible, provenance-wrapped, self-contained typed `assignment` as AGY. `dangerous` auto-approves every tool call, so manager assignments must bound scope and required tests. Devin reports its native session through the installed `herdr:devin` hook at session start, so it binds under the strict exact-identity path rather than AGY's provisional one.
 
 ### Claude profiles
 
@@ -250,13 +256,13 @@ Checkpoint: load the catalog and build argv for the manager plus one Pi/Claude p
 - Keep models, reasoning, timeouts, persistence, and existing fallback direction unchanged.
 - Include `herdr_tab` in the manager set and the four approved background-job tools in `worker-pi`.
 
-Checkpoint: catalog resolution has 17 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
+Checkpoint: catalog resolution has 19 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
 
 ### 3. Enforce contracts in tests
 
 - Extend `test/unit/profile-catalog.test.ts` with an exact capability matrix and role-resource existence checks.
 - Add representative `buildProfileArgv` assertions for manager, worker, read-only Pi, and Claude profiles.
-- Update `test/integration/herdr-tools.integration.test.ts` to inspect 17 profiles, inspect manager/promoter profiles plus the AGY role profiles, and verify exact worker and AGY launch arguments without changing provenance or topology assertions.
+- Update `test/integration/herdr-tools.integration.test.ts` to inspect 19 profiles, inspect manager/promoter profiles plus the AGY role profiles, and verify exact worker and AGY launch arguments without changing provenance or topology assertions.
 - Add identity-bound prompt acknowledgement and optional post-dispatch observation in `src/tools/launch.ts`: accept partial Herdr protocol 22 `agent_started` identity, then run one bounded read-only snapshot + `agent get` + pane preflight sample at a time before submission. Join each sample only with start-supplied fields; never merge missing components across samples, and fail immediately on supplied contradictions. After one sample yields the exact pane/terminal/name/kind and complete `agent_session`, submit exactly once through `agent prompt --stdin` and require the typed `agent_prompted` response to match that captured identity, `interactive_ready:true`, and safe revision. Abort/timeout stops before stdin and recipient registration with bounded evidence. Persist that identity for attachments, report working/skipped/stale/unavailable observation without waiting, retrying, runtime hooks, fallback, or sending Enter, and omit replacement post-state from authoritative details and success rows.
 - Cover accepted idle/screen-detection-skipped launches, stale/unavailable observation, malformed/mismatched acknowledgements, and the no-duplicate/no-key boundary in `test/unit/launch.test.ts`.
 - Do not weaken strict parser, inspection-budget, discovery, or fallback tests.

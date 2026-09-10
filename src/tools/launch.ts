@@ -15,7 +15,7 @@ import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { LAUNCH_ASSIGNMENT_FIELDS, LaunchParamsSchema, renderAssignment, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, refreshBundledProfileResourceSelection, RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
-import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
+import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, DEVIN_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
@@ -352,7 +352,7 @@ function validateParams(params: LaunchRequest): void {
     if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
     if (params.overrides.thinking !== undefined && (typeof params.overrides.thinking !== "string" || !THINKING_LEVELS.includes(params.overrides.thinking as typeof THINKING_LEVELS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.thinking is invalid");
     if (params.overrides.effort !== undefined && (typeof params.overrides.effort !== "string" || !CLAUDE_EFFORTS.includes(params.overrides.effort as typeof CLAUDE_EFFORTS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.effort is invalid");
-    if (params.overrides.permissionMode !== undefined && (typeof params.overrides.permissionMode !== "string" || !CLAUDE_PERMISSION_MODES.includes(params.overrides.permissionMode as typeof CLAUDE_PERMISSION_MODES[number]))) throw new LaunchError("INVALID_INPUT", "overrides.permissionMode is invalid");
+    if (params.overrides.permissionMode !== undefined && (typeof params.overrides.permissionMode !== "string" || (!CLAUDE_PERMISSION_MODES.includes(params.overrides.permissionMode as typeof CLAUDE_PERMISSION_MODES[number]) && !DEVIN_PERMISSION_MODES.includes(params.overrides.permissionMode as typeof DEVIN_PERMISSION_MODES[number])))) throw new LaunchError("INVALID_INPUT", "overrides.permissionMode is invalid");
     for (const key of ["tools", "allowedTools", "disallowedTools", "addDirs"] as const) {
       const value = params.overrides[key];
       if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0 || /[\0\r\n]/.test(item)))) throw new LaunchError("INVALID_INPUT", `overrides.${key} must be non-empty strings without NUL or newlines`);
@@ -714,9 +714,15 @@ function startFailureEvidence(error: unknown): { code: string; message: string }
   return { ...envelope.error };
 }
 
-type QualifiedRuntime = Extract<RuntimeProfile, { kind: "pi" }>;
+type QualifiedRuntime = Extract<RuntimeProfile, { kind: "pi" | "devin" }>;
 
 function effectiveDetails(profile: Profile, runtime: QualifiedRuntime): { runtime: Record<string, unknown>; permissions: Record<string, unknown> } {
+  if (runtime.kind === "devin") {
+    return {
+      runtime: { kind: "devin", model: runtime.model, permissionMode: runtime.permissionMode },
+      permissions: { sessionPersistence: profile.sessionPersistence }
+    };
+  }
   return {
     runtime: { kind: "pi", model: runtime.model, thinking: runtime.thinking },
     permissions: { sessionPersistence: profile.sessionPersistence, tools: [...runtime.tools], extensions: [...runtime.extensions], skills: [...runtime.skills] }
@@ -1571,7 +1577,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
   return {
     name: "herdr_launch",
     label: "Herdr Launch",
-    description: "Launch a named Pi Herdr agent from a strict profile in an explicitly selected pane placement; Claude and AGY launches are not qualified.",
+    description: "Launch a named Pi or Devin Herdr agent from a strict profile in an explicitly selected pane placement; Claude and AGY launches are not qualified.",
     parameters: LaunchParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, ctx) {
       const params = rawParams as unknown as LaunchRequest;
@@ -1660,9 +1666,12 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           }
           profiles.push(profile);
         }
-        // Every allowed reachable fallback profile is checked before the first
-        // launch effect. Bundled canonical edits are materialized here; unsafe
-        // trees and edited generated copies still fail before any effect.
+        // Devin's mandatory self-contained assignment is the initial prompt.
+        // The typed assignment is required for every launch, so no profile in
+        // the chain can ever be started without one. Every allowed reachable
+        // fallback profile is checked before the first launch effect. Bundled
+        // canonical edits are materialized here; unsafe trees and edited
+        // generated copies still fail before any effect.
         for (const profile of profiles) {
           const overrides = profile.name === params.profile ? params.overrides : {};
           const runtime = resolveProfileRuntime(profile, overrides);
@@ -1682,8 +1691,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           if (initialPromptDelivery === "attachment" && !capability.capable) {
             throw new LaunchError("ATTACHMENT_TARGET_UNVERIFIED", "Profile cannot read a local attachment", { profile: profile.name, reason: capability.reason });
           }
-          const promptPath = (await promptStore.create(profile.body)).path;
-          promptPaths.set(profile.name, promptPath);
+          const promptPath = runtime.kind === "agy" || runtime.kind === "devin" ? undefined : (await promptStore.create(profile.body)).path;
+          if (promptPath !== undefined) promptPaths.set(profile.name, promptPath);
           buildRuntimeArgv(profile, runtime, promptPath, grant.path);
         }
         const effective = await contextResolver(abortSignal);

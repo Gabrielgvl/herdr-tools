@@ -28,18 +28,18 @@ Do not use for a localized change that one bounded worker can implement and veri
 
 ## Profile Routing
 
-Pi is primary:
+Pi is primary, except that Devin is the implementation and critic default:
 
 - manager: `manager-pi`; use `manager-claude` only when selected explicitly or for a deliberate manager handoff;
 - explore: `scout-pi`, plus `researcher-pi` only when external facts are required;
 - plan: `planner-pi`;
-- work: `worker-pi`;
-- critic: `reviewer-pi`;
+- work: `worker-devin`;
+- critic: `reviewer-devin`;
 - promote: `promoter-pi`.
 
 Use each profile's declared fallback chain. Never hardcode provider or model IDs here. For prewalk, choose the highest-capability approved profile configuration for planning and the first genuinely novel DAG node; once that node establishes a pattern, use the default worker profile for later nodes.
 
-AGY receives only self-contained, provenance-wrapped phase assignments. Do not assume profile Markdown or this skill reaches AGY.
+AGY and Devin receive only self-contained, provenance-wrapped phase assignments. Do not assume profile Markdown or this skill reaches AGY or Devin.
 
 ## Lean Gate
 
@@ -80,7 +80,7 @@ Use `pi-review plan` when the plan has material architectural risk or uncertaint
 
 ### 3. Work
 
-Launch one fresh `worker-pi` per ready DAG node. Supply the complete node, relevant evidence, current repository state, and exact gate; never make the worker rediscover the whole plan.
+Launch one fresh `worker-devin` per ready DAG node. Supply the complete node, relevant evidence, current repository state, and exact gate; never make the worker rediscover the whole plan.
 
 Run writers sequentially by default. Parallel writers require independent DAG nodes and isolated Git worktrees. Never run two writers in one checkout.
 
@@ -88,7 +88,7 @@ A worker is complete only when its gate passes and it reports changed paths plus
 
 ### 4. Critic
 
-After every DAG node is complete, launch a fresh `reviewer-pi`. The critic is read-only and must review requirements, actual diff, surrounding code, tests, and deliberate simplifications.
+After every DAG node is complete, launch a fresh `reviewer-devin`. The critic is read-only and must review requirements, actual diff, surrounding code, tests, and deliberate simplifications.
 
 The critic always uses `pi-review pr|diff` as auxiliary evidence for implementation review:
 

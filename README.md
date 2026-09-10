@@ -26,11 +26,15 @@ The canonical skill is `herdr-profiles/role-plugins/manager/skills/harness-flow/
 
 ## Profile-backed roles and AGY qualification
 
-`worker-pi` is the only local hotfix qualification target. Claude and AGY profiles remain catalog metadata and their fallback edges are retained for the original full contract, but this hotfix refuses Claude launch, prompt, and steer with `CLAUDE_UNQUALIFIED`, and AGY launch, prompt, and steer with `AGY_UNQUALIFIED`; no Claude or AGY child is created. The original full integration runner and its Claude/AGY cases remain separate, preserved, and **NOTQUALIFIED** here.
+`worker-pi` and the Devin profiles are the local hotfix qualification targets. Claude and AGY profiles remain catalog metadata and their fallback edges are retained for the original full contract, but this hotfix refuses Claude launch, prompt, and steer with `CLAUDE_UNQUALIFIED`, and AGY launch, prompt, and steer with `AGY_UNQUALIFIED`; no Claude or AGY child is created. `worker-devin` is the implementation default and `reviewer-devin` the review default (see below); both run the Devin runtime under the same strict exact-identity contract as Pi. The original full integration runner and its Claude/AGY cases remain separate, preserved, and **NOTQUALIFIED** here.
 
 `researcher-agy` remains the default research profile and `scout-agy` remains the reconnaissance profile in the catalog. Scout and researcher use `gemini-3.8-flash-low`; the worker AGY profile uses `gemini-3.8-flash-high`. All AGY profiles use `--dangerously-skip-permissions` and a fixed per-profile mode: `plan` for research/scout and `accept-edits` for worker. Callers may override only model and scope-normalized `addDirs`; mode is never launch-overrideable and primary overrides never reach fallbacks.
 
 If AGY qualification is enabled in a future gate, every AGY launch must still require a visible, self-contained `assignment`. The profile Markdown body is catalog metadata only and never reaches AGY. AGY discovers repository `AGENTS.md` natively and receives the manager's single provenance-wrapped assignment through the normal prompt channel. The worker mode can auto-approve repository mutations, so manager assignments must bound scope and tests. These constraints are retained as the deferred contract; they are not live hotfix evidence.
+
+## Profile-backed Devin worker
+
+`worker-devin` is the default implementation profile and its chain is exactly `worker-devin -> worker-agy -> worker-claude`. `reviewer-devin` is the default review profile with `reviewer-devin -> reviewer-pi -> reviewer-claude`; it runs the same Devin runtime and stays read-only by assignment, never editing, committing, or promoting the work it reviews. Both launch Devin with `--model swe-2-max --permission-mode dangerous`; Devin's reasoning depth rides on the model tier because the CLI exposes no separate effort flag, and sessions always persist. Callers may override only `model` and `permissionMode` (canonical `normal`, `accept-edits`, `smart`, `dangerous`). The profile body is catalog metadata that never reaches Devin, so every launch requires the same visible, self-contained, provenance-wrapped `assignment` as AGY. `dangerous` auto-approves every tool call, so manager assignments must bound scope and tests. Devin reports its native session through the installed `herdr:devin` hook at session start, so it keeps the strict exact-identity launch contract and never enters AGY's provisional path.
 
 ## Claude Fable manager
 
@@ -119,7 +123,7 @@ herdr_communicate({"target":"worker-id","operation":"interrupt"})
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000})
 herdr_wait({"targets":["worker-id"],"match":"any","condition":{"kind":"state","state":"completed"},"timeoutMs":30000,"label":"worker review"})
 herdr_jobs({"operation":"list","operation_phase":"running"})
-herdr_launch({"name":"reviewer","profile":"reviewer-pi","assignment":{"objective":"Inspect the current changes","scope":"Read-only review of the working tree","verification":"Report findings with file and line references"}})
+herdr_launch({"name":"reviewer","profile":"reviewer-devin","assignment":{"objective":"Inspect the current changes","scope":"Read-only review of the working tree","verification":"Report findings with file and line references"}})
 herdr_pane({"operation":"split","label":"worker","direction":"right"})
 herdr_tab({"operation":"create","label":"review"})
 ```

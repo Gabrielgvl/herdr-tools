@@ -3,7 +3,7 @@ import { access, mkdtemp, mkdir, readdir, readFile, stat, writeFile } from "node
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { AGY_MODES, attachmentCapability, buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, validateProfileResourceSelection, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type ProfileReadIo } from "../../src/profiles/index.js";
+import { AGY_MODES, attachmentCapability, buildClaudeArgv, buildPiArgv, buildProfileArgv, defaultPromptSourceStore, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileCatalog, profileNameFromPath, profileSource, readProfileText, resolveProfile, validateProfileResourceSelection, ProfileParseError, ProfileResolutionError, MAX_PROFILE_BYTES, type DevinPermissionMode, type ProfileReadIo } from "../../src/profiles/index.js";
 import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
 import { createLaunchTool as createLaunchToolImplementation, validateLaunchParams, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE, type LaunchDependencies } from "../../src/tools/launch.js";
 import { createRuntime } from "../../index.js";
@@ -18,12 +18,14 @@ function launchDiagnostic(error: Error): Record<string, unknown> {
 }
 
 function source(root: string, name: string) { return profileSource("project", join(root, `${name}.md`), root); }
-function profileText(name: string, runtime: "pi" | "claude" | "agy" = "pi", extra = "", fallbackProfiles = "[]", agyMode: (typeof AGY_MODES)[number] = "plan") {
+function profileText(name: string, runtime: "pi" | "claude" | "agy" | "devin" = "pi", extra = "", fallbackProfiles = "[]", agyMode: (typeof AGY_MODES)[number] = "plan", devinMode: DevinPermissionMode = "dangerous") {
   const block = runtime === "pi"
     ? "  kind: pi\n  model: test/model\n  thinking: low"
     : runtime === "claude"
       ? "  kind: claude\n  model: claude-test\n  effort: medium"
-      : `  kind: agy\n  model: gemini-3.8-flash-high\n  mode: ${agyMode}\n  addDirs: []`;
+      : runtime === "devin"
+        ? `  kind: devin\n  model: swe-2-max\n  permissionMode: ${devinMode}`
+        : `  kind: agy\n  model: gemini-3.8-flash-high\n  mode: ${agyMode}\n  addDirs: []`;
   const sessionPersistence = runtime === "pi" ? "false" : "true";
   return `---\nname: ${name}\ndescription: Test ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${sessionPersistence}\nruntime:\n${block}\nfallbackProfiles: ${fallbackProfiles}\n${extra}---\n\nBody for ${name}.\n`;
 }
@@ -344,6 +346,30 @@ describe("profile catalog", () => {
     expect(attachmentCapability(agy)).toEqual({ kind: "agy", capable: true, reason: "AGY profile can read its granted attachment directory" });
   });
 
+  it("parses and adapts strict Devin profiles", () => {
+    const root = "/tmp/profile-scope";
+    const devin = parseProfile(profileText("worker-devin", "devin", "", "[worker-agy]"), source(root, "worker-devin"));
+    expect(devin.runtime).toEqual({ kind: "devin", model: "swe-2-max", permissionMode: "dangerous" });
+    expect(devin.sessionPersistence).toBe(true);
+    expect(devin.fallbackProfiles).toEqual(["worker-agy"]);
+    expect(buildProfileArgv(devin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);
+    expect(buildProfileArgv(devin, { model: "swe-2", permissionMode: "normal" })).toEqual(["--model", "swe-2", "--permission-mode", "normal"]);
+    expect(buildProfileArgv(devin, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);
+    // The Devin body is catalog metadata and its granted attachment directory
+    // is read ambiently, so neither produces argv.
+    expect(() => buildProfileArgv(devin, {}, "/tmp/prompt-source")).toThrow(/prompt source/);
+    expect(() => buildProfileArgv({ ...devin, sessionPersistence: false })).toThrow(/sessionPersistence/);
+    for (const key of ["thinking", "tools", "effort", "allowedTools", "disallowedTools", "addDirs", "pluginDirs", "extensions", "skills", "mode"] as const) {
+      expect(() => buildProfileArgv(devin, { [key]: key === "thinking" || key === "effort" || key === "mode" ? "low" : ["value"] } as never)).toThrow(/Devin|profile-only/);
+    }
+    // Claude-only permission values do not become valid Devin overrides.
+    expect(() => buildProfileArgv(devin, { permissionMode: "bypassPermissions" } as never)).toThrow(/permission mode/);
+    expect(() => parseProfile(profileText("worker-devin", "devin").replace("permissionMode: dangerous", "permissionMode: autonomous"), source(root, "worker-devin"))).toThrow(ProfileParseError);
+    expect(() => parseProfile(profileText("worker-devin", "devin").replace("permissionMode: dangerous", "permissionMode: dangerous\n  addDirs: [./docs]"), source(root, "worker-devin"))).toThrow(ProfileParseError);
+    expect(() => parseProfile(profileText("worker-devin", "devin").replace("sessionPersistence: true", "sessionPersistence: false"), source(root, "worker-devin"))).toThrow(/Devin profiles must set sessionPersistence/);
+    expect(attachmentCapability(devin)).toEqual({ kind: "devin", capable: true, reason: "Devin profile can read its granted attachment directory" });
+  });
+
   it("preserves AGY mode and permission metadata in model-visible profile inspection", async () => {
     const root = "/tmp/profile-scope";
     const agy = parseProfile(profileText("researcher", "agy"), source(root, "researcher"));
@@ -587,7 +613,7 @@ describe("profile catalog", () => {
   it("enforces the bundled capability matrix and shared role resources", async () => {
     const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
     const catalog = await runtime.profiles.load();
-    expect(catalog.effective.size).toBe(17);
+    expect(catalog.effective.size).toBe(19);
     expect(catalog.diagnostics).toEqual([]);
     const bundledRoot = catalog.effective.get("manager-pi")!.source.scopeRoot;
     const rolePluginRoot = join(bundledRoot, "herdr-profiles", "role-plugins");
@@ -717,6 +743,23 @@ describe("profile catalog", () => {
     expect(workerAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", addDirs: [] });
     expect(workerAgy.fallbackProfiles).toEqual(["worker-claude"]);
     expect(resolveProfile("worker-pi", catalog).reachableNames).toEqual(["worker-pi", "worker-agy", "worker-claude"]);
+    const workerDevin = catalog.effective.get("worker-devin")!;
+    expect(workerDevin.runtime).toEqual({ kind: "devin", model: "swe-2-max", permissionMode: "dangerous" });
+    expect(workerDevin.sessionPersistence).toBe(true);
+    expect(workerDevin.timeoutMinutes).toBe(30);
+    expect(workerDevin.fallbackProfiles).toEqual(["worker-agy"]);
+    expect(workerDevin.source.kind).toBe("bundled");
+    expect(resolveProfile("worker-devin", catalog).reachableNames).toEqual(["worker-devin", "worker-agy", "worker-claude"]);
+    expect(buildProfileArgv(workerDevin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);
+    const reviewerDevin = catalog.effective.get("reviewer-devin")!;
+    expect(reviewerDevin.runtime).toEqual({ kind: "devin", model: "swe-2-max", permissionMode: "dangerous" });
+    expect(reviewerDevin.sessionPersistence).toBe(true);
+    expect(reviewerDevin.timeoutMinutes).toBe(30);
+    expect(reviewerDevin.fallbackProfiles).toEqual(["reviewer-pi"]);
+    expect(reviewerDevin.source.kind).toBe("bundled");
+    expect(resolveProfile("reviewer-devin", catalog).reachableNames).toEqual(["reviewer-devin", "reviewer-pi", "reviewer-claude"]);
+    expect(buildProfileArgv(reviewerDevin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);
+    expect(reviewerDevin.body).toContain("read-only");
     const scoutAgy = catalog.effective.get("scout-agy")!;
     expect(scoutAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", addDirs: [] });
     expect(scoutAgy.fallbackProfiles).toEqual(["scout-claude"]);
@@ -835,7 +878,7 @@ describe("profile catalog", () => {
   it("loads bundled profiles from the package scope", async () => {
     const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
     const catalog = await runtime.profiles.load();
-    expect(catalog.effective.size).toBe(17);
+    expect(catalog.effective.size).toBe(19);
     expect(catalog.effective.get("worker-pi")?.source.scopeRoot).toBe(process.cwd());
   });
 });

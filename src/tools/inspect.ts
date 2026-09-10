@@ -103,11 +103,15 @@ function compactProfile(profile: Profile): Record<string, unknown> {
         addDirs: boundedValues(profile.runtime.addDirs, 16, 512),
         pluginDirs: boundedValues(profile.runtime.pluginDirs, 16, 512)
       }
-      : {
-        mode: profile.runtime.mode,
-        dangerouslySkipPermissions: true,
-        addDirs: boundedValues(profile.runtime.addDirs, 16, 512)
-      };
+      : profile.runtime.kind === "devin"
+        ? {
+          permissionMode: profile.runtime.permissionMode
+        }
+        : {
+          mode: profile.runtime.mode,
+          dangerouslySkipPermissions: true,
+          addDirs: boundedValues(profile.runtime.addDirs, 16, 512)
+        };
   return {
     name: boundedText(profile.name, 128),
     description: boundedText(profile.description, 512),
@@ -231,13 +235,19 @@ function exactProfile(catalog: ProfileCatalog, name: string): Record<string, unk
         addDirs: boundedValues(profile.runtime.addDirs, 16, 512),
         pluginDirs: boundedValues(profile.runtime.pluginDirs, 16, 512)
       }
-      : {
-        kind: "agy",
-        model: boundedText(profile.runtime.model, 256),
-        mode: profile.runtime.mode,
-        dangerouslySkipPermissions: true,
-        addDirs: boundedValues(profile.runtime.addDirs, 16, 512)
-      };
+      : profile.runtime.kind === "devin"
+        ? {
+          kind: "devin",
+          model: boundedText(profile.runtime.model, 256),
+          permissionMode: profile.runtime.permissionMode
+        }
+        : {
+          kind: "agy",
+          model: boundedText(profile.runtime.model, 256),
+          mode: profile.runtime.mode,
+          dangerouslySkipPermissions: true,
+          addDirs: boundedValues(profile.runtime.addDirs, 16, 512)
+        };
   return {
     ...compactProfile(profile),
     runtime,

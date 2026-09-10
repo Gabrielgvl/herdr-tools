@@ -39,8 +39,9 @@ runtime:
 - `researcher-agy` uses `plan` and falls back to `researcher-claude`, yielding exactly
   `researcher-agy -> researcher-claude -> researcher-pi`. `scout-agy` uses `plan` and
   yields `scout-agy -> scout-claude -> scout-pi`. `worker-agy` uses `accept-edits` and
-  falls back to `worker-claude`; the implementation default `worker-pi` yields exactly
-  `worker-pi -> worker-agy -> worker-claude`.
+  falls back to `worker-claude`; the implementation default `worker-devin` yields
+  exactly `worker-devin -> worker-agy -> worker-claude`, and `worker-pi` remains
+  selectable with `worker-pi -> worker-agy -> worker-claude`.
 - The required Markdown body remains catalog metadata. AGY receives repository
   `AGENTS.md` through its native discovery and receives the manager's one explicit,
   visible v1 provenance-wrapped assignment through the existing prompt channel.

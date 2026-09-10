@@ -7,11 +7,19 @@ export type ClaudeEffort = (typeof CLAUDE_EFFORTS)[number];
 export const CLAUDE_PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"] as const;
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODES)[number];
 
-export const PROFILE_KINDS = ["pi", "claude", "agy"] as const;
+export const PROFILE_KINDS = ["pi", "claude", "agy", "devin"] as const;
 export type ProfileKind = (typeof PROFILE_KINDS)[number];
 
 export const AGY_MODES = ["plan", "accept-edits"] as const;
 export type AgyMode = (typeof AGY_MODES)[number];
+
+/**
+ * The canonical Devin `--permission-mode` values. `autonomous` is excluded
+ * because it requires `--sandbox`, which profiles cannot express; the CLI's
+ * `auto`/`yolo`/`bypass` spellings are aliases of the canonical names.
+ */
+export const DEVIN_PERMISSION_MODES = ["normal", "accept-edits", "smart", "dangerous"] as const;
+export type DevinPermissionMode = (typeof DEVIN_PERMISSION_MODES)[number];
 export type ProfileSourceKind = "bundled" | "user" | "project";
 
 export const RESERVED_BUNDLED_PROFILE_NAMES = new Set(["promoter-pi", "promoter-claude"]);
@@ -56,7 +64,18 @@ export interface AgyRuntimeProfile {
   addDirs: string[];
 }
 
-export type RuntimeProfile = PiRuntimeProfile | ClaudeRuntimeProfile | AgyRuntimeProfile;
+/**
+ * Devin's native surface is a model plus a permission mode. Reasoning depth is
+ * a property of the selected model tier (for example `swe-2-max`); the CLI
+ * exposes no effort flag, prompt-file channel, or per-session tool selector.
+ */
+export interface DevinRuntimeProfile {
+  kind: "devin";
+  model: string;
+  permissionMode: DevinPermissionMode;
+}
+
+export type RuntimeProfile = PiRuntimeProfile | ClaudeRuntimeProfile | AgyRuntimeProfile | DevinRuntimeProfile;
 
 export interface Profile {
   name: string;
@@ -127,7 +146,12 @@ export interface AgyRuntimeOverrides {
   addDirs?: string[];
 }
 
-export type RuntimeOverrides = PiRuntimeOverrides | ClaudeRuntimeOverrides | AgyRuntimeOverrides;
+export interface DevinRuntimeOverrides {
+  model?: string;
+  permissionMode?: DevinPermissionMode;
+}
+
+export type RuntimeOverrides = PiRuntimeOverrides | ClaudeRuntimeOverrides | AgyRuntimeOverrides | DevinRuntimeOverrides;
 
 export const MAX_PROFILE_BYTES = 64 * 1024;
 export const MAX_PROFILE_BODY_BYTES = 32 * 1024;

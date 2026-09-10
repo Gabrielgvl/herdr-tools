@@ -37,5 +37,8 @@ export function attachmentCapability(profile: Profile, overrides: RuntimeOverrid
     const disallowedTools = claudeOverrides.disallowedTools ?? profile.runtime.disallowedTools;
     return { kind: "claude", ...claudeCapability(allowedTools, disallowedTools) };
   }
-  return { kind: "agy", capable: true, reason: "AGY profile can read its granted attachment directory" };
+  if (profile.runtime.kind === "agy") {
+    return { kind: "agy", capable: true, reason: "AGY profile can read its granted attachment directory" };
+  }
+  return { kind: "devin", capable: true, reason: "Devin profile can read its granted attachment directory" };
 }

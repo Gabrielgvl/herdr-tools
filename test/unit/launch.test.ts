@@ -89,12 +89,14 @@ const observedPane = (state: string | undefined, stateChangeSeq: number | undefi
   revision
 });
 
-function profile(name: string, kind: "pi" | "claude" | "agy" = "pi", fallbackProfiles: string[] = [], agyMode: "plan" | "accept-edits" = "plan") {
+function profile(name: string, kind: "pi" | "claude" | "agy" | "devin" = "pi", fallbackProfiles: string[] = [], agyMode: "plan" | "accept-edits" = "plan") {
   const runtime = kind === "pi"
     ? "  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]"
     : kind === "claude"
       ? "  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]"
-      : `  kind: agy\n  model: gemini-3.8-flash-high\n  mode: ${agyMode}\n  addDirs: []`;
+      : kind === "devin"
+        ? "  kind: devin\n  model: swe-2-max\n  permissionMode: dangerous"
+        : `  kind: agy\n  model: gemini-3.8-flash-high\n  mode: ${agyMode}\n  addDirs: []`;
   return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${kind !== "pi"}\nruntime:\n${runtime}\nfallbackProfiles: ${JSON.stringify(fallbackProfiles)}\n---\n\nProfile body for ${name}.\n`, profileSource("bundled", `/profiles/${name}.md`, "/profiles"));
 }
 
@@ -3360,6 +3362,61 @@ describe("herdr_launch profile-only contract", () => {
     expect(attachments.ensureRecipient).not.toHaveBeenCalled();
     expect(attachments.publish).not.toHaveBeenCalled();
     expect(supervision.reserved).toHaveLength(0);
+  });
+
+  it("launches Devin with exact identity, no prompt source, and only model/permissionMode overrides", async () => {
+    const workerDevin = profile("worker-devin", "devin");
+    const calls: string[][] = [];
+    const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
+    const harness = makeCli({ calls });
+    const result = await launch({ name: "worker", profile: "worker-devin", assignment: assign("implement") }, catalog(workerDevin), harness.cli, promptSources);
+    // Devin bodies are catalog metadata, so no prompt source is materialized.
+    expect(promptSources.create).not.toHaveBeenCalled();
+    expect(calls.find((call) => call[0] === "agent" && call[1] === "start")).toEqual([
+      "agent", "start", "worker", "--kind", "devin", "--pane", "w1:p2", "--timeout", "120000", "--",
+      "--model", "swe-2-max", "--permission-mode", "dangerous"
+    ]);
+    // The installed herdr:devin hook reports agent_session at session start, so
+    // the strict exact-identity path binds and registers the recipient.
+    expect(result.details).toMatchObject({ kind: "devin", profile: { name: "worker-devin", runtime: { kind: "devin", model: "swe-2-max", permissionMode: "dangerous" }, permissions: { sessionPersistence: true } } });
+    expect(lastSupervision.bound[0]!.identity).toMatchObject({ agentName: "worker", agentKind: "devin" });
+    await expect(launch({ name: "worker", profile: "worker-devin", assignment: assign("implement"), overrides: { model: "swe-2", permissionMode: "smart" } }, catalog(workerDevin), makeCli().cli)).resolves.toBeDefined();
+    for (const key of ["thinking", "tools", "effort", "allowedTools", "disallowedTools", "addDirs"] as const) {
+      await expect(launch({ name: "worker", profile: "worker-devin", assignment: assign("implement"), overrides: { [key]: key === "thinking" || key === "effort" ? "low" : ["x"] } as never }, catalog(workerDevin), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE" });
+    }
+    // A Claude-only permission value is a schema-valid field but invalid for Devin.
+    await expect(launch({ name: "worker", profile: "worker-devin", assignment: assign("implement"), overrides: { permissionMode: "bypassPermissions" } }, catalog(workerDevin), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE" });
+  });
+
+  it("keeps Devin bodies as metadata and starts a Devin fallback chain without a prompt source", async () => {
+    const primary = profile("primary", "devin", ["fallback"]);
+    const fallback = profile("fallback", "pi");
+    const calls: string[][] = [];
+    const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
+    const harness = makeCli({
+      calls,
+      paneStates: [
+        { pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "unknown" },
+        { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" }, agent_status: "idle", state_change_seq: 7, revision: 3 },
+        { pane_id: "w1:p2", tab_id: "w1:t1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" }, agent_status: "working", state_change_seq: 8, revision: 4 }
+      ],
+      start: (_argv, attempt) => {
+        if (attempt === 0) throw startFailure();
+        return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "pi", agent: "pi", kind: "id", value: "session-fallback" } } });
+      }
+    });
+    const result = await launch({ name: "worker", profile: "primary", assignment: assign("research") }, catalog(primary, fallback), harness.cli, promptSources);
+
+    expect(promptSources.create).toHaveBeenCalledTimes(1);
+    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "devin")).toEqual([
+      "agent", "start", "worker", "--kind", "devin", "--pane", "w1:p2", "--timeout", "120000", "--",
+      "--model", "swe-2-max", "--permission-mode", "dangerous"
+    ]);
+    expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "pi")).toEqual([
+      "agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--",
+      "--model", "test/model", "--thinking", "low", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/body.md"
+    ]);
+    expect(result.details).toMatchObject({ kind: "pi", profile: { requested: "primary", selected: "fallback" } });
   });
 
   it("refuses Claude and AGY fallbacks without blocking an allowed Pi primary", async () => {

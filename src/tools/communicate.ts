@@ -118,9 +118,6 @@ function assertQualifiedPromptTarget(records: readonly Record<string, unknown>[]
     if (fields.agentKind === "agy" || fields.agentSession?.agent === "agy") {
       throw Object.assign(new Error("AGY text delivery is not qualified"), { code: "AGY_UNQUALIFIED", details: { target: paneId } });
     }
-    if (fields.agentKind === "claude" || fields.agentSession?.agent === "claude") {
-      throw Object.assign(new Error("Claude text delivery is not qualified"), { code: "CLAUDE_UNQUALIFIED", details: { target: paneId } });
-    }
   }
 }
 

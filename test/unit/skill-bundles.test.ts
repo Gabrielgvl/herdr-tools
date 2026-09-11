@@ -497,4 +497,54 @@ describe("generated skill bundles", () => {
     registry(root, { bundles: { "herdr-profiles/pi-skills/worker": { source: "./linked", treeHash: "0".repeat(64) } } });
     await expect(generateSkillBundles(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_PATH_ESCAPES_SCOPE" });
   });
+
+  it("refuses a generated target whose parent physically escapes the scope root", async () => {
+    const root = scope("target-escape");
+    const outside = scope("target-outside");
+    const canonical = skillTree(join(root, "canonical"), "worker");
+    const pin = await skillTreeDigest(canonical);
+    // The registry checks targets lexically, so a symlinked parent directory
+    // inside the scope root still resolves the real target outside it.
+    symlinkSync(outside, join(root, "linked"), "dir");
+    registry(root, { bundles: { "linked/worker": { source: "./canonical/worker", treeHash: pin } } });
+    await expect(generateSkillBundles(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_PATH_ESCAPES_SCOPE", details: { path: join(root, "linked", "worker") } });
+    expect(existsSync(join(outside, "worker"))).toBe(false);
+  });
+
+  it("fails closed when the refresh lock root cannot be created", async () => {
+    const root = scope("lock-blocked");
+    writeFileSync(join(root, ".herdr-locks"), "not a directory\n");
+    await expect(generateSkillBundles(root, "bundled")).rejects.toMatchObject({ code: "PROFILE_SKILL_BUNDLE_STALE" });
+  });
+
+  it("rethrows a refresh-blocked validation error when the target still exists", async () => {
+    const root = scope("refresh-blocked");
+    const canonical = skillTree(join(root, "canonical"), "worker");
+    const pin = await skillTreeDigest(canonical);
+    mkdirSync(join(root, "herdr-profiles", "pi-skills"), { recursive: true });
+    const target = join(root, "herdr-profiles", "pi-skills", "worker");
+    // A registered target that is still present but not a plain tree (here a
+    // symlink) is a validation failure a refresh must not regenerate away.
+    symlinkSync(canonical, target, "dir");
+    registry(root, { bundles: { "herdr-profiles/pi-skills/worker": { source: "./canonical/worker", treeHash: pin } } });
+    const bundled = piProfile(root, "bundled-unsafe", "  skills: [./herdr-profiles/pi-skills/worker]");
+    await expect(refreshBundledProfileResourceSelection(bundled, bundled.runtime)).rejects.toMatchObject({ code: "PROFILE_SKILL_TREE_UNSAFE", details: { path: target } });
+  });
+
+  it("keeps a refresh-blocked target failure instead of regenerating past it", async () => {
+    const root = scope("refresh-stat");
+    const canonical = skillTree(join(root, "canonical"), "worker");
+    const pin = await skillTreeDigest(canonical);
+    mkdirSync(join(root, "herdr-profiles", "pi-skills", "tampered"), { recursive: true });
+    writeFileSync(join(root, "herdr-profiles", "pi-skills", "tampered", "SKILL.md"), "tampered\n");
+    // The blocked bundle sorts first so the refresh loop reaches its target
+    // digest before the tampered one that triggered the refresh.
+    writeFileSync(join(root, "herdr-profiles", "blocked"), "not a directory\n");
+    registry(root, { bundles: {
+      "herdr-profiles/blocked/worker": { source: "./canonical/worker", treeHash: pin },
+      "herdr-profiles/pi-skills/tampered": { source: "./canonical/worker", treeHash: pin }
+    } });
+    const bundled = piProfile(root, "bundled-stale", "  skills: [./herdr-profiles/pi-skills/tampered]");
+    await expect(refreshBundledProfileResourceSelection(bundled, bundled.runtime)).rejects.toMatchObject({ code: "PROFILE_SKILL_TREE_UNSAFE", details: { path: join(root, "herdr-profiles", "blocked", "worker") } });
+  });
 });

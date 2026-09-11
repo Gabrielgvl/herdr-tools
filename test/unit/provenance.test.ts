@@ -44,6 +44,8 @@ describe("inter-agent provenance", () => {
     expect(buildEnvelope(sender, "prompt", payload)).toBe(`[HERDR AGENT MESSAGE v1]\nfrom: ${sender.from}\nkind: prompt\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`);
     expect(buildEnvelope(sender, "steer", payload)).toContain("kind: steer");
     expect(buildEnvelope(sender, "assignment", payload)).toContain("kind: assignment");
+    expect(buildEnvelope(sender, "supervision", payload)).toContain("kind: supervision");
+    expect(buildEnvelope(sender, "wait", payload)).toContain("kind: wait");
   });
 
   it("fails closed when the caller pane identity is unavailable", () => {

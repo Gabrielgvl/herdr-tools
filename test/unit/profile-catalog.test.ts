@@ -298,6 +298,11 @@ describe("profile catalog", () => {
     const fanout = new Map([make("root", ["next", "last", "end", "extra"]), make("next", []), make("last", []), make("end", []), make("extra", [])].map((item) => [item.name, item] as const));
     expect(() => resolveProfile("root", { effective: fanout, candidates: [], diagnostics: [] })).toThrow(ProfileResolutionError);
     expect(() => resolveProfile("blocked", { effective, blocked: new Set(["blocked"]), candidates: [], diagnostics: [] })).toThrow(/blocked/);
+    // Reserved bundled names can only resolve from the bundled tier: absent or
+    // shadowed by another scope is a refusal, never a fallback resolution.
+    expect(() => resolveProfile("promoter-pi", { effective: new Map(), candidates: [], diagnostics: [] })).toThrow(/unavailable from the bundled catalog/);
+    const userPromoter = { ...make("promoter-pi", []), source: profileSource("user", "/user/promoter-pi.md", "/user") };
+    expect(() => resolveProfile("promoter-pi", { effective: new Map([["promoter-pi", userPromoter]]), candidates: [], diagnostics: [] })).toThrow(/unavailable from the bundled catalog/);
   });
 
   it("builds only typed Pi and Claude flags", () => {
@@ -322,6 +327,13 @@ describe("profile catalog", () => {
     expect(() => buildPiArgv(pi.runtime as Extract<typeof pi.runtime, { kind: "pi" }>, pi.sessionPersistence, { extensions: ["../outside"] } as never)).toThrow(/profile-only/);
     for (const key of ["effort", "permissionMode", "allowedTools", "disallowedTools", "addDirs", "pluginDirs"] as const) expect(() => buildProfileArgv(pi, { [key]: key === "permissionMode" ? "plan" : key === "effort" ? "low" : ["value"] } as never)).toThrow();
     for (const key of ["thinking", "tools", "extensions", "skills"] as const) expect(() => buildProfileArgv(claude, { [key]: key === "thinking" ? "low" : ["value"] } as never)).toThrow();
+    // Scoped overrides need a scope root to resolve against; a bare adapter
+    // call without one is refused rather than resolved against the process cwd.
+    expect(() => buildClaudeArgv(claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>, claude.sessionPersistence, { addDirs: ["./docs"] })).toThrow(/scope root/);
+    // A Claude profile can opt into development channels, which become one
+    // variadic flag group ahead of the fixed flags that follow.
+    const channeled = parseProfile(profileText("channeled", "claude").replace("effort: medium", "effort: medium\n  developmentChannels: [server:herdr]"), source("/tmp/profile-scope", "channeled"));
+    expect(buildProfileArgv(channeled)).toEqual(expect.arrayContaining(["--dangerously-load-development-channels", "server:herdr"]));
   });
 
   it("parses and adapts strict AGY profiles", () => {
@@ -350,6 +362,8 @@ describe("profile catalog", () => {
     const root = "/tmp/profile-scope";
     const devin = parseProfile(profileText("worker-devin", "devin", "", "[worker-agy]"), source(root, "worker-devin"));
     expect(devin.runtime).toEqual({ kind: "devin", model: "swe-2-max", permissionMode: "dangerous" });
+    // permissionMode is optional for Devin runtimes and defaults to normal.
+    expect(parseProfile(profileText("worker-devin", "devin").replace("\n  permissionMode: dangerous", ""), source(root, "worker-devin")).runtime).toMatchObject({ kind: "devin", permissionMode: "normal" });
     expect(devin.sessionPersistence).toBe(true);
     expect(devin.fallbackProfiles).toEqual(["worker-agy"]);
     expect(buildProfileArgv(devin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);

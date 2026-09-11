@@ -13,7 +13,7 @@
   "bundles": {
     "herdr-profiles/profile-plugins/manager/skills/manager": {
       "source": "./herdr-profiles/role-plugins/manager/skills/manager",
-      "treeHash": "2c1e36317a3cf0bd68dd20c1d7cb051944dc6ebea35209d0bce9b03a37d54766"
+      "treeHash": "48667d75812e4203981bf84667cb5ec459741bfeec5ac230f1c24ef55cb60a54"
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",
@@ -33,7 +33,7 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/herdr-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/herdr-manager",
-      "treeHash": "70e840c638cf2ce0935c44237b7edd47ee682ff1f0171c6c8cbe8bf0ebd0e769"
+      "treeHash": "80d036bf5eb1d40fd0f87b27a79f3ee11b13033cf9920a43b3a790382034c565"
     },
     "herdr-profiles/profile-plugins/manager/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",

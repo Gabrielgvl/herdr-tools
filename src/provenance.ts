@@ -1,7 +1,7 @@
 import type { HerdrSnapshot, PaneRecord } from "./targets.js";
 import { assertMessageText, type MessageDelivery } from "./messages/limits.js";
 
-export type ProvenanceKind = "assignment" | "prompt" | "steer";
+export type ProvenanceKind = "assignment" | "prompt" | "steer" | "supervision" | "wait";
 export type SenderSource = "agent_name" | "pane_agent_name" | "label" | "agent_kind" | "pane_id";
 
 export interface SenderIdentity {

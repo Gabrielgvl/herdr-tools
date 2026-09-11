@@ -480,12 +480,30 @@ launch success · <paneId> · supervisor <jobId>
 
 Delivery is **wake/report only**, best effort, never a gate, never retried.
 
-- **Pi** — the existing `pi.sendMessage({ customType: "herdr-supervision", content, display,
+- **Pi extension host** — the existing `pi.sendMessage({ customType: "herdr-supervision", content, display,
   details }, { deliverAs: "steer", triggerTurn: true })` path.
-- **Claude** — the documented Claude Code Channels research preview inside the *same* MCP
-  server: the server advertises `capabilities.experimental["claude/channel"] = {}` and sends
-  `notifications/claude/channel` with bounded `content` and `meta`. There is no delivery
-  acknowledgement and no Herdr agent prompt injection.
+- **MCP host** — a single `deliver()` routes by the hosting pane's own agent kind, resolved
+  lazily on the first wake and cached for the session; a failed resolution is never cached, so
+  the next wake retries:
+  - `devin` and `pi` — self-prompt through `agent.prompt` on the server's own hosting pane,
+    carrying the full identity sandwich: `kind: "supervision"` for supervisor events and
+    `kind: "wait"` for settled `herdr_wait` jobs. The acknowledgement is validated with
+    `parsePromptSubmission` exactly like a `herdr_communicate` send. The self-target bypass is
+    deliberate: `herdr_communicate`'s self-target refusal is a tool-call policy, while the
+    socket has no such rule and this wake *is* the delivery mechanism, not a user message. The
+    sendable-state gate is the only state check: `working` and `blocked` still send, while
+    `unknown` or unproven state drops.
+  - `claude` — the documented Claude Code Channels research preview inside the *same* MCP
+    server: the server advertises `capabilities.experimental["claude/channel"] = {}` and sends
+    `notifications/claude/channel` with bounded `content` and `meta`. There is no prompt
+    fallback, no delivery acknowledgement, and no Herdr agent prompt injection.
+  - anything else — `agy`, `unknown`, missing, unsupported, or an own-pane identity that cannot
+    be proven (including a pane that proves no `agent_name`) — is inert; the wake drops silently.
+
+Settled `herdr_wait` jobs reach the same router through `JobRegistry.onTerminal`; supervisor
+settlements never re-notify, because their events already woke the manager. Every failure —
+kind resolution, context or identity proof, the prompt write, the acknowledgement — is
+swallowed: `herdr_jobs` polling stays the recovery contract on every host.
 
 `manager-claude` no longer opts in. It declares no `runtime.developmentChannels`, so no
 `--dangerously-load-development-channels` opt-in is emitted, and the session raises neither

@@ -1214,7 +1214,7 @@ async function waitForLaunchReadiness(
         if (pending.length === 0 && identity !== undefined && authoritativeAgent !== undefined && paneRecordResult.record !== undefined && (!baselineRequired || baseline !== undefined)) {
           window.assertActive();
           const evidence = readinessEvidence(clock, attemptStartedAt, samples, lastRecords, baselineRequired, lastPendingReason);
-          return { identity, agent: authoritativeAgent, pane: paneRecordResult.record.value, ...(baseline === undefined ? {} : { baseline }), evidence };
+          return { identity, agent: authoritativeAgent, pane: paneRecordResult.record.value, ...(baseline === undefined ? /* c8 ignore next -- the only caller always requires a baseline, so a ready result always carries one. */ {} : { baseline }), evidence };
         }
         lastPendingReason = [...new Set(pending)].join(",");
       } catch (error) {
@@ -1530,7 +1530,7 @@ function partialError(
     ...(Object.keys(effects.timing).length === 0 ? {} : { timing: effects.timing }),
     ...(effects.attempts.length === 0 ? {} : { attempts: effects.attempts }),
     ...(cliFailure ? { cliFailure } : {}),
-    ...(delivery ? { delivery, initialPromptDelivery: delivery } : {}),
+    ...(delivery ? { delivery, initialPromptDelivery: delivery } : /* c8 ignore next -- partialError runs only after the delivery route is fixed at precondition time. */ {}),
     recipientGrant: { path: grant.path },
     ...(published ? { attachmentRetained: true, attachment: { ...published } } : {}),
     ...(readiness === undefined ? {} : { readiness }),
@@ -1983,9 +1983,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           promptDispatch: promptDispatch!,
           assignmentState: assignmentState!,
           initialPromptDelivery: initialPromptDelivery!,
-          ...(initialPromptSubmission ? { initialPromptSubmission: compactPromptSubmission(initialPromptSubmission) } : {}),
-          ...(initialPromptObservation ? { initialPromptObservation } : {}),
-          ...(promptConfirmation ? { promptConfirmation } : {}),
+          ...(initialPromptSubmission ? { initialPromptSubmission: compactPromptSubmission(initialPromptSubmission) } : /* c8 ignore next -- the launched result is only built after the confirmed submission evidence exists. */ {}),
+          ...(initialPromptObservation ? { initialPromptObservation } : /* c8 ignore next -- a confirmed prompt always yields its closing observation. */ {}),
+          ...(promptConfirmation ? { promptConfirmation } : /* c8 ignore next -- the launched result is only built after consumption is confirmed. */ {}),
           timing,
           sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
           envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },

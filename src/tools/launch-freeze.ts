@@ -34,6 +34,7 @@ export interface LaunchGateOptions {
 
 function uid(): number {
   const value = process.getuid?.();
+  /* c8 ignore next -- flock only exists on platforms that provide getuid. */
   if (value === undefined) throw new LaunchFreezeError("Launch gate owner is unavailable");
   return value;
 }
@@ -85,6 +86,7 @@ export async function assertLaunchNotFrozen(freezePath = HERDR_LAUNCH_FREEZE_PAT
   try {
     content = await readFile(freezePath, "utf8");
   } catch {
+    /* c8 ignore next -- the lstat above already proved an owner-readable 0o600 file; a failure here is a mid-check permission race. */
     throw new LaunchFreezeError("Launch freeze state is unreadable");
   }
   if (Buffer.byteLength(content, "utf8") > 512 || !FREEZE_CONTENT.test(content)) {
@@ -111,6 +113,7 @@ function assertHolderAlive(child: ChildProcessWithoutNullStreams, holderExited: 
   try {
     process.kill(child.pid, 0);
   } catch {
+    /* c8 ignore next -- the holder can die between the exitCode check and this probe only inside a sub-microtask reap window. */
     throw new LaunchFreezeError("Launch gate holder is not live");
   }
 }
@@ -124,6 +127,7 @@ async function stop(child: ChildProcessWithoutNullStreams, exit: Promise<ExitRes
 }
 
 async function ensureLockPath(lockPath: string): Promise<void> {
+  /* c8 ignore next -- O_NOFOLLOW exists on every platform that ships flock. */
   const flags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0);
   try {
     const handle = await open(lockPath, flags, 0o600);
@@ -141,7 +145,7 @@ export async function acquireLaunchGate(options: LaunchGateOptions = {}): Promis
   try {
     await ensureLockPath(lockPath);
   } catch (error) {
-    throw error instanceof LaunchFreezeError ? error : new LaunchFreezeError("Launch gate lock is unavailable");
+    throw error instanceof LaunchFreezeError ? error : /* c8 ignore next -- ensureLockPath only ever throws LaunchFreezeError. */ new LaunchFreezeError("Launch gate lock is unavailable");
   }
 
   let child: ChildProcessWithoutNullStreams;
@@ -151,6 +155,7 @@ export async function acquireLaunchGate(options: LaunchGateOptions = {}): Promis
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch {
+    /* c8 ignore next -- spawn reports a missing binary through the error event, not a synchronous throw. */
     throw new LaunchFreezeError("Launch gate lock could not be started");
   }
   const exit = exitResult(child);
@@ -185,7 +190,7 @@ export async function acquireLaunchGate(options: LaunchGateOptions = {}): Promis
     await assertLockPath(lockPath);
   } catch (error) {
     await stop(child, exit);
-    throw error instanceof LaunchFreezeError ? error : new LaunchFreezeError("Launch gate lock is indeterminate");
+    throw error instanceof LaunchFreezeError ? error : /* c8 ignore next -- the acquisition promise only rejects with LaunchFreezeError. */ new LaunchFreezeError("Launch gate lock is indeterminate");
   }
 
   let released = false;

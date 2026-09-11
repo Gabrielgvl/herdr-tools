@@ -16,7 +16,7 @@ import { discoverProfiles } from "../profiles/discovery.js";
 import type { ProfileCatalog } from "../profiles/types.js";
 import { ReviewerFailure } from "../reviewer.js";
 import { createCliTranscriptReader, SupervisionRegistry } from "../supervision/registry.js";
-import { CLAUDE_CHANNEL_CAPABILITY, createChannelSupervisionNotifier } from "../supervision/notify.js";
+import { CLAUDE_CHANNEL_CAPABILITY, createMcpHostWake } from "../supervision/notify.js";
 import { createBuiltinModelService } from "../supervision/model-service.js";
 import { loadSettings, type Settings } from "../settings.js";
 import type { CurrentContext } from "../targets.js";
@@ -134,15 +134,16 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   const attachments = deps.attachments ?? defaultAttachmentStore;
   const recipients = deps.recipients ?? new RecipientRegistry();
   const ownership = new RuntimeOwnership();
-  const jobs = new JobRegistry();
   // The Channels research preview has no delivery acknowledgement, so the
   // notifier is wired before the transport and every send stays best effort.
   const channel = { current: undefined as ((notification: { method: string; params: { content: string; meta: Record<string, unknown> } }) => Promise<void>) | undefined };
+  const hostWake = createMcpHostWake({ cli, context: startup.context, notifyChannel: (notification) => channel.current?.(notification) });
+  const jobs = new JobRegistry({ onTerminal: (detail) => hostWake.notifyJobTerminal(detail) });
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
     readTranscript: createCliTranscriptReader(cli),
-    notifier: createChannelSupervisionNotifier((notification) => channel.current?.(notification)),
+    notifier: hostWake.notifier,
     // The MCP host has no Pi model registry, and `hostContext` deliberately
     // still throws for `context.modelRegistry`. It resolves the supervisor's
     // reviewer model through its own host-independent service instead.

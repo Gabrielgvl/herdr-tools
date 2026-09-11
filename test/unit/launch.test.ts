@@ -3897,4 +3897,22 @@ describe("herdr_launch automatic child supervision", () => {
     expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
     expect(gate.release).toHaveBeenCalledTimes(1);
   });
+
+  it("still reports the freeze when the gate lease release itself fails", async () => {
+    const tool = createLaunchTool({
+      cli: makeCli().cli,
+      context,
+      cwd: "/repo",
+      profiles: { load: async () => catalog(profile("worker")) },
+      attachments: fakeAttachments(),
+      recipients: new RecipientRegistry(),
+      launchGate: async () => ({
+        check: async () => { throw new Error("gate broken"); },
+        release: async () => { throw new Error("release failed"); }
+      })
+    });
+    await expect(tool.execute("id", { assignment: assign("go"), name: "worker", profile: "worker" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN" });
+  });
+
 });

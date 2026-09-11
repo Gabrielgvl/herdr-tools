@@ -127,9 +127,10 @@ describe("Claude manager plugin package", () => {
     // `node`, while a locally installed copy may pin the absolute Node binary a
     // version manager selected. Both run the same entry; nothing else may.
     expect(isSupportedNodeCommand(entry.command), `unsupported stdio command ${JSON.stringify(entry.command)}`).toBe(true);
-    // `CLAUDE_PROJECT_DIR` is exported to MCP server subprocesses by Claude Code
-    // itself, verified live against a loaded plugin, so no explicit `env`
-    // mapping is carried. The server still refuses to start without it.
+    // The server anchors its project directory on its launch directory, which
+    // Claude Code spawns as the session project directory — verified live
+    // against a loaded plugin — so no explicit `env` mapping is carried.
+    // `HERDR_PROJECT_DIR` remains an explicit override for hosts that need one.
     expect(entry.env).toBeUndefined();
   });
 

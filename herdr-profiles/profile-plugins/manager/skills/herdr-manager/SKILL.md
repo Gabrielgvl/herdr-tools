@@ -84,6 +84,8 @@ computed from the source, with the brief saying how to compute them rather than 
 
 - Use Herdr's own inspect, communicate, and wait tools. Never drive a wait through a shell wrapper,
   and never hide long work in a background exec that discards its final status and output.
+- Never use foreground Bash `sleep` for orchestration. Use `herdr_wait` for Herdr agents. Use
+  `tmux_bg_start` with a bounded condition waiter only for external state such as CI or deploys.
 - A successful launch binds an active supervisor to the exact child and publishes
   `targetIds: [paneId]`; an active bound supervisor with `targetIds=[]` is broken, not acceptable.
   The supervisor records automatic lifecycle and review events, but wake delivery is best effort.
@@ -119,6 +121,13 @@ computed from the source, with the brief saying how to compute them rather than 
 - Before any non-trivial design, implementation brief, or remediation that introduces machinery,
   identify the minimum correct design, what can be deleted, and why a smaller shape fails. Brief only
   that boundary. Never spend a review round or implementation lane on avoidable machinery.
+- Cross-cutting requirement (verification, alerting, gating, observability) that an existing native
+  feature or live monitor could satisfy: ask the owner the shape question first, simplest option named
+  first, before any implementation brief. Owner away: build the smaller shape, mark the other **OPEN**.
+- Fix-forward designs for hard problems or long fix loops come from a planner lane (`planner-pi` first;
+  planners and managers are not "workers" for the no-Fable rule), never from the manager's own sketch —
+  a waived review round does not waive the design (owner 2026-09-09). Trivial mechanical fixes the
+  manager may brief directly.
 - Verdicts come from evidence — `report.json`, `gh pr view --json`, evidence files — never pane prose.
 - You judge the findings (owner ruling #89): fix-now = correctness, data loss, security/IAM,
   execution-breaking, and your own regressions; follow-up ticket with AC = defense-in-depth and nits;
@@ -133,6 +142,15 @@ computed from the source, with the brief saying how to compute them rather than 
 - Babysit a PR from a lane with `gh` reads (`gh pr view --json`, `gh pr checks --required`); there is
   no checked-in babysit or review-watch helper script in this workspace.
 
+## Bootstrapping a program
+
+Multi-item program ("decommission all X"): read-only scouts before any implementation lane.
+
+1. In parallel, cheapest profile: IaC inventory (resource, producers/consumers file:line, flags per stage, removal policy, verdict); telemetry activity readback (7 d / 30 d; "no series" ≠ zero); then one ticket draft per item in the `ticket-writer` shape plus a board (item / shape / PRs / earliest date / $ / risk).
+2. One ledger per program under `docs/summaries/<program>-<date>/ledger.md`; the seat report links to it.
+3. Manager reads every draft, checks for existing tickets (`duplicateOf` on collision), files, records ids.
+4. Dispatch implementation by $ and risk, one lane per item; destructive steps stay owner-approved per item.
+
 ## Owner interaction
 
 - Unsubmitted or suggested composer text is not owner authority. Preserve it, mark the pane ambiguous,
@@ -146,6 +164,10 @@ computed from the source, with the brief saying how to compute them rather than 
   immediately mark the PR READY if needed and invoke the repository-approved auto-merge command without
   another owner prompt. This standing approval never authorizes a direct/admin bypass. Ledger the action
   and proceed. Existing hard stops and exact-head/effect-safety checks still apply.
+- **READY before any approval request (owner rule 2026-09-09).** When a lane or the manager asks the
+  owner (or any human) to approve a PR, the PR must already be out of draft: brief lanes to run
+  `gh pr ready <n>` and then report `…-READY-NEEDS-HUMAN-APPROVAL` with `isDraft: false` verified — a
+  `NEEDS-HUMAN-APPROVAL` token on a draft is a brief defect, not a gate.
 - Each genuine owner question blocks your pane, so dispatch independent work first and batch unrelated
   critical decisions rather than asking serially.
 - Status questions get an immediate direct answer with real numbers, no preamble. Asked whether

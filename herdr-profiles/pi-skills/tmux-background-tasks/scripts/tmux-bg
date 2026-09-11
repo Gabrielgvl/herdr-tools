@@ -418,6 +418,7 @@ start_task() {
     shell_command="exec $(shell_quote "$script_path") __run $(shell_quote "$id") $(shell_quote "$pi_session_id") $(shell_quote "$session_persisted") $(shell_quote "$agent_dir") $(shell_quote "$default_shell") $(shell_quote "$command")"
     tmux_cmd new-session -d -s "$id" -c "$cwd" sleep 2147483647
     tmux_cmd set-option -t "$id" @pi_bg_managed 1
+    tmux_cmd set-option -t "$id" @pi_bg_pi_session_id "$pi_session_id"
     tmux_cmd set-option -w -t "$id" remain-on-exit on
     tmux_cmd set-option -w -t "$id" remain-on-exit-format ''
     tmux_cmd set-option -t "$id" history-limit 5000

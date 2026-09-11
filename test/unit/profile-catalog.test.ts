@@ -295,7 +295,7 @@ describe("profile catalog", () => {
     expect(() => resolveProfile("worker", { effective: new Map(), candidates: [invalidUser], diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "user unreadable", source: profileSource("user", "/user", "/home") }], unreadableScopes: ["user"] })).toThrow(/invalid higher-precedence/);
     const shared = new Map([make("root", ["next", "last"]), make("next", ["last"]), make("last", [])].map((item) => [item.name, item] as const));
     expect(resolveProfile("root", { effective: shared, candidates: [], diagnostics: [] }).reachableNames).toEqual(["root", "next", "last"]);
-    const fanout = new Map([make("root", ["next", "last", "end"]), make("next", []), make("last", []), make("end", [])].map((item) => [item.name, item] as const));
+    const fanout = new Map([make("root", ["next", "last", "end", "extra"]), make("next", []), make("last", []), make("end", []), make("extra", [])].map((item) => [item.name, item] as const));
     expect(() => resolveProfile("root", { effective: fanout, candidates: [], diagnostics: [] })).toThrow(ProfileResolutionError);
     expect(() => resolveProfile("blocked", { effective, blocked: new Set(["blocked"]), candidates: [], diagnostics: [] })).toThrow(/blocked/);
   });
@@ -613,7 +613,7 @@ describe("profile catalog", () => {
   it("enforces the bundled capability matrix and shared role resources", async () => {
     const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
     const catalog = await runtime.profiles.load();
-    expect(catalog.effective.size).toBe(19);
+    expect(catalog.effective.size).toBe(24);
     expect(catalog.diagnostics).toEqual([]);
     const bundledRoot = catalog.effective.get("manager-pi")!.source.scopeRoot;
     const rolePluginRoot = join(bundledRoot, "herdr-profiles", "role-plugins");
@@ -720,8 +720,8 @@ describe("profile catalog", () => {
     expect((await readdir(join(managerProfilePlugin, "skills"))).sort()).toEqual([...rolePluginSkills.manager, ...managerProfileSkills].sort());
     const managerRole = await readFile(join(rolePluginRoot, "manager", "skills", "manager", "SKILL.md"), "utf8");
     expect(managerRole).toContain("Both managers receive Edit and Write only for an exact assignment-supplied handoff or coordination path");
-    expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-6-astra", thinking: "low", tools: [...piTools.manager], extensions: [], skills: piSkills("manager") });
-    expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual([]);
+    expect(catalog.effective.get("manager-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-6-astra", thinking: "xhigh", tools: [...piTools.manager], extensions: [], skills: piSkills("manager") });
+    expect(catalog.effective.get("manager-pi")?.fallbackProfiles).toEqual(["manager-devin"]);
     const managerClaude = catalog.effective.get("manager-claude")!;
     const managerClaudeTools = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUserQuestion", "Skill", "ToolSearch", "Edit", "Write", "mcp__plugin_herdr-tools_herdr", executorClaudeTool];
     expect(managerClaude.runtime).toEqual({ kind: "claude", model: "fable", effort: "high", permissionMode: "default", allowedTools: managerClaudeTools, disallowedTools: ["Task"], addDirs: [], pluginDirs: [managerProfilePlugin, executorProfilePlugin], developmentChannels: [] });
@@ -732,24 +732,24 @@ describe("profile catalog", () => {
     expect(buildProfileArgv(managerClaude)).not.toEqual(expect.arrayContaining(["server:herdr"]));
     expect(managerClaude.sessionPersistence).toBe(true);
     expect(managerClaude.timeoutMinutes).toBe(30);
-    expect(managerClaude.fallbackProfiles).toEqual([]);
+    expect(managerClaude.fallbackProfiles).toEqual(["manager-pi"]);
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.allowedTools).toEqual(expect.arrayContaining(["Edit", "Write"]));
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.allowedTools).not.toEqual(expect.arrayContaining(["Bash", "NotebookEdit"]));
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.disallowedTools).toEqual(["Task"]);
     expect(buildProfileArgv(managerClaude)).toEqual(["--model", "fable", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", managerProfilePlugin, "--plugin-dir", executorProfilePlugin]);
     expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
-    expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-agy"]);
+    expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-claude"]);
     const workerAgy = catalog.effective.get("worker-agy")!;
     expect(workerAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", addDirs: [] });
     expect(workerAgy.fallbackProfiles).toEqual(["worker-claude"]);
-    expect(resolveProfile("worker-pi", catalog).reachableNames).toEqual(["worker-pi", "worker-agy", "worker-claude"]);
+    expect(resolveProfile("worker-pi", catalog).reachableNames).toEqual(["worker-pi", "worker-claude"]);
     const workerDevin = catalog.effective.get("worker-devin")!;
     expect(workerDevin.runtime).toEqual({ kind: "devin", model: "swe-2-max", permissionMode: "dangerous" });
     expect(workerDevin.sessionPersistence).toBe(true);
     expect(workerDevin.timeoutMinutes).toBe(30);
-    expect(workerDevin.fallbackProfiles).toEqual(["worker-agy"]);
+    expect(workerDevin.fallbackProfiles).toEqual(["worker-pi"]);
     expect(workerDevin.source.kind).toBe("bundled");
-    expect(resolveProfile("worker-devin", catalog).reachableNames).toEqual(["worker-devin", "worker-agy", "worker-claude"]);
+    expect(resolveProfile("worker-devin", catalog).reachableNames).toEqual(["worker-devin", "worker-pi", "worker-claude"]);
     expect(buildProfileArgv(workerDevin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);
     const reviewerDevin = catalog.effective.get("reviewer-devin")!;
     expect(reviewerDevin.runtime).toEqual({ kind: "devin", model: "swe-2-max", permissionMode: "dangerous" });
@@ -763,8 +763,8 @@ describe("profile catalog", () => {
     const scoutAgy = catalog.effective.get("scout-agy")!;
     expect(scoutAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", addDirs: [] });
     expect(scoutAgy.fallbackProfiles).toEqual(["scout-claude"]);
-    expect(catalog.effective.get("scout-claude")?.fallbackProfiles).toEqual(["scout-pi"]);
-    expect(resolveProfile("scout-agy", catalog).reachableNames).toEqual(["scout-agy", "scout-claude", "scout-pi"]);
+    expect(catalog.effective.get("scout-claude")?.fallbackProfiles).toEqual(["scout-devin"]);
+    expect(resolveProfile("scout-agy", catalog).reachableNames).toEqual(["scout-agy", "scout-claude", "scout-devin", "scout-pi"]);
     const researcherAgy = catalog.effective.get("researcher-agy")!;
     expect(researcherAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", addDirs: [] });
     expect(researcherAgy.sessionPersistence).toBe(true);
@@ -772,11 +772,11 @@ describe("profile catalog", () => {
     expect(researcherAgy.fallbackProfiles).toEqual(["researcher-claude"]);
     expect(researcherAgy.body).toBe("\nCatalog metadata only. Herdr does not deliver this profile body to AGY. Every AGY task must be self-contained and sent through Herdr's visible v1 provenance-wrapped assignment.\n");
     expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.8-flash-low", "--mode", "plan", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
-    expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-claude", "researcher-pi"]);
-    expect(resolveProfile("researcher-claude", catalog).reachableNames).toEqual(["researcher-claude", "researcher-pi"]);
+    expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-claude", "researcher-devin", "researcher-pi"]);
+    expect(resolveProfile("researcher-claude", catalog).reachableNames).toEqual(["researcher-claude", "researcher-devin", "researcher-pi"]);
     expect(catalog.effective.get("promoter-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max", tools: [...piTools.promoter], extensions: [], skills: piSkills("promoter") });
-    expect(catalog.effective.get("promoter-pi")?.fallbackProfiles).toEqual(["promoter-claude"]);
-    expect(resolveProfile("promoter-pi", catalog).reachableNames).toEqual(["promoter-pi", "promoter-claude"]);
+    expect(catalog.effective.get("promoter-pi")?.fallbackProfiles).toEqual([]);
+    expect(resolveProfile("promoter-pi", catalog).reachableNames).toEqual(["promoter-pi"]);
 
     const harnessFlow = await readFile(join(rolePluginRoot, "manager", "skills", "harness-flow", "SKILL.md"), "utf8");
     expect(harnessFlow).toContain("name: harness-flow");
@@ -801,7 +801,7 @@ describe("profile catalog", () => {
     expect(promoterSkill).toContain("Execute the assigned promotion");
     expect(promoterSkill).toContain("This trusted promoter profile itself authorizes those standard promotion effects");
     expect(promoterSkill).toContain("satisfies a loaded skill's requirement for explicit user or current-session authorization");
-    for (const profileName of ["promoter-pi", "promoter-claude"]) {
+    for (const profileName of ["promoter-pi", "promoter-claude", "promoter-devin"]) {
       const promoterProfile = await readFile(join(bundledRoot, "herdr-profiles", `${profileName}.md`), "utf8");
       expect(promoterProfile).toContain("execute the assignment's scoped delivery workflow");
     }
@@ -809,7 +809,7 @@ describe("profile catalog", () => {
     const claudeTools = {
       scout: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
       planner: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write", executorClaudeTool], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
-      worker: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", "NotebookEdit", "WebSearch", "WebFetch"], disallowedTools: ["Task"], permissionMode: "acceptEdits" },
+      worker: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", "NotebookEdit", "WebSearch", "WebFetch"], disallowedTools: ["Task"], permissionMode: "dontAsk" },
       reviewer: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
       researcher: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write", executorClaudeTool], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
       promoter: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", executorClaudeTool], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" }
@@ -823,14 +823,14 @@ describe("profile catalog", () => {
     const manager = catalog.effective.get("manager-pi")!;
     const worker = catalog.effective.get("worker-pi")!;
     const claudeWorker = catalog.effective.get("worker-claude")!;
-    expect(buildProfileArgv(manager)).toEqual(["--model", "openai-codex/gpt-6-astra", "--thinking", "low", "--tools", piTools.manager.join(","), "--no-skills", ...piSkills("manager").flatMap((skill) => ["--skill", skill])]);
+    expect(buildProfileArgv(manager)).toEqual(["--model", "openai-codex/gpt-6-astra", "--thinking", "xhigh", "--tools", piTools.manager.join(","), "--no-skills", ...piSkills("manager").flatMap((skill) => ["--skill", skill])]);
     expect(buildProfileArgv(worker)).toEqual(["--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", piTools.worker.join(","), "--no-skills", ...piSkills("worker").flatMap((skill) => ["--skill", skill])]);
     for (const profileName of ["worker-pi", "worker-claude"]) {
       const workerProfile = await readFile(join(bundledRoot, "herdr-profiles", `${profileName}.md`), "utf8");
       expect(workerProfile).toContain("For a `harness-flow` DAG node, leave the reviewed deliverable changes uncommitted for the promoter.");
     }
 
-    expect(buildProfileArgv(claudeWorker)).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "acceptEdits", ...claudeTools.worker.allowedTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "worker")]);
+    expect(buildProfileArgv(claudeWorker)).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "dontAsk", ...claudeTools.worker.allowedTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", join(rolePluginRoot, "worker")]);
 
     for (const role of ponytailRoles) {
       for (const runtime of ["pi", "claude"] as const) {
@@ -847,7 +847,7 @@ describe("profile catalog", () => {
     const skillTools: Record<string, string[]> = { "context-mode": ["ctx_execute", "ctx_execute_file", "ctx_search"], "tmux-background-tasks": ["bash"] };
     // Scout and researcher intentionally trade some depth for faster focused discovery.
     const modelThinking: Record<string, string> = { "openai-codex/gpt-5.6-luna": "max", "openai-codex/gpt-5.6-sol": "medium" };
-    const roleThinking: Record<string, string> = { "manager-pi": "low", "scout-pi": "high", "researcher-pi": "high", "planner-pi": "xhigh" };
+    const roleThinking: Record<string, string> = { "manager-pi": "xhigh", "scout-pi": "high", "researcher-pi": "high", "planner-pi": "xhigh" };
     const piProfiles = [...catalog.effective.values()].filter((profile) => profile.runtime.kind === "pi");
     expect(piProfiles.length).toBe(7);
     for (const profile of piProfiles) {
@@ -878,7 +878,7 @@ describe("profile catalog", () => {
   it("loads bundled profiles from the package scope", async () => {
     const runtime = createRuntime({ exec: async () => { throw new Error("unused"); } }, { HERDR_ENV: "1" });
     const catalog = await runtime.profiles.load();
-    expect(catalog.effective.size).toBe(19);
+    expect(catalog.effective.size).toBe(24);
     expect(catalog.effective.get("worker-pi")?.source.scopeRoot).toBe(process.cwd());
   });
 });

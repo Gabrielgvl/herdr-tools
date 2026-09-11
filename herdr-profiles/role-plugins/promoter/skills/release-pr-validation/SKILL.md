@@ -102,6 +102,10 @@ gh pr checks <n> --repo "$PR_REPO"
 
 Report check states accurately, but do not use any check result—including failed, cancelled, pending, queued, in-progress, or skipped—as an approval blocker. Do not require reruns, waivers, or equivalent successful checks before release approval. Staging deployment containment and applicable smoke results are the approval gate.
 
+**Named exception — `staging-failure-destinations-empty` (C-20638, post-mortem A6).** In `trycourier/backend` the `Release PR Checks` workflow reports environment state, not code health, so it *is* an approval blocker. It lists `backend-staging-SendFailureDestination-*` in `us-east-1` and `eu-west-1` and fails when any queue holds messages, printing each queue's depth and oldest-message age. A red gate means staging is still dropping sends into the failure destination: drain the backlog and fix its cause, or — only when the backlog is understood and accepted — add a line `SFD-EXCEPTION: <reason>` to the release PR body, which clears the gate and records the acceptance in the PR. Never approve a release over a red `staging-failure-destinations-empty` without such a line; on 2026-09-08 that queue sat at depth 65 for three days and release v0.1707.0 shipped the same behavior to production unnoticed.
+
+Structural failure mode (learned 2026-09-11): the workflow checks out `pull_request.base.sha`, frozen in the event payload. When the script itself is introduced by the release being checked (or is otherwise absent at the base SHA), every run of that event exits 127 — reruns cannot help. Verify whether the script exists on the base ref before trusting a red result; when it is structural, run the queue probe manually (same regions/queues, read-only `get-queue-attributes`), state the depths, and record acceptance via `SFD-EXCEPTION:` as above.
+
 ## Required staging deploy validation
 
 Validate staging deploy evidence in the repo that owns the selected PR, not in a hard-coded repo.
@@ -209,6 +213,7 @@ An isolated probe may provide functional staging evidence for shared libraries, 
 - Start from a fail-closed baseline, publish the synthetic document before its digest/activation marker, and publish the stop marker before cleanup.
 - Use a staging-only tenant and reserved recipient domains such as `example.com` or `example.invalid`; verify send acceptance, downstream retrieval/state, regional behavior, and archive/cleanup or documented retention.
 - Retrieve staging credentials without printing them, verify the AWS account/stage first, and keep identifiers out of the final report when the runbook requires secrecy.
+- For `trycourier/backend` `/send` smoke, mint a dedicated staging token (`dynamodb put-item` on `${PREFIX}-tenant-auth-tokens`) — a Lambda's `COURIER_AUTH_TOKEN` is the production credential, not a staging inbound credential. Full procedure and pitfalls: workspace `docs/staging-auth-and-release.md`.
 - Validate observability from the changed artifact itself: parse raw EMF/log envelopes and confirm the backend (for example CloudWatch or Datadog) received the expected namespace, metrics, dimensions, and safe properties.
 
 ## Comprehensive smoke matrix requirements

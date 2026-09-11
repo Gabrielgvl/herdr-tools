@@ -8,7 +8,7 @@ import { RuntimeOwnership } from "../../src/ownership.js";
 import { createPreflight, createToolSurface } from "../../src/tool-surface.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import { createLaunchTool } from "../../src/tools/launch.js";
-import { EXEC_FORCE_KILL_MS, EXEC_IDLE_GRACE_MS, EXEC_MAX_OUTPUT_BYTES, HOST_FIELDS, HostCapabilityError, StartupRefusal, createNodeExec, hostContext, resolveStartup, type ChildProcessLike, type SpawnLike } from "../../src/mcp/host.js";
+import { EXEC_FORCE_KILL_MS, EXEC_IDLE_GRACE_MS, EXEC_MAX_OUTPUT_BYTES, HOST_FIELDS, HostCapabilityError, StartupRefusal, createNodeExec, hostContext, resolveStartup, type ChildProcessLike, type SpawnLike, type StartupDependencies } from "../../src/mcp/host.js";
 import { stubSupervision } from "./supervision-fixtures.js";
 
 const snapshot = {
@@ -167,32 +167,45 @@ describe("MCP host capability proxy", () => {
 
 describe("MCP startup gating", () => {
   const directory = mkdtempSync(join(tmpdir(), "herdr-mcp-host-"));
+  const launchDir = mkdtempSync(join(tmpdir(), "herdr-mcp-launch-"));
   const file = join(directory, "not-a-directory");
   writeFileSync(file, "");
 
-  it("resolves the injected context and project directory in order", async () => {
-    await expect(resolveStartup({ env: { ...validEnv, CLAUDE_PROJECT_DIR: directory } })).resolves.toEqual({
+  it("resolves the injected context and explicit HERDR_PROJECT_DIR in order", async () => {
+    await expect(resolveStartup({ env: { ...validEnv, HERDR_PROJECT_DIR: directory }, cwd: () => launchDir })).resolves.toEqual({
       context,
       environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
       projectDir: directory
     });
   });
 
+  it("anchors on the launch directory when HERDR_PROJECT_DIR is unset", async () => {
+    await expect(resolveStartup({ env: { ...validEnv }, cwd: () => launchDir })).resolves.toMatchObject({ projectDir: launchDir });
+    // The default launch-directory source is the server process cwd.
+    await expect(resolveStartup({ env: { ...validEnv } })).resolves.toMatchObject({ projectDir: process.cwd() });
+  });
+
   it("refuses without HERDR_ENV, without valid injected identity, and without a usable project directory", async () => {
-    const refusals: Array<[NodeJS.ProcessEnv, string]> = [
-      [{ CLAUDE_PROJECT_DIR: directory }, "HERDR_ENV"],
-      [{ HERDR_ENV: "0", CLAUDE_PROJECT_DIR: directory }, "HERDR_ENV"],
-      [{ HERDR_ENV: "1", CLAUDE_PROJECT_DIR: directory }, "INJECTED_CONTEXT"],
-      [{ HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "bad\npane", CLAUDE_PROJECT_DIR: directory }, "INJECTED_CONTEXT"],
-      [{ ...validEnv }, "CLAUDE_PROJECT_DIR"],
-      [{ ...validEnv, CLAUDE_PROJECT_DIR: "" }, "CLAUDE_PROJECT_DIR"],
-      [{ ...validEnv, CLAUDE_PROJECT_DIR: "relative/project" }, "CLAUDE_PROJECT_DIR"],
-      [{ ...validEnv, CLAUDE_PROJECT_DIR: `${directory}\nother` }, "CLAUDE_PROJECT_DIR"],
-      [{ ...validEnv, CLAUDE_PROJECT_DIR: join(directory, "missing") }, "CLAUDE_PROJECT_DIR"],
-      [{ ...validEnv, CLAUDE_PROJECT_DIR: file }, "CLAUDE_PROJECT_DIR"]
+    const refusals: Array<[StartupDependencies, string]> = [
+      [{ env: { HERDR_PROJECT_DIR: directory } }, "HERDR_ENV"],
+      [{ env: { HERDR_ENV: "0", HERDR_PROJECT_DIR: directory } }, "HERDR_ENV"],
+      [{ env: { HERDR_ENV: "1", HERDR_PROJECT_DIR: directory } }, "INJECTED_CONTEXT"],
+      [{ env: { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "bad\npane", HERDR_PROJECT_DIR: directory } }, "INJECTED_CONTEXT"],
+      // An explicit value wins over a valid launch directory and fails loud when unusable.
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: "" }, cwd: () => launchDir }, "PROJECT_DIR"],
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: "relative/project" }, cwd: () => launchDir }, "PROJECT_DIR"],
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: `${directory}\nother` }, cwd: () => launchDir }, "PROJECT_DIR"],
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: "/" }, cwd: () => launchDir }, "PROJECT_DIR"],
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: join(directory, "missing") }, cwd: () => launchDir }, "PROJECT_DIR"],
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: file }, cwd: () => launchDir }, "PROJECT_DIR"],
+      // The launch-directory fallback refuses degenerate or unreadable anchors.
+      [{ env: { ...validEnv }, cwd: () => "/" }, "PROJECT_DIR"],
+      [{ env: { ...validEnv }, cwd: () => "relative" }, "PROJECT_DIR"],
+      [{ env: { ...validEnv }, cwd: () => { throw new Error("cwd deleted"); } }, "PROJECT_DIR"],
+      [{ env: { ...validEnv }, cwd: () => join(launchDir, "missing") }, "PROJECT_DIR"]
     ];
-    for (const [env, reason] of refusals) {
-      const refusal = await resolveStartup({ env }).catch((error: unknown) => error);
+    for (const [deps, reason] of refusals) {
+      const refusal = await resolveStartup(deps).catch((error: unknown) => error);
       expect(refusal).toBeInstanceOf(StartupRefusal);
       expect(refusal).toMatchObject({ code: "STARTUP_REFUSED", reason });
       expect((refusal as Error).message).not.toContain(directory);
@@ -202,10 +215,12 @@ describe("MCP startup gating", () => {
   it("reads the ambient environment and a real directory stat by default", async () => {
     const original = { ...process.env };
     try {
-      Object.assign(process.env, validEnv, { CLAUDE_PROJECT_DIR: directory });
+      Object.assign(process.env, validEnv, { HERDR_PROJECT_DIR: directory });
       await expect(resolveStartup()).resolves.toMatchObject({ projectDir: directory });
+      delete process.env.HERDR_PROJECT_DIR;
+      await expect(resolveStartup()).resolves.toMatchObject({ projectDir: process.cwd() });
     } finally {
-      for (const key of ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "CLAUDE_PROJECT_DIR"]) {
+      for (const key of ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "HERDR_PROJECT_DIR"]) {
         if (original[key] === undefined) delete process.env[key];
         else process.env[key] = original[key];
       }

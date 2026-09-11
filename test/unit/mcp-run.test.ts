@@ -80,7 +80,7 @@ const snapshot = {
 };
 
 const projectDir = mkdtempSync(join(tmpdir(), "herdr-mcp-run-"));
-const env = { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p", CLAUDE_PROJECT_DIR: projectDir };
+const env = { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p", HERDR_PROJECT_DIR: projectDir };
 const emptyCatalog = { effective: new Map(), candidates: [], diagnostics: [] } as never;
 
 function fakeExec(): { exec: PiExec; calls: string[][] } {
@@ -165,9 +165,9 @@ afterEach(() => {
 describe("MCP server startup", () => {
   it("refuses to serve without gating and never connects a transport or calls the CLI", async () => {
     const refusals: Array<[NodeJS.ProcessEnv, string]> = [
-      [{ CLAUDE_PROJECT_DIR: projectDir }, "HERDR_ENV"],
-      [{ HERDR_ENV: "1", CLAUDE_PROJECT_DIR: projectDir }, "INJECTED_CONTEXT"],
-      [{ HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p" }, "CLAUDE_PROJECT_DIR"]
+      [{ HERDR_PROJECT_DIR: projectDir }, "HERDR_ENV"],
+      [{ HERDR_ENV: "1", HERDR_PROJECT_DIR: projectDir }, "INJECTED_CONTEXT"],
+      [{ HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p", HERDR_PROJECT_DIR: "relative/project" }, "PROJECT_DIR"]
     ];
     for (const [refusedEnv, reason] of refusals) {
       const [, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -227,7 +227,7 @@ describe("MCP server startup", () => {
     });
     expect(handle).toBeUndefined();
     expect(exits).toEqual([1]);
-    expect(errors[0]).toContain("CLAUDE_PROJECT_DIR");
+    expect(errors[0]).toContain("PROJECT_DIR");
   });
 
   it("writes refusals to stderr and exits the process by default", async () => {
@@ -258,7 +258,7 @@ describe("MCP server startup", () => {
 
   it("bounds and sanitizes the fatal entry line with the same conventions", () => {
     expect(fatalLine(new Error("transport exploded"))).toBe(`${MCP_SERVER_NAME} mcp server failed: transport exploded\n`);
-    const hostile = fatalLine(new Error(`forged\nCLAUDE_PROJECT_DIR=/etc\r ${"y".repeat(2_000)}`));
+    const hostile = fatalLine(new Error(`forged\nHERDR_API_KEY=/etc\r ${"y".repeat(2_000)}`));
     expect(hostile.split("\n")).toHaveLength(2);
     expect(hostile.endsWith("\n")).toBe(true);
     expect(hostile.slice(`${MCP_SERVER_NAME} mcp server failed: `.length, -1)).toHaveLength(500);
@@ -381,7 +381,7 @@ describe("MCP tool serving", () => {
     await harness.handle.shutdown();
   });
 
-  it("uses CLAUDE_PROJECT_DIR as the operational working directory", async () => {
+  it("uses HERDR_PROJECT_DIR as the operational working directory", async () => {
     const harness = await start();
     expect(harness.handle.projectDir).toBe(projectDir);
     expect(projectDir).not.toBe(process.cwd());
@@ -390,6 +390,13 @@ describe("MCP tool serving", () => {
     const create = harness.calls.find((call) => call[0] === "tab" && call[1] === "create");
     expect(create?.[create.indexOf("--cwd") + 1]).toBe(projectDir);
     expect(harness.handle.ownership.snapshot().map((resource) => resource.kind)).toEqual(["tab", "pane"]);
+    await harness.handle.shutdown();
+  });
+
+  it("anchors on the injected launch directory when HERDR_PROJECT_DIR is unset", async () => {
+    const launchOnlyEnv = { HERDR_ENV: env.HERDR_ENV, HERDR_WORKSPACE_ID: env.HERDR_WORKSPACE_ID, HERDR_TAB_ID: env.HERDR_TAB_ID, HERDR_PANE_ID: env.HERDR_PANE_ID };
+    const harness = await start({ env: launchOnlyEnv, cwd: () => projectDir });
+    expect(harness.handle.projectDir).toBe(projectDir);
     await harness.handle.shutdown();
   });
 

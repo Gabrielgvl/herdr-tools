@@ -33,6 +33,7 @@ const MAX_STDERR_LINE_CHARS = 500;
 export interface McpRunDependencies {
   env?: NodeJS.ProcessEnv;
   stat?: (path: string) => Promise<DirectoryStat>;
+  cwd?: () => string;
   exec?: PiExec;
   promptClient?: AgentPromptClient;
   attachments?: AttachmentStore;
@@ -108,7 +109,7 @@ export function packageRoot(moduleUrl: string, exists: (path: string) => boolean
 }
 
 /**
- * Start the stdio Herdr tools server for a Claude manager session.
+ * Start the stdio Herdr tools server for a manager session on any MCP host.
  *
  * Startup is fail-closed and ordered; a refusal writes one bounded stderr line
  * and exits non-zero with no tool registered, no transport connected, and no
@@ -120,7 +121,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
 
   let startup;
   try {
-    startup = await resolveStartup({ ...(deps.env ? { env: deps.env } : {}), ...(deps.stat ? { stat: deps.stat } : {}) });
+    startup = await resolveStartup({ ...(deps.env ? { env: deps.env } : {}), ...(deps.stat ? { stat: deps.stat } : {}), ...(deps.cwd ? { cwd: deps.cwd } : {}) });
   } catch (error) {
     writeStderr(refusalLine(error));
     exit(1);

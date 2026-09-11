@@ -37,11 +37,13 @@ runtime:
 - Only typed primary overrides `model` and `addDirs` are allowed. Overrides never leak
   into fallbacks; fallback profiles keep their own defaults.
 - `researcher-agy` uses `plan` and falls back to `researcher-claude`, yielding exactly
-  `researcher-agy -> researcher-claude -> researcher-pi`. `scout-agy` uses `plan` and
-  yields `scout-agy -> scout-claude -> scout-pi`. `worker-agy` uses `accept-edits` and
-  falls back to `worker-claude`; the implementation default `worker-devin` yields
-  exactly `worker-devin -> worker-agy -> worker-claude`, and `worker-pi` remains
-  selectable with `worker-pi -> worker-agy -> worker-claude`.
+  `researcher-agy -> researcher-claude -> researcher-devin -> researcher-pi`.
+  `scout-agy` uses `plan` and yields `scout-agy -> scout-claude -> scout-devin ->
+  scout-pi`. `worker-agy` uses `accept-edits` and falls back to `worker-claude`; the
+  implementation default `worker-devin` yields exactly `worker-devin -> worker-pi ->
+  worker-claude`. `worker-agy` is no longer on that default chain and remains directly
+  selectable with `worker-agy -> worker-claude`; `worker-pi` remains selectable with
+  `worker-pi -> worker-claude`.
 - The required Markdown body remains catalog metadata. AGY receives repository
   `AGENTS.md` through its native discovery and receives the manager's one explicit,
   visible v1 provenance-wrapped assignment through the existing prompt channel.
@@ -150,7 +152,9 @@ dependent work. Preserve the child, evidence, and recovery handles for inspectio
 
 The sole fallback exception remains the existing exact, non-killed,
 untruncated pre-interactive `agent_start_failed` envelope followed by fresh authoritative
-proof that no agent exists. Only then may the chain advance from AGY to Pi to Claude.
+proof that no agent exists. Only then may the chain advance along the declared
+fallback graph — `scout-agy` and `researcher-agy` to their Claude, Devin, then Pi
+profiles, and `worker-agy` to `worker-claude`.
 No readiness, prompt, identity, supervision, timeout, or uncertain-effect failure may
 select a fallback.
 
@@ -288,7 +292,8 @@ Files: `herdr-profiles/researcher-agy.md`, `herdr-profiles/scout-agy.md`,
 Add the three profiles, recommend the scout and researcher AGY defaults, route worker
 fallbacks through worker AGY, move catalog assertions from 13 to 15, and state that
 every AGY assignment is self-contained and provenance-wrapped; profile bodies never
-reach AGY.
+reach AGY. (Routing and count superseded by ADR-026: `worker-devin -> worker-pi ->
+worker-claude`, `worker-agy -> worker-claude` only, 24 bundled profiles.)
 
 ### Slice 8: living documentation
 

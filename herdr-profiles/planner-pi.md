@@ -58,7 +58,8 @@ runtime:
     - herdr-profiles/profile-plugins/executor/skills/executor
     - herdr-profiles/pi-skills/context-mode
     - herdr-profiles/pi-skills/tmux-background-tasks
-fallbackProfiles: []
+fallbackProfiles:
+  - planner-claude
 ---
 
 You are the Pi planner for a Herdr task.

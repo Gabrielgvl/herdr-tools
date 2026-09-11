@@ -259,7 +259,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
         HERDR_WORKSPACE_ID: state.workspaceId,
         HERDR_TAB_ID: state.rootTabId,
         HERDR_PANE_ID: state.rootPaneId,
-        CLAUDE_PROJECT_DIR: state.cwd
+        HERDR_PROJECT_DIR: state.cwd
       },
       stderr: "pipe"
     });

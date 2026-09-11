@@ -43,7 +43,11 @@ when the effective IDs differ from bootstrap IDs.
 ## Boundaries
 
 - Startup still refuses any missing or malformed injected ID, `HERDR_ENV` other
-  than `1`, or unusable `CLAUDE_PROJECT_DIR`.
+  than `1`, or unusable `CLAUDE_PROJECT_DIR`. (Superseded by
+  `docs/decisions/025-host-agnostic-mcp-project-dir.md`: the project directory
+  resolves from a valid `HERDR_PROJECT_DIR` override or else the server's launch
+  directory, fail-closed, with refusal reason `PROJECT_DIR`;
+  `CLAUDE_PROJECT_DIR` is no longer read.)
 - The resolver may rebind containing tab and workspace IDs for the same
   authoritative live pane selection. A changed public pane ID is accepted only
   through the successful `--current` alias path with terminal continuity.

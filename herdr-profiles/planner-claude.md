@@ -26,7 +26,7 @@ runtime:
     - herdr-profiles/role-plugins/planner
     - herdr-profiles/profile-plugins/executor
 fallbackProfiles:
-  - planner-pi
+  - planner-devin
 ---
 
 You are the Claude planner for a Herdr task.

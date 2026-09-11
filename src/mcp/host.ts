@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { ExecOptions, ExecResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { boundedEvidence, CliProtocolError, type PiExec } from "../cli.js";
@@ -40,7 +40,7 @@ export function hostContext(host: HerdrToolHost): ExtensionContext {
   }) as unknown as ExtensionContext;
 }
 
-export type StartupRefusalReason = "HERDR_ENV" | "INJECTED_CONTEXT" | "CLAUDE_PROJECT_DIR";
+export type StartupRefusalReason = "HERDR_ENV" | "INJECTED_CONTEXT" | "PROJECT_DIR";
 
 export class StartupRefusal extends Error {
   readonly code = "STARTUP_REFUSED" as const;
@@ -58,6 +58,8 @@ export interface DirectoryStat {
 export interface StartupDependencies {
   env?: NodeJS.ProcessEnv;
   stat?: (path: string) => Promise<DirectoryStat>;
+  /** Launch-directory source; defaults to `process.cwd`. Injectable so tests stay hermetic. */
+  cwd?: () => string;
 }
 
 export interface StartupContext {
@@ -74,8 +76,16 @@ function safeDirectory(value: string | undefined): string | undefined {
 
 /**
  * Fail-closed startup gating, in order: Herdr environment, injected Herdr
- * identity, then the manager session's project directory. Messages never echo
+ * identity, then the session's project directory. Messages never echo
  * environment values.
+ *
+ * The project directory is host-agnostic: an explicit `HERDR_PROJECT_DIR`
+ * wins, and when it is unset the server's own launch directory anchors the
+ * session, which is the directory every observed MCP host (Claude Code,
+ * Devin, pi-mcp-adapter) already spawns stdio servers from. An explicit value
+ * that fails validation refuses startup rather than silently re-anchoring to
+ * the launch directory, and a launch directory of a filesystem root is not a
+ * project anchor.
  */
 export async function resolveStartup(deps: StartupDependencies = {}): Promise<StartupContext> {
   const env = deps.env ?? process.env;
@@ -87,18 +97,26 @@ export async function resolveStartup(deps: StartupDependencies = {}): Promise<St
   if (!injected.idsPresent || !injected.idsValid) {
     throw new StartupRefusal("INJECTED_CONTEXT", "injected Herdr workspace, tab, and pane identifiers are missing or malformed");
   }
-  const projectDir = safeDirectory(env.CLAUDE_PROJECT_DIR);
+  let candidate = env.HERDR_PROJECT_DIR;
+  if (candidate === undefined) {
+    try {
+      candidate = (deps.cwd ?? (() => process.cwd()))();
+    } catch {
+      candidate = undefined;
+    }
+  }
+  const projectDir = candidate !== undefined && dirname(candidate) !== candidate ? safeDirectory(candidate) : undefined;
   if (projectDir === undefined) {
-    throw new StartupRefusal("CLAUDE_PROJECT_DIR", "CLAUDE_PROJECT_DIR must be an absolute single-line path to an existing directory");
+    throw new StartupRefusal("PROJECT_DIR", "HERDR_PROJECT_DIR or the server launch directory must be an absolute single-line path to an existing directory below the filesystem root");
   }
   let directory: DirectoryStat;
   try {
     directory = await stat(projectDir);
   } catch {
-    throw new StartupRefusal("CLAUDE_PROJECT_DIR", "CLAUDE_PROJECT_DIR must be an absolute single-line path to an existing directory");
+    throw new StartupRefusal("PROJECT_DIR", "HERDR_PROJECT_DIR or the server launch directory must be an absolute single-line path to an existing directory below the filesystem root");
   }
   if (!directory.isDirectory()) {
-    throw new StartupRefusal("CLAUDE_PROJECT_DIR", "CLAUDE_PROJECT_DIR must be an absolute single-line path to an existing directory");
+    throw new StartupRefusal("PROJECT_DIR", "HERDR_PROJECT_DIR or the server launch directory must be an absolute single-line path to an existing directory below the filesystem root");
   }
   return {
     context: injected.context,

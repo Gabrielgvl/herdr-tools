@@ -168,6 +168,8 @@ special_status="$($BG status "$special_task")"
 list_status="$($BG list)"
 assert_contains "$list_status" "command=$special_command"
 tmux -L "$SOCKET" show-options -p -v -t "$special_task" @pi_bg_wrapper | grep -qx 1 || fail "wrapper marker missing"
+tmux -L "$SOCKET" show-options -v -t "$special_task" @pi_bg_pi_session_id | grep -qx notify-session-special || fail "origin session marker missing"
+assert_not_contains "$(tmux -L "$SOCKET" show-options -v -t "$special_task" @pi_bg_pi_session_id)" "$special_command"
 assert_contains "$($BG kill "$special_task")" "killed $special_task"
 assert_fails "$BG" status "$special_task"
 

@@ -1,19 +1,19 @@
 ---
 name: pi-review-pr
-description: Adversarial cross-model review of a GitHub PR or an ordinary architecture plan/blueprint via the local pi-review CLI driving pi. Use for PR review, cross-model review, second-model review, ordinary plan review, blueprint review, or architecture-document review — including GitHub PR URLs, local Markdown files, and Notion blueprint links. Critical-plan review uses Oracle.
+description: Adversarial cross-model review of a GitHub PR or architecture plan/blueprint via the local pi-review CLI driving pi. Use for PR review, cross-model review, second-model review, plan review, blueprint review, or architecture-document review — including GitHub PR URLs, local Markdown files, and Notion blueprint links. Oracle is used only when Gabriel explicitly requests it.
 ---
 
 # pi-review a PR or ordinary plan
 
-Runs the local `pi-review` CLI (adversarial cross-model harness: agentic finder(s) → semantic dedupe → cold-start refuter → deterministic verdict) against either a GitHub PR or an ordinary plan/architecture document. PR mode reviews a disposable detached worktree without touching the current checkout. Plan mode reviews a document against the selected repository's real architecture and implementation context. Critical plans route to Oracle instead. Source: `~/workspace/pi-review` (README has the model policy and full contract).
+Runs the local `pi-review` CLI (adversarial cross-model harness: agentic finder(s) → semantic dedupe → cold-start refuter → deterministic verdict) against either a GitHub PR or a plan/architecture document. PR mode reviews a disposable detached worktree without touching the current checkout. Plan mode reviews a document against the selected repository's real architecture and implementation context. Oracle is never selected automatically; it requires Gabriel's explicit request for the current task. Source: `~/workspace/pi-review` (README has the model policy and full contract).
 
 ## Steps
 
 1. **Preflight**: run `command -v pi-review || echo MISSING`. If missing, report that pi-review is not installed (`ln -s ~/workspace/pi-review/bin/pi-review.mjs ~/.local/bin/pi-review`) and stop.
 2. **Choose the mode from the user's actual target**:
    - A GitHub PR number or URL means PR mode: `pi-review pr <number|url>`.
-   - A local document, Notion page, blueprint, proposal, RFC, ADR, or explicit request to review an ordinary plan means plan mode: `pi-review plan <file...>`.
-   - A critical plan routes to Oracle instead of this plan mode. Treat a plan as critical when it is explicitly marked critical or when it covers an irreversible or high-blast-radius architecture, security or IAM, infrastructure or deployment, production, or data-migration decision.
+   - A local document, Notion page, blueprint, proposal, RFC, ADR, or explicit request to review a plan means plan mode: `pi-review plan <file...>`.
+   - Route to Oracle only when Gabriel explicitly requests Oracle for the current task; risk or criticality alone never authorizes it.
    - A non-GitHub document URL is **not** a malformed PR reference. Do not ask for a PR after the user confirms they want the document reviewed.
    - If it is genuinely unclear whether the user wants implementation or design reviewed, ask once before spending on model calls.
 3. **Prepare the target**:
@@ -234,3 +234,15 @@ pi-review runs a **convergence protocol**: every finding becomes a durable *thre
 - Rebased since the last round → `--rebased`. The session is keyed per PR number, so a retargeted stacked PR keeps its rounds.
 - Unchanged thread text across rounds is persisted text, not a missed read (`traces/adjudicator-*.jsonl`). Before re-fixing a still-open thread, get file:line proof at the reviewed head.
 - Runner clone with `staging` checked out: `git pull --ff-only origin staging` before each run.
+
+## Lessons 2026-09-09 (multi-repo, response rounds, closure state)
+- The pinned CLI has NO `--repo` flag; the repository is inferred from the cwd's git remote — run from a clean checkout of the target repo (e.g. a `services-review-runner` clone), never from an author worktree. Two lanes lost a run each to `--repo`.
+- Response bundles use the ROUND-1 review session + invocation ids (the round that opened the thread), not a later round's; thread escalate/resolve commands fail with `session/invocation mismatch` on the wrong pair. `pi-review check` is attach-only.
+- `NEEDS_SWEEP` with zero findings after a response round is the expected closure state under ruling #89 (one round is the gate for config PRs) — record it, do not run a paid sweep.
+- One host review slot across ALL workspaces on the machine: check `ps` for a live `pi-review` before starting; a queued lane sitting `done`/idle between waits is not stale.
+- Standing brief clauses: author/fix lanes never run `pi-review`; review lanes never push; a confirmed finding on a file the PR does not touch is dismissed as out of scope and filed as a follow-up ticket with AC.
+
+## Lessons 2026-09-10
+- `check` (the `$0 check`) is **attach-only and its session store is per runner clone**: run it from `backend-review-runner` / `services-review-runner` after `git fetch origin staging:staging`; from a worktree it reports "requested session does not exist in this repository".
+- Exit 2 with `Post https://api.github.com/graphql … i/o timeout` is a network fault, not a harness or PR problem: probe `curl -s -m 8 https://api.github.com/`, wait ~5 min, retry once; do not burn the harness re-run on it.
+- A response-first round can keep round-1 threads **still-open on stale evidence** even when the fixed head no longer has the cited code (its re-verification quotes round-1 file:line). Do not spend a third round: human-close with file:line proof at the final head + `$0 check` (`--rebased` after an amend).

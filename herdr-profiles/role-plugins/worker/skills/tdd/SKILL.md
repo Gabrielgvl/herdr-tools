@@ -78,6 +78,8 @@ Before writing checks, create a compact trace from the approved acceptance crite
 6. For the provisional tests-first default, write meaningful positive and negative native test or contract checks before implementation. Use tests-after, verifier-first, or another `REASONABLE_TO_TEST` protocol only when the task shape makes it more appropriate; record why without presenting that choice as proven. Do not force an artificial red test when the selected protocol is not tests-first. A parallel partition may implement only its scoped test-case mappings; it must not execute another criterion's external evidence.
 7. Run the target repository's configured test or check command before implementation when tests-first is selected. Confirm that any red result is for the intended behavior and not setup or environment failure. If the check is immediately green, apply the immediate-green rule above.
 
+For fail-closed branches, the fixture set must include at least one recoverable-class error and one ambiguous-class error, asserting different outcomes; a single "throttling" fixture proving the stop is not sufficient.
+
 ### Phase 3 — Implement and verify
 
 8. Make the smallest change that satisfies the mapped criteria. Do not add speculative abstractions or refactor unrelated code.

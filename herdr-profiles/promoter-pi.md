@@ -53,8 +53,7 @@ runtime:
     - herdr-profiles/profile-plugins/executor/skills/executor
     - herdr-profiles/pi-skills/context-mode
     - herdr-profiles/pi-skills/tmux-background-tasks
-fallbackProfiles:
-  - promoter-claude
+fallbackProfiles: []
 ---
 
 You are the Pi promoter for a Herdr task.

@@ -313,7 +313,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
           // three IDs without accepting an unrelated replacement.
           HERDR_TAB_ID: originalTabId,
           HERDR_PANE_ID: originalPaneId,
-          CLAUDE_PROJECT_DIR: cwd
+          HERDR_PROJECT_DIR: cwd
         },
         stderr: "pipe"
       });
@@ -362,15 +362,15 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const profiles = await call("herdr_inspect", { mode: "collection", collection: "profiles" });
       const catalog = evidence(profiles);
       expect(catalog).toMatchObject({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success" });
-      expect(Array.isArray(catalog.items) ? catalog.items : []).toHaveLength(19);
+      expect(Array.isArray(catalog.items) ? catalog.items : []).toHaveLength(24);
       expect(catalog.items).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "worker-pi", kind: "pi" }),
-        expect.objectContaining({ name: "promoter-pi", kind: "pi", fallbackProfiles: ["promoter-claude"] }),
-        expect.objectContaining({ name: "manager-claude", kind: "claude", model: "fable", effort: "high", permissionMode: "default", fallbackProfiles: [] }),
+        expect.objectContaining({ name: "promoter-pi", kind: "pi", fallbackProfiles: [] }),
+        expect.objectContaining({ name: "manager-claude", kind: "claude", model: "fable", effort: "high", permissionMode: "default", fallbackProfiles: ["manager-pi"] }),
         expect.objectContaining({ name: "scout-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["scout-claude"] }),
         expect.objectContaining({ name: "worker-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["worker-claude"] }),
         expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-claude"] }),
-        expect.objectContaining({ name: "worker-devin", kind: "devin", model: "swe-2-max", permissionMode: "dangerous", fallbackProfiles: ["worker-agy"] }),
+        expect.objectContaining({ name: "worker-devin", kind: "devin", model: "swe-2-max", permissionMode: "dangerous", fallbackProfiles: ["worker-pi"] }),
         expect.objectContaining({ name: "reviewer-devin", kind: "devin", model: "swe-2-max", permissionMode: "dangerous", fallbackProfiles: ["reviewer-pi"] })
       ]));
       expect(catalog.diagnostics ?? []).toEqual([]);
@@ -545,9 +545,9 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
 
       // Fail-closed startup, exercised against the same built entry.
       const refusals: Array<[NodeJS.ProcessEnv, string]> = [
-        [{ HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath, HERDR_WORKSPACE_ID: workspaceId, HERDR_TAB_ID: rootPane.tab_id, HERDR_PANE_ID: rootPane.pane_id }, "CLAUDE_PROJECT_DIR"],
-        [{ HERDR_SOCKET_PATH: socketPath, HERDR_WORKSPACE_ID: workspaceId, HERDR_TAB_ID: rootPane.tab_id, HERDR_PANE_ID: rootPane.pane_id, CLAUDE_PROJECT_DIR: cwd }, "HERDR_ENV"],
-        [{ HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath, CLAUDE_PROJECT_DIR: cwd }, "INJECTED_CONTEXT"]
+        [{ HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath, HERDR_WORKSPACE_ID: workspaceId, HERDR_TAB_ID: rootPane.tab_id, HERDR_PANE_ID: rootPane.pane_id, HERDR_PROJECT_DIR: join(cwd, "missing") }, "PROJECT_DIR"],
+        [{ HERDR_SOCKET_PATH: socketPath, HERDR_WORKSPACE_ID: workspaceId, HERDR_TAB_ID: rootPane.tab_id, HERDR_PANE_ID: rootPane.pane_id, HERDR_PROJECT_DIR: cwd }, "HERDR_ENV"],
+        [{ HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath, HERDR_PROJECT_DIR: cwd }, "INJECTED_CONTEXT"]
       ];
       for (const [refusedEnv, reason] of refusals) {
         const refusal = await new Promise<{ code: number | null; stderr: string; stdout: string }>((settle) => {

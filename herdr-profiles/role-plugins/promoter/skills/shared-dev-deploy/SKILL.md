@@ -29,6 +29,12 @@ local Services `cdk deploy`, and multi-function/full deploys are enforced by
   record the worktree HEAD and fetched base and verify their relationship with `git merge-base`.
 - If fetch, fork, base identity, ancestry, or the intended revision is ambiguous, stop before the
   deploy. A stale-base deploy previously removed an export construct.
+- Validating unmerged work is the exception to "create from `origin/staging`": deploy the exact
+  branch head (`deploy-dev.yml --ref <branch>`). Merge order is a plan decision, never a technical
+  prerequisite for a dev deploy — never defer a dev run waiting for merges.
+- When the work spans several branches, build one dev-only integration branch (cherry-picks allowed,
+  labelled as such in its commits, never merged, never a review surface), deploy that head, and
+  record it in the evidence. Every reviewed PR still travels its own path.
 - Keep the deploy footprint to the changed function/project. A full stack is not the default.
 
 ## Use the minimum-footprint path
@@ -97,3 +103,36 @@ Each of these returns success or silence while doing nothing, which is the dange
 **Long deployments must be detached.** The agent harness kills a lane's background task at roughly twenty minutes; one full dev deployment died mid-packaging (verified zero AWS effect: stack `LastUpdatedTime` unchanged, no non-terminal stacks, target functions at baseline). Run the deployment as a detached process (`nohup setsid` on a wrapper that sets its own environment) started through the lock wrapper, then **poll the log and the stack from fresh tool calls** — never hold one call open across the CloudFormation update. A client-side kill mid-update is the real unknown-effect hazard; detaching protects the stack while leaving the operator able to stop it by PID or `cancel-update-stack`.
 
 **Zero-effect proof is the retry precondition.** After any interrupted attempt, prove `effectStarted=false` before a corrected retry: stack status and `LastUpdatedTime` unchanged, no stack in a non-terminal state, no deployment process alive, target functions still at their pre-attempt `LastModified`/`CodeSha256`, lock released. A retry on that evidence consumes no additional owner authorization.
+
+## Lessons 2026-09-06 — the resolved-environment budget
+
+- **Measure the resolved Lambda environment, not the source YAML.** The guard that matters is
+  `Σ len(key)+len(value)` over the *resolved* `Environment.Variables` against Lambda's 4,096-byte
+  limit. A source-byte check on the YAML block is a proxy that moves in the wrong direction: deleting
+  a function-local empty override *shrinks* the source text while *restoring* the inherited provider
+  value and growing the deployed environment.
+- **Dev understates staging and production.** Measured 2026-09-06 on the ProviderSend path:
+  `ProviderSendQueueWorker` dev 3,450 B, production 3,666 B, staging over 4,096 B with the same PR
+  applied. Read staging and production with `aws lambda get-function-configuration --query
+  Environment.Variables` (or `serverless print --stage <stage> --region <region>` where credentials
+  allow) for every function the change touches, and keep ≥ 300 B of margin. Report key counts, byte
+  totals and presence booleans only — never a value.
+- **Retire only keys the deployed code cannot read.** Cite the grep over the function's import graph
+  per key. An empty function-local override of a provider-level key is not a retirement candidate.
+
+## Lessons 2026-09-09 — the env-noop guard (C-20644 / A14)
+
+- **`deploy_lambda.sh` used to silently no-op an intended env change.** `serverless deploy function`
+  drops the *entire* `Environment` block when any resolved value is a CloudFormation intrinsic
+  (`node_modules/serverless/lib/plugins/aws/deploy-function.js:335-336`), printing "Function
+  configuration did not change" instead of failing — a 2026-09-08 dev deploy with exported
+  `PROVIDER_SEND_TRANSPORT`/`_EPOCH` shipped code but left the env untouched. `deploy_lambda.sh` now
+  detects that shape (an intrinsic present + an exported var differing from what's deployed) and
+  fails loudly, naming the variable(s) and pointing to `full_deploy.sh` or a direct
+  `aws lambda update-function-configuration`; `--allow-env-noop` bypasses it deliberately. The dev
+  drift this caused on 2026-09-08 (8 functions) stands until C-20606 fixes the underlying defaults.
+
+## Lessons 2026-09-10 — single-app ARM64 dispatch and the `skip_tests` guard
+- When the AMD64 `deploy` job is broken by another team's app (C-20715: an arm64 image built in the AMD64 lane), deploy one arm64 app alone: `gh workflow run deploy-dev.yml --ref <branch> -f deploy_amd64=false -f deploy_arm64=true -f arm64_project=<app>`; the shared `nx deploy config` step of the failed run has usually already landed — check its log before assuming.
+- `skip_tests=true` needs `tests_green_run_id` whose RUN conclusion is `success` on the exact head; a run with green tests but a failed deploy job is rejected by `verify-skip` — rerun with tests (≈ 25 min) instead of retrying the skip.
+- Pi lanes running `git fetch`/`push` inside background shells can hang on SSH indefinitely; briefs wrap network git in `timeout 120` and report a block instead of looping.

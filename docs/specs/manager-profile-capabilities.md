@@ -16,13 +16,13 @@ Success means profile launches are useful by default, hidden subagent spawning i
 - Both manager profiles orchestrate visible workers and may use Edit/Write only for an exact assignment-supplied handoff or coordination path. Both managers now hold a shell capability -- Claude through `Bash`, Pi through the Codex adapter's `exec_command`/`write_stdin` -- and both require direct owner approval for shell and control-plane actions. Neither manager may perform unapproved implementation, testing/smoke execution, deployment, merge, publication, or other mutation.
 - Use role-scoped tool allowlists while retaining installed extension discovery.
 - Configure role-specific skills.
-- Advisory defaults are manager-pi for generic management, worker-devin for implementation, planner-claude first with planner-pi fallback for planning, scout-agy for reconnaissance, researcher-agy for research, and reviewer-devin for review. The exact chains are `scout-agy -> scout-claude -> scout-pi`, `researcher-agy -> researcher-claude -> researcher-pi`, `worker-devin -> worker-agy -> worker-claude`, and `reviewer-devin -> reviewer-pi -> reviewer-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.
+- Advisory defaults are manager-pi for generic management, worker-devin for implementation, planner-pi for planning, scout-agy for reconnaissance, researcher-agy for research, and reviewer-devin for review. The exact chains are `manager-claude -> manager-pi -> manager-devin`, `planner-pi -> planner-claude -> planner-devin`, `scout-agy -> scout-claude -> scout-devin -> scout-pi`, `researcher-agy -> researcher-claude -> researcher-devin -> researcher-pi`, `worker-devin -> worker-pi -> worker-claude`, `reviewer-devin -> reviewer-pi -> reviewer-claude`, and `promoter-devin -> promoter-claude -> promoter-pi`. `worker-agy` remains directly selectable with `worker-agy -> worker-claude`. Select manager-claude when the owner requests Claude/Fable management or Claude-to-Claude succession. Planner order is intentional and must not be inverted.
 
 ## Assumptions
 
-1. `manager-pi` uses `openai-codex/gpt-6-astra` with `thinking: low`, a 30-minute timeout, and persistent Pi session state.
-2. `manager-claude` uses the rolling `fable` alias, which Claude Code resolves to the latest supported Fable model, with high effort, default permission mode, a 30-minute timeout, persistent session state, and no fallback because manager identity must not silently change. It declares no development channels, so it emits no `--dangerously-load-development-channels` opt-in and its supervisor wakes are recovered by `herdr_jobs` polling.
-3. Existing Claude model and fallback choices remain unchanged. `scout-agy` and `researcher-agy` use `gemini-3.8-flash-low`; `worker-agy` uses `gemini-3.8-flash-high`. AGY modes are fixed as `plan`, `plan`, and `accept-edits` respectively.
+1. `manager-pi` uses `openai-codex/gpt-6-astra` with `thinking: xhigh`, a 30-minute timeout, and persistent Pi session state.
+2. `manager-claude` uses the rolling `fable` alias, which Claude Code resolves to the latest supported Fable model, with high effort, default permission mode, a 30-minute timeout, persistent session state, and the declared chain `manager-claude -> manager-pi -> manager-devin`, reachable only through the exact pre-interactive no-agent start failure. It declares no development channels, so it emits no `--dangerously-load-development-channels` opt-in and its supervisor wakes are recovered by `herdr_jobs` polling.
+3. Claude model pins remain unchanged; the fallback graph was rewired under ADR-026. `scout-agy` and `researcher-agy` use `gemini-3.8-flash-low`; `worker-agy` uses `gemini-3.8-flash-high`. AGY modes are fixed as `plan`, `plan`, and `accept-edits` respectively.
 4. Pi extension discovery remains enabled. The globally configured `pi-mcp-adapter` provides Executor; manager, planner, researcher, and promoter allowlist its tools and load its skill. Every Pi profile keeps `runtime.extensions` empty to avoid duplicate adapter registration.
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
@@ -140,7 +140,7 @@ AGY initially publishes provisional pane, terminal, name, and kind supervision b
 
 ### Devin role profiles
 
-`worker-devin` is the implementation default. It launches Devin with `--model swe-2-max --permission-mode dangerous` and falls back to `worker-agy`, yielding exactly `worker-devin -> worker-agy -> worker-claude`; `worker-pi` remains selectable when the owner requests the Pi runtime explicitly. `reviewer-devin` is the review default with the same Devin runtime and `reviewer-devin -> reviewer-pi -> reviewer-claude`; its assignment and profile body are explicitly read-only, and it never approves or promotes its own work. Reasoning depth rides on the selected model tier because the Devin CLI exposes no effort flag, and sessions always persist. Only `model` and `permissionMode` may be overridden; `permissionMode` accepts the canonical `normal`, `accept-edits`, `smart`, and `dangerous` values (`autonomous` is not expressible because it requires `--sandbox`). Devin profile bodies are catalog metadata, so every launch requires the same visible, provenance-wrapped, self-contained typed `assignment` as AGY. `dangerous` auto-approves every tool call, so manager assignments must bound scope and required tests. Devin reports its native session through the installed `herdr:devin` hook at session start, so it binds under the strict exact-identity path rather than AGY's provisional one.
+`worker-devin` is the implementation default. It launches Devin with `--model swe-2-max --permission-mode dangerous` and falls back to `worker-pi`, yielding exactly `worker-devin -> worker-pi -> worker-claude`; `worker-agy` remains directly selectable with `worker-agy -> worker-claude` when the owner requests the AGY runtime explicitly. `reviewer-devin` is the review default with the same Devin runtime and `reviewer-devin -> reviewer-pi -> reviewer-claude`; its assignment and profile body are explicitly read-only, and it never approves or promotes its own work. Reasoning depth rides on the selected model tier because the Devin CLI exposes no effort flag, and sessions always persist. Only `model` and `permissionMode` may be overridden; `permissionMode` accepts the canonical `normal`, `accept-edits`, `smart`, and `dangerous` values (`autonomous` is not expressible because it requires `--sandbox`). Devin profile bodies are catalog metadata, so every launch requires the same visible, provenance-wrapped, self-contained typed `assignment` as AGY. `dangerous` auto-approves every tool call, so manager assignments must bound scope and required tests. Devin reports its native session through the installed `herdr:devin` hook at session start, so it binds under the strict exact-identity path rather than AGY's provisional one.
 
 ### Claude profiles
 
@@ -151,7 +151,7 @@ AGY initially publishes provisional pane, terminal, name, and kind supervision b
 | Reviewer | `dontAsk` | Planner set | `NotebookEdit`, `Task` |
 | Researcher | `dontAsk` | Planner set | `NotebookEdit`, `Task` |
 | Promoter | `dontAsk` | `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write` | `NotebookEdit`, `Task` |
-| Worker | `acceptEdits` | `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write`, `NotebookEdit`, `WebSearch`, `WebFetch` | `Task` |
+| Worker | `dontAsk` | `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write`, `NotebookEdit`, `WebSearch`, `WebFetch` | `Task` |
 
 Claude `allowedTools` pre-approves selected tools; `disallowedTools` supplies the actual hard exclusions. Every Claude profile loads exactly its role plugin directory.
 
@@ -194,7 +194,7 @@ For every non-manager role, edit/write may persist only an assignment-required h
 
 ### Researcher
 
-- Use `researcher-agy` by default, with the declared Pi then Claude fallback chain available only for an exact pre-interactive no-agent start failure.
+- Use `researcher-agy` by default, with the declared Claude, then Devin, then Pi fallback chain available only for an exact pre-interactive no-agent start failure.
 - Give AGY a self-contained assignment because its profile body never reaches the runtime.
 - Answer a focused question with bounded, cited findings.
 - Prefer primary sources and separate sourced facts from inference.
@@ -222,8 +222,8 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 
 ### Unit tests
 
-- Catalog discovers 17 bundled profiles with no diagnostics.
-- `manager-pi` and `manager-claude` have exact identity, model, authority prompt, tools, shared skill/plugin path, and empty fallbacks.
+- Catalog discovers 24 bundled profiles with no diagnostics.
+- `manager-pi` and `manager-claude` have exact identity, model, authority prompt, tools, shared skill/plugin path, and their declared fallback chains (`manager-pi -> manager-devin` and `manager-claude -> manager-pi` respectively).
 - Every Pi profile has a non-empty role allowlist and a scoped role skill; `manager-pi` additionally loads `harness-flow`.
 - Every Claude profile has explicit permission mode, allowed/disallowed tools, and its scoped role plugin. Executor-enabled roles also load the separate Executor plugin.
 - Every Pi and Claude profile includes edit/write for assignment-required handoffs; role contracts still prohibit unassigned repository mutation.
@@ -245,7 +245,7 @@ No interpolation, environment-dependent paths, compatibility aliases, or runtime
 - Add seven scope-local role plugin directories under `herdr-profiles/role-plugins/`.
 - Give each plugin a minimal Claude manifest and one `skills/<role>/SKILL.md` contract.
 - Keep role method in the shared skill; keep profile bodies focused on identity, authority, and expected result shape.
-- Add `herdr-profiles/manager-pi.md` with the approved Sol/high orchestration-only configuration and no fallback, plus `herdr-profiles/manager-claude.md` with the exact owner-gated Fable manager policy and no fallback.
+- Add `herdr-profiles/manager-pi.md` with the approved Sol/high orchestration-only configuration and no fallback, plus `herdr-profiles/manager-claude.md` with the exact owner-gated Fable manager policy and no fallback. (Fallback claims superseded by ADR-026: `manager-pi -> manager-devin` and `manager-claude -> manager-pi -> manager-devin`.)
 
 Checkpoint: load the catalog and build argv for the manager plus one Pi/Claude pair before changing every profile.
 
@@ -256,7 +256,7 @@ Checkpoint: load the catalog and build argv for the manager plus one Pi/Claude p
 - Keep models, reasoning, timeouts, persistence, and existing fallback direction unchanged.
 - Include `herdr_tab` in the manager set and the four approved background-job tools in `worker-pi`.
 
-Checkpoint: catalog resolution has 19 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root.
+Checkpoint: catalog resolution has 19 effective profiles, no diagnostics, and every scoped resource resolves under the bundled profile root. (Count superseded by ADR-026: 24 effective profiles.)
 
 ### 3. Enforce contracts in tests
 
@@ -291,7 +291,7 @@ HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration
 
 Then inspect the live profile collection from the built extension and confirm:
 
-- 17 effective profiles;
+- 17 effective profiles (superseded by ADR-026: 24 effective profiles);
 - no diagnostics;
 - `manager-pi` reports the exact approved tools and skill;
 - existing profiles report their role-specific resources.
@@ -349,7 +349,7 @@ Then inspect the live profile collection from the built extension and confirm:
 ## Success Criteria
 
 - `manager-pi` can visibly orchestrate profile-backed workers through Herdr and writes only exact assignment-supplied handoff or coordination paths.
-- All 17 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
+- All 24 profiles expose deliberate role capabilities rather than the unrestricted inherited tool set.
 - All Pi and Claude variants use one shared role skill source per role; the managers also expose the cross-role harness contract.
 - No-hidden-delegation boundaries are mechanically represented in profile configuration; read-only repository behavior remains an explicit role contract because those roles already have Bash and now also have edit/write for handoffs.
 - Unit tests, typecheck, lint, build, and integration tests pass.

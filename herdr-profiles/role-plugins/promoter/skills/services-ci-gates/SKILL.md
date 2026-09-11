@@ -61,7 +61,17 @@ The Nx deep-import/build-order exception below remains valid: classify it from t
 
 ## PR publication authorization
 
-Never publish a PR comment, inline comment, or review without explicit authorization from the user in the current session. Authorization to publish a review does not authorize review body text: use a bodyless review unless the user separately requests text. Do not publish validation summaries by default.
+Routine, prescribed delivery-gate writes are manager authority and need no per-action user permission:
+post the exact `/claude-review` trigger when this skill requires it and mark a clean PR READY. After every
+required exact-current-head gate passes, immediately mark the PR READY if needed and invoke the
+repository-approved auto-merge command without another owner prompt. This standing approval never
+authorizes a direct/admin bypass. Reverify the exact head and duplicate/history gate immediately before
+each write. Ask the owner only when the action changes scope or material cost, touches
+production/irreversible/high-blast-radius behavior, makes a security-policy trade-off, or bypasses
+normal governance.
+
+This standing authority does **not** authorize discretionary prose. Use a bodyless approval unless the
+user separately requests body text, and do not publish validation summaries by default.
 
 An explicitly authorized validation-plan comment uses exactly `<!-- aicodeflow-validation-plan:v1 ticket=<ticket-id> head=<40-char-sha> digest=<64-char-sha256> -->`, where the digest covers the formatted plan. Serialize publication with an atomic repo-git-common-dir lock, verify the current PR head, fetch and parse every existing issue-comment page before each write, and skip a matching marker. A lock, head, history-fetch, or parse error fails closed: publish nothing and report the gate blocked.
 
@@ -109,31 +119,59 @@ owner=trycourier
 repo=services
 pr=<n>
 
+# The authoritative sticky review is posted by `github-actions[bot]`, whose login
+# does not contain "claude", and it is edited in place, so its comment id never
+# changes. Selecting on login alone never collects it, and keying freshness on id
+# alone can never see an in-place edit. Every surface therefore also selects the
+# `<!-- backend-claude-review -->` marker, and every key carries the comment's own
+# `updated_at`, so an edited-in-place sticky result registers as a new result.
 collect_claude_results() {
   local issue_results review_results inline_results
   issue_results="$(gh api "repos/$owner/$repo/issues/$pr/comments" --paginate --jq '
     .[] | select(
-      ((.user.login // "") | ascii_downcase | contains("claude")) and
+      (((.user.login // "") | ascii_downcase | contains("claude")) or
+       ((.body // "") | contains("<!-- backend-claude-review -->"))) and
       ((.body // "") | length > 0)
     ) | {
-      key: ("issue:" + (.id | tostring)),
+      key: ("issue:" + (.id | tostring) + "@" + ((.updated_at // .created_at) // "")),
       surface: "issue",
       id,
       body,
+      updated_at: ((.updated_at // .created_at) // ""),
+      sticky: ((.body // "") | contains("<!-- backend-claude-review -->")),
       commit_id: (try ((.body // "") | capture("<!-- reviewed-tree: (?<sha>[0-9a-f]{40}) -->").sha) catch null)
     }
   ')" || return 1
   review_results="$(gh api "repos/$owner/$repo/pulls/$pr/reviews" --paginate --jq '
     .[] | select(
-      ((.user.login // "") | ascii_downcase | contains("claude")) and
+      (((.user.login // "") | ascii_downcase | contains("claude")) or
+       ((.body // "") | contains("<!-- backend-claude-review -->"))) and
       (((.body // "") | length > 0) or ((.state // "") | length > 0))
-    ) | {key: ("review:" + (.id | tostring)), surface: "review", id, body, state, commit_id}
+    ) | {
+      key: ("review:" + (.id | tostring) + "@" + ((.submitted_at // "") // "")),
+      surface: "review",
+      id,
+      body,
+      state,
+      updated_at: ((.submitted_at // "") // ""),
+      sticky: ((.body // "") | contains("<!-- backend-claude-review -->")),
+      commit_id
+    }
   ')" || return 1
   inline_results="$(gh api "repos/$owner/$repo/pulls/$pr/comments" --paginate --jq '
     .[] | select(
-      ((.user.login // "") | ascii_downcase | contains("claude")) and
+      (((.user.login // "") | ascii_downcase | contains("claude")) or
+       ((.body // "") | contains("<!-- backend-claude-review -->"))) and
       ((.body // "") | length > 0)
-    ) | {key: ("inline:" + (.id | tostring)), surface: "inline", id, body, commit_id}
+    ) | {
+      key: ("inline:" + (.id | tostring) + "@" + ((.updated_at // .created_at) // "")),
+      surface: "inline",
+      id,
+      body,
+      updated_at: ((.updated_at // .created_at) // ""),
+      sticky: ((.body // "") | contains("<!-- backend-claude-review -->")),
+      commit_id
+    }
   ')" || return 1
   printf '%s\n%s\n%s\n' "$issue_results" "$review_results" "$inline_results" | jq -s '.'
 }
@@ -147,7 +185,7 @@ if [ "$pre_request_head" != "$requested_head" ]; then
   exit 1
 fi
 
-# This write is allowed only when the user explicitly requested it in the current session.
+# This prescribed delivery-gate write is allowed when this skill requires it; no per-action prompt is needed.
 gh pr comment "$pr" --repo "$owner/$repo" --body "/claude-review" || exit 1
 
 review_results='[]'
@@ -176,7 +214,9 @@ for attempt in $(seq 1 40); do
         (["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"] | index($state)) != null)
     )]
   ' <<<"$head_bound_results")" || exit 1
-  if jq -e 'length > 0' <<<"$terminal_results" >/dev/null; then
+  sticky_results="$(jq '[.[] | select(.surface == "issue" and .sticky == true)]' <<<"$head_bound_results")" || exit 1
+  if jq -e 'length > 0' <<<"$terminal_results" >/dev/null &&
+     jq -e 'length > 0' <<<"$sticky_results" >/dev/null; then
     review_results="$terminal_results"
     break
   fi
@@ -189,11 +229,11 @@ if ! jq -e 'length > 0' <<<"$review_results" >/dev/null; then
 fi
 ```
 
-Do not use `jq -e '.[]'`, a bare jq query, or command exit status as the completion test: jq exits 0 for empty output in common query forms. A fresh issue comment is head-bound only when its `<!-- reviewed-tree: <sha> -->` marker equals the requested head, but issue and inline comments never complete the waiter by themselves. Review and inline results must likewise carry the requested head explicitly. Baseline freshness alone is insufficient because a delayed result from an earlier request can arrive after the new baseline. Only a new head-bound review with terminal state `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, or `DISMISSED` releases the waiter; harvest every new head-bound surface again before proceeding.
+Do not use `jq -e '.[]'`, a bare jq query, or command exit status as the completion test: jq exits 0 for empty output in common query forms. A fresh issue comment is head-bound only when its `<!-- reviewed-tree: <sha> -->` marker equals the requested head, but issue and inline comments never complete the waiter by themselves. Review and inline results must likewise carry the requested head explicitly. Baseline freshness alone is insufficient because a delayed result from an earlier request can arrive after the new baseline. Only both a new marker-bearing sticky issue comment bound to the requested head and a new head-bound review with terminal state `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, or `DISMISSED` release the waiter. The issue comment does not complete the waiter by itself; harvest every new head-bound surface again before proceeding.
 
 After the waiter returns, preserve this ordering:
 
-1. Harvest all three paginated surfaces again and inspect every new result. Presence is not the same as approval or cleanliness.
+1. Harvest all three paginated surfaces again and inspect every new result, including the marker-bearing sticky comment. Presence is not the same as approval or cleanliness.
 2. **Resolve every finding** before proceeding. If a fix changes the head, the prior review is stale: return to the baseline/request/wait cycle for the new head, subject to the same explicit authorization rule for the `/claude-review` comment.
 3. **Re-check current-head CI and mergeability** after the review findings are resolved. Confirm the reviewed head still equals the PR head, all required checks belong to and pass on that head, and `mergeable`/`mergeStateStatus` permit queueing. If the head changes during these checks, restart review validation for the new head.
 4. Only then queue auto-merge with the sole allowed method:
@@ -263,3 +303,13 @@ A sharded `test (N, 24.x)` job can fail with `Cannot find module '@trycourier/<p
 ## Local false-greens to distrust
 
 - Type-aware eslint rules (`no-unnecessary-type-assertion`, `enforce-module-boundaries`) resolve workspace types from built `dist` in CI but from a stale local `node_modules`/nx daemon otherwise → a local "clean" run can hide real CI findings. Do a fresh `pnpm install` (+ `nx build <lib>`) before trusting local type-aware lint.
+
+## CDK test hygiene (2026-09-06)
+
+- Test fixtures: `new App({ outdir })` under a per-file temp dir removed in `afterAll`; helpers remove their own `mkdtemp`. Leaks filled `/` to 100 % (~52 MB per synth × ~50 per run) and produced an ENOSPC Jest burst that looked like a mass regression — check `df -h /` before reading a mass failure. Fixed in #1715; eslint rule requested (`briefs/request-eslint-rule-no-raw-cdk-app-20260905.md`).
+
+## More false reds and greens (2026-09-06)
+
+- `rtk proxy env … npx cdk synth` exits 0 without running; run synth and the validator directly and check the `cdk.out` mtime.
+- READY or a body edit re-fires `pull_request` workflows and cancels the run in flight; read `statusCheckRollup`, not the run list.
+- Claude review on diffs above ~5k lines fails with `Review agent produced no comment body`; fallback = owner `system-courier` approval on the exact head + a review-gate closure note in the PR body (#93).

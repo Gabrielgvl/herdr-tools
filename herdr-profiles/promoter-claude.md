@@ -23,7 +23,8 @@ runtime:
   pluginDirs:
     - herdr-profiles/role-plugins/promoter
     - herdr-profiles/profile-plugins/executor
-fallbackProfiles: []
+fallbackProfiles:
+  - promoter-pi
 ---
 
 You are the Claude promoter for a Herdr task.

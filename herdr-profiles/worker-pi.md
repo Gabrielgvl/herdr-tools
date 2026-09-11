@@ -57,7 +57,7 @@ runtime:
     - herdr-profiles/pi-skills/context-mode
     - herdr-profiles/pi-skills/tmux-background-tasks
 fallbackProfiles:
-  - worker-agy
+  - worker-claude
 ---
 
 You are the Pi worker for a Herdr task.

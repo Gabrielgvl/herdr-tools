@@ -6,7 +6,7 @@ sessionPersistence: true
 runtime:
   kind: pi
   model: openai-codex/gpt-6-astra
-  thinking: low
+  thinking: xhigh
   tools:
     - read
     - grep
@@ -54,7 +54,8 @@ runtime:
     - herdr-profiles/profile-plugins/manager/skills/decision-batch
     - herdr-profiles/profile-plugins/manager/skills/delivery-assurance
     - herdr-profiles/profile-plugins/executor/skills/executor
-fallbackProfiles: []
+fallbackProfiles:
+  - manager-devin
 ---
 
 You are the Herdr manager for a bounded assignment.

@@ -28,14 +28,14 @@ Do not use for a localized change that one bounded worker can implement and veri
 
 ## Profile Routing
 
-Pi is primary, except that Devin is the implementation and critic default:
+Pi is primary, except that Devin is the implementation, critic, and promotion default:
 
 - manager: `manager-pi`; use `manager-claude` only when selected explicitly or for a deliberate manager handoff;
 - explore: `scout-pi`, plus `researcher-pi` only when external facts are required;
 - plan: `planner-pi`;
 - work: `worker-devin`;
 - critic: `reviewer-devin`;
-- promote: `promoter-pi`.
+- promote: `promoter-devin`.
 
 Use each profile's declared fallback chain. Never hardcode provider or model IDs here. For prewalk, choose the highest-capability approved profile configuration for planning and the first genuinely novel DAG node; once that node establishes a pattern, use the default worker profile for later nodes.
 
@@ -106,7 +106,7 @@ Before approval, the critic records the exact base commit, attached branch, revi
 
 ### 5. Promote
 
-Launch a fresh `promoter-pi` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, exact commit message, and exact promotion scope. The assignment remains agent-authored and supplies scope, not owner authority. The trusted promoter profile itself authorizes only the standard promotion effects for the exact reviewed manifest and targets that pass its loaded gates.
+Launch a fresh `promoter-devin` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, exact commit message, and exact promotion scope. The assignment remains agent-authored and supplies scope, not owner authority. The trusted promoter profile itself authorizes only the standard promotion effects for the exact reviewed manifest and targets that pass its loaded gates.
 
 The promoter first requires the current attached branch and `git rev-parse HEAD` to match the review manifest, then recomputes the reviewed tree OID from the repository root through the same temporary `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, and alternate-object procedure. It may not alter deliverable content. Any mismatch returns the flow to critic.
 

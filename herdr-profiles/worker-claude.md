@@ -7,7 +7,7 @@ runtime:
   kind: claude
   model: claude-opus-5
   effort: high
-  permissionMode: acceptEdits
+  permissionMode: dontAsk
   allowedTools:
     - Read
     - Glob

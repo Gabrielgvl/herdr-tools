@@ -4,6 +4,8 @@
 
 Implemented and accepted through Phase 5, including owner dogfooding of a live Fable manager session. Phase 6 (optional shared wording alignment) is not started.
 
+Superseded in part by `docs/decisions/025-host-agnostic-mcp-project-dir.md`: every passage below that pins `CLAUDE_PROJECT_DIR` as the startup gate — Assumptions 3-4, Startup gating, the gating/cwd and integration testing bullets, the startup success criterion, and the delivery stop condition — records the contract as implemented at the time, not the current one. The current gate is `HERDR_ENV=1` plus valid injected IDs plus a project directory resolved from a valid `HERDR_PROJECT_DIR` override or else the server's launch directory (`process.cwd()`), fail-closed with refusal reason `PROJECT_DIR`. Phase-report evidence is left verbatim as history.
+
 ## Objective
 
 Let an interactive Claude Fable session act as the primary Herdr manager by exposing the existing seven safe `herdr-tools` tools through a local stdio MCP adapter.
@@ -37,7 +39,7 @@ This slice is the Claude-to-Herdr control bridge and the manager plugin consolid
 
 1. The manager Claude session runs inside a Herdr pane, so `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID` are inherited by the MCP subprocess.
 2. Claude Code loads a local package through `--plugin-dir`, reads `.claude-plugin/plugin.json`, and resolves its `mcpServers` field to a sibling `mcp-servers.json` holding a top-level server map with no `mcpServers` wrapper, as the live Honcho plugin in this environment does. `${CLAUDE_PLUGIN_ROOT}` expands to the package root inside that map.
-3. Subprocess working directory is never trusted. `CLAUDE_PROJECT_DIR` must be present, absolute, and an existing directory; it is the profile-discovery `projectCwd` and the operational `cwd` for launch/pane/tab. There is no fallback.
+3. Subprocess working directory is never trusted. `CLAUDE_PROJECT_DIR` must be present, absolute, and an existing directory; it is the profile-discovery `projectCwd` and the operational `cwd` for launch/pane/tab. There is no fallback. (Superseded by ADR-025: the launch directory itself is the default anchor, and a valid `HERDR_PROJECT_DIR` is the explicit override.)
 4. Claude Code delivers `CLAUDE_PROJECT_DIR` to the MCP server environment. Confirmed in Phase 4: it is exported to MCP subprocesses by default, so no expansion entry is carried. The server never substitutes another value.
 5. `typebox` schemas are JSON Schema documents and can be published as MCP `inputSchema` after a structural adaptation for union roots. The adapter validates arguments with `typebox/value` before invoking a tool, which is exactly the guarantee the Pi host provides today.
 6. The shared tool modules can be imported in a plain Node process. They already import `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` for `truncateTail` and the compact renderers.
@@ -144,9 +146,9 @@ export function callTool(request: {
 
 1. `HERDR_ENV === "1"`.
 2. `readInjectedContext(process.env)` reports `idsPresent && idsValid`, providing syntactic bootstrap identity for the workspace, tab, and pane.
-3. `CLAUDE_PROJECT_DIR` is present, absolute (`path.isAbsolute`), and an existing directory (`fs.stat().isDirectory()`).
+3. `CLAUDE_PROJECT_DIR` is present, absolute (`path.isAbsolute`), and an existing directory (`fs.stat().isDirectory()`). (Superseded by ADR-025: the check is now a project directory resolved from `HERDR_PROJECT_DIR` or else `process.cwd()`, each required to be absolute, single-line, below the filesystem root, and an existing directory; the refusal reason is `PROJECT_DIR`.)
 
-The resolved `CLAUDE_PROJECT_DIR` is used as both the profile-discovery `projectCwd` and the operational `cwd`. `process.cwd()` is never read, and no path is derived from `import.meta.url` except the bundled profile directory, which keeps its current module-relative resolution.
+The resolved `CLAUDE_PROJECT_DIR` is used as both the profile-discovery `projectCwd` and the operational `cwd`. `process.cwd()` is never read, and no path is derived from `import.meta.url` except the bundled profile directory, which keeps its current module-relative resolution. (Superseded by ADR-025: the resolved project directory keeps both roles; `process.cwd()` is now the default source, and module-relative resolution is still limited to the bundled profile directory.)
 
 After startup, each context-dependent tool call reads `herdr pane current --current`, using the injected pane identity as the selection anchor, then verifies the returned effective pane against one authoritative `herdr api snapshot`. A Herdr alias may return a new public pane ID after a move. That changed ID is accepted only when the live and snapshot records carry the same terminal identity. The live tab and workspace IDs are the effective caller context, so stale ancestors after a pane move do not brick the tools. A bounded retry covers a concurrent move read. Missing or malformed injected identity, an unresolved or duplicate caller pane, incoherent relationships, pane replacement, protocol failure, or persistent topology drift fails closed. `herdr_inspect` context details expose injected and effective IDs plus `rebound`; other successful calls expose bounded `contextRebinding` details only when a rebind occurred. Health retains syntactic environment reporting and does not call stale ancestor IDs malformed.
 
@@ -203,7 +205,7 @@ Any failure that escapes startup entirely is written by `src/mcp-server.ts` thro
 
 The manifest `name` and the server key are pinned, because Claude derives tool names from both: the seven tools appear as `mcp__plugin_herdr-tools_herdr__herdr_inspect` through `mcp__plugin_herdr-tools_herdr__herdr_tab`. Renaming either segment rewrites every allowlist entry an owner or launch configuration may reference, so a rename is an owner decision, not an implementation detail.
 
-The plugin lives at `herdr-profiles/role-plugins/manager/`, so `${CLAUDE_PLUGIN_ROOT}/../../../` is the installed `herdr-tools` root and the built entry is the same code the Pi host runs. The server map carries no `env` mapping: Claude Code exports `CLAUDE_PROJECT_DIR` to MCP server subprocesses itself, confirmed by the official plugin reference and by the running Honcho plugin's subprocesses in this installation (Phase 4 evidence). The server still refuses to guess if it is ever absent.
+The plugin lives at `herdr-profiles/role-plugins/manager/`, so `${CLAUDE_PLUGIN_ROOT}/../../../` is the installed `herdr-tools` root and the built entry is the same code the Pi host runs. The server map carries no `env` mapping: Claude Code exports `CLAUDE_PROJECT_DIR` to MCP server subprocesses itself, confirmed by the official plugin reference and by the running Honcho plugin's subprocesses in this installation (Phase 4 evidence). The server still refuses to guess if it is ever absent. (Superseded by ADR-025: `CLAUDE_PROJECT_DIR` is no longer read at all; the no-`env` conclusion stands because the launch directory is the anchor and `HERDR_PROJECT_DIR` the override.)
 
 ### Local plugin loading only
 
@@ -305,8 +307,8 @@ No compatibility aliases, no reshaped tool names, no per-host schema variants, a
 - Error mapping: typed codes (`INVALID_INPUT`, `TARGET_NOT_FOUND`, `TARGET_AMBIGUOUS`, `CLI_TIMEOUT`, `CLI_PROTOCOL_ERROR`, `PROFILE_CATALOG_UNAVAILABLE`, `REVIEWER_FAILED`, `ABORTED`, `HOST_CAPABILITY_UNAVAILABLE`) survive to `isError: true` payloads; unknown tool names raise `MethodNotFound`.
 - Host proxy: `cwd` and `signal` reads succeed, symbol reads return `undefined`, `modelRegistry` and any other string read throw `HOST_CAPABILITY_UNAVAILABLE`, and each of the seven tools is exercised against a recording proxy to prove the read set is exactly `cwd` and `signal`.
 - Effective caller context: live `pane current --current` plus snapshot verification rebinds same-workspace and cross-workspace moves, accepts coherent unchanged reads, retries one concurrent topology race, and rejects unresolved, duplicate, incoherent, replacement, malformed, and protocol evidence.
-- Gating: missing/incorrect `HERDR_ENV`, missing or malformed injected IDs, and missing/relative/nonexistent `CLAUDE_PROJECT_DIR` each exit non-zero with no transport connect, no tool registration, and no CLI invocation.
-- Cwd rules: the resolved operational `cwd` equals `CLAUDE_PROJECT_DIR` for launch, pane, and tab argv; `process.cwd()` is never consulted.
+- Gating: missing/incorrect `HERDR_ENV`, missing or malformed injected IDs, and missing/relative/nonexistent `CLAUDE_PROJECT_DIR` each exit non-zero with no transport connect, no tool registration, and no CLI invocation. (Superseded by ADR-025: the variable is `HERDR_PROJECT_DIR`, with the launch directory as the default source.)
+- Cwd rules: the resolved operational `cwd` equals `CLAUDE_PROJECT_DIR` for launch, pane, and tab argv; `process.cwd()` is never consulted. (Superseded by ADR-025: `process.cwd()` is the default source and is consulted exactly when `HERDR_PROJECT_DIR` is unset.)
 - Wait host limits: every wait returns a job ID retrievable through `herdr_jobs`; a job beyond the effective cadence fails with `REVIEWER_FAILED`, while a wait within cadence needs no reviewer.
 - Lifecycle: shutdown fences and aborts active jobs, discards the in-memory registry, resets ownership, closes no Herdr resource, and exits 0; no notification, steer, or turn-injection call path exists in the MCP host.
 - Coverage thresholds stay at 100% statements, branches, functions, and lines for the included sources, with `src/mcp-server.ts` the only `coverage.exclude` entry.
@@ -315,12 +317,12 @@ No compatibility aliases, no reshaped tool names, no per-host schema variants, a
 
 Only in the disposable named session `herdr-tools-integration`, extending the existing harness and never touching the live workspace:
 
-- Build `dist/`, spawn `node dist/src/mcp-server.js` over stdio with `HERDR_ENV=1`, the disposable session's injected IDs, and `CLAUDE_PROJECT_DIR` set to the temporary fixture directory.
+- Build `dist/`, spawn `node dist/src/mcp-server.js` over stdio with `HERDR_ENV=1`, the disposable session's injected IDs, and `CLAUDE_PROJECT_DIR` set to the temporary fixture directory. (Superseded by ADR-025: the fixture directory is now delivered through `HERDR_PROJECT_DIR` or the spawned server's cwd.)
 - `tools/list` returns the seven names in order with object input schemas.
 - `tools/call` for `herdr_inspect` `health` and `collection: "profiles"` returns bounded authoritative evidence with no diagnostics.
 - One profile-backed `herdr_launch` into the disposable session preserves the v1 assignment envelope and reports typed effective-profile evidence; the created pane is closed through `herdr_pane` in the same run.
 - A detached `herdr_wait` job is created and then observed through `herdr_jobs` without any injected turn or self-communication.
-- Startup refusal is asserted for a missing `CLAUDE_PROJECT_DIR` and for `HERDR_ENV` unset.
+- Startup refusal is asserted for a missing `CLAUDE_PROJECT_DIR` and for `HERDR_ENV` unset. (Superseded by ADR-025: refusal is asserted for an invalid `HERDR_PROJECT_DIR` or an unusable launch directory under reason `PROJECT_DIR`.)
 - Existing provenance, topology, and profile launch assertions stay green.
 
 ## Staged tasks
@@ -461,7 +463,7 @@ Independently re-verified here: no global installation and no configuration writ
 - [x] A Claude Fable manager session in a Herdr pane lists and calls exactly the seven tools through the local stdio adapter. Proven twice: the disposable-session integration run lists and calls all seven over real stdio, and the dogfood run called all seven from a primary `claude-fable-5` session loaded with local `--plugin-dir`.
 - [x] Pi and Claude hosts run the same tool implementation and profile catalog, with no duplicated schema or policy.
 - [x] `@modelcontextprotocol/sdk` is the only added runtime dependency.
-- [x] Startup refuses to serve without `HERDR_ENV=1`, valid injected IDs, and a valid absolute existing `CLAUDE_PROJECT_DIR`, and never falls back to subprocess or module paths.
+- [x] Startup refuses to serve without `HERDR_ENV=1`, valid injected IDs, and a valid absolute existing `CLAUDE_PROJECT_DIR`, and never falls back to subprocess or module paths. (Superseded by ADR-025: the criterion is now a valid `HERDR_PROJECT_DIR` or a valid launch directory; module paths remain unused.)
 - [x] Profile discovery, prompt sources, bounded fallback, ownership, and v1 provenance behave identically across hosts.
 - [x] Detached waits are created and polled through `herdr_jobs`, with no self-communication and no automatic turn injection.
 - [x] Every wait is detached and polled through `herdr_jobs`; jobs beyond the effective review cadence fail closed with a typed reviewer error.
@@ -473,7 +475,7 @@ Independently re-verified here: no global installation and no configuration writ
 
 Stop and report instead of improvising when:
 
-- `CLAUDE_PROJECT_DIR` cannot be delivered to the MCP subprocess in any documented form.
+- `CLAUDE_PROJECT_DIR` cannot be delivered to the MCP subprocess in any documented form. (Superseded by ADR-025: delivery no longer matters; the launch directory is the anchor and `HERDR_PROJECT_DIR` the override.)
 - The plugin manifest or top-level server-map contract differs from Phase 1 evidence in a way that requires a different packaging shape.
 - The manager session needs the package installed from a marketplace or any other cached location, which this slice's server path cannot support.
 - Keeping the executable entry inside `src/` conflicts with typecheck, lint, or emit configuration in a way that would force an untyped root shim.

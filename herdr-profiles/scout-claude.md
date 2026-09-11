@@ -22,7 +22,7 @@ runtime:
   pluginDirs:
     - herdr-profiles/role-plugins/scout
 fallbackProfiles:
-  - scout-pi
+  - scout-devin
 ---
 
 You are the Claude scout for a Herdr task.

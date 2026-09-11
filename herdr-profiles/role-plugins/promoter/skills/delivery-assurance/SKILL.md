@@ -64,12 +64,16 @@ At planning:
    dependencies, and evidence for omissions or contradictions.
 3. The authorized mapper persists agreements, disagreements, and every omission disposition in the
    existing Scope Review, then reads back the document and affected native graph before implementation.
+4. Before writing or revising the plan, recompute surface ownership and projected changed-source LOC.
 
 After implementation or a review fix, run a fresh delta challenger against the exact diff and
 reconcile it into the same document before evidence or review resumes. Before review, readiness,
 merge, or closure, live-read the current document and graph; a cached or transcript-only read is not
 proof. For a one-surface standalone leaf, record its self-ownership and an explicit complete-scope
 reconciliation rather than manufacturing a child.
+
+Keep one closure matrix for all review findings. After the first full review, review only the delta
+and unresolved findings unless the architecture changes again.
 
 ## 3. Exact-revision evidence publication and invalidation
 
@@ -92,6 +96,9 @@ Applicability or exemption comes from `dev-evidence-gate`; task type alone never
 
 A changed acceptance criterion, requirement, owner, dependency, contract, IAM binding, migration
 strategy, or affected code/infra surface is a graph change, not a chat note:
+
+An owner-approved scope expansion immediately invalidates prior review, CI, deploy, and smoke evidence,
+even before code changes.
 
 1. Pause affected unmerged PRs and writes only; never rewrite terminal child history.
 2. Follow native relations to identify the native blocker subgraph. If blast radius is unknown,

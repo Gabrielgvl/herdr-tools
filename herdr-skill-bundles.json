@@ -13,19 +13,19 @@
   "bundles": {
     "herdr-profiles/profile-plugins/manager/skills/manager": {
       "source": "./herdr-profiles/role-plugins/manager/skills/manager",
-      "treeHash": "dca876e5dfdd440c5b37345b722094b99254bfc163529c000550538ce52b8233"
+      "treeHash": "2c1e36317a3cf0bd68dd20c1d7cb051944dc6ebea35209d0bce9b03a37d54766"
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",
-      "treeHash": "322c5238f9f675d7d9c58d167a7948e1a501023a9ea518b2cc51a7732f7e4d73"
+      "treeHash": "022c9cfaef217316c0e4f7e0890050a5a63c2b16be94b91864b38cdded498881"
     },
     "herdr-profiles/profile-plugins/manager/skills/decision-batch": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/decision-batch",
-      "treeHash": "74fef67031a29c6ee42d643e0ac61a243d6722695bf657b19050563f9ed09209"
+      "treeHash": "d0adbbb9e193b64b4bbc2b165d4eb4d48c3dd8ca01a69672e123aaf901181a27"
     },
     "herdr-profiles/profile-plugins/manager/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4d625f0f4328587d90ecafcf1440e843118400321fba0c18c985a4524728ab60"
+      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
     },
     "herdr-profiles/profile-plugins/manager/skills/engineering-project-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/engineering-project-manager",
@@ -33,15 +33,15 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/herdr-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/herdr-manager",
-      "treeHash": "5da886e9d30fe64dd4cfc617281840fcda6495e707fd888b50af487b128fdd45"
+      "treeHash": "70e840c638cf2ce0935c44237b7edd47ee682ff1f0171c6c8cbe8bf0ebd0e769"
     },
     "herdr-profiles/profile-plugins/manager/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "d68a425d40821b2b2d841bf447417588af6bbe4be5c7d37b49288eb2562b7d2b"
+      "treeHash": "b4535594407765abfebfd6674ab3cafe7382389368dbd10ba97b09c1dda42609"
     },
     "herdr-profiles/profile-plugins/manager/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "43644ca6b0a7d39a02d844a6fc8c7475c460683d6ba09baf279d63ef8e5612d7"
+      "treeHash": "b7cfc6e90382c5a3e91c50425bb3bf71cfa06efeec37645a474844c53d5bd585"
     },
     "herdr-profiles/role-plugins/planner/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -53,7 +53,7 @@
     },
     "herdr-profiles/role-plugins/planner/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4d625f0f4328587d90ecafcf1440e843118400321fba0c18c985a4524728ab60"
+      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
     },
     "herdr-profiles/role-plugins/planner/skills/engineering-project-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/engineering-project-manager",
@@ -77,31 +77,31 @@
     },
     "herdr-profiles/role-plugins/promoter/skills/courier-pr-gates": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/courier-pr-gates",
-      "treeHash": "b7fffd9ef4fd4d32659e72c5d5e75ac7a2b43f00b465b1693bbc13b2744a247d"
+      "treeHash": "235401c6689be72f137b898d0081164fc7e59b9274fb7a4747b572ddf0fada81"
     },
     "herdr-profiles/role-plugins/promoter/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4d625f0f4328587d90ecafcf1440e843118400321fba0c18c985a4524728ab60"
+      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
     },
     "herdr-profiles/role-plugins/promoter/skills/dev-evidence-gate": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/dev-evidence-gate",
-      "treeHash": "d143dfc8e3f5c6f59e5b29d8dded82df3dda082775c5f07e668a6d90002e0631"
+      "treeHash": "53df806d3c06254a93f5f1c576fd1a49fdf268bdaac22bebaf6cae4c56bac2fa"
     },
     "herdr-profiles/role-plugins/promoter/skills/git-flow": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/git-flow",
-      "treeHash": "7abc71ead89845c9a7756ff28940bbd4da51030a1e5e2c3fa0346b266cf8862f"
+      "treeHash": "3d7991d78cbafb9203518b5cb7b45aaf9f572212a7c467e52fd8994b053d14a4"
     },
     "herdr-profiles/role-plugins/promoter/skills/release-pr-validation": {
       "source": "/home/gabriel/workspace/courier/.pi/skills/release-pr-validation",
-      "treeHash": "64c60ffe366a755b4a69f1bf151356bb89626e2c0818e114615b7654772ec9ba"
+      "treeHash": "3478ef2f41a34cca2c8935a17a0abdf971f9c18c47541aea78aa7ab1d080817c"
     },
     "herdr-profiles/role-plugins/promoter/skills/services-ci-gates": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/services-ci-gates",
-      "treeHash": "564ffc7830cc49ce731dc29846b0deb157c8f13b9b8e304a30957e39815fe211"
+      "treeHash": "41bdf8a61c9999dbc782b7a6605f0b271f2ab302a99c49e49575357deee02146"
     },
     "herdr-profiles/role-plugins/promoter/skills/shared-dev-deploy": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/shared-dev-deploy",
-      "treeHash": "348a5b8fdf715df5f5bc0d95ef284a05d0c8e7742783bf83a86acad38355f62c"
+      "treeHash": "b1d95b542131f1bbb1b20c160664e22bd51da509c7f6ec4786a37fcc60845186"
     },
     "herdr-profiles/role-plugins/researcher/skills/humanizer": {
       "source": "/home/gabriel/.codex/skills/humanizer",
@@ -113,15 +113,15 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4d625f0f4328587d90ecafcf1440e843118400321fba0c18c985a4524728ab60"
+      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
     },
     "herdr-profiles/role-plugins/reviewer/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "d68a425d40821b2b2d841bf447417588af6bbe4be5c7d37b49288eb2562b7d2b"
+      "treeHash": "b4535594407765abfebfd6674ab3cafe7382389368dbd10ba97b09c1dda42609"
     },
     "herdr-profiles/role-plugins/reviewer/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "43644ca6b0a7d39a02d844a6fc8c7475c460683d6ba09baf279d63ef8e5612d7"
+      "treeHash": "b7cfc6e90382c5a3e91c50425bb3bf71cfa06efeec37645a474844c53d5bd585"
     },
     "herdr-profiles/role-plugins/reviewer/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",
@@ -137,15 +137,15 @@
     },
     "herdr-profiles/role-plugins/worker/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4d625f0f4328587d90ecafcf1440e843118400321fba0c18c985a4524728ab60"
+      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
     },
     "herdr-profiles/role-plugins/worker/skills/git-flow": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/git-flow",
-      "treeHash": "7abc71ead89845c9a7756ff28940bbd4da51030a1e5e2c3fa0346b266cf8862f"
+      "treeHash": "3d7991d78cbafb9203518b5cb7b45aaf9f572212a7c467e52fd8994b053d14a4"
     },
     "herdr-profiles/role-plugins/worker/skills/tdd": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/tdd",
-      "treeHash": "413c502c45f26a5360402a7da246aa1a78fe7561994134caaff3294f550a00b8"
+      "treeHash": "5f35ae930e3b7369418cf9ec5d27d75454ddf128f13769a1106c3c3c510804be"
     },
     "herdr-profiles/role-plugins/worker/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",
@@ -165,7 +165,7 @@
     },
     "herdr-profiles/pi-skills/tmux-background-tasks": {
       "source": "/home/gabriel/.pi/agent/skills/tmux-background-tasks",
-      "treeHash": "20f05eb716e42c6ede3dab161c724da53aeb6dc4c69533c6c9a7e6de137a3521"
+      "treeHash": "ab14714cbccd66678d78bcf6fbbd331a00687cf6a06b275b2c39ffa71fb852fd"
     }
   }
 }

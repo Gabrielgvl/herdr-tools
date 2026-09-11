@@ -94,7 +94,7 @@ describe("the MCP host supervision wiring", () => {
     };
     // No `env` dependency: the host falls back to the ambient process environment
     // for both startup gating and the supervision monitor.
-    const ambient: Record<string, string | undefined> = { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "t", HERDR_PANE_ID: "p1", CLAUDE_PROJECT_DIR: directory, HERDR_SOCKET_PATH: socket.path };
+    const ambient: Record<string, string | undefined> = { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "t", HERDR_PANE_ID: "p1", HERDR_PROJECT_DIR: directory, HERDR_SOCKET_PATH: socket.path };
     const previous = Object.fromEntries(Object.keys(ambient).map((key) => [key, process.env[key]]));
     Object.assign(process.env, ambient);
     const server = await runHerdrMcpServer({

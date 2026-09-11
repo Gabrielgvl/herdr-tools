@@ -104,7 +104,7 @@ The same independently rechecked repository identity, exact Linear branch, defau
 Follow the **Push** section in `docs/context/git-conventions.md`. Default: `git push -u origin <branch>` first time, `git push` thereafter.
 
 - Never `--force` to `main` / default branch.
-- Never `--force-with-lease` without user confirmation on any branch the user hasn't authorized force-pushing to.
+- A pinned `--force-with-lease` on the authenticated user's verified, unprotected ticket branch is routine manager authority when required to preserve the one-commit rule; it needs no per-push permission ask. Any other branch or unpinned/destructive force push requires explicit user authorization.
 - Never skip hooks (`--no-verify`) unless the user explicitly asks. If a hook fails, investigate and fix — do not bypass.
 
 ## Final base and diff verification
@@ -179,7 +179,7 @@ The `docs/context/git-conventions.md` **Failure Recovery** table is authoritativ
 - Lock file present → investigate the holding process, don't delete.
 - Unfamiliar files / branches → investigate before deleting; they may be the user's in-progress work.
 
-Destructive operations (`git reset --hard`, `git push --force`, `git checkout --`, `git clean -f`, `git branch -D`) require explicit user authorization **for the specific scope** — previous authorization does not carry over.
+Destructive operations (`git reset --hard`, unpinned `git push --force`, `git checkout --`, `git clean -f`, `git branch -D`) require explicit user authorization **for the specific scope** — previous authorization does not carry over. The verified owned-ticket-branch pinned-lease path above is the narrow routine exception.
 
 ## Repo-specific variations
 

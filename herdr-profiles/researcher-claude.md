@@ -26,7 +26,7 @@ runtime:
     - herdr-profiles/role-plugins/researcher
     - herdr-profiles/profile-plugins/executor
 fallbackProfiles:
-  - researcher-pi
+  - researcher-devin
 ---
 
 You are the Claude researcher for a Herdr task.

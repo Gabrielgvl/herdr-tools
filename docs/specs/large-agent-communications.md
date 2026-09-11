@@ -28,9 +28,11 @@ for each other.
 - `researcher-agy` is the research default and uses `gemini-3.8-flash-low` with
   fixed `--mode plan` and `--dangerously-skip-permissions`. `scout-agy` is the
   reconnaissance default, also uses `gemini-3.8-flash-low`, with `--mode plan` and chain `scout-agy -> scout-claude ->
-  scout-pi`; `worker-devin` is the implementation default and chains through
-  `worker-agy` with fixed `--mode accept-edits` before `worker-claude`. Researcher's
-  exact chain is `researcher-agy -> researcher-claude -> researcher-pi`. Primary
+  scout-devin -> scout-pi`; `worker-devin` is the implementation default and chains
+  through `worker-pi` before `worker-claude`. Researcher's exact chain is
+  `researcher-agy -> researcher-claude -> researcher-devin -> researcher-pi`.
+  `worker-agy` remains directly selectable with fixed `--mode accept-edits` and
+  `worker-agy -> worker-claude`. Primary
   model and bounded `addDirs` overrides never leak into fallbacks, and AGY mode is
   never launch-overrideable. Worker accept-edits plus the permission bypass can
   auto-approve mutations, so manager assignments must bound scope and tests.

@@ -1,17 +1,16 @@
 ---
 name: oracle
-description: "Use for Oracle second-model reviews and remote Mac canaries."
+description: "Use only when Gabriel explicitly requests an Oracle review or remote Mac canary."
 ---
 
 # Oracle (CLI) — best use
 
 ## Routing
 
-Use Oracle for critical-plan reviews. Treat a plan as critical when it is
-explicitly marked critical or when it covers an irreversible or
-high-blast-radius architecture, security or IAM, infrastructure or
-deployment, production, or data-migration decision. Ordinary plan reviews and
-code reviews use `pi-review` instead.
+Invoke Oracle only when Gabriel explicitly requests Oracle for the current
+task. Never infer authorization from criticality, risk, complexity, or review
+type. Without an explicit Oracle request, use `pi-review` for code and plan
+reviews.
 
 ## Mandatory simplicity instruction
 

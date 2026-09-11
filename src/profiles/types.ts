@@ -22,7 +22,7 @@ export const DEVIN_PERMISSION_MODES = ["normal", "accept-edits", "smart", "dange
 export type DevinPermissionMode = (typeof DEVIN_PERMISSION_MODES)[number];
 export type ProfileSourceKind = "bundled" | "user" | "project";
 
-export const RESERVED_BUNDLED_PROFILE_NAMES = new Set(["promoter-pi", "promoter-claude"]);
+export const RESERVED_BUNDLED_PROFILE_NAMES = new Set(["promoter-pi", "promoter-claude", "promoter-devin"]);
 
 export interface ProfileSource {
   kind: ProfileSourceKind;

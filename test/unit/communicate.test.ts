@@ -93,6 +93,30 @@ function execute(cli: HerdrCli, params: Record<string, unknown>, signal: AbortSi
   return createCommunicateTool({ cli, context }).execute("id", params as never, signal, undefined, extensionContext);
 }
 
+const claudeIdentity = { terminal_id: "term-claude", agent_session: { source: "herdr:claude", agent: "claude", kind: "id", value: "session-claude" } };
+
+function makeClaudeCli(options: { omitSession?: boolean } = {}) {
+  const harness = makeCli();
+  const paneRecord = { ...basePane, agent: "claude", ...claudeIdentity };
+  const agentRecord = { ...baseSnapshot.agents[1]!, agent: "claude", ...claudeIdentity };
+  if (options.omitSession) {
+    delete (paneRecord as Record<string, unknown>).agent_session;
+    delete (agentRecord as Record<string, unknown>).agent_session;
+  }
+  const baseExec = harness.exec.getMockImplementation()!;
+  harness.exec.mockImplementation(async (_command, argv, execOptions) => {
+    if (argv[0] === "api") return execResponse("snapshot-claude", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, paneRecord], agents: [baseSnapshot.agents[0]!, agentRecord] } });
+    if (argv[0] === "agent" && argv[1] === "get") return execResponse("agent-get", { agent: agentRecord });
+    if (argv[0] === "pane" && argv[1] === "get") return execResponse("pane-claude", { pane: paneRecord });
+    return baseExec(_command, argv, execOptions);
+  });
+  harness.prompt.mockImplementation(async (_target, input) => {
+    harness.promptInputs.push(input);
+    return { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { ...agentRecord, name: "reviewer", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } } };
+  });
+  return harness;
+}
+
 describe("herdr_communicate", () => {
   it.each(["idle", "done", "blocked"] as const)("steers %s directly without Escape", async (state) => {
     const harness = makeCli(state);
@@ -462,7 +486,28 @@ describe("herdr_communicate", () => {
     expect(unverifiedStore.publish).not.toHaveBeenCalled();
   });
 
-  it.each([["AGY", "agy", "AGY_UNQUALIFIED"], ["Claude", "claude", "CLAUDE_UNQUALIFIED"]] as const)("rejects %s %s before attachment publication or prompt send", async (_label, kind, code) => {
+  it.each(["prompt", "steer"] as const)("delivers %s to a qualified Claude recipient", async (operation) => {
+    const harness = makeClaudeCli();
+    const result = await execute(harness.cli, { target: "reviewer", operation, text: "claude body" });
+    expect(harness.prompt).toHaveBeenCalledWith("w1:p2", expect.stringContaining("claude body"), expect.anything());
+    expect(harness.promptInputs[0]).toContain(`kind: ${operation}`);
+    expect(result.details).toMatchObject({ route: `${operation}_direct`, promptDispatch: { state: "acknowledged", requestId: "cli:agent:prompt" }, submission: { confirmed: true, agentSession: claudeIdentity.agent_session } });
+  });
+
+  it("publishes attachments for a verified Claude recipient", async () => {
+    const harness = makeClaudeCli();
+    const recipients = new RecipientRegistry();
+    recipients.register({ paneId: "w1:p2", terminalId: "term-claude", agentName: "reviewer", agentKind: "claude", agentSession: claudeIdentity.agent_session, recipientKey: "claude-recipient-key", profileName: "worker-claude", kind: "claude", capable: true, reason: "read", agentId: "agent-7" });
+    const publish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/claude-recipient-key/attachment-1/body.txt", bytes: 15, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
+    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
+    const result = await createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "attachment body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ body: "attachment body", recipientKey: "claude-recipient-key", recipientPaneId: "w1:p2" }));
+    expect(harness.promptInputs[0]).toContain("delivery: attachment");
+    expect(harness.promptInputs[0]).not.toContain("attachment body");
+    expect(result.details).toMatchObject({ delivery: "attachment", attachment: { attachmentId: "attachment-1" } });
+  });
+
+  it.each([["AGY", "agy", "AGY_UNQUALIFIED"]] as const)("rejects %s %s before attachment publication or prompt send", async (_label, kind, code) => {
     const harness = makeCli();
     const targetPane = { ...basePane, agent: kind, terminal_id: `term-${kind}`, agent_session: { source: kind, agent: kind, kind: "id", value: `session-${kind}` } };
     const targetAgent = { ...baseSnapshot.agents[1]!, agent: kind, terminal_id: `term-${kind}`, agent_session: targetPane.agent_session };
@@ -482,7 +527,15 @@ describe("herdr_communicate", () => {
     expect(harness.prompt).not.toHaveBeenCalled();
   });
 
-  it.each([["AGY", "agy", "AGY_UNQUALIFIED"], ["Claude", "claude", "CLAUDE_UNQUALIFIED"]] as const)("rejects a partial %s %s identity before the strict join", async (_label, kind, code) => {
+  it("rejects a partial Claude identity at the strict join before any send", async () => {
+    const harness = makeClaudeCli({ omitSession: true });
+    for (const operation of ["prompt", "steer"] as const) {
+      await expect(execute(harness.cli, { target: "reviewer", operation, text: "blocked" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    }
+    expect(harness.prompt).not.toHaveBeenCalled();
+  });
+
+  it.each([["AGY", "agy", "AGY_UNQUALIFIED"]] as const)("rejects a partial %s %s identity before the strict join", async (_label, kind, code) => {
     const harness = makeCli();
     const targetPane = { ...basePane, agent: kind };
     delete (targetPane as Record<string, unknown>).agent_session;
@@ -502,8 +555,8 @@ describe("herdr_communicate", () => {
   it.each([
     ["AGY", "agy", "AGY_UNQUALIFIED", "prompt", "inline"], ["AGY", "agy", "AGY_UNQUALIFIED", "prompt", "attachment"],
     ["AGY", "agy", "AGY_UNQUALIFIED", "steer", "inline"], ["AGY", "agy", "AGY_UNQUALIFIED", "steer", "attachment"],
-    ["Claude", "claude", "CLAUDE_UNQUALIFIED", "prompt", "inline"], ["Claude", "claude", "CLAUDE_UNQUALIFIED", "prompt", "attachment"],
-    ["Claude", "claude", "CLAUDE_UNQUALIFIED", "steer", "inline"], ["Claude", "claude", "CLAUDE_UNQUALIFIED", "steer", "attachment"]
+    ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "prompt", "inline"], ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "prompt", "attachment"],
+    ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "steer", "inline"], ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "steer", "attachment"]
   ] as const)("rejects a %s final-read replacement before %s %s delivery", async (_label, kind, code, operation, delivery) => {
     const harness = makeCli();
     const baseRun = harness.cli.runJson;

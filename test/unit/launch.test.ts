@@ -3348,20 +3348,25 @@ describe("herdr_launch profile-only contract", () => {
     expect(supervision.released).toHaveLength(0);
   });
 
-  it.each(["inline", "attachment"] as const)("rejects a direct Claude %s launch before any effect", async (assignmentDelivery) => {
+  it.each(["inline", "attachment"] as const)("launches a direct Claude %s launch with exact identity", async (assignmentDelivery) => {
     const harness = makeCli();
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
     const attachments = fakeAttachments();
     const recipients = new RecipientRegistry();
     const supervision = stubSupervision();
-    await expect(launch({ name: "worker", profile: "worker-claude", assignment: assign("research"), assignmentDelivery }, catalog(profile("worker-claude", "claude")), harness.cli, promptSources, { attachments, recipients, supervision }))
-      .rejects.toMatchObject({ code: "CLAUDE_UNQUALIFIED", details: { causeCode: "CLAUDE_UNQUALIFIED", profile: "worker-claude", phase: "resolve_profile", agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent" } });
-    expect(harness.calls).toHaveLength(0);
-    expect(harness.promptInputs).toHaveLength(0);
-    expect(promptSources.create).not.toHaveBeenCalled();
-    expect(attachments.ensureRecipient).not.toHaveBeenCalled();
-    expect(attachments.publish).not.toHaveBeenCalled();
-    expect(supervision.reserved).toHaveLength(0);
+    const result = await launch({ name: "worker", profile: "worker-claude", assignment: assign("research"), assignmentDelivery }, catalog(profile("worker-claude", "claude")), harness.cli, promptSources, { attachments, recipients, supervision });
+    expect(harness.calls.find((call) => call[0] === "agent" && call[1] === "start")).toEqual([
+      "agent", "start", "worker", "--kind", "claude", "--pane", "w1:p2", "--timeout", "120000", "--",
+      "--model", "claude/test", "--effort", "medium", "--permission-mode", "dontAsk",
+      "--allowed-tools", "Read", "--disallowed-tools", "Edit", "--add-dir", GRANT_PATH, "--append-system-prompt-file", "/cache/body.md"
+    ]);
+    expect(result.details).toMatchObject({
+      kind: "claude", promptSubmitted: true, recipientRegistered: true,
+      profile: { name: "worker-claude", selected: "worker-claude", runtime: { kind: "claude", model: "claude/test", effort: "medium" }, permissions: { sessionPersistence: true, permissionMode: "dontAsk", allowedTools: ["Read"], disallowedTools: ["Edit"], addDirs: [], pluginDirs: [] } }
+    });
+    if (assignmentDelivery === "attachment") expect(attachments.publish).toHaveBeenCalled();
+    expect(supervision.bound[0]!.identity).toMatchObject({ agentName: "worker", agentKind: "claude" });
+    expect(recipients.get("w1:p2")).toMatchObject({ paneId: "w1:p2", agentName: "worker", agentKind: "claude", kind: "claude" });
   });
 
   it("launches Devin with exact identity, no prompt source, and only model/permissionMode overrides", async () => {
@@ -3419,18 +3424,43 @@ describe("herdr_launch profile-only contract", () => {
     expect(result.details).toMatchObject({ kind: "pi", profile: { requested: "primary", selected: "fallback" } });
   });
 
-  it("refuses Claude and AGY fallbacks without blocking an allowed Pi primary", async () => {
+  it("refuses an AGY fallback while leaving a Claude edge eligible", async () => {
     const calls: string[][] = [];
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
     const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker-pi" }, catalog(profile("worker-pi", "pi", ["worker-agy", "worker-claude"]), profile("worker-agy", "agy"), profile("worker-claude", "claude")), makeCli({ calls }).cli, promptSources);
     expect(result.details).toMatchObject({ kind: "pi", initialPromptSent: true, profile: { requested: "worker-pi", selected: "worker-pi", reachableNames: ["worker-pi", "worker-agy", "worker-claude"], attempts: expect.arrayContaining([
-      expect.objectContaining({ profile: "worker-agy", outcome: "fallback_refused", errorCode: "AGY_UNQUALIFIED" }),
-      expect.objectContaining({ profile: "worker-claude", outcome: "fallback_refused", errorCode: "CLAUDE_UNQUALIFIED" })
+      expect.objectContaining({ profile: "worker-agy", outcome: "fallback_refused", errorCode: "AGY_UNQUALIFIED" })
     ]) } });
-    expect(promptSources.create).toHaveBeenCalledTimes(1);
+    expect(result.details!.profile!.attempts.some((attempt) => attempt.profile === "worker-claude")).toBe(false);
+    // The eligible Claude fallback gets its prompt source materialized up front.
+    expect(promptSources.create).toHaveBeenCalledTimes(2);
     expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
     expect(calls.flat()).not.toContain("agy");
     expect(calls.flat()).not.toContain("claude");
+  });
+
+  it("selects a Claude fallback after a safe Pi start failure", async () => {
+    const primary = profile("primary", "pi", ["fallback-claude"]);
+    const fallback = profile("fallback-claude", "claude");
+    const calls: string[][] = [];
+    const claudePane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "claude", terminal_id: "terminal-fallback", agent_session: { source: "herdr:claude", agent: "claude", kind: "id", value: "session-fallback" }, agent_status: "idle", state_change_seq: 7, revision: 3 };
+    const confirmedPane = { ...claudePane, agent_status: "working", state_change_seq: 8, revision: 4 };
+    const harness = makeCli({ calls, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }, claudePane, confirmedPane], start: (argv, attempt) => {
+      if (attempt === 0) throw startFailure();
+      return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-fallback", agent_session: claudePane.agent_session } });
+    }});
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "primary" }, catalog(primary, fallback), harness.cli);
+    const starts = calls.filter((call) => call[0] === "agent" && call[1] === "start");
+    expect(starts.map((call) => call[4])).toEqual(["pi", "claude"]);
+    expect(starts[1]).toEqual([
+      "agent", "start", "worker", "--kind", "claude", "--pane", "w1:p2", "--timeout", "120000", "--",
+      "--model", "claude/test", "--effort", "medium", "--permission-mode", "dontAsk",
+      "--allowed-tools", "Read", "--disallowed-tools", "Edit", "--add-dir", GRANT_PATH, "--append-system-prompt-file", "/cache/body.md"
+    ]);
+    expect(result.details).toMatchObject({ kind: "claude", profile: { selected: "fallback-claude", attempts: expect.arrayContaining([
+      expect.objectContaining({ profile: "primary", outcome: "agent_start_failed" }),
+      expect.objectContaining({ profile: "fallback-claude", outcome: "selected" })
+    ]) } });
   });
 
   it("tries an allowed fallback after a safe Pi start failure, never an AGY fallback", async () => {

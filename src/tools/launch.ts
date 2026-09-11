@@ -714,13 +714,19 @@ function startFailureEvidence(error: unknown): { code: string; message: string }
   return { ...envelope.error };
 }
 
-type QualifiedRuntime = Extract<RuntimeProfile, { kind: "pi" | "devin" }>;
+type QualifiedRuntime = Extract<RuntimeProfile, { kind: "pi" | "devin" | "claude" }>;
 
 function effectiveDetails(profile: Profile, runtime: QualifiedRuntime): { runtime: Record<string, unknown>; permissions: Record<string, unknown> } {
   if (runtime.kind === "devin") {
     return {
       runtime: { kind: "devin", model: runtime.model, permissionMode: runtime.permissionMode },
       permissions: { sessionPersistence: profile.sessionPersistence }
+    };
+  }
+  if (runtime.kind === "claude") {
+    return {
+      runtime: { kind: "claude", model: runtime.model, effort: runtime.effort },
+      permissions: { sessionPersistence: profile.sessionPersistence, permissionMode: runtime.permissionMode, allowedTools: [...runtime.allowedTools], disallowedTools: [...runtime.disallowedTools], addDirs: [...runtime.addDirs], pluginDirs: [...runtime.pluginDirs] }
     };
   }
   return {
@@ -1577,7 +1583,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
   return {
     name: "herdr_launch",
     label: "Herdr Launch",
-    description: "Launch a named Pi or Devin Herdr agent from a strict profile in an explicitly selected pane placement; Claude and AGY launches are not qualified.",
+    description: "Launch a named Pi, Devin, or Claude Herdr agent from a strict profile in an explicitly selected pane placement; AGY launches are not qualified.",
     parameters: LaunchParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, ctx) {
       const params = rawParams as unknown as LaunchRequest;
@@ -1653,15 +1659,10 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (primaryProfile.runtime.kind === "agy") {
           throw new LaunchError("AGY_UNQUALIFIED", "AGY launch qualification is not available", { profile: primaryProfile.name });
         }
-        if (primaryProfile.runtime.kind === "claude") {
-          throw new LaunchError("CLAUDE_UNQUALIFIED", "Claude launch qualification is not available", { profile: primaryProfile.name });
-        }
         profiles = [primaryProfile];
         for (const profile of reachableProfiles.slice(1)) {
-          if (profile.runtime.kind === "agy" || profile.runtime.kind === "claude") {
-            const kind = profile.runtime.kind === "agy" ? "AGY" : "Claude";
-            const errorCode = profile.runtime.kind === "agy" ? "AGY_UNQUALIFIED" : "CLAUDE_UNQUALIFIED";
-            attempts.push({ profile: profile.name, outcome: "fallback_refused", errorCode, message: `${kind} fallback qualification is not available` });
+          if (profile.runtime.kind === "agy") {
+            attempts.push({ profile: profile.name, outcome: "fallback_refused", errorCode: "AGY_UNQUALIFIED", message: "AGY fallback qualification is not available" });
             continue;
           }
           profiles.push(profile);

@@ -17,13 +17,15 @@ stdio server use the same tool definitions and this same client. The old
 literal `herdr agent prompt --stdin` construction is removed; it is not a
 fallback, compatibility route, or silently retained legacy path.
 
-The local release admits only Pi launch, prompt, and steer recipients. A direct
-Claude recipient fails closed with `CLAUDE_UNQUALIFIED`; a direct AGY recipient
-retains `AGY_UNQUALIFIED`. Claude and AGY fallback edges are reported as refused
-attempts and removed before profile resources, grants, attachments, topology,
-agent start, or prompt dispatch. Communication applies the same refusal before
-attachment publication and on its final authoritative identity re-read. Reads,
-waits, jobs, cancel, interrupt, and validated named keys remain unchanged.
+The local release admits Pi, Claude, and Devin launch, prompt, and steer
+recipients. A direct AGY recipient retains `AGY_UNQUALIFIED`. AGY fallback edges
+are reported as refused attempts and removed before profile resources, grants,
+attachments, topology, agent start, or prompt dispatch. Communication applies the
+same refusal before attachment publication and on its final authoritative
+identity re-read. Claude recipients cleared the provider-layer requalification
+with exact recipient-generated body and identity evidence; qualification
+objectives use operational phrasing rather than extraction-shaped phrasing.
+Reads, waits, jobs, cancel, interrupt, and validated named keys remain unchanged.
 
 The socket acknowledgement proves dispatch only. Exact pane, terminal, name,
 kind, and complete `agent_session` identity remain mandatory before text is

@@ -12,6 +12,7 @@
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { modelFor, ReviewerFailure, type ModelRegistrySeam } from "../reviewer.js";
+import { AuthJsonCredentialStore } from "./auth-json-credential-store.js";
 
 export interface ResolvedSupervisionModel {
   model: Model<Api>;
@@ -58,8 +59,15 @@ export interface BuiltinModelsSeam {
  * built-in provider catalogue and asks that catalogue for the model's auth. An
  * unresolvable model or unavailable credential is a reviewer failure: it never
  * selects a substitute model.
+ *
+ * Credentials come from the Pi agent's `auth.json` through
+ * `AuthJsonCredentialStore` — the same file the Pi host logs into — because
+ * `builtinModels()` alone defaults to an empty in-memory store that can never
+ * authenticate anything. `openai-codex` OAuth refreshes persist back into that
+ * file under its usual lock, so this path both reuses and maintains the host's
+ * existing login.
  */
-export function createBuiltinModelService(models: BuiltinModelsSeam = builtinModels() as unknown as BuiltinModelsSeam): SupervisionModelService {
+export function createBuiltinModelService(models: BuiltinModelsSeam = builtinModels({ credentials: new AuthJsonCredentialStore() }) as unknown as BuiltinModelsSeam): SupervisionModelService {
   return {
     async resolve(identifier) {
       const { provider, modelId } = splitIdentifier(identifier);

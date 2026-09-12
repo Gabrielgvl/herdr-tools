@@ -136,11 +136,12 @@ src/supervision/
   monitor.ts     SessionEventMonitor: one connection, bootstrap, reconnect, fan-out
   identity.ts    exact child identity, continuity, and move-continuity rules
   events.ts      transition folding, material-wake classification, opaque event IDs
-  reviewer.ts    supervisor reviewer (gpt-5.6-luna, thinking=max) + model service seam
+  reviewer.ts    supervisor reviewer (gpt-5.6-sol, thinking=max) + model service seam
   notify.ts      ManagerNotifier: Pi sendMessage and Claude Channel implementations
   supervisor.ts  one child's state machine, cadence, degradation, receipts
   registry.ts    SupervisionRegistry: reserve → bind → settle, job ownership
   model-service.ts host-independent model registry/auth service for the MCP host
+  auth-json-credential-store.ts CredentialStore over the Pi agent's auth.json
 ```
 
 ## 6. Identity and continuity
@@ -326,7 +327,7 @@ supervisor job settles immediately after the wake.
 
 - Cadence: `settings.wait.reviewCadenceMinutes` (default 5), measured from the start of a
   **continuous** `working` run. Any transition out of `working` resets the timer.
-- Model: exactly `openai-codex/gpt-5.6-luna`, `thinkingLevel: "max"`. This is a module
+- Model: exactly `openai-codex/gpt-5.6-sol`, `thinkingLevel: "max"`. This is a module
   constant, not a setting: the setting `wait.reviewerModel` continues to govern the
   explicit `herdr_wait` reviewer, which stays Luna at `low`.
 - Evidence: bounded compact pane metadata plus the transcript delta since the previous
@@ -353,8 +354,16 @@ supervisor job settles immediately after the wake.
 - **Pi host** — adapts the host's existing `ModelRegistrySeam` (`ctx.modelRegistry`).
 - **MCP host** — `createBuiltinModelService()` builds a host-independent service from the
   installed Pi packages (`builtinModels()` from `@earendil-works/pi-ai/providers/all`,
-  `getAuth()` for credentials). The MCP host never exposes `context.modelRegistry`, and the
-  `hostContext` proxy keeps throwing for it.
+  `getAuth()` for credentials). Its `Models` resolves credentials through
+  `AuthJsonCredentialStore` (`src/supervision/auth-json-credential-store.ts`), a
+  `CredentialStore` backed by the Pi agent's `auth.json`
+  (`$PI_CODING_AGENT_DIR/auth.json`, default `~/.pi/agent/auth.json`) — the same file the
+  Pi host logs into — so the reviewer reuses the host's existing `openai-codex` OAuth
+  login, and OAuth refreshes persist back to that file under the shared
+  `proper-lockfile` lock. A missing, malformed, or credential-less file resolves as
+  "not authenticated" and degrades the reviewer; it never crashes the supervisor. The
+  MCP host never exposes `context.modelRegistry`, and the `hostContext` proxy keeps
+  throwing for it.
 
 Unresolvable model or unavailable auth is a reviewer failure (degraded episode), never a
 supervisor failure and never a substitute model.

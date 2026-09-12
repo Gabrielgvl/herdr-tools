@@ -101,7 +101,7 @@ fallback.
 
 **6. A continuously working child is reviewed on cadence by an exact model.** Every
 `reviewCadenceMinutes` of continuous `working`, a supervisor-specific reviewer classifies the
-child using `openai-codex/gpt-5.6-luna` at `thinking: "max"`. This is a module constant, not
+child using `openai-codex/gpt-5.6-sol` at `thinking: "max"`. This is a module constant, not
 a setting: the explicit `herdr_wait` reviewer keeps its own setting and stays Luna at `low`.
 Reviewer results store silently; only `stalled`, `blocked`, `risk`, `appears_complete`, and
 `unknown` wake the manager, and the supervisor stays active either way. A reviewer failure
@@ -110,9 +110,14 @@ it notifies recovery once. The reviewer never starts a Herdr agent.
 
 **7. The MCP host gets its own narrow model service instead of the host's registry.**
 `hostContext` continues to throw for `context.modelRegistry`. The MCP host instead builds a
-host-independent registry/auth service from the installed Pi packages. Unresolvable model or
-unavailable auth degrades the reviewer visibly; it never selects a substitute model and never
-fails the supervisor.
+host-independent registry/auth service from the installed Pi packages. Its `Models`
+instance stores credentials in the Pi agent's `auth.json`
+(`$PI_CODING_AGENT_DIR/auth.json`, default `~/.pi/agent/auth.json`) through
+`AuthJsonCredentialStore`, a `proper-lockfile`-locked file `CredentialStore`, so the
+reviewer shares the Pi host's existing `openai-codex` OAuth login and persists refreshes
+back to the same file. Unresolvable model or unavailable auth (including a missing or
+malformed `auth.json`) degrades the reviewer visibly; it never selects a substitute model
+and never fails the supervisor.
 
 **8. Wake is report-only and best effort.** Pi wakes through the existing `sendMessage`
 custom-context path (`deliverAs: "steer"`, `triggerTurn: true`). Claude wakes through the

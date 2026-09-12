@@ -7,6 +7,7 @@ import { compactPromptTargetIdentity, type PromptTargetIdentity } from "../messa
 import { recordCreatedResource, runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { paneCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
+import type { SelfCloseTracker } from "../supervision/self-close.js";
 import { withoutEnvironment } from "../redaction.js";
 import { assertSafeEnvironment, assertSafeIdentifier, PaneParamsSchema, type PaneParams } from "../topology-schema.js";
 import { parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot, type PaneRecord, type ResolvedTarget } from "../targets.js";
@@ -39,6 +40,8 @@ export interface PaneDependencies {
   preflight: CompatibilityPreflight;
   cwd?: string;
   ownership?: RuntimeOwnership;
+  /** The host's own-close ledger; omitted on hosts whose wakes are never gated. */
+  selfClose?: SelfCloseTracker;
 }
 
 interface LayoutPane {
@@ -155,31 +158,43 @@ async function closePane(deps: PaneDependencies, params: Extract<PaneParams, { o
   if (!validation.allowed) {
     throw Object.assign(new Error(`${validation.code}: pane close is not permitted`), { code: validation.code, details: { resourceIds: validation.resourceIds } });
   }
-  const closed = await closeWithReadback({
-    cli: deps.cli,
-    argv: ["pane", "close", target.id],
-    signal,
-    targetId: target.id,
-    readback: (readbackSignal) => readSnapshot(deps.cli, readbackSignal),
-    targetPresent: (snapshot) => snapshot.panes.some((pane) => pane.pane_id === target.id),
-    summarize: topologySummary
-  });
-  const afterIds = new Set(snapshotIds(closed.readback));
-  const removed = snapshotIds(before).filter((id) => !afterIds.has(id));
-  return {
-    operation: "close",
-    outcome: closed.reconciled ? "reconciled" : "success",
-    paneId: target.id,
-    tabId: target.tabId,
-    workspaceId: target.workspaceId,
-    ...(closed.operationId ? { operationId: closed.operationId } : {}),
-    ...(closed.mutationResult === undefined ? {} : { mutationResult: closed.mutationResult }),
-    ...(closed.reconciled ? { reconciliation: { targetAbsent: true, causality: "absence_proven_only" as const, operationIdAvailable: false } } : {}),
-    removedIds: removed,
-    containingContext: { tabId: target.tabId, workspaceId: target.workspaceId },
-    postState: topologySummary(closed.readback),
-    ...contextRebindingDetails(effective.diagnostics)
-  };
+  // Tracking starts only after the resolved target passed validation, and the
+  // finisher runs on every exit. Only the close's own proven success — a
+  // successful envelope plus an absence-proving readback — may suppress the
+  // matching pane_closed wake; a reconciled absence proves the pane is gone
+  // but not that this close did it, and every failure still wakes.
+  const finish = deps.selfClose?.begin(target.id);
+  let confirmed = false;
+  try {
+    const closed = await closeWithReadback({
+      cli: deps.cli,
+      argv: ["pane", "close", target.id],
+      signal,
+      targetId: target.id,
+      readback: (readbackSignal) => readSnapshot(deps.cli, readbackSignal),
+      targetPresent: (snapshot) => snapshot.panes.some((pane) => pane.pane_id === target.id),
+      summarize: topologySummary
+    });
+    confirmed = closed.reconciled === false;
+    const afterIds = new Set(snapshotIds(closed.readback));
+    const removed = snapshotIds(before).filter((id) => !afterIds.has(id));
+    return {
+      operation: "close",
+      outcome: closed.reconciled ? "reconciled" : "success",
+      paneId: target.id,
+      tabId: target.tabId,
+      workspaceId: target.workspaceId,
+      ...(closed.operationId ? { operationId: closed.operationId } : {}),
+      ...(closed.mutationResult === undefined ? {} : { mutationResult: closed.mutationResult }),
+      ...(closed.reconciled ? { reconciliation: { targetAbsent: true, causality: "absence_proven_only" as const, operationIdAvailable: false } } : {}),
+      removedIds: removed,
+      containingContext: { tabId: target.tabId, workspaceId: target.workspaceId },
+      postState: topologySummary(closed.readback),
+      ...contextRebindingDetails(effective.diagnostics)
+    };
+  } finally {
+    finish?.(confirmed);
+  }
 }
 
 export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof PaneParamsSchema, PaneDetails> {

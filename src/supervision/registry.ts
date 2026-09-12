@@ -15,6 +15,7 @@ import { ReviewerFailure } from "../reviewer.js";
 import { ModelSupervisionReviewer, SUPERVISION_REVIEWER_MODEL, type SupervisionReviewer } from "./reviewer.js";
 import type { SupervisionModelService } from "./model-service.js";
 import type { ProvisionalSupervisionBinding } from "./identity.js";
+import type { SelfCloseTracker } from "./self-close.js";
 import {
   Supervisor,
   type SupervisionBinding,
@@ -57,6 +58,8 @@ export interface SupervisionRegistryDependencies {
    */
   models?: () => SupervisionModelService | undefined;
   reviewerFactory?: () => SupervisionReviewer;
+  /** The host's own-close ledger; forwarded to every supervisor it reserves. */
+  selfClose?: SelfCloseTracker;
   clock?: { now(): number };
   scheduler?: SupervisionScheduler;
   idFactory?: () => string;
@@ -157,6 +160,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         cadenceMs: settings.reviewCadenceMinutes * 60_000,
         clock: this.deps.clock ?? { now: () => Date.now() },
         ...(this.deps.scheduler ? { scheduler: this.deps.scheduler } : {}),
+        ...(this.deps.selfClose ? { selfClose: this.deps.selfClose } : {}),
         readTranscript: this.deps.readTranscript,
         ...(this.deps.idFactory ? { idFactory: this.deps.idFactory } : {}),
         update,

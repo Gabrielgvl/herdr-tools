@@ -2,6 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { resetOwnership, runtimeOwnership } from "../../src/ownership.js";
+import { createSelfCloseTracker } from "../../src/supervision/self-close.js";
 import { createPaneTool as createPaneToolImplementation, type PaneDependencies } from "../../src/tools/pane.js";
 import type { HerdrSnapshot, PaneRecord } from "../../src/targets.js";
 
@@ -108,8 +109,8 @@ function makeHarness(): Harness {
   return { cli, calls, snapshot, confirm, ctx };
 }
 
-function execute(harness: Harness, params: Record<string, unknown>, overrides: Partial<ExtensionContext> = {}, signal: AbortSignal = new AbortController().signal) {
-  const tool = createPaneTool({ cli: harness.cli, context, cwd: "/cwd" });
+function execute(harness: Harness, params: Record<string, unknown>, overrides: Partial<ExtensionContext> = {}, signal: AbortSignal = new AbortController().signal, selfClose?: PaneDependencies["selfClose"]) {
+  const tool = createPaneTool({ cli: harness.cli, context, cwd: "/cwd", ...(selfClose ? { selfClose } : {}) });
   return tool.execute("call", params as never, signal, undefined, { ...harness.ctx, ...overrides } as ExtensionContext);
 }
 
@@ -374,6 +375,85 @@ describe("herdr_pane", () => {
     });
     await expect(execute(contradictory, { operation: "close", target: "p2" })).rejects.toMatchObject({ code: "MUTATION_UNCERTAIN", details: { targetId: "p2", readback: { status: "target_present" } } });
     expect(contradictory.confirm).not.toHaveBeenCalled();
+  });
+
+  it("marks a proven self-close but never a reconciled one", async () => {
+    const success = makeHarness();
+    const successTracker = createSelfCloseTracker();
+    await expect(execute(success, { operation: "close", target: "p2" }, { hasUI: false }, undefined, successTracker)).resolves.toMatchObject({ details: { outcome: "success" } });
+    expect(successTracker.consume("p2")).toBe(true);
+    successTracker.clear();
+
+    const reconciled = makeHarness();
+    const reconciledTracker = createSelfCloseTracker();
+    const base = reconciled.cli.runJson.bind(reconciled.cli);
+    reconciled.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "pane" && argv[1] === "close") {
+        reconciled.snapshot.panes = reconciled.snapshot.panes.filter((pane) => pane.pane_id !== "p2");
+        throw Object.assign(new Error("response lost"), { code: "CLI_PROTOCOL_ERROR" });
+      }
+      return base(argv, signal, preserve);
+    });
+    // Absence is proven but causality is not: a reconciled close still wakes.
+    await expect(execute(reconciled, { operation: "close", target: "p2" }, { hasUI: false }, undefined, reconciledTracker)).resolves.toMatchObject({ details: { outcome: "reconciled" } });
+    expect(reconciledTracker.consume("p2")).toBe(false);
+    reconciledTracker.clear();
+  });
+
+  it("leaves no self-close marker when the close never proved itself", async () => {
+    const uncertain = makeHarness();
+    const uncertainTracker = createSelfCloseTracker();
+    const base = uncertain.cli.runJson.bind(uncertain.cli);
+    uncertain.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "pane" && argv[1] === "close") return { id: "close", result: {} };
+      return base(argv, signal, preserve);
+    });
+    await expect(execute(uncertain, { operation: "close", target: "p2" }, { hasUI: false }, undefined, uncertainTracker)).rejects.toMatchObject({ code: "MUTATION_UNCERTAIN" });
+    expect(uncertainTracker.consume("p2")).toBe(false);
+    uncertainTracker.clear();
+
+    const unavailable = makeHarness();
+    const unavailableTracker = createSelfCloseTracker();
+    const unavailableBase = unavailable.cli.runJson.bind(unavailable.cli);
+    unavailable.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal, preserve) => {
+      if (argv[0] === "pane" && argv[1] === "close") throw Object.assign(new Error("backend gone"), { code: "BACKEND_UNAVAILABLE" });
+      return unavailableBase(argv, signal, preserve);
+    });
+    await expect(execute(unavailable, { operation: "close", target: "p2" }, { hasUI: false }, undefined, unavailableTracker)).rejects.toMatchObject({ code: "BACKEND_UNAVAILABLE" });
+    expect(unavailableTracker.consume("p2")).toBe(false);
+    unavailableTracker.clear();
+
+    const aborted = makeHarness();
+    const abortedTracker = createSelfCloseTracker();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(execute(aborted, { operation: "close", target: "p2" }, { hasUI: false }, controller.signal, abortedTracker)).rejects.toMatchObject({ code: "ABORTED" });
+    expect(abortedTracker.consume("p2")).toBe(false);
+    abortedTracker.clear();
+  });
+
+  it("never tracks a protected target and keeps the marker through a completed abort", async () => {
+    const protectedCase = makeHarness();
+    const protectedTracker = createSelfCloseTracker();
+    const beginSpy = vi.spyOn(protectedTracker, "begin");
+    await expect(execute(protectedCase, { operation: "close", target: "current" }, {}, undefined, protectedTracker)).rejects.toMatchObject({ code: "PROTECTED_RESOURCE" });
+    expect(beginSpy).not.toHaveBeenCalled();
+    expect(protectedTracker.consume("p1")).toBe(false);
+    protectedTracker.clear();
+
+    const completed = makeHarness();
+    const completedTracker = createSelfCloseTracker();
+    const controller = new AbortController();
+    const base = completed.cli.runJson.bind(completed.cli);
+    completed.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal, preserve) => {
+      const result = await base(argv, signal, preserve);
+      if (argv[0] === "pane" && argv[1] === "close") controller.abort();
+      return result;
+    });
+    // The preserved envelope plus the absence readback still confirm the marker.
+    await expect(execute(completed, { operation: "close", target: "p2" }, { hasUI: false }, controller.signal, completedTracker)).resolves.toMatchObject({ details: { outcome: "success" } });
+    expect(completedTracker.consume("p2")).toBe(true);
+    completedTracker.clear();
   });
 
   it("protects the caller pane from close and fails closed on malformed create responses", async () => {

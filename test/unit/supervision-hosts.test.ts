@@ -84,16 +84,26 @@ function wakeExec(fixture: {
   agents?: Record<string, Record<string, unknown>>;
   current?: Record<string, unknown>;
   snapshot?: unknown;
+  onClose?: (paneId: string) => void | Promise<void>;
 }): { exec: PiExec; calls: string[][] } {
   const calls: string[][] = [];
   const envelope = (id: string, result: unknown): { stdout: string; stderr: string; code: number; killed: boolean } =>
     ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
+  const health = {
+    client: { version: "0.9.0", protocol: 22, endpoint_protocol_generation: 1 },
+    server: { status: "running", version: "0.9.0", protocol: 22, compatible: true, endpoint_compatible: true, capabilities: { endpoint_protocol_generation: 1 } }
+  };
   const exec: PiExec = async (_command, argv) => {
     calls.push(argv);
+    if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
     if (argv[0] === "pane" && argv[1] === "get") return envelope("pane-get", { pane: fixture.panes[argv[2]!] });
     if (argv[0] === "pane" && argv[1] === "current") return envelope("pane-current", { type: "pane_current", pane: fixture.current });
     if (argv[0] === "api" && argv[1] === "snapshot") return envelope("snapshot", fixture.snapshot);
     if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: fixture.agents?.[argv[2]!] });
+    if (argv[0] === "pane" && argv[1] === "close") {
+      await fixture.onClose?.(argv[2]!);
+      return envelope("close", { ok: true });
+    }
     return envelope("other", { ok: true });
   };
   return { exec, calls };
@@ -254,6 +264,116 @@ describe("the MCP host supervision wiring", () => {
           expect(socket.prompts[1]!.text).toContain("kind: wait");
           await new Promise((resolve) => setTimeout(resolve, 20));
           expect(socket.prompts).toHaveLength(2);
+          expect(notifications).toHaveLength(0);
+        } finally {
+          await server?.shutdown();
+        }
+      },
+    );
+  });
+
+  it("suppresses only the pane_closed wake of a close this host itself proved", async () => {
+    const devinSession = { source: "herdr:devin", agent: "devin", kind: "id", value: "m-1" };
+    const ownPane = { pane_id: "p1", terminal_id: "t1", tab_id: "t", workspace_id: "w", label: "manager", agent_name: "manager", agent_status: "idle", revision: 3, agent: "devin", agent_session: devinSession };
+    const ownAgent = { pane_id: "p1", name: "manager", agent: "devin", terminal_id: "t1", agent_session: devinSession, agent_status: "idle" };
+    const childPane = { ...pane, pane_id: "p2", terminal_id: "t2" };
+    const otherPane = { ...pane, pane_id: "p3", terminal_id: "t3" };
+    const laterPane = { ...pane, pane_id: "p4", terminal_id: "t4" };
+    const hostSnapshot = {
+      type: "session_snapshot",
+      snapshot: {
+        version: "0.8.2",
+        protocol: 22,
+        workspaces: [{ workspace_id: "w", label: "w" }],
+        tabs: [{ tab_id: "t", workspace_id: "w", label: "t" }],
+        panes: [ownPane, childPane, otherPane, laterPane],
+        agents: [ownAgent, { pane_id: "p2", name: "worker" }, { pane_id: "p3", name: "worker" }, { pane_id: "p4", name: "worker" }],
+      },
+    };
+    const remove = (paneId: string): void => {
+      hostSnapshot.snapshot.panes = hostSnapshot.snapshot.panes.filter((entry) => entry.pane_id !== paneId);
+      hostSnapshot.snapshot.agents = hostSnapshot.snapshot.agents.filter((entry) => entry.pane_id !== paneId);
+    };
+    const promptAck = { pane_id: "p1", terminal_id: "t1", name: "manager", agent: "devin", agent_session: devinSession, interactive_ready: true, revision: 4 };
+    const socket = await herdrSocket(hostSnapshot, { p1: promptAck });
+    const directory = mkdtempSync(join(tmpdir(), "herdr-project-"));
+    directories.push(directory);
+    const notifications: Array<{ method: string }> = [];
+    // The close lands in Herdr before its response returns, so the supervisor
+    // records, settles, and only then learns whether this host may suppress.
+    let closeApplied: string | undefined;
+    let releaseClose: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    const { exec } = wakeExec({
+      panes: { p1: ownPane, p2: childPane, p3: otherPane, p4: laterPane },
+      agents: { p1: ownAgent },
+      current: ownPane,
+      snapshot: hostSnapshot,
+      onClose: async (paneId) => {
+        remove(paneId);
+        closeApplied = paneId;
+        if (paneId === "p2") await gate;
+      },
+    });
+    const transport = {
+      start: async () => undefined,
+      send: async (message: { method?: string }) => { if (message.method) notifications.push({ method: message.method }); },
+      close: async () => undefined,
+      onclose: undefined,
+      onerror: undefined,
+      onmessage: undefined,
+    };
+    await withAmbient(
+      { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "t", HERDR_PANE_ID: "p1", HERDR_PROJECT_DIR: directory, HERDR_SOCKET_PATH: socket.path },
+      async () => {
+        const server = await runHerdrMcpServer({ exec, transport: transport as never, exit: () => undefined });
+        try {
+          expect(server).toBeDefined();
+          const reservation = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+          await reservation.bind({ identity: { ...identity, paneId: "p2", terminalId: "t2" }, profileName: "worker-pi" });
+
+          const closing = server!.surface.pane.execute("close-call", { operation: "close", target: "p2" } as never, new AbortController().signal, undefined, { cwd: directory, hasUI: false } as never);
+          await vi.waitFor(() => expect(closeApplied).toBe("p2"));
+          socket.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p2", workspace_id: "w" } })}\n`);
+          // The event is recorded and the job settles while the close is still
+          // in flight; only the wake waits on its bounded outcome.
+          await vi.waitFor(() => expect(server!.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "settled", supervision_result: "released" }));
+          releaseClose();
+          const result = await closing;
+          expect(result.details).toMatchObject({ operation: "close", outcome: "success", paneId: "p2" });
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(socket.prompts).toHaveLength(0);
+          expect(notifications).toHaveLength(0);
+
+          // The suppressed wake left the event record and its soft receipt.
+          const detail = server!.jobs.get(reservation.jobId)!;
+          expect(detail.supervision?.events.map((event) => event.type)).toEqual(["pane_closed"]);
+          expect(detail.unobservedEvents).toBe(1);
+          const first = await server!.surface.jobs.execute("get-call", { operation: "get", jobId: reservation.jobId } as never, new AbortController().signal, undefined, {} as never);
+          expect((first.details as { pending_events?: Array<{ type: string }> }).pending_events?.map((event) => event.type)).toEqual(["pane_closed"]);
+          const second = await server!.surface.jobs.execute("get-call-2", { operation: "get", jobId: reservation.jobId } as never, new AbortController().signal, undefined, {} as never);
+          expect(second.details).not.toHaveProperty("pending_events");
+
+          // A close that finished before its absence was observed takes the
+          // same suppression path: the confirmed marker is already waiting.
+          const later = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+          await later.bind({ identity: { ...identity, paneId: "p4", terminalId: "t4" }, profileName: "worker-pi" });
+          const finished = await server!.surface.pane.execute("close-call-2", { operation: "close", target: "p4" } as never, new AbortController().signal, undefined, { cwd: directory, hasUI: false } as never);
+          expect(finished.details).toMatchObject({ operation: "close", outcome: "success", paneId: "p4" });
+          socket.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p4", workspace_id: "w" } })}\n`);
+          await vi.waitFor(() => expect(server!.jobs.get(later.jobId)).toMatchObject({ operation_phase: "settled", supervision_result: "released" }));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(socket.prompts).toHaveLength(0);
+          expect(server!.jobs.get(later.jobId)!.supervision?.events.map((event) => event.type)).toEqual(["pane_closed"]);
+
+          // An absence this host did not close still wakes exactly once.
+          const external = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+          await external.bind({ identity: { ...identity, paneId: "p3", terminalId: "t3" }, profileName: "worker-pi" });
+          remove("p3");
+          socket.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p3", workspace_id: "w" } })}\n`);
+          await vi.waitFor(() => expect(socket.prompts).toHaveLength(1));
+          expect(socket.prompts[0]!.target).toBe("p1");
+          expect(socket.prompts[0]!.text).toContain("reported pane_closed");
           expect(notifications).toHaveLength(0);
         } finally {
           await server?.shutdown();

@@ -37,7 +37,8 @@ import {
   type SupervisionAnchor,
 } from "./identity.js";
 import { SUPERVISION_RECONCILIATION_INTERVAL_MS, type SessionEventMonitor, type SupervisionObserver } from "./monitor.js";
-import type { ManagerNotifier } from "./notify.js";
+import type { ManagerNotifier, SupervisionWake } from "./notify.js";
+import type { SelfCloseTracker } from "./self-close.js";
 import {
   isPaneRecordEvent,
   type SupervisionAgentStatus,
@@ -97,6 +98,11 @@ export interface SupervisorDependencies {
   cadenceMs: number;
   clock: { now(): number };
   scheduler?: SupervisionScheduler;
+  /**
+   * The host's own-close ledger, consulted only for `pane_closed` wakes. Its
+   * absence keeps every event waking exactly as before.
+   */
+  selfClose?: SelfCloseTracker;
   /** Bounded transcript delta source for the reviewer; the CLI's authoritative pane read. */
   readTranscript: (paneId: string, signal: AbortSignal) => Promise<string[]>;
   idFactory?: () => string;
@@ -1475,13 +1481,44 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private emit(type: SupervisionEventType, summary: string, details?: Record<string, string | number | boolean>): SupervisionEvent {
     const event = this.log.record(type, this.deps.clock.now(), summary, details);
     this.publish(`${type}: ${summary}`);
-    this.deps.notifier.wake({
+    // The wake payload is fixed at emission: a deferred suppression decision
+    // must never re-read an identity the settle in between may have dropped.
+    const wake: SupervisionWake = {
       jobId: this.deps.jobId,
       // Every material event is emitted after binding, so the bound identity is
       // authoritative here rather than the requested profile's shape.
       child: this.childRef(),
       event,
-    });
+    };
+    const selfClose = this.deps.selfClose;
+    if (type !== "pane_closed" || selfClose === undefined) {
+      this.deps.notifier.wake(wake);
+      return event;
+    }
+    // Only the pane judged absent can correlate with a tracked close: a
+    // retained move destination is that pane, not the origin still on the
+    // bound identity this wake reports.
+    let suppress: boolean | Promise<boolean>;
+    try {
+      suppress = selfClose.consume(this.pendingMoveDestination?.paneId ?? wake.child.paneId);
+    } catch {
+      suppress = false;
+    }
+    if (suppress === true) return event;
+    if (suppress === false) {
+      this.deps.notifier.wake(wake);
+      return event;
+    }
+    // The matching close is still proving itself: the event and settlement are
+    // already done, and only the wake waits on the attempt's bounded outcome.
+    void Promise.resolve(suppress).then(
+      (confirmed) => {
+        if (!confirmed) this.deps.notifier.wake(wake);
+      },
+      () => {
+        this.deps.notifier.wake(wake);
+      },
+    );
     return event;
   }
 

@@ -4,6 +4,7 @@ import { ReviewerFailure } from "../../src/reviewer.js";
 import type { ReconciliationFailureReason, SupervisionEvent } from "../../src/supervision/events.js";
 import { classifySnapshotTarget, type ProvisionalSupervisedIdentity, type ProvisionalSupervisionBinding, type SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
+import { createSelfCloseTracker, type SelfCloseTracker } from "../../src/supervision/self-close.js";
 import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervision/protocol.js";
 import type { SupervisionReviewResult, SupervisionReviewer } from "../../src/supervision/reviewer.js";
 import { Supervisor, SupervisionBindError, type SupervisionBinding, type SupervisionScheduler, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
@@ -96,6 +97,7 @@ interface HarnessOptions {
   transcript?: (paneId: string) => Promise<string[]>;
   cadenceMs?: number;
   child?: SupervisorDependencies["child"];
+  selfClose?: SelfCloseTracker;
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -141,6 +143,7 @@ function harness(options: HarnessOptions = {}): Harness {
     cadenceMs: options.cadenceMs ?? 300_000,
     clock: { now: () => 1_000 },
     scheduler,
+    ...(options.selfClose ? { selfClose: options.selfClose } : {}),
     readTranscript: options.transcript ?? (async () => ["line"]),
     idFactory: (() => { let id = 0; return () => `e${++id}`; })(),
     update: (text) => { progress.push(text); },
@@ -2269,5 +2272,173 @@ describe("the supervisor job port", () => {
     expect(h.supervisor.coversIdentity(identity)).toBe(false);
     expect(h.supervisor.view()).toMatchObject({ state: "reserved", transitions: [], events: [], unobservedEvents: 0 });
     expect(h.supervisor.view().child).toBeUndefined();
+  });
+});
+
+describe("self-close wake suppression", () => {
+  const absent = (): HerdrSnapshot => snapshot([], []);
+
+  it("records pane_closed but skips only its wake after a proven self-close", async () => {
+    const tracker = createSelfCloseTracker();
+    const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    tracker.begin("p1")(true);
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    expect(h.wakes).toEqual([]);
+    // The event, its settlement, and the soft receipt are the unsuppressed
+    // path: only the notification was skipped.
+    expect(h.supervisor.view().events).toEqual([
+      expect.objectContaining({ type: "pane_closed", details: { trigger: "event:pane_closed" } }),
+    ]);
+    expect(h.supervisor.view().unobservedEvents).toBe(1);
+    expect(h.supervisor.takePendingEvents().map((event) => event.type)).toEqual(["pane_closed"]);
+    expect(h.supervisor.takePendingEvents()).toEqual([]);
+    expect(await h.supervisor.run()).toEqual({ outcome: "released", reason: "event:pane_closed" });
+    tracker.clear();
+  });
+
+  it("suppresses a wake whose absence was observed before the close finished", async () => {
+    const tracker = createSelfCloseTracker();
+    const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    // The close is still proving itself: begin without a finisher is a pending
+    // attempt, which a plain post-success marker could never cover.
+    const finish = tracker.begin("p1");
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    expect(h.wakes).toEqual([]);
+    expect(h.supervisor.view().events.map((event) => event.type)).toEqual(["pane_closed"]);
+    expect(await h.supervisor.run()).toEqual({ outcome: "released", reason: "event:pane_closed" });
+    finish(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.wakes).toEqual([]);
+    tracker.clear();
+  });
+
+  it("wakes exactly once when a still-pending close resolves unproven", async () => {
+    const tracker = createSelfCloseTracker();
+    const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    const finish = tracker.begin("p1");
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    expect(h.wakes).toEqual([]);
+    finish(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(types(h.wakes)).toEqual(["pane_closed"]);
+    tracker.clear();
+  });
+
+  it("wakes pane_closed normally when the tracked close failed", async () => {
+    const tracker = createSelfCloseTracker();
+    const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    tracker.begin("p1")(false);
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    expect(types(h.wakes)).toEqual(["pane_closed"]);
+    tracker.clear();
+  });
+
+  it("wakes a recycled pane id whose marker was already consumed", async () => {
+    const tracker = createSelfCloseTracker();
+    tracker.begin("p1")(true);
+    expect(tracker.consume("p1")).toBe(true);
+    const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    expect(types(h.wakes)).toEqual(["pane_closed"]);
+    tracker.clear();
+  });
+
+  it("keeps every non-close wake and never spends the marker on them", async () => {
+    const tracker = createSelfCloseTracker();
+    const consumeSpy = vi.spyOn(tracker, "consume");
+    const h = harness({
+      selfClose: tracker,
+      snapshots: [
+        snapshot([paneRecord()]),
+        Object.assign(new Error("down"), { code: "SUPERVISION_SOCKET_CLOSED" }),
+        snapshot([paneRecord({ agentSession: null, agentKind: null })], []),
+      ],
+    });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    tracker.begin("p1")(true);
+    await h.supervisor.onEvent(thinEvent("pane_exited"));
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    expect(types(h.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "released"]);
+    expect(consumeSpy).not.toHaveBeenCalled();
+    // The marker was never spent: it still suppresses a matching pane_closed.
+    expect(tracker.consume("p1")).toBe(true);
+    tracker.clear();
+  });
+
+  it("keeps identity_replaced and identity_lost wakes without spending the marker", async () => {
+    const tracker = createSelfCloseTracker();
+    const consumeSpy = vi.spyOn(tracker, "consume");
+
+    const replaced = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), snapshot([paneRecord({ terminalId: "t9" })])] });
+    await replaced.supervisor.bind({ identity, profileName: "worker-pi" });
+    tracker.begin("p1")(true);
+    await replaced.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ terminalId: "t9", revision: 6 })));
+    expect(types(replaced.wakes)).toEqual(["identity_replaced"]);
+
+    const lost = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()])] });
+    await lost.supervisor.bind({ identity, profileName: "worker-pi" });
+    await lost.supervisor.onBootstrap(snapshot([], []), 2, true);
+    expect(types(lost.wakes)).toEqual(["identity_lost"]);
+
+    expect(consumeSpy).not.toHaveBeenCalled();
+    expect(tracker.consume("p1")).toBe(true);
+    tracker.clear();
+  });
+
+  it("correlates a retained move destination's closure, not the origin pane", async () => {
+    const tracker = createSelfCloseTracker();
+    const origin = paneRecord({ status: "working", revision: 5 });
+    const moved = paneRecord({ paneId: "p2", revision: 6 });
+
+    // A marker on the origin pane must not suppress the destination's closure.
+    const stray = harness({ selfClose: tracker, snapshots: [snapshot([origin]), invalidDestination()] });
+    await stray.supervisor.bind({ identity, profileName: "worker-pi" });
+    await stray.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+    tracker.begin("p1")(true);
+    await stray.supervisor.onReconciliationSnapshot(absent());
+    expect(types(stray.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered", "pane_closed"]);
+    expect(await stray.supervisor.run()).toEqual({ outcome: "released", reason: "periodic_snapshot" });
+
+    // The marker on the destination itself does suppress it.
+    const held = harness({ selfClose: tracker, snapshots: [snapshot([origin]), invalidDestination()] });
+    await held.supervisor.bind({ identity, profileName: "worker-pi" });
+    await held.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+    tracker.begin("p2")(true);
+    await held.supervisor.onReconciliationSnapshot(absent());
+    expect(types(held.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered"]);
+    expect(held.supervisor.view().events.at(-1)?.type).toBe("pane_closed");
+    expect(await held.supervisor.run()).toEqual({ outcome: "released", reason: "periodic_snapshot" });
+    tracker.clear();
+  });
+
+  it("falls back to waking when the tracker throws or its decision rejects", async () => {
+    const throwing: SelfCloseTracker = {
+      begin: () => () => undefined,
+      consume: () => {
+        throw new Error("tracker exploded");
+      },
+      clear: () => undefined,
+    };
+    const h = harness({ selfClose: throwing, snapshots: [snapshot([paneRecord()]), absent()] });
+    await h.supervisor.bind({ identity, profileName: "worker-pi" });
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    expect(types(h.wakes)).toEqual(["pane_closed"]);
+
+    const rejecting: SelfCloseTracker = {
+      begin: () => () => undefined,
+      consume: () => Promise.reject(new Error("tracker exploded")),
+      clear: () => undefined,
+    };
+    const deferred = harness({ selfClose: rejecting, snapshots: [snapshot([paneRecord()]), absent()] });
+    await deferred.supervisor.bind({ identity, profileName: "worker-pi" });
+    await deferred.supervisor.onEvent(thinEvent("pane_closed"));
+    await vi.waitFor(() => expect(deferred.wakes).toHaveLength(1));
+    expect(types(deferred.wakes)).toEqual(["pane_closed"]);
   });
 });

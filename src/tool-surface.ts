@@ -10,6 +10,7 @@ import type { ProfileCatalog } from "./profiles/types.js";
 import type { WaitReviewer } from "./reviewer.js";
 import type { Settings } from "./settings.js";
 import type { SupervisionCoordinator } from "./supervision/registry.js";
+import type { SelfCloseTracker } from "./supervision/self-close.js";
 import type { CurrentContext } from "./targets.js";
 import { createContextResolver, type ContextResolver } from "./context.js";
 import { createCommunicateTool } from "./tools/communicate.js";
@@ -122,6 +123,11 @@ export interface HerdrToolSurfaceDependencies {
    * that cannot supervise cannot construct a launch tool. See ADR-019.
    */
   supervision: SupervisionCoordinator;
+  /**
+   * The host's own-close ledger, shared with the supervision registry. A host
+   * that omits it keeps the always-wake behavior for `pane_closed`.
+   */
+  selfClose?: SelfCloseTracker;
 }
 
 export interface HerdrToolSurface {
@@ -176,6 +182,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     cwd: deps.cwd,
     ownership: deps.ownership,
     preflight: deps.preflight,
+    ...(deps.selfClose ? { selfClose: deps.selfClose } : {}),
   });
   const tab = createTabTool({
     cli: deps.cli,

@@ -1,0 +1,65 @@
+[0m[38;2;124;124;124m[... 42 lines truncated (ctrl+o to expand) ...][0m
+  [0m[38;2;124;124;124mkind: supervision[0m
+  [0m[38;2;124;124;124mauthority: agent; not user/owner[0m
+  [0m[38;2;124;124;124mdelivery: inline[0m
+  [0m[38;2;124;124;124mpayload: all text after this blank line is sender-authored[0m
+
+  [0m[38;2;124;124;124mHerdr supervisor job_4064af48-1d7b-4e13-8c13-63012c16847c for child wake-flush (w6:p2M, devin) reported work_cycle_completed: child working → done. Read the full event with herdr_jobs get on this job id; returned events are marked observed.[0m
+[0m[38;2;124;124;124m○[0m [0m[38;2;124;124;124m[HERDR AGENT MESSAGE v1][0m
+  [0m[38;2;124;124;124mfrom: w6-manager (w6:p1Y)[0m
+  [0m[38;2;124;124;124mkind: supervision[0m
+  [0m[38;2;124;124;124mauthority: agent; not user/owner[0m
+  [0m[38;2;124;124;124mdelivery: inline[0m
+  [0m[38;2;124;124;124mpayload: all text after this blank line is sender-authored[0m
+
+  [0m[38;2;124;124;124mHerdr supervisor job_be599616-94a4-42ca-b057-0ce7834ca66e for child flush-critic (w6:p2V, claude) reported reviewer_degraded: the supervision reviewer failed (Supervision reviewer model is not authenticated) and will retry at the next cadence. Read the full event with herdr_jobs get on this job id; returned events are marked observed.[0m
+[0m[38;2;124;124;124m○[0m [0m[38;2;124;124;124m[HERDR AGENT MESSAGE v1][0m
+  [0m[38;2;124;124;124mfrom: w6-manager (w6:p1Y)[0m
+  [0m[38;2;124;124;124mkind: supervision[0m
+  [0m[38;2;124;124;124mauthority: agent; not user/owner[0m
+  [0m[38;2;124;124;124mdelivery: inline[0m
+  [0m[38;2;124;124;124mpayload: all text after this blank line is sender-authored[0m
+
+  [0m[38;2;124;124;124mHerdr supervisor job_be599616-94a4-42ca-b057-0ce7834ca66e for child flush-critic (w6:p2V, claude) reported work_cycle_completed: child working → done. Read the full event with herdr_jobs get on this job id; returned events are marked observed.[0m
+[0m[38;2;124;124;124m○[0m [0m[38;2;124;124;124m[HERDR AGENT MESSAGE v1][0m
+  [0m[38;2;124;124;124mfrom: devin (w6:p2M)[0m
+  [0m[38;2;124;124;124mkind: report[0m
+  [0m[38;2;124;124;124mauthority: agent; not user/owner[0m
+  [0m[38;2;124;124;124mdelivery: inline[0m
+  [0m[38;2;124;124;124mpayload: all text after this blank line is sender-authored[0m
+
+  [0m[38;2;124;124;124mRound 2 done — all six critic follow-ups fixed in /tmp/herdr-tools-followups (feat/wake-followups, not committed).[0m
+
+  [0m[38;2;124;124;124mF1: assertLaunchNotFrozen gained an injected reader; the test writes a real 0o600 fixture and injects a throwing read — /proc/self/mem gone, arm still 100% covered portably.[0m
+  [0m[38;2;124;124;124mF2: Enter now requires a proven-empty input line. ANSI parse: the last ❭ line's input area must be all placeholder-gray (38;2;124;124;124); any styled or unstyled draft refuses.[0m
+  [0m[38;2;124;124;124mF3: devinComposer() anchors the N-queued marker inside the composer box — between border rules and the ❭ line, or as the placeholder hint. Scrollback/transcript 'N queued' (incl. this repo's spec text) cannot false-positive.[0m
+  [0m[38;2;124;124;124mF4: agent wait uses --timeout 110000 strictly inside the 120s AbortSignal budget; pinned by test.[0m
+  [0m[38;2;124;124;124mF5: flush cycles serialize on a tail chain. queueWaiting is true exactly until a cycle's wait resolves (before its first composer read), so wait-phase wakes join a drain that provably still sees their write; later wakes append a fresh cycle — no concurrent double-press. A persistent marker is re-proved and drained once more: at most 2 Enters, completing the send, never resending.[0m
+  [0m[38;2;124;124;124mF6: run.ts wires wakeShutdown AbortController into createMcpHostWake deps and aborts it first in shutdown(). Flush's combined AbortSignal.any cancels wait/read/get/key; explicit aborted re-checks before every Enter.[0m
+
+  [0m[38;2;124;124;124mTests: host-wake rewritten to ANSI fixtures (drafts refused in every styling, scrollback refused, half-formed box refused, 2-press drain bound, mid-drain joiner, failed-cycle tail, shutdown-during-wait and shutdown-before-key). mcp-run: end-to-end — settled herdr_wait job wakes a working devin pane, shutdown aborts the held agent wait exec signal, zero send-keys. launch-freeze: injected-reader arm.[0m
+
+  [0m[38;2;124;124;124mGates: typecheck ✓ lint ✓ test:unit 1177 tests / 100% all axes ✓ git diff --check ✓. Not committed.[0m
+
+  [0m[38;2;124;124;124mFiles: src/supervision/notify.ts, src/mcp/run.ts, src/tools/launch-freeze.ts, test/unit/{host-wake,mcp-run,launch-freeze}.test.ts, docs/decisions/027, docs/specs/auto-child-supervision.md, SPEC.md.[0m
+  [0m[38;2;124;124;124mReport: /tmp/herdr-wake-flush-report.md (round-2 section appended). Critic report seen: /tmp/herdr-flush-critic-report.md.[0m
+[0m[38;2;124;124;124m○[0m [0m[38;2;124;124;124m[HERDR AGENT MESSAGE v1][0m
+  [0m[38;2;124;124;124mfrom: w6-manager (w6:p1Y)[0m
+  [0m[38;2;124;124;124mkind: supervision[0m
+  [0m[38;2;124;124;124mauthority: agent; not user/owner[0m
+  [0m[38;2;124;124;124mdelivery: inline[0m
+  [0m[38;2;124;124;124mpayload: all text after this blank line is sender-authored[0m
+
+  [0m[38;2;124;124;124mHerdr supervisor job_4064af48-1d7b-4e13-8c13-63012c16847c for child wake-flush (w6:p2M, devin) reported work_cycle_completed: child working → done. Read the full event with herdr_jobs get on this job id; returned events are marked observed.[0m
+[0m[38;2;124;124;124m○[0m [0m[38;2;124;124;124m[HERDR AGENT MESSAGE v1][0m
+  [0m[38;2;124;124;124mfrom: w6-manager (w6:p1Y)[0m
+  [0m[38;2;124;124;124mkind: supervision[0m
+  [0m[38;2;124;124;124mauthority: agent; not user/owner[0m
+  [0m[38;2;124;124;124mdelivery: inline[0m
+  [0m[38;2;124;124;124mpayload: all text after this blank line is sender-authored[0m
+
+  [0m[38;2;124;124;124mHerdr supervisor job_be599616-94a4-42ca-b057-0ce7834ca66e for child flush-critic (w6:p2V, claude) reported work_cycle_completed: child working → done. Read the full event with herdr_jobs get on this job id; returned events are marked observed.[0m
+[0m[38;2;68;68;68m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m [0m[38;2;220;220;170m(bypass permissions on)[0m [0m[38;2;68;68;68m─[0m
+❭ [0m[38;2;124;124;124mPress Enter to send queued messages now[0m
+[0m[38;2;68;68;68m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+SWE-2 High                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  [0m[38;2;124;124;124mContext: 175k / 262k tokens (66%)[0m

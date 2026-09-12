@@ -515,6 +515,85 @@ describe("MCP server lifecycle", () => {
     expect(recipients.size).toBe(0);
   });
 
+  it("cancels an in-flight devin wake flush at shutdown — no Enter after close", async () => {
+    const base = fakeExec();
+    const calls: string[][] = [];
+    const waitSignals: AbortSignal[] = [];
+    let releaseWait!: () => void;
+    const holdWait = new Promise<void>((resolve) => { releaseWait = resolve; });
+    const exec: PiExec = async (command, argv, options) => {
+      calls.push(argv);
+      // The flush's own-pane `agent wait` is the call shutdown must cancel.
+      if (argv[0] === "agent" && argv[1] === "wait" && argv[2] === "w:p") {
+        waitSignals.push(options.signal!);
+        await holdWait;
+      }
+      const result = await base.exec(command, argv, options);
+      // Recast the hosting pane as a working devin pane wherever it surfaces,
+      // so a settled wait job's wake takes the devin queue-flush path.
+      const rewrite = (record: unknown): void => {
+        const pane = record as Record<string, unknown> | undefined;
+        if (pane?.pane_id === "w:p") {
+          pane.agent = "devin";
+          pane.agent_status = "working";
+          pane.agent_session = { source: "devin", agent: "devin", kind: "id", value: "devin-session" };
+        }
+      };
+      if (argv[0] === "pane" && (argv[1] === "get" || argv[1] === "current")) {
+        const parsed = JSON.parse(result.stdout);
+        rewrite(parsed.result?.pane);
+        return { ...result, stdout: JSON.stringify(parsed) };
+      }
+      if (argv[0] === "agent" && argv[1] === "get") {
+        const parsed = JSON.parse(result.stdout);
+        rewrite(parsed.result?.agent);
+        return { ...result, stdout: JSON.stringify(parsed) };
+      }
+      if (argv[0] === "api" && argv[1] !== "schema") {
+        const parsed = JSON.parse(result.stdout);
+        for (const record of parsed.result?.snapshot?.panes ?? []) rewrite(record);
+        for (const record of parsed.result?.snapshot?.agents ?? []) rewrite(record);
+        return { ...result, stdout: JSON.stringify(parsed) };
+      }
+      return result;
+    };
+    const promptClient: AgentPromptClient = {
+      prompt: vi.fn(async () => ({
+        id: "wake-prompt",
+        result: {
+          type: "agent_prompted",
+          agent: {
+            pane_id: "w:p",
+            terminal_id: "term-manager",
+            name: "manager",
+            agent_name: "manager",
+            agent: "devin",
+            agent_session: { source: "devin", agent: "devin", kind: "id", value: "devin-session" },
+            interactive_ready: true,
+            revision: 1,
+            state_change_seq: 1
+          }
+        }
+      })),
+      ping: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const harness = await start({ exec, promptClient });
+    const wait = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
+    expect(wait.isError).toBeUndefined();
+    const jobId = (JSON.parse(textOf(wait).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.operation_phase).toBe("settled"));
+    // The settled job's wake self-prompts the working devin pane, then parks in
+    // the queue-flush wait.
+    await vi.waitFor(() => expect(promptClient.prompt).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(waitSignals).toHaveLength(1));
+    await harness.handle.shutdown();
+    expect(waitSignals[0]!.aborted).toBe(true);
+    releaseWait();
+    await vi.waitFor(() => expect(harness.exits).toEqual([0]));
+    expect(calls.some((argv) => argv[0] === "agent" && argv[1] === "send-keys")).toBe(false);
+  });
+
   it("marks jobs shut down, resets ownership, and exits zero exactly once", async () => {
     const harness = await start();
     const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } });

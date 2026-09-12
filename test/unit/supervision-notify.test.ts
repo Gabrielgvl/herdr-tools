@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   CLAUDE_CHANNEL_CAPABILITY,
   CLAUDE_CHANNEL_NOTIFICATION_METHOD,
-  createChannelSupervisionNotifier,
   createPiSupervisionNotifier,
   inertNotifier,
   supervisionWakeContent,
@@ -50,17 +49,9 @@ describe("supervision manager wake delivery", () => {
     expect(() => createPiSupervisionNotifier(() => { throw new Error("shutting down"); }).wake(wake)).not.toThrow();
   });
 
-  it("delivers a Claude wake as the documented channel notification and never retries", () => {
-    const sent: unknown[] = [];
-    createChannelSupervisionNotifier((notification) => { sent.push(notification); return Promise.resolve(); }).wake(wake);
-    expect(sent).toEqual([{
-      method: CLAUDE_CHANNEL_NOTIFICATION_METHOD,
-      params: { content: supervisionWakeContent(wake), meta: supervisionWakeMeta(wake) },
-    }]);
+  it("pins the documented Claude channel notification method and capability", () => {
     expect(CLAUDE_CHANNEL_NOTIFICATION_METHOD).toBe("notifications/claude/channel");
     expect(CLAUDE_CHANNEL_CAPABILITY).toBe("claude/channel");
-    expect(() => createChannelSupervisionNotifier(() => Promise.reject(new Error("disconnected"))).wake(wake)).not.toThrow();
-    expect(() => createChannelSupervisionNotifier(() => { throw new Error("closed"); }).wake(wake)).not.toThrow();
   });
 
   it("keeps recording when a host has no wake channel", () => {

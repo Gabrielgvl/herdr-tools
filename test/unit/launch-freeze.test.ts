@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { acquireLaunchGate, assertLaunchNotFrozen } from "../../src/tools/launch-freeze.js";
 
 async function paths(): Promise<{ root: string; freeze: string; lock: string }> {
@@ -124,6 +124,34 @@ describe("profile launch freeze gate", () => {
       await orphan.release();
     } finally {
       await rm(nested.root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when a proven 0o600 freeze file still cannot be read", async () => {
+    // An injected read proves the fail-closed arm deterministically on every
+    // platform; the lstat checks still run against a real owned 0o600 file.
+    const fixture = await paths();
+    try {
+      await writeFile(fixture.freeze, "transaction-1\n1234\n", { mode: 0o600 });
+      await expect(assertLaunchNotFrozen(fixture.freeze, async () => { throw new Error("EIO"); }))
+        .rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN", message: "Launch freeze state is unreadable" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the holder liveness probe itself fails", async () => {
+    const fixture = await paths();
+    const gate = await acquireLaunchGate({ freezePath: fixture.freeze, lockPath: fixture.lock });
+    const probe = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+    });
+    try {
+      await expect(gate.check()).rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN", message: "Launch gate holder is not live" });
+    } finally {
+      probe.mockRestore();
+      await gate.release();
+      await rm(fixture.root, { recursive: true, force: true });
     }
   });
 

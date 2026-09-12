@@ -492,7 +492,26 @@ Delivery is **wake/report only**, best effort, never a gate, never retried.
     deliberate: `herdr_communicate`'s self-target refusal is a tool-call policy, while the
     socket has no such rule and this wake *is* the delivery mechanism, not a user message. The
     sendable-state gate is the only state check: `working` and `blocked` still send, while
-    `unknown` or unproven state drops.
+    `unknown` or unproven state drops. On `devin`, a write acknowledged while the pane was
+    `working`/`blocked` lands in the composer's queued input — rendered as `○`-prefixed gray
+    rows above the input box plus an all-placeholder "Press Enter to send queued messages"
+    hint — which does not drain at turn end on its own; the pipeline then runs a bounded flush
+    cycle — `agent wait` for `idle`/`done` with a timeout strictly inside the cycle's abort
+    budget, which starts when the cycle starts, then `pane read --format ansi` — and sends an
+    `enter` key only while the rendered composer proves queue evidence *inside the composer
+    box* (a `○` row, the word "queued" in the box's section, or the placeholder hint — never
+    in scrollback, where transcript text can say the same words) above an input area whose
+    printable characters are all placeholder-styled (so the key cannot submit a draft), and a
+    fresh `pane get` still shows `idle`/`done`. The ANSI walk carries SGR state across each
+    whole raw line and consumes extended `38`/`48`/`58` color payloads as units; unproven
+    structure fails closed to no key. One Enter drains the entire queue, so a second press is
+    earned only by an observed change to the box interior — an identical re-read is repaint
+    lag — and at most two Enters ever fire per cycle. Cycles serialize: a wake acknowledged
+    while the latest cycle still waits joins its drain; anything later appends a fresh cycle
+    with its own budget. `shutdown()` aborts the session signal the whole pipeline shares —
+    identity reads, the `agent.prompt` write, and the flush — so neither can fire after the
+    server closes. That flush completes the acknowledged send — it is not a retry, resend, or
+    new submission. Pi steers the same write into the running turn, so no flush follows it.
   - `claude` — the documented Claude Code Channels research preview inside the *same* MCP
     server: the server advertises `capabilities.experimental["claude/channel"] = {}` and sends
     `notifications/claude/channel` with bounded `content` and `meta`. There is no prompt

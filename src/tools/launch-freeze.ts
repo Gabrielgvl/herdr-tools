@@ -71,7 +71,7 @@ function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoExcepti
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
 
-export async function assertLaunchNotFrozen(freezePath = HERDR_LAUNCH_FREEZE_PATH): Promise<void> {
+export async function assertLaunchNotFrozen(freezePath = HERDR_LAUNCH_FREEZE_PATH, read: (path: string) => Promise<string> = (path) => readFile(path, "utf8")): Promise<void> {
   let value;
   try {
     value = await lstat(freezePath);
@@ -84,9 +84,8 @@ export async function assertLaunchNotFrozen(freezePath = HERDR_LAUNCH_FREEZE_PAT
   }
   let content: string;
   try {
-    content = await readFile(freezePath, "utf8");
+    content = await read(freezePath);
   } catch {
-    /* c8 ignore next -- the lstat above already proved an owner-readable 0o600 file; a failure here is a mid-check permission race. */
     throw new LaunchFreezeError("Launch freeze state is unreadable");
   }
   if (Buffer.byteLength(content, "utf8") > 512 || !FREEZE_CONTENT.test(content)) {
@@ -113,7 +112,6 @@ function assertHolderAlive(child: ChildProcessWithoutNullStreams, holderExited: 
   try {
     process.kill(child.pid, 0);
   } catch {
-    /* c8 ignore next -- the holder can die between the exitCode check and this probe only inside a sub-microtask reap window. */
     throw new LaunchFreezeError("Launch gate holder is not live");
   }
 }

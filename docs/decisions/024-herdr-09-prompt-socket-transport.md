@@ -34,6 +34,9 @@ separate semantic-consumption confirmation. Communication remains
 acknowledgement-based and non-blocking. No path sends Enter, retries, resends,
 falls back, or cleans up after a dispatch whose effect is uncertain, preserving
 the single-submit rules of ADR-013/015/016 and direct steering from ADR-004.
+The one scoped exception is ADR-027's post-acknowledgement Devin composer
+flush: after a validated `agent_prompted` ack leaves input queued on an
+idle-or-done own pane, a single proven Enter completes that send.
 
 Attachments remain Tools-owned. The recipient receives only the attachment
 reference and must generate the exact complete body readback. Qualification

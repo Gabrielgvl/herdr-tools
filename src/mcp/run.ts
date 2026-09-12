@@ -137,7 +137,9 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   // The Channels research preview has no delivery acknowledgement, so the
   // notifier is wired before the transport and every send stays best effort.
   const channel = { current: undefined as ((notification: { method: string; params: { content: string; meta: Record<string, unknown> } }) => Promise<void>) | undefined };
-  const hostWake = createMcpHostWake({ cli, context: startup.context, notifyChannel: (notification) => channel.current?.(notification) });
+  // An in-flight wake queue-flush must not press Enter into a closed session.
+  const wakeShutdown = new AbortController();
+  const hostWake = createMcpHostWake({ cli, context: startup.context, notifyChannel: (notification) => channel.current?.(notification), signal: wakeShutdown.signal });
   const jobs = new JobRegistry({ onTerminal: (detail) => hostWake.notifyJobTerminal(detail) });
   const supervision = new SupervisionRegistry({
     jobs,
@@ -205,6 +207,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   const shutdown = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
+    wakeShutdown.abort();
     // Closed before the registry and the transport, so a call still waiting for
     // its turn is refused instead of mutating during teardown.
     queue.close();

@@ -2,6 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HerdrCli } from "./src/cli.js";
 import { createAgentPromptClient, type AgentPromptClient } from "./src/agent-prompt.js";
 import { createPreflight, createToolSurface, readInjectedContext } from "./src/tool-surface.js";
+import { createDevinQueueFlush, type DevinQueueFlush } from "./src/messages/devin-queue-flush.js";
+import { createPaneWriteGuard, resolvePaneWriteNamespace } from "./src/pane-write-lock.js";
 import { defaultAttachmentStore, type AttachmentStore } from "./src/messages/store.js";
 import { RecipientRegistry } from "./src/messages/recipients.js";
 import { JobRegistry } from "./src/job-registry.js";
@@ -37,6 +39,12 @@ export interface ExtensionRuntime {
   waitJobsUi: WaitJobsUi;
   attachments: AttachmentStore;
   recipients: RecipientRegistry;
+  /**
+   * The Pi host's shared Devin queue-flush coordinator. `session_start` arms a
+   * fresh controller and `session_shutdown` aborts the old one, so pending
+   * cycles from a dead session can never dispatch.
+   */
+  queueFlush: DevinQueueFlush;
   settings: { load: () => Promise<Settings> };
   profiles: { load: () => Promise<ProfileCatalog> };
   idsPresent: boolean;
@@ -67,6 +75,10 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   const waitJobsUi = new WaitJobsUi(jobs);
   uiRef.current = waitJobsUi;
   const cli = new HerdrCli(pi.exec.bind(pi), 10_000, 50_000, options.promptClient ?? createAgentPromptClient({ env }));
+  // The coordinator's namespace resolves lazily on first use, so constructing
+  // the runtime still performs no filesystem or Herdr calls.
+  const queueFlush = createDevinQueueFlush({ cli, guard: createPaneWriteGuard({ namespace: resolvePaneWriteNamespace.bind(null, env) }) });
+  queueFlush.begin();
   // The Pi host only learns its model registry once a session context exists, so
   // the supervision reviewer resolves through this holder rather than a
   // construction-time value.
@@ -89,6 +101,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
     waitJobsUi,
     attachments: options.attachments ?? defaultAttachmentStore,
     recipients: options.recipients ?? new RecipientRegistry(),
+    queueFlush,
     settings: { load: () => loadSettings() },
     profiles: { load: () => discoverProfiles({ bundledDir: resolve(dirname(fileURLToPath(import.meta.url)), "herdr-profiles"), bundledScopeRoot: dirname(fileURLToPath(import.meta.url)), projectCwd: process.cwd() }) },
     idsPresent: injected.idsPresent,
@@ -108,6 +121,9 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     runtime.waitJobsUi.endSession();
+    // Abort pending flush cycles before the prompt transport closes: no new
+    // operation may be dispatched into a closed session.
+    await runtime.queueFlush.shutdown();
     runtime.cli.closePromptTransport();
     runtime.supervision.shutdown();
     runtime.jobs.shutdown();
@@ -116,6 +132,9 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
   });
   pi.on("session_start", async (_event, context) => {
     runtime.bindModelRegistry(context.modelRegistry);
+    // A fresh controller per session: cycles a dead session left pending keep
+    // their aborted signal and can never revive under the new one.
+    runtime.queueFlush.begin();
     // Supervision is session-scoped: the previous session's supervisors and
     // event connection are stopped and a fresh monitor replaces them, so a
     // session that follows a shutdown can still launch.
@@ -147,6 +166,7 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     attachments: runtime.attachments,
     recipients: runtime.recipients,
     supervision: runtime.supervision,
+    queueFlush: runtime.queueFlush,
   });
   pi.registerTool(surface.inspect);
   pi.registerTool(surface.communicate);

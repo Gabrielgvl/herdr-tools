@@ -9,6 +9,8 @@ import { HerdrCli, type PiExec } from "../cli.js";
 import type { AgentPromptClient } from "../agent-prompt.js";
 import { createAgentPromptClient } from "../agent-prompt.js";
 import { JobRegistry } from "../job-registry.js";
+import { createDevinQueueFlush, type DevinQueueFlush } from "../messages/devin-queue-flush.js";
+import { createPaneWriteGuard, resolvePaneWriteNamespace } from "../pane-write-lock.js";
 import { RecipientRegistry } from "../messages/recipients.js";
 import { defaultAttachmentStore, type AttachmentStore } from "../messages/store.js";
 import { resetOwnership, RuntimeOwnership } from "../ownership.js";
@@ -58,6 +60,7 @@ export interface HerdrMcpServer {
   readonly recipients: RecipientRegistry;
   readonly context: CurrentContext;
   readonly projectDir: string;
+  readonly queueFlush: DevinQueueFlush;
   shutdown(): Promise<void>;
 }
 
@@ -140,7 +143,11 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   const channel = { current: undefined as ((notification: { method: string; params: { content: string; meta: Record<string, unknown> } }) => Promise<void>) | undefined };
   // An in-flight wake queue-flush must not press Enter into a closed session.
   const wakeShutdown = new AbortController();
-  const hostWake = createMcpHostWake({ cli, context: startup.context, notifyChannel: (notification) => channel.current?.(notification), signal: wakeShutdown.signal });
+  // One coordinator per host: wake delivery, communicate, and launch all share
+  // its per-pane cycles and the cross-process write lock it wraps them in.
+  const queueFlush = createDevinQueueFlush({ cli, guard: createPaneWriteGuard({ namespace: resolvePaneWriteNamespace.bind(null, deps.env ?? process.env) }) });
+  queueFlush.begin();
+  const hostWake = createMcpHostWake({ cli, context: startup.context, notifyChannel: (notification) => channel.current?.(notification), signal: wakeShutdown.signal, queueFlush });
   const jobs = new JobRegistry({ onTerminal: (detail) => hostWake.notifyJobTerminal(detail) });
   // One ledger per host: the pane tool marks the closes this process proved,
   // and every supervisor this registry creates consults it before waking a
@@ -172,6 +179,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     recipients,
     supervision,
     selfClose,
+    queueFlush,
     // Model-backed wait review is a Pi capability. Failing closed here keeps a
     // wait beyond the configured review cadence from running unsupervised.
     // Supervision review is separate and does run here, through its own service.
@@ -219,6 +227,9 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     // Wake delivery dies first, so a pending suppression decision resolving to
     // "wake" during teardown can never produce a post-shutdown send.
     wakeShutdown.abort();
+    // The flush coordinator aborts before transports close: already-dispatched
+    // PTY bytes cannot be recalled, but no new operation is dispatched after.
+    await queueFlush.shutdown();
     selfClose.clear();
     // Closed before the registry and the transport, so a call still waiting for
     // its turn is refused instead of mutating during teardown.
@@ -244,5 +255,5 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     process.stdin.once("close", onClientDisconnect);
   }
   await server.connect(transport);
-  return { server, surface, jobs, supervision, ownership, attachments, recipients, context: startup.context, projectDir: startup.projectDir, shutdown };
+  return { server, surface, jobs, supervision, ownership, attachments, recipients, context: startup.context, projectDir: startup.projectDir, queueFlush, shutdown };
 }

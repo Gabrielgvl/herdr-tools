@@ -36,7 +36,10 @@ falls back, or cleans up after a dispatch whose effect is uncertain, preserving
 the single-submit rules of ADR-013/015/016 and direct steering from ADR-004.
 The one scoped exception is ADR-027's post-acknowledgement Devin composer
 flush: after a validated `agent_prompted` ack leaves input queued on an
-idle-or-done own pane, a single proven Enter completes that send.
+idle-or-done own pane, a single proven Enter completes that send. ADR-029
+extends that exception to acknowledged busy `herdr_communicate` deliveries on
+Devin targets under a shared cross-process lock and spent-frame fence; the
+no-Enter rule otherwise stands.
 
 Attachments remain Tools-owned. The recipient receives only the attachment
 reference and must generate the exact complete body readback. Qualification

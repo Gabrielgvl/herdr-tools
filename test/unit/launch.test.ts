@@ -307,7 +307,7 @@ function launch(
   profiles: ProfileCatalog,
   cli = makeCli().cli,
   promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) },
-  extras: { attachments?: AttachmentStore; recipients?: RecipientRegistry; clock?: LaunchClock; supervision?: StubSupervision } = {}
+  extras: { attachments?: AttachmentStore; recipients?: RecipientRegistry; clock?: LaunchClock; supervision?: StubSupervision; queueFlush?: LaunchDependencies["queueFlush"] } = {}
 ) {
   const tool = createLaunchTool({
     cli,
@@ -318,7 +318,8 @@ function launch(
     attachments: extras.attachments ?? fakeAttachments(),
     recipients: extras.recipients ?? new RecipientRegistry(),
     ...(extras.supervision === undefined ? {} : { supervision: extras.supervision }),
-    ...(extras.clock === undefined ? {} : { clock: extras.clock })
+    ...(extras.clock === undefined ? {} : { clock: extras.clock }),
+    ...(extras.queueFlush === undefined ? {} : { queueFlush: extras.queueFlush })
   });
   return tool.execute("id", params, new AbortController().signal, undefined, extensionContext);
 }
@@ -3395,6 +3396,43 @@ describe("herdr_launch profile-only contract", () => {
     }
     // A Claude-only permission value is a schema-valid field but invalid for Devin.
     await expect(launch({ name: "worker", profile: "worker-devin", assignment: assign("implement"), overrides: { permissionMode: "bypassPermissions" } }, catalog(workerDevin), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE" });
+  });
+
+  it("rides the shared pane-write section for a Devin initial prompt write only", async () => {
+    const events: string[] = [];
+    const queueFlush = {
+      writeSection: vi.fn(async () => {
+        events.push("acquire");
+        return {
+          check: async () => undefined,
+          release: async () => { events.push("release"); },
+          fence: { isSpent: async () => false, record: async () => undefined, rearm: async () => undefined },
+        };
+      }),
+    };
+    const workerDevin = profile("worker-devin", "devin");
+    const harness = makeCli();
+    const prompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn(async (target, text, signal) => {
+      events.push("prompt");
+      return prompt(target, text, signal);
+    });
+    const result = await launch({ name: "worker", profile: "worker-devin", assignment: assign("implement") }, catalog(workerDevin), harness.cli, undefined, { queueFlush });
+    expect(result.details).toMatchObject({ kind: "devin", promptSubmitted: true });
+    // The locked section wraps exactly the final verify+write boundary.
+    expect(events).toEqual(["acquire", "prompt", "release"]);
+    expect(queueFlush.writeSection).toHaveBeenCalledWith("w1:p2");
+
+    // A Pi launch's initial write never enters the pane-write section.
+    const piEvents: string[] = [];
+    const piQueueFlush = {
+      writeSection: vi.fn(async () => {
+        piEvents.push("acquire");
+        return { check: async () => undefined, release: async () => undefined, fence: { isSpent: async () => false, record: async () => undefined, rearm: async () => undefined } };
+      }),
+    };
+    await launch({ name: "worker", profile: "worker", assignment: assign("implement") }, catalog(profile("worker")), makeCli().cli, undefined, { queueFlush: piQueueFlush });
+    expect(piQueueFlush.writeSection).not.toHaveBeenCalled();
   });
 
   it("keeps Devin bodies as metadata and starts a Devin fallback chain without a prompt source", async () => {

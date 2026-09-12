@@ -1,12 +1,9 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { constants } from "node:fs";
-import { lstat, open, readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { lstat, readFile } from "node:fs/promises";
+import { acquireFlockHolder } from "../pane-write-lock.js";
 
 export const HERDR_LAUNCH_FREEZE_PATH = "/home/gabriel/.pi/agent/herdr-launch-freeze";
 export const HERDR_LAUNCH_GATE_PATH = "/home/gabriel/.pi/agent/herdr-launch-gate.lock";
 const LOCK_READY = "HERDR_LAUNCH_GATE_READY";
-const LOCK_COMMAND = `printf '${LOCK_READY}\\n'; cat`;
 const DEFAULT_LOCK_DEADLINE_MS = 1_000;
 const FREEZE_CONTENT = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\n[1-9][0-9]{0,9}\n$/u;
 
@@ -18,6 +15,8 @@ export class LaunchFreezeError extends Error {
     this.name = "LaunchFreezeError";
   }
 }
+
+const launchGateFailure = (message: string): LaunchFreezeError => new LaunchFreezeError(message);
 
 export interface LaunchGateLease {
   check(): Promise<void>;
@@ -32,43 +31,15 @@ export interface LaunchGateOptions {
   nonblock?: boolean;
 }
 
+function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
+}
+
 function uid(): number {
   const value = process.getuid?.();
   /* c8 ignore next -- flock only exists on platforms that provide getuid. */
   if (value === undefined) throw new LaunchFreezeError("Launch gate owner is unavailable");
   return value;
-}
-
-function assertOwnerOnlyDirectory(path: string, value: Awaited<ReturnType<typeof lstat>>): void {
-  const mode = Number(value.mode);
-  if (!value.isDirectory() || value.isSymbolicLink() || value.uid !== uid() || (mode & 0o22) !== 0) {
-    throw new LaunchFreezeError(`Launch gate directory is not trusted: ${path}`);
-  }
-}
-
-async function assertLockPath(lockPath: string): Promise<void> {
-  let parent;
-  try {
-    parent = await lstat(dirname(lockPath));
-  } catch {
-    throw new LaunchFreezeError("Launch gate directory is unavailable");
-  }
-  assertOwnerOnlyDirectory(dirname(lockPath), parent);
-
-  try {
-    const value = await lstat(lockPath);
-    const mode = Number(value.mode);
-    if (!value.isFile() || value.isSymbolicLink() || value.uid !== uid() || (mode & 0o22) !== 0) {
-      throw new LaunchFreezeError("Launch gate lock is not trusted");
-    }
-  } catch (error) {
-    if (error instanceof LaunchFreezeError) throw error;
-    if (!isNodeError(error, "ENOENT")) throw new LaunchFreezeError("Launch gate lock is indeterminate");
-  }
-}
-
-function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
-  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
 
 export async function assertLaunchNotFrozen(freezePath = HERDR_LAUNCH_FREEZE_PATH, read: (path: string) => Promise<string> = (path) => readFile(path, "utf8")): Promise<void> {
@@ -94,118 +65,29 @@ export async function assertLaunchNotFrozen(freezePath = HERDR_LAUNCH_FREEZE_PAT
   throw new LaunchFreezeError();
 }
 
-interface ExitResult {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-}
-
-function exitResult(child: ChildProcessWithoutNullStreams): Promise<ExitResult> {
-  return new Promise((resolve) => {
-    child.once("exit", (code, signal) => resolve({ code, signal }));
-  });
-}
-
-function assertHolderAlive(child: ChildProcessWithoutNullStreams, holderExited: boolean): void {
-  if (holderExited || child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
-    throw new LaunchFreezeError("Launch gate holder is not live");
-  }
-  try {
-    process.kill(child.pid, 0);
-  } catch {
-    throw new LaunchFreezeError("Launch gate holder is not live");
-  }
-}
-
-async function stop(child: ChildProcessWithoutNullStreams, exit: Promise<ExitResult>): Promise<void> {
-  child.kill("SIGKILL");
-  await Promise.race([
-    exit,
-    new Promise<void>((resolve) => setTimeout(resolve, 100)),
-  ]);
-}
-
-async function ensureLockPath(lockPath: string): Promise<void> {
-  /* c8 ignore next -- O_NOFOLLOW exists on every platform that ships flock. */
-  const flags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0);
-  try {
-    const handle = await open(lockPath, flags, 0o600);
-    await handle.close();
-  } catch (error) {
-    if (!isNodeError(error, "EEXIST")) throw new LaunchFreezeError("Launch gate lock is unavailable");
-  }
-  await assertLockPath(lockPath);
-}
-
+/**
+ * The launch gate is a *shared* native flock by default: concurrent launchers
+ * all hold it while the freeze file remains the authorization decision — the
+ * lock exists to keep the check/settle section ordered, not to exclude peers.
+ * The holder itself lives in `pane-write-lock.ts`, which also powers the Devin
+ * composer write lock; this wrapper only adds the freeze-file policy.
+ */
 export async function acquireLaunchGate(options: LaunchGateOptions = {}): Promise<LaunchGateLease> {
   const freezePath = options.freezePath ?? HERDR_LAUNCH_FREEZE_PATH;
-  const lockPath = options.lockPath ?? HERDR_LAUNCH_GATE_PATH;
-  const deadlineMs = options.deadlineMs ?? DEFAULT_LOCK_DEADLINE_MS;
-  try {
-    await ensureLockPath(lockPath);
-  } catch (error) {
-    throw error instanceof LaunchFreezeError ? error : /* c8 ignore next -- ensureLockPath only ever throws LaunchFreezeError. */ new LaunchFreezeError("Launch gate lock is unavailable");
-  }
-
-  let child: ChildProcessWithoutNullStreams;
-  try {
-    const lockArgs = [options.exclusive ? "--exclusive" : "--shared", ...(options.nonblock === false ? [] : ["--nonblock"]), lockPath, "--command", LOCK_COMMAND];
-    child = spawn("flock", lockArgs, {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch {
-    /* c8 ignore next -- spawn reports a missing binary through the error event, not a synchronous throw. */
-    throw new LaunchFreezeError("Launch gate lock could not be started");
-  }
-  const exit = exitResult(child);
-  let holderExited = false;
-  void exit.then(() => { holderExited = true; });
-  const acquisition = new Promise<void>((resolve, reject) => {
-    let output = "";
-    const timer = setTimeout(() => reject(new LaunchFreezeError("Launch gate lock was unavailable")), deadlineMs);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      output += chunk;
-      if (output.includes(`${LOCK_READY}\n`)) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-    child.once("error", () => {
-      clearTimeout(timer);
-      reject(new LaunchFreezeError("Launch gate lock is indeterminate"));
-    });
-    child.once("exit", (code) => {
-      if (!output.includes(`${LOCK_READY}\n`)) {
-        clearTimeout(timer);
-        reject(code === 1 ? new LaunchFreezeError("Launch gate lock was unavailable") : new LaunchFreezeError("Launch gate lock is indeterminate"));
-      }
-    });
+  const holder = await acquireFlockHolder({
+    lockPath: options.lockPath ?? HERDR_LAUNCH_GATE_PATH,
+    mode: options.exclusive === true ? "exclusive" : "shared",
+    wait: options.nonblock === false ? "wait" : "nonblock",
+    deadlineMs: options.deadlineMs ?? DEFAULT_LOCK_DEADLINE_MS,
+    readyMarker: LOCK_READY,
+    subject: "Launch gate",
+    failure: launchGateFailure,
   });
-
-  try {
-    await acquisition;
-    assertHolderAlive(child, holderExited);
-    await assertLockPath(lockPath);
-  } catch (error) {
-    await stop(child, exit);
-    throw error instanceof LaunchFreezeError ? error : /* c8 ignore next -- the acquisition promise only rejects with LaunchFreezeError. */ new LaunchFreezeError("Launch gate lock is indeterminate");
-  }
-
-  let released = false;
   return {
     async check(): Promise<void> {
-      assertHolderAlive(child, holderExited);
-      await assertLockPath(lockPath);
+      await holder.check();
       await assertLaunchNotFrozen(freezePath);
     },
-    async release(): Promise<void> {
-      if (released) return;
-      released = true;
-      await assertLockPath(lockPath);
-      child.stdin.end();
-      const result = await exit;
-      if (result.code !== 0 || result.signal !== null) throw new LaunchFreezeError("Launch gate release is indeterminate");
-      await assertLockPath(lockPath);
-    },
+    release: () => holder.release(),
   };
 }

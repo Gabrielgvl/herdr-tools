@@ -92,7 +92,12 @@ recorded here:
   (cross-referenced there), safe here because the acknowledgement already
   proved dispatch, the target is the server's own pane, the key is gated on
   a proven composer, and a wrong-time Enter on an empty composer is a
-  no-op. If the turn outlives the bound, the envelope stays queued and is
+  no-op. ADR-029 extends this exception to acknowledged busy
+  `herdr_communicate` deliveries on Devin targets: the machinery described
+  here now lives in one coordinator shared by the wake and communicate
+  paths, serialized across processes by a pane-write lock and spent-frame
+  fence — "own pane" records the original scope, not a standing boundary.
+  If the turn outlives the bound, the envelope stays queued and is
   recovered by the next prompt or `herdr_jobs` polling. One honest single
   point of failure: on the live render the in-box queue proof rests on the
   word "queued" inside the all-placeholder hint — if Devin ever rewords or

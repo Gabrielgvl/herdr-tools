@@ -521,6 +521,12 @@ Delivery is **wake/report only**, best effort, never a gate, never retried.
     identity reads, the `agent.prompt` write, and the flush — so neither can fire after the
     server closes. That flush completes the acknowledged send — it is not a retry, resend, or
     new submission. Pi steers the same write into the running turn, so no flush follows it.
+    The flush machinery is not wake-private: ADR-029 extends the same bounded cycle to
+    acknowledged busy `herdr_communicate` deliveries on Devin targets, with the
+    proof/key section serialized across hosts by a shared pane-write lock and a
+    spent-frame fence suppressing duplicate keys. Every participating Devin text
+    write — this wake self-prompt included — passes through that lock. The wake
+    contract above is unchanged; the extension and its limits are ADR-029's record.
   - `claude` — the documented Claude Code Channels research preview inside the *same* MCP
     server: the server advertises `capabilities.experimental["claude/channel"] = {}` and sends
     `notifications/claude/channel` with bounded `content` and `meta`. There is no prompt

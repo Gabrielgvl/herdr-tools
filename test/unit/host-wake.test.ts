@@ -1,8 +1,12 @@
-import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentPromptError } from "../../src/agent-prompt.js";
 import type { JsonEnvelope } from "../../src/cli.js";
 import type { JobDetail } from "../../src/job-registry.js";
+import { createDevinQueueFlush, type DevinQueueFlush, type DevinQueueFlushCli } from "../../src/messages/devin-queue-flush.js";
+import { createPaneWriteGuard } from "../../src/pane-write-lock.js";
 import {
   CLAUDE_CHANNEL_NOTIFICATION_METHOD,
   createMcpHostWake,
@@ -107,6 +111,22 @@ interface Harness {
   calls: string[][];
   prompts: Array<{ target: string; text: string }>;
   notifications: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }>;
+  queueFlush: DevinQueueFlush;
+  lockDir: string;
+}
+
+const lockDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of lockDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+/** A held flush operation must notice the cycle abort like a real transport would. */
+function aborted(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal.aborted) reject(new Error("aborted"));
+    else signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+  });
 }
 
 interface HarnessOptions {
@@ -121,6 +141,8 @@ interface HarnessOptions {
   statusAfterWait?: string;
   /** Per-`pane get` agent_status sequence (the last value repeats); overrides statusAfterWait. */
   paneStatuses?: string[];
+  /** Dynamic agent_status for `pane get`, keyed on progress counters; overrides paneStatuses. */
+  paneStatusFn?: (obs: { paneGet: number; prompted: number; sentKeys: number; waits: number }) => string;
   /** Reject this many leading `pane get` calls before serving records. */
   paneGetFailures?: number;
   promptError?: Error;
@@ -138,7 +160,7 @@ interface HarnessOptions {
   paneViews?: string[];
   /** Session controller wired as `deps.signal`; aborting it is server shutdown. */
   session?: AbortController;
-  /** Abort the session inside the first `pane get` that follows an `agent wait`. */
+  /** Shut the coordinator down inside the first `pane get` that follows an `agent wait`. */
   abortBeforeKey?: boolean;
   /** Drop the snapshot agent record entirely (the incomplete own-pane edge). */
   noSnapshotAgent?: boolean;
@@ -165,7 +187,7 @@ function harness(options: HarnessOptions = {}): Harness {
   let waited = false;
   let readCalls = 0;
   const envelope = (id: string, result: unknown): JsonEnvelope => ({ id, result });
-  const cli: McpWakeCli = {
+  const cli: McpWakeCli & DevinQueueFlushCli = {
     runJson: async (argv, signal) => {
       if (signal.aborted) throw new Error("aborted");
       calls.push(argv);
@@ -176,12 +198,19 @@ function harness(options: HarnessOptions = {}): Harness {
         const sequence = options.paneStatuses;
         const record = paneRecord(
           paneGetSuccesses === 1 ? resolvedKind : sandwichKind,
-          sequence === undefined
-            ? (waited ? (options.statusAfterWait ?? "idle") : status)
-            : sequence[Math.min(paneGetSuccesses - 1, sequence.length - 1)]!,
+          options.paneStatusFn !== undefined
+            ? options.paneStatusFn({
+              paneGet: paneGetSuccesses,
+              prompted: prompts.length,
+              sentKeys: calls.filter((argv) => argv[0] === "agent" && argv[1] === "send-keys").length,
+              waits: calls.filter((argv) => argv[0] === "agent" && argv[1] === "wait").length,
+            })
+            : sequence === undefined
+              ? (waited ? (options.statusAfterWait ?? "idle") : status)
+              : sequence[Math.min(paneGetSuccesses - 1, sequence.length - 1)]!,
         );
         if (paneGetSuccesses > 1 && options.omitSandwichPaneStatus) delete record.agent_status;
-        if (options.abortBeforeKey && waited) session.abort();
+        if (options.abortBeforeKey && waited) void queueFlush.shutdown();
         return envelope("pane-get", { pane: record });
       }
       if (argv[0] === "pane" && argv[1] === "current") {
@@ -198,7 +227,7 @@ function harness(options: HarnessOptions = {}): Harness {
       if (argv[0] === "agent" && argv[1] === "wait") {
         waited = true;
         if (options.waitError) throw options.waitError;
-        if (options.holdWait) await options.holdWait;
+        if (options.holdWait) await Promise.race([options.holdWait, aborted(signal)]);
         return envelope("agent-wait", { type: "agent_info", agent: agentRecord(sandwichKind, options.statusAfterWait ?? "idle") });
       }
       if (argv[0] === "agent" && argv[1] === "send-keys") {
@@ -207,13 +236,13 @@ function harness(options: HarnessOptions = {}): Harness {
       }
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
     },
-    runText: async (argv, signal) => {
+    runTextResult: async (argv, signal) => {
       if (signal.aborted) throw new Error("aborted");
       calls.push(argv);
       if (argv[0] === "pane" && argv[1] === "read") {
         readCalls += 1;
-        if (readCalls === 1 && options.holdRead) await options.holdRead;
-        return options.paneViews !== undefined && options.paneViews.length > 0 ? options.paneViews.shift()! : (options.paneView ?? "");
+        if (readCalls === 1 && options.holdRead) await Promise.race([options.holdRead, aborted(signal)]);
+        return { value: options.paneViews !== undefined && options.paneViews.length > 0 ? options.paneViews.shift()! : (options.paneView ?? ""), truncated: false };
       }
       throw new Error(`unexpected argv: ${argv.join(" ")}`);
     },
@@ -223,16 +252,23 @@ function harness(options: HarnessOptions = {}): Harness {
       return envelope("prompt-1", ackResult(ackKind));
     },
   };
+  const lockDir = mkdtempSync(join(tmpdir(), "herdr-wake-locks-"));
+  lockDirs.push(lockDir);
+  const queueFlush = createDevinQueueFlush({ cli, guard: createPaneWriteGuard({ namespace: { dir: lockDir, endpoint: "herdr-test-endpoint" } }), sectionWaitMs: 500 });
+  queueFlush.begin();
   return {
     deps: {
       cli,
       context: options.ctx ?? context,
       notifyChannel: options.notifyChannel ?? ((notification) => { notifications.push(notification); }),
       signal: session.signal,
+      queueFlush,
     },
     calls,
     prompts,
     notifications,
+    queueFlush,
+    lockDir,
   };
 }
 
@@ -352,6 +388,18 @@ describe("the MCP host wake router", () => {
     }
   });
 
+  it("schedules no flush when the fresh identity join proves a different kind than the resolution", async () => {
+    // The pane resolved devin, but the sandwich freshly proves pi: the
+    // self-prompt is refused inside the write section before any send, so no
+    // submission exists to schedule.
+    const { deps, calls, prompts } = harness({ resolvedKind: "devin", sandwichKind: "pi" });
+    createMcpHostWake(deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(paneGets(calls)).toBeGreaterThanOrEqual(2));
+    await flush();
+    expect(prompts).toHaveLength(0);
+    expect(sendKeys(calls)).toHaveLength(0);
+  });
+
   const sendKeys = (calls: string[][]): string[][] => calls.filter((argv) => argv[0] === "agent" && argv[1] === "send-keys");
   const waits = (calls: string[][]): string[][] => calls.filter((argv) => argv[0] === "agent" && argv[1] === "wait");
 
@@ -386,8 +434,10 @@ describe("the MCP host wake router", () => {
 
   it.each(["working", "blocked"] as const)("flushes a devin wake queued mid-turn after the pane goes idle", async (agentStatus) => {
     // Driven by the real captured composer, not a synthetic render: the queue
-    // is proven by the all-placeholder input hint alone.
-    const { deps, calls, prompts } = harness({ agentStatus, paneViews: [REAL_QUEUED, DRAINED] });
+    // is proven by the all-placeholder input hint alone. Views are candidate,
+    // final re-proof, then the post-press drained frame: every key is gated by
+    // a candidate read and a final ANSI proof rendering the identical frame.
+    const { deps, calls, prompts } = harness({ agentStatus, paneViews: [REAL_QUEUED, REAL_QUEUED, DRAINED] });
     createMcpHostWake(deps).notifier.wake(wake);
     await vi.waitFor(() => expect(sendKeys(calls)).toEqual([["agent", "send-keys", ownPaneId, "enter"]]));
     expect(prompts).toHaveLength(1);
@@ -420,11 +470,9 @@ describe("the MCP host wake router", () => {
       composerView(`\x1b[2K\x1b[;m\x1b[m${GRAY}Press Enter to send queued messages now${RESET}`),
     ];
     for (const [index, view] of views.entries()) {
-      const ok = harness({ agentStatus: "working", paneViews: [view, DRAINED] });
+      const ok = harness({ agentStatus: "working", paneViews: [view, view, DRAINED] });
       createMcpHostWake(ok.deps).notifier.wake(wake);
-      await vi.waitFor(() => expect(ok.calls.some((argv) => argv[0] === "pane" && argv[1] === "read")).toBe(true));
-      await flush();
-      expect(sendKeys(ok.calls), `accepted view ${index} refused Enter`).toHaveLength(1);
+      await vi.waitFor(() => expect(sendKeys(ok.calls), `accepted view ${index} refused Enter`).toHaveLength(1));
     }
   });
 
@@ -511,19 +559,25 @@ describe("the MCP host wake router", () => {
     expect(busy.prompts).toHaveLength(1);
     expect(sendKeys(busy.calls)).toHaveLength(0);
 
-    // One Enter drains the whole queue, so an identical frame on the immediate
-    // re-read is repaint lag — not an un-drained queue — and earns no key.
+    // One Enter drains the whole queue, so an identical frame on the next
+    // candidate read is repaint lag — not an un-drained queue — and earns no
+    // key. Reads: candidate + final for the spent press, candidate for the
+    // refused one.
     const stale = harness({ agentStatus: "working", paneView: QUEUED });
     createMcpHostWake(stale.deps).notifier.wake(wake);
-    await vi.waitFor(() => expect(stale.calls.filter((argv) => argv[1] === "read")).toHaveLength(2));
+    await vi.waitFor(() => expect(sendKeys(stale.calls)).toHaveLength(1));
+    // The refused repaint candidate pays one more locked read — a real flock
+    // round-trip — so wait for it rather than yielding a fixed number of turns.
+    await vi.waitFor(() => expect(stale.calls.filter((argv) => argv[1] === "read")).toHaveLength(3));
     await flush();
     expect(sendKeys(stale.calls)).toHaveLength(1);
 
     // A changed still-queued frame is new evidence: one more Enter, then the
-    // cycle stops regardless (draining a newer arrival, never resending).
+    // cycle stops regardless (draining a newer arrival, never resending). The
+    // second key needs its own candidate + identical final pair.
     const changed = harness({
       agentStatus: "working",
-      paneViews: [QUEUED, composerView(HINT, { section: `${QUEUED_ROW("late envelope")}\n` }), DRAINED],
+      paneViews: [QUEUED, QUEUED, composerView(HINT, { section: `${QUEUED_ROW("late envelope")}\n` }), composerView(HINT, { section: `${QUEUED_ROW("late envelope")}\n` }), DRAINED],
     });
     createMcpHostWake(changed.deps).notifier.wake(wake);
     await vi.waitFor(() => expect(sendKeys(changed.calls)).toHaveLength(2));
@@ -534,28 +588,36 @@ describe("the MCP host wake router", () => {
   it("starts a fresh flush cycle for a wake acknowledged mid-drain", async () => {
     let releaseRead!: () => void;
     const holdRead = new Promise<void>((resolve) => { releaseRead = resolve; });
-    // pane get order: kind resolution, first sandwich, second sandwich, re-proofs.
+    // The second wake's own text write must ride the same pane-write section
+    // the parked cycle holds, so it cannot interleave with the proof/Enter —
+    // it waits out the held read, then delivers and schedules a fresh cycle.
+    // Pane status by progress: both wakes' sandwiches read working (eligible),
+    // every flush re-proof reads idle.
     const { deps, calls, prompts } = harness({
       agentStatus: "working",
-      paneViews: [QUEUED, DRAINED],
+      paneViews: [QUEUED, QUEUED, DRAINED],
       paneView: DRAINED,
       holdRead,
-      paneStatuses: ["working", "working", "working", "idle"],
+      paneStatusFn: ({ waits: w, sentKeys, prompted }) =>
+        w === 0 ? "working" : sentKeys === 0 ? "idle" : prompted === 1 ? "working" : "idle",
     });
     const host = createMcpHostWake(deps);
     host.notifier.wake(wake);
     await vi.waitFor(() => expect(waits(calls)).toHaveLength(1));
     await vi.waitFor(() => expect(calls.some((argv) => argv[0] === "pane" && argv[1] === "read")).toBe(true));
-    // The first cycle is parked at its held composer read; the second wake's
-    // write queues now and must not join the stale cycle — it appends a fresh
-    // one behind it, serialized, so its own wait cannot start yet.
+    // The first cycle is parked at its held composer read, holding the pane
+    // write section. The second wake reaches the lock and waits there — its
+    // prompt cannot interleave with the in-flight proof.
     host.notifier.wake(wake);
-    await vi.waitFor(() => expect(prompts).toHaveLength(2));
+    await vi.waitFor(() => expect(calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(2));
     await flush();
+    expect(prompts).toHaveLength(1);
     expect(waits(calls)).toHaveLength(1);
     releaseRead();
-    // Cycle 1 drains and presses once; cycle 2 then runs its own wait and a
-    // fresh composer read — the marker is gone, so no second key.
+    // Cycle 1 drains and presses once; the second write then acquires the
+    // section, delivers, and appends a serialized cycle that runs its own wait
+    // and a fresh composer read — the marker is gone, so no second key.
+    await vi.waitFor(() => expect(prompts).toHaveLength(2));
     await vi.waitFor(() => expect(waits(calls)).toHaveLength(2));
     await vi.waitFor(() => expect(sendKeys(calls)).toHaveLength(1));
     await flush();
@@ -577,23 +639,21 @@ describe("the MCP host wake router", () => {
     expect(sendKeys(calls)).toHaveLength(0);
   });
 
-  it("never presses Enter after the session closes mid-flush", async () => {
+  it("never presses Enter after the coordinator shuts down mid-flush", async () => {
     // Shutdown while the wait is held: the cycle is cancelled at the next call.
-    const session = new AbortController();
     let releaseWait!: () => void;
     const holdWait = new Promise<void>((resolve) => { releaseWait = resolve; });
-    const duringWait = harness({ agentStatus: "working", paneView: QUEUED, holdWait, session });
+    const duringWait = harness({ agentStatus: "working", paneView: QUEUED, holdWait });
     createMcpHostWake(duringWait.deps).notifier.wake(wake);
     await vi.waitFor(() => expect(waits(duringWait.calls)).toHaveLength(1));
-    session.abort();
+    void duringWait.queueFlush.shutdown();
     releaseWait();
     await flush();
     expect(duringWait.prompts).toHaveLength(1);
     expect(sendKeys(duringWait.calls)).toHaveLength(0);
 
     // Shutdown landing between the state re-proof and the key: still no Enter.
-    const beforeKey = new AbortController();
-    const atKey = harness({ agentStatus: "working", paneView: QUEUED, session: beforeKey, abortBeforeKey: true });
+    const atKey = harness({ agentStatus: "working", paneView: QUEUED, abortBeforeKey: true });
     createMcpHostWake(atKey.deps).notifier.wake(wake);
     await vi.waitFor(() => expect(waits(atKey.calls)).toHaveLength(1));
     await flush();
@@ -616,7 +676,7 @@ describe("the MCP host wake router", () => {
   it("coalesces a burst of queued wakes into one wait and one Enter", async () => {
     let release!: () => void;
     const latch = new Promise<void>((resolve) => { release = resolve; });
-    const { deps, calls, prompts } = harness({ agentStatus: "working", paneViews: [QUEUED, DRAINED], holdWait: latch });
+    const { deps, calls, prompts } = harness({ agentStatus: "working", paneViews: [QUEUED, QUEUED, DRAINED], holdWait: latch });
     const host = createMcpHostWake(deps);
     host.notifier.wake(wake);
     host.notifier.wake(wake);
@@ -637,7 +697,7 @@ describe("the MCP host wake router", () => {
     expect(waitFail.prompts).toHaveLength(1);
     expect(sendKeys(waitFail.calls)).toHaveLength(0);
 
-    const keysFail = harness({ agentStatus: "working", paneViews: [QUEUED], sendKeysError: new Error("gone") });
+    const keysFail = harness({ agentStatus: "working", paneViews: [QUEUED, QUEUED], sendKeysError: new Error("gone") });
     createMcpHostWake(keysFail.deps).notifier.wake(wake);
     await vi.waitFor(() => expect(sendKeys(keysFail.calls)).toHaveLength(1));
     await flush();
@@ -815,7 +875,7 @@ describe("lazy self-adoption in the MCP host wake", () => {
     const nameTaken = (name: string) => Object.assign(new Error(`name taken: ${name}`), {
       details: { errorEnvelope: { id: "r", error: { code: "agent_name_taken", message: "name taken" } } }
     });
-    const cli: McpWakeCli = {
+    const cli: McpWakeCli & DevinQueueFlushCli = {
       runJson: async (argv, signal) => {
         if (signal.aborted) throw new Error("aborted");
         calls.push(argv);
@@ -863,10 +923,10 @@ describe("lazy self-adoption in the MCP host wake", () => {
         if (argv[0] === "agent" && argv[1] === "wait") return envelope("agent-wait", { type: "agent_info", agent });
         throw new Error(`unexpected argv: ${argv.join(" ")}`);
       },
-      runText: async (argv, signal) => {
+      runTextResult: async (argv, signal) => {
         if (signal.aborted) throw new Error("aborted");
         calls.push(argv);
-        return "";
+        return { value: "", truncated: false };
       },
       prompt: async (target, text) => {
         prompts.push({ target, text });
@@ -881,12 +941,17 @@ describe("lazy self-adoption in the MCP host wake", () => {
         });
       }
     };
+    const lockDir = mkdtempSync(join(tmpdir(), "herdr-wake-locks-"));
+    lockDirs.push(lockDir);
+    const queueFlush = createDevinQueueFlush({ cli, guard: createPaneWriteGuard({ namespace: { dir: lockDir, endpoint: "herdr-test-endpoint" } }), sectionWaitMs: 500 });
+    queueFlush.begin();
     return {
       deps: {
         cli,
         context: { workspaceId: "w1", tabId: "w1:t1", paneId },
         notifyChannel: (notification) => { notifications.push(notification); },
-        signal: new AbortController().signal
+        signal: new AbortController().signal,
+        queueFlush
       },
       calls,
       renames,
@@ -950,15 +1015,16 @@ describe("lazy self-adoption in the MCP host wake", () => {
     const h = selfAdoptHarness({ sessionless: true });
     const host = createMcpHostWake(h.deps);
     host.notifier.wake(wake);
+    await vi.waitFor(() => expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(2));
     await flush();
     expect(h.renames).toHaveLength(0);
     expect(h.prompts).toHaveLength(0);
     // "unqualified" is not cached — the next wake re-evaluates and still refuses.
     host.notifier.wake(wake);
+    await vi.waitFor(() => expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(4));
     await flush();
     expect(h.renames).toHaveLength(0);
     expect(h.prompts).toHaveLength(0);
-    expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(4);
   });
 
   it("walks the collision suffixes when the derived name is taken", async () => {
@@ -972,8 +1038,8 @@ describe("lazy self-adoption in the MCP host wake", () => {
     const h = selfAdoptHarness({ taken: Array.from({ length: 9 }, (_, i) => (i === 0 ? "devin-w1p9" : `devin-w1p9-${i + 1}`)) });
     const host = createMcpHostWake(h.deps);
     host.notifier.wake(wake);
+    await vi.waitFor(() => expect(h.renames).toHaveLength(9));
     await flush();
-    expect(h.renames).toHaveLength(9);
     expect(h.prompts).toHaveLength(0);
     host.notifier.wake(wake);
     await flush();
@@ -985,8 +1051,12 @@ describe("lazy self-adoption in the MCP host wake", () => {
     const h = selfAdoptHarness({ snapshotFailures: 1 });
     const host = createMcpHostWake(h.deps);
     host.notifier.wake(wake);
+    // The failed attempt is not cached: this wake still drops on the missing
+    // name. Its drop is final once the send's sandwich `pane get` has run —
+    // the write section makes the pipeline's reads genuinely async, so settle
+    // on that last call rather than a fixed yield.
+    await vi.waitFor(() => expect(h.calls.filter((argv) => argv[0] === "pane" && argv[1] === "get")).toHaveLength(2));
     await flush();
-    // The failed attempt is not cached: this wake still drops on the missing name…
     expect(h.renames).toHaveLength(0);
     expect(h.prompts).toHaveLength(0);
     // …and the next wake re-runs the whole attempt, mints, and delivers.
@@ -997,6 +1067,9 @@ describe("lazy self-adoption in the MCP host wake", () => {
     const raced = selfAdoptHarness({ renameTransient: true });
     const racedHost = createMcpHostWake(raced.deps);
     racedHost.notifier.wake(wake);
+    // Settle the dropped pipeline on its last read before asserting the drop —
+    // kind resolution, the failed attempt's own read, then the send sandwich.
+    await vi.waitFor(() => expect(raced.calls.filter((argv) => argv[0] === "pane" && argv[1] === "get")).toHaveLength(3));
     await flush();
     expect(raced.renames).toEqual(["devin-w1p9"]);
     expect(raced.prompts).toHaveLength(0);
@@ -1008,8 +1081,8 @@ describe("lazy self-adoption in the MCP host wake", () => {
   it("drops the wake when the minted ack cannot verify the adopted name", async () => {
     const h = selfAdoptHarness({ mismatchName: "other-name" });
     createMcpHostWake(h.deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(h.renames).toEqual(["devin-w1p9"]));
     await flush();
-    expect(h.renames).toEqual(["devin-w1p9"]);
     expect(h.prompts).toHaveLength(0);
   });
 
@@ -1024,12 +1097,15 @@ describe("lazy self-adoption in the MCP host wake", () => {
     const h = selfAdoptHarness({ paneId: ":::" });
     const host = createMcpHostWake(h.deps);
     host.notifier.wake(wake);
+    await vi.waitFor(() => expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(2));
     await flush();
     expect(h.renames).toHaveLength(0);
     expect(h.prompts).toHaveLength(0);
     host.notifier.wake(wake);
+    // The "refused" outcome is memoized: the second wake pays only the context
+    // read — one more snapshot, never another adoption attempt.
+    await vi.waitFor(() => expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(3));
     await flush();
-    // The "refused" outcome is memoized: the second wake paid only the context read.
-    expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(3);
+    expect(h.prompts).toHaveLength(0);
   });
 });

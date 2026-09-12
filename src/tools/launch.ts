@@ -4,6 +4,7 @@ import type { PromptDispatchEvidence } from "../agent-prompt.js";
 import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
+import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
@@ -51,6 +52,12 @@ export interface LaunchDependencies {
   clock?: LaunchClock;
   /** Test hosts may provide the same fail-closed gate with disposable paths. */
   launchGate?: () => Promise<LaunchGateLease>;
+  /**
+   * The host's shared Devin queue-flush coordinator. A Devin launch's initial
+   * prompt write rides its short write section like every other participating
+   * text write; holding it never makes a launch eligible for a flush.
+   */
+  queueFlush?: Pick<DevinQueueFlush, "writeSection">;
   /**
    * Required. Every successful launch creates supervision, so a host that
    * cannot supervise cannot launch. See ADR-019.
@@ -1915,7 +1922,22 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         try {
           let promptResponse: JsonEnvelope;
           try {
-            promptResponse = await dispatchMutation(() => runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal));
+            promptResponse = await dispatchMutation(async () => {
+              // The Devin initial write rides inside the shared pane-write
+              // section like every participating text write, so a peer's flush
+              // proof/Enter cannot interleave with it. Launch readiness and
+              // semantic confirmation are unchanged; the lock buys ordering
+              // only, never eligibility for a flush.
+              if (capturedIdentity.agentKind !== "devin" || deps.queueFlush === undefined) {
+                return runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
+              }
+              const lease = await deps.queueFlush.writeSection(resolvedPaneId);
+              try {
+                return await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
+              } finally {
+                await lease.release();
+              }
+            });
           } catch (error) {
             const details = record(error) && record(error.details) ? error.details : undefined;
             const dispatch = details?.promptDispatch;

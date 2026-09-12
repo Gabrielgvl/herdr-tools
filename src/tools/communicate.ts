@@ -3,6 +3,7 @@ import type { HerdrCli, JsonEnvelope } from "../cli.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
+import { queueFlushEligible, type DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import { classifyPromptObservation, compactPromptSubmission, requirePromptTargetIdentity, parsePromptSubmission, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
@@ -55,6 +56,12 @@ export interface CommunicateDependencies {
   preflight: CompatibilityPreflight;
   attachments?: AttachmentStore;
   recipients?: RecipientRegistry;
+  /**
+   * The host's shared Devin queue-flush coordinator. A Devin-kind send rides
+   * its short write section and an acknowledged busy write schedules the
+   * bounded flush; when absent, sends proceed without either.
+   */
+  queueFlush?: DevinQueueFlush;
 }
 
 function assertPromptState(pane: Record<string, unknown>, state: CommunicateState): void {
@@ -185,7 +192,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           phase = "send";
           keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...legacyParams.keys], activeSignal);
         } else {
-          const verifyFreshPromptTarget = async (): Promise<{ identity: PromptTargetIdentity; pane: Record<string, unknown> }> => {
+          const verifyFreshPromptTarget = async (): Promise<{ identity: PromptTargetIdentity; state: CommunicateState }> => {
             phase = "pre_state";
             const finalAgentEnvelope = await deps.cli.runJson(["agent", "get", target.paneId!], activeSignal);
             const finalEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
@@ -199,13 +206,13 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             ];
             assertQualifiedPromptTarget(finalIdentityRecords, target.paneId!);
             const identity = requirePromptTargetIdentity(finalIdentityRecords, target.paneId!);
-            return { identity, pane: finalPane };
+            return { identity, state: finalState };
           };
           // Check the fresh occupant before attachment publication as well as
           // immediately before the prompt. This keeps an AGY replacement from
           // receiving a published body while still retaining any race evidence.
-          promptIdentity = (await verifyFreshPromptTarget()).identity;
           if (delivery === "attachment") {
+            promptIdentity = (await verifyFreshPromptTarget()).identity;
             phase = "publish";
             published = await deps.attachments!.publish({
               body: legacyParams.text,
@@ -216,21 +223,47 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
               senderDisplay: sender!.display,
               operation: legacyParams.operation
             });
-            promptIdentity = (await verifyFreshPromptTarget()).identity;
           }
           phase = "send";
-          const envelope = delivery === "attachment"
-            ? buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "attachment", { ...published!, encoding: "utf-8" })
-            : buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "inline");
-          prompt = await deps.cli.prompt(target.paneId!, envelope, activeSignal);
-          const requestId = prompt.id;
-          try {
-            submission = parsePromptSubmission(prompt, promptIdentity!);
-          } catch (error) {
-            promptDispatch = { state: "unknown", requestId };
-            throw error;
+          let sentState: CommunicateState | undefined;
+          const sendPrompt = async (): Promise<void> => {
+            const fresh = await verifyFreshPromptTarget();
+            promptIdentity = fresh.identity;
+            sentState = fresh.state;
+            phase = "send";
+            const envelope = delivery === "attachment"
+              ? buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "attachment", { ...published!, encoding: "utf-8" })
+              : buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "inline");
+            prompt = await deps.cli.prompt(target.paneId!, envelope, activeSignal);
+            const requestId = prompt.id;
+            try {
+              submission = parsePromptSubmission(prompt, promptIdentity);
+            } catch (error) {
+              promptDispatch = { state: "unknown", requestId };
+              throw error;
+            }
+            promptDispatch = { state: "acknowledged", requestId };
+          };
+          // For a Devin target the final verify+write is the shared locked
+          // section: a flush's proof/Enter in another host can never interleave
+          // between the check and the bracketed-paste submission. The kind comes
+          // from the latest verified identity — a replacement swapping kinds
+          // between reads degrades to an unlocked write, never a wrong one.
+          if (promptIdentity!.agentKind === "devin" && deps.queueFlush !== undefined) {
+            const lease = await deps.queueFlush.writeSection(target.paneId!);
+            try {
+              await sendPrompt();
+            } finally {
+              await lease.release();
+            }
+          } else {
+            await sendPrompt();
           }
-          promptDispatch = { state: "acknowledged", requestId };
+          // The last verified pre-send state — never the post-send observation —
+          // decides whether this acknowledged write needs a queue flush.
+          if (submission !== undefined && sentState !== undefined && queueFlushEligible(submission, sentState)) {
+            deps.queueFlush?.schedule({ submission, sentState });
+          }
         }
 
         phase = "post_state";

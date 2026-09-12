@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -12,10 +12,11 @@ import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore, PublishedAttachment } from "../../src/messages/store.js";
 import { AdapterContractError } from "../../src/mcp/adapter.js";
 import type * as AdapterModule from "../../src/mcp/adapter.js";
+import type * as FsPromises from "node:fs/promises";
 import { StartupRefusal } from "../../src/mcp/host.js";
 
 const readFileMock = vi.hoisted(() => vi.fn());
-vi.mock("node:fs/promises", () => ({ readFile: readFileMock }));
+vi.mock("node:fs/promises", async (importOriginal) => ({ ...(await importOriginal<typeof FsPromises>()), readFile: readFileMock }));
 
 const describeFailure = vi.hoisted(() => ({ enabled: false }));
 vi.mock("../../src/mcp/adapter.js", async (importOriginal) => {
@@ -562,7 +563,10 @@ describe("MCP server lifecycle", () => {
       // The flush's own-pane `agent wait` is the call shutdown must cancel.
       if (argv[0] === "agent" && argv[1] === "wait" && argv[2] === "w:p") {
         waitSignals.push(options.signal!);
-        await holdWait;
+        await Promise.race([holdWait, new Promise<never>((_, reject) => {
+          if (options.signal!.aborted) reject(new Error("aborted"));
+          else options.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        })]);
       }
       const result = await base.exec(command, argv, options);
       // Recast the hosting pane as a working devin pane wherever it surfaces,
@@ -614,7 +618,12 @@ describe("MCP server lifecycle", () => {
       ping: vi.fn(async () => undefined),
       close: vi.fn()
     };
-    const harness = await start({ exec, promptClient });
+    // The wake's Devin write and the flush both ride the real pane-write
+    // section, which resolves its lock namespace from the endpoint socket —
+    // the path only needs to exist for canonicalization, never to connect.
+    const socketPath = join(canonicalProjectDir, "herdr-test.sock");
+    writeFileSync(socketPath, "");
+    const harness = await start({ exec, promptClient, env: { ...env, HERDR_SOCKET_PATH: socketPath } });
     const wait = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
     expect(wait.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(wait).split("herdr-details\n")[1]!) as { jobId: string }).jobId;

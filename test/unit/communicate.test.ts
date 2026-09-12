@@ -4,6 +4,7 @@ import { AgentPromptError, type AgentPromptClient } from "../../src/agent-prompt
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
+import type { DevinQueueFlush } from "../../src/messages/devin-queue-flush.js";
 import { compactPane, createCommunicateTool as createCommunicateToolImplementation, paneFrom, type CommunicateDependencies } from "../../src/tools/communicate.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
@@ -661,6 +662,89 @@ describe("herdr_communicate", () => {
     expect(preflight).not.toHaveBeenCalled();
     await expect(tool.execute("id", { target: "reviewer", operation: "keys", keys: ["enter"], delivery: "inline" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(tool.execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "other" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
+  it("locks a Devin steer write and schedules the flush from the last verified pre-send state", async () => {
+    const devinIdentity = { terminal_id: "term-devin", agent_session: { source: "herdr:devin", agent: "devin", kind: "id", value: "session-devin" } };
+    const makeDevinCli = (initial: State) => {
+      const harness = makeCli(initial);
+      const baseExec = harness.exec.getMockImplementation()!;
+      const devinize = <T extends Record<string, unknown>>(record: T): T => ({ ...record, agent: "devin", ...devinIdentity });
+      harness.exec.mockImplementation(async (_command, argv, execOptions) => {
+        const base = await baseExec(_command, argv, execOptions);
+        const response = JSON.parse(base.stdout) as { id: string; result: Record<string, unknown> };
+        const snapshot = (response.result as { snapshot?: { panes?: Record<string, unknown>[]; agents?: Record<string, unknown>[] } }).snapshot;
+        if (snapshot) {
+          snapshot.panes = snapshot.panes!.map((pane) => (pane.pane_id === "w1:p2" ? devinize(pane) : pane));
+          snapshot.agents = snapshot.agents!.map((agent) => (agent.pane_id === "w1:p2" ? devinize(agent) : agent));
+        }
+        const agent = (response.result as { agent?: Record<string, unknown> }).agent;
+        if (agent?.pane_id === "w1:p2") response.result = { ...response.result, agent: devinize(agent) };
+        const pane = (response.result as { pane?: Record<string, unknown> }).pane;
+        if (pane?.pane_id === "w1:p2") response.result = { ...response.result, pane: devinize(pane) };
+        return { ...base, stdout: JSON.stringify(response) };
+      });
+      harness.prompt.mockImplementation(async (_target, input) => {
+        harness.promptInputs.push(input);
+        return { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: devinize({ name: "reviewer", pane_id: "w1:p2", agent_status: "working", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true }) } };
+      });
+      return harness;
+    };
+    const fakeQueueFlush = (events: string[]): { flush: DevinQueueFlush; schedule: ReturnType<typeof vi.fn>; writeSection: ReturnType<typeof vi.fn> } => {
+      const schedule = vi.fn();
+      const writeSection = vi.fn(async () => {
+        events.push("acquire");
+        return {
+          check: async () => undefined,
+          release: async () => { events.push("release"); },
+          fence: { isSpent: async () => false, record: async () => undefined, rearm: async () => undefined },
+        };
+      });
+      return { schedule, writeSection, flush: { begin: vi.fn(), shutdown: vi.fn(async () => undefined), schedule, writeSection } };
+    };
+
+    // A Devin steer acknowledged on a busy pane: the write rides the section
+    // and the ack schedules a flush bound to the last verified pre-send state.
+    const events: string[] = [];
+    const busy = makeDevinCli("working");
+    const { flush, schedule, writeSection } = fakeQueueFlush(events);
+    busy.prompt.mockImplementation(async (target) => {
+      events.push("prompt");
+      return { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { name: "reviewer", pane_id: target, agent: "devin", agent_status: "working", ...devinIdentity, interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } } };
+    });
+    const result = await createCommunicateTool({ cli: busy.cli, context, queueFlush: flush })
+      .execute("id", { target: "reviewer", operation: "steer", text: "queued direction" }, new AbortController().signal, undefined, extensionContext);
+    expect(events).toEqual(["acquire", "prompt", "release"]);
+    expect(writeSection).toHaveBeenCalledWith("w1:p2");
+    expect(schedule).toHaveBeenCalledTimes(1);
+    expect(schedule).toHaveBeenCalledWith({ submission: expect.objectContaining({ agentKind: "devin", paneId: "w1:p2", agentName: "reviewer", agentSession: devinIdentity.agent_session, confirmed: true }), sentState: "working" });
+    expect(result.details).toMatchObject({ outcome: "sent", route: "steer_direct", preState: { agent_status: "working" } });
+
+    // Acknowledged on an idle pane: the write is still locked, but no flush.
+    const idleEvents: string[] = [];
+    const idle = makeDevinCli("idle");
+    const idleFlush = fakeQueueFlush(idleEvents);
+    await createCommunicateTool({ cli: idle.cli, context, queueFlush: idleFlush.flush })
+      .execute("id", { target: "reviewer", operation: "steer", text: "free direction" }, new AbortController().signal, undefined, extensionContext);
+    expect(idleEvents).toEqual(["acquire", "release"]);
+    expect(idleFlush.schedule).not.toHaveBeenCalled();
+
+    // A normal prompt to a working Devin pane still refuses before any section.
+    const refused = makeDevinCli("working");
+    const refusedFlush = fakeQueueFlush([]);
+    await expect(createCommunicateTool({ cli: refused.cli, context, queueFlush: refusedFlush.flush })
+      .execute("id", { target: "reviewer", operation: "prompt", text: "body" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "TARGET_BUSY" });
+    expect(refusedFlush.writeSection).not.toHaveBeenCalled();
+    expect(refusedFlush.schedule).not.toHaveBeenCalled();
+
+    // A non-Devin target never touches the coordinator even when one is wired.
+    const pi = makeCli("working");
+    const piFlush = fakeQueueFlush([]);
+    await createCommunicateTool({ cli: pi.cli, context, queueFlush: piFlush.flush })
+      .execute("id", { target: "reviewer", operation: "steer", text: "pi direction" }, new AbortController().signal, undefined, extensionContext);
+    expect(piFlush.writeSection).not.toHaveBeenCalled();
+    expect(piFlush.schedule).not.toHaveBeenCalled();
   });
 
   it("renders compact call/result rows", () => {

@@ -1,6 +1,7 @@
 import type { AgentToolResult, ExtensionContext, ToolExecutionMode } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import type { HerdrCli } from "./cli.js";
+import type { DevinQueueFlush } from "./messages/devin-queue-flush.js";
 import { preflightCompatibility, type CompatibilityPreflight, type HealthCli } from "./health.js";
 import type { JobRegistry } from "./job-registry.js";
 import type { RecipientRegistry } from "./messages/recipients.js";
@@ -119,6 +120,12 @@ export interface HerdrToolSurfaceDependencies {
   attachments?: AttachmentStore;
   recipients?: RecipientRegistry;
   /**
+   * The host's shared Devin queue-flush coordinator. Communicate and launch
+   * pass Devin text writes through its short write section, and an
+   * acknowledged busy Devin write schedules the bounded flush.
+   */
+  queueFlush?: DevinQueueFlush;
+  /**
    * Required. Every successful `herdr_launch` creates supervision, so a host
    * that cannot supervise cannot construct a launch tool. See ADR-019.
    */
@@ -151,6 +158,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     context: deps.context,
     contextResolver,
     preflight: deps.preflight,
+    queueFlush: deps.queueFlush,
     ...(deps.attachments ? { attachments: deps.attachments } : {}),
     ...(deps.recipients ? { recipients: deps.recipients } : {}),
   });
@@ -172,6 +180,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     profiles: deps.profiles,
     preflight: deps.preflight,
     supervision: deps.supervision,
+    queueFlush: deps.queueFlush,
     ...(deps.attachments ? { attachments: deps.attachments } : {}),
     ...(deps.recipients ? { recipients: deps.recipients } : {}),
   });

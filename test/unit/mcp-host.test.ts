@@ -1,4 +1,5 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { promises as fsPromises } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -170,19 +171,164 @@ describe("MCP startup gating", () => {
   const launchDir = mkdtempSync(join(tmpdir(), "herdr-mcp-launch-"));
   const file = join(directory, "not-a-directory");
   writeFileSync(file, "");
+  // Expectations are always the canonical path: on platforms whose temp parent
+  // is itself a symlink the fixture spelling and its realpath differ.
+  const canonicalDirectory = realpathSync(directory);
+  const canonicalLaunchDir = realpathSync(launchDir);
+  const canonicalCwd = realpathSync(process.cwd());
+  const projectDirMessage = "HERDR_PROJECT_DIR or the server launch directory must be an absolute single-line path to an existing directory below the filesystem root";
 
   it("resolves the injected context and explicit HERDR_PROJECT_DIR in order", async () => {
     await expect(resolveStartup({ env: { ...validEnv, HERDR_PROJECT_DIR: directory }, cwd: () => launchDir })).resolves.toEqual({
       context,
       environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
-      projectDir: directory
+      projectDir: canonicalDirectory
     });
   });
 
   it("anchors on the launch directory when HERDR_PROJECT_DIR is unset", async () => {
-    await expect(resolveStartup({ env: { ...validEnv }, cwd: () => launchDir })).resolves.toMatchObject({ projectDir: launchDir });
+    await expect(resolveStartup({ env: { ...validEnv }, cwd: () => launchDir })).resolves.toMatchObject({ projectDir: canonicalLaunchDir });
     // The default launch-directory source is the server process cwd.
-    await expect(resolveStartup({ env: { ...validEnv } })).resolves.toMatchObject({ projectDir: process.cwd() });
+    await expect(resolveStartup({ env: { ...validEnv } })).resolves.toMatchObject({ projectDir: canonicalCwd });
+  });
+
+  it("resolves a symlinked project directory to its canonical path from either source", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-mcp-canonical-"));
+    try {
+      const target = join(root, "target");
+      mkdirSync(target);
+      const alias = join(root, "alias");
+      symlinkSync(target, alias, "dir");
+      const canonical = await fsPromises.realpath(alias);
+      expect(canonical).not.toBe(alias);
+      await expect(resolveStartup({ env: { ...validEnv, HERDR_PROJECT_DIR: alias }, cwd: () => launchDir })).resolves.toMatchObject({ projectDir: canonical });
+      await expect(resolveStartup({ env: { ...validEnv }, cwd: () => alias })).resolves.toMatchObject({ projectDir: canonical });
+      // An explicit alias still wins over a different valid launch directory.
+      const other = join(root, "other");
+      mkdirSync(other);
+      await expect(resolveStartup({ env: { ...validEnv, HERDR_PROJECT_DIR: alias }, cwd: () => other })).resolves.toMatchObject({ projectDir: canonical });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a symlinked ancestor, not only the final component", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-mcp-ancestor-"));
+    try {
+      const nested = join(root, "target", "nested");
+      mkdirSync(nested, { recursive: true });
+      const alias = join(root, "alias");
+      symlinkSync(join(root, "target"), alias, "dir");
+      const throughAlias = join(alias, "nested");
+      const canonical = await fsPromises.realpath(throughAlias);
+      expect(canonical).not.toBe(throughAlias);
+      await expect(resolveStartup({ env: { ...validEnv, HERDR_PROJECT_DIR: throughAlias }, cwd: () => launchDir })).resolves.toMatchObject({ projectDir: canonical });
+      await expect(resolveStartup({ env: { ...validEnv }, cwd: () => throughAlias })).resolves.toMatchObject({ projectDir: canonical });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an alias to the filesystem root and a raw .. path that resolves to it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-mcp-root-alias-"));
+    try {
+      const rootAlias = join(root, "root-alias");
+      symlinkSync("/", rootAlias, "dir");
+      // `..` is a legitimate raw component: the string is built without a path
+      // helper so the regression input reaches realpath un-normalized and only
+      // the canonical result is judged. "/.." realpaths to "/" regardless of
+      // the temp tree's depth or symlinked ancestors.
+      const dotdot = "/..";
+      const refusals: StartupDependencies[] = [
+        { env: { ...validEnv, HERDR_PROJECT_DIR: rootAlias }, cwd: () => launchDir },
+        { env: { ...validEnv }, cwd: () => rootAlias },
+        { env: { ...validEnv, HERDR_PROJECT_DIR: dotdot }, cwd: () => launchDir },
+        { env: { ...validEnv }, cwd: () => dotdot }
+      ];
+      for (const deps of refusals) {
+        const refusal = await resolveStartup(deps).catch((error: unknown) => error);
+        expect(refusal).toBeInstanceOf(StartupRefusal);
+        expect(refusal).toMatchObject({ code: "STARTUP_REFUSED", reason: "PROJECT_DIR" });
+        expect((refusal as Error).message).toBe(projectDirMessage);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a safely named alias whose canonical target contains a newline", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-mcp-newline-"));
+    try {
+      const target = join(root, "target\nname");
+      mkdirSync(target);
+      const alias = join(root, "safe-alias");
+      symlinkSync(target, alias, "dir");
+      // The raw spelling passes every shape check; only the canonical target
+      // carries the control character, so canonical revalidation is what refuses.
+      expect(await fsPromises.realpath(alias)).toContain("\n");
+      for (const deps of [
+        { env: { ...validEnv, HERDR_PROJECT_DIR: alias }, cwd: () => launchDir },
+        { env: { ...validEnv }, cwd: () => alias }
+      ]) {
+        const refusal = await resolveStartup(deps).catch((error: unknown) => error);
+        expect(refusal).toBeInstanceOf(StartupRefusal);
+        expect(refusal).toMatchObject({ code: "STARTUP_REFUSED", reason: "PROJECT_DIR" });
+        expect((refusal as Error).message).toBe(projectDirMessage);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails realpath on dangling aliases and converts resolution errors to the same refusal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-mcp-dangling-"));
+    const realpathSpy = vi.spyOn(fsPromises, "realpath");
+    try {
+      const dangling = join(root, "dangling");
+      symlinkSync(join(root, "missing-target"), dangling, "dir");
+      for (const deps of [
+        { env: { ...validEnv, HERDR_PROJECT_DIR: dangling }, cwd: () => launchDir },
+        { env: { ...validEnv }, cwd: () => dangling }
+      ]) {
+        const refusal = await resolveStartup(deps).catch((error: unknown) => error);
+        expect(refusal).toBeInstanceOf(StartupRefusal);
+        expect(refusal).toMatchObject({ code: "STARTUP_REFUSED", reason: "PROJECT_DIR" });
+        expect((refusal as Error).message).toBe(projectDirMessage);
+      }
+      expect(realpathSpy).toHaveBeenCalled();
+      // A permission-style resolution failure on an existing directory is the
+      // same typed refusal, pinned without unreliable chmod assumptions.
+      realpathSpy.mockRejectedValue(Object.assign(new Error("realpath exploded"), { code: "EACCES" }));
+      const refusal = await resolveStartup({ env: { ...validEnv, HERDR_PROJECT_DIR: directory }, cwd: () => launchDir }).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(StartupRefusal);
+      expect(refusal).toMatchObject({ code: "STARTUP_REFUSED", reason: "PROJECT_DIR" });
+      expect((refusal as Error).message).toBe(projectDirMessage);
+    } finally {
+      realpathSpy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("never reaches the filesystem for identity or raw-shape refusals", async () => {
+    const realpathSpy = vi.spyOn(fsPromises, "realpath");
+    const stat = vi.fn();
+    try {
+      const refusals: StartupDependencies[] = [
+        { env: { HERDR_PROJECT_DIR: directory }, stat },
+        { env: { HERDR_ENV: "1", HERDR_PROJECT_DIR: directory }, stat },
+        { env: { ...validEnv, HERDR_PROJECT_DIR: "relative/project" }, cwd: () => launchDir, stat },
+        { env: { ...validEnv, HERDR_PROJECT_DIR: "/" }, cwd: () => launchDir, stat },
+        { env: { ...validEnv, HERDR_PROJECT_DIR: `${directory}\nother` }, cwd: () => launchDir, stat },
+        { env: { ...validEnv }, cwd: () => `${launchDir}\rother`, stat }
+      ];
+      for (const deps of refusals) {
+        await expect(resolveStartup(deps)).rejects.toBeInstanceOf(StartupRefusal);
+      }
+      expect(realpathSpy).not.toHaveBeenCalled();
+      expect(stat).not.toHaveBeenCalled();
+    } finally {
+      realpathSpy.mockRestore();
+    }
   });
 
   it("refuses without HERDR_ENV, without valid injected identity, and without a usable project directory", async () => {
@@ -195,12 +341,22 @@ describe("MCP startup gating", () => {
       [{ env: { ...validEnv, HERDR_PROJECT_DIR: "" }, cwd: () => launchDir }, "PROJECT_DIR"],
       [{ env: { ...validEnv, HERDR_PROJECT_DIR: "relative/project" }, cwd: () => launchDir }, "PROJECT_DIR"],
       [{ env: { ...validEnv, HERDR_PROJECT_DIR: `${directory}\nother` }, cwd: () => launchDir }, "PROJECT_DIR"],
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: `${directory}\rother` }, cwd: () => launchDir }, "PROJECT_DIR"],
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: `${directory}\r\nother` }, cwd: () => launchDir }, "PROJECT_DIR"],
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: `${directory}\0other` }, cwd: () => launchDir }, "PROJECT_DIR"],
       [{ env: { ...validEnv, HERDR_PROJECT_DIR: "/" }, cwd: () => launchDir }, "PROJECT_DIR"],
       [{ env: { ...validEnv, HERDR_PROJECT_DIR: join(directory, "missing") }, cwd: () => launchDir }, "PROJECT_DIR"],
       [{ env: { ...validEnv, HERDR_PROJECT_DIR: file }, cwd: () => launchDir }, "PROJECT_DIR"],
+      // A stat failure is the same typed refusal and never echoes error text.
+      [{ env: { ...validEnv, HERDR_PROJECT_DIR: directory }, cwd: () => launchDir, stat: async () => { throw new Error("stat EACCES"); } }, "PROJECT_DIR"],
       // The launch-directory fallback refuses degenerate or unreadable anchors.
+      [{ env: { ...validEnv }, cwd: () => "" }, "PROJECT_DIR"],
       [{ env: { ...validEnv }, cwd: () => "/" }, "PROJECT_DIR"],
       [{ env: { ...validEnv }, cwd: () => "relative" }, "PROJECT_DIR"],
+      [{ env: { ...validEnv }, cwd: () => `${launchDir}\nother` }, "PROJECT_DIR"],
+      [{ env: { ...validEnv }, cwd: () => `${launchDir}\rother` }, "PROJECT_DIR"],
+      [{ env: { ...validEnv }, cwd: () => `${launchDir}\r\nother` }, "PROJECT_DIR"],
+      [{ env: { ...validEnv }, cwd: () => `${launchDir}\0other` }, "PROJECT_DIR"],
       [{ env: { ...validEnv }, cwd: () => { throw new Error("cwd deleted"); } }, "PROJECT_DIR"],
       [{ env: { ...validEnv }, cwd: () => join(launchDir, "missing") }, "PROJECT_DIR"]
     ];
@@ -209,6 +365,12 @@ describe("MCP startup gating", () => {
       expect(refusal).toBeInstanceOf(StartupRefusal);
       expect(refusal).toMatchObject({ code: "STARTUP_REFUSED", reason });
       expect((refusal as Error).message).not.toContain(directory);
+      expect((refusal as Error).message).not.toContain(launchDir);
+      if (reason === "PROJECT_DIR") {
+        // The fixed refusal proves no candidate, target, or filesystem error
+        // text can echo into the message.
+        expect((refusal as Error).message).toBe(projectDirMessage);
+      }
     }
   });
 
@@ -216,9 +378,9 @@ describe("MCP startup gating", () => {
     const original = { ...process.env };
     try {
       Object.assign(process.env, validEnv, { HERDR_PROJECT_DIR: directory });
-      await expect(resolveStartup()).resolves.toMatchObject({ projectDir: directory });
+      await expect(resolveStartup()).resolves.toMatchObject({ projectDir: canonicalDirectory });
       delete process.env.HERDR_PROJECT_DIR;
-      await expect(resolveStartup()).resolves.toMatchObject({ projectDir: process.cwd() });
+      await expect(resolveStartup()).resolves.toMatchObject({ projectDir: canonicalCwd });
     } finally {
       for (const key of ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "HERDR_PROJECT_DIR"]) {
         if (original[key] === undefined) delete process.env[key];

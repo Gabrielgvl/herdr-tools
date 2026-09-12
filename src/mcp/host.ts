@@ -86,6 +86,12 @@ function safeDirectory(value: string | undefined): string | undefined {
  * that fails validation refuses startup rather than silently re-anchoring to
  * the launch directory, and a launch directory of a filesystem root is not a
  * project anchor.
+ *
+ * The validated candidate is resolved to its canonical filesystem path before
+ * it is accepted, and the canonical result must pass the same non-root
+ * single-line shape check, so a symlink to the root or to a path that could
+ * never be echoed safely is refused rather than served. Only the canonical
+ * directory anchors the session and is returned.
  */
 export async function resolveStartup(deps: StartupDependencies = {}): Promise<StartupContext> {
   const env = deps.env ?? process.env;
@@ -105,12 +111,19 @@ export async function resolveStartup(deps: StartupDependencies = {}): Promise<St
       candidate = undefined;
     }
   }
-  const projectDir = candidate !== undefined && dirname(candidate) !== candidate ? safeDirectory(candidate) : undefined;
-  if (projectDir === undefined) {
+  const validated = candidate !== undefined && dirname(candidate) !== candidate ? safeDirectory(candidate) : undefined;
+  if (validated === undefined) {
     throw new StartupRefusal("PROJECT_DIR", "HERDR_PROJECT_DIR or the server launch directory must be an absolute single-line path to an existing directory below the filesystem root");
   }
+  let projectDir: string;
   let directory: DirectoryStat;
   try {
+    const resolved = await fs.realpath(validated);
+    const canonical = dirname(resolved) !== resolved ? safeDirectory(resolved) : undefined;
+    if (canonical === undefined) {
+      throw new StartupRefusal("PROJECT_DIR", "HERDR_PROJECT_DIR or the server launch directory must be an absolute single-line path to an existing directory below the filesystem root");
+    }
+    projectDir = canonical;
     directory = await stat(projectDir);
   } catch {
     throw new StartupRefusal("PROJECT_DIR", "HERDR_PROJECT_DIR or the server launch directory must be an absolute single-line path to an existing directory below the filesystem root");

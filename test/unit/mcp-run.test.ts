@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -80,6 +80,9 @@ const snapshot = {
 };
 
 const projectDir = mkdtempSync(join(tmpdir(), "herdr-mcp-run-"));
+// The served directory is always the canonical path; the raw spelling is only
+// the resolution input.
+const canonicalProjectDir = realpathSync(projectDir);
 const env = { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p", HERDR_PROJECT_DIR: projectDir };
 const emptyCatalog = { effective: new Map(), candidates: [], diagnostics: [] } as never;
 
@@ -164,32 +167,44 @@ afterEach(() => {
 
 describe("MCP server startup", () => {
   it("refuses to serve without gating and never connects a transport or calls the CLI", async () => {
+    const danglingRoot = mkdtempSync(join(tmpdir(), "herdr-mcp-dangling-"));
+    const dangling = join(danglingRoot, "dangling");
+    symlinkSync(join(danglingRoot, "missing-target"), dangling, "dir");
     const refusals: Array<[NodeJS.ProcessEnv, string]> = [
       [{ HERDR_PROJECT_DIR: projectDir }, "HERDR_ENV"],
       [{ HERDR_ENV: "1", HERDR_PROJECT_DIR: projectDir }, "INJECTED_CONTEXT"],
-      [{ HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p", HERDR_PROJECT_DIR: "relative/project" }, "PROJECT_DIR"]
+      [{ HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p", HERDR_PROJECT_DIR: "relative/project" }, "PROJECT_DIR"],
+      // A symlink whose target cannot be resolved fails at startup the same way.
+      [{ HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p", HERDR_PROJECT_DIR: dangling }, "PROJECT_DIR"]
     ];
-    for (const [refusedEnv, reason] of refusals) {
-      const [, serverTransport] = InMemoryTransport.createLinkedPair();
-      const started = vi.spyOn(serverTransport, "start");
-      const { exec, calls } = fakeExec();
-      const errors: string[] = [];
-      const exits: number[] = [];
-      const handle = await runHerdrMcpServer({
-        env: refusedEnv,
-        exec,
-        transport: serverTransport,
-        profiles: { load: async () => emptyCatalog },
-        writeStderr: (line) => errors.push(line),
-        exit: (code) => exits.push(code)
-      });
-      expect(handle).toBeUndefined();
-      expect(exits).toEqual([1]);
-      expect(errors).toHaveLength(1);
-      expect(errors[0]).toContain(`${MCP_SERVER_NAME} mcp server refused to start: ${reason}`);
-      expect(errors[0]!.endsWith("\n")).toBe(true);
-      expect(started).not.toHaveBeenCalled();
-      expect(calls).toEqual([]);
+    try {
+      for (const [refusedEnv, reason] of refusals) {
+        const [, serverTransport] = InMemoryTransport.createLinkedPair();
+        const started = vi.spyOn(serverTransport, "start");
+        const { exec, calls } = fakeExec();
+        const errors: string[] = [];
+        const exits: number[] = [];
+        const handle = await runHerdrMcpServer({
+          env: refusedEnv,
+          exec,
+          transport: serverTransport,
+          profiles: { load: async () => emptyCatalog },
+          writeStderr: (line) => errors.push(line),
+          exit: (code) => exits.push(code)
+        });
+        expect(handle).toBeUndefined();
+        expect(exits).toEqual([1]);
+        expect(errors).toHaveLength(1);
+        expect(errors[0]).toContain(`${MCP_SERVER_NAME} mcp server refused to start: ${reason}`);
+        expect(errors[0]!.endsWith("\n")).toBe(true);
+        if (refusedEnv.HERDR_PROJECT_DIR !== undefined) {
+          expect(errors[0]).not.toContain(refusedEnv.HERDR_PROJECT_DIR);
+        }
+        expect(started).not.toHaveBeenCalled();
+        expect(calls).toEqual([]);
+      }
+    } finally {
+      rmSync(danglingRoot, { recursive: true, force: true });
     }
   });
 
@@ -383,12 +398,12 @@ describe("MCP tool serving", () => {
 
   it("uses HERDR_PROJECT_DIR as the operational working directory", async () => {
     const harness = await start();
-    expect(harness.handle.projectDir).toBe(projectDir);
-    expect(projectDir).not.toBe(process.cwd());
+    expect(harness.handle.projectDir).toBe(canonicalProjectDir);
+    expect(canonicalProjectDir).not.toBe(realpathSync(process.cwd()));
     const created = await harness.client.callTool({ name: "herdr_tab", arguments: { operation: "create", label: "worker-tab" } });
     expect(created.isError).toBeUndefined();
     const create = harness.calls.find((call) => call[0] === "tab" && call[1] === "create");
-    expect(create?.[create.indexOf("--cwd") + 1]).toBe(projectDir);
+    expect(create?.[create.indexOf("--cwd") + 1]).toBe(canonicalProjectDir);
     expect(harness.handle.ownership.snapshot().map((resource) => resource.kind)).toEqual(["tab", "pane"]);
     await harness.handle.shutdown();
   });
@@ -396,8 +411,29 @@ describe("MCP tool serving", () => {
   it("anchors on the injected launch directory when HERDR_PROJECT_DIR is unset", async () => {
     const launchOnlyEnv = { HERDR_ENV: env.HERDR_ENV, HERDR_WORKSPACE_ID: env.HERDR_WORKSPACE_ID, HERDR_TAB_ID: env.HERDR_TAB_ID, HERDR_PANE_ID: env.HERDR_PANE_ID };
     const harness = await start({ env: launchOnlyEnv, cwd: () => projectDir });
-    expect(harness.handle.projectDir).toBe(projectDir);
+    expect(harness.handle.projectDir).toBe(canonicalProjectDir);
     await harness.handle.shutdown();
+  });
+
+  it("resolves a symlinked HERDR_PROJECT_DIR and serves the canonical directory to every consumer", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-mcp-alias-"));
+    try {
+      const target = join(root, "target");
+      mkdirSync(target);
+      const alias = join(root, "alias");
+      symlinkSync(target, alias, "dir");
+      const canonical = realpathSync(alias);
+      expect(canonical).not.toBe(alias);
+      const harness = await start({ env: { ...env, HERDR_PROJECT_DIR: alias } });
+      expect(harness.handle.projectDir).toBe(canonical);
+      const created = await harness.client.callTool({ name: "herdr_tab", arguments: { operation: "create", label: "worker-tab" } });
+      expect(created.isError).toBeUndefined();
+      const create = harness.calls.find((call) => call[0] === "tab" && call[1] === "create");
+      expect(create?.[create.indexOf("--cwd") + 1]).toBe(canonical);
+      await harness.handle.shutdown();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("does not cancel a detached job through the request signal after registration", async () => {

@@ -812,13 +812,23 @@ describe("profile catalog", () => {
     expect(promoterSkill).toContain("GIT_OBJECT_DIRECTORY");
     expect(promoterSkill).toContain("git commit-tree");
     expect(promoterSkill).toContain("git update-ref");
+    expect(promoterSkill).toContain("Stage only reviewed paths, inspect the staged diff, and require live `git write-tree` to equal the reviewed tree OID");
     expect(promoterSkill).toContain("Execute the assigned promotion");
     expect(promoterSkill).toContain("This trusted promoter profile itself authorizes those standard promotion effects");
     expect(promoterSkill).toContain("satisfies a loaded skill's requirement for explicit user or current-session authorization");
+    // Every promoter body restates the promotion gate: the shared skill is not
+    // guaranteed to reach each runtime, and Devin never receives a body at all.
     for (const profileName of ["promoter-pi", "promoter-claude", "promoter-devin"]) {
       const promoterProfile = await readFile(join(bundledRoot, "herdr-profiles", `${profileName}.md`), "utf8");
       expect(promoterProfile).toContain("execute the assignment's scoped delivery workflow");
+      expect(promoterProfile).toContain("Stage only reviewed paths, inspect the staged diff, and require live `git write-tree` to equal the reviewed tree OID");
+      expect(promoterProfile).toContain("Refuse any mismatch and return to critic before committing or executing delivery effects");
     }
+    // Devin's body is catalog metadata, so the manager's self-contained
+    // assignment contract must restate the gate alongside the manifest.
+    const devinPromoter = await readFile(join(bundledRoot, "herdr-profiles", "promoter-devin.md"), "utf8");
+    expect(devinPromoter).toContain("does not deliver this profile body to Devin");
+    expect(devinPromoter).toContain("must restate the reviewed manifest, the exact promotion scope, the required read-back receipts, and the promotion gate");
 
     const claudeTools = {
       scout: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },

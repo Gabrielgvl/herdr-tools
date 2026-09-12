@@ -5,7 +5,7 @@ timeoutMinutes: 30
 sessionPersistence: true
 runtime:
   kind: pi
-  model: openai-codex/gpt-6-astra
+  model: openai-codex/gpt-5.6-sol
   thinking: high
   tools:
     - read

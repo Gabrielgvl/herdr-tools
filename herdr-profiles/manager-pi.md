@@ -6,7 +6,7 @@ sessionPersistence: true
 runtime:
   kind: pi
   model: openai-codex/gpt-6-astra
-  thinking: xhigh
+  thinking: high
   tools:
     - read
     - grep

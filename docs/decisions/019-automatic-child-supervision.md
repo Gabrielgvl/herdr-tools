@@ -101,7 +101,7 @@ fallback.
 
 **6. A continuously working child is reviewed on cadence by an exact model.** Every
 `reviewCadenceMinutes` of continuous `working`, a supervisor-specific reviewer classifies the
-child using `openai-codex/gpt-5.6-sol` at `thinking: "max"`. This is a module constant, not
+child using `openai-codex/gpt-5.6-luna` at `thinking: "max"`. This is a module constant, not
 a setting: the explicit `herdr_wait` reviewer keeps its own setting and stays Luna at `low`.
 Reviewer results store silently; only `stalled`, `blocked`, `risk`, `appears_complete`, and
 `unknown` wake the manager, and the supervisor stays active either way. A reviewer failure

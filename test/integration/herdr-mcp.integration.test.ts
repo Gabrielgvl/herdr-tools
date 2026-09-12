@@ -88,7 +88,7 @@ function schemaReferenceSurface() {
     context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" },
     environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
     preflight: createPreflight(cli),
-    settingsLoader: async () => ({ reviewCadenceMinutes: 5, reviewerModel: "reference", reviewerThinking: "low" }),
+    settingsLoader: async () => ({ reviewCadenceMinutes: 5, reviewerModel: "reference", reviewerThinking: "max" }),
     jobs: new JobRegistry(),
     profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
     ownership: new RuntimeOwnership(),

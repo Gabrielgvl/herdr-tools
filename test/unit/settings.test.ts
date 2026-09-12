@@ -37,7 +37,7 @@ describe("extension-owned settings", () => {
     await expect(loadSettings({ readFile: fake.readFile })).resolves.toEqual({
       reviewCadenceMinutes: 10,
       reviewerModel: "luna",
-      reviewerThinking: "low"
+      reviewerThinking: "max"
     });
   });
 
@@ -75,7 +75,7 @@ describe("extension-owned settings", () => {
     await expect(loadSettings({
       readFile: fake.readFile,
       toolInput: { reviewCadenceMinutes: 1, reviewerModel: "other", reviewerThinking: "max" }
-    })).resolves.toMatchObject({ reviewCadenceMinutes: 7, reviewerModel: "luna", reviewerThinking: "low" });
+    })).resolves.toMatchObject({ reviewCadenceMinutes: 7, reviewerModel: "luna", reviewerThinking: "max" });
     expect(fake.paths).toEqual(["/home/gabriel/.pi/agent/extensions/herdr-tools/config.json"]);
   });
 

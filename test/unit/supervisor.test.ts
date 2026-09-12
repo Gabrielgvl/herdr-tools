@@ -200,7 +200,7 @@ describe("supervisor binding", () => {
     expect(view.state).toBe("active");
     expect(view.status).toBe("working");
     expect(view.child).toEqual({ agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-pi" });
-    expect(view.reviewer).toMatchObject({ model: "openai-codex/gpt-5.6-sol", thinking: "max", cadenceMinutes: 5, degraded: false });
+    expect(view.reviewer).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false });
     expect(h.supervisor.childLive()).toBe(true);
     // A working child arms the review cadence immediately.
     expect(h.timerArmed()).toBe(true);

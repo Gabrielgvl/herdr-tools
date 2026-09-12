@@ -38,7 +38,7 @@ const snapshot = {
 
 const health = { client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } };
 const context = { workspaceId: "w", tabId: "w:t", paneId: "w:p" };
-const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" as const };
 
 function fakeExec(): { exec: PiExec; calls: string[][] } {
   const calls: string[][] = [];

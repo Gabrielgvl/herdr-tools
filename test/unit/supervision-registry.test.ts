@@ -12,7 +12,7 @@ const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
 const agyIdentity: ProvisionalSupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy" };
 const agySession = { source: "agy", agent: "agy", kind: "id", value: "agy-1" };
-const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "max" as const };
 
 const pane = { pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "working", revision: 3, agent: "pi", agent_session: session };
 
@@ -66,7 +66,7 @@ describe("the supervision registry", () => {
       // No pane exists at reservation time, so no target id is back-dated into the request.
       targetIds: [],
       child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
-      settings: { reviewerModel: "openai-codex/gpt-5.6-sol", reviewerThinking: "max", reviewCadenceMinutes: 5 },
+      settings: { reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max", reviewCadenceMinutes: 5 },
     });
     expect(detail.request.target_generation_refs?.[0]).toMatch(/^target_generation_/u);
     f.supervision.shutdown();
@@ -255,7 +255,7 @@ describe("the supervision registry", () => {
   it("keeps a host with no model service visibly degraded rather than silently unreviewed", async () => {
     const f = fixture();
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    expect(f.jobs.get(reservation.jobId)?.supervision?.reviewer).toMatchObject({ model: "openai-codex/gpt-5.6-sol", thinking: "max", degraded: false });
+    expect(f.jobs.get(reservation.jobId)?.supervision?.reviewer).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max", degraded: false });
     // The default reviewer for a host without a model service always fails.
     const registry = f.supervision as unknown as { reviewer(): SupervisionReviewer };
     await expect(registry.reviewer().review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: {}, transcriptDelta: [] }, new AbortController().signal))

@@ -231,7 +231,7 @@ A wait whose timeout is longer than the configured review cadence is a long wait
 Long waits use mandatory in-process, tool-less reviewer calls only for targets without active exact-child supervision:
 
 - The reviewer model is the extension-owned setting from `config.json`, default `openai-codex/gpt-5.6-luna`; the tool cannot select or override it.
-- Reviewer thinking is fixed at `low`; the tool cannot select or override it.
+- Reviewer thinking is fixed at `max`; the tool cannot select or override it.
 - After each latest authoritative target observation and immediately before dispatch, the wait partitions targets between active bound supervisors and the explicit reviewer. A covered target receives no wait-reviewer request. Uncovered targets receive one independent reviewer call each, concurrently, with no target-count cap.
 - Reviewer construction is lazy. An all-covered long wait does not resolve or authenticate the wait reviewer. Native lifecycle waits are still bounded into review windows so authoritative waiting is not bypassed.
 - Reviewer calls are not Herdr panes, are invisible in Herdr topology, receive no tools, and cannot mutate or communicate. A degraded but live supervisor remains the semantic-review owner; the wait reviewer is never a hidden fallback.
@@ -460,7 +460,7 @@ The optional extension-owned `config.json` uses this JSON shape:
 
 - `wait.reviewCadenceMinutes`: integer, default `5`, inclusive range `1..30`.
 - `wait.reviewerModel`: model identifier, default `openai-codex/gpt-5.6-luna`.
-- Reviewer thinking level is fixed to `low` and is not configurable by a tool call.
+- Reviewer thinking level is fixed to `max` and is not configurable by a tool call.
 - `wait.reviewCadenceMinutes` is shared with the supervision reviewer. `wait.reviewerModel` is wait-only: the supervisor reviewer pins `openai-codex/gpt-5.6-luna` at thinking `max` in code, because it judges a child that has been working continuously with no transition to read.
 
 If `config.json` is absent, use the specified defaults. If it is present but malformed or invalid, fail closed with `INVALID_SETTINGS`; do not coerce values or fall back to defaults or another reviewer model. A configured reviewer model that cannot be resolved or authenticated causes a long wait to fail with `REVIEWER_FAILED`; there is no fallback model.

@@ -100,7 +100,7 @@ function nativeCli(options: { statuses?: Record<string, string>; currentStatuses
 
 const context = { workspaceId: "w", tabId: "w:t", paneId: "p1" };
 const extensionContext = { modelRegistry: {} } as ExtensionContext;
-const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" as const };
 
 function nativePredicateTimeout(): CliProtocolError {
   return new CliProtocolError("CLI_PROTOCOL_ERROR", "timed out waiting for agent status", {
@@ -1732,7 +1732,7 @@ describe("herdr_wait", () => {
   it("uses the default settings loader during direct preflight", async () => {
     const prepared = await prepareWait({ cli: fakeCli(), context, jobRegistry: new JobRegistry() }, { targets: ["p1"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }, new AbortController().signal);
     expect(prepared.params.targets).toEqual(["p1"]);
-    expect(prepared.settings.reviewerThinking).toBe("low");
+    expect(prepared.settings.reviewerThinking).toBe("max");
   });
 
   it("detaches a wait at exactly the review cadence without reviewer supervision", async () => {

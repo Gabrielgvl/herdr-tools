@@ -6,7 +6,7 @@
  * read, which is a harder judgement than confirming a wait predicate. It
  * therefore pins an exact model at maximum thinking rather than reading
  * `wait.reviewerModel`, which continues to govern the explicit wait reviewer at
- * `low`.
+ * `max`.
  *
  * It never starts a Herdr agent and never creates a pane.
  */
@@ -16,7 +16,7 @@ import { ReviewerFailure, strictResult, textFrom, type CompleteSeam, type Review
 import type { SupervisionModelService } from "./model-service.js";
 
 /** The exact supervisor review model. Not configurable: see the module comment. */
-export const SUPERVISION_REVIEWER_MODEL = "openai-codex/gpt-5.6-sol";
+export const SUPERVISION_REVIEWER_MODEL = "openai-codex/gpt-5.6-luna";
 export const SUPERVISION_REVIEWER_THINKING = "max" as const;
 
 const MAX_PROMPT_BYTES = 16_000;

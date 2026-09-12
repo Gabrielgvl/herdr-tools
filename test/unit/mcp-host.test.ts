@@ -135,7 +135,7 @@ describe("MCP host capability proxy", () => {
       context,
       environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
       preflight: createPreflight(cli),
-      settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "low" }),
+      settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "max" }),
       jobs: new JobRegistry(),
       profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
       ownership: new RuntimeOwnership(),

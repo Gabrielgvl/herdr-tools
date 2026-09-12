@@ -136,7 +136,7 @@ src/supervision/
   monitor.ts     SessionEventMonitor: one connection, bootstrap, reconnect, fan-out
   identity.ts    exact child identity, continuity, and move-continuity rules
   events.ts      transition folding, material-wake classification, opaque event IDs
-  reviewer.ts    supervisor reviewer (gpt-5.6-sol, thinking=max) + model service seam
+  reviewer.ts    supervisor reviewer (gpt-5.6-luna, thinking=max) + model service seam
   notify.ts      ManagerNotifier: Pi sendMessage and Claude Channel implementations
   supervisor.ts  one child's state machine, cadence, degradation, receipts
   registry.ts    SupervisionRegistry: reserve → bind → settle, job ownership
@@ -327,7 +327,7 @@ supervisor job settles immediately after the wake.
 
 - Cadence: `settings.wait.reviewCadenceMinutes` (default 5), measured from the start of a
   **continuous** `working` run. Any transition out of `working` resets the timer.
-- Model: exactly `openai-codex/gpt-5.6-sol`, `thinkingLevel: "max"`. This is a module
+- Model: exactly `openai-codex/gpt-5.6-luna`, `thinkingLevel: "max"`. This is a module
   constant, not a setting: the setting `wait.reviewerModel` continues to govern the
   explicit `herdr_wait` reviewer, which stays Luna at `low`.
 - Evidence: bounded compact pane metadata plus the transcript delta since the previous

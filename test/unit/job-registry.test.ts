@@ -12,7 +12,7 @@ const request: JobRequestSnapshot = {
   match: "any",
   condition: { kind: "state", state: "done" },
   timeoutMs: 1_000,
-  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }
+  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" }
 };
 
 function deferred<T>() {

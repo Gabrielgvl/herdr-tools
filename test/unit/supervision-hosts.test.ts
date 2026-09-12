@@ -250,7 +250,7 @@ describe("the MCP host supervision wiring", () => {
           // A settled wait job wakes the same way under `kind: wait`; a settled
           // supervisor job is suppressed (it already wakes via supervision events).
           const wait = server!.jobs.register(
-            { kind: "wait", label: "wait for worker", targets: ["worker"], targetIds: ["p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1_000, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } },
+            { kind: "wait", label: "wait for worker", targets: ["worker"], targetIds: ["p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1_000, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" } },
             async () => ({ wait_result: "condition_met" as const, matched: true }),
           );
           const supervisor = server!.jobs.register(

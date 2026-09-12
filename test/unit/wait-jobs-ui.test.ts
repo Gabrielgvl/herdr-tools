@@ -11,7 +11,7 @@ const request: JobRequestSnapshot = {
   match: "any",
   condition: { kind: "state", state: "done" },
   timeoutMs: 60_000,
-  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }
+  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" }
 };
 
 function fakeContext() {

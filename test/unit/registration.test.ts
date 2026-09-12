@@ -117,7 +117,7 @@ describe("global extension registration", () => {
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
     expect(runtime.settings.load).toBeTypeOf("function");
     readFileMock.mockRejectedValueOnce(Object.assign(new Error("missing"), { code: "ENOENT" }));
-    await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "low" });
+    await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max" });
   });
 
   it("creates a compatibility preflight for the registered CLI", async () => {
@@ -135,7 +135,7 @@ describe("global extension registration", () => {
       sequence: 1,
       createdAtMs: 0,
       finishedAtMs: 1,
-      request: { kind: "wait" as const, label: "wait for worker", targets: ["worker\\n<untrusted>"], targetIds: ["p1"], match: "any" as const, condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const } },
+      request: { kind: "wait" as const, label: "wait for worker", targets: ["worker\\n<untrusted>"], targetIds: ["p1"], match: "any" as const, condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" as const } },
       result: { wait_result: "manager_judgment_required" as const, matched: false, reason: "manager_judgment_required", reviewerSummaries: [{ target: "worker", targetId: "p1", classification: "blocked", summary: "review\nsummary" }] }
     };
     const notification = notificationForJob(detail);
@@ -238,11 +238,11 @@ describe("global extension registration", () => {
     const { pi } = fakePi();
     const runtime = createRuntime(pi, process.env);
     const pending = new Promise<never>(() => undefined);
-    const handle = runtime.jobs.register({ kind: "wait" as const, label: "wait for worker", targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } }, async () => pending);
+    const handle = runtime.jobs.register({ kind: "wait" as const, label: "wait for worker", targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" } }, async () => pending);
     runtime.jobs.cancel(handle.jobId);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect((pi.sendMessage as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
-    const second = runtime.jobs.register({ kind: "wait" as const, label: "wait for worker", targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } }, async () => pending);
+    const second = runtime.jobs.register({ kind: "wait" as const, label: "wait for worker", targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" } }, async () => pending);
     runtime.jobs.shutdown();
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(runtime.jobs.get(second.jobId)).toBeUndefined();

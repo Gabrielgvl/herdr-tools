@@ -9,7 +9,7 @@ import { createJobsTool } from "../../src/tools/jobs.js";
 import { WaitJobsUi } from "../../src/wait-jobs-ui.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "max" as const };
 
 describe("the shared transcript reader", () => {
   it("reads exactly the bounded authoritative pane window and tolerates an empty one", async () => {

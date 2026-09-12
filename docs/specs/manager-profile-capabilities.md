@@ -208,7 +208,7 @@ Profile resources remain explicit and declarative:
 runtime:
   kind: pi
   model: openai-codex/gpt-5.6-luna
-  thinking: low
+  thinking: max
   tools:
     - read
     - grep

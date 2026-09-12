@@ -1,4 +1,5 @@
 import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { writeIdentityProvenance } from "../agent-identity.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
 import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
@@ -148,6 +149,9 @@ export interface LaunchDetails extends LaunchResourceIds {
   readiness?: LaunchReadinessEvidence;
   promptConfirmation?: PromptConfirmationEvidence;
   timing?: LaunchTimingEvidence;
+  /** Advisory identity provenance tokens were written; `provenanceWarning` is set when that write failed. */
+  identityProvenance?: "launched";
+  provenanceWarning?: string;
   phase?: "validate" | "resolve_profile" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification" | "supervision_bind";
   supervision?:
     { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; profileName: string } };
@@ -1751,6 +1755,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let assignmentState: "confirmed" | "unconfirmed" | undefined;
       let recipientRegistered = false;
       let supervisionBound = false;
+      let provenanceWarning: string | undefined;
       let boundSupervision: LaunchDetails["supervision"] | undefined;
       let readiness: LaunchReadinessEvidence | undefined;
       let selectedAttemptStartedAt: number | undefined;
@@ -1881,6 +1886,11 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           });
         }
         supervisionBound = true;
+        // Advisory provenance only: the tokens are forgeable diagnostics — any
+        // source can overwrite them — so they are never consulted for
+        // authorization and a failed write degrades to a detail, never a
+        // launch failure.
+        provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, capturedIdentity.agentSession, abortSignal);
         if (params.focus === true) {
           phase = "focus";
           progress(onUpdate, phase, created);
@@ -1987,6 +1997,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           ...(initialPromptObservation ? { initialPromptObservation } : /* c8 ignore next -- a confirmed prompt always yields its closing observation. */ {}),
           ...(promptConfirmation ? { promptConfirmation } : /* c8 ignore next -- the launched result is only built after consumption is confirmed. */ {}),
           timing,
+          identityProvenance: "launched",
+          ...(provenanceWarning === undefined ? {} : { provenanceWarning }),
           sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
           envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },
           ...(published ? { attachment: published } : {}),

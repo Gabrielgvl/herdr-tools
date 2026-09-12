@@ -1,7 +1,9 @@
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { adoptAgentIdentity, assertAgentName } from "../agent-identity.js";
 import type { HerdrCli } from "../cli.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver, type EffectiveContext } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
+import { compactPromptTargetIdentity, type PromptTargetIdentity } from "../messages/prompt.js";
 import { recordCreatedResource, runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { paneCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
@@ -23,6 +25,11 @@ export interface PaneDetails {
   removedIds?: string[];
   containingContext?: { tabId?: string; workspaceId?: string };
   postState?: unknown;
+  agentName?: string;
+  /** The verified post-adopt prompt identity; presence proves the pane is prompt-addressable by name. */
+  identity?: PromptTargetIdentity;
+  namePreexisting?: true;
+  provenanceWarning?: string;
 }
 
 export interface PaneDependencies {
@@ -180,7 +187,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
   return {
     name: "herdr_pane",
     label: "Herdr Pane",
-    description: "Inspect and mutate exact Herdr pane topology through explicit stable targets.",
+    description: "Inspect and mutate exact Herdr pane topology through explicit stable targets; adopt binds a verified agent name to a detected pane for prompt routing.",
     executionMode: "sequential",
     parameters: PaneParamsSchema,
     async execute(_id, rawParams, signal, _onUpdate, ctx) {
@@ -280,6 +287,23 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         await deps.cli.runJson(["pane", "zoom", target.id, `--${mode}`], activeSignal);
         const postState = await readPane(deps.cli, target.id, activeSignal);
         return result({ operation: "zoom", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "zoom", postState.pane_id);
+      }
+      if (params.operation === "adopt") {
+        assertAgentName(params.name, "name");
+        await deps.preflight(activeSignal);
+        const effective = await contextResolver(activeSignal);
+        const target = stateTarget(effective.snapshot, params.target, effective.context);
+        const adopted = await adoptAgentIdentity(deps.cli, effective.snapshot, target.id, params.name, effective.context.paneId, activeSignal);
+        return result({
+          operation: "adopt",
+          outcome: "success",
+          paneId: adopted.paneId,
+          agentName: adopted.agentName,
+          identity: compactPromptTargetIdentity(adopted.identity),
+          ...(adopted.namePreexisting === undefined ? {} : { namePreexisting: true }),
+          ...(adopted.provenanceWarning === undefined ? {} : { provenanceWarning: adopted.provenanceWarning }),
+          ...contextRebindingDetails(effective.diagnostics)
+        }, "adopt", adopted.paneId);
       }
       await deps.preflight(activeSignal);
       const effective = await contextResolver(activeSignal);

@@ -20,7 +20,9 @@ describe("topology schemas", () => {
       { operation: "swap", source: "p1", with: "right" },
       { operation: "swap", source: "p1", with: "p2" },
       { operation: "zoom", target: "p1", mode: "on" },
-      { operation: "close", target: "p1" }
+      { operation: "close", target: "p1" },
+      { operation: "adopt", target: "p1", name: "worker-1" },
+      { operation: "adopt", target: "w6:p1Y", name: "devin-w6p1y" }
     ];
     const tabs = [
       { operation: "create", label: "new" },
@@ -41,6 +43,17 @@ describe("topology schemas", () => {
     expect(Value.Check(TabParamsSchema, { operation: "create", label: "" })).toBe(false);
     expect(Value.Check(TabParamsSchema, { operation: "create", label: "bad\nlabel" })).toBe(false);
     expect(Value.Check(PaneParamsSchema, { operation: "close", target: "p1", confirm: true })).toBe(false);
+  });
+
+  it("enforces the launch name grammar on adopt and rejects malformed adopt shapes", () => {
+    expect(Value.Check(PaneParamsSchema, { operation: "adopt", target: "p1" })).toBe(false);
+    expect(Value.Check(PaneParamsSchema, { operation: "adopt", target: "p1", name: "worker", extra: true })).toBe(false);
+    for (const name of ["", "Worker", "1worker", "-lead", "_lead", "has space", "has.dot", "a".repeat(33), "très"]){
+      expect(Value.Check(PaneParamsSchema, { operation: "adopt", target: "p1", name })).toBe(false);
+    }
+    for (const name of ["a", "worker_2", "a".repeat(32), "devin-w6p1y"]) {
+      expect(Value.Check(PaneParamsSchema, { operation: "adopt", target: "p1", name })).toBe(true);
+    }
   });
 
   it("validates identifiers and transport-safe environment values without an allowlist", () => {

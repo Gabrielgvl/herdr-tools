@@ -10,11 +10,12 @@
 import { boundedText, type JobDetail } from "../job-registry.js";
 import { notificationForJob } from "../job-notification.js";
 import { resolveEffectiveContext } from "../context.js";
+import { AdoptError, mintAgentName, nameOnlyGap, selfNameCandidates, writeIdentityProvenance, type AdoptOutcome } from "../agent-identity.js";
 import type { JsonEnvelope } from "../cli.js";
 import { agentFrom, assertQualifiedPromptTarget, assertSendableState, paneFrom, snapshotIdentityRecords, stateOf } from "../messages/prompt-target.js";
-import { parsePromptSubmission, parsePromptTargetIdentityFields, requirePromptTargetIdentity } from "../messages/prompt.js";
+import { parsePromptSubmission, parsePromptTargetIdentityFields, PromptIdentityError, requirePromptTargetIdentity } from "../messages/prompt.js";
 import { buildEnvelope, resolveSender, type ProvenanceKind } from "../provenance.js";
-import type { CurrentContext } from "../targets.js";
+import { parseSnapshotResult, type CurrentContext } from "../targets.js";
 import type { SupervisionEvent } from "./events.js";
 
 export const SUPERVISION_WAKE_CONTENT_BYTES = 4_000;
@@ -126,6 +127,13 @@ export interface McpHostWake {
  * future kind stays inert until its TUI proves it consumes typed input.
  */
 const PROMPT_WAKE_KINDS = new Set(["devin", "pi"]);
+/**
+ * Kinds allowed to mint their own routing name when detection left their pane
+ * unnamed. Explicitly allowlisted — never "not agy" — because adoption asserts
+ * reachability that policy has only granted these three; an unsupported kind
+ * such as `agy` stays inert.
+ */
+const SELF_ADOPT_KINDS = new Set(["devin", "pi", "claude"]);
 const WAKE_PIPELINE_TIMEOUT_MS = 15_000;
 /**
  * Devin's composer holds input submitted mid-turn in a queue that does not
@@ -288,14 +296,24 @@ export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
   // side-effect-free. One shared in-flight promise means a burst of wakes pays
   // exactly one `pane get`; a rejected read is not cached, so the next wake
   // retries, while a resolved kind — including "no usable kind" — is permanent
-  // for the session.
-  let kindPromise: Promise<string | undefined> | undefined;
-  const resolveKind = (signal: AbortSignal): Promise<string | undefined> => {
+  // for the session. The pane record rides along so the self-adopt gate can
+  // consult the same coherent read instead of a second probe.
+  interface OwnPaneResolution {
+    kind: string;
+    paneId: string;
+    pane: Record<string, unknown>;
+  }
+  let kindPromise: Promise<OwnPaneResolution | undefined> | undefined;
+  const resolveKind = (signal: AbortSignal): Promise<OwnPaneResolution | undefined> => {
     if (ownPaneId === undefined) return Promise.resolve(undefined);
     if (kindPromise === undefined) {
       const pending = deps.cli
         .runJson(["pane", "get", ownPaneId], signal)
-        .then((envelope) => parsePromptTargetIdentityFields(paneFrom(envelope.result, ownPaneId), ownPaneId).agentKind);
+        .then((envelope) => {
+          const pane = paneFrom(envelope.result, ownPaneId);
+          const kind = parsePromptTargetIdentityFields(pane, ownPaneId).agentKind;
+          return kind === undefined ? undefined : { kind, paneId: ownPaneId, pane };
+        });
       kindPromise = pending;
       void pending.catch(() => {
         // Only a settled rejection clears the slot; it runs before any later
@@ -304,6 +322,66 @@ export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
       });
     }
     return kindPromise;
+  };
+
+  const paneSuppliesNoName = (pane: Record<string, unknown>): boolean =>
+    typeof pane.name !== "string" && typeof pane.agent_name !== "string";
+
+  /**
+   * Lazy self-adoption, once per session. Runs only when the kind-resolution
+   * read showed an unnamed pane; the attempt re-reads the full identity set
+   * and mints only when the name is the *sole* missing join field — any other
+   * failure stays fail-closed. Outcomes are memoized exactly like the kind:
+   * "named" and "refused" (collision exhaustion, no derivable name) are
+   * permanent, while "unqualified" is cleared so the next wake re-evaluates —
+   * detection can mature. A minted name is verified through the real join
+   * before the provenance tokens are written; the tokens are advisory and
+   * their failure never voids the adoption.
+   */
+  const attemptSelfName = async (paneId: string, kind: string, signal: AbortSignal): Promise<AdoptOutcome> => {
+    try {
+      const snapshot = parseSnapshotResult((await deps.cli.runJson(["api", "snapshot"], signal)).result);
+      const agentEnvelope = await deps.cli.runJson(["agent", "get", paneId], signal);
+      const paneEnvelope = await deps.cli.runJson(["pane", "get", paneId], signal);
+      const records = [...snapshotIdentityRecords(snapshot, paneId), agentFrom(agentEnvelope.result), paneFrom(paneEnvelope.result, paneId)];
+      const gap = nameOnlyGap(records, paneId);
+      if (gap !== "ready") return gap === "named" ? "named" : "unqualified";
+      const candidates = selfNameCandidates(kind, paneId);
+      if (candidates === undefined) return "refused";
+      for (const candidate of candidates) {
+        try {
+          const minted = await mintAgentName(deps.cli, paneId, candidate, signal);
+          const identity = requirePromptTargetIdentity([...records, minted], paneId);
+          if (identity.agentName !== candidate) {
+            throw new PromptIdentityError("TARGET_IDENTITY_CHANGED", "the adopted name did not bind to the verified identity", {
+              expectedAgentName: candidate,
+              actualAgentName: identity.agentName
+            });
+          }
+          await writeIdentityProvenance(deps.cli, paneId, "adopted", paneId, identity.agentSession, signal);
+          return "named";
+        } catch (error) {
+          if (error instanceof AdoptError && error.code === "AGENT_NAME_TAKEN") continue;
+          throw error;
+        }
+      }
+      return "refused";
+    } catch {
+      return "unqualified";
+    }
+  };
+  let selfNamePromise: Promise<AdoptOutcome> | undefined;
+  const ensureOwnName = (paneId: string, kind: string, signal: AbortSignal): Promise<AdoptOutcome> => {
+    if (selfNamePromise === undefined) {
+      const pending = attemptSelfName(paneId, kind, signal);
+      selfNamePromise = pending;
+      void pending.then((outcome) => {
+        // Only a settled outcome clears the slot; it runs before any later
+        // wake can install a replacement, so clearing unconditionally is safe.
+        if (outcome === "unqualified") selfNamePromise = undefined;
+      });
+    }
+    return selfNamePromise;
   };
 
   /**
@@ -362,7 +440,19 @@ export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
 
   const pipeline = async (content: string, meta: Record<string, unknown>, kind: ProvenanceKind): Promise<void> => {
     const signal = AbortSignal.any([AbortSignal.timeout(WAKE_PIPELINE_TIMEOUT_MS), deps.signal]);
-    const resolved = await resolveKind(signal);
+    const resolution = await resolveKind(signal);
+    // Lazy self-adoption sits between kind resolution and the identity join: a
+    // detected-but-never-launched pane has a complete session but no routing
+    // name, so the join below would fail closed. When the resolution read
+    // showed no name and the kind may adopt, mint one derived name once —
+    // memoized for the session and inert on agent_name_taken — so this and
+    // every later wake join on a real identity. A pane already named by hand
+    // is untouched. For Claude the name buys inbound reachability only; the
+    // channel notification below never depends on it.
+    if (resolution !== undefined && SELF_ADOPT_KINDS.has(resolution.kind) && paneSuppliesNoName(resolution.pane)) {
+      await ensureOwnName(resolution.paneId, resolution.kind, signal);
+    }
+    const resolved = resolution?.kind;
     if (resolved === "claude") {
       // Channels-only for Claude (owner decision): even though targeted prompt
       // delivery to Claude panes is qualified for tool calls, a self-wake is

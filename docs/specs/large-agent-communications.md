@@ -123,7 +123,9 @@ release, or duplicate bytes. Herdr's optional working-state observation can repo
 `screen_detection_skipped:true` with an idle post-state. A successful
 `cli:agent:prompt` / `agent_prompted` envelope must match the full captured Pi or Claude
 identity, or the provisional AGY pane, terminal, name, and kind. It must also carry
-`interactive_ready` and safe `revision`. This is the atomic submission acknowledgement.
+interactivity proof — `interactive_ready:true` (managed), or a known live
+`agent_status` when the flag is absent and `launch_pending` is absent or `false` (detection) —
+and safe `revision`. This is the atomic submission acknowledgement.
 It confirms acceptance, not turn progress or completion. The follow-up agent/pane reads are optional identity-bound
 observation and report working, non-working, unknown, skipped, stale, or
 unavailable without resubmitting the body; a replacement is never described as

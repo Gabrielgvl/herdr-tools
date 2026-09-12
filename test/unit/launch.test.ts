@@ -116,7 +116,7 @@ function catalog(...profiles: ReturnType<typeof profile>[]): ProfileCatalog {
   return { effective: new Map(profiles.map((item) => [item.name, item])), candidates: [], diagnostics: [] };
 }
 
-function makeCli(options: { start?: (argv: string[], attempt: number) => unknown; agentStates?: Array<Record<string, unknown>>; paneStates?: Array<Record<string, unknown>>; calls?: string[][]; promptInputs?: string[]; snapshot?: HerdrSnapshot; omitFreshAgentSession?: boolean } = {}) {
+function makeCli(options: { start?: (argv: string[], attempt: number) => unknown; agentStates?: Array<Record<string, unknown>>; paneStates?: Array<Record<string, unknown>>; calls?: string[][]; promptInputs?: string[]; snapshot?: HerdrSnapshot; omitFreshAgentSession?: boolean; metadataError?: unknown } = {}) {
   const calls = options.calls ?? [];
   const promptInputs = options.promptInputs ?? [];
   const liveSnapshot = options.snapshot ?? snapshot;
@@ -190,6 +190,10 @@ function makeCli(options: { start?: (argv: string[], attempt: number) => unknown
         return ok("start", { agent: { name: lastName, pane_id: lastPaneId, agent: argv[4], terminal_id: lastTerminalId, agent_session: lastAgentSession } });
       }
       if (argv[0] === "agent" && argv[1] === "focus") return ok("focus", {});
+      if (argv[0] === "pane" && argv[1] === "report-metadata") {
+        if (options.metadataError !== undefined) throw options.metadataError;
+        return ok("metadata", { ok: true });
+      }
       if (argv[0] === "agent" && argv[1] === "get") {
         const configured = options.agentStates && options.agentStates.length > 0
           ? options.agentStates[Math.min(agentReads++, options.agentStates.length - 1)]
@@ -3915,4 +3919,50 @@ describe("herdr_launch automatic child supervision", () => {
       .rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN" });
   });
 
+});
+
+describe("launch identity provenance", () => {
+  it("writes advisory launched-provenance tokens after supervision bind", async () => {
+    const harness = makeCli();
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli);
+    expect(result.details).toMatchObject({ identityProvenance: "launched" });
+    expect(result.details.provenanceWarning).toBeUndefined();
+    expect(harness.calls).toContainEqual([
+      "pane", "report-metadata", "w1:p2", "--source", "herdr-tools",
+      "--token", "identity_provenance=launched",
+      "--token", "identity_actor=w1:p1",
+      "--token", "identity_session=session-0"
+    ]);
+  });
+
+  it("degrades a failed provenance write to a warning, never a launch failure", async () => {
+    const harness = makeCli({ metadataError: new Error("metadata service unavailable") });
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli);
+    expect(result.details).toMatchObject({ identityProvenance: "launched", provenanceWarning: "metadata service unavailable" });
+    expect(harness.calls).toContainEqual(PROMPT_CALL("w1:p2"));
+  });
+});
+
+describe("launch acknowledgement proof", () => {
+  // parsePromptSubmission is shared with communicate and the wake: a managed
+  // launch acknowledgement that omits interactive_ready is proven by a known
+  // live agent_status instead (detection proof) — the identity join still
+  // pins pane/terminal/name/kind/session to the launched agent.
+  it("accepts a managed acknowledgement without interactive_ready via detection proof", async () => {
+    const harness = makeCli();
+    const basePrompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn<LaunchCli["prompt"]>(async (target, text, signal) => {
+      const envelope = await basePrompt(target, text, signal);
+      const result = envelope.result as { agent: Record<string, unknown> };
+      const agent = { ...result.agent };
+      delete agent.interactive_ready;
+      return { ...envelope, result: { ...result, agent } };
+    });
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli);
+    expect(result.details).toMatchObject({
+      promptSubmitted: true,
+      promptConsumption: "confirmed",
+      initialPromptSubmission: { interactiveReady: true, interactiveProof: "detection" }
+    });
+  });
 });

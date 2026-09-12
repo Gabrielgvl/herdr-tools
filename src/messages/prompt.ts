@@ -70,7 +70,9 @@ export type PromptSubmissionExpectation = PromptTargetIdentity;
 export interface PromptSubmissionEvidence extends PromptTargetIdentity {
   confirmed: true;
   operationId: string;
+  /** Interactivity was proven; `interactiveProof` records which path established it. */
   interactiveReady: true;
+  interactiveProof: "managed" | "detection";
   revision: number;
   stateChangeSeq?: number;
   screenDetectionSkipped?: boolean;
@@ -317,6 +319,13 @@ function promptProtocolError(message: string, details: Record<string, unknown> =
 }
 
 /**
+ * Detected lifecycle states that prove a live interactive agent when the
+ * managed-only `interactive_ready` flag is absent from an acknowledgement.
+ * `unknown` is absent: detection reporting nothing proves nothing.
+ */
+const DETECTED_LIVE_STATES = new Set(["idle", "working", "blocked", "done"]);
+
+/**
  * A successful prompt request is only a delivery acknowledgement when Herdr
  * returns its typed prompt envelope and the returned process identity is exactly
  * the one captured before submission. The socket owns request correlation; this
@@ -360,8 +369,27 @@ export function parsePromptSubmission(response: JsonEnvelope, expected: PromptSu
       actualAgentSession: identity.agentSession
     });
   }
-  if (agent.interactive_ready !== true) {
-    promptProtocolError("Herdr prompt acknowledgement did not prove an interactive target", { interactiveReady: agent.interactive_ready });
+  // `interactive_ready` is managed-agent proof: only `agent start` or a restore
+  // marks a launched agent Active, so detection — including an adopted pane —
+  // can never emit it. When the flag is absent, the acknowledgement still proves
+  // interactivity through detection itself: the server verified the pane's
+  // foreground process hosts the detected agent before accepting the write, and
+  // `agent_status` is a required field on every AgentInfo, so a known non-unknown
+  // lifecycle state is that proof. `launch_pending` marks the one intermediate
+  // shape — a managed agent started but not yet interactive — so the detection
+  // branch admits only a proven-false or absent value; anything malformed is
+  // terminal. The managed branch never consults it: a contradictory
+  // `interactive_ready:true` + `launch_pending:true` still returns "managed"
+  // because the explicit flag is the stronger, server-owned signal. An explicit
+  // `false` — never serialized today — or an absent/unknown status stays
+  // fail-closed.
+  const interactiveProof = agent.interactive_ready === true
+    ? "managed" as const
+    : agent.interactive_ready === undefined && (agent.launch_pending === undefined || agent.launch_pending === false) && typeof agent.agent_status === "string" && DETECTED_LIVE_STATES.has(agent.agent_status)
+      ? "detection" as const
+      : undefined;
+  if (interactiveProof === undefined) {
+    promptProtocolError("Herdr prompt acknowledgement did not prove an interactive target", { interactiveReady: agent.interactive_ready, agentStatus: agent.agent_status });
   }
   const revision = optionalSafeInteger(agent.revision, "revision");
   if (revision === undefined) {
@@ -376,6 +404,7 @@ export function parsePromptSubmission(response: JsonEnvelope, expected: PromptSu
     operationId: response.id,
     ...identity,
     interactiveReady: true,
+    interactiveProof,
     revision,
     ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }),
     ...(screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped })

@@ -2,6 +2,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
 const Identifier = Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$" });
+/** Agent names share the launch grammar so adopted and launched agents resolve identically. */
+const AgentName = Type.String({ pattern: "^[a-z][a-z0-9_-]{0,31}$" });
 const EnvironmentKey = Type.String({ minLength: 1, pattern: "^[^=\\u0000\\r\\n]+$" });
 const EnvironmentValue = Type.String({ pattern: "^[^\\u0000\\r\\n]*$" });
 const Direction = StringEnum(["right", "down", "left", "up"] as const);
@@ -57,6 +59,11 @@ export const PaneParamsSchema = Type.Union([
     mode: Type.Optional(StringEnum(["toggle", "on", "off"] as const))
   }, { additionalProperties: false }),
   Type.Object({
+    operation: Type.Literal("adopt"),
+    target: Identifier,
+    name: AgentName
+  }, { additionalProperties: false }),
+  Type.Object({
     operation: Type.Literal("close"),
     target: Identifier
   }, { additionalProperties: false })
@@ -89,6 +96,7 @@ export type PaneParams =
   | { operation: "resize"; target: string; direction: DirectionValue; amount: number }
   | { operation: "swap"; source: string; with: string }
   | { operation: "zoom"; target?: string; mode?: "toggle" | "on" | "off" }
+  | { operation: "adopt"; target: string; name: string }
   | { operation: "close"; target: string };
 
 export type TabParams =

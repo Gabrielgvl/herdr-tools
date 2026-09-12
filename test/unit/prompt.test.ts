@@ -33,12 +33,33 @@ describe("prompt submission acknowledgement", () => {
       terminalId: "term-worker",
       agentSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-worker" },
       interactiveReady: true,
+      interactiveProof: "managed",
       revision: 7,
       stateChangeSeq: 4,
       screenDetectionSkipped: true
     });
     expect(validSubmission({ state_change_seq: undefined, screen_detection_skipped: undefined })).toEqual(expect.objectContaining({ revision: 7, interactiveReady: true }));
     expect(validSubmission({ screen_detection_skipped: "invalid" })).not.toHaveProperty("screenDetectionSkipped");
+  });
+
+  it.each(["idle", "working", "blocked", "done"] as const)("accepts a detected-pane acknowledgement without interactive_ready when the lifecycle state proves live (%s)", (agentStatus) => {
+    // Detected and adopted panes never emit interactive_ready — only
+    // `agent start` marks a managed agent Active. The ack still proves
+    // delivery: identity matched and the server verified the foreground
+    // process before accepting the write; the required agent_status field
+    // carries the detected state.
+    expect(validSubmission({ interactive_ready: undefined, agent_status: agentStatus })).toEqual(expect.objectContaining({
+      interactiveReady: true,
+      interactiveProof: "detection",
+      revision: 7
+    }));
+  });
+
+  it("accepts an explicit launch_pending:false on the detection branch and keeps launch_pending:true off the managed one", () => {
+    expect(validSubmission({ interactive_ready: undefined, launch_pending: false, agent_status: "idle" })).toEqual(expect.objectContaining({ interactiveProof: "detection" }));
+    // The managed branch never consults launch_pending: the explicit
+    // interactive flag is the stronger, server-owned signal.
+    expect(validSubmission({ interactive_ready: true, launch_pending: true })).toEqual(expect.objectContaining({ interactiveProof: "managed" }));
   });
 
   it.each([
@@ -77,7 +98,11 @@ describe("prompt submission acknowledgement", () => {
     ["malformed agent session", { agent_session: "session-worker" }],
     ["incomplete agent session", { agent_session: { source: "pi", agent: "pi", kind: "id" } }],
     ["not interactive", { interactive_ready: false }],
-    ["missing interactive flag", { interactive_ready: undefined }],
+    ["missing interactive flag without a live detected state", { interactive_ready: undefined, agent_status: "unknown" }],
+    ["missing interactive flag without any detected state", { interactive_ready: undefined, agent_status: undefined }],
+    ["missing interactive flag with malformed detected state", { interactive_ready: undefined, agent_status: "bogus" }],
+    ["missing interactive flag on a launch-pending managed agent", { interactive_ready: undefined, launch_pending: true }],
+    ["missing interactive flag with a malformed launch_pending", { interactive_ready: undefined, launch_pending: "true" }],
     ["missing revision", { revision: undefined }],
     ["negative revision", { revision: -1 }],
     ["fractional revision", { revision: 1.5 }],

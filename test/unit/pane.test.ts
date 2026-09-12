@@ -84,6 +84,22 @@ function makeHarness(): Harness {
       snapshot.panes = snapshot.panes.filter((item) => item.pane_id !== argv[2]);
       return response("close", { ok: true });
     }
+    if (argv[0] === "agent" && argv[1] === "rename") {
+      const agent = snapshot.agents.find((item) => item.pane_id === argv[2]);
+      if (!agent) return { stdout: JSON.stringify({ id: "rename", error: { code: "agent_not_found", message: "no agent" } }), stderr: "", code: 1, killed: false };
+      const name = argv[3]!;
+      const taken = snapshot.agents.some((item) => item.pane_id !== argv[2] && item.name === name)
+        || snapshot.panes.some((item) => item.pane_id !== argv[2] && item.agent_name === name);
+      if (taken) return { stdout: "", stderr: JSON.stringify({ id: "rename", error: { code: "agent_name_taken", message: "name taken" } }), code: 1, killed: false };
+      agent.name = name;
+      const pane = snapshot.panes.find((item) => item.pane_id === argv[2]);
+      if (pane) pane.agent_name = name;
+      return response("rename", { type: "agent_info", agent });
+    }
+    if (argv[0] === "agent" && argv[1] === "get") {
+      return response("get", { agent: snapshot.agents.find((item) => item.pane_id === argv[2]) ?? null });
+    }
+    if (argv[0] === "pane" && argv[1] === "report-metadata") return response("metadata", { ok: true });
     if (argv[0] === "pane" && ["resize", "swap", "zoom"].includes(argv[1])) return response(argv[1], { ok: true });
     throw new Error(`unexpected argv ${argv.join(" ")}`);
   });
@@ -402,5 +418,136 @@ describe("herdr_pane", () => {
     const result = tool.renderResult?.({ content: [], details: { operation: "rename", outcome: "success", paneId: "p2" } } as never, { expanded: false, isPartial: false } as never, {} as never, { isError: false } as never);
     expect(result?.render(80)).toEqual(["pane · p2"]);
     result?.invalidate();
+  });
+});
+
+describe("herdr_pane adopt", () => {
+  const detectedSession = { source: "herdr:devin", agent: "devin", kind: "id", value: "sess-p2" };
+  const detectedAgent = (overrides: Record<string, unknown> = {}) => ({
+    pane_id: "p2",
+    agent: "devin",
+    terminal_id: "term-2",
+    agent_session: detectedSession,
+    agent_status: "idle",
+    revision: 3,
+    ...overrides
+  });
+  const detectedPane = (overrides: Record<string, unknown> = {}) => ({
+    pane_id: "p2",
+    tab_id: "t1",
+    workspace_id: "w1",
+    label: "worker",
+    agent: "devin",
+    terminal_id: "term-2",
+    agent_session: detectedSession,
+    agent_status: "idle",
+    ...overrides
+  });
+  /** Swap p2's bare fixture pane for a detected-agent pane plus its agent record. */
+  function detected(harness: Harness, paneOverrides: Record<string, unknown> = {}, agentOverrides: Record<string, unknown> = {}): Harness {
+    harness.snapshot.panes[1] = detectedPane(paneOverrides) as PaneRecord;
+    harness.snapshot.agents.push(detectedAgent(agentOverrides) as never);
+    return harness;
+  }
+
+  it("adopts a detected non-launched pane, verifies identity, and writes advisory provenance", async () => {
+    const harness = detected(makeHarness());
+    const result = await execute(harness, { operation: "adopt", target: "p2", name: "adopted-worker" });
+    expect(result.details).toMatchObject({
+      operation: "adopt",
+      outcome: "success",
+      paneId: "p2",
+      agentName: "adopted-worker",
+      identity: { paneId: "p2", agentName: "adopted-worker", agentKind: "devin", terminalId: "term-2", agentSession: detectedSession }
+    });
+    expect(harness.calls).toContainEqual(["agent", "rename", "p2", "adopted-worker"]);
+    expect(harness.calls).toContainEqual([
+      "pane", "report-metadata", "p2", "--source", "herdr-tools",
+      "--token", "identity_provenance=adopted", "--token", "identity_actor=p1", "--token", "identity_session=sess-p2"
+    ]);
+    // Label is UI furniture, not routing identity: adoption leaves it untouched.
+    expect(harness.snapshot.panes[1]!.label).toBe("worker");
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "rename")).toHaveLength(0);
+  });
+
+  it("rejects before any rename when the pane has no agent record", async () => {
+    const harness = makeHarness();
+    await expect(execute(harness, { operation: "adopt", target: "p2", name: "orphan" })).rejects.toMatchObject({ code: "ADOPT_TARGET_UNQUALIFIED" });
+    expect(harness.calls.filter((argv) => argv[0] === "agent" && argv[1] === "rename")).toHaveLength(0);
+  });
+
+  it.each([
+    ["a malformed name", { operation: "adopt", target: "p2", name: "Bad Name" }, "INVALID_INPUT"],
+    ["a workspace id target", { operation: "adopt", target: "w1", name: "valid-name" }, "TARGET_TYPE_MISMATCH"],
+    ["a tab id target", { operation: "adopt", target: "t2", name: "valid-name" }, "TARGET_TYPE_MISMATCH"],
+    ["an unknown target", { operation: "adopt", target: "no-such", name: "valid-name" }, "TARGET_NOT_FOUND"]
+  ])("rejects %s", async (_label, params, code) => {
+    const harness = detected(makeHarness());
+    await expect(execute(harness, params)).rejects.toMatchObject({ code });
+    expect(harness.calls.filter((argv) => argv[0] === "agent" && argv[1] === "rename")).toHaveLength(0);
+  });
+
+  it("rejects an ambiguous target that resolves to multiple agents", async () => {
+    const harness = detected(makeHarness());
+    harness.snapshot.agents.push({ pane_id: "p9", name: "dupe" } as never, { pane_id: "p10", name: "dupe" } as never);
+    await expect(execute(harness, { operation: "adopt", target: "dupe", name: "valid-name" })).rejects.toMatchObject({ code: "TARGET_AMBIGUOUS" });
+  });
+
+  it("is idempotent on the same name and refuses a different existing name", async () => {
+    const harness = detected(makeHarness(), { agent_name: "kept-name" }, { name: "kept-name" });
+    const result = await execute(harness, { operation: "adopt", target: "p2", name: "kept-name" });
+    expect(result.details).toMatchObject({ operation: "adopt", outcome: "success", namePreexisting: true });
+    expect(harness.calls.filter((argv) => argv[0] === "agent" && argv[1] === "rename")).toHaveLength(0);
+    // No mint happened, so the no-op adopt must not overwrite an existing
+    // provenance marker (e.g. identity_provenance=launched).
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "report-metadata")).toHaveLength(0);
+    const fresh = detected(makeHarness(), { agent_name: "kept-name" }, { name: "kept-name" });
+    await expect(execute(fresh, { operation: "adopt", target: "p2", name: "other-name" })).rejects.toMatchObject({ code: "AGENT_ALREADY_NAMED" });
+  });
+
+  it("rejects a name already held by another pane", async () => {
+    const harness = detected(makeHarness());
+    harness.snapshot.agents.push({ pane_id: "p9", name: "taken-name", agent: "pi" } as never);
+    await expect(execute(harness, { operation: "adopt", target: "p2", name: "taken-name" })).rejects.toMatchObject({ code: "AGENT_NAME_TAKEN" });
+  });
+
+  it("maps a server-side collision the snapshot missed to AGENT_NAME_TAKEN", async () => {
+    const harness = detected(makeHarness());
+    const base = harness.cli.runJson.bind(harness.cli);
+    harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "agent" && argv[1] === "rename") {
+        throw Object.assign(new Error("name taken"), { details: { errorEnvelope: { id: "r", error: { code: "agent_name_taken", message: "name taken" } } } });
+      }
+      return base(argv, signal);
+    });
+    await expect(execute(harness, { operation: "adopt", target: "p2", name: "raced-name" })).rejects.toMatchObject({ code: "AGENT_NAME_TAKEN" });
+  });
+
+  it("treats a provenance token failure as a warning, never a failed adopt", async () => {
+    const harness = detected(makeHarness());
+    const base = harness.cli.runJson.bind(harness.cli);
+    harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      if (argv[0] === "pane" && argv[1] === "report-metadata") throw new Error("metadata offline");
+      return base(argv, signal);
+    });
+    const result = await execute(harness, { operation: "adopt", target: "p2", name: "adopted-worker" });
+    expect(result.details).toMatchObject({ operation: "adopt", outcome: "success", agentName: "adopted-worker", provenanceWarning: "metadata offline" });
+  });
+
+  it("fails closed when the identity changed between precondition and verify", async () => {
+    const harness = detected(makeHarness());
+    const base = harness.cli.runJson.bind(harness.cli);
+    let renamed = false;
+    harness.cli.runJson = vi.fn<HerdrCli["runJson"]>(async (argv, signal) => {
+      const out = await base(argv, signal);
+      if (argv[0] === "agent" && argv[1] === "rename") renamed = true;
+      // Once renamed, every fresh read reports a different session: the pane's
+      // agent rotated mid-adopt and the post-verify join must refuse.
+      if (renamed && argv[0] === "agent" && argv[1] === "get") {
+        return { id: "get", result: { agent: detectedAgent({ name: "adopted-worker", agent_session: { ...detectedSession, value: "sess-rotated" } }) } };
+      }
+      return out;
+    });
+    await expect(execute(harness, { operation: "adopt", target: "p2", name: "adopted-worker" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_CHANGED" });
   });
 });

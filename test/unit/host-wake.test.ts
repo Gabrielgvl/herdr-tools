@@ -740,3 +740,296 @@ describe("the MCP host wake router", () => {
     await flush();
   });
 });
+
+describe("lazy self-adoption in the MCP host wake", () => {
+  const selfSession = { source: "herdr:devin", agent: "devin", kind: "id", value: "s-unnamed" };
+
+  interface SelfAdoptOptions {
+    kind?: string;
+    agentStatus?: string;
+    /** The pane id this session hosts; ":::" exercises the underivable-name refusal. */
+    paneId?: string;
+    /** Records carry a name already (hand-named pane — the gate never fires). */
+    named?: boolean;
+    /** Only the kind-resolution read is nameless; later reads are named (race). */
+    lateName?: boolean;
+    /** Agent/pane records lack agent_session entirely — the gap is not name-only. */
+    sessionless?: boolean;
+    /** Names held by other panes — `agent rename` answers agent_name_taken. */
+    taken?: string[];
+    /** Fail the first N `api snapshot` calls inside the adopt attempt. */
+    snapshotFailures?: number;
+    /** A non-collision rename error (agent_not_found) — transient, retried. */
+    renameTransient?: boolean;
+    /** The rename ack carries a name other than the one requested. */
+    mismatchName?: string;
+    /** Provenance token write fails — adoption still stands. */
+    metadataFails?: boolean;
+  }
+
+  interface SelfAdoptHarness {
+    deps: McpHostWakeDeps;
+    calls: string[][];
+    renames: string[];
+    prompts: Array<{ target: string; text: string }>;
+    notifications: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }>;
+  }
+
+  function selfAdoptHarness(options: SelfAdoptOptions = {}): SelfAdoptHarness {
+    const kind = options.kind ?? "devin";
+    const status = options.agentStatus ?? "idle";
+    const paneId = options.paneId ?? ownPaneId;
+    const calls: string[][] = [];
+    const renames: string[] = [];
+    const prompts: Array<{ target: string; text: string }> = [];
+    const notifications: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }> = [];
+    const named = options.named === true || options.lateName === true;
+    const pane: Record<string, unknown> = {
+      pane_id: paneId, tab_id: "w1:t1", workspace_id: "w1", label: "manager",
+      agent: kind, terminal_id: "term-9",
+      agent_status: status, revision: 7,
+      ...(options.sessionless === true ? {} : { agent_session: { ...selfSession, agent: kind } }),
+      ...(named ? { agent_name: "manual-name" } : {})
+    };
+    const agent: Record<string, unknown> = {
+      pane_id: paneId, agent: kind, terminal_id: "term-9",
+      agent_status: status, revision: 7,
+      ...(options.sessionless === true ? {} : { agent_session: { ...selfSession, agent: kind } }),
+      ...(named ? { name: "manual-name" } : {})
+    };
+    // Every read returns a point-in-time copy so a mint mid-flight cannot leak
+    // backwards into records the attempt already sampled.
+    const snapshotResultNow = () => ({
+      type: "session_snapshot",
+      snapshot: {
+        version: "0.9.0", protocol: 22,
+        workspaces: [{ workspace_id: "w1", label: "w" }],
+        tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "t" }],
+        panes: [{ ...pane }],
+        agents: [{ ...agent }]
+      }
+    });
+    const envelope = (id: string, result: unknown): JsonEnvelope => ({ id, result });
+    let snapshotFailures = options.snapshotFailures ?? 0;
+    let firstPaneGet = options.lateName === true;
+    const nameTaken = (name: string) => Object.assign(new Error(`name taken: ${name}`), {
+      details: { errorEnvelope: { id: "r", error: { code: "agent_name_taken", message: "name taken" } } }
+    });
+    const cli: McpWakeCli = {
+      runJson: async (argv, signal) => {
+        if (signal.aborted) throw new Error("aborted");
+        calls.push(argv);
+        if (argv[0] === "pane" && argv[1] === "get") {
+          if (firstPaneGet) {
+            firstPaneGet = false;
+            const nameless = { ...pane };
+            delete nameless.agent_name;
+            delete nameless.name;
+            return envelope("pane-get", { pane: nameless });
+          }
+          return envelope("pane-get", { pane: { ...pane } });
+        }
+        if (argv[0] === "pane" && argv[1] === "current") return envelope("pane-current", { type: "pane_current", pane: { ...pane } });
+        if (argv[0] === "api" && argv[1] === "snapshot") {
+          if (snapshotFailures > 0) {
+            snapshotFailures -= 1;
+            throw new Error("backend down");
+          }
+          return envelope("snapshot", snapshotResultNow());
+        }
+        if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: { ...agent } });
+        if (argv[0] === "agent" && argv[1] === "rename") {
+          const name = argv[3]!;
+          renames.push(name);
+          if (options.renameTransient === true) {
+            options.renameTransient = false;
+            throw Object.assign(new Error("no agent"), { details: { errorEnvelope: { id: "r", error: { code: "agent_not_found", message: "no agent" } } } });
+          }
+          if (options.taken?.includes(name)) throw nameTaken(name);
+          if (options.mismatchName !== undefined) {
+            // The ack claims a different name than the one minted — the pane's
+            // own records stay nameless so the join's lone supplied name is the
+            // ack's, and the adopted-name check refuses.
+            return envelope("rename", { type: "agent_info", agent: { ...agent, name: options.mismatchName } });
+          }
+          agent.name = name;
+          pane.agent_name = name;
+          return envelope("rename", { type: "agent_info", agent: { ...agent } });
+        }
+        if (argv[0] === "pane" && argv[1] === "report-metadata") {
+          if (options.metadataFails === true) throw new Error("metadata offline");
+          return envelope("metadata", { ok: true });
+        }
+        if (argv[0] === "agent" && argv[1] === "wait") return envelope("agent-wait", { type: "agent_info", agent });
+        throw new Error(`unexpected argv: ${argv.join(" ")}`);
+      },
+      runText: async (argv, signal) => {
+        if (signal.aborted) throw new Error("aborted");
+        calls.push(argv);
+        return "";
+      },
+      prompt: async (target, text) => {
+        prompts.push({ target, text });
+        // A detected/adopted pane's ack has no interactive_ready — only the
+        // required agent_status proves the live detected agent.
+        return envelope("prompt-1", {
+          type: "agent_prompted",
+          agent: {
+            pane_id: paneId, terminal_id: "term-9", name: agent.name, agent: kind,
+            agent_session: { ...selfSession, agent: kind }, agent_status: status, revision: 8
+          }
+        });
+      }
+    };
+    return {
+      deps: {
+        cli,
+        context: { workspaceId: "w1", tabId: "w1:t1", paneId },
+        notifyChannel: (notification) => { notifications.push(notification); },
+        signal: new AbortController().signal
+      },
+      calls,
+      renames,
+      prompts,
+      notifications
+    };
+  }
+
+  it("mints the derived name once, then the wake self-prompts through the detection-proven ack", async () => {
+    const h = selfAdoptHarness();
+    const host = createMcpHostWake(h.deps);
+    host.notifier.wake(wake);
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    expect(h.renames).toEqual(["devin-w1p9"]);
+    expect(h.calls).toContainEqual([
+      "pane", "report-metadata", ownPaneId, "--source", "herdr-tools",
+      "--token", "identity_provenance=adopted", "--token", `identity_actor=${ownPaneId}`, "--token", "identity_session=s-unnamed"
+    ]);
+    expect(h.prompts[0]!.text).toContain("[HERDR AGENT MESSAGE v1]");
+    // The minted outcome is memoized: a second wake re-reads nothing for adoption.
+    host.notifier.wake(wake);
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+    expect(h.renames).toHaveLength(1);
+    expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(3);
+  });
+
+  it("never touches a pane already named by hand", async () => {
+    const h = selfAdoptHarness({ named: true });
+    createMcpHostWake(h.deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    expect(h.renames).toHaveLength(0);
+    expect(h.calls.filter((argv) => argv[0] === "pane" && argv[1] === "report-metadata")).toHaveLength(0);
+  });
+
+  it("adopts nothing when a name arrives between resolution and the attempt", async () => {
+    const h = selfAdoptHarness({ lateName: true });
+    createMcpHostWake(h.deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    expect(h.renames).toHaveLength(0);
+  });
+
+  it.each(["agy", "hermes"] as const)("stays inert for an unnamed %s pane — the kind gate is an allowlist", async (kind) => {
+    const h = selfAdoptHarness({ kind });
+    const host = createMcpHostWake(h.deps);
+    host.notifier.wake(wake);
+    await flush();
+    expect(h.renames).toHaveLength(0);
+    expect(h.prompts).toHaveLength(0);
+    expect(h.notifications).toHaveLength(0);
+  });
+
+  it("mints a name for an unnamed claude pane while the wake still rides the channel", async () => {
+    const h = selfAdoptHarness({ kind: "claude" });
+    createMcpHostWake(h.deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(h.notifications).toHaveLength(1));
+    expect(h.renames).toEqual(["claude-w1p9"]);
+    expect(h.prompts).toHaveLength(0);
+  });
+
+  it("fails closed without minting when the missing field is not the name", async () => {
+    const h = selfAdoptHarness({ sessionless: true });
+    const host = createMcpHostWake(h.deps);
+    host.notifier.wake(wake);
+    await flush();
+    expect(h.renames).toHaveLength(0);
+    expect(h.prompts).toHaveLength(0);
+    // "unqualified" is not cached — the next wake re-evaluates and still refuses.
+    host.notifier.wake(wake);
+    await flush();
+    expect(h.renames).toHaveLength(0);
+    expect(h.prompts).toHaveLength(0);
+    expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(4);
+  });
+
+  it("walks the collision suffixes when the derived name is taken", async () => {
+    const h = selfAdoptHarness({ taken: ["devin-w1p9", "devin-w1p9-2"] });
+    createMcpHostWake(h.deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    expect(h.renames).toEqual(["devin-w1p9", "devin-w1p9-2", "devin-w1p9-3"]);
+  });
+
+  it("stays inert permanently once every suffix is taken", async () => {
+    const h = selfAdoptHarness({ taken: Array.from({ length: 9 }, (_, i) => (i === 0 ? "devin-w1p9" : `devin-w1p9-${i + 1}`)) });
+    const host = createMcpHostWake(h.deps);
+    host.notifier.wake(wake);
+    await flush();
+    expect(h.renames).toHaveLength(9);
+    expect(h.prompts).toHaveLength(0);
+    host.notifier.wake(wake);
+    await flush();
+    expect(h.renames).toHaveLength(9);
+    expect(h.prompts).toHaveLength(0);
+  });
+
+  it("retries after a transient read failure and after a non-collision rename error", async () => {
+    const h = selfAdoptHarness({ snapshotFailures: 1 });
+    const host = createMcpHostWake(h.deps);
+    host.notifier.wake(wake);
+    await flush();
+    // The failed attempt is not cached: this wake still drops on the missing name…
+    expect(h.renames).toHaveLength(0);
+    expect(h.prompts).toHaveLength(0);
+    // …and the next wake re-runs the whole attempt, mints, and delivers.
+    host.notifier.wake(wake);
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    expect(h.renames).toEqual(["devin-w1p9"]);
+
+    const raced = selfAdoptHarness({ renameTransient: true });
+    const racedHost = createMcpHostWake(raced.deps);
+    racedHost.notifier.wake(wake);
+    await flush();
+    expect(raced.renames).toEqual(["devin-w1p9"]);
+    expect(raced.prompts).toHaveLength(0);
+    racedHost.notifier.wake(wake);
+    await vi.waitFor(() => expect(raced.prompts).toHaveLength(1));
+    expect(raced.renames).toEqual(["devin-w1p9", "devin-w1p9"]);
+  });
+
+  it("drops the wake when the minted ack cannot verify the adopted name", async () => {
+    const h = selfAdoptHarness({ mismatchName: "other-name" });
+    createMcpHostWake(h.deps).notifier.wake(wake);
+    await flush();
+    expect(h.renames).toEqual(["devin-w1p9"]);
+    expect(h.prompts).toHaveLength(0);
+  });
+
+  it("keeps the adoption when the advisory token write fails", async () => {
+    const h = selfAdoptHarness({ metadataFails: true });
+    createMcpHostWake(h.deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    expect(h.renames).toEqual(["devin-w1p9"]);
+  });
+
+  it("refuses permanently when no valid name can be derived from the pane id", async () => {
+    const h = selfAdoptHarness({ paneId: ":::" });
+    const host = createMcpHostWake(h.deps);
+    host.notifier.wake(wake);
+    await flush();
+    expect(h.renames).toHaveLength(0);
+    expect(h.prompts).toHaveLength(0);
+    host.notifier.wake(wake);
+    await flush();
+    // The "refused" outcome is memoized: the second wake paid only the context read.
+    expect(h.calls.filter((argv) => argv[0] === "api" && argv[1] === "snapshot")).toHaveLength(3);
+  });
+});

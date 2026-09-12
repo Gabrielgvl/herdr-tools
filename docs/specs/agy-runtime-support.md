@@ -91,7 +91,7 @@ publication, and reservation-before-topology-mutation rules remain in force. AGY
 uses this reduced-assurance sequence:
 
 1. **Pre-prompt readiness.** A fresh coherent readiness sample must prove the exact pane,
-   terminal, name, `agent: "agy"`, `interactive_ready: true`, idle lifecycle, and safe
+   terminal, name, `agent: "agy"`, idle lifecycle, and safe
    baseline sequence/revision. Missing native `agent_session` is allowed at this stage;
    records are never merged across samples. Contradictions, malformed fields, duplicate
    records, or replacement fail closed.

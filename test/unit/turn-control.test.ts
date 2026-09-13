@@ -341,6 +341,64 @@ describe("explicit turn control", () => {
     expect(harness.calls.some((call) => call[1] === "send-keys")).toBe(false);
   });
 
+  it("denies a leaf worker turn control before any target state read or dispatch", async () => {
+    const callerSession = { source: "herdr:devin", agent: "devin", kind: "id", value: "session-caller" };
+    const leafCallerPane = { ...callerPane, agent_session: callerSession, tokens: { identity_provenance: "launched", identity_actor: "w1:pM", identity_session: "session-caller" } };
+    const managerPane = { pane_id: "w1:pM", tab_id: "w1:t1", workspace_id: "w1", label: "manager", agent_status: "idle" };
+    const leafSnapshot: HerdrSnapshot = {
+      ...snapshot(workerPane("working")),
+      panes: [leafCallerPane, workerPane("working"), managerPane],
+      agents: [
+        { pane_id: "w1:p1", name: "caller", agent_status: "idle", agent_session: callerSession },
+        workerAgent("working"),
+        { pane_id: "w1:pM", name: "manager", agent_status: "idle" }
+      ]
+    };
+    for (const operation of ["cancel", "interrupt"] as const) {
+      const harness = makeCli(leafSnapshot, { initialSnapshot: leafSnapshot });
+      await expect(execute(harness.cli, { target: "worker", operation })).rejects.toMatchObject({
+        code: "TARGET_SCOPE_REJECTED",
+        details: { phase: "caller_policy", callerPolicy: { operation, callerPaneId: "w1:p1", parentPaneId: "w1:pM" } }
+      });
+      expect(harness.calls).toEqual([["api", "snapshot"]]);
+    }
+  });
+
+  it("fails closed when caller-policy evidence is unusable", async () => {
+    const unverifiableSession = { ...callerPane, tokens: { identity_provenance: "launched", identity_actor: "w1:pM", identity_session: "session-caller" } };
+    const leafSnapshot: HerdrSnapshot = {
+      ...snapshot(workerPane("working")),
+      panes: [unverifiableSession, workerPane("working"), { pane_id: "w1:pM", tab_id: "w1:t1", workspace_id: "w1", label: "manager", agent_status: "idle" }],
+      agents: [
+        { pane_id: "w1:p1", name: "caller", agent_status: "idle" },
+        workerAgent("working"),
+        { pane_id: "w1:pM", name: "manager", agent_status: "idle" }
+      ]
+    };
+    const harness = makeCli(leafSnapshot, { initialSnapshot: leafSnapshot });
+    await expect(execute(harness.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({
+      code: "TARGET_SCOPE_REJECTED",
+      details: { phase: "caller_policy", callerPolicy: { reason: "session_unverifiable" } }
+    });
+
+    const contradictoryCaller = { ...callerPane, tokens: { identity_provenance: "launched" } };
+    const contradictorySnapshot: HerdrSnapshot = {
+      ...leafSnapshot,
+      panes: [contradictoryCaller, workerPane("working")],
+      agents: [
+        { pane_id: "w1:p1", name: "caller", agent_status: "idle", tokens: { identity_provenance: "adopted" } },
+        workerAgent("working"),
+        { pane_id: "w1:pM", name: "manager", agent_status: "idle" }
+      ]
+    };
+    const contradictory = makeCli(contradictorySnapshot, { initialSnapshot: contradictorySnapshot });
+    await expect(execute(contradictory.cli, { target: "worker", operation: "cancel" })).rejects.toMatchObject({
+      code: "CALLER_POLICY_UNAVAILABLE",
+      details: { phase: "caller_policy", callerPolicy: { reason: "provenance_contradictory" } }
+    });
+    expect(contradictory.calls).toEqual([["api", "snapshot"]]);
+  });
+
   it("requires a complete stable identity and rejects identity changes", async () => {
     const missingInitial = snapshot(workerPane("working", 10, { agent_session: undefined }), workerAgent("working", 10, { agent_session: undefined }));
     const missing = makeCli(missingInitial, { initialSnapshot: missingInitial });

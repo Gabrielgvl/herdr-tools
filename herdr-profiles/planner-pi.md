@@ -28,6 +28,13 @@ runtime:
     - executor_resume
     - edit
     - write
+    - herdr_inspect
+    - herdr_launch
+    - herdr_communicate
+    - herdr_wait
+    - herdr_jobs
+    - herdr_pane
+    - herdr_tab
     # Codex adapter (pi-codex-conversion) tool surface. Pi applies --tools to
     # extension tools too, so the adapter reports "Codex adapter off:
     # unavailable tools" unless every tool it owns is allowlisted here. The

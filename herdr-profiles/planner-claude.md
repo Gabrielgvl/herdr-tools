@@ -18,6 +18,13 @@ runtime:
     - Edit
     - Write
     - mcp__plugin_herdr-executor_executor
+    - mcp__plugin_herdr-tools_herdr__herdr_inspect
+    - mcp__plugin_herdr-tools_herdr__herdr_launch
+    - mcp__plugin_herdr-tools_herdr__herdr_communicate
+    - mcp__plugin_herdr-tools_herdr__herdr_wait
+    - mcp__plugin_herdr-tools_herdr__herdr_jobs
+    - mcp__plugin_herdr-tools_herdr__herdr_pane
+    - mcp__plugin_herdr-tools_herdr__herdr_tab
   disallowedTools:
     - NotebookEdit
     - Task

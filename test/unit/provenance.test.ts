@@ -46,6 +46,7 @@ describe("inter-agent provenance", () => {
     expect(buildEnvelope(sender, "assignment", payload)).toContain("kind: assignment");
     expect(buildEnvelope(sender, "supervision", payload)).toContain("kind: supervision");
     expect(buildEnvelope(sender, "wait", payload)).toContain("kind: wait");
+    expect(buildEnvelope(sender, "result", payload)).toContain("kind: result");
   });
 
   it("fails closed when the caller pane identity is unavailable", () => {

@@ -28,6 +28,8 @@ runtime:
     - jobs
     - job_decide
     - monitor
+    - herdr_communicate
+    - herdr_inspect
     # Codex adapter (pi-codex-conversion) tool surface. Pi applies --tools to
     # extension tools too, so the adapter reports "Codex adapter off:
     # unavailable tools" unless every tool it owns is allowlisted here. The

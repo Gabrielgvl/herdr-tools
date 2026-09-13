@@ -647,14 +647,18 @@ describe("profile catalog", () => {
       expect((await readFile(skillPath, "utf8")).trim().length).toBeGreaterThan(0);
     }
 
+    // ADR-030: leaf workers get exactly the reply channel; a planner gets the
+    // whole surface because it may own scout/researcher sub-lanes.
+    const herdrReplyPiTools = ["herdr_communicate", "herdr_inspect"];
+    const herdrAllPiTools = ["herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"];
     const piTools = {
-      manager: ["read", "grep", "find", "ls", "edit", "write", "ask_user_question", ...executorPiTools, "herdr_inspect", "herdr_launch", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab", ...CODEX_ADAPTER_PI_TOOLS],
-      scout: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "edit", "write", ...CODEX_ADAPTER_PI_TOOLS],
-      planner: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write", ...CODEX_ADAPTER_PI_TOOLS],
-      worker: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", "bash_bg", "jobs", "job_decide", "monitor", ...CODEX_ADAPTER_PI_TOOLS],
-      reviewer: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", ...CODEX_ADAPTER_PI_TOOLS],
-      researcher: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write", ...CODEX_ADAPTER_PI_TOOLS],
-      promoter: ["read", "bash", "grep", "find", "ls", "ctx_execute", "ctx_execute_file", "ctx_search", ...executorPiTools, "edit", "write", ...CODEX_ADAPTER_PI_TOOLS]
+      manager: ["read", "grep", "find", "ls", "edit", "write", "ask_user_question", ...executorPiTools, ...herdrAllPiTools, ...CODEX_ADAPTER_PI_TOOLS],
+      scout: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "edit", "write", ...herdrReplyPiTools, ...CODEX_ADAPTER_PI_TOOLS],
+      planner: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write", ...herdrAllPiTools, ...CODEX_ADAPTER_PI_TOOLS],
+      worker: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", "bash_bg", "jobs", "job_decide", "monitor", ...herdrReplyPiTools, ...CODEX_ADAPTER_PI_TOOLS],
+      reviewer: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", "edit", "write", ...herdrReplyPiTools, ...CODEX_ADAPTER_PI_TOOLS],
+      researcher: ["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "ctx_execute", "ctx_execute_file", "ctx_search", "web_search", "source_check", "fetch_content", "get_search_content", ...executorPiTools, "edit", "write", ...herdrReplyPiTools, ...CODEX_ADAPTER_PI_TOOLS],
+      promoter: ["read", "bash", "grep", "find", "ls", "ctx_execute", "ctx_execute_file", "ctx_search", ...executorPiTools, "edit", "write", ...herdrReplyPiTools, ...CODEX_ADAPTER_PI_TOOLS]
     } as const;
     // Every bundled Pi profile allowlists the whole owned Codex adapter surface,
     // in the adapter's own order. Any plan tool Pi filters out of the registry
@@ -830,13 +834,15 @@ describe("profile catalog", () => {
     expect(devinPromoter).toContain("does not deliver this profile body to Devin");
     expect(devinPromoter).toContain("must restate the reviewed manifest, the exact promotion scope, the required read-back receipts, and the promotion gate");
 
+    const herdrReplyClaudeTools = ["mcp__plugin_herdr-tools_herdr__herdr_communicate", "mcp__plugin_herdr-tools_herdr__herdr_inspect"];
+    const herdrAllClaudeTools = ["mcp__plugin_herdr-tools_herdr__herdr_inspect", "mcp__plugin_herdr-tools_herdr__herdr_launch", "mcp__plugin_herdr-tools_herdr__herdr_communicate", "mcp__plugin_herdr-tools_herdr__herdr_wait", "mcp__plugin_herdr-tools_herdr__herdr_jobs", "mcp__plugin_herdr-tools_herdr__herdr_pane", "mcp__plugin_herdr-tools_herdr__herdr_tab"];
     const claudeTools = {
-      scout: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
-      planner: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write", executorClaudeTool], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
-      worker: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", "NotebookEdit", "WebSearch", "WebFetch"], disallowedTools: ["Task"], permissionMode: "dontAsk" },
-      reviewer: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write"], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
-      researcher: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write", executorClaudeTool], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
-      promoter: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", executorClaudeTool], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" }
+      scout: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", ...herdrReplyClaudeTools], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
+      planner: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write", executorClaudeTool, ...herdrAllClaudeTools], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
+      worker: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", "NotebookEdit", "WebSearch", "WebFetch", ...herdrReplyClaudeTools], disallowedTools: ["Task"], permissionMode: "dontAsk" },
+      reviewer: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write", ...herdrReplyClaudeTools], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
+      researcher: { allowedTools: ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Edit", "Write", executorClaudeTool, ...herdrReplyClaudeTools], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" },
+      promoter: { allowedTools: ["Read", "Glob", "Grep", "Bash", "Edit", "Write", executorClaudeTool, ...herdrReplyClaudeTools], disallowedTools: ["NotebookEdit", "Task"], permissionMode: "dontAsk" }
     } as const;
     for (const role of ["scout", "planner", "worker", "reviewer", "researcher", "promoter"] as const) {
       const profile = catalog.effective.get(`${role}-claude`)!;

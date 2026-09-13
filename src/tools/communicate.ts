@@ -1,6 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli, JsonEnvelope } from "../cli.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
+import { assertControlScope, assertSendScope, classifyCaller } from "../caller-policy.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { queueFlushEligible, type DevinQueueFlush } from "../messages/devin-queue-flush.js";
@@ -19,7 +20,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 export type CommunicateRoute = "prompt_direct" | "steer_direct";
 export type { CommunicateState };
 export { compactPane, paneFrom };
-export type CommunicatePhase = "validate" | "resolve_target" | "verify_recipient" | "pre_state" | "publish" | "send" | "post_state";
+export type CommunicatePhase = "validate" | "resolve_target" | "caller_policy" | "verify_recipient" | "pre_state" | "publish" | "send" | "post_state";
 
 export interface LegacyCommunicateDetails {
   operation: "prompt" | "steer" | "keys";
@@ -42,7 +43,7 @@ export interface LegacyCommunicateDetails {
     postState?: string;
   };
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
-  envelope?: { version: "v1"; kind: "prompt" | "steer"; delivery: MessageDelivery };
+  envelope?: { version: "v1"; kind: "prompt" | "steer" | "result"; delivery: MessageDelivery };
   contextRebinding?: ContextResolutionDiagnostics;
   attachment?: { attachmentId: string; path: string; bytes: number; sha256: string; expiresAt: string; recipientPaneId?: string };
 }
@@ -124,12 +125,14 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       try {
         if (legacyParams.operation === "keys") {
           if (Object.prototype.hasOwnProperty.call(legacyParams, "delivery")) throw Object.assign(new Error("delivery is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "delivery" } });
+          if (Object.prototype.hasOwnProperty.call(legacyParams, "kind")) throw Object.assign(new Error("kind is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "kind" } });
           if (legacyParams.keys.some((key) => !isNamedKey(key))) {
             throw Object.assign(new Error("Unsupported named key"), { code: "KEY_REJECTED" });
           }
         } else {
           assertMessageText(legacyParams.text);
           if (legacyParams.delivery !== undefined && legacyParams.delivery !== "inline" && legacyParams.delivery !== "attachment") throw Object.assign(new Error("delivery must be inline or attachment"), { code: "INVALID_INPUT", details: { field: "delivery" } });
+          if (legacyParams.kind !== undefined && legacyParams.kind !== "result") throw Object.assign(new Error("kind must be result"), { code: "INVALID_INPUT", details: { field: "kind" } });
           assertDeliverySize(legacyParams.text, delivery!);
         }
 
@@ -154,6 +157,14 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             ...snapshot.agents.filter((agent) => agent.pane_id === target.paneId)
           ], target.paneId!);
         }
+        // Cooperative worker/manager routing (ADR-030): classify the effective
+        // caller after exact target resolution so an alias for the bound
+        // manager pane compares equal, and before any recipient lookup,
+        // fresh-state read, or dispatch so a denied call performs no sends.
+        phase = "caller_policy";
+        const callerPolicy = classifyCaller(snapshot, effective.context.paneId);
+        if (legacyParams.operation === "keys") assertControlScope(callerPolicy, "keys");
+        else assertSendScope(callerPolicy, legacyParams.operation, target.paneId);
         let recipientKey: string | undefined;
         let recipientAgentName: string | undefined;
         let recipientRecord: ReturnType<RecipientRegistry["get"]>;
@@ -192,6 +203,10 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           phase = "send";
           keys = await deps.cli.runJson(["agent", "send-keys", target.paneId!, ...legacyParams.keys], activeSignal);
         } else {
+          // The envelope names the semantic kind: an explicit `kind: "result"`
+          // marks a worker's report to its manager, while omission keeps the
+          // operation-derived prompt/steer kind byte-identical (ADR-030).
+          const envelopeKind = legacyParams.kind ?? legacyParams.operation;
           const verifyFreshPromptTarget = async (): Promise<{ identity: PromptTargetIdentity; state: CommunicateState }> => {
             phase = "pre_state";
             const finalAgentEnvelope = await deps.cli.runJson(["agent", "get", target.paneId!], activeSignal);
@@ -232,8 +247,8 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             sentState = fresh.state;
             phase = "send";
             const envelope = delivery === "attachment"
-              ? buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "attachment", { ...published!, encoding: "utf-8" })
-              : buildEnvelope(sender!, legacyParams.operation, legacyParams.text, "inline");
+              ? buildEnvelope(sender!, envelopeKind, legacyParams.text, "attachment", { ...published!, encoding: "utf-8" })
+              : buildEnvelope(sender!, envelopeKind, legacyParams.text, "inline");
             prompt = await deps.cli.prompt(target.paneId!, envelope, activeSignal);
             const requestId = prompt.id;
             try {
@@ -335,7 +350,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         },
         ...(legacyParams.operation !== "keys" ? {
           sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
-          envelope: { version: "v1" as const, kind: legacyParams.operation, delivery: delivery! },
+          envelope: { version: "v1" as const, kind: legacyParams.kind ?? legacyParams.operation, delivery: delivery! },
           ...(published ? { attachment: published } : {})
         } : {})
       };

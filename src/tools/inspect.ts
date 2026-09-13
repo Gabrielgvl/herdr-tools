@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { callerPolicyDiagnostics, callerPolicyFailure, classifyCaller } from "../caller-policy.js";
 import type { HerdrCli } from "../cli.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { parseHealth } from "../health.js";
@@ -19,6 +20,7 @@ interface InspectDetails {
   profile?: unknown;
   diagnostics?: unknown[];
   context?: ContextResolutionDiagnostics;
+  callerPolicy?: unknown;
   contextRebinding?: ContextResolutionDiagnostics;
   truncated?: boolean;
   omittedCount?: number;
@@ -62,6 +64,19 @@ function compactEnvironment(value: InspectDependencies["environment"] | undefine
     currentIdsPresent: value?.currentIdsPresent ?? Boolean(context.workspaceId && context.tabId && context.paneId),
     currentIdsValid: value?.currentIdsValid ?? true
   };
+}
+
+/**
+ * Bounded caller-policy evidence for context mode (ADR-030). A caller whose
+ * policy evidence is malformed still gets its context report — the failure is
+ * surfaced as `{scope:"unavailable", code}` instead of breaking inspection.
+ */
+function callerPolicyEvidence(snapshot: HerdrSnapshot, paneId: string): Record<string, unknown> {
+  try {
+    return callerPolicyDiagnostics(classifyCaller(snapshot, paneId));
+  } catch (error) {
+    return callerPolicyFailure(error);
+  }
 }
 
 function compactCollectionRecord(value: Record<string, unknown>, collection: "panes" | "agents" | "tabs"): Record<string, unknown> {
@@ -492,7 +507,7 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
         kind: "target",
         outcome: "success",
         target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName },
-        ...(mode === "context" ? { context: effective.diagnostics } : contextRebindingDetails(effective.diagnostics)),
+        ...(mode === "context" ? { context: effective.diagnostics, callerPolicy: callerPolicyEvidence(snapshot, effective.context.paneId) } : contextRebindingDetails(effective.diagnostics)),
         metadata: modelSafeJson(pane),
         recentUnwrappedLines,
         ...(raw.truncated ? { truncated: true } : {})

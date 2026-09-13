@@ -660,8 +660,10 @@ describe("herdr_communicate", () => {
     const tool = createCommunicateTool({ cli: harness.cli, context, preflight });
     await expect(tool.execute("id", { target: "reviewer", operation: "prompt", text: "x".repeat(16 * 1024 + 1) }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE_FOR_INLINE" });
     expect(preflight).not.toHaveBeenCalled();
-    await expect(tool.execute("id", { target: "reviewer", operation: "keys", keys: ["enter"], delivery: "inline" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(tool.execute("id", { target: "reviewer", operation: "keys", keys: ["enter"], delivery: "inline" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT", details: { field: "delivery" } });
+    await expect(tool.execute("id", { target: "reviewer", operation: "keys", keys: ["enter"], kind: "result" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT", details: { field: "kind" } });
     await expect(tool.execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "other" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(tool.execute("id", { target: "reviewer", operation: "steer", text: "body", kind: "bogus" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT", details: { field: "kind" } });
   });
 
   it("locks a Devin steer write and schedules the flush from the last verified pre-send state", async () => {
@@ -758,5 +760,143 @@ describe("herdr_communicate", () => {
     const result = tool.renderResult?.({ content: [], details: { operation: "prompt", outcome: "sent", delivery: "inline", target: { paneId: "w1:p2" }, preState: {}, postState: { agent_status: "working" }, operationIds: {} }, isError: false } as never, {} as never, {} as never, {} as never);
     expect(result?.render(80)).toEqual(["sent · inline · w1:p2 · working"]);
     result?.invalidate();
+  });
+});
+
+describe("caller policy", () => {
+  const workerSession = { source: "herdr:devin", agent: "devin", kind: "id", value: "session-worker" };
+  const workerTokens = { identity_provenance: "launched", identity_actor: "w1:pM", identity_session: "session-worker" };
+  const managerIdentity = { terminal_id: "term-manager", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-manager" } };
+
+  function makeWorkerCli(options: { tokens?: Record<string, unknown>; callerAgentTokens?: Record<string, unknown>; callerSessionOverride?: unknown; includeManager?: boolean; callerChildren?: number } = {}) {
+    const calls: string[][] = [];
+    const promptInputs: string[] = [];
+    let state: State = "idle";
+    const callerSession = options.callerSessionOverride === undefined ? workerSession : options.callerSessionOverride;
+    const callerRecord = { ...callerPane, agent_session: callerSession, tokens: options.tokens ?? { ...workerTokens } };
+    const callerAgent = { pane_id: "w1:p1", agent_id: "agent-caller", name: "caller", agent_status: "idle", ...(options.callerSessionOverride === undefined ? { agent_session: workerSession } : {}), ...(options.callerAgentTokens ? { tokens: options.callerAgentTokens } : {}) };
+    const manager = { pane_id: "w1:pM", tab_id: "w1:t1", workspace_id: "w1", label: "manager", agent_id: "agent-m", agent_status: "idle", agent: "pi", ...managerIdentity };
+    const managerAgent = { pane_id: "w1:pM", agent_id: "agent-m", name: "manager", agent_status: "idle", agent: "pi", ...managerIdentity };
+    const children = Array.from({ length: options.callerChildren ?? 0 }, (_, index) => ({
+      pane: { pane_id: `w1:c${index}`, tab_id: "w1:t1", workspace_id: "w1", label: `scout-${index}`, agent_status: "idle", tokens: { identity_provenance: "launched", identity_actor: "w1:p1", identity_session: `session-child-${index}` } },
+      agent: { pane_id: `w1:c${index}`, name: `scout-${index}`, agent_status: "idle", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: `session-child-${index}` } }
+    }));
+    const snapshot: HerdrSnapshot = {
+      ...baseSnapshot,
+      panes: [callerRecord, ...(options.includeManager === false ? [] : [manager]), basePane, ...children.map((child) => child.pane)],
+      agents: [callerAgent, ...(options.includeManager === false ? [] : [managerAgent]), baseSnapshot.agents[1]!, ...children.map((child) => child.agent)]
+    };
+    const exec = vi.fn<PiExec>().mockImplementation(async (_command, argv) => {
+      if (argv[0] === "pane" && argv[1] === "current") return execResponse("current", { type: "pane_current", pane: callerRecord });
+      calls.push(argv);
+      if (argv[0] === "api") return execResponse("snapshot-worker", { type: "session_snapshot", snapshot });
+      if (argv[0] === "agent" && argv[1] === "get") {
+        const agent = argv[2] === "w1:p2" ? { ...baseSnapshot.agents[1]! } : { ...managerAgent };
+        return execResponse("agent-get", { agent: { ...agent, agent_status: state } });
+      }
+      if (argv[0] === "pane" && argv[1] === "get") {
+        const pane = argv[2] === "w1:p2" ? { ...basePane } : { ...manager };
+        return execResponse("pane-get", { pane: { ...pane, agent_status: state } });
+      }
+      if (argv[0] === "agent" && argv[1] === "send-keys") return execResponse("keys-1", { ok: true });
+      throw new Error(`unexpected argv ${argv.join(" ")}`);
+    });
+    const prompt = vi.fn<AgentPromptClient["prompt"]>().mockImplementation(async (target, input) => {
+      promptInputs.push(input);
+      state = "working";
+      const agent = target === "w1:p2" ? { ...baseSnapshot.agents[1]! } : { ...managerAgent };
+      return { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { ...agent, agent_status: "working", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } } };
+    });
+    const promptClient: AgentPromptClient = { prompt, ping: vi.fn(async () => undefined) };
+    return { cli: new HerdrCli(exec, 10_000, 50_000, promptClient), calls, promptInputs, prompt };
+  }
+
+  it("lets a bound leaf worker steer its recorded manager by ID or by exact alias", async () => {
+    const harness = makeWorkerCli();
+    for (const target of ["w1:pM", "manager"]) {
+      await expect(execute(harness.cli, { target, operation: "steer", text: "status update" })).resolves.toMatchObject({ details: { target: { paneId: "w1:pM" } } });
+    }
+    expect(harness.promptInputs).toEqual([senderEnvelope("steer", "status update"), senderEnvelope("steer", "status update")]);
+  });
+
+  it("marks a worker result with kind result while keeping the steer route", async () => {
+    const harness = makeWorkerCli();
+    const result = await execute(harness.cli, { target: "manager", operation: "steer", kind: "result", text: "Status: completed" });
+    expect(harness.promptInputs[0]).toContain("kind: result");
+    expect(result.details).toMatchObject({ operation: "steer", route: "steer_direct", envelope: { version: "v1", kind: "result", delivery: "inline" } });
+    const promptHarness = makeWorkerCli();
+    const promptResult = await execute(promptHarness.cli, { target: "w1:pM", operation: "prompt", kind: "result", text: "Status: blocked" });
+    expect(promptHarness.promptInputs[0]).toContain("kind: result");
+    expect(promptResult.details).toMatchObject({ envelope: { version: "v1", kind: "result" } });
+  });
+
+  it("keeps an omitted kind byte-identical to the operation envelope", async () => {
+    const harness = makeWorkerCli();
+    await execute(harness.cli, { target: "manager", operation: "steer", text: "plain steer" });
+    expect(harness.promptInputs[0]).toBe(senderEnvelope("steer", "plain steer"));
+  });
+
+  it("denies a leaf worker's sends to a peer without touching dispatch", async () => {
+    for (const operation of ["prompt", "steer"] as const) {
+      const harness = makeWorkerCli();
+      await expect(execute(harness.cli, { target: "reviewer", operation, text: "peer message" })).rejects.toMatchObject({ code: "TARGET_SCOPE_REJECTED", details: { phase: "caller_policy", delivery: "inline", route: `${operation}_direct`, callerPaneId: "w1:p1", targetPaneId: "w1:p2", parentPaneId: "w1:pM", operation } });
+      expect(harness.calls).toEqual([["api", "snapshot"]]);
+      expect(harness.prompt).not.toHaveBeenCalled();
+    }
+  });
+
+  it("denies a leaf worker attachment send before any recipient lookup or publication", async () => {
+    const harness = makeWorkerCli();
+    const recipients = new RecipientRegistry();
+    recipients.register({ paneId: "w1:p2", terminalId: "term-reviewer", agentName: "reviewer", agentKind: "pi", agentSession: targetIdentity.agent_session, recipientKey: "recipient-key", profileName: "worker-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-7" });
+    const publish = vi.fn(async () => { throw new Error("unreachable"); });
+    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
+    await expect(createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "steer", kind: "result", text: "peer result", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "TARGET_SCOPE_REJECTED", details: { phase: "caller_policy", delivery: "attachment", route: "steer_direct", targetPaneId: "w1:p2", parentPaneId: "w1:pM" } });
+    expect(publish).not.toHaveBeenCalled();
+    expect(harness.calls).toEqual([["api", "snapshot"]]);
+  });
+
+  it("denies a leaf worker keys and turn control regardless of binding", async () => {
+    const harness = makeWorkerCli();
+    await expect(execute(harness.cli, { target: "manager", operation: "keys", keys: ["enter"] })).rejects.toMatchObject({ code: "TARGET_SCOPE_REJECTED", details: { phase: "caller_policy", operation: "keys", callerPaneId: "w1:p1", parentPaneId: "w1:pM" } });
+    await expect(execute(harness.cli, { target: "manager", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_SCOPE_REJECTED", details: { phase: "caller_policy", callerPolicy: { operation: "cancel" } } });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "interrupt" })).rejects.toMatchObject({ code: "TARGET_SCOPE_REJECTED" });
+    expect(harness.calls.filter((call) => call[1] === "send-keys")).toEqual([]);
+  });
+
+  it("fails closed when a launched leaf worker's binding evidence is unusable", async () => {
+    const missingActor = makeWorkerCli({ tokens: { identity_provenance: "launched", identity_session: "session-worker" } });
+    await expect(execute(missingActor.cli, { target: "manager", operation: "steer", text: "result" })).rejects.toMatchObject({ code: "CALLER_BINDING_UNAVAILABLE", details: { phase: "caller_policy", reason: "actor_missing" } });
+
+    const staleActor = makeWorkerCli({ tokens: { identity_provenance: "launched", identity_actor: "w1:pGONE", identity_session: "session-worker" } });
+    await expect(execute(staleActor.cli, { target: "manager", operation: "prompt", text: "result" })).rejects.toMatchObject({ code: "CALLER_BINDING_UNAVAILABLE", details: { reason: "actor_stale" } });
+
+    const staleSession = makeWorkerCli({ tokens: { identity_provenance: "launched", identity_actor: "w1:pM", identity_session: "session-replaced" } });
+    await expect(execute(staleSession.cli, { target: "manager", operation: "steer", kind: "result", text: "result" })).rejects.toMatchObject({ code: "CALLER_BINDING_UNAVAILABLE", details: { reason: "session_stale" } });
+  });
+
+  it("fails closed when a leaf worker's caller-policy evidence is contradictory", async () => {
+    const harness = makeWorkerCli({ callerAgentTokens: { identity_provenance: "adopted" } });
+    await expect(execute(harness.cli, { target: "manager", operation: "steer", text: "result" })).rejects.toMatchObject({ code: "CALLER_POLICY_UNAVAILABLE", details: { phase: "caller_policy", reason: "provenance_contradictory" } });
+    expect(harness.prompt).not.toHaveBeenCalled();
+  });
+
+  it("leaves a launched caller unrestricted once it manages children", async () => {
+    const harness = makeWorkerCli({ callerChildren: 1 });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "manager can reach anyone" })).resolves.toMatchObject({ details: { target: { paneId: "w1:p2" } } });
+  });
+
+  it("publishes a result attachment with kind result while the store keeps the operation", async () => {
+    const harness = makeWorkerCli();
+    const recipients = new RecipientRegistry();
+    recipients.register({ paneId: "w1:pM", terminalId: "term-manager", agentName: "manager", agentKind: "pi", agentSession: managerIdentity.agent_session, recipientKey: "manager-key", profileName: "manager-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-m" });
+    const publish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/manager-key/attachment-1/body.txt", bytes: 20, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:pM" }));
+    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
+    const result = await createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "manager", operation: "steer", kind: "result", text: "Status: completed", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ operation: "steer" }));
+    expect(harness.promptInputs[0]).toContain("kind: result");
+    expect(harness.promptInputs[0]).toContain("delivery: attachment");
+    expect(result.details).toMatchObject({ envelope: { version: "v1", kind: "result", delivery: "attachment" } });
   });
 });

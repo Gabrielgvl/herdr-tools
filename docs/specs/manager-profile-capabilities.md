@@ -26,7 +26,7 @@ Success means profile launches are useful by default, hidden subagent spawning i
 4. Pi extension discovery remains enabled. The globally configured `pi-mcp-adapter` provides Executor; manager, planner, researcher, and promoter allowlist its tools and load its skill. Every Pi profile keeps `runtime.extensions` empty to avoid duplicate adapter registration.
 5. Tool names from inherited extensions are allowlisted only where they serve the role. If a task requires an allowlisted extension tool that is not installed, the role skill requires a visible blocked result; it must not claim equivalent verification through an unspecified fallback.
 6. Claude role skills are packaged as scope-local Claude plugins. The corresponding Pi profile loads the same `SKILL.md` path directly, so role method has one source of truth across runtimes.
-7. Non-manager profiles cannot spawn hidden subagents. Pi profiles omit `Agent` and Herdr lifecycle tools; Claude profiles disallow `Task`.
+7. Non-manager profiles cannot spawn hidden subagents. Pi profiles omit `Agent`; Claude profiles disallow `Task`. (Herdr-tool scope superseded by ADR-030: `manager-pi`/`manager-claude` and `planner-pi`/`planner-claude` carry the full Herdr tool surface; every other non-manager Pi and Claude profile carries only `herdr_communicate` and `herdr_inspect` for the typed reply channel.)
 8. Read-only describes repository authority, not tool absence. Non-manager Pi and Claude roles already retain Bash and now also receive edit/write for assignment-required handoffs; their role skills still prohibit unassigned repository mutation. The same now holds for both managers, whose shell capability is bounded by owner approval in the role skill rather than by the absence of a shell tool.
 9. AGY support is implemented only in Herdr Tools. It requires no Herdr Core change. The AGY profile body is metadata, not a runtime prompt.
 
@@ -103,14 +103,14 @@ Common extension-backed navigation tools are selected by name but still supplied
 |---|---|
 | `manager-pi` | `read`, `grep`, `find`, `ls`, `edit`, `write`, `ask_user_question`, Executor, and Herdr lifecycle tools, plus the Codex adapter surface | Generic advisory manager; writes only exact assignment-supplied handoff or coordination paths. Owner-approved: the adapter surface gives it `exec_command`/`write_stdin`, so it now has shell execution, and `apply_patch`. |
 | `manager-claude` | Core research tools, `Edit`, `Write`, Herdr MCP, and Executor MCP | Claude `default`; only `Task` is disallowed. Writes only exact assignment-supplied handoff or coordination paths. |
-| `scout-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ffgrep`, `fffind`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write` |
-| `planner-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content` |
-| `worker-pi` | Planner set plus `bash_bg`, `jobs`, `job_decide`, `monitor` |
+| `scout-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ffgrep`, `fffind`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write`, `herdr_communicate`, `herdr_inspect` |
+| `planner-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content` and the full seven-tool Herdr surface (`herdr_inspect`, `herdr_launch`, `herdr_communicate`, `herdr_wait`, `herdr_jobs`, `herdr_pane`, `herdr_tab`) for conventional `scout-*`/`researcher-*` sub-lanes (ADR-030) |
+| `worker-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content`, `bash_bg`, `jobs`, `job_decide`, `monitor`, `herdr_communicate`, `herdr_inspect` |
 | `worker-devin` | Devin runtime with `dangerous` permission mode; no per-session tool or skill selector |
 | `reviewer-devin` | Devin runtime with `dangerous` permission mode; read-only reviewer by assignment |
-| `reviewer-pi` | Planner set |
-| `researcher-pi` | Planner set |
-| `promoter-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write`; exact reviewed commit and gated delivery scope only |
+| `reviewer-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content`, `herdr_communicate`, `herdr_inspect` |
+| `researcher-pi` | Scout set plus `web_search`, `source_check`, `fetch_content`, `get_search_content`, `herdr_communicate`, `herdr_inspect` |
+| `promoter-pi` | `read`, `bash`, `grep`, `find`, `ls`, `ctx_execute`, `ctx_execute_file`, `ctx_search`, `edit`, `write`, `herdr_communicate`, `herdr_inspect`; exact reviewed commit and gated delivery scope only |
 
 Every Pi row above additionally allowlists the full 12-tool Codex adapter surface --
 `change_reasoning`, `exec_command`, `write_stdin`, `apply_patch`, `exec`, `wait`,
@@ -127,10 +127,12 @@ absence of a shell tool.**
 Explicitly absent from every non-manager Pi profile:
 
 - `Agent` and `agent_bg`
-- Herdr lifecycle tools
+- Herdr lifecycle tools other than the ADR-030 grants — `planner-pi` carries the full seven-tool surface; the other non-manager roles carry `herdr_communicate` and `herdr_inspect` only
 - durable-memory mutation tools
 
 Every Pi and Claude profile receives edit/write so it can persist an assignment-required handoff. Manager profiles restrict writes to exact assignment-supplied handoff or coordination paths and do not gain implementation authority. Manager, planner, researcher, and promoter load the Executor skill and allowlist its tools; Pi uses the global adapter while Claude loads the profile-scoped plugin. Scout, worker, reviewer, and every AGY profile do not expose Executor tools. Executor availability itself never authorizes an external mutation; the trusted promoter profile authorizes only its standard gated delivery workflow for the exact reviewed manifest and targets.
+
+ADR-030 scopes Herdr access by role: managers and planners hold the full seven-tool surface; every other non-manager Pi and Claude role holds only `herdr_communicate` and `herdr_inspect` so a leaf worker can inspect its context and return one typed `result` to its manager. A planner's sub-lane grant — launch only `scout-*`/`researcher-*`, supervise through the automatic supervisor job, close only its own children — is teaching convention in the role skill, not runtime profile-name enforcement; the cooperative caller policy scopes sends by topology, so a planner with children already reaches them as their recorded `identity_actor` and a leaf planner can still only reach its own manager.
 
 ### AGY role profiles
 
@@ -154,6 +156,8 @@ AGY initially publishes provisional pane, terminal, name, and kind supervision b
 | Worker | `dontAsk` | `Read`, `Glob`, `Grep`, `Bash`, `Edit`, `Write`, `NotebookEdit`, `WebSearch`, `WebFetch` | `Task` |
 
 Claude `allowedTools` pre-approves selected tools; `disallowedTools` supplies the actual hard exclusions. Every Claude profile loads exactly its role plugin directory.
+
+Per ADR-030, non-manager Claude `allowedTools` also name Herdr tools explicitly: `planner-claude` allowlists the seven `mcp__plugin_herdr-tools_herdr__herdr_*` tools individually; scout, worker, reviewer, researcher, and promoter allowlist only `mcp__plugin_herdr-tools_herdr__herdr_communicate` and `mcp__plugin_herdr-tools_herdr__herdr_inspect`. The whole-server `mcp__plugin_herdr-tools_herdr` grant remains `manager-claude`-only.
 
 ## Role Skill Contracts
 
@@ -304,7 +308,7 @@ Then inspect the live profile collection from the built extension and confirm:
   - Files: `herdr-profiles/role-plugins/**`.
 
 - [x] Add `manager-pi` and `manager-claude`, and configure all manager/profile capabilities.
-  - Acceptance: seven Pi profiles have exact tools and one role skill, with the manager also loading `harness-flow`; manager-claude has the exact owner-gated Claude policy and shared manager plugin; only manager Pi has Herdr lifecycle tools in its Pi allowlist; every non-manager Pi profile has edit/write, while only worker has background-job tools.
+  - Acceptance: seven Pi profiles have exact tools and one role skill, with the manager also loading `harness-flow`; manager-claude has the exact owner-gated Claude policy and shared manager plugin; only manager Pi has Herdr lifecycle tools in its Pi allowlist (superseded by ADR-030: `planner-pi` also holds the full surface, and other non-manager Pi profiles hold `herdr_communicate`/`herdr_inspect`); every non-manager Pi profile has edit/write, while only worker has background-job tools.
   - Verify: unit capability-matrix and argv tests.
   - Files: `herdr-profiles/*-pi.md`, `test/unit/profile-catalog.test.ts`.
 

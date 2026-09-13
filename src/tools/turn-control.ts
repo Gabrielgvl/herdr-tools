@@ -1,4 +1,5 @@
 import type { HerdrCli } from "../cli.js";
+import { assertControlScope, CallerPolicyError, classifyCaller } from "../caller-policy.js";
 import { contextRebindingDetails, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { formatResult } from "../tui.js";
 import { joinPromptTargetIdentity, type PromptIdentityError, type PromptTargetIdentity } from "../messages/prompt.js";
@@ -52,7 +53,7 @@ const AGENT_IDENTITY_FIELDS = [
 ] as const;
 
 type AgentState = "idle" | "working" | "blocked" | "done" | "unknown";
-type TurnControlPhase = "preflight" | "snapshot" | "pre_state" | "identity" | "dispatch" | "wait" | "final_snapshot" | "confirmation" | "confirmed";
+type TurnControlPhase = "preflight" | "snapshot" | "caller_policy" | "pre_state" | "identity" | "dispatch" | "wait" | "final_snapshot" | "confirmation" | "confirmed";
 type ConfirmationKind = "same_agent" | "agent_exited" | "unconfirmed";
 
 interface AgentSessionIdentity {
@@ -694,6 +695,21 @@ export async function executeTurnControl(
     operationIds.snapshot = boundedOperationId(effective.operationIds.snapshot);
     const snapshot = effective.snapshot;
     const resolved = resolveTarget(snapshot, params.target, "agent", effective.context);
+    // Cooperative worker/manager routing (ADR-030): the same caller policy as
+    // text sends — a leaf worker may never send turn-control keys, so the
+    // denial is target-independent and happens before any state read or key.
+    phase = "caller_policy";
+    try {
+      assertControlScope(classifyCaller(snapshot, effective.context.paneId), operation);
+    } catch (error) {
+      /* c8 ignore next -- parseSnapshotResult guarantees well-formed records, so classifyCaller only throws CallerPolicyError. */
+      if (!(error instanceof CallerPolicyError)) throw error;
+      fail(operation, key, error.code, error.message, preEvidence, identity, phase, operationIds, false, false, finalEvidence, {
+        callerPolicy: error.details,
+        ...contextRebindingDetails(contextDiagnostics!),
+        reason: error.message
+      });
+    }
     const snapshotRecords = requireSnapshotTargetRecords(snapshot, resolved.paneId!, "pre_state");
 
     phase = "pre_state";

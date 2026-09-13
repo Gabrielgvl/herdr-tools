@@ -17,6 +17,8 @@ runtime:
     - WebFetch
     - Edit
     - Write
+    - mcp__plugin_herdr-tools_herdr__herdr_communicate
+    - mcp__plugin_herdr-tools_herdr__herdr_inspect
   disallowedTools:
     - NotebookEdit
     - Task

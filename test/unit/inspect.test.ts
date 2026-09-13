@@ -125,6 +125,47 @@ describe("herdr_inspect", () => {
     expect(result.details).toMatchObject({ context: { injected: { workspaceId: "stale-workspace", tabId: "stale-tab", paneId: "w1:p1" }, effective: context, rebound: true, attempts: 1 } });
   });
 
+  it("reports bounded, token-free caller-policy evidence in context mode", async () => {
+    const callerSession = { source: "herdr:devin", agent: "devin", kind: "id", value: "session-worker" };
+    const workerSnapshot: HerdrSnapshot = {
+      ...snapshot,
+      panes: [
+        { ...snapshot.panes[0]!, agent_session: callerSession, tokens: { identity_provenance: "launched", identity_actor: "w1:pM", identity_session: "session-worker" } },
+        { pane_id: "w1:pM", tab_id: "w1:t1", workspace_id: "w1", label: "manager", agent_status: "idle" }
+      ],
+      agents: [
+        { pane_id: "w1:p1", name: "caller", agent_status: "idle", agent_session: callerSession },
+        { pane_id: "w1:pM", name: "manager", agent_status: "idle" }
+      ]
+    };
+    const worker = await execute(makeCli(undefined, workerSnapshot).cli, { mode: "context" });
+    expect(worker.details).toMatchObject({ callerPolicy: { scope: "worker", basis: "launched_leaf", replyPaneId: "w1:pM" } });
+    const policyEvidence = JSON.stringify((worker.details as { callerPolicy: unknown }).callerPolicy);
+    expect(policyEvidence).not.toContain("identity_");
+    expect(policyEvidence).not.toContain("session-worker");
+    expect(policyEvidence).not.toContain("tokens");
+
+    const unrestricted = await execute(makeCli().cli, { mode: "context" });
+    expect(unrestricted.details).toMatchObject({ callerPolicy: { scope: "unrestricted", basis: "unmarked" } });
+
+    const managerSnapshot: HerdrSnapshot = {
+      ...workerSnapshot,
+      panes: [...workerSnapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "scout", agent_status: "idle", tokens: { identity_provenance: "launched", identity_actor: "w1:p1", identity_session: "session-child" } }]
+    };
+    const manager = await execute(makeCli(undefined, managerSnapshot).cli, { mode: "context" });
+    expect(manager.details).toMatchObject({ callerPolicy: { scope: "unrestricted", basis: "manages_children", replyPaneId: "w1:pM" } });
+  });
+
+  it("keeps context inspection usable when caller-policy evidence is malformed", async () => {
+    const broken: HerdrSnapshot = {
+      ...snapshot,
+      panes: [{ ...snapshot.panes[0]!, tokens: { identity_provenance: "launched" } }],
+      agents: [{ pane_id: "w1:p1", name: "caller", agent_status: "idle", tokens: { identity_provenance: "adopted" } }]
+    };
+    const result = await execute(makeCli(undefined, broken).cli, { mode: "context" });
+    expect(result.details).toMatchObject({ kind: "target", callerPolicy: { scope: "unavailable", code: "CALLER_POLICY_UNAVAILABLE" } });
+  });
+
   it("returns compact collections without reading transcripts", async () => {
     const { cli, calls } = makeCli();
     const result = await execute(cli, { mode: "collection", collection: "panes" });

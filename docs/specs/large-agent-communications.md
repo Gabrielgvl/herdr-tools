@@ -213,7 +213,9 @@ Rules:
   text reaches a header line, so the existing single-line normalization guarantee
   against field injection is preserved.
 - `kind` keeps its current meaning: `assignment` for `herdr_launch.assignment`,
-  `prompt` or `steer` for `herdr_communicate`.
+  `prompt` or `steer` for `herdr_communicate`, plus `result` when a
+  `herdr_communicate` caller explicitly sets `kind: "result"` on a `prompt` or
+  `steer` text send (ADR-030 worker-reply contract).
 - The attachment route sends no sender-authored text inline. An optional bounded
   inline preface is deferred.
 - Callers cannot set, suppress, or reorder any header line.
@@ -349,12 +351,22 @@ before every attachment send.
 ### `herdr_communicate`
 
 ```text
-{ target: TargetRef, operation: "prompt", text: string, delivery?: "inline" | "attachment" }
-{ target: TargetRef, operation: "steer",  text: string, delivery?: "inline" | "attachment" }
+{ target: TargetRef, operation: "prompt", text: string, delivery?: "inline" | "attachment", kind?: "result" }
+{ target: TargetRef, operation: "steer",  text: string, delivery?: "inline" | "attachment", kind?: "result" }
 { target: TargetRef, operation: "keys",   keys: NamedKey[] }
 ```
 
-- `delivery` defaults to `inline`. `keys` rejects `delivery` as an unknown field.
+- `delivery` defaults to `inline`. `keys` rejects `delivery` and `kind` as unknown
+  fields.
+- `kind` is optional on `prompt` and `steer` only; `"result"` is the sole accepted
+  value (ADR-030). Omitting `kind` keeps the operation-derived `prompt`/`steer`
+  envelope kind byte-identical; sending `kind: "result"` stamps that kind on the
+  v1 envelope while the operation and route stay unchanged — a result sent over
+  `steer` still reports `steer_direct`. The `cancel`/`interrupt` turn-control
+  variants reject `kind` outright. These are schema rules, and the same checks
+  are re-run inside `execute` for unvalidated callers: a stray `kind` on `keys`
+  or a non-`"result"` value on a text send fails `INVALID_INPUT` before any
+  preflight.
 - `text` must be non-empty and NUL-free; a NUL is `INVALID_INPUT`.
 - Existing behaviour is otherwise unchanged: sequential execution, fresh snapshot,
   sender resolution, self-target rejection, `TARGET_BUSY` for a working `prompt`,
@@ -377,7 +389,7 @@ before every attachment send.
   recipientPaneId }`. It never contains the body, and no existing field is removed.
 - The route is established before any precondition, and one body-free wrapper adds it to
   every failure. A failure keeps its typed code and gains `delivery` and `phase`
-  (`validate`, `resolve_target`, `verify_recipient`, `pre_state`, `publish`, `send`, or
+  (`validate`, `resolve_target`, `caller_policy`, `verify_recipient`, `pre_state`, `publish`, `send`, or
   `post_state`), plus `route` once the operation is known. `SELF_TARGET_REJECTED`,
   `TARGET_BUSY`, `KEY_REJECTED`, `ATTACHMENT_TARGET_UNVERIFIED`, and oversize refusals
   therefore all name the requested route. When the attachment was already published, the

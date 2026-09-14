@@ -229,6 +229,50 @@ describe("herdr_communicate", () => {
     expect(harness.prompt).not.toHaveBeenCalled();
   });
 
+  it("lazily adopts a detected unnamed pi target before prompting", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    let adopted = false;
+    const renameCalls: string[][] = [];
+    const unnamedAgent = { pane_id: "w1:p2", agent_id: "agent-7", agent_status: "idle", agent: "pi", ...targetIdentity };
+    const agent = () => adopted ? { ...unnamedAgent, name: "pi-w1p2" } : unnamedAgent;
+    const pane = () => adopted ? { ...basePane, agent_name: "pi-w1p2" } : basePane;
+    harness.cli.runJson = vi.fn(async (argv, signal, preserve) => {
+      const key = argv.join(" ");
+      if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, pane()], agents: [baseSnapshot.agents[0]!, agent()] } } };
+      if (key.startsWith("agent get")) return { id: "agent-get", result: { agent: agent() } };
+      if (key.startsWith("pane get")) return { id: "pane-get", result: { pane: pane() } };
+      if (key.startsWith("agent rename")) { renameCalls.push(argv); adopted = true; return { id: "rename", result: { type: "agent_info", agent: { ...unnamedAgent, name: argv[3] } } }; }
+      if (key.startsWith("pane report-metadata")) return { id: "meta", result: { ok: true } };
+      return base.call(harness.cli, argv, signal, preserve);
+    });
+    harness.prompt.mockImplementation(async (_target, input) => {
+      harness.promptInputs.push(input);
+      return { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { ...agent(), agent_status: "working", interactive_ready: true, revision: 3 } } };
+    });
+    const result = await execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" });
+    expect(renameCalls).toEqual([["agent", "rename", "w1:p2", "pi-w1p2"]]);
+    expect(harness.promptInputs).toEqual([senderEnvelope("prompt", "hello")]);
+    expect(result.details).toMatchObject({ operation: "prompt", submission: { confirmed: true } });
+  });
+
+  it("still fails closed when a detected target misses identity fields beyond the name", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    const unnamedAgent = { pane_id: "w1:p2", agent_id: "agent-7", agent_status: "idle", agent: "pi", terminal_id: "term-reviewer" };
+    const unnamedPane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "reviewer", agent_id: "agent-7", agent_status: "idle", agent: "pi", terminal_id: "term-reviewer" };
+    harness.cli.runJson = vi.fn(async (argv, signal, preserve) => {
+      const key = argv.join(" ");
+      if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, unnamedPane], agents: [baseSnapshot.agents[0]!, unnamedAgent] } } };
+      if (key.startsWith("agent get")) return { id: "agent-get", result: { agent: unnamedAgent } };
+      if (key.startsWith("pane get")) return { id: "pane-get", result: { pane: unnamedPane } };
+      return base.call(harness.cli, argv, signal, preserve);
+    });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "must not send" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    expect(harness.calls.some((argv) => argv[0] === "agent" && argv[1] === "rename")).toBe(false);
+    expect(harness.prompt).not.toHaveBeenCalled();
+  });
+
   it("prompts idle directly and returns bounded operation IDs and states", async () => {
     const harness = makeCli();
     const result = await execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" });

@@ -10,13 +10,13 @@
 import { boundedText, type JobDetail } from "../job-registry.js";
 import { notificationForJob } from "../job-notification.js";
 import { resolveEffectiveContext } from "../context.js";
-import { AdoptError, mintAgentName, nameOnlyGap, selfNameCandidates, writeIdentityProvenance, type AdoptOutcome } from "../agent-identity.js";
+import { adoptUnnamedTarget, LAZY_ADOPT_KINDS, type AdoptOutcome } from "../agent-identity.js";
 import type { JsonEnvelope } from "../cli.js";
 import type { DevinQueueFlush, DevinQueueFlushRequest } from "../messages/devin-queue-flush.js";
 import { agentFrom, assertQualifiedPromptTarget, assertSendableState, paneFrom, snapshotIdentityRecords } from "../messages/prompt-target.js";
-import { parsePromptSubmission, parsePromptTargetIdentityFields, PromptIdentityError, requirePromptTargetIdentity } from "../messages/prompt.js";
+import { parsePromptSubmission, parsePromptTargetIdentityFields, requirePromptTargetIdentity } from "../messages/prompt.js";
 import { buildEnvelope, resolveSender, type ProvenanceKind } from "../provenance.js";
-import { parseSnapshotResult, type CurrentContext } from "../targets.js";
+import type { CurrentContext } from "../targets.js";
 import type { SupervisionEvent } from "./events.js";
 
 export const SUPERVISION_WAKE_CONTENT_BYTES = 4_000;
@@ -138,7 +138,7 @@ const PROMPT_WAKE_KINDS = new Set(["devin", "pi"]);
  * reachability that policy has only granted these three; an unsupported kind
  * such as `agy` stays inert.
  */
-const SELF_ADOPT_KINDS = new Set(["devin", "pi", "claude"]);
+const SELF_ADOPT_KINDS = LAZY_ADOPT_KINDS;
 const WAKE_PIPELINE_TIMEOUT_MS = 15_000;
 
 export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
@@ -191,32 +191,7 @@ export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
    */
   const attemptSelfName = async (paneId: string, kind: string, signal: AbortSignal): Promise<AdoptOutcome> => {
     try {
-      const snapshot = parseSnapshotResult((await deps.cli.runJson(["api", "snapshot"], signal)).result);
-      const agentEnvelope = await deps.cli.runJson(["agent", "get", paneId], signal);
-      const paneEnvelope = await deps.cli.runJson(["pane", "get", paneId], signal);
-      const records = [...snapshotIdentityRecords(snapshot, paneId), agentFrom(agentEnvelope.result), paneFrom(paneEnvelope.result, paneId)];
-      const gap = nameOnlyGap(records, paneId);
-      if (gap !== "ready") return gap === "named" ? "named" : "unqualified";
-      const candidates = selfNameCandidates(kind, paneId);
-      if (candidates === undefined) return "refused";
-      for (const candidate of candidates) {
-        try {
-          const minted = await mintAgentName(deps.cli, paneId, candidate, signal);
-          const identity = requirePromptTargetIdentity([...records, minted], paneId);
-          if (identity.agentName !== candidate) {
-            throw new PromptIdentityError("TARGET_IDENTITY_CHANGED", "the adopted name did not bind to the verified identity", {
-              expectedAgentName: candidate,
-              actualAgentName: identity.agentName
-            });
-          }
-          await writeIdentityProvenance(deps.cli, paneId, "adopted", paneId, identity.agentSession, signal);
-          return "named";
-        } catch (error) {
-          if (error instanceof AdoptError && error.code === "AGENT_NAME_TAKEN") continue;
-          throw error;
-        }
-      }
-      return "refused";
+      return (await adoptUnnamedTarget(deps.cli, paneId, kind, paneId, signal)).outcome;
     } catch {
       return "unqualified";
     }

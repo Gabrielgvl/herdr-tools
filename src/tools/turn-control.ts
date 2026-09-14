@@ -1,8 +1,9 @@
 import type { HerdrCli } from "../cli.js";
+import { adoptUnnamedTarget, LAZY_ADOPT_KINDS, nameOnlyGap } from "../agent-identity.js";
 import { assertControlScope, CallerPolicyError, classifyCaller } from "../caller-policy.js";
 import { contextRebindingDetails, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { formatResult } from "../tui.js";
-import { joinPromptTargetIdentity, type PromptIdentityError, type PromptTargetIdentity } from "../messages/prompt.js";
+import { joinPromptTargetIdentity, parsePromptTargetIdentityFields, type PromptIdentityError, type PromptTargetIdentity } from "../messages/prompt.js";
 import { parseSnapshotResult, resolveTarget, type CurrentContext, type HerdrSnapshot, type ResolvedTarget } from "../targets.js";
 import type { TurnControlOperation } from "../schemas.js";
 
@@ -712,8 +713,21 @@ export async function executeTurnControl(
     }
     const snapshotRecords = requireSnapshotTargetRecords(snapshot, resolved.paneId!, "pre_state");
 
+    // Lazy target adoption (ADR-028): a detected pane whose only missing join
+    // field is the agent name gets a derived name minted before the control
+    // fails closed. The minted record satisfies this join; the fresh agent
+    // re-read below sees the name natively.
+    const turnRecords = [snapshotRecords.pane, snapshotRecords.agent];
+    if (nameOnlyGap(turnRecords, resolved.paneId!) === "ready") {
+      const targetKind = turnRecords.map((value) => parsePromptTargetIdentityFields(value, resolved.paneId).agentKind).find((kind) => kind !== undefined);
+      if (targetKind !== undefined && LAZY_ADOPT_KINDS.has(targetKind)) {
+        const adopted = await adoptUnnamedTarget(deps.cli, resolved.paneId!, targetKind, effective.context.paneId, signal);
+        if (adopted.minted !== undefined) turnRecords.push(adopted.minted);
+      }
+    }
+
     phase = "pre_state";
-    const snapshotIdentity = joinTurnIdentity([snapshotRecords.pane, snapshotRecords.agent], resolved.paneId!, phase);
+    const snapshotIdentity = joinTurnIdentity(turnRecords, resolved.paneId!, phase);
     requireWorking(snapshotRecords.pane, phase);
     requireWorking(snapshotRecords.agent, phase);
     preEvidence = mergeEvidence([snapshotRecords.pane, snapshotRecords.agent]);

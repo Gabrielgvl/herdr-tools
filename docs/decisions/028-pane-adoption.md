@@ -85,6 +85,44 @@ operators and inspectors only. They are never consulted for authorization,
 identity verification, or delivery qualification, and a failed write degrades
 to a `provenanceWarning` detail rather than failing the adopt or launch.
 
+### Lazy target adoption in the typed tools
+
+The same name-only gap also blocked the *target* side: `herdr_communicate`
+prompt/steer, turn-control cancel/interrupt, and strict `herdr_wait` bindings
+all failed closed on a detected pane that was otherwise fully identified but
+unnamed. The wake's self-adopt rule is therefore generalized into
+`adoptUnnamedTarget` in `src/agent-identity.ts` — the wake path now consumes
+it too, so the mint-verify-stamp sequence exists exactly once.
+
+Before each consumer's strict identity join, the caller evaluates
+`nameOnlyGap` on its fresh target records. Only when the gap is `ready` —
+the agent name is the sole missing join field — and the joined agent kind is
+in `LAZY_ADOPT_KINDS` (`{devin, pi, claude}`, the same allowlist as
+self-adopt) does the tool attempt adoption. The helper re-reads the snapshot
+plus `agent get`/`pane get` so a stale caller snapshot cannot mint on
+outdated evidence, mints the first free derived name, verifies the post-mint
+identity through the standard join, then stamps advisory provenance with the
+acting pane as `identity_actor`. The minted acknowledgement record is
+appended to the caller's record set so the pending join sees the name;
+every subsequent fresh read observes it natively.
+
+Ordering is load-bearing: `herdr_communicate` runs the cooperative caller
+policy (`assertSendScope`) and turn-control runs `assertControlScope` before
+the adopt attempt, so a denied caller never mutates the registry, and
+`assertQualifiedPromptTarget` still rejects unqualified kinds (e.g. `agy`)
+before the gap check. An adopt attempt that fails or finds the gap is not
+name-only falls through to the canonical `TARGET_IDENTITY_UNAVAILABLE` /
+`TARGET_IDENTITY_CHANGED` refusal — adoption can widen reachability, never
+weaken the join.
+
+This is a cooperative registry mutation performed on a send/wait/control
+operation: the first inbound call to a detected pane names it. The derived
+name is deterministic (`<kind>-<paneId>`), the rename is verified before
+bytes or keys are sent, and the provenance stamp records which pane caused
+the naming — the same evidence shape an explicit `herdr_pane adopt` would
+produce. If upstream Herdr ever names panes at detection time, this path
+becomes a no-op: `nameOnlyGap` reports `named` and no rename is issued.
+
 ### Detection-based acknowledgement proof
 
 `parsePromptSubmission` now requires interactivity proof, not the specific
@@ -115,8 +153,12 @@ could report delivered without a live agent.
 
 ## Consequences
 
-- Detected panes become first-class prompt/wake targets after a verified
-  name binding; nothing about the identity join itself is weakened.
+- Detected panes become first-class prompt/wake/wait/control targets after a
+  verified name binding; nothing about the identity join itself is weakened.
+- The first typed inbound call to an unnamed detected pane performs a
+  registry mutation (derived-name mint). It is deterministic, verified, and
+  provenance-stamped, but it is a side effect on a nominally read-then-send
+  operation; operators should know a prompt can name a pane.
 - `herdr_pane` now mutates the agent-name registry, not only topology.
 - Operators can distinguish launched from adopted panes in pane metadata,
   but must not build policy on those tokens.
@@ -127,6 +169,8 @@ could report delivered without a live agent.
   label. Labels are UI furniture; agent names are routing identity. Keeping
   them independent preserves the evidence that the pane was detected, not
   launched, and avoids two names drifting apart.
-- **Kind gate for lazy self-adopt.** Restricted to `{devin, pi, claude}` —
+- **Kind gate for lazy adoption.** Restricted to `{devin, pi, claude}` —
   exactly the kinds policy qualifies for typed inbound delivery. `agy` and future unknown kinds
   stay unnamed and inert rather than acquiring a name with no delivery path.
+  The allowlist is shared (`LAZY_ADOPT_KINDS`) by self-adopt and target-side
+  adopt so the gate cannot drift.

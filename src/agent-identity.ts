@@ -296,6 +296,62 @@ export async function adoptAgentIdentity(
 }
 
 /**
+ * Kinds that may receive a lazily minted name: exactly the kinds policy
+ * qualifies for typed inbound delivery. Explicitly allowlisted — never
+ * "not agy" — so unknown kinds stay inert rather than acquiring routing names.
+ */
+export const LAZY_ADOPT_KINDS: ReadonlySet<string> = new Set(["devin", "pi", "claude"]);
+
+export interface LazyAdoptResult {
+  outcome: AdoptOutcome;
+  /** The acknowledged agent record carrying the minted name; safe to append to a pre-mint record set so the join sees the name. */
+  minted?: Record<string, unknown>;
+}
+
+/**
+ * Lazy target adoption shared by tool call sites that hit a name-only identity
+ * gap on a detected pane (ADR-028). Re-reads the authoritative records so a
+ * stale caller snapshot cannot mint on outdated evidence, mints the first
+ * available derived name, verifies through the real join, then stamps advisory
+ * provenance attributed to the acting pane. Returns `minted` only when the
+ * post-mint identity verified; callers append it to their record set.
+ */
+export async function adoptUnnamedTarget(
+  cli: AdoptIdentityCli,
+  paneId: string,
+  kind: string,
+  actorPaneId: string | undefined,
+  signal: AbortSignal
+): Promise<LazyAdoptResult> {
+  const snapshot = parseSnapshotResult((await cli.runJson(["api", "snapshot"], signal)).result);
+  const agentEnvelope = await cli.runJson(["agent", "get", paneId], signal);
+  const paneEnvelope = await cli.runJson(["pane", "get", paneId], signal);
+  const records = [...snapshotIdentityRecords(snapshot, paneId), agentFrom(agentEnvelope.result), paneFrom(paneEnvelope.result, paneId)];
+  const gap = nameOnlyGap(records, paneId);
+  if (gap !== "ready") return { outcome: gap === "named" ? "named" : "unqualified" };
+  const candidates = selfNameCandidates(kind, paneId);
+  if (candidates === undefined) return { outcome: "refused" };
+  for (const candidate of candidates) {
+    try {
+      const minted = await mintAgentName(cli, paneId, candidate, signal);
+      const identity = requirePromptTargetIdentity([...records, minted], paneId);
+      if (identity.agentName !== candidate) {
+        throw new PromptIdentityError("TARGET_IDENTITY_CHANGED", "the adopted name did not bind to the verified identity", {
+          expectedAgentName: candidate,
+          actualAgentName: identity.agentName
+        });
+      }
+      await writeIdentityProvenance(cli, paneId, "adopted", actorPaneId, identity.agentSession, signal);
+      return { outcome: "named", minted };
+    } catch (error) {
+      if (error instanceof AdoptError && error.code === "AGENT_NAME_TAKEN") continue;
+      throw error;
+    }
+  }
+  return { outcome: "refused" };
+}
+
+/**
  * Derived self-adoption names: `<kind>-<normalized paneId>` (e.g. `devin-w6p1y`),
  * truncated so the whole `-N` suffix range still fits the 32-char grammar.
  * Returns every candidate in mint order — base first, then `-2` … `-9`.

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   adoptAgentIdentity,
   adoptTargetPreconditions,
+  adoptUnnamedTarget,
   assertAgentName,
   isAgentName,
   mintAgentName,
@@ -320,5 +321,87 @@ describe("adoptAgentIdentity", () => {
     const outcome = await adoptAgentIdentity(cli, snapshot(), "w6:p1y", "devin-w6p1y", "w1:p1", signal);
     expect(outcome.provenanceWarning).toBe("metadata read-only");
     expect(outcome.agentName).toBe("devin-w6p1y");
+  });
+});
+
+describe("adoptUnnamedTarget", () => {
+  const unnamedOptions = (overrides: Parameters<typeof mockCli>[0] = {}) => ({
+    postSnapshot: snapshot({ panes: [paneRecord()], agents: [agentRecord()] }),
+    agentGet: { agent: agentRecord() },
+    paneGet: { pane: paneRecord() },
+    ...overrides
+  });
+
+  it("mints a derived name on a name-only gap and stamps provenance", async () => {
+    const cli = mockCli(unnamedOptions());
+    const result = await adoptUnnamedTarget(cli, "w6:p1y", "devin", "w1:p1", signal);
+    expect(result.outcome).toBe("named");
+    expect(result.minted).toMatchObject({ name: "devin-w6p1y" });
+    expect(cli.renames).toEqual([["agent", "rename", "w6:p1y", "devin-w6p1y"]]);
+    expect(cli.calls.some((argv) => argv[0] === "pane" && argv[1] === "report-metadata")).toBe(true);
+  });
+
+  it("does not rename when the pane is already named", async () => {
+    const cli = mockCli();
+    const result = await adoptUnnamedTarget(cli, "w6:p1y", "devin", "w1:p1", signal);
+    expect(result).toEqual({ outcome: "named" });
+    expect(cli.renames).toEqual([]);
+  });
+
+  it.each([
+    ["missing session", {
+      postSnapshot: snapshot({ panes: [paneRecord({ agent_session: undefined })], agents: [agentRecord({ agent_session: undefined })] }),
+      agentGet: { agent: agentRecord({ agent_session: undefined }) },
+      paneGet: { pane: paneRecord({ agent_session: undefined }) }
+    }],
+    ["missing terminal", {
+      postSnapshot: snapshot({ panes: [paneRecord({ terminal_id: undefined })], agents: [agentRecord({ terminal_id: undefined })] }),
+      agentGet: { agent: agentRecord({ terminal_id: undefined }) },
+      paneGet: { pane: paneRecord({ terminal_id: undefined }) }
+    }],
+    ["contradictory sessions", {
+      postSnapshot: snapshot({ panes: [paneRecord()], agents: [agentRecord({ agent_session: { ...session, value: "other" } })] }),
+      agentGet: { agent: agentRecord({ agent_session: { ...session, value: "other" } }) },
+      paneGet: { pane: paneRecord() }
+    }]
+  ])("refuses without a rename when another join field is missing or contradictory (%s)", async (_label, overrides) => {
+    const cli = mockCli(unnamedOptions(overrides));
+    const result = await adoptUnnamedTarget(cli, "w6:p1y", "devin", "w1:p1", signal);
+    expect(result.outcome).toBe("unqualified");
+    expect(cli.renames).toEqual([]);
+  });
+
+  it("advances to the next candidate on name collision", async () => {
+    const cli = mockCli(unnamedOptions());
+    const inner = cli.runJson;
+    let renameAttempts = 0;
+    cli.runJson = vi.fn(async (argv: string[], callSignal: AbortSignal) => {
+      if (argv.join(" ").startsWith("agent rename") && renameAttempts++ === 0) throw herdrError("agent_name_taken");
+      return inner(argv, callSignal);
+    });
+    const result = await adoptUnnamedTarget(cli, "w6:p1y", "devin", "w1:p1", signal);
+    expect(result.outcome).toBe("named");
+    expect(result.minted).toMatchObject({ name: "devin-w6p1y-2" });
+    expect(renameAttempts).toBe(2);
+  });
+
+  it("refuses when no derivable name exists", async () => {
+    const cli = mockCli(unnamedOptions());
+    const result = await adoptUnnamedTarget(cli, "w6:p1y", "9lives", "w1:p1", signal);
+    expect(result.outcome).toBe("refused");
+    expect(cli.renames).toEqual([]);
+  });
+
+  it("propagates post-mint identity contradictions rather than masking them", async () => {
+    const cli = mockCli(unnamedOptions());
+    const inner = cli.runJson;
+    cli.runJson = vi.fn(async (argv: string[], callSignal: AbortSignal) => {
+      if (argv.join(" ").startsWith("agent rename")) {
+        cli.renames.push(argv);
+        return { id: "rename", result: { type: "agent_info", agent: { ...agentRecord(), name: argv[3], agent_session: { ...session, value: "rotated" } } } };
+      }
+      return inner(argv, callSignal);
+    });
+    await expect(adoptUnnamedTarget(cli, "w6:p1y", "devin", "w1:p1", signal)).rejects.toMatchObject({ code: "TARGET_IDENTITY_CHANGED" });
   });
 });

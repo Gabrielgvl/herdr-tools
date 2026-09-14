@@ -1,13 +1,14 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli, JsonEnvelope } from "../cli.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
+import { adoptUnnamedTarget, LAZY_ADOPT_KINDS, nameOnlyGap } from "../agent-identity.js";
 import { assertControlScope, assertSendScope, classifyCaller } from "../caller-policy.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { queueFlushEligible, type DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
-import { classifyPromptObservation, compactPromptSubmission, requirePromptTargetIdentity, parsePromptSubmission, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
+import { classifyPromptObservation, compactPromptSubmission, requirePromptTargetIdentity, parsePromptSubmission, parsePromptTargetIdentityFields, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { agentFrom, assertQualifiedPromptTarget, assertSendableState, compactPane, paneFrom, snapshotIdentityRecords, stateOf, type CommunicateState } from "../messages/prompt-target.js";
 import type { AttachmentStore, PublishedAttachment } from "../messages/store.js";
 import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
@@ -196,6 +197,17 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             before
           ];
           assertQualifiedPromptTarget(preIdentityRecords, target.paneId!);
+          // Lazy target adoption (ADR-028): a detected pane whose only missing
+          // join field is the agent name gets a derived name minted before the
+          // send fails closed. The minted record satisfies this join; fresh
+          // re-reads in verifyFreshPromptTarget see the name natively.
+          if (nameOnlyGap(preIdentityRecords, target.paneId!) === "ready") {
+            const targetKind = preIdentityRecords.map((value) => parsePromptTargetIdentityFields(value, target.paneId).agentKind).find((kind) => kind !== undefined);
+            if (targetKind !== undefined && LAZY_ADOPT_KINDS.has(targetKind)) {
+              const adopted = await adoptUnnamedTarget(deps.cli, target.paneId!, targetKind, effective.context.paneId, activeSignal);
+              if (adopted.minted !== undefined) preIdentityRecords.push(adopted.minted);
+            }
+          }
           promptIdentity = requirePromptTargetIdentity(preIdentityRecords, target.paneId!);
         }
 

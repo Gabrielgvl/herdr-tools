@@ -1,8 +1,10 @@
 import RE2 from "re2";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CliTextResult, HerdrCli, JsonEnvelope } from "../cli.js";
+import { adoptUnnamedTarget, LAZY_ADOPT_KINDS, nameOnlyGap } from "../agent-identity.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import { loadSettings, type Settings } from "../settings.js";
+import { parsePromptTargetIdentityFields } from "../messages/prompt.js";
 import { resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { createPiModelReviewer, ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
 import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams, type WaitRawState, type WaitSemanticState } from "../wait-schema.js";
@@ -953,18 +955,32 @@ export async function prepareWait(deps: WaitDependencies, rawParams: unknown, si
   const effective = await contextResolver(signal);
   const initial = effective.snapshot;
   const requireIdentity = deps.requireTargetIdentity === true || (deps.cli as WaitCli).supportsNativeAgentWait === true;
-  const resolved = params.targets.map((ref) => {
+  const resolved = [];
+  for (const ref of params.targets) {
     const target = resolveTarget(initial, ref, "agent", effective.context);
     const paneId = target.paneId!;
-    const records = [target.record, ...initial.agents.filter((agent) => agent.pane_id === paneId)];
-    const identity = requireIdentity ? waitIdentity(records, paneId) : undefined;
-    return {
+    const records: Record<string, unknown>[] = [target.record, ...initial.agents.filter((agent) => agent.pane_id === paneId)];
+    let identity: WaitTargetIdentity | undefined;
+    if (requireIdentity) {
+      // Lazy target adoption (ADR-028): a detected pane whose only missing
+      // join field is the agent name gets a derived name minted before the
+      // wait binding fails closed; later identity reads see it natively.
+      if (nameOnlyGap(records, paneId) === "ready") {
+        const targetKind = records.map((value) => parsePromptTargetIdentityFields(value, paneId).agentKind).find((kind) => kind !== undefined);
+        if (targetKind !== undefined && LAZY_ADOPT_KINDS.has(targetKind)) {
+          const adopted = await adoptUnnamedTarget(deps.cli, paneId, targetKind, effective.context.paneId, signal);
+          if (adopted.minted !== undefined) records.push(adopted.minted);
+        }
+      }
+      identity = waitIdentity(records, paneId);
+    }
+    resolved.push({
       ref,
       target,
       targetGenerationRef: createTargetGenerationRef(deps.targetGenerationRefFactory),
       ...(identity ? { identity } : {})
-    };
-  });
+    });
+  }
   const ids = new Set<string>();
   for (const item of resolved) {
     if (ids.has(item.target.id)) throw new WaitError("INVALID_INPUT", "INVALID_INPUT: target references resolve to the same resource", { targetId: item.target.id });

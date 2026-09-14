@@ -15,7 +15,7 @@ const types = (wakes: SupervisionWake[]): string[] => wakes.map((wake) => wake.e
 
 const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
-const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "max" as const };
+const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "low" as const };
 
 const request: SupervisorJobRequestSnapshot = {
   kind: "supervisor",

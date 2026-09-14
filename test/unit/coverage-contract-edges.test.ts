@@ -18,7 +18,7 @@ const waitRequest: JobRequestSnapshot = {
   match: "any",
   condition: { kind: "state", state: "done" },
   timeoutMs: 1_000,
-  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" },
+  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" },
 };
 
 const supervisorRequest: SupervisorJobRequestSnapshot = {

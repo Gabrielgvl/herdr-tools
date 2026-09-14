@@ -6,7 +6,7 @@ const request: JobRequestSnapshot = {
   kind: "wait",
   label: "wait for worker",
   targets: ["worker"], targetIds: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 10,
-  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" }
+  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }
 };
 
 function registry() {

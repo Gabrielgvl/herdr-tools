@@ -42,7 +42,7 @@ function waitDetail(overrides: Partial<JobDetail> = {}): JobDetail {
       match: "any",
       condition: { kind: "state", state: "done" },
       timeoutMs: 1,
-      settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" },
+      settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" },
     },
     result: { wait_result: "condition_met", matched: true, reason: "condition_met", matchedTargets: [{ target: "worker", targetId: "w1:p2" }] },
     ...overrides,

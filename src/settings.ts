@@ -12,13 +12,13 @@ export interface SettingsFile {
 export interface Settings {
   reviewCadenceMinutes: number;
   reviewerModel: string;
-  reviewerThinking: "max";
+  reviewerThinking: "low";
 }
 
 export const DEFAULT_SETTINGS: Settings = Object.freeze({
   reviewCadenceMinutes: 5,
-  reviewerModel: "openai-codex/gpt-5.6-luna",
-  reviewerThinking: "max"
+  reviewerModel: "openai-codex/gpt-5.6-sol",
+  reviewerThinking: "low"
 });
 
 export class SettingsError extends Error {
@@ -55,7 +55,7 @@ function parseSettings(value: unknown): Settings {
   if (typeof model !== "string" || model.trim() === "" || model !== model.trim() || !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(model)) {
     throw new SettingsError("wait.reviewerModel must be a non-empty model identifier");
   }
-  return { reviewCadenceMinutes: cadence as number, reviewerModel: model, reviewerThinking: "max" };
+  return { reviewCadenceMinutes: cadence as number, reviewerModel: model, reviewerThinking: "low" };
 }
 
 export async function loadSettings(io: Partial<SettingsIo> = {}): Promise<Settings> {

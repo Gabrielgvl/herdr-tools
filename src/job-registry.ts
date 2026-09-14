@@ -91,7 +91,7 @@ export interface WaitJobRequestSnapshot extends JobRequestCommon {
   settings: {
     reviewCadenceMinutes: number;
     reviewerModel: string;
-    reviewerThinking: "max";
+    reviewerThinking: "low";
   };
 }
 

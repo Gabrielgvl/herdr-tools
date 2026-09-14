@@ -232,8 +232,8 @@ A wait whose timeout is longer than the configured review cadence is a long wait
 
 Long waits use mandatory in-process, tool-less reviewer calls only for targets without active exact-child supervision:
 
-- The reviewer model is the extension-owned setting from `config.json`, default `openai-codex/gpt-5.6-luna`; the tool cannot select or override it.
-- Reviewer thinking is fixed at `max`; the tool cannot select or override it.
+- The reviewer model is the extension-owned setting from `config.json`, default `openai-codex/gpt-5.6-sol`; the tool cannot select or override it.
+- Reviewer thinking is fixed at `low`; the tool cannot select or override it.
 - After each latest authoritative target observation and immediately before dispatch, the wait partitions targets between active bound supervisors and the explicit reviewer. A covered target receives no wait-reviewer request. Uncovered targets receive one independent reviewer call each, concurrently, with no target-count cap.
 - Reviewer construction is lazy. An all-covered long wait does not resolve or authenticate the wait reviewer. Native lifecycle waits are still bounded into review windows so authoritative waiting is not bypassed.
 - Reviewer calls are not Herdr panes, are invisible in Herdr topology, receive no tools, and cannot mutate or communicate. A degraded but live supervisor remains the semantic-review owner; the wait reviewer is never a hidden fallback.
@@ -455,14 +455,14 @@ The optional extension-owned `config.json` uses this JSON shape:
 {
   "wait": {
     "reviewCadenceMinutes": 5,
-    "reviewerModel": "openai-codex/gpt-5.6-luna"
+    "reviewerModel": "openai-codex/gpt-5.6-sol"
   }
 }
 ```
 
 - `wait.reviewCadenceMinutes`: integer, default `5`, inclusive range `1..30`.
-- `wait.reviewerModel`: model identifier, default `openai-codex/gpt-5.6-luna`.
-- Reviewer thinking level is fixed to `max` and is not configurable by a tool call.
+- `wait.reviewerModel`: model identifier, default `openai-codex/gpt-5.6-sol`.
+- Reviewer thinking level is fixed to `low` and is not configurable by a tool call.
 - `wait.reviewCadenceMinutes` is shared with the supervision reviewer. `wait.reviewerModel` is wait-only: the supervisor reviewer pins `openai-codex/gpt-5.6-luna` at thinking `max` in code, because it judges a child that has been working continuously with no transition to read.
 
 If `config.json` is absent, use the specified defaults. If it is present but malformed or invalid, fail closed with `INVALID_SETTINGS`; do not coerce values or fall back to defaults or another reviewer model. A configured reviewer model that cannot be resolved or authenticated causes a long wait to fail with `REVIEWER_FAILED`; there is no fallback model.
@@ -722,7 +722,7 @@ The feature is complete only when all of the following are true:
 - Inspection has the specified current, single-target, collection, and health behavior.
 - Communication distinguishes normal prompt, explicit steer, named keys, cancel, and interrupt; normal prompt never interrupts a working target; steer never synthesizes an interrupt; turn control binds one key to one stable working identity and independently verifies the outcome.
 - Wait supports the specified raw/semantic states, literal/regex output, any/all, explicit one-hour maximum, structured timeout snapshots, and long-wait reviewer ownership partitioning.
-- Reviewer calls are in-process, tool-less, concurrent per unsupervised target, bounded, non-mutating, fixed at low thinking, use the extension-owned reviewer model (default `openai-codex/gpt-5.6-luna`), and fail immediately without fallback when unavailable. Active exact supervisors own review for their covered children, and reviewer `unknown` requires a fresh exact working-state proof to be suppressed.
+- Reviewer calls are in-process, tool-less, concurrent per unsupervised target, bounded, non-mutating, fixed at low thinking, use the extension-owned reviewer model (default `openai-codex/gpt-5.6-sol`), and fail immediately without fallback when unavailable. Active exact supervisors own review for their covered children, and reviewer `unknown` requires a fresh exact working-state proof to be suppressed.
 - Launch requires a unique caller name and named profile. Pi and Claude bind exact supervision before focus or assignment. AGY requires a self-contained initial prompt, publishes provisional supervision before its single submission, and strengthens to exact native-session supervision before success, recipient registration, or attachment access. Failed launches are never automatically cleaned.
 - Pane and tab topology operations implement the specified defaults, labels, environment behavior, autonomous exact close, protected ancestors, bounded reconciliation, and authoritative post-state.
 - Results are structured and concise, custom rows are compact, and waits/launches stream progress.

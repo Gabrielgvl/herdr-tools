@@ -258,7 +258,7 @@ describe("the registry's supervision port", () => {
     const registry = new JobRegistry({ idFactory: (() => { let id = 0; return () => `job_${++id}`; })() });
     expect(() => registry.attachSupervision("job_missing", port())).toThrow(/JOB_NOT_FOUND/u);
     const wait = registry.register(
-      { kind: "wait", label: "w", targets: ["a"], targetIds: ["p1"], match: "any", condition: {}, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" } },
+      { kind: "wait", label: "w", targets: ["a"], targetIds: ["p1"], match: "any", condition: {}, timeoutMs: 1, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" } },
       async () => new Promise<never>(() => undefined),
     );
     expect(() => registry.attachSupervision(wait.jobId, port())).toThrow(/JOB_KIND_MISMATCH/u);

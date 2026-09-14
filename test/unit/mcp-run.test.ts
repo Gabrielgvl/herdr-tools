@@ -137,7 +137,7 @@ async function start(overrides: Partial<Parameters<typeof runHerdrMcpServer>[0]>
     exec,
     transport: serverTransport,
     profiles: { load: async () => emptyCatalog },
-    settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "max" }),
+    settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "low" }),
     writeStderr: (line) => errors.push(line),
     exit: (code) => exits.push(code),
     onSignal: (signal) => signals.push(signal),
@@ -308,7 +308,7 @@ describe("MCP server startup", () => {
     const handle = await runHerdrMcpServer({
       env,
       profiles: { load: async () => emptyCatalog },
-      settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "max" }),
+      settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "low" }),
       exit: (code) => exits.push(code)
     });
     expect(handle).toBeDefined();
@@ -456,7 +456,7 @@ describe("MCP tool serving", () => {
 describe("MCP wait and job semantics", () => {
   it("records a reviewer failure in the detached job beyond the review cadence", async () => {
     vi.useFakeTimers();
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" }) });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
@@ -467,7 +467,7 @@ describe("MCP wait and job semantics", () => {
 
   it("registers a detached wait that is polled through herdr_jobs and fails closed beyond the cadence", async () => {
     vi.useFakeTimers();
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" }) });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
     const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(detached.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
@@ -485,7 +485,7 @@ describe("MCP wait and job semantics", () => {
   });
 
   it("detaches a wait within the cadence without starting a reviewer", async () => {
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" }) });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;

@@ -41,6 +41,16 @@ function highestBlocker(catalog: ProfileCatalog, name: string, value: Profile | 
   return blockers[0];
 }
 
+function invalidCandidateMessage(name: string, scope: ProfileSourceKind | undefined): string {
+  // "Higher-precedence" is only accurate for user/project scopes — an invalid
+  // bundled candidate is the *lowest* tier, and the flat wording sent a stale
+  // host build (old parser rejecting a newer bundled schema) hunting for a
+  // shadow file that never existed.
+  if (scope === "bundled") return `Profile ${name} is blocked by an invalid bundled candidate`;
+  if (scope === undefined) return `Profile ${name} is blocked by an invalid candidate`;
+  return `Profile ${name} is blocked by an invalid higher-precedence ${scope} candidate`;
+}
+
 function profile(catalog: ProfileCatalog, name: string): Profile {
   const value = catalog.effective.get(name);
   if (RESERVED_BUNDLED_PROFILE_NAMES.has(name)) {
@@ -48,12 +58,15 @@ function profile(catalog: ProfileCatalog, name: string): Profile {
     return value;
   }
   const blocker = highestBlocker(catalog, name, value);
-  if (blocker?.kind === "invalid") throw new ProfileResolutionError(`Profile ${name} is blocked by an invalid higher-precedence candidate`, { name, blocked: true, candidatePath: blocker.candidate.source.path });
+  if (blocker?.kind === "invalid") throw new ProfileResolutionError(invalidCandidateMessage(name, blocker.candidate.source.kind), { name, blocked: true, candidatePath: blocker.candidate.source.path });
   if (blocker?.kind === "unreadable") {
     const message = value ? `Profile ${name} is blocked by unreadable ${blocker.scope} profile scope` : `Profile ${name} cannot be resolved because the ${blocker.scope} profile scope is unreadable`;
     throw new ProfileResolutionError(message, { name, unreadableScope: blocker.scope, blocked: true });
   }
-  if (!value) throw new ProfileResolutionError(catalog.blocked?.has(name) ? `Profile ${name} is blocked by an invalid higher-precedence candidate` : `Unknown profile ${name}`, { name, blocked: catalog.blocked?.has(name) === true });
+  if (!value) {
+    const blocked = catalog.blocked?.has(name) === true;
+    throw new ProfileResolutionError(blocked ? invalidCandidateMessage(name, highestInvalidCandidate(catalog, name)?.source.kind) : `Unknown profile ${name}`, { name, blocked });
+  }
   return value;
 }
 

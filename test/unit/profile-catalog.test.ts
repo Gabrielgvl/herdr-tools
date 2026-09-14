@@ -293,6 +293,12 @@ describe("profile catalog", () => {
     const invalidUser = { name: "worker", source: profileSource("user", "/user/worker.md", "/user"), diagnostic: { code: "INVALID_PROFILE" as const, message: "user invalid" } };
     expect(() => resolveProfile("worker", { effective: new Map([[bundledWorker.name, bundledWorker]]), candidates: [{ name: "worker", profile: bundledWorker, source: bundledWorker.source }, invalidUser], diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "project unreadable", source: profileSource("project", "/project", "/project") }], unreadableScopes: ["project"] })).toThrow(/unreadable project/);
     expect(() => resolveProfile("worker", { effective: new Map(), candidates: [invalidUser], diagnostics: [{ code: "DISCOVERY_ERROR" as const, message: "user unreadable", source: profileSource("user", "/user", "/home") }], unreadableScopes: ["user"] })).toThrow(/invalid higher-precedence/);
+    // An invalid bundled candidate is the lowest tier, not "higher-precedence":
+    // the message names the bundled scope so a stale-parser host is not
+    // mistaken for a shadow file.
+    const invalidBundled = { name: "worker", source: profileSource("bundled", "/bundled/worker.md", "/bundled"), diagnostic: { code: "INVALID_PROFILE" as const, message: "bundled invalid" } };
+    expect(() => resolveProfile("worker", { effective: new Map(), blocked: new Set(["worker"]), candidates: [invalidBundled], diagnostics: [] })).toThrow(/invalid bundled candidate/);
+    expect(() => resolveProfile("worker", { effective: new Map(), candidates: [invalidBundled], diagnostics: [] })).toThrow(/invalid bundled candidate/);
     const shared = new Map([make("root", ["next", "last"]), make("next", ["last"]), make("last", [])].map((item) => [item.name, item] as const));
     expect(resolveProfile("root", { effective: shared, candidates: [], diagnostics: [] }).reachableNames).toEqual(["root", "next", "last"]);
     const fanout = new Map([make("root", ["next", "last", "end", "extra"]), make("next", []), make("last", []), make("end", []), make("extra", [])].map((item) => [item.name, item] as const));

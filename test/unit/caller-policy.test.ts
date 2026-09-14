@@ -62,6 +62,34 @@ describe("classifyCaller", () => {
     expect(policy).toEqual({ callerPaneId: CALLER, scope: "worker", basis: "launched_leaf", binding: { status: "bound", parentPaneId: MANAGER } });
   });
 
+  it("binds a launched worker whose session id exceeds the token length cap", () => {
+    // Pi sessions are file paths longer than the 80-char token cap; the stored
+    // token is the normalized truncation, so the raw session value must be
+    // normalized before comparing or every launched pi worker is session_stale.
+    const longSession = "/home/user/.pi/agent/sessions/--home-user-workspace--/2026-09-12T19-14-47-776Z_01a0970b-2f60-7519-bda4-c6b538c1a470.jsonl";
+    const session = { source: "herdr:pi", agent: "pi", kind: "path", value: longSession };
+    const policy = classifyCaller(
+      snap(
+        [callerPane({ agent_session: session, tokens: { identity_provenance: "launched", identity_actor: MANAGER, identity_session: longSession.slice(0, 80) } }), managerPane()],
+        [callerAgent({ agent_session: session })]
+      ),
+      CALLER
+    );
+    expect(policy).toEqual({ callerPaneId: CALLER, scope: "worker", basis: "launched_leaf", binding: { status: "bound", parentPaneId: MANAGER } });
+  });
+
+  it("still rejects a launched worker whose normalized session does not match the token", () => {
+    const session = { source: "herdr:pi", agent: "pi", kind: "path", value: "/x/".repeat(30) + "current.jsonl" };
+    const policy = classifyCaller(
+      snap(
+        [callerPane({ agent_session: session, tokens: { identity_provenance: "launched", identity_actor: MANAGER, identity_session: "stale-token" } }), managerPane()],
+        [callerAgent({ agent_session: session })]
+      ),
+      CALLER
+    );
+    expect(policy).toMatchObject({ scope: "worker", binding: { status: "unavailable", reason: "session_stale" } });
+  });
+
   it("leaves a launched caller unrestricted once it is the recorded actor of a child", () => {
     const policy = classifyCaller(snap([launchedCaller(), managerPane(), childPane("w1:p2")], [callerAgent({ agent_session: callerSession })]), CALLER);
     expect(policy).toEqual({ callerPaneId: CALLER, scope: "unrestricted", basis: "manages_children", binding: { status: "bound", parentPaneId: MANAGER } });

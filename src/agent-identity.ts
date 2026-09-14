@@ -211,7 +211,8 @@ export async function mintAgentName(cli: AdoptIdentityCli, paneId: string, name:
   return agentFrom(envelope.result);
 }
 
-function tokenValue(value: string): string | undefined {
+/** Identity-token normalization: control/format/surrogate characters stripped, trimmed, 80-char cap. Shared with caller-policy so stored-token comparisons normalize current evidence identically. */
+export function tokenValue(value: string): string | undefined {
   const normalized = value.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, "").trim().slice(0, TOKEN_VALUE_MAX_LENGTH);
   return normalized.length > 0 ? normalized : undefined;
 }

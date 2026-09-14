@@ -1,3 +1,4 @@
+import { tokenValue } from "./agent-identity.js";
 import type { AgentRecord, HerdrSnapshot, PaneRecord } from "./targets.js";
 
 /**
@@ -192,7 +193,10 @@ function workerBinding(snapshot: HerdrSnapshot, callerPaneId: string, records: r
   const current = callerSession(records);
   if (current.state === "contradictory") return unavailable("session_contradictory");
   if (current.state !== "value") return unavailable("session_unverifiable");
-  if (current.value !== token.value) return unavailable("session_stale");
+  // The stored token was normalized at write time (tokenValue strips control
+  // characters and caps at 80 chars), so a long session id — e.g. a Pi session
+  // path — must be normalized identically before comparing.
+  if (tokenValue(current.value) !== token.value) return unavailable("session_stale");
   return { status: "bound", parentPaneId: actor.value };
 }
 

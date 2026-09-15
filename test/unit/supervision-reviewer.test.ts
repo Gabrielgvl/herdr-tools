@@ -2,6 +2,7 @@ import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { ReviewerFailure, type ModelRegistrySeam } from "../../src/reviewer.js";
 import {
+  createBuiltinModelRegistry,
   createBuiltinModelService,
   createRegistryModelService,
   type BuiltinModelsSeam,
@@ -36,6 +37,7 @@ describe("the supervision reviewer model service", () => {
   it("resolves host-independently from the installed built-in catalogue", async () => {
     const models = (found: boolean, auth: unknown): BuiltinModelsSeam => ({
       getModel: () => found ? model : undefined,
+      getModels: () => found ? [model] : [],
       getAuth: async () => auth as never,
     });
     await expect(createBuiltinModelService(models(true, { auth: { apiKey: "k", headers: { a: "b" } } })).resolve("openai-codex/gpt-5.6-luna")).resolves.toEqual({ model, apiKey: "k", headers: { a: "b" } });
@@ -45,6 +47,24 @@ describe("the supervision reviewer model service", () => {
     for (const identifier of ["luna", "/luna", "openai-codex/"]) {
       await expect(createBuiltinModelService(models(true, { auth: {} })).resolve(identifier)).rejects.toThrow(/must be provider\/model/u);
     }
+  });
+
+  it("presents the same catalogue as the wait reviewer's registry seam", async () => {
+    const models = (auth: { auth: { apiKey?: string; headers?: Record<string, string> } } | undefined): BuiltinModelsSeam => ({
+      getModel: (provider, id) => provider === "openai-codex" && id === model.id ? model : undefined,
+      getModels: () => [model],
+      getAuth: async () => auth,
+    });
+    const rejecting = (cause: unknown): BuiltinModelsSeam => ({ ...models(undefined), getAuth: async () => { throw cause; } });
+    const registry = createBuiltinModelRegistry(models({ auth: { apiKey: "k", headers: { a: "b" } } }));
+    expect(registry.find("openai-codex", "gpt-5.6-luna")).toBe(model);
+    expect(registry.find("openai-codex", "other")).toBeUndefined();
+    expect(registry.getAll()).toEqual([model]);
+    await expect(registry.getApiKeyAndHeaders(model)).resolves.toEqual({ ok: true, apiKey: "k", headers: { a: "b" } });
+    await expect(createBuiltinModelRegistry(models({ auth: {} })).getApiKeyAndHeaders(model)).resolves.toEqual({ ok: true });
+    await expect(createBuiltinModelRegistry(models(undefined)).getApiKeyAndHeaders(model)).resolves.toEqual({ ok: false, error: "provider is not authenticated" });
+    await expect(createBuiltinModelRegistry(rejecting(new Error("refresh exploded"))).getApiKeyAndHeaders(model)).resolves.toEqual({ ok: false, error: "refresh exploded" });
+    await expect(createBuiltinModelRegistry(rejecting("string failure")).getApiKeyAndHeaders(model)).resolves.toEqual({ ok: false, error: "string failure" });
   });
 });
 

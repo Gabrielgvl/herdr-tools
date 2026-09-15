@@ -14,6 +14,11 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { modelFor, ReviewerFailure, type ModelRegistrySeam } from "../reviewer.js";
 import { AuthJsonCredentialStore } from "./auth-json-credential-store.js";
 
+/** The builtin catalogue plus `auth.json` credential store both model seams share. */
+export function createBuiltinModels(): BuiltinModelsSeam {
+  return builtinModels({ credentials: new AuthJsonCredentialStore() }) as unknown as BuiltinModelsSeam;
+}
+
 export interface ResolvedSupervisionModel {
   model: Model<Api>;
   apiKey?: string;
@@ -48,9 +53,10 @@ export function createRegistryModelService(registry: ModelRegistrySeam): Supervi
   };
 }
 
-/** The minimal slice of `Models` this service consumes, so it can be tested without network. */
+/** The minimal slice of `Models` these services consume, so they can be tested without network. */
 export interface BuiltinModelsSeam {
   getModel(provider: string, id: string): Model<Api> | undefined;
+  getModels(provider?: string): readonly Model<Api>[];
   getAuth(model: Model<Api>): Promise<{ auth: { apiKey?: string; headers?: Record<string, string> } } | undefined>;
 }
 
@@ -67,7 +73,7 @@ export interface BuiltinModelsSeam {
  * file under its usual lock, so this path both reuses and maintains the host's
  * existing login.
  */
-export function createBuiltinModelService(models: BuiltinModelsSeam = builtinModels({ credentials: new AuthJsonCredentialStore() }) as unknown as BuiltinModelsSeam): SupervisionModelService {
+export function createBuiltinModelService(models: BuiltinModelsSeam = createBuiltinModels()): SupervisionModelService {
   return {
     async resolve(identifier) {
       const { provider, modelId } = splitIdentifier(identifier);
@@ -80,6 +86,33 @@ export function createBuiltinModelService(models: BuiltinModelsSeam = builtinMod
         ...(auth.auth.apiKey === undefined ? {} : { apiKey: auth.auth.apiKey }),
         ...(auth.auth.headers === undefined ? {} : { headers: auth.auth.headers }),
       };
+    },
+  };
+}
+
+/**
+ * The same builtin catalogue presented as the wait reviewer's
+ * `ModelRegistrySeam`, so the MCP host reuses the Pi host's `PiModelReviewer`
+ * unchanged — including its `provider/model` and bare-identifier resolution.
+ * `getAuth` outcomes arrive as the seam's `ok: false` rather than rejecting,
+ * matching the Pi registry contract the reviewer already handles.
+ */
+export function createBuiltinModelRegistry(models: BuiltinModelsSeam): ModelRegistrySeam {
+  return {
+    find: (provider, modelId) => models.getModel(provider, modelId),
+    getAll: () => [...models.getModels()],
+    getApiKeyAndHeaders: async (model) => {
+      try {
+        const auth = await models.getAuth(model);
+        if (auth === undefined) return { ok: false, error: "provider is not authenticated" };
+        return {
+          ok: true,
+          ...(auth.auth.apiKey === undefined ? {} : { apiKey: auth.auth.apiKey }),
+          ...(auth.auth.headers === undefined ? {} : { headers: auth.auth.headers }),
+        };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
     },
   };
 }

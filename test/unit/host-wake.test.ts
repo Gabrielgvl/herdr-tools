@@ -9,6 +9,8 @@ import { createDevinQueueFlush, type DevinQueueFlush, type DevinQueueFlushCli } 
 import { createPaneWriteGuard } from "../../src/pane-write-lock.js";
 import {
   CLAUDE_CHANNEL_NOTIFICATION_METHOD,
+  CLAUDE_WAKE_MAX_ATTEMPTS,
+  CLAUDE_WAKE_RETRY_DELAY_MS,
   createMcpHostWake,
   type McpHostWakeDeps,
   type McpWakeCli,
@@ -321,6 +323,57 @@ describe("the MCP host wake router", () => {
       await vi.waitFor(() => expect(paneGets(calls)).toBe(1));
       await flush();
     }
+  });
+
+  it("retries a failed channel send with the identical payload until it lands", async () => {
+    const sent: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }> = [];
+    const notifyChannel: McpHostWakeDeps["notifyChannel"] = (notification) => {
+      sent.push(notification);
+      // A synchronous failure — the same shape as the host's not-yet-installed
+      // sender — must enter the retry, not read as a delivered write.
+      if (sent.length === 1) throw new Error("not connected");
+    };
+    const { deps } = harness({ resolvedKind: "claude", notifyChannel });
+    createMcpHostWake(deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(sent).toHaveLength(2));
+    // The retried write is the identical payload object, not a rebuilt copy.
+    expect(sent[1]).toBe(sent[0]);
+    expect(sent[0]!.method).toBe(CLAUDE_CHANNEL_NOTIFICATION_METHOD);
+    expect(sent[0]!.params.content).toContain("job_sup");
+    await flush();
+    expect(sent).toHaveLength(2);
+  });
+
+  it("drops the wake silently once the channel retry bound is spent", async () => {
+    const attempts: unknown[] = [];
+    const notifyChannel: McpHostWakeDeps["notifyChannel"] = (notification) => {
+      attempts.push(notification);
+      return Promise.reject(new Error("closed"));
+    };
+    const { deps } = harness({ resolvedKind: "claude", notifyChannel });
+    expect(() => createMcpHostWake(deps).notifier.wake(wake)).not.toThrow();
+    await vi.waitFor(() => expect(attempts).toHaveLength(CLAUDE_WAKE_MAX_ATTEMPTS));
+    // The drop is final: a further attempt would fire within one backoff, so
+    // outlasting two with the count still at the cap proves nothing follows.
+    await new Promise((resolve) => setTimeout(resolve, CLAUDE_WAKE_RETRY_DELAY_MS * 2));
+    expect(attempts).toHaveLength(CLAUDE_WAKE_MAX_ATTEMPTS);
+  });
+
+  it("stops the channel retry when the session aborts during the backoff", async () => {
+    const session = new AbortController();
+    const attempts: unknown[] = [];
+    const notifyChannel: McpHostWakeDeps["notifyChannel"] = (notification) => {
+      attempts.push(notification);
+      // The abort lands while the pipeline is parked in the retry backoff —
+      // the armed sleep must cancel and no further write may leave.
+      setImmediate(() => session.abort());
+      return Promise.reject(new Error("closed"));
+    };
+    const { deps } = harness({ resolvedKind: "claude", notifyChannel, session });
+    createMcpHostWake(deps).notifier.wake(wake);
+    await vi.waitFor(() => expect(attempts).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, CLAUDE_WAKE_RETRY_DELAY_MS * 2));
+    expect(attempts).toHaveLength(1);
   });
 
   it.each([["agy"], ["codex"], [undefined]] as const)("stays inert for a %s own pane and caches the resolution", async (kind) => {

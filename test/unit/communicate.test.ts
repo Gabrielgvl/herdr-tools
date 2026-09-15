@@ -180,10 +180,12 @@ describe("herdr_communicate", () => {
     }
   });
 
-  it("refuses prompt against working without mutation", async () => {
+  it("delivers a prompt to a working target as steering input", async () => {
     const harness = makeCli("working");
-    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" })).rejects.toMatchObject({ code: "TARGET_BUSY" });
-    expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "prompt")).toBe(false);
+    const result = await execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" });
+    expect(harness.prompt).toHaveBeenCalledTimes(1);
+    expect(harness.promptInputs).toEqual([senderEnvelope("prompt", "hello")]);
+    expect(result.details).toMatchObject({ outcome: "sent", operation: "prompt", route: "prompt_direct", preState: { agent_status: "working" } });
   });
 
   it.each([
@@ -775,14 +777,18 @@ describe("herdr_communicate", () => {
     expect(idleEvents).toEqual(["acquire", "release"]);
     expect(idleFlush.schedule).not.toHaveBeenCalled();
 
-    // A normal prompt to a working Devin pane still refuses before any section.
-    const refused = makeDevinCli("working");
-    const refusedFlush = fakeQueueFlush([]);
-    await expect(createCommunicateTool({ cli: refused.cli, context, queueFlush: refusedFlush.flush })
-      .execute("id", { target: "reviewer", operation: "prompt", text: "body" }, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "TARGET_BUSY" });
-    expect(refusedFlush.writeSection).not.toHaveBeenCalled();
-    expect(refusedFlush.schedule).not.toHaveBeenCalled();
+    // A normal prompt to a working Devin pane delivers through the same
+    // locked section and schedules the queue flush just like a steer: the
+    // submitted text lands in the composer queue while the pane is busy.
+    const promptEvents: string[] = [];
+    const promptDevin = makeDevinCli("working");
+    const promptFlush = fakeQueueFlush(promptEvents);
+    const promptResult = await createCommunicateTool({ cli: promptDevin.cli, context, queueFlush: promptFlush.flush })
+      .execute("id", { target: "reviewer", operation: "prompt", text: "body" }, new AbortController().signal, undefined, extensionContext);
+    expect(promptEvents).toEqual(["acquire", "release"]);
+    expect(promptDevin.promptInputs).toHaveLength(1);
+    expect(promptFlush.schedule).toHaveBeenCalledTimes(1);
+    expect(promptResult.details).toMatchObject({ outcome: "sent", route: "prompt_direct", preState: { agent_status: "working" } });
 
     // A non-Devin target never touches the coordinator even when one is wired.
     const pi = makeCli("working");

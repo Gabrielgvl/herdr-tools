@@ -67,9 +67,10 @@ export interface CommunicateDependencies {
 }
 
 function assertPromptState(pane: Record<string, unknown>, state: CommunicateState): void {
-  if (state === "working") {
-    throw Object.assign(new Error("Target is working; normal prompt refuses to interrupt"), { code: "TARGET_BUSY", details: { target: pane.pane_id, state } });
-  }
+  // A working target receives a prompt exactly like a steer: `agent prompt`
+  // submits the same bytes and the target runtime decides (Pi steers mid-turn,
+  // Devin queues for the composer flush). Blocked stays refused — a pane
+  // awaiting input could consume the text as its answer.
   if (state === "blocked") {
     throw Object.assign(new Error("Target is blocked; normal prompt refuses delivery"), { code: "TARGET_BLOCKED", details: { target: pane.pane_id, state } });
   }

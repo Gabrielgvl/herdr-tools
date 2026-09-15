@@ -109,8 +109,8 @@ computed from the source, with the brief saying how to compute them rather than 
   tail, and take the durable artifact off disk. Every brief names a delivery fallback — if the report
   cannot reach the manager pane, write it beside the brief and idle. Never delay or stop work because
   a report could not be delivered.
-- Verify independently what a report claims before acting on it, ledgering it, or passing it to
-  another lane. Recompute any number that will reach the owner.
+- Verify independently what a report claims before acting on it or passing it to another lane.
+  Recompute any number that will reach the owner.
 - Close a completed pane once its evidence is captured and nothing live remains: no unanswered
   instruction, no pending composer text, no running process, worktree and branch state known.
   Unsubmitted composer text is a live instruction, and ambiguity means keep the pane. Preserve
@@ -151,9 +151,8 @@ computed from the source, with the brief saying how to compute them rather than 
 Multi-item program ("decommission all X"): read-only scouts before any implementation lane.
 
 1. In parallel, cheapest profile: IaC inventory (resource, producers/consumers file:line, flags per stage, removal policy, verdict); telemetry activity readback (7 d / 30 d; "no series" ≠ zero); then one ticket draft per item in the `ticket-writer` shape plus a board (item / shape / PRs / earliest date / $ / risk).
-2. One ledger per program under `docs/summaries/<program>-<date>/ledger.md`; the seat report links to it.
-3. Manager reads every draft, checks for existing tickets (`duplicateOf` on collision), files, records ids.
-4. Dispatch implementation by $ and risk, one lane per item; destructive steps stay owner-approved per item.
+2. Manager reads every draft, checks for existing tickets (`duplicateOf` on collision), files, records ids.
+3. Dispatch implementation by $ and risk, one lane per item; destructive steps stay owner-approved per item.
 
 ## Owner interaction
 
@@ -166,8 +165,8 @@ Multi-item program ("decommission all X"): read-only scouts before any implement
   permission question: DEV deploys, sanctioned review-gate requests, CI reruns after a verified
   transient, READY transitions, and safe rebases. After every required exact-current-head gate passes,
   immediately mark the PR READY if needed and invoke the repository-approved auto-merge command without
-  another owner prompt. This standing approval never authorizes a direct/admin bypass. Ledger the action
-  and proceed. Existing hard stops and exact-head/effect-safety checks still apply.
+  another owner prompt. This standing approval never authorizes a direct/admin bypass. Existing hard
+  stops and exact-head/effect-safety checks still apply.
 - **READY before any approval request (owner rule 2026-09-09).** When a lane or the manager asks the
   owner (or any human) to approve a PR, the PR must already be out of draft: brief lanes to run
   `gh pr ready <n>` and then report `…-READY-NEEDS-HUMAN-APPROVAL` with `isDraft: false` verified — a

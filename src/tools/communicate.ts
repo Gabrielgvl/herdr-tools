@@ -66,16 +66,6 @@ export interface CommunicateDependencies {
   queueFlush?: DevinQueueFlush;
 }
 
-function assertPromptState(pane: Record<string, unknown>, state: CommunicateState): void {
-  // A working target receives a prompt exactly like a steer: `agent prompt`
-  // submits the same bytes and the target runtime decides (Pi steers mid-turn,
-  // Devin queues for the composer flush). Blocked stays refused — a pane
-  // awaiting input could consume the text as its answer.
-  if (state === "blocked") {
-    throw Object.assign(new Error("Target is blocked; normal prompt refuses delivery"), { code: "TARGET_BLOCKED", details: { target: pane.pane_id, state } });
-  }
-}
-
 function assertPostState(pane: Record<string, unknown>): CommunicateState {
   const state = stateOf(pane);
   if (state === "unknown") {
@@ -189,8 +179,8 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         }
         preEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
         before = paneFrom(preEnvelope.result, target.paneId!);
-        const beforeState = assertSendableState(before);
-        if (legacyParams.operation === "prompt") assertPromptState(before, beforeState);
+        assertSendableState(before);
+
         if (params.operation !== "keys") {
           const preIdentityRecords = [
             ...snapshotIdentityRecords(snapshot, target.paneId!),
@@ -226,7 +216,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             const finalEnvelope = await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal);
             const finalPane = paneFrom(finalEnvelope.result, target.paneId!);
             const finalState = assertSendableState(finalPane);
-            if (legacyParams.operation === "prompt") assertPromptState(finalPane, finalState);
+
             const finalIdentityRecords = [
               ...snapshotIdentityRecords(snapshot, target.paneId!),
               agentFrom(finalAgentEnvelope.result),

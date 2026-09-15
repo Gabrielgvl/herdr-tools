@@ -188,8 +188,14 @@ describe("herdr_communicate", () => {
     expect(result.details).toMatchObject({ outcome: "sent", operation: "prompt", route: "prompt_direct", preState: { agent_status: "working" } });
   });
 
+  it("delivers a prompt to a blocked target through the same direct path", async () => {
+    const harness = makeCli("blocked");
+    const result = await execute(harness.cli, { target: "reviewer", operation: "prompt", text: "hello" });
+    expect(harness.prompt).toHaveBeenCalledTimes(1);
+    expect(result.details).toMatchObject({ outcome: "sent", operation: "prompt", route: "prompt_direct", preState: { agent_status: "blocked" } });
+  });
+
   it.each([
-    ["blocked", "TARGET_BLOCKED"],
     ["unknown", "TARGET_STATE_UNKNOWN"],
     ["malformed", "TARGET_STATE_UNAVAILABLE"]
   ] as const)("refuses normal prompt against %s without prompt bytes", async (state, code) => {

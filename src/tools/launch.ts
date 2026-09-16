@@ -1938,7 +1938,15 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         // source can overwrite them — so they are never consulted for
         // authorization and a failed write degrades to a detail, never a
         // launch failure.
-        provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, capturedIdentity.agentSession, abortSignal);
+        provenanceWarning = await writeIdentityProvenance(
+      deps.cli,
+      resolvedPaneId,
+      "launched",
+      sender?.paneId,
+      capturedIdentity.agentSession,
+      abortSignal,
+      /^(?:manager|planner)(?:-|$)/u.test(chosenProfile.name) ? "orchestrator" : undefined,
+    );
         if (params.focus === true) {
           phase = "focus";
           progress(onUpdate, phase, created);

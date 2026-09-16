@@ -4104,6 +4104,18 @@ describe("launch identity provenance", () => {
     ]);
   });
 
+  it.each(["manager-pi", "planner-pi"])("marks delegated %s seats as orchestrators before they launch lanes", async (profileName) => {
+    const harness = makeCli();
+    await launch({ assignment: assign("go"), name: profileName, profile: profileName }, catalog(profile(profileName)), harness.cli);
+    expect(harness.calls).toContainEqual([
+      "pane", "report-metadata", "w1:p2", "--source", "herdr-tools",
+      "--token", "identity_provenance=launched",
+      "--token", "identity_scope=orchestrator",
+      "--token", "identity_actor=w1:p1",
+      "--token", "identity_session=session-0"
+    ]);
+  });
+
   it("degrades a failed provenance write to a warning, never a launch failure", async () => {
     const harness = makeCli({ metadataError: new Error("metadata service unavailable") });
     const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), harness.cli);

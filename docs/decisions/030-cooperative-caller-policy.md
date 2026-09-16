@@ -28,11 +28,11 @@ than its manager. Two facts shaped the design:
 
 - **Runtime records carry no `profileName`.** `herdr agent get` and the
   snapshot expose pane/agent records with `tokens`, but the launching
-  profile name is not recorded. A profile-based classification ("worker
-  profiles are restricted, manager profiles are not") is impossible at
-  runtime, and the plugin-recipient `profileName` registry is populated
-  only after a successful launch — too late and too narrow to classify
-  callers with.
+  profile name is not recorded. Launch therefore materializes only the
+  needed role fact: manager and planner profiles receive the advisory
+  `identity_scope=orchestrator` token. This avoids a delegated manager being
+  transiently treated as a leaf before its first child exists without adding
+  a cross-process role registry.
 
 ## Decision
 
@@ -45,12 +45,14 @@ authoritative snapshot alone:
   `identity_provenance=launched` marker — detected or adopted panes
   included — keeps the full tool contract. Callers that predate the
   provenance tokens lose nothing.
-- **Unrestricted (manager):** a caller named as `identity_actor` by at
-  least one other pane's consistent records manages children and is
-  unrestricted toward every pane. This is how "managers can communicate
-  with everyone" is satisfied without a role registry.
-- **Leaf worker:** a caller with `identity_provenance=launched` and zero
-  recorded children. Its text sends (`prompt`, `steer`, including
+- **Unrestricted (orchestrator):** a launched manager or planner carrying
+  `identity_scope=orchestrator` is unrestricted immediately, including before
+  it launches its first lane.
+- **Unrestricted (manager by topology):** a caller named as `identity_actor`
+  by at least one other pane's consistent records manages children and is
+  unrestricted toward every pane. This preserves promotion by topology.
+- **Leaf worker:** any other caller with `identity_provenance=launched` and
+  zero recorded children. Its text sends (`prompt`, `steer`, including
   `kind: "result"`) may target only its own `identity_actor` pane, and
   `keys`, `cancel`, and `interrupt` are refused entirely — a leaf never
   sends control input.
@@ -112,8 +114,10 @@ automatic-supervisor and ownership rules as every other caller.
 
 - Honest leaf workers route exactly one typed result to their recorded
   manager and cannot accidentally prompt, steer, or send keys to peers.
-- A pane promoted to manager mid-session — by launching or adopting a child —
-  becomes unrestricted automatically; no registration step exists.
+- Delegated manager and planner seats are unrestricted from launch; they never
+  pass through an unusable leaf phase. A different pane promoted to manager
+  mid-session by launching or adopting a child still becomes unrestricted
+  automatically.
 - The restriction is cooperative, not a boundary: the tokens are still
   forgeable shared metadata, and a caller with raw CLI access bypasses
   the guard entirely. ADR-028's warning stands for anything that needs
@@ -121,8 +125,8 @@ automatic-supervisor and ownership rules as every other caller.
 - Stale tokens left behind by a reused pane fail closed via the
   `identity_session`/`agent_session.value` comparison instead of binding
   the pane to a manager it no longer belongs to.
-- Profile names remain launch-time input only; no runtime policy reads
-  them.
+- Profile names remain launch-time input only. Runtime policy reads the
+  materialized `identity_scope=orchestrator` fact, not the profile name.
 
 ## Open questions ratified
 

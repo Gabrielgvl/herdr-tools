@@ -44,7 +44,7 @@ export type WorkerBinding =
 export interface UnrestrictedCaller {
   readonly callerPaneId: string;
   readonly scope: "unrestricted";
-  readonly basis: "unmarked" | "adopted" | "manages_children";
+  readonly basis: "unmarked" | "adopted" | "orchestrator" | "manages_children";
   /**
    * The caller's own launch binding — present only when provenance is
    * `launched`. It never restricts the caller, but `herdr_inspect` exposes a
@@ -215,6 +215,7 @@ export function classifyCaller(snapshot: HerdrSnapshot, callerPaneId: string): C
   }
   const records = paneRecords(snapshot, callerPaneId);
   const provenance = mergedToken(records, "identity_provenance");
+  const declaredScope = mergedToken(records, "identity_scope");
   if (provenance.state === "malformed" || provenance.state === "contradictory") {
     throw new CallerPolicyError("CALLER_POLICY_UNAVAILABLE", `caller provenance evidence is ${provenance.state}`, {
       callerPaneId: bounded(callerPaneId),
@@ -227,11 +228,18 @@ export function classifyCaller(snapshot: HerdrSnapshot, callerPaneId: string): C
       reason: "provenance_unrecognized"
     });
   }
+  if (declaredScope.state === "malformed" || declaredScope.state === "contradictory" || (declaredScope.state === "value" && declaredScope.value !== "orchestrator")) {
+    throw new CallerPolicyError("CALLER_POLICY_UNAVAILABLE", "caller scope evidence is malformed, contradictory, or unrecognized", {
+      callerPaneId: bounded(callerPaneId),
+      reason: `scope_${declaredScope.state === "value" ? "unrecognized" : declaredScope.state}`
+    });
+  }
   // A pane is never its own child, so a self `identity_actor` does not make a
   // launched caller a manager — it is a leaf with an unusable binding.
   const managesChildren = snapshot.panes.some((pane) => pane.pane_id !== callerPaneId && claimsActor(snapshot, pane.pane_id, callerPaneId));
   if (provenance.state === "value" && provenance.value === "launched") {
     const binding = workerBinding(snapshot, callerPaneId, records);
+    if (declaredScope.state === "value") return { callerPaneId, scope: "unrestricted", basis: "orchestrator", binding };
     if (!managesChildren) return { callerPaneId, scope: "worker", basis: "launched_leaf", binding };
     return { callerPaneId, scope: "unrestricted", basis: "manages_children", binding };
   }

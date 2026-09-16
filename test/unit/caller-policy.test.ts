@@ -62,6 +62,12 @@ describe("classifyCaller", () => {
     expect(policy).toEqual({ callerPaneId: CALLER, scope: "worker", basis: "launched_leaf", binding: { status: "bound", parentPaneId: MANAGER } });
   });
 
+  it("keeps a delegated orchestrator unrestricted before it launches its first lane", () => {
+    const orchestrator = launchedCaller({ tokens: { ...launchedTokens, identity_scope: "orchestrator" } });
+    const policy = classifyCaller(snap([orchestrator, managerPane()], [callerAgent({ agent_session: callerSession })]), CALLER);
+    expect(policy).toEqual({ callerPaneId: CALLER, scope: "unrestricted", basis: "orchestrator", binding: { status: "bound", parentPaneId: MANAGER } });
+  });
+
   it("binds a launched worker whose session id exceeds the token length cap", () => {
     // Pi sessions are file paths longer than the 80-char token cap; the stored
     // token is the normalized truncation, so the raw session value must be
@@ -125,6 +131,16 @@ describe("classifyCaller", () => {
 
   it("fails closed on an unrecognized provenance value", () => {
     expect(denied(() => classifyCaller(snap([callerPane({ tokens: { identity_provenance: "spawned" } })]), CALLER))).toMatchObject({ code: "CALLER_POLICY_UNAVAILABLE", details: { reason: "provenance_unrecognized" } });
+  });
+
+  it.each([
+    ["scope_unrecognized", { identity_scope: "manager" }, undefined],
+    ["scope_malformed", { identity_scope: 7 }, undefined],
+    ["scope_contradictory", { identity_scope: "orchestrator" }, { identity_scope: "worker" }],
+  ] as const)("fails closed on %s evidence", (reason, paneScope, agentScope) => {
+    const pane = launchedCaller({ tokens: { ...launchedTokens, ...paneScope } });
+    const agents = [callerAgent({ agent_session: callerSession, ...(agentScope ? { tokens: agentScope } : {}) })];
+    expect(denied(() => classifyCaller(snap([pane, managerPane()], agents), CALLER))).toMatchObject({ code: "CALLER_POLICY_UNAVAILABLE", details: { reason } });
   });
 
   it.each([

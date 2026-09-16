@@ -6,11 +6,12 @@ import type { CompatibilityPreflight } from "../health.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
+import { createHandoffAllocator, renderHandoffContract, type HandoffAllocation, type HandoffAllocator } from "../handoff.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
 import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
-import { attachmentCapability } from "../profiles/capability.js";
+import { attachmentCapability, handoffWriteCapability } from "../profiles/capability.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { parseSnapshotResult, resolveTarget } from "../targets.js";
@@ -48,6 +49,11 @@ export interface LaunchDependencies {
   profiles?: { load: () => Promise<ProfileCatalog> };
   promptSources?: PromptSourceStore;
   attachments?: AttachmentStore;
+  /**
+   * Tools-owned handoff allocation for the run. Every managed launch gets one
+   * generated run directory; the caller cannot supply or select its path.
+   */
+  handoffs?: HandoffAllocator;
   recipients?: RecipientRegistry;
   clock?: LaunchClock;
   /** Test hosts may provide the same fail-closed gate with disposable paths. */
@@ -159,7 +165,7 @@ export interface LaunchDetails extends LaunchResourceIds {
   /** Advisory identity provenance tokens were written; `provenanceWarning` is set when that write failed. */
   identityProvenance?: "launched";
   provenanceWarning?: string;
-  phase?: "validate" | "resolve_profile" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification" | "supervision_bind";
+  phase?: "validate" | "resolve_profile" | "handoff" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification" | "supervision_bind";
   supervision?:
     { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; profileName: string } };
   created?: LaunchResourceIds;
@@ -167,6 +173,8 @@ export interface LaunchDetails extends LaunchResourceIds {
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
   envelope?: { version: "v1"; kind: "assignment"; delivery: MessageDelivery };
   attachment?: PublishedAttachment;
+  /** The generated Tools-owned run and its agent-writable artifact path. */
+  handoff?: { runId: string; path: string };
   recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; profileName: string; kind: ProfileKind; capable: boolean; reason: string };
   profile?: LaunchEffectiveProfile & { name: string; sessionPersistence: boolean };
 }
@@ -190,6 +198,7 @@ export const LAUNCH_DIAGNOSTIC_SUMMARY = "Launch failed; inspect the structured 
 /** Shape of every failure code this module and the CLI transport define. */
 const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const realLaunchClock: LaunchClock = { now: () => performance.now() };
+let defaultHandoffs: HandoffAllocator | undefined;
 
 export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
   inspectBeforeRetry: "Inspect the affected pane and agent with herdr_inspect before retrying; do not assume that no agent started.",
@@ -1610,6 +1619,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       const requestedDelivery: MessageDelivery = record(params) && params.assignmentDelivery === "attachment" ? "attachment" : "inline";
       const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
       const attachmentStore = deps.attachments ?? defaultAttachmentStore;
+      const handoffs = deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({}));
       const clock = deps.clock ?? realLaunchClock;
       let initialPromptDelivery: MessageDelivery | undefined;
       let assignmentText: string | undefined;
@@ -1632,6 +1642,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let topologyBaseline: HerdrSnapshot | undefined;
       let topologyMutationDispatched = false;
       let reservation: SupervisionReservation | undefined;
+      let handoffRun: HandoffAllocation | undefined;
       let phase: LaunchPhase = "validate";
       const created: LaunchResourceIds = {};
       const attempts: LaunchAttemptEvidence[] = [];
@@ -1646,8 +1657,9 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       try {
         validateParams(params);
         initialPromptDelivery = requestedDelivery;
-        // The rendered payload, not any single field, is what the delivery
-        // route has to carry, so the size bound is checked after rendering.
+        // Refuse a payload that is already too large before transport or profile
+        // work. The generated handoff contract is appended and checked again
+        // after the managed profile has been accepted and a run is allocated.
         assignmentText = renderAssignment(params.assignment);
         assertMessageText(assignmentText);
         assertDeliverySize(assignmentText, initialPromptDelivery);
@@ -1690,12 +1702,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           effectiveRuntimes.set(profile.name, runtime);
           await assertResourceSelection(profile, runtime, true);
         }
-        recipientKey = mintRecipientKey();
-        grant = await attachmentStore.ensureRecipient(recipientKey);
-        const promptStore = deps.promptSources ?? defaultPromptSourceStore;
         for (const profile of profiles) {
           const overrides = profile.name === params.profile ? params.overrides : {};
-          const runtime = effectiveRuntimes.get(profile.name)!;
           const capability = attachmentCapability(profile, overrides);
           capabilities.set(profile.name, capability);
           // Any profile the fallback chain can start may be the one that receives the
@@ -1703,10 +1711,20 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           if (initialPromptDelivery === "attachment" && !capability.capable) {
             throw new LaunchError("ATTACHMENT_TARGET_UNVERIFIED", "Profile cannot read a local attachment", { profile: profile.name, reason: capability.reason });
           }
-          const promptPath = runtime.kind === "agy" || runtime.kind === "devin" ? undefined : (await promptStore.create(profile.body)).path;
-          if (promptPath !== undefined) promptPaths.set(profile.name, promptPath);
-          buildRuntimeArgv(profile, runtime, promptPath, grant.path);
+          // Every profile the chain can start must be able to persist the exact
+          // artifact. Prove this before allocating any handoff or recipient state.
+          const writeCapability = handoffWriteCapability(profile, overrides);
+          if (!writeCapability.capable) {
+            throw new LaunchError("HANDOFF_TARGET_UNVERIFIED", "Profile cannot write the run handoff artifact", { profile: profile.name, reason: writeCapability.reason });
+          }
         }
+        // Allocate only after every reachable profile is accepted. The generated
+        // contract is part of the mandatory assignment and its bytes count toward
+        // the selected delivery limit.
+        handoffRun = await handoffs.allocate();
+        assignmentText += renderHandoffContract(handoffRun);
+        assertMessageText(assignmentText);
+        assertDeliverySize(assignmentText, initialPromptDelivery);
         const effective = await contextResolver(abortSignal);
         contextDiagnostics = effective.diagnostics;
         const snapshot = effective.snapshot;
@@ -1719,6 +1737,29 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         }
         existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, currentContext) : undefined;
         workspaceId = placement.mode === "new_tab" ? currentContext.workspaceId : undefined;
+        // The sidecar is committed before the first topology effect so the run
+        // is recoverable even when the launch dies between allocation and start.
+        phase = "handoff";
+        progress(onUpdate, phase, created);
+        await handoffs.persist(handoffRun!, {
+          manager: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
+          child: {
+            agentName: params.name,
+            agentKind: profiles[0]!.runtime.kind,
+            profileName: profiles[0]!.name,
+            requestedProfile: params.profile,
+            fallbackProfiles: profiles.slice(1).map((profile) => profile.name)
+          }
+        });
+        recipientKey = mintRecipientKey();
+        grant = await attachmentStore.ensureRecipient(recipientKey);
+        const promptStore = deps.promptSources ?? defaultPromptSourceStore;
+        for (const profile of profiles) {
+          const runtime = effectiveRuntimes.get(profile.name)!;
+          const promptPath = runtime.kind === "agy" || runtime.kind === "devin" ? undefined : (await promptStore.create(profile.body)).path;
+          if (promptPath !== undefined) promptPaths.set(profile.name, promptPath);
+          buildRuntimeArgv(profile, runtime, promptPath, grant.path, handoffRun.directory);
+        }
         if (initialPromptDelivery === "attachment") {
           phase = "attachment_publish";
           progress(onUpdate, phase, created);
@@ -1745,7 +1786,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           });
         }
       } catch (error) {
-        const failure = withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published });
+        const failure = withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published, handoffRunId: handoffRun?.runId });
         try {
           await grant?.release();
           reservation?.release("launch_precondition_failed");
@@ -1819,7 +1860,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           // that access can already edit the package's own code or registry, so
           // the race grants no capability they lack.
           await assertResourceSelection(profile, runtime);
-          const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path)];
+          const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path, handoffRun!.directory)];
           const attemptStartedAt = clock.now();
           try {
             started = await dispatchMutation(() => run(deps.cli, startArgs, abortSignal, true));
@@ -1878,7 +1919,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         // Every launch requires the readiness baseline, so the anchor always
         // comes from the same coherent sample that captured identity.
         try {
-          await reservation!.bind({ identity: capturedIdentity, profileName: chosenProfile.name, stateChangeSeq: ready.baseline!.stateChangeSeq });
+          await reservation!.bind({ identity: capturedIdentity, profileName: chosenProfile.name, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
           boundSupervision = {
             jobId: reservation!.jobId,
             state: "active",
@@ -2024,6 +2065,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
           envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },
           ...(published ? { attachment: published } : {}),
+          handoff: { runId: handoffRun!.runId, path: handoffRun!.artifactPath },
           recipient,
           effectCertainty: "confirmed",
           supervision: boundSupervision!,
@@ -2075,6 +2117,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         // Releasing an unbound reservation settles its job; a committed exact
         // supervisor is retained through every later launch failure.
         if (!supervisionBound) reservation?.release(`launch_failed_${phase}`);
+        withDeliveryFailureEvidence(error, { handoffRunId: handoffRun!.runId });
         throw partialError(error, created, phase, grant!, {
           agentStarted,
           promptSubmitted,

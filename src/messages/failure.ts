@@ -8,6 +8,8 @@ export interface DeliveryFailureContext {
   phase?: string;
   published?: PublishedAttachment;
   promptDispatch?: PromptDispatchEvidence;
+  /** Generated run id, so a failed launch still names its durable handoff. */
+  handoffRunId?: string;
 }
 
 function safePromptDispatch(value: unknown): PromptDispatchEvidence | undefined {
@@ -35,6 +37,7 @@ export function withDeliveryFailureEvidence(error: unknown, context: DeliveryFai
     ...(context.route ? { route: context.route } : {}),
     ...(context.phase ? { phase: context.phase } : {}),
     ...(promptDispatch === undefined ? {} : { promptDispatch }),
+    ...(context.handoffRunId === undefined ? {} : { handoffRunId: context.handoffRunId }),
     ...(context.published ? { attachmentRetained: true, attachment: { ...context.published } } : {})
   };
   return error;

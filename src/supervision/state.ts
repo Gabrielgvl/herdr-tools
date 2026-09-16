@@ -9,6 +9,7 @@
 
 import type { ReconciliationFailureReason, SupervisionEvent, SupervisionTransition } from "./events.js";
 import { SUPERVISION_AGENT_STATUSES, type SupervisionAgentStatus } from "./protocol.js";
+import type { HandoffInspection } from "../handoff-gate.js";
 import type { ReviewClassification } from "../reviewer.js";
 import type { SupervisedIdentity } from "./identity.js";
 
@@ -191,6 +192,11 @@ export function isSupervisionJobView(value: unknown): value is SupervisionJobVie
  */
 export interface SupervisionJobPort {
   view(): SupervisionJobView;
+  /**
+   * The bound managed run's bounded evidence, published on the job detail
+   * rather than inside this view so no truncation tier can strip it.
+   */
+  handoffEvidence?(): HandoffInspection | undefined;
   takePendingEvents(): SupervisionEvent[];
   /** True while the exact child is still live, which refuses `herdr_jobs cancel`. */
   childLive(): boolean;

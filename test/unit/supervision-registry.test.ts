@@ -1,5 +1,10 @@
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { JobRegistry, SupervisionActiveError } from "../../src/job-registry.js";
+import { createHandoffAllocator, readHandoffState, type HandoffAllocation } from "../../src/handoff.js";
+import { createHandoffGate, type HandoffGate } from "../../src/handoff-gate.js";
 import { SessionEventMonitor } from "../../src/supervision/monitor.js";
 import { SupervisionRegistry } from "../../src/supervision/registry.js";
 import { scriptedServer } from "./supervision-peer.js";
@@ -35,7 +40,7 @@ interface Fixture {
   push(line: string): void;
 }
 
-function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[] } = {}): Fixture {
+function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[]; handoffs?: HandoffGate; repairPrompt?: (paneId: string, text: string, signal: AbortSignal) => Promise<unknown> } = {}): Fixture {
   const server = scriptedServer({ snapshots: options.snapshots ?? [snapshotResult([pane])] });
   const jobs = new JobRegistry();
   const wakes: SupervisionWake[] = [];
@@ -49,8 +54,22 @@ function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[
     ...(options.reviewer ? { reviewerFactory: () => options.reviewer! } : {}),
     scheduler: { setTimer: () => "timer", clearTimer: () => undefined },
     idFactory: (() => { let id = 0; return () => `fixture-${++id}`; })(),
+    ...(options.handoffs ? { handoffs: options.handoffs } : {}),
+    ...(options.repairPrompt ? { repairPrompt: options.repairPrompt } : {}),
   });
   return { jobs, supervision, wakes, push: server.push };
+}
+
+async function managedAllocation(): Promise<HandoffAllocation> {
+  const dir = await mkdtemp(join(tmpdir(), "herdr-registry-handoff-"));
+  await chmod(dir, 0o700);
+  const allocator = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+  const allocation = await allocator.allocate();
+  await allocator.persist(allocation, {
+    manager: { paneId: "p0", display: "caller", source: "injected" },
+    child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: [] }
+  });
+  return allocation;
 }
 
 describe("the supervision registry", () => {
@@ -69,7 +88,7 @@ describe("the supervision registry", () => {
       settings: { reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max", reviewCadenceMinutes: 5 },
     });
     expect(detail.request.target_generation_refs?.[0]).toMatch(/^target_generation_/u);
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("publishes AGY provisional supervision and atomically strengthens it to exact coverage", async () => {
@@ -97,7 +116,7 @@ describe("the supervision registry", () => {
       supervision: { state: "active", child: { paneId: "p1", agentKind: "agy" }, status: "working" },
     });
     expect(f.jobs.activeSupervisorFor(exactIdentity)).toEqual({ jobId: reservation.jobId });
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("keeps the provisional recovery handle when strengthening evidence is rejected", async () => {
@@ -110,7 +129,7 @@ describe("the supervision registry", () => {
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running", request: { targetIds: [] }, supervision: { state: "provisional" } });
     expect(f.jobs.activeSupervisorFor({ ...agyIdentity, agentSession: agySession })).toBeUndefined();
     await expect(f.jobs.cancel(reservation.jobId)).rejects.toMatchObject({ code: "SUPERVISION_ACTIVE" });
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("rolls back the request publication when AGY provisional evidence is rejected", async () => {
@@ -120,7 +139,7 @@ describe("the supervision registry", () => {
     await expect(reservation.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: -1, revision: 2 } }))
       .rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "provisional_baseline_invalid" } });
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ request: { targetIds: [], child: { agentKind: "agy", profileName: "researcher-agy" } } });
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("does not expose AGY provisional state through the exact binding path", async () => {
@@ -128,7 +147,35 @@ describe("the supervision registry", () => {
     const f = fixture({ snapshots: [baseline, baseline] });
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
     await expect(reservation.bind({ identity: { ...agyIdentity, agentSession: agySession }, profileName: "researcher-agy" })).rejects.toThrow(/STRENGTHENING_REQUIRED/u);
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
+  });
+
+  it("binds the managed handoff run to the exact launched identity through the shared gate", async () => {
+    const gate = createHandoffGate();
+    const f = fixture({ handoffs: gate });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation, agentId: "agent-1" } });
+    // The gate bound the run before the child publication committed: the exact
+    // identity is lookup-visible and persisted in the sidecar for recovery.
+    expect(gate.lookup(identity)).toMatchObject({ runId: allocation.runId, lifecycle: "awaiting_handoff", artifactPath: allocation.artifactPath });
+    const state = await readHandoffState(allocation);
+    expect(state.child).toMatchObject({ paneId: "p1", terminalId: "t1", agentId: "agent-1" });
+    expect(state.nativeSession).toEqual(session);
+    expect(f.jobs.activeSupervisorFor(identity)).toEqual({ jobId: reservation.jobId });
+    await f.supervision.shutdown();
+  });
+
+  it("refuses a managed binding on a host with no handoff gate", async () => {
+    const f = fixture();
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    await expect(reservation.bind({ identity, profileName: "worker-pi", handoff: { allocation } }))
+      .rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED" });
+    // The child publication rolled back: no exact coverage was ever published.
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ request: { targetIds: [] } });
+    expect(f.jobs.activeSupervisorFor(identity)).toBeUndefined();
+    await f.supervision.shutdown();
   });
 
   it("binds, publishes a live view, and settles when the exact child goes away", async () => {
@@ -147,7 +194,7 @@ describe("the supervision registry", () => {
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "settled", supervision_result: "released", supervision_reason: "event:pane_closed" });
     expect(f.wakes.map((wake) => wake.event.type)).toEqual(["pane_closed"]);
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("finds coverage only for the complete exact live identity without observing receipts", async () => {
@@ -182,7 +229,7 @@ describe("the supervision registry", () => {
     f.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.activeSupervisorFor(identity)).toBeUndefined();
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("rolls request target publication back when queued evidence settles during bind", async () => {
@@ -197,7 +244,7 @@ describe("the supervision registry", () => {
       request: { targets: ["worker"], targetIds: [], child: { agentKind: "pi", profileName: "worker-pi" } },
       supervision_result: "released",
     });
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("refuses herdr_jobs cancel while the exact child is live and allows it afterwards", async () => {
@@ -211,7 +258,7 @@ describe("the supervision registry", () => {
     f.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
     await vi_waitForSettled(f.jobs, reservation.jobId);
     await expect(f.jobs.cancel(reservation.jobId)).resolves.toMatchObject({ operation_phase: "settled" });
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("returns soft receipts through herdr_jobs get and counts them in list", async () => {
@@ -230,7 +277,7 @@ describe("the supervision registry", () => {
     expect((first.details as { pending_events: Array<{ type: string }> }).pending_events.map((event) => event.type)).toEqual(["blocked"]);
     const second = await tool.execute("id", { operation: "get", jobId: reservation.jobId } as never, undefined, undefined, {} as never);
     expect(second.details).not.toHaveProperty("pending_events");
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("settles a released reservation instead of leaking its job", async () => {
@@ -239,17 +286,17 @@ describe("the supervision registry", () => {
     reservation.release("launch_failed_placement");
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ supervision_result: "failed", supervision_reason: "launch_failed_placement" });
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("cancels every supervisor on manager-session shutdown", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane])] });
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
     await reservation.bind({ identity, profileName: "worker-pi" });
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ supervision_result: "cancelled", supervision_reason: "manager_session_shutdown" });
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("keeps a host with no model service visibly degraded rather than silently unreviewed", async () => {
@@ -260,7 +307,7 @@ describe("the supervision registry", () => {
     const registry = f.supervision as unknown as { reviewer(): SupervisionReviewer };
     await expect(registry.reviewer().review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: {}, transcriptDelta: [] }, new AbortController().signal))
       .rejects.toThrow(/No supervision reviewer model service is available/u);
-    f.supervision.shutdown();
+    await f.supervision.shutdown();
   });
 
   it("refuses to reserve when the monitor cannot start", async () => {
@@ -273,7 +320,235 @@ describe("the supervision registry", () => {
     });
     await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
     expect(jobs.size()).toBe(0);
-    supervision.shutdown();
+    await supervision.shutdown();
+  });
+});
+
+describe("managed handoff runtime enforcement", () => {
+  const writeArtifact = (allocation: HandoffAllocation, status = "done", summary = "Finished the work.") =>
+    writeFile(allocation.artifactPath, `${allocation.marker}\n\n## Status\n${status}\n\n## Summary\n${summary}\n\n## Changes\n- src/a.ts\n\n## Verification\nnpm test passed.\n\n## Blockers\nNone\n\n## Continuation\nNone\n`, { mode: 0o600 });
+  const paneUpdated = (revision: number, status: string) =>
+    `${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { ...pane, agent_status: status, revision } } })}\n`;
+  const paneClosed = `${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`;
+  const child = { agentName: "worker", agentKind: "pi", profileName: "worker-pi" };
+
+  async function waitForLifecycle(allocation: HandoffAllocation, state: string, timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if ((await readHandoffState(allocation)).lifecycle.state === state) return;
+      if (Date.now() > deadline) throw new Error(`handoff lifecycle did not reach ${state}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  it("opens a fresh artifact cycle on an authoritative working transition", async () => {
+    const gate = createHandoffGate();
+    const f = fixture({ handoffs: gate });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    const run = gate.lookup(identity)!;
+    await writeArtifact(allocation);
+    f.push(paneUpdated(4, "done"));
+    await waitForLifecycle(allocation, "handed_off");
+    expect(run.cycleOpen).toBe(false);
+
+    f.push(paneUpdated(5, "working"));
+    await vi_waitFor(() => run.cycleOpen === true);
+    // The previously accepted artifact version is stale in the new cycle.
+    expect((await gate.validate(run)).state).toBe("stale");
+    expect((await readHandoffState(allocation)).artifact.version).toBe(1);
+    await f.supervision.shutdown();
+  });
+
+  it("keeps supervision active and sends exactly one fenced repair prompt per artifact version", async () => {
+    const gate = createHandoffGate();
+    const calls: Array<{ paneId: string; text: string }> = [];
+    const f = fixture({ handoffs: gate, repairPrompt: async (paneId, text) => { calls.push({ paneId, text }); } });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+
+    f.push(paneUpdated(4, "done"));
+    await vi_waitFor(() => calls.length === 1);
+    // The attempt and fence were persisted before the send, and the prompt
+    // went to the exact child's current pane with the run's own contract.
+    expect(calls[0]!.paneId).toBe("p1");
+    expect(calls[0]!.text).toContain(allocation.artifactPath);
+    expect(calls[0]!.text).toContain(allocation.marker);
+    let state = await readHandoffState(allocation);
+    expect(state.lifecycle.state).toBe("awaiting_handoff");
+    expect(state.repair).toMatchObject({ attempts: 1, fence: { version: 0 } });
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running" });
+
+    // The same artifact version is never re-prompted: a second unmatched
+    // terminal observation behind a new cycle finds the fence standing.
+    f.push(paneUpdated(5, "working"));
+    f.push(paneUpdated(6, "done"));
+    await writeArtifact(allocation);
+    f.push(paneUpdated(7, "working"));
+    f.push(paneUpdated(8, "done"));
+    await waitForLifecycle(allocation, "handed_off");
+    expect(calls).toHaveLength(1);
+    state = await readHandoffState(allocation);
+    expect(state.repair.attempts).toBe(1);
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running" });
+    await f.supervision.shutdown();
+  });
+
+  it("never treats a failed repair prompt as evidence", async () => {
+    const gate = createHandoffGate();
+    const calls: string[] = [];
+    const f = fixture({
+      handoffs: gate,
+      repairPrompt: async (_paneId, text) => { calls.push(text); throw new Error("send_failed"); },
+    });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+
+    f.push(paneUpdated(4, "done"));
+    await vi_waitFor(() => calls.length === 1);
+    // The send failed: the fence stands but nothing about the run resolved.
+    let state = await readHandoffState(allocation);
+    expect(state.lifecycle.state).toBe("awaiting_handoff");
+    expect(state.repair.attempts).toBe(1);
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running" });
+
+    // A later valid artifact still hands the run off.
+    f.push(paneUpdated(5, "working"));
+    await writeArtifact(allocation);
+    f.push(paneUpdated(6, "done"));
+    await waitForLifecycle(allocation, "handed_off");
+    state = await readHandoffState(allocation);
+    expect(state.repair.attempts).toBe(1);
+    expect(calls).toHaveLength(1);
+    await f.supervision.shutdown();
+  });
+
+  it("does not prompt or fence for an initial terminal status at bind", async () => {
+    const gate = createHandoffGate();
+    const calls: string[] = [];
+    const idlePane = { ...pane, agent_status: "idle" };
+    const f = fixture({ handoffs: gate, snapshots: [snapshotResult([idlePane])], repairPrompt: async (_paneId, text) => { calls.push(text); } });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(calls).toHaveLength(0);
+    expect((await readHandoffState(allocation)).repair.attempts).toBe(0);
+    expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+    await f.supervision.shutdown();
+  });
+
+  it("persists the agent-authored handoff ahead of an exit settlement", async () => {
+    const gate = createHandoffGate();
+    const f = fixture({ handoffs: gate, snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    // The artifact landed while the child was still working; the exit settle
+    // validates it before any fallback may be authored.
+    await writeArtifact(allocation);
+    f.push(paneClosed);
+    await vi_waitForSettled(f.jobs, reservation.jobId);
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ supervision_result: "released" });
+    expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off");
+    expect(gate.lookup(identity)).toBeUndefined();
+    await f.supervision.shutdown();
+  });
+
+  it("persists the cancelled fallback only on an authoritative exit", async () => {
+    const gate = createHandoffGate();
+    const f = fixture({ handoffs: gate, snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    f.push(paneClosed);
+    await vi_waitForSettled(f.jobs, reservation.jobId);
+    expect((await readHandoffState(allocation)).lifecycle).toMatchObject({ state: "cancelled", detail: "event:pane_closed" });
+    await f.supervision.shutdown();
+  });
+
+  it("marks unresolved runs recovery_pending on shutdown and fabricates no terminal status", async () => {
+    const gate = createHandoffGate();
+    const f = fixture({ handoffs: gate });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await f.supervision.shutdown();
+    await vi_waitForSettled(f.jobs, reservation.jobId);
+    // The job reports the supervisor's stop, but the durable run is only ever
+    // recovery_pending: teardown authored no terminal outcome for it.
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ supervision_result: "cancelled" });
+    await waitForLifecycle(allocation, "recovery_pending");
+    expect((await readHandoffState(allocation)).lifecycle.detail).toBe("manager_session_shutdown");
+  });
+
+  it("awaits the durable recovery_pending write before tearing supervisors down", async () => {
+    const gate = createHandoffGate();
+    const realShutdown = gate.shutdown;
+    let release!: () => void;
+    const blocker = new Promise<void>((resolve) => { release = resolve; });
+    let gateShutdownStarted = false;
+    gate.shutdown = async () => {
+      gateShutdownStarted = true;
+      await blocker;
+      await realShutdown();
+    };
+    const f = fixture({ handoffs: gate });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+
+    const shutdown = f.supervision.shutdown();
+    await vi_waitFor(() => gateShutdownStarted);
+    // The durable write is still in flight: the supervisor is not torn down and
+    // the sidecar is not yet marked — teardown strictly follows the write.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running" });
+    expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+
+    release();
+    await shutdown;
+    expect((await readHandoffState(allocation)).lifecycle.state).toBe("recovery_pending");
+    await vi_waitForSettled(f.jobs, reservation.jobId);
+  });
+
+  it("projects the bound run's bounded evidence on the supervisor job detail", async () => {
+    const gate = createHandoffGate();
+    const f = fixture({ handoffs: gate, snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+
+    let detail = f.jobs.get(reservation.jobId)!;
+    expect(detail.handoff).toMatchObject({ gated: true, runId: allocation.runId, path: allocation.artifactPath, state: "awaiting_handoff" });
+
+    // Settled on an authoritative exit: the run drops from the live gate, but
+    // the job detail keeps the durable terminal evidence via the retained binding.
+    f.push(paneClosed);
+    await vi_waitForSettled(f.jobs, reservation.jobId);
+    detail = f.jobs.get(reservation.jobId)!;
+    expect(detail.handoff).toMatchObject({ gated: true, runId: allocation.runId, state: "cancelled" });
+    const serialized = JSON.stringify(detail.handoff);
+    expect(serialized).not.toContain("token");
+    expect(serialized).not.toContain(allocation.marker);
+    await f.supervision.shutdown();
+  });
+
+  it("reports the explicit ungated reason on supervisor job details", async () => {
+    const gated = fixture({ handoffs: createHandoffGate() });
+    const unbound = await gated.supervision.reserve({ child });
+    await unbound.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2 });
+    expect(gated.jobs.get(unbound.jobId)!.handoff).toEqual({ gated: false, reason: "no_managed_run" });
+    await gated.supervision.shutdown();
+
+    const gateless = fixture();
+    const reservation = await gateless.supervision.reserve({ child });
+    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2 });
+    expect(gateless.jobs.get(reservation.jobId)!.handoff).toEqual({ gated: false, reason: "gate_unavailable" });
+    await gateless.supervision.shutdown();
   });
 });
 

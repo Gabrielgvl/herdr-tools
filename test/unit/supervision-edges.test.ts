@@ -308,7 +308,7 @@ describe("monitor and registry seams", () => {
     } finally {
       if (previous !== undefined) process.env.HERDR_SOCKET_PATH = previous;
     }
-    supervision.shutdown();
+    await supervision.shutdown();
   });
 });
 
@@ -332,16 +332,16 @@ describe("review-round remediations", () => {
     const first = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
     expect(first.jobId).toBeDefined();
 
-    supervision.shutdown();
+    await supervision.shutdown();
     await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
 
-    supervision.beginSession();
+    await supervision.beginSession();
     const second = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
     expect(second.jobId).not.toBe(first.jobId);
     expect(monitors).toHaveLength(2);
     // The replaced monitor stays stopped; it never serves the new session.
     await expect(monitors[0]!.ensureStarted()).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
-    supervision.shutdown();
+    await supervision.shutdown();
   });
 
   it("keeps replay deduplication correct across a pane move", async () => {
@@ -489,6 +489,6 @@ describe("review-round remediations", () => {
     const detail = jobs.get(reservation.jobId)!;
     expect(detail.request).toMatchObject({ child: { agentKind: "claude", profileName: "worker-claude", requestedAgentKind: "pi", requestedProfileName: "worker-pi" } });
     expect(detail.supervision?.child).toMatchObject({ agentKind: "claude", profileName: "worker-claude", requestedAgentKind: "pi", requestedProfileName: "worker-pi" });
-    supervision.shutdown();
+    await supervision.shutdown();
   });
 });

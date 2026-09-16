@@ -11,8 +11,9 @@ the exact child agent it launched for the whole life of that child, binding as s
 exact launch identity is proven, before optional focus or assignment. Assignment
 confirmation remains a separate launch-success gate. If assignment consumption is not
 proven, launch fails while retaining the active supervisor so the child remains observable.
-Supervision is observation and notification. It never mutates the child, never gates the
-child's work, and never becomes an eighth public tool.
+Supervision remains an internal service, not an eighth public tool. It observes the raw
+child lifecycle and, for Tools-managed handoff runs, may withhold completion acceptance
+and send one identity-bound repair prompt. It does not veto Herdr core state transitions.
 
 The seven public tools are unchanged: `herdr_inspect`, `herdr_communicate`, `herdr_wait`,
 `herdr_jobs`, `herdr_launch`, `herdr_pane`, `herdr_tab`.
@@ -431,8 +432,9 @@ ID as a one-item target array.
 
 **Cancellation refusal (requirements 2 and 13).** `herdr_jobs cancel` on a supervisor job
 whose exact child is still live throws `SUPERVISION_ACTIVE`. Manager-session shutdown
-(`session_shutdown`, MCP shutdown, `beginSession`) cancels supervisors unconditionally.
-Exact-child termination settles the supervisor by itself.
+(`session_shutdown`, MCP shutdown, `beginSession`) stops in-memory supervisors but does
+not fabricate cancellation; an unresolved handoff record remains `recovery_pending`.
+Exact-child termination settles only after required runtime-authored evidence persists.
 
 **Soft receipts (requirement 12).** Every material event carries an opaque `eventId`.
 `herdr_jobs get` returns at most `SUPERVISION_MAX_RETURNED_EVENTS = 16` unobserved events,

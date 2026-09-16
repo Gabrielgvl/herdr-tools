@@ -13,10 +13,26 @@ import type { AttachmentStore, PublishedAttachment } from "../../src/messages/st
 import { AdapterContractError } from "../../src/mcp/adapter.js";
 import type * as AdapterModule from "../../src/mcp/adapter.js";
 import type * as FsPromises from "node:fs/promises";
+import type * as SupervisionRegistryModule from "../../src/supervision/registry.js";
 import { StartupRefusal } from "../../src/mcp/host.js";
 
 const readFileMock = vi.hoisted(() => vi.fn());
 vi.mock("node:fs/promises", async (importOriginal) => ({ ...(await importOriginal<typeof FsPromises>()), readFile: readFileMock }));
+
+/** Capture the options the MCP host composes its supervision registry from. */
+const registryOptions = vi.hoisted(() => ({ last: undefined as Record<string, unknown> | undefined }));
+vi.mock("../../src/supervision/registry.js", async (importOriginal) => {
+  const real = await importOriginal<typeof SupervisionRegistryModule>();
+  return {
+    ...real,
+    SupervisionRegistry: class extends real.SupervisionRegistry {
+      constructor(options: ConstructorParameters<typeof real.SupervisionRegistry>[0]) {
+        super(options);
+        registryOptions.last = options as unknown as Record<string, unknown>;
+      }
+    },
+  };
+});
 
 const describeFailure = vi.hoisted(() => ({ enabled: false }));
 vi.mock("../../src/mcp/adapter.js", async (importOriginal) => {
@@ -665,5 +681,20 @@ describe("MCP server lifecycle", () => {
     await vi.waitFor(() => expect(harness.exits).toEqual([0]));
     signalled[1]!();
     expect(harness.exits).toEqual([0]);
+  });
+  it("wires the supervision repair transport to the host's own prompt client", async () => {
+    const promptClient: AgentPromptClient = {
+      prompt: vi.fn(async () => ({ id: "repair-prompt", result: { type: "agent_prompted", agent: { pane_id: "w:p2" } } })),
+      ping: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const harness = await start({ promptClient });
+    // The gate's repair prompt must reach the exact child through the same
+    // authenticated prompt transport every other send on this host uses.
+    const repairPrompt = registryOptions.last!.repairPrompt as (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
+    const signal = new AbortController().signal;
+    await expect(repairPrompt("w:p2", "repair the handoff artifact", signal)).resolves.toMatchObject({ id: "repair-prompt" });
+    expect(promptClient.prompt).toHaveBeenCalledWith("w:p2", "repair the handoff artifact", signal);
+    await harness.handle.shutdown();
   });
 });

@@ -693,6 +693,45 @@ describe("JobRegistry", () => {
     longIdRegistry.cancel(longIdHandle.jobId);
   });
 
+  it("preserves bounded handoff evidence through result copy and every detail tier", async () => {
+    const registry = new JobRegistry({ idFactory: () => "job_handoff_copy", clock: { now: () => 10 } });
+    const result: JobRunResult = {
+      wait_result: "condition_met",
+      matched: true,
+      reason: "condition_met",
+      targets: [{ target: "one", targetId: "p1", metadata: { agent_status: "done" }, recentUnwrappedLines: ["done"], observedAtMs: 1, matched: true, handoff: { runId: "run-1", gate: "accepted", status: "done" } }]
+    };
+    const handle = registry.register(request, async () => result);
+    await handle.promise;
+    expect(registry.get(handle.jobId)?.result?.targets?.[0]?.handoff).toEqual({ runId: "run-1", gate: "accepted", status: "done" });
+
+    const evidence = {
+      gated: true as const,
+      runId: "run-1",
+      path: "/tmp/run-1/handoff.md",
+      state: "handed_off" as const,
+      validation: { state: "accepted" as const },
+      artifact: { status: "done" as const, version: 2, sha256: "abc123", bytes: 42 },
+      repair: { attempts: 1, fenceVersion: 0 }
+    };
+    const base: JobDetail = { jobId: "job_hf", kind: "supervisor", operation_phase: "settled", supervision_result: "released", sequence: 1, createdAtMs: 1, request: provisionalRequest, handoff: evidence };
+    expect(publicDetail(base).handoff).toEqual(evidence);
+    // Forcing every tier below the bound runs compact then minimal; the
+    // bounded block survives both instead of being silently stripped.
+    const bulky: JobDetail = { ...base, progress: { text: "progress", atMs: 1, details: { evidence: "e".repeat(100_000) } } };
+    const degraded = publicDetail(bulky, 1);
+    expect(degraded.truncation).toMatchObject({ publicEvidenceOmitted: true });
+    expect(degraded.handoff).toEqual(evidence);
+    // The explicit ungated reason projects through unchanged.
+    expect(publicDetail({ ...base, handoff: { gated: false as const, reason: "no_managed_run" as const } }).handoff).toEqual({ gated: false, reason: "no_managed_run" });
+    // Malformed evidence is omitted and counted, never projected.
+    const malformed = publicDetail({ ...base, handoff: { gated: true, runId: 7 } as unknown as JobDetail["handoff"] });
+    expect(malformed.handoff).toBeUndefined();
+    expect(malformed.truncation).toMatchObject({ handoffEvidence: 1 });
+    // No secret material ever reaches the projection.
+    expect(JSON.stringify(publicDetail(base).handoff)).not.toContain("token");
+  });
+
   it("requires a live matching installed supervisor before publishing a binding", async () => {
     let id = 0;
     const registry = new JobRegistry({ idFactory: () => `job_publication_${++id}`, quiescenceMs: 0 });

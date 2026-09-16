@@ -1,4 +1,9 @@
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { createHandoffAllocator, readHandoffState, type HandoffAllocation } from "../../src/handoff.js";
+import { createHandoffGate, type HandoffGate } from "../../src/handoff-gate.js";
 import type { SupervisionChildBindingPublication } from "../../src/job-registry.js";
 import { ReviewerFailure } from "../../src/reviewer.js";
 import type { ReconciliationFailureReason, SupervisionEvent } from "../../src/supervision/events.js";
@@ -98,6 +103,8 @@ interface HarnessOptions {
   cadenceMs?: number;
   child?: SupervisorDependencies["child"];
   selfClose?: SelfCloseTracker;
+  handoffs?: HandoffGate;
+  repairPrompt?: SupervisorDependencies["repairPrompt"];
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -144,6 +151,8 @@ function harness(options: HarnessOptions = {}): Harness {
     clock: { now: () => 1_000 },
     scheduler,
     ...(options.selfClose ? { selfClose: options.selfClose } : {}),
+    ...(options.handoffs ? { handoffs: options.handoffs } : {}),
+    ...(options.repairPrompt ? { repairPrompt: options.repairPrompt } : {}),
     readTranscript: options.transcript ?? (async () => ["line"]),
     idFactory: (() => { let id = 0; return () => `e${++id}`; })(),
     update: (text) => { progress.push(text); },
@@ -2440,5 +2449,224 @@ describe("self-close wake suppression", () => {
     await deferred.supervisor.onEvent(thinEvent("pane_closed"));
     await vi.waitFor(() => expect(deferred.wakes).toHaveLength(1));
     expect(types(deferred.wakes)).toEqual(["pane_closed"]);
+  });
+});
+
+describe("managed handoff evaluation", () => {
+  async function managedAllocation(): Promise<HandoffAllocation> {
+    const dir = await mkdtemp(join(tmpdir(), "herdr-supervisor-handoff-"));
+    await chmod(dir, 0o700);
+    const allocator = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+    const allocation = await allocator.allocate();
+    await allocator.persist(allocation, {
+      manager: { paneId: "p0", display: "caller", source: "injected" },
+      child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: [] },
+    });
+    return allocation;
+  }
+
+  const writeArtifact = (allocation: HandoffAllocation, status: string, summary = "Finished the work.") =>
+    writeFile(
+      allocation.artifactPath,
+      `${allocation.marker}\n\n## Status\n${status}\n\n## Summary\n${summary}\n\n## Changes\n- src/a.ts\n\n## Verification\nnpm test passed.\n\n## Blockers\nNone\n\n## Continuation\nNone\n`,
+      { mode: 0o600 },
+    );
+
+  /** Count every gate read so a queued evaluation that never ran is provable. */
+  function countValidations(gate: HandoffGate): () => number {
+    const real = gate.validate.bind(gate);
+    let count = 0;
+    gate.validate = async (run) => { count += 1; return real(run); };
+    return () => count;
+  }
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const workingOrigin = () => snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 })]);
+
+  async function managed(options: { snapshots?: Array<HerdrSnapshot | Error | Promise<HerdrSnapshot>>; repairPrompt?: SupervisorDependencies["repairPrompt"] } = {}) {
+    const gate = createHandoffGate();
+    const h = harness({
+      snapshots: options.snapshots ?? [workingOrigin()],
+      handoffs: gate,
+      ...(options.repairPrompt ? { repairPrompt: options.repairPrompt } : {}),
+    });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+    const allocation = await managedAllocation();
+    const run = await gate.bind(allocation, identity);
+    return { gate, h, allocation, run };
+  }
+
+  it("keeps a blocked child in repair when its artifact reports done", async () => {
+    const prompts: Array<{ paneId: string; text: string }> = [];
+    const { h, allocation, run } = await managed({ repairPrompt: async (paneId, text) => { prompts.push({ paneId, text }); } });
+    await writeArtifact(allocation, "done");
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 6, stateChangeSeq: 6 })));
+    await vi.waitFor(() => expect(prompts).toHaveLength(1));
+
+    // The artifact is valid and was accepted into the sidecar, but a `done`
+    // status does not correspond to a blocked child: the run stays unmatched,
+    // stays awaiting_handoff, and earns exactly one fenced repair prompt.
+    const state = await readHandoffState(allocation);
+    expect(state.lifecycle.state).toBe("awaiting_handoff");
+    expect(state.artifact).toMatchObject({ version: 1, status: "done" });
+    expect(state.repair).toMatchObject({ attempts: 1, fence: { version: 1 } });
+    expect(run.lastValidation).toEqual({ state: "accepted" });
+    expect(prompts[0]).toMatchObject({ paneId: "p1" });
+    expect(prompts[0]!.text).toContain("(accepted)");
+    expect(prompts[0]!.text).toContain(allocation.artifactPath);
+    // Supervision never settles on an unmatched artifact.
+    expect(h.supervisor.view().state).toBe("active");
+    h.supervisor.shutdown();
+  });
+
+  it("names the parser's refusal in the repair prompt when the artifact is invalid", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    await writeFile(allocation.artifactPath, `${allocation.marker}\n\nno headings at all\n`, { mode: 0o600 });
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+    await vi.waitFor(() => expect(prompts).toHaveLength(1));
+    expect(prompts[0]).toContain("(invalid:headings_mismatch)");
+    expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+    h.supervisor.shutdown();
+  });
+
+  it("never consumes a repair fence on a host that cannot prompt", async () => {
+    const { h, allocation, run } = await managed();
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+    await vi.waitFor(() => expect(run.lastValidation).toEqual({ state: "missing" }));
+    // The verdict was computed and the run left unresolved, but with no prompt
+    // transport no attempt is recorded and no version is ever fenced.
+    const state = await readHandoffState(allocation);
+    expect(state.repair).toEqual({ attempts: 0, fence: null });
+    expect(state.lifecycle.state).toBe("awaiting_handoff");
+    h.supervisor.shutdown();
+  });
+
+  it("sends no second prompt when the version is already fenced or the fence write fails", async () => {
+    const prompts: string[] = [];
+    const { gate, h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    const validations = countValidations(gate);
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+    await vi.waitFor(() => expect(prompts).toHaveLength(1));
+
+    // A later terminal observation on the same artifact version finds the fence
+    // standing, so `beginRepair` grants no token and nothing is sent.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7, stateChangeSeq: 7 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 8, stateChangeSeq: 8 })));
+    await vi.waitFor(() => expect(validations()).toBe(2));
+    expect(prompts).toHaveLength(1);
+    expect((await readHandoffState(allocation)).repair.attempts).toBe(1);
+
+    // A fence that cannot be persisted yields no token either: the failed write
+    // is never treated as permission to send.
+    gate.beginRepair = async () => { throw new Error("sidecar is unavailable"); };
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 9, stateChangeSeq: 9 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 10, stateChangeSeq: 10 })));
+    await vi.waitFor(() => expect(validations()).toBe(3));
+    expect(prompts).toHaveLength(1);
+    expect((await readHandoffState(allocation)).repair.attempts).toBe(1);
+    h.supervisor.shutdown();
+  });
+
+  it("treats a failed gate read as no evidence rather than a settlement", async () => {
+    const prompts: string[] = [];
+    const { gate, h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    let reads = 0;
+    gate.validate = async () => { reads += 1; throw new Error("gate exploded"); };
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+    await vi.waitFor(() => expect(reads).toBe(1));
+    await sleep(20);
+    // No verdict means no acceptance, no repair, and no settlement.
+    expect(prompts).toHaveLength(0);
+    expect((await readHandoffState(allocation)).repair.attempts).toBe(0);
+    expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+    expect(h.supervisor.view().state).toBe("active");
+    h.supervisor.shutdown();
+  });
+
+  it("keeps folding evidence when the gate throws outside the guarded calls", async () => {
+    const { gate, h, run } = await managed();
+    const realLookup = gate.lookup.bind(gate);
+    let poisoned = true;
+    gate.lookup = (target) => {
+      if (!poisoned) return realLookup(target);
+      poisoned = false;
+      throw new Error("gate exploded");
+    };
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+    // The rejected evaluation is swallowed; the mutation chain survives it and
+    // the next terminal observation is still evaluated.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7, stateChangeSeq: 7 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 8, stateChangeSeq: 8 })));
+    await vi.waitFor(() => expect(run.lastValidation).toEqual({ state: "missing" }));
+    expect(h.supervisor.view().state).toBe("active");
+    h.supervisor.shutdown();
+  });
+
+  it("abandons a queued evaluation when the status left terminal before it ran", async () => {
+    const { gate, h } = await managed();
+    const validations = countValidations(gate);
+    // Both events land in one fold: the terminal observation queues the
+    // evaluation, and the working transition behind it reopens the cycle
+    // before the queued task reaches the chain.
+    const folding = h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+    void h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7, stateChangeSeq: 7 })));
+    await folding;
+    await sleep(20);
+    expect(validations()).toBe(0);
+    expect(h.supervisor.view().status).toBe("working");
+    h.supervisor.shutdown();
+  });
+
+  it("abandons a queued evaluation when the supervisor stopped before it ran", async () => {
+    let release!: (value: HerdrSnapshot) => void;
+    const blocked = new Promise<HerdrSnapshot>((resolve) => { release = resolve; });
+    const { gate, h, allocation } = await managed({ snapshots: [workingOrigin(), blocked] });
+    const validations = countValidations(gate);
+
+    // The terminal observation queues the evaluation; the thin event behind it
+    // parks the same fold on a reconciliation snapshot that has not arrived.
+    const folding = h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+    void h.supervisor.onEvent(thinEvent("pane_exited"));
+    await sleep(20);
+    h.supervisor.shutdown();
+    release(snapshot([paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })]));
+    await folding;
+    await sleep(20);
+    expect(validations()).toBe(0);
+    expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+  });
+
+  it("follows a proven move so the repair prompt reaches the child's current pane", async () => {
+    const prompts: Array<{ paneId: string; text: string }> = [];
+    const moved = paneRecord({ paneId: "p2", status: "working", revision: 1, stateChangeSeq: 8 });
+    const { h, run } = await managed({
+      snapshots: [workingOrigin(), snapshot([moved], [{ pane_id: "p2", name: "worker" }])],
+      repairPrompt: async (paneId, text) => { prompts.push({ paneId, text }); },
+    });
+
+    await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
+    expect(h.supervisor.view().child?.paneId).toBe("p2");
+    // The gate's bound run tracks the move, so the repair reaches the exact
+    // child where it now lives rather than where it was launched.
+    expect(run.identity.paneId).toBe("p2");
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ paneId: "p2", status: "done", revision: 2, stateChangeSeq: 9 })));
+    await vi.waitFor(() => expect(prompts).toHaveLength(1));
+    expect(prompts[0]).toMatchObject({ paneId: "p2" });
+    h.supervisor.shutdown();
+  });
+
+  it("reports an unbound identity as the reason a gated host is still ungated", async () => {
+    const h = harness({ snapshots: [workingOrigin()], handoffs: createHandoffGate() });
+    expect(h.supervisor.handoffEvidence()).toEqual({ gated: false, reason: "identity_unavailable" });
+    await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 5 });
+    expect(h.supervisor.handoffEvidence()).toEqual({ gated: false, reason: "no_managed_run" });
+    h.supervisor.shutdown();
   });
 });

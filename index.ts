@@ -9,6 +9,7 @@ import { RecipientRegistry } from "./src/messages/recipients.js";
 import { JobRegistry } from "./src/job-registry.js";
 import { notificationForJob } from "./src/job-notification.js";
 import { createCliTranscriptReader, SupervisionRegistry } from "./src/supervision/registry.js";
+import { createHandoffGate, type HandoffGate } from "./src/handoff-gate.js";
 import { createPiSupervisionNotifier } from "./src/supervision/notify.js";
 import { createRegistryModelService, type SupervisionModelService } from "./src/supervision/model-service.js";
 import type { ModelRegistrySeam } from "./src/reviewer.js";
@@ -34,6 +35,8 @@ export interface ExtensionRuntime {
   ownership: RuntimeOwnership;
   jobs: JobRegistry;
   supervision: SupervisionRegistry;
+  /** The host's shared managed-handoff gate: one registry for launch binding and wait gating. */
+  handoffs: HandoffGate;
   /** Bound when a Pi session context first exists; before that review degrades visibly. */
   bindModelRegistry: (registry: ModelRegistrySeam) => void;
   waitJobsUi: WaitJobsUi;
@@ -83,6 +86,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   // the supervision reviewer resolves through this holder rather than a
   // construction-time value.
   const models: { current?: SupervisionModelService } = {};
+  const handoffs = createHandoffGate();
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: () => loadSettings(),
@@ -90,6 +94,8 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
     ...(pi.sendMessage ? { notifier: createPiSupervisionNotifier((message, deliveryOptions) => pi.sendMessage!(message, deliveryOptions)) } : {}),
     models: () => models.current,
     monitorOptions: { env },
+    handoffs,
+    repairPrompt: (paneId, text, signal) => cli.prompt(paneId, text, signal),
   });
   return {
     cli,
@@ -97,6 +103,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
     ownership: new RuntimeOwnership(),
     jobs,
     supervision,
+    handoffs,
     bindModelRegistry: (registry) => { models.current = createRegistryModelService(registry); },
     waitJobsUi,
     attachments: options.attachments ?? defaultAttachmentStore,
@@ -125,7 +132,7 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     // operation may be dispatched into a closed session.
     await runtime.queueFlush.shutdown();
     runtime.cli.closePromptTransport();
-    runtime.supervision.shutdown();
+    await runtime.supervision.shutdown();
     runtime.jobs.shutdown();
     runtime.recipients.reset();
     resetOwnership(runtime.ownership);
@@ -138,7 +145,7 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     // Supervision is session-scoped: the previous session's supervisors and
     // event connection are stopped and a fresh monitor replaces them, so a
     // session that follows a shutdown can still launch.
-    runtime.supervision.beginSession();
+    await runtime.supervision.beginSession();
     runtime.jobs.beginSession();
     runtime.waitJobsUi.beginSession(context);
     runtime.recipients.reset();
@@ -166,6 +173,7 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     attachments: runtime.attachments,
     recipients: runtime.recipients,
     supervision: runtime.supervision,
+    handoffs: runtime.handoffs,
     queueFlush: runtime.queueFlush,
   });
   pi.registerTool(surface.inspect);

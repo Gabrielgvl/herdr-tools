@@ -14,6 +14,8 @@ Make supervision converge from authoritative session snapshots even when the soc
 
 Make the same supervisor the semantic review owner for that child. A long `herdr_wait` must continue to evaluate its authoritative condition, but it must not invoke a second semantic reviewer for a target already covered by an active exact-child supervisor. Targets without that coverage retain the existing required wait reviewer.
 
+For Tools-managed handoff runs, authoritative identity also selects the completion gate. A matching `idle`, `done`, or other terminal observation remains unmatched while the current artifact is missing or invalid, so repair has time to complete. Validation is asynchronous in each target reader before `any` or `all` aggregation. A non-strict wait without authoritative managed-run identity remains observation-only. Turn-level cancellation does not create run-cancellation evidence. Host shutdown leaves unresolved durable state `recovery_pending`; automatic restoration is deferred.
+
 Success has five observable properties:
 
 1. An identity-proven child is bound to supervision before focus or assignment can fail.

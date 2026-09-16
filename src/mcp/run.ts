@@ -18,6 +18,7 @@ import { discoverProfiles } from "../profiles/discovery.js";
 import type { ProfileCatalog } from "../profiles/types.js";
 import { ReviewerFailure } from "../reviewer.js";
 import { createCliTranscriptReader, SupervisionRegistry } from "../supervision/registry.js";
+import { createHandoffGate } from "../handoff-gate.js";
 import { createSelfCloseTracker } from "../supervision/self-close.js";
 import { CLAUDE_CHANNEL_CAPABILITY, createMcpHostWake } from "../supervision/notify.js";
 import { createBuiltinModelService } from "../supervision/model-service.js";
@@ -153,6 +154,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   // and every supervisor this registry creates consults it before waking a
   // pane_closed. Both directions stay in this process; nothing persists.
   const selfClose = createSelfCloseTracker();
+  const handoffs = createHandoffGate();
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
@@ -164,6 +166,8 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     models: () => createBuiltinModelService(),
     monitorOptions: { ...(deps.env ? { env: deps.env } : {}) },
     selfClose,
+    handoffs,
+    repairPrompt: (paneId, text, signal) => cli.prompt(paneId, text, signal),
   });
   const surface = createToolSurface({
     cli,
@@ -180,6 +184,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     supervision,
     selfClose,
     queueFlush,
+    handoffs,
     // Model-backed wait review is a Pi capability. Failing closed here keeps a
     // wait beyond the configured review cadence from running unsupervised.
     // Supervision review is separate and does run here, through its own service.
@@ -235,7 +240,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     // its turn is refused instead of mutating during teardown.
     queue.close();
     cli.closePromptTransport();
-    supervision.shutdown();
+    await supervision.shutdown();
     jobs.shutdown();
     recipients.reset();
     resetOwnership(ownership);

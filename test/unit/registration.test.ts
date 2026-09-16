@@ -1,8 +1,24 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type * as SupervisionRegistryModule from "../../src/supervision/registry.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const readFileMock = vi.hoisted(() => vi.fn());
 vi.mock("node:fs/promises", () => ({ readFile: readFileMock }));
+
+/** Capture the options the runtime composes its supervision registry from. */
+const registryOptions = vi.hoisted(() => ({ last: undefined as Record<string, unknown> | undefined }));
+vi.mock("../../src/supervision/registry.js", async (importOriginal) => {
+  const real = await importOriginal<typeof SupervisionRegistryModule>();
+  return {
+    ...real,
+    SupervisionRegistry: class extends real.SupervisionRegistry {
+      constructor(options: ConstructorParameters<typeof real.SupervisionRegistry>[0]) {
+        super(options);
+        registryOptions.last = options as unknown as Record<string, unknown>;
+      }
+    },
+  };
+});
 
 import extension, { CORE_TOOL_NAMES, createPreflight, createRuntime, notificationForJob, readInjectedContext } from "../../index.js";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
@@ -231,6 +247,24 @@ describe("global extension registration", () => {
     await rejectingHandle.promise;
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(asyncReject).toHaveBeenCalledTimes(1);
+  });
+
+  it("wires the supervision repair transport to the runtime's own prompt client", async () => {
+    enable();
+    const { pi } = fakePi();
+    const promptClient = {
+      prompt: vi.fn(async () => ({ id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { pane_id: "w1:p2" } } })),
+      ping: vi.fn(async () => undefined),
+      close: vi.fn(),
+    };
+    createRuntime(pi, process.env, { promptClient });
+    // The gate's repair prompt must reach the exact child through the same
+    // authenticated prompt transport every other send uses.
+    const repairPrompt = registryOptions.last!.repairPrompt as (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
+    const signal = new AbortController().signal;
+    await expect(repairPrompt("w1:p2", "repair the handoff artifact", signal)).resolves.toMatchObject({ id: "cli:agent:prompt" });
+    expect(promptClient.prompt).toHaveBeenCalledWith("w1:p2", "repair the handoff artifact", signal);
+    expect(pi.exec).not.toHaveBeenCalled();
   });
 
   it("suppresses notification for explicit cancel and shutdown", async () => {

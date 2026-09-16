@@ -1,6 +1,7 @@
-import { mkdirSync, mkdtempSync, promises as fsPromises, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, promises as fsPromises, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentPromptError } from "../../src/agent-prompt.js";
@@ -8,6 +9,7 @@ import { CliProtocolError } from "../../src/cli.js";
 import { errorOutcome } from "../../src/mcp/adapter.js";
 import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
 import { LaunchParamsSchema, renderAssignment, type LaunchAssignment, type LaunchParams } from "../../src/launch-schema.js";
+import { createHandoffAllocator, renderHandoffContract, type HandoffAllocation, type HandoffAllocator } from "../../src/handoff.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
 import { parseProfile, profileSource, skillTreeDigest, SKILL_BUNDLE_REGISTRY_FILE, type ProfileCatalog } from "../../src/profiles/index.js";
@@ -21,8 +23,27 @@ let lastSupervision: StubSupervision;
 const createLaunchTool = (deps: Omit<LaunchDependencies, "preflight" | "supervision"> & Partial<Pick<LaunchDependencies, "preflight" | "supervision">>) => {
   lastSupervision = (deps.supervision as StubSupervision | undefined) ?? stubSupervision();
   const launchGate = deps.launchGate ?? (async () => ({ check: async () => undefined, release: async () => undefined }));
-  return createLaunchToolImplementation({ ...deps, launchGate, preflight: deps.preflight ?? testPreflight, supervision: lastSupervision });
+  const handoffs = deps.handoffs ?? fakeHandoffs();
+  return createLaunchToolImplementation({ ...deps, launchGate, handoffs, preflight: deps.preflight ?? testPreflight, supervision: lastSupervision });
 };
+/**
+ * In-memory allocator for the launch suite: the real one's native flock and
+ * fs writes land outside the microtask drain window fake-timer tests drive.
+ * Tests that need the real commit path inject a `createHandoffAllocator` over
+ * a tmpdir namespace themselves.
+ */
+function fakeHandoffs(): HandoffAllocator {
+  return {
+    allocate: async () => {
+      const runId = randomUUID();
+      const namespaceDir = join(tmpdir(), `herdr-handoffs-test-${randomUUID()}`);
+      const directory = join(namespaceDir, runId);
+      const toolsDir = join(directory, ".tools");
+      return { runId, namespaceDir, directory, artifactPath: join(directory, "handoff.md"), toolsDir, statePath: join(toolsDir, "state.json"), lockPath: join(toolsDir, "lock"), marker: `herdr-run:${runId}` };
+    },
+    persist: async () => undefined
+  };
+}
 const GRANT_PATH = "/cache/recipient";
 const fakeGrant = () => ({ path: GRANT_PATH, token: "grant-recipient", renew: async () => undefined, release: async () => undefined });
 const publishedAttachment = { attachmentId: "attachment-1", path: "/cache/recipient/attachment-1/body.txt", bytes: 4, sha256: "b".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" };
@@ -91,9 +112,9 @@ const observedPane = (state: string | undefined, stateChangeSeq: number | undefi
 
 function profile(name: string, kind: "pi" | "claude" | "agy" | "devin" = "pi", fallbackProfiles: string[] = [], agyMode: "plan" | "accept-edits" = "plan") {
   const runtime = kind === "pi"
-    ? "  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]"
+    ? "  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read, write]"
     : kind === "claude"
-      ? "  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]"
+      ? "  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read, Write]\n  disallowedTools: [Edit]"
       : kind === "devin"
         ? "  kind: devin\n  model: swe-2-max\n  permissionMode: dangerous"
         : `  kind: agy\n  model: gemini-3.8-flash-high\n  mode: ${agyMode}\n  addDirs: []`;
@@ -107,8 +128,8 @@ function scopeRoot(label: string): string {
 
 function scopedProfile(root: string, name: string, resources: string, fallbackProfiles: string[] = [], kind: "pi" | "claude" = "pi") {
   const runtime = kind === "pi"
-    ? `  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read]\n${resources}`
-    : `  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read]\n  disallowedTools: [Edit]\n${resources}`;
+    ? `  kind: pi\n  model: test/model\n  thinking: low\n  tools: [read, write]\n${resources}`
+    : `  kind: claude\n  model: claude/test\n  effort: medium\n  permissionMode: dontAsk\n  allowedTools: [Read, Write]\n  disallowedTools: [Edit]\n${resources}`;
   return parseProfile(`---\nname: ${name}\ndescription: ${name}\ntimeoutMinutes: 30\nsessionPersistence: ${kind !== "pi"}\nruntime:\n${runtime}\nfallbackProfiles: ${JSON.stringify(fallbackProfiles)}\n---\n\nProfile body for ${name}.\n`, profileSource("bundled", join(root, `${name}.md`), root));
 }
 
@@ -307,7 +328,7 @@ function launch(
   profiles: ProfileCatalog,
   cli = makeCli().cli,
   promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) },
-  extras: { attachments?: AttachmentStore; recipients?: RecipientRegistry; clock?: LaunchClock; supervision?: StubSupervision; queueFlush?: LaunchDependencies["queueFlush"] } = {}
+  extras: { attachments?: AttachmentStore; recipients?: RecipientRegistry; clock?: LaunchClock; supervision?: StubSupervision; queueFlush?: LaunchDependencies["queueFlush"]; handoffs?: HandoffAllocator } = {}
 ) {
   const tool = createLaunchTool({
     cli,
@@ -319,7 +340,8 @@ function launch(
     recipients: extras.recipients ?? new RecipientRegistry(),
     ...(extras.supervision === undefined ? {} : { supervision: extras.supervision }),
     ...(extras.clock === undefined ? {} : { clock: extras.clock }),
-    ...(extras.queueFlush === undefined ? {} : { queueFlush: extras.queueFlush })
+    ...(extras.queueFlush === undefined ? {} : { queueFlush: extras.queueFlush }),
+    ...(extras.handoffs === undefined ? {} : { handoffs: extras.handoffs })
   });
   return tool.execute("id", params, new AbortController().signal, undefined, extensionContext);
 }
@@ -2941,7 +2963,9 @@ describe("herdr_launch profile-only contract", () => {
     const worker = profile("worker-pi", "pi");
     const result = await launch({ name: "worker", profile: "worker-pi", assignment: assign("body"), assignmentDelivery: "attachment" }, catalog(worker), harness.cli, undefined, { attachments, recipients });
     expect(attachments.ensureRecipient).toHaveBeenCalledTimes(1);
-    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: renderAssignment(assign("body")), operation: "assignment", recipientAgentName: "worker" }));
+    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining(renderAssignment(assign("body"))), operation: "assignment", recipientAgentName: "worker" }));
+    expect(vi.mocked(attachments.publish).mock.calls[0]![0].body).toContain(`herdr-run:${result.details.handoff!.runId}`);
+    expect(vi.mocked(attachments.publish).mock.calls[0]![0].body).toContain(result.details.handoff!.path);
     expect(harness.calls).toContainEqual(PROMPT_CALL("w1:p2"));
     expect(harness.calls.find((call) => call[1] === "start")).toEqual(expect.arrayContaining(["--append-system-prompt", "/cache/body.md"]));
     expect(harness.promptInputs[0]).toContain("delivery: attachment");
@@ -3088,8 +3112,8 @@ describe("herdr_launch profile-only contract", () => {
     const calls: string[][] = [];
     const promptSources = { create: vi.fn(async () => ({ path: "/cache/custom.md" })) };
     const result = await launch({ assignment: assign("go"), name: "worker", profile: "custom-profile", overrides: { model: "override/model", thinking: "high" } }, catalog(worker), makeCli({ calls }).cli, promptSources);
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/custom.md"]);
-    expect(result.details).toMatchObject({ profile: { name: "custom-profile", requested: "custom-profile", selected: "custom-profile", source: { path: "/profiles/custom-profile.md" }, timeoutMinutes: 30, runtime: { kind: "pi", model: "override/model", thinking: "high" }, permissions: { sessionPersistence: false, tools: ["read"], extensions: [], skills: [] }, attempts: [{ profile: "custom-profile", outcome: "selected" }] } });
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,write", "--no-skills", "--no-session", "--append-system-prompt", "/cache/custom.md"]);
+    expect(result.details).toMatchObject({ profile: { name: "custom-profile", requested: "custom-profile", selected: "custom-profile", source: { path: "/profiles/custom-profile.md" }, timeoutMinutes: 30, runtime: { kind: "pi", model: "override/model", thinking: "high" }, permissions: { sessionPersistence: false, tools: ["read", "write"], extensions: [], skills: [] }, attempts: [{ profile: "custom-profile", outcome: "selected" }] } });
   });
 
   it("reports capability overrides but keeps resource selection profile-only", async () => {
@@ -3099,9 +3123,9 @@ describe("herdr_launch profile-only contract", () => {
     writeFileSync(join(root, "base-extension.ts"), "export default 0;\n");
     const resourceProfile = scopedProfile(root, "resource-profile", "  extensions: [./base-extension.ts]\n  skills: [./base-skill]");
     const calls: string[][] = [];
-    const result = await launch({ assignment: assign("go"), name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "grep"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
-    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,grep", "--extension", join(root, "base-extension.ts"), "--no-skills", "--skill", join(root, "base-skill"), "--no-session", "--append-system-prompt", "/cache/body.md"]);
-    expect(result.details).toMatchObject({ profile: { runtime: { model: "override/model", thinking: "high" }, permissions: { tools: ["read", "grep"], extensions: [join(root, "base-extension.ts")], skills: [join(root, "base-skill")] } } });
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "resource-profile", overrides: { model: "override/model", thinking: "high", tools: ["read", "write", "grep"] } }, catalog(resourceProfile), makeCli({ calls }).cli);
+    expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "override/model", "--thinking", "high", "--tools", "read,write,grep", "--extension", join(root, "base-extension.ts"), "--no-skills", "--skill", join(root, "base-skill"), "--no-session", "--append-system-prompt", "/cache/body.md"]);
+    expect(result.details).toMatchObject({ profile: { runtime: { model: "override/model", thinking: "high" }, permissions: { tools: ["read", "write", "grep"], extensions: [join(root, "base-extension.ts")], skills: [join(root, "base-skill")] } } });
     for (const key of ["extensions", "skills"]) {
       await expect(launch({ assignment: assign("go"), name: "worker", profile: "resource-profile", overrides: { [key]: ["./base-skill"] } as never }, catalog(resourceProfile), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     }
@@ -3246,11 +3270,15 @@ describe("herdr_launch profile-only contract", () => {
       prompt: vi.fn(async (target, text, signal) => { order.push("agent prompt"); return base.cli.prompt(target, text, signal); })
     };
     const result = await launch({ name: "worker", profile: "worker", assignment: assign("begin") }, catalog(worker), cli, promptSources);
-    expect(order.slice(0, 5)).toEqual(["source", "pane current", "api snapshot", "pane split", "pane rename"]);
+    expect(order.slice(0, 5)).toEqual(["pane current", "api snapshot", "source", "pane split", "pane rename"]);
     // The wrapped envelope travels over the prompt client, never in argv.
     expect(base.calls).toContainEqual(PROMPT_CALL("w1:p2"));
-    expect(base.promptInputs).toEqual([envelope("begin")]);
-    expect(base.calls.flat()).not.toContain(envelope("begin"));
+    expect(base.promptInputs).toHaveLength(1);
+    expect(base.promptInputs[0]).toContain(envelope("begin"));
+    expect(base.promptInputs[0]).toContain(`herdr-run:${result.details.handoff!.runId}`);
+    expect(base.promptInputs[0]).toContain(result.details.handoff!.path);
+    expect(base.promptInputs[0]).toContain("## Status");
+    expect(base.calls.flat()).not.toContain(base.promptInputs[0]);
     expect(result.details).toMatchObject({ initialPromptSent: true, initialPromptDelivery: "inline", envelope: { version: "v1", kind: "assignment", delivery: "inline" } });
   });
 
@@ -3278,11 +3306,21 @@ describe("herdr_launch profile-only contract", () => {
     const fallbackPane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" } };
     // First pane read proves no agent survived the failed attempt; the next two
     // are the selected attempt's readiness baseline and confirmation samples.
+    const allocations: HandoffAllocation[] = [];
+    const namespace = { dir: mkdtempSync(join(tmpdir(), "herdr-handoffs-fallback-")), endpoint: "test-endpoint" };
+    const inner = createHandoffAllocator({ namespace });
+    const handoffs: HandoffAllocator = {
+      allocate: async () => { const run = await inner.allocate(); allocations.push(run); return run; },
+      persist: (run, identity) => inner.persist(run, identity)
+    };
     const result = await launch({ assignment: assign("go"), name: "worker", profile: "primary", overrides: { model: "override/model", thinking: "high" } }, catalog(first, second), makeCli({ calls, paneStates: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" }, { ...fallbackPane, ...lifecycleFor(0) }, { ...fallbackPane, ...lifecycleFor(1) }] , start: (argv, attempt) => {
       if (attempt === 0) throw startFailure();
       return ok("start", { agent: { name: "worker", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-fallback", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-fallback" } } });
-    }}).cli);
-    expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")[1]).toEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/body.md"]);
+    }}).cli, undefined, { handoffs });
+    // One generated run serves the whole attempt chain; the fallback attempt reuses it.
+    expect(allocations).toHaveLength(1);
+    expect(result.details.handoff!.runId).toBe(allocations[0]!.runId);
+    expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")[1]).toEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--tools", "read,write", "--no-skills", "--no-session", "--append-system-prompt", "/cache/body.md"]);
     expect(calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
     expect(result.details).toMatchObject({ kind: "pi", profile: { requested: "primary", selected: "fallback", attempts: [{ profile: "primary", outcome: "agent_start_failed", errorCode: "agent_start_failed" }, { profile: "fallback", outcome: "selected" }] } });
   });
@@ -3342,7 +3380,8 @@ describe("herdr_launch profile-only contract", () => {
     const attachments = fakeAttachments();
     const recipients = new RecipientRegistry();
     const supervision = stubSupervision();
-    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research"), assignmentDelivery }, catalog(profile("researcher-agy", "agy")), harness.cli, promptSources, { attachments, recipients, supervision }))
+    const dir = mkdtempSync(join(tmpdir(), "herdr-handoffs-agy-"));
+    await expect(launch({ name: "worker", profile: "researcher-agy", assignment: assign("research"), assignmentDelivery }, catalog(profile("researcher-agy", "agy")), harness.cli, promptSources, { attachments, recipients, supervision, handoffs: createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } }) }))
       .rejects.toMatchObject({ code: "AGY_UNQUALIFIED", details: { causeCode: "AGY_UNQUALIFIED", phase: "resolve_profile", agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent" } });
     expect(harness.calls).toHaveLength(0);
     expect(harness.promptInputs).toHaveLength(0);
@@ -3351,6 +3390,77 @@ describe("herdr_launch profile-only contract", () => {
     expect(attachments.publish).not.toHaveBeenCalled();
     expect(supervision.reserved).toHaveLength(0);
     expect(supervision.released).toHaveLength(0);
+    // Refusal happens before a run id or on-disk run is allocated.
+    expect(readdirSync(dir)).toHaveLength(0);
+  });
+
+  it.each(["inline", "attachment"] as const)("refuses a %s launch whose profile cannot write the handoff before any effect", async (assignmentDelivery) => {
+    const harness = makeCli();
+    const attachments = fakeAttachments();
+    const promptSources = { create: vi.fn(async () => ({ path: "/cache/body.md" })) };
+    const readOnly = profile("read-only", "pi");
+    const noWrite = { ...readOnly, runtime: { ...readOnly.runtime, tools: ["read"] } } as typeof readOnly;
+    const claudeReadOnly = profile("claude-read-only", "claude");
+    const claudeNoWrite = { ...claudeReadOnly, runtime: { ...claudeReadOnly.runtime, allowedTools: ["Read"], disallowedTools: ["Bash"] } } as typeof claudeReadOnly;
+    const dir = mkdtempSync(join(tmpdir(), "herdr-handoffs-nowrite-"));
+    const handoffs = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+    for (const candidate of [noWrite, claudeNoWrite]) {
+      await expect(launch({ name: "worker", profile: candidate.name, assignment: assign("research"), assignmentDelivery }, catalog(candidate), harness.cli, promptSources, { attachments, handoffs }))
+        .rejects.toMatchObject({ code: "HANDOFF_TARGET_UNVERIFIED", details: { phase: "resolve_profile", profile: candidate.name, agentStarted: false, promptSubmitted: false, effectCertainty: "absent" } });
+    }
+    expect(harness.calls).toHaveLength(0);
+    expect(harness.promptInputs).toHaveLength(0);
+    expect(promptSources.create).not.toHaveBeenCalled();
+    expect(attachments.ensureRecipient).not.toHaveBeenCalled();
+    expect(attachments.publish).not.toHaveBeenCalled();
+    expect(lastSupervision.reserved).toHaveLength(0);
+    expect(readdirSync(dir)).toHaveLength(0);
+  });
+
+  it("bounds the injected handoff contract inside the inline delivery limit", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdr-handoffs-size-"));
+    const probeId = "00000000-0000-4000-8000-000000000000";
+    const directory = join(dir, probeId);
+    const probe: HandoffAllocation = {
+      runId: probeId, namespaceDir: dir, directory,
+      artifactPath: join(directory, "handoff.md"),
+      toolsDir: join(directory, ".tools"),
+      statePath: join(directory, ".tools", "state.json"),
+      lockPath: join(directory, ".tools", "lock"),
+      marker: `herdr-run:${probeId}`
+    };
+    // One byte beyond the limit once the generated contract is appended.
+    const assignmentBytes = renderAssignment(assign("")).length;
+    const objective = "x".repeat(16 * 1024 + 1 - assignmentBytes - renderHandoffContract(probe).length);
+    const calls: string[][] = [];
+    await expect(launch({ name: "worker", profile: "worker", assignment: assign(objective) }, catalog(profile("worker")), makeCli({ calls }).cli, undefined, { handoffs: createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } }) }))
+      .rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE_FOR_INLINE", details: { delivery: "inline" } });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("allocates an isolated generated run per launch and persists the versioned sidecar", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdr-handoffs-runs-"));
+    const handoffs = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+    const first = await launch({ name: "worker", profile: "worker", assignment: assign("one") }, catalog(profile("worker")), makeCli().cli, undefined, { handoffs });
+    const second = await launch({ name: "worker-two", profile: "worker", assignment: assign("two") }, catalog(profile("worker")), makeCli().cli, undefined, { handoffs });
+    expect(first.details.handoff!.runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second.details.handoff!.runId).not.toBe(first.details.handoff!.runId);
+    expect(first.details.handoff!.path).toBe(join(dir, first.details.handoff!.runId, "handoff.md"));
+    const state = JSON.parse(await fsPromises.readFile(join(dir, first.details.handoff!.runId, ".tools", "state.json"), "utf8")) as Record<string, unknown>;
+    expect(state).toMatchObject({
+      v: 1,
+      runId: first.details.handoff!.runId,
+      endpoint: "test-endpoint",
+      lifecycle: { state: "awaiting_handoff" },
+      artifact: { path: first.details.handoff!.path, version: 0 },
+      repair: { attempts: 0 },
+      manager: { paneId: "w1:p1" },
+      child: { agentName: "worker", agentKind: "pi", profileName: "worker", requestedProfile: "worker" }
+    });
+    // The agent-writable artifact path is exactly the one injected into the prompt.
+    const harness = makeCli();
+    const third = await launch({ name: "worker-three", profile: "worker", assignment: assign("three") }, catalog(profile("worker")), harness.cli, undefined, { handoffs });
+    expect(harness.promptInputs[0]).toContain(third.details.handoff!.path);
   });
 
   it.each(["inline", "attachment"] as const)("launches a direct Claude %s launch with exact identity", async (assignmentDelivery) => {
@@ -3363,11 +3473,11 @@ describe("herdr_launch profile-only contract", () => {
     expect(harness.calls.find((call) => call[0] === "agent" && call[1] === "start")).toEqual([
       "agent", "start", "worker", "--kind", "claude", "--pane", "w1:p2", "--timeout", "120000", "--",
       "--model", "claude/test", "--effort", "medium", "--permission-mode", "dontAsk",
-      "--allowed-tools", "Read", "--disallowed-tools", "Edit", "--add-dir", GRANT_PATH, "--append-system-prompt-file", "/cache/body.md"
+      "--allowed-tools", "Read", "--allowed-tools", "Write", "--disallowed-tools", "Edit", "--add-dir", GRANT_PATH, "--add-dir", dirname(result.details.handoff!.path), "--append-system-prompt-file", "/cache/body.md"
     ]);
     expect(result.details).toMatchObject({
       kind: "claude", promptSubmitted: true, recipientRegistered: true,
-      profile: { name: "worker-claude", selected: "worker-claude", runtime: { kind: "claude", model: "claude/test", effort: "medium" }, permissions: { sessionPersistence: true, permissionMode: "dontAsk", allowedTools: ["Read"], disallowedTools: ["Edit"], addDirs: [], pluginDirs: [] } }
+      profile: { name: "worker-claude", selected: "worker-claude", runtime: { kind: "claude", model: "claude/test", effort: "medium" }, permissions: { sessionPersistence: true, permissionMode: "dontAsk", allowedTools: ["Read", "Write"], disallowedTools: ["Edit"], addDirs: [], pluginDirs: [] } }
     });
     if (assignmentDelivery === "attachment") expect(attachments.publish).toHaveBeenCalled();
     expect(supervision.bound[0]!.identity).toMatchObject({ agentName: "worker", agentKind: "claude" });
@@ -3390,6 +3500,11 @@ describe("herdr_launch profile-only contract", () => {
     // the strict exact-identity path binds and registers the recipient.
     expect(result.details).toMatchObject({ kind: "devin", profile: { name: "worker-devin", runtime: { kind: "devin", model: "swe-2-max", permissionMode: "dangerous" }, permissions: { sessionPersistence: true } } });
     expect(lastSupervision.bound[0]!.identity).toMatchObject({ agentName: "worker", agentKind: "devin" });
+    // Devin attachment delivery carries the injected handoff contract too.
+    const devinAttachments = fakeAttachments();
+    const devinAttachment = await launch({ name: "worker", profile: "worker-devin", assignment: assign("implement"), assignmentDelivery: "attachment" }, catalog(workerDevin), makeCli().cli, promptSources, { attachments: devinAttachments });
+    expect(vi.mocked(devinAttachments.publish).mock.calls[0]![0].body).toContain(`herdr-run:${devinAttachment.details.handoff!.runId}`);
+    expect(devinAttachment.details).toMatchObject({ initialPromptDelivery: "attachment" });
     await expect(launch({ name: "worker", profile: "worker-devin", assignment: assign("implement"), overrides: { model: "swe-2", permissionMode: "smart" } }, catalog(workerDevin), makeCli().cli)).resolves.toBeDefined();
     for (const key of ["thinking", "tools", "effort", "allowedTools", "disallowedTools", "addDirs"] as const) {
       await expect(launch({ name: "worker", profile: "worker-devin", assignment: assign("implement"), overrides: { [key]: key === "thinking" || key === "effort" ? "low" : ["x"] } as never }, catalog(workerDevin), makeCli().cli)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE" });
@@ -3461,7 +3576,7 @@ describe("herdr_launch profile-only contract", () => {
     ]);
     expect(calls.find((call) => call[0] === "agent" && call[1] === "start" && call[4] === "pi")).toEqual([
       "agent", "start", "worker", "--kind", "pi", "--pane", "w1:p2", "--timeout", "120000", "--",
-      "--model", "test/model", "--thinking", "low", "--tools", "read", "--no-skills", "--no-session", "--append-system-prompt", "/cache/body.md"
+      "--model", "test/model", "--thinking", "low", "--tools", "read,write", "--no-skills", "--no-session", "--append-system-prompt", "/cache/body.md"
     ]);
     expect(result.details).toMatchObject({ kind: "pi", profile: { requested: "primary", selected: "fallback" } });
   });
@@ -3497,7 +3612,7 @@ describe("herdr_launch profile-only contract", () => {
     expect(starts[1]).toEqual([
       "agent", "start", "worker", "--kind", "claude", "--pane", "w1:p2", "--timeout", "120000", "--",
       "--model", "claude/test", "--effort", "medium", "--permission-mode", "dontAsk",
-      "--allowed-tools", "Read", "--disallowed-tools", "Edit", "--add-dir", GRANT_PATH, "--append-system-prompt-file", "/cache/body.md"
+      "--allowed-tools", "Read", "--allowed-tools", "Write", "--disallowed-tools", "Edit", "--add-dir", GRANT_PATH, "--add-dir", dirname(result.details.handoff!.path), "--append-system-prompt-file", "/cache/body.md"
     ]);
     expect(result.details).toMatchObject({ kind: "claude", profile: { selected: "fallback-claude", attempts: expect.arrayContaining([
       expect.objectContaining({ profile: "primary", outcome: "agent_start_failed" }),
@@ -3655,6 +3770,22 @@ describe("herdr_launch automatic child supervision", () => {
       supervision: { jobId: "job_sup_1", state: "active", child: { agentName: "worker", agentKind: "pi", paneId: "w1:p2", profileName: "worker" } }
     });
     expect((result.content[0] as { text: string }).text).toContain("supervisor job_sup_1");
+  });
+
+  it("binds the allocated handoff run to the exact launched identity", async () => {
+    const supervision = stubSupervision();
+    const result = await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision });
+    expect(result.details).toMatchObject({ outcome: "launched" });
+    expect(supervision.bindAttempts).toHaveLength(1);
+    const binding = supervision.bindAttempts[0]!;
+    const published = (result.details as { handoff: { runId: string; path: string } }).handoff;
+    // The binding carries exactly the allocation the caller sees, pinned to the
+    // same launch-captured identity supervision binds.
+    expect(binding.handoff?.allocation.runId).toBe(published.runId);
+    expect(binding.handoff?.allocation.artifactPath).toBe(published.path);
+    expect(binding.handoff?.allocation.marker).toBe(`herdr-run:${published.runId}`);
+    expect(binding.handoff?.allocation.directory).toBe(dirname(published.path));
+    expect(binding.identity).toMatchObject({ paneId: "w1:p2", terminalId: "terminal-0", agentName: "worker", agentKind: "pi" });
   });
 
   it("supervises an inline launch and one into an existing pane", async () => {

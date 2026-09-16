@@ -468,13 +468,13 @@ describe("profile catalog", () => {
     // typed LaunchError instead of the original: the model contract is the code,
     // the failed phase, and the no-effect diagnostic, never the store's own text.
     const storeRejection = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never).then(() => undefined, (error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    expect(storeRejection).toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "resolve_profile", causeCode: "CLI_PROTOCOL_ERROR", effectCertainty: "absent", agentStarted: false, promptSubmitted: false, recipientRegistered: false } });
-    expect(launchDiagnostic(storeRejection!)).toEqual({ code: "CLI_PROTOCOL_ERROR", phase: "resolve_profile", created: {}, agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.noEffect });
+    expect(storeRejection).toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "handoff", causeCode: "CLI_PROTOCOL_ERROR", effectCertainty: "absent", agentStarted: false, promptSubmitted: false, recipientRegistered: false } });
+    expect(launchDiagnostic(storeRejection!)).toEqual({ code: "CLI_PROTOCOL_ERROR", phase: "handoff", created: {}, agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.noEffect });
     expect(storeRejection!.message).not.toContain(storeFailure.message);
-    expect(calls).toHaveLength(callsBeforeFailure);
+    expect(calls).toHaveLength(callsBeforeFailure + 2);
     const invalidPathCalls = calls.length;
     await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => ({ path: "/tmp/invalid\nprofile.md" }) }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-3", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE", details: { causeCode: "INVALID_PROFILE_OVERRIDE" } });
-    expect(calls).toHaveLength(invalidPathCalls);
+    expect(calls).toHaveLength(invalidPathCalls + 2);
   });
 
   it("inspects bounded profile collections and exact profiles without Herdr reads", async () => {

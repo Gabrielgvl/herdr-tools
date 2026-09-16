@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { HerdrCli, JsonEnvelope } from "../../src/cli.js";
+import { CliProtocolError, type HerdrCli, type JsonEnvelope } from "../../src/cli.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import { turnControlInternals as internals } from "../../src/tools/turn-control.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
@@ -795,5 +795,71 @@ describe("explicit turn control", () => {
     const harness = makeCli(snapshot(workerPane("idle", 11)));
     await expect(execute(harness.cli, { target: "worker", operation: "cancel" }, controller.signal)).rejects.toMatchObject({ code: "ABORTED" });
     expect(harness.calls).toEqual([]);
+  });
+});
+
+describe("lazy target adoption in turn control", () => {
+  /** A detected worker whose only missing join field is the agent name. */
+  function adoptTurnCli(options: { kind?: string; nameTaken?: boolean } = {}) {
+    const kind = options.kind ?? "pi";
+    const session = { source: kind, agent: kind, kind: "id", value: "session-worker" };
+    const renames: string[][] = [];
+    let minted: string | undefined;
+    let dispatched = false;
+    const pane = () => ({
+      pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", label: "worker", agent: kind,
+      agent_status: dispatched ? "idle" : "working", state_change_seq: dispatched ? 11 : 10,
+      terminal_id: "term-worker", agent_session: session,
+      ...(minted === undefined ? {} : { agent_name: minted })
+    });
+    const agent = () => ({
+      pane_id: "w1:p2", agent: kind, agent_status: dispatched ? "idle" : "working", state_change_seq: dispatched ? 11 : 10,
+      terminal_id: "term-worker", agent_session: session,
+      ...(minted === undefined ? {} : { name: minted })
+    });
+    const snap = (): HerdrSnapshot => ({
+      version: "0.8.2", protocol: 22,
+      workspaces: [{ workspace_id: "w1", label: "workspace" }],
+      tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main" }],
+      panes: [callerPane as never, pane() as never],
+      agents: [{ pane_id: "w1:p1", name: "caller", agent_status: "idle" } as never, agent() as never]
+    });
+    const runJson = vi.fn(async (argv: string[]): Promise<JsonEnvelope> => {
+      const key = argv.join(" ");
+      if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: callerPane });
+      if (key.startsWith("agent rename")) {
+        renames.push(argv);
+        if (options.nameTaken) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "taken", { errorEnvelope: { id: "x", error: { code: "agent_name_taken", message: "taken" } } });
+        minted = argv[3];
+        return envelope("rename", { type: "agent_info", agent: { ...agent(), name: argv[3] } });
+      }
+      if (key.startsWith("pane report-metadata")) return envelope("meta", { ok: true });
+      if (argv[0] === "api") return resultForSnapshot(snap());
+      if (argv[0] === "pane" && argv[1] === "get") return envelope("pane-get", { pane: pane() });
+      if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: agent() });
+      if (argv[0] === "agent" && argv[1] === "send-keys") { dispatched = true; return envelope("dispatch-1", { ok: true }); }
+      if (argv[0] === "agent" && argv[1] === "wait") return envelope("wait-1", { agent: agent() });
+      throw new Error(`unexpected ${argv.join(" ")}`);
+    });
+    return { cli: { runJson } as unknown as HerdrCli, renames };
+  }
+
+  it("mints a derived name before the control would fail closed", async () => {
+    const { cli, renames } = adoptTurnCli();
+    const result = await execute(cli, { target: "w1:p2", operation: "cancel" });
+    expect(renames).toEqual([["agent", "rename", "w1:p2", "pi-w1p2"]]);
+    expect(result.details).toMatchObject({ operation: "cancel", outcome: "cancelled", target: { paneId: "w1:p2", agentName: "pi-w1p2" } });
+  });
+
+  it("never adopts a kind outside the allowlist and still fails closed", async () => {
+    const { cli, renames } = adoptTurnCli({ kind: "agy" });
+    await expect(execute(cli, { target: "w1:p2", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    expect(renames).toEqual([]);
+  });
+
+  it("fails closed when every derived name is already held", async () => {
+    const { cli, renames } = adoptTurnCli({ nameTaken: true });
+    await expect(execute(cli, { target: "w1:p2", operation: "cancel" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    expect(renames.length).toBeGreaterThan(1);
   });
 });

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import { WAIT_LABEL_MAX_BYTES } from "./wait-schema.js";
+import type { HandoffInspection, HandoffUngatedReason, HandoffValidationState } from "./handoff-gate.js";
+import type { HandoffLifecycleState, HandoffStatus } from "./handoff.js";
 import { isTargetEvidence, type TargetEvidence } from "./wait-target-evidence.js";
 import type { SupervisionEvent } from "./supervision/events.js";
 import type { SupervisedIdentity } from "./supervision/identity.js";
@@ -162,6 +164,8 @@ export interface JobResultTargetSnapshot {
   outputTruncated?: boolean;
   observedAtMs: number;
   matched: boolean;
+  /** The managed-handoff gate verdict that decided `matched`, when the wait was gated. */
+  handoff?: { runId: string; gate: string; status?: string; reason?: string };
   target_evidence?: TargetEvidence;
 }
 
@@ -218,6 +222,10 @@ export interface JobTruncation {
   supervisionEvents?: number;
   supervisionReviews?: number;
   supervisionFieldsClipped?: number;
+  /** Handoff evidence blocks omitted because they were malformed. */
+  handoffEvidence?: number;
+  /** Handoff string fields clipped or omitted at the public bound. */
+  handoffFieldsClipped?: number;
   pendingEvents?: number;
   errorDetails?: boolean;
   errorCodeClipped?: boolean;
@@ -247,6 +255,12 @@ export interface JobDetail {
   supervision_reason?: string;
   result?: JobResultSnapshot;
   supervision?: SupervisionJobView;
+  /**
+   * The bound managed run's bounded evidence for a supervisor job, or the
+   * explicit reason it is ungated. Published at detail level rather than inside
+   * the supervision view so no truncation tier can silently strip it.
+   */
+  handoff?: HandoffInspection;
   /** Soft receipts. Present only on a `get` that observed them. */
   pending_events?: SupervisionEvent[];
   unobservedEvents?: number;
@@ -728,6 +742,99 @@ function copyEvidence(value: unknown, truncation: JobTruncation): TargetEvidence
   };
 }
 
+function handoffField(value: string, truncation: JobTruncation): string {
+  const bounded = boundedText(value, PUBLIC_FIELD_BYTES);
+  if (bounded !== value) truncation.handoffFieldsClipped = (truncation.handoffFieldsClipped ?? 0) + 1;
+  return bounded;
+}
+
+/** The wait snapshot's per-target gate verdict, re-bounded for the public result. */
+function boundedGateVerdict(value: unknown, truncation: JobTruncation): JobResultTargetSnapshot["handoff"] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    truncation.handoffEvidence = (truncation.handoffEvidence ?? 0) + 1;
+    return undefined;
+  }
+  const candidate = value as { runId?: unknown; gate?: unknown; status?: unknown; reason?: unknown };
+  if (typeof candidate.runId !== "string" || typeof candidate.gate !== "string"
+    || (candidate.status !== undefined && typeof candidate.status !== "string")
+    || (candidate.reason !== undefined && typeof candidate.reason !== "string")) {
+    truncation.handoffEvidence = (truncation.handoffEvidence ?? 0) + 1;
+    return undefined;
+  }
+  return {
+    runId: handoffField(candidate.runId, truncation),
+    gate: handoffField(candidate.gate, truncation),
+    ...(candidate.status === undefined ? {} : { status: handoffField(candidate.status, truncation) }),
+    ...(candidate.reason === undefined ? {} : { reason: handoffField(candidate.reason, truncation) })
+  };
+}
+
+/**
+ * The supervisor job's bound-run evidence. Every block is re-validated at the
+ * public boundary: malformed evidence is omitted and counted rather than
+ * projected, and optional sub-objects drop independently so one bad field can
+ * never take the run's identity with it.
+ */
+function boundedHandoffEvidence(value: unknown, truncation: JobTruncation): HandoffInspection | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    truncation.handoffEvidence = (truncation.handoffEvidence ?? 0) + 1;
+    return undefined;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.gated === false) {
+    if (typeof candidate.reason !== "string") {
+      truncation.handoffEvidence = (truncation.handoffEvidence ?? 0) + 1;
+      return undefined;
+    }
+    return { gated: false, reason: handoffField(candidate.reason, truncation) as HandoffUngatedReason };
+  }
+  if (candidate.gated !== true || typeof candidate.runId !== "string" || typeof candidate.path !== "string" || typeof candidate.state !== "string") {
+    truncation.handoffEvidence = (truncation.handoffEvidence ?? 0) + 1;
+    return undefined;
+  }
+  const subobject = (field: "validation" | "artifact" | "repair"): Record<string, unknown> | undefined => {
+    const item = candidate[field];
+    if (item === undefined) return undefined;
+    if (typeof item === "object" && item !== null && !Array.isArray(item)) return item as Record<string, unknown>;
+    truncation.handoffFieldsClipped = (truncation.handoffFieldsClipped ?? 0) + 1;
+    return undefined;
+  };
+  const validation = subobject("validation");
+  const artifact = subobject("artifact");
+  const repair = subobject("repair");
+  if (validation !== undefined && typeof validation.state !== "string"
+    || artifact !== undefined && (typeof artifact.sha256 !== "string" || !Number.isSafeInteger(artifact.version) || !Number.isSafeInteger(artifact.bytes))
+    || repair !== undefined && !Number.isSafeInteger(repair.attempts)) {
+    truncation.handoffFieldsClipped = (truncation.handoffFieldsClipped ?? 0) + 1;
+  }
+  return {
+    gated: true,
+    runId: handoffField(candidate.runId, truncation),
+    path: handoffField(candidate.path, truncation),
+    state: candidate.state as HandoffLifecycleState,
+    ...(validation === undefined || typeof validation.state !== "string" ? {} : {
+      validation: {
+        state: handoffField(validation.state, truncation) as HandoffValidationState,
+        ...(typeof validation.reason === "string" ? { reason: handoffField(validation.reason, truncation) } : {})
+      }
+    }),
+    ...(artifact === undefined || typeof artifact.sha256 !== "string" || !Number.isSafeInteger(artifact.version) || !Number.isSafeInteger(artifact.bytes) ? {} : {
+      artifact: {
+        ...(typeof artifact.status === "string" ? { status: handoffField(artifact.status, truncation) as HandoffStatus } : {}),
+        version: artifact.version as number,
+        sha256: handoffField(artifact.sha256, truncation),
+        bytes: artifact.bytes as number
+      }
+    }),
+    ...(repair === undefined || !Number.isSafeInteger(repair.attempts) ? {} : {
+      repair: {
+        attempts: repair.attempts as number,
+        ...(Number.isSafeInteger(repair.fenceVersion) ? { fenceVersion: repair.fenceVersion as number } : {})
+      }
+    })
+  };
+}
+
 function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit = PUBLIC_RESULT_TARGETS, lineLimit = PUBLIC_TARGET_LINES, reviewerLimit = PUBLIC_REVIEWER_SUMMARIES): JobResultSnapshot {
   const sourceTargets = result.targets ?? [];
   const matchedSourceTargets = result.wait_result === "condition_met" ? sourceTargets.filter((target) => target.matched) : [];
@@ -747,6 +854,7 @@ function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit
       return bounded;
     });
     const targetEvidence = target.target_evidence === undefined ? undefined : copyEvidence(target.target_evidence, truncation);
+    const handoff = target.handoff === undefined ? undefined : boundedGateVerdict(target.handoff, truncation);
     return {
       target: targetValue,
       targetId,
@@ -755,6 +863,7 @@ function copyResult(result: JobRunResult, truncation: JobTruncation, targetLimit
       ...(target.outputTruncated === undefined ? {} : { outputTruncated: target.outputTruncated }),
       observedAtMs: target.observedAtMs,
       matched: target.matched,
+      ...(handoff === undefined ? {} : { handoff }),
       ...(targetEvidence === undefined ? {} : { target_evidence: targetEvidence })
     };
   });
@@ -807,7 +916,7 @@ function copyProgress(progress: JobProgress, truncation: JobTruncation): JobProg
 }
 
 const TRUNCATION_KEYS = [
-  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped", "requestCondition", "requestConditionClipped", "requestLabelClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetGenerationRefsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "resultTargetEvidence", "resultTargetErrors", "reviewerSummaries", "reviewerFieldsClipped", "supervisionTransitions", "supervisionEvents", "supervisionReviews", "supervisionFieldsClipped", "pendingEvents", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted", "lateSettlementClipped"
+  "requestTargets", "requestTargetsClipped", "requestTargetIds", "requestTargetIdsClipped", "requestTargetGenerationRefs", "requestTargetGenerationRefsClipped", "requestCondition", "requestConditionClipped", "requestLabelClipped", "requestReviewerModelClipped", "jobIdClipped", "progressDetails", "progressTextClipped", "resultTargets", "resultMatchedTargets", "resultTargetValuesClipped", "resultTargetIdsClipped", "resultTargetGenerationRefsClipped", "resultTargetLines", "resultTargetLinesClipped", "resultTargetMetadata", "resultTargetEvidence", "resultTargetErrors", "reviewerSummaries", "reviewerFieldsClipped", "supervisionTransitions", "supervisionEvents", "supervisionReviews", "supervisionFieldsClipped", "handoffEvidence", "handoffFieldsClipped", "pendingEvents", "errorDetails", "errorCodeClipped", "errorMessageClipped", "publicEvidenceOmitted", "lateSettlementClipped"
 ] as const;
 
 function boundedTruncation(value: JobTruncation | undefined): JobTruncation {
@@ -891,6 +1000,7 @@ function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
     ...(copy.operation_phase === "settled" && copy.wait_result ? { wait_result: copy.wait_result } : {}),
     ...(copy.operation_phase === "settled" && copy.supervision_result ? { supervision_result: copy.supervision_result } : {}),
     ...(copy.unobservedEvents === undefined ? {} : { unobservedEvents: copy.unobservedEvents }),
+    ...(copy.handoff === undefined ? {} : { handoff: copy.handoff }),
     ...(copy.result ? { result: { wait_result: copy.result.wait_result, matched: copy.result.matched, ...(copy.result.matchedTargetCount === undefined ? {} : { matchedTargetCount: copy.result.matchedTargetCount }), ...(copy.result.matchedTargets ? { matchedTargets: copy.result.matchedTargets.slice(0, 1) } : {}) } } : {}),
     ...(copy.cancelReason ? { cancelReason: copy.cancelReason } : {}),
     ...(copy.late_settlement_observed ? { late_settlement_observed: copy.late_settlement_observed } : {}),
@@ -901,6 +1011,7 @@ function minimalDetail(copy: JobDetail, truncation: JobTruncation): JobDetail {
 export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): JobDetail {
   const truncation: JobTruncation = boundedTruncation(detail.truncation);
   const supervision = detail.supervision === undefined ? undefined : boundedSupervision(detail.supervision, truncation);
+  const handoff = detail.handoff === undefined ? undefined : boundedHandoffEvidence(detail.handoff, truncation);
   const jobId = boundedText(detail.jobId, PUBLIC_FIELD_BYTES);
   if (jobId !== detail.jobId) truncation.jobIdClipped = true;
   const terminal = detail.operation_phase === "settled";
@@ -919,6 +1030,7 @@ export function publicDetail(detail: JobDetail, maxBytes = MAX_PUBLIC_BYTES): Jo
     ...(terminal && detail.supervision_result ? { supervision_result: detail.supervision_result } : {}),
     ...(terminal && detail.supervision_reason ? { supervision_reason: boundedText(detail.supervision_reason, PUBLIC_FIELD_BYTES) } : {}),
     ...(supervision === undefined ? {} : { supervision }),
+    ...(handoff === undefined ? {} : { handoff }),
     ...(detail.pending_events ? { pending_events: detail.pending_events.map((event) => boundedSupervisionEvent(event, truncation)) } : {}),
     ...(detail.unobservedEvents === undefined ? {} : { unobservedEvents: detail.unobservedEvents }),
     ...(terminal && detail.result ? { result: copyResult({
@@ -1480,9 +1592,11 @@ export class JobRegistry {
     if (!port) return publicDetail(record.detail);
     const view = port.view();
     const pending = observeEvents ? port.takePendingEvents() : undefined;
+    const handoff = port.handoffEvidence?.();
     return publicDetail({
       ...record.detail,
       supervision: view,
+      ...(handoff === undefined ? {} : { handoff }),
       // `takePendingEvents` has already marked the returned events observed, so
       // the published count is the state a follow-up `get` would see.
       unobservedEvents: observeEvents ? port.view().unobservedEvents : view.unobservedEvents,
@@ -1575,7 +1689,7 @@ export class JobRegistry {
     });
   }
 
-  /** Session teardown. Supervisors are stopped unconditionally; nothing persists. */
+  /** Session teardown. In-memory jobs stop; managed handoff sidecars persist separately as recovery evidence. */
   private abandonAll(): void {
     for (const record of this.jobs.values()) {
       record.supervision?.shutdown();

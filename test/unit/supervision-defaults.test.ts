@@ -45,7 +45,7 @@ describe("supervision runtime defaults", () => {
     });
     // Constructing the defaults is enough; reserving proves they are reachable.
     await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
-    supervision.shutdown();
+    await supervision.shutdown();
   });
 });
 
@@ -175,6 +175,6 @@ describe("supervision runtime seams", () => {
       monitorOptions: { env: {} },
     });
     expect((supervision as unknown as { reviewer(): unknown }).reviewer()).toBeInstanceOf(ModelSupervisionReviewer);
-    supervision.shutdown();
+    await supervision.shutdown();
   });
 });

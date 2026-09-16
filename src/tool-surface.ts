@@ -12,6 +12,7 @@ import type { WaitReviewer } from "./reviewer.js";
 import type { Settings } from "./settings.js";
 import type { SupervisionCoordinator } from "./supervision/registry.js";
 import type { SelfCloseTracker } from "./supervision/self-close.js";
+import type { HandoffGate } from "./handoff-gate.js";
 import type { CurrentContext } from "./targets.js";
 import { createContextResolver, type ContextResolver } from "./context.js";
 import { createCommunicateTool } from "./tools/communicate.js";
@@ -135,6 +136,12 @@ export interface HerdrToolSurfaceDependencies {
    * that omits it keeps the always-wake behavior for `pane_closed`.
    */
   selfClose?: SelfCloseTracker;
+  /**
+   * The host's shared managed-handoff gate. Launch bindings and strict waits
+   * consult the same instance so managed completion is never read off raw
+   * lifecycle alone.
+   */
+  handoffs?: HandoffGate;
 }
 
 export interface HerdrToolSurface {
@@ -152,7 +159,7 @@ export interface HerdrToolSurface {
 /** Construct the seven Herdr tools once for every host. */
 export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrToolSurface {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
-  const inspect = createInspectTool({ cli: deps.cli, context: deps.context, contextResolver, environment: deps.environment, profiles: deps.profiles });
+  const inspect = createInspectTool({ cli: deps.cli, context: deps.context, contextResolver, environment: deps.environment, profiles: deps.profiles, ...(deps.handoffs ? { handoffs: deps.handoffs } : {}) });
   const communicate = createCommunicateTool({
     cli: deps.cli,
     context: deps.context,
@@ -169,6 +176,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     settingsLoader: deps.settingsLoader,
     jobRegistry: deps.jobs,
     ...(deps.reviewerFactory ? { reviewerFactory: deps.reviewerFactory } : {}),
+    ...(deps.handoffs ? { handoffs: deps.handoffs } : {}),
   });
   const jobs = createJobsTool(deps.jobs);
   const launch = createLaunchTool({

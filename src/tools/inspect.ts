@@ -2,9 +2,12 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { callerPolicyDiagnostics, callerPolicyFailure, classifyCaller } from "../caller-policy.js";
 import type { HerdrCli } from "../cli.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
+import { projectHandoffEvidence, type HandoffGate, type HandoffInspection, type HandoffUngatedReason } from "../handoff-gate.js";
 import { parseHealth } from "../health.js";
+import { PromptIdentityError } from "../messages/prompt.js";
 import { InspectParamsSchema, type InspectParams } from "../schemas.js";
 import { resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
+import { requireWaitTargetIdentity, type WaitTargetIdentity } from "../wait-target-evidence.js";
 import { formatCall, renderResultComponent, textComponent } from "../tui.js";
 import { RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, type Profile, type ProfileCandidate, type ProfileCatalog, MAX_PROFILE_BODY_OUTPUT, MAX_PROFILE_LIST_ITEMS, MAX_PROFILE_RESULT_BYTES } from "../profiles/index.js";
 import { boundedText } from "../job-registry.js";
@@ -26,6 +29,8 @@ interface InspectDetails {
   omittedCount?: number;
   diagnosticOmittedCount?: number;
   metadata?: unknown;
+  /** Bounded managed-handoff evidence for the exact current occupant, or why the target is ungated. */
+  handoff?: HandoffInspection;
   recentUnwrappedLines?: string[];
   client?: { version: string; protocol: number };
   server?: { status: string; version?: string; protocol?: number };
@@ -40,6 +45,8 @@ export interface InspectDependencies {
   contextResolver?: ContextResolver;
   environment?: { enabled: boolean; currentIdsPresent: boolean; currentIdsValid: boolean };
   profiles?: { load: () => Promise<ProfileCatalog> };
+  /** The shared managed-handoff gate; absent on a host that cannot gate. */
+  handoffs?: HandoffGate;
 }
 
 function asPane(result: unknown): Record<string, unknown> {
@@ -375,7 +382,7 @@ export function fitInspectionValue(value: unknown, maxBytes: number): unknown {
       largestArray.value.splice(Math.ceil(largestArray.value.length / 2));
       continue;
     }
-    const removable = objects.flatMap((item) => Object.keys(item.value as Record<string, unknown>).filter((objectKey) => !["profile", "diagnostics", "source", "name", "kind"].includes(objectKey)).map((objectKey) => ({ owner: item.value as Record<string, unknown>, key: objectKey })))[0];
+    const removable = objects.flatMap((item) => Object.keys(item.value as Record<string, unknown>).filter((objectKey) => !["profile", "diagnostics", "source", "name", "kind", "handoff"].includes(objectKey)).map((objectKey) => ({ owner: item.value as Record<string, unknown>, key: objectKey })))[0];
     if (removable) {
       delete removable.owner[removable.key];
       continue;
@@ -429,6 +436,29 @@ function modelVisibleInspectionContent(value: InspectDetails): string {
   // MCP host from mistaking this Pi-facing projection for its authoritative
   // details block and dropping the latter.
   return modelVisibleContent({ ...value, modelVisible: true }, MAX_INSPECT_CONTENT_BYTES);
+}
+
+/**
+ * Exact-current-run handoff evidence for a pane/agent target. The identity is
+ * joined from the fresh pane read and the snapshot's agent record; when those
+ * records cannot prove the current occupant the block reports why it is
+ * ungated rather than staying silent. A bound run gets a fresh artifact
+ * verdict so the projection never reports a stale gate state.
+ */
+async function targetHandoff(deps: InspectDependencies, pane: Record<string, unknown>, agent: Record<string, unknown> | undefined, paneId: string): Promise<HandoffInspection> {
+  let identity: WaitTargetIdentity | undefined;
+  let reason: HandoffUngatedReason = "identity_unavailable";
+  try {
+    identity = requireWaitTargetIdentity(agent === undefined ? [pane] : [pane, agent], paneId);
+  } catch (error) {
+    if (error instanceof PromptIdentityError && error.code === "TARGET_IDENTITY_CHANGED") reason = "identity_changed";
+  }
+  const gate = deps.handoffs;
+  if (identity !== undefined && gate !== undefined) {
+    const run = gate.lookup(identity);
+    if (run !== undefined) await gate.validate(run).catch(() => undefined);
+  }
+  return projectHandoffEvidence(gate, identity, reason);
 }
 
 export function createInspectTool(deps: InspectDependencies): ToolDefinition<typeof InspectParamsSchema, InspectDetails> {
@@ -502,11 +532,13 @@ export function createInspectTool(deps: InspectDependencies): ToolDefinition<typ
       const pane = asPane((await deps.cli.runJson(["pane", "get", target.paneId!], activeSignal)).result);
       const raw = await deps.cli.runTextResult(["pane", "read", target.paneId!, "--source", "recent-unwrapped", "--lines", "100", "--format", "text"], activeSignal);
       const recentUnwrappedLines = raw.value.length === 0 ? [] : raw.value.split(/\r?\n/).slice(-100);
+      const handoff = await targetHandoff(deps, pane, snapshot.agents.find((agent) => agent.pane_id === target.paneId), target.paneId!);
       const details: InspectDetails = {
         operation: "inspect",
         kind: "target",
         outcome: "success",
         target: { paneId: target.paneId, tabId: target.tabId, workspaceId: target.workspaceId, label: target.label, agentName: target.agentName },
+        handoff,
         ...(mode === "context" ? { context: effective.diagnostics, callerPolicy: callerPolicyEvidence(snapshot, effective.context.paneId) } : contextRebindingDetails(effective.diagnostics)),
         metadata: modelSafeJson(pane),
         recentUnwrappedLines,

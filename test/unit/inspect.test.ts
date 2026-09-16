@@ -1,6 +1,11 @@
+import { chmod, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
+import { createHandoffAllocator } from "../../src/handoff.js";
+import { createHandoffGate } from "../../src/handoff-gate.js";
 import { createInspectTool, MAX_INSPECT_CONTENT_BYTES } from "../../src/tools/inspect.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { parseProfile, profileSource, type ProfileCatalog } from "../../src/profiles/index.js";
@@ -304,6 +309,99 @@ describe("herdr_inspect", () => {
         await expect(execute(new HerdrCli(exec), { mode: "health" })).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
       }
     }
+  });
+
+  it("projects bound managed-handoff evidence for the exact current occupant", async () => {
+    const session = { source: "native", agent: "pi", kind: "session", value: "sess-1" };
+    const managed: HerdrSnapshot = {
+      ...snapshot,
+      panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "worker", agent_status: "idle", agent_name: "worker", terminal_id: "t1", agent: "pi", agent_session: session }],
+      agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", agent_status: "idle", agent_session: session }]
+    };
+    const dir = await mkdtemp(join(tmpdir(), "herdr-inspect-handoff-"));
+    await chmod(dir, 0o700);
+    const allocator = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+    const allocation = await allocator.allocate();
+    await allocator.persist(allocation, {
+      manager: { paneId: "w1:p0", display: "caller", source: "injected" },
+      child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: [] }
+    });
+    const gate = createHandoffGate();
+    await gate.bind(allocation, { paneId: "w1:p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session });
+    const { cli } = makeCli(undefined, managed);
+    const result = await createInspectTool({ cli, context, handoffs: gate }).execute("id", { mode: "target", target: "worker" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(result.details.handoff).toMatchObject({ gated: true, runId: allocation.runId, path: allocation.artifactPath, state: "awaiting_handoff" });
+    const content = JSON.parse(contentText(result)) as Record<string, unknown>;
+    expect(content.handoff).toMatchObject({ gated: true, runId: allocation.runId });
+    // Bounded evidence only: no artifact body, marker, or fence token.
+    const serialized = JSON.stringify(result.details.handoff);
+    expect(serialized).not.toContain("token");
+    expect(serialized).not.toContain(allocation.marker);
+    expect(serialized).not.toContain("## Summary");
+  });
+
+  it("reports the explicit ungated handoff reason instead of omitting the block", async () => {
+    const session = { source: "native", agent: "pi", kind: "session", value: "sess-1" };
+    const managed: HerdrSnapshot = {
+      ...snapshot,
+      panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "worker", agent_status: "idle", agent_name: "worker", terminal_id: "t1", agent: "pi", agent_session: session }],
+      agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", agent_status: "idle", agent_session: session }]
+    };
+    // Exact identity but no bound run.
+    const { cli: managedCli } = makeCli(undefined, managed);
+    const unmanaged = await createInspectTool({ cli: managedCli, context, handoffs: createHandoffGate() })
+      .execute("id", { mode: "target", target: "worker" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(unmanaged.details.handoff).toEqual({ gated: false, reason: "no_managed_run" });
+
+    // The default snapshot cannot prove the current occupant's identity.
+    const { cli } = makeCli();
+    const unproven = await createInspectTool({ cli, context, handoffs: createHandoffGate() })
+      .execute("id", { mode: "target", target: "caller" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(unproven.details.handoff).toEqual({ gated: false, reason: "identity_unavailable" });
+
+    // A host without the shared gate says so.
+    const gateless = await execute(managedCli, { mode: "target", target: "worker" });
+    expect(gateless.details.handoff).toEqual({ gated: false, reason: "gate_unavailable" });
+  });
+
+  it("distinguishes an identity that changed from one that was never provable", async () => {
+    const contradictory: HerdrSnapshot = {
+      ...snapshot,
+      // The pane's own kind and its session's kind disagree, so the join
+      // refuses the occupant rather than binding evidence to the wrong child.
+      panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "worker", agent_status: "idle", agent_name: "worker", terminal_id: "t1", agent: "pi", agent_session: { source: "native", agent: "claude", kind: "session", value: "sess-1" } }],
+      agents: []
+    };
+    const { cli } = makeCli(undefined, contradictory);
+    const result = await createInspectTool({ cli, context, handoffs: createHandoffGate() })
+      .execute("id", { mode: "target", target: "worker" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(result.details.handoff).toEqual({ gated: false, reason: "identity_changed" });
+  });
+
+  it("projects the retained verdict when the fresh artifact read fails", async () => {
+    const session = { source: "native", agent: "pi", kind: "session", value: "sess-1" };
+    const managed: HerdrSnapshot = {
+      ...snapshot,
+      panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "worker", agent_status: "idle", agent_name: "worker", terminal_id: "t1", agent: "pi", agent_session: session }],
+      agents: [{ pane_id: "w1:p1", name: "worker", agent: "pi", agent_status: "idle", agent_session: session }]
+    };
+    const dir = await mkdtemp(join(tmpdir(), "herdr-inspect-handoff-"));
+    await chmod(dir, 0o700);
+    const allocator = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+    const allocation = await allocator.allocate();
+    await allocator.persist(allocation, {
+      manager: { paneId: "w1:p0", display: "caller", source: "injected" },
+      child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: [] }
+    });
+    const gate = createHandoffGate();
+    await gate.bind(allocation, { paneId: "w1:p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session });
+    gate.validate = async () => { throw new Error("gate exploded"); };
+    const { cli } = makeCli(undefined, managed);
+    // A failed refresh never fails the inspection; the durable run is still projected.
+    const result = await createInspectTool({ cli, context, handoffs: gate })
+      .execute("id", { mode: "target", target: "worker" } as never, new AbortController().signal, undefined, extensionContext);
+    expect(result.details.handoff).toMatchObject({ gated: true, runId: allocation.runId, state: "awaiting_handoff" });
+    expect(result.details.handoff).not.toHaveProperty("validation");
   });
 
   it("renders compact inspect call and result rows", () => {

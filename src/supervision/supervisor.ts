@@ -1,14 +1,17 @@
 /**
  * One child's supervisor.
  *
- * It observes; it never mutates the child and never gates its work. Every exact
- * child transition is recorded, only the material subset wakes the manager, and
+ * It observes raw child lifecycle. Managed handoff integration may withhold Tools
+ * completion acceptance and issue one identity-bound repair prompt without vetoing
+ * the core state transition. Every exact child transition is recorded, and
  * a wake is best effort — the manager recovers a dropped one with
  * `herdr_jobs get`, which returns the pending events and marks exactly those
  * observed.
  */
 
 import { ReviewerFailure } from "../reviewer.js";
+import { renderHandoffContract, type HandoffAllocation } from "../handoff.js";
+import { handoffGateMatches, type HandoffGate, type HandoffInspection, type HandoffRun, type HandoffValidation } from "../handoff-gate.js";
 import type { HerdrSnapshot } from "../targets.js";
 import {
   BoundedHistory,
@@ -87,6 +90,12 @@ export interface SupervisionBinding {
   profileName: string;
   /** Present only where the authoritative agent record supplied one. */
   stateChangeSeq?: number;
+  /**
+   * The allocated managed-handoff run this binding must bind to the exact
+   * identity. Present on every qualified managed launch; the registry binds it
+   * through the shared gate before the child binding is accepted.
+   */
+  handoff?: { allocation: HandoffAllocation; agentId?: string };
 }
 
 export interface SupervisorDependencies {
@@ -103,6 +112,18 @@ export interface SupervisorDependencies {
    * absence keeps every event waking exactly as before.
    */
   selfClose?: SelfCloseTracker;
+  /**
+   * The shared managed-handoff gate. When a bound run exists for the exact
+   * identity, authoritative working transitions open a fresh artifact cycle,
+   * terminal observations validate and may send one fenced repair prompt, and
+   * an exit settlement persists the run's outcome first.
+   */
+  handoffs?: HandoffGate;
+  /**
+   * Exact-child repair prompt transport (`cli.prompt`). Absent on hosts that
+   * cannot prompt; without one no repair fence is ever consumed.
+   */
+  repairPrompt?: (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
   /** Bounded transcript delta source for the reviewer; the CLI's authoritative pane read. */
   readTranscript: (paneId: string, signal: AbortSignal) => Promise<string[]>;
   idFactory?: () => string;
@@ -239,6 +260,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private bindingPublished = false;
   private provisionalPublished = false;
   private stopped = false;
+  /** The bound managed run, retained so its evidence still projects after the gate drops a resolved run. */
+  private boundHandoff: { gate: HandoffGate; run: HandoffRun } | undefined;
   private readonly abort = new AbortController();
 
   constructor(private readonly deps: SupervisorDependencies) {
@@ -1057,6 +1080,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.paneIdentityGeneration += 1;
     this.identity = next;
     this.paneId = next.paneId;
+    // The gate's run tracks the pane too: a repair prompt must reach the exact
+    // child where it actually lives, not where it was launched.
+    const managed = this.managedRun();
+    if (managed !== undefined) managed.gate.notePane(managed.run, next.paneId);
     this.lastRevision = moveEvent.revision;
     this.anchor = {
       revision: moveEvent.revision,
@@ -1328,7 +1355,19 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (from === next) return;
     this.status = next;
     this.transitions.push({ atMs: this.deps.clock.now(), from, to: next, revision, source });
+    if (next === "working") {
+      // An authoritative working transition opens a fresh artifact cycle: the
+      // previously accepted handoff version is stale from this point on.
+      const managed = this.managedRun();
+      if (managed !== undefined) managed.gate.beginCycle(managed.run);
+    }
     this.enterStatus(next);
+    if (next === "idle" || next === "done" || next === "blocked") {
+      // A managed terminal observation is not acceptance by itself. The
+      // current-cycle artifact check runs on the mutation chain behind the
+      // fold that produced it, so it sees every earlier transition first.
+      this.scheduleHandoffEvaluation();
+    }
     const material = materialTransitionEvent(from, next);
     if (material === undefined) {
       // Working starts and every other non-material change are recorded silently.
@@ -1540,6 +1579,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // `identity_lost` is the one settling outcome reached without its own event,
     // because a move or a reconnect proves it directly rather than observing it.
     if (outcome === "identity_lost") this.emit("identity_lost", `supervision lost the exact child's identity (${reason})`, { reason });
+    // The managed run's outcome is durable before the supervisor settles.
+    await this.persistHandoffOutcome(outcome, reason);
     this.state = "settled";
     this.settlement = { outcome, reason };
     this.clearReviewTimer();
@@ -1548,7 +1589,115 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.resolveSettled(this.settlement);
   }
 
+  // ------------------------------------------------------------------ handoff
+
+  /** The bound managed run for the current exact identity, when this host gates one. */
+  private managedRun(): { gate: HandoffGate; run: HandoffRun } | undefined {
+    const gate = this.deps.handoffs;
+    if (gate === undefined || this.identity === undefined) return undefined;
+    const run = gate.lookup(this.identity);
+    if (run !== undefined) this.boundHandoff = { gate, run };
+    return run === undefined ? undefined : { gate, run };
+  }
+
+  /**
+   * Queue a managed terminal observation for gated evaluation on the mutation
+   * chain, behind the fold that produced it and ahead of later evidence.
+   */
+  private scheduleHandoffEvaluation(): void {
+    if (this.deps.handoffs === undefined || this.stopped || this.isSettled()) return;
+    void this.serialize(() => this.evaluateHandoff()).catch(() => undefined);
+  }
+
+  /**
+   * One managed terminal observation: the current-cycle artifact hands the run
+   * off when it validates; otherwise the exact child earns at most one repair
+   * prompt per artifact version, fenced and persisted before any send.
+   * Supervision stays active either way — a missing or invalid artifact is a
+   * repair signal, never a settlement and never evidence.
+   */
+  private async evaluateHandoff(): Promise<void> {
+    if (this.stopped || this.isSettled()) return;
+    if (this.status !== "idle" && this.status !== "done" && this.status !== "blocked") return;
+    const managed = this.managedRun();
+    if (managed === undefined || managed.run.lifecycle !== "awaiting_handoff") return;
+    const { gate, run } = managed;
+    const validation: HandoffValidation | undefined = await gate.validate(run).catch(() => undefined);
+    if (validation === undefined) return;
+    if (handoffGateMatches(validation, "terminal", this.status)) {
+      try {
+        await gate.recordOutcome(run, "handed_off");
+      } catch {
+        // An unpersisted outcome is re-evaluated by the next observation or shutdown.
+      }
+      return;
+    }
+    const prompt = this.deps.repairPrompt;
+    if (prompt === undefined || this.stopped || this.isSettled()) return;
+    // The attempt and fence are durable before this returns a token; a version
+    // already fenced is never re-prompted, and a send that fails never
+    // un-fences it and never counts as evidence.
+    const fence = await gate.beginRepair(run).catch(() => null);
+    if (fence === null) return;
+    const gateReason = validation.reason === undefined ? validation.state : `${validation.state}:${validation.reason}`;
+    try {
+      await prompt(run.identity.paneId, [
+        `The managed run handoff for this assignment is still awaiting a valid artifact (${gateReason}).`,
+        "Write or repair it exactly as specified, then finish the turn.",
+        renderHandoffContract(run.allocation),
+      ].join("\n"), this.abort.signal);
+      this.publish(`handoff repair prompt sent for artifact version ${fence.version} (${gateReason})`);
+    } catch {
+      this.publish(`handoff repair prompt for artifact version ${fence.version} failed (${gateReason})`);
+    }
+  }
+
+  /**
+   * Persist the run's outcome ahead of settlement. Only an authoritative exit
+   * (`released`, `identity_replaced`) authorizes the Tools-authored cancelled
+   * fallback, and only after the current artifact had its last chance to hand
+   * off. `identity_lost` proves nothing about the run and teardown fabricates
+   * nothing — both leave the run unresolved for `recovery_pending`.
+   */
+  private async persistHandoffOutcome(outcome: SupervisionResult, reason: string): Promise<void> {
+    if (outcome !== "released" && outcome !== "identity_replaced") return;
+    const managed = this.managedRun();
+    if (managed === undefined || managed.run.lifecycle !== "awaiting_handoff") return;
+    let handedOff = false;
+    try {
+      // Authoritative exit has no remaining raw agent state to correlate. Any
+      // current valid terminal artifact wins over the Tools-authored fallback.
+      handedOff = (await managed.gate.validate(managed.run)).state === "accepted";
+    } catch {
+      // An unreadable artifact does not weaken the authoritative exit.
+    }
+    try {
+      await managed.gate.recordOutcome(managed.run, handedOff ? "handed_off" : "cancelled", reason);
+    } catch {
+      // A failed write leaves the run unresolved; recovery owns it from here.
+    }
+  }
+
   // ----------------------------------------------------------------- job port
+
+  /**
+   * The bound managed run's bounded evidence for `herdr_jobs get`. The gate
+   * drops a resolved run once the supervisor settles it, so the retained
+   * binding keeps the terminal evidence projectable; an absent binding reports
+   * exactly why the job is ungated instead of omitting the block.
+   */
+  handoffEvidence(): HandoffInspection {
+    const managed = this.managedRun() ?? this.boundHandoff;
+    if (managed === undefined) {
+      return {
+        gated: false,
+        reason: this.deps.handoffs === undefined ? "gate_unavailable"
+          : this.identity === undefined ? "identity_unavailable"
+          : "no_managed_run"
+      };
+    }
+    return { gated: true, ...managed.gate.evidence(managed.run) };
+  }
 
   view(): SupervisionJobView {
     const streamDegraded = this.eventStreamDegraded || this.deps.monitor.isDegraded();

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentPromptError, type AgentPromptClient } from "../../src/agent-prompt.js";
-import { HerdrCli, type PiExec } from "../../src/cli.js";
+import { CliProtocolError, HerdrCli, type PiExec } from "../../src/cli.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
 import type { DevinQueueFlush } from "../../src/messages/devin-queue-flush.js";
@@ -262,6 +262,47 @@ describe("herdr_communicate", () => {
     expect(renameCalls).toEqual([["agent", "rename", "w1:p2", "pi-w1p2"]]);
     expect(harness.promptInputs).toEqual([senderEnvelope("prompt", "hello")]);
     expect(result.details).toMatchObject({ operation: "prompt", submission: { confirmed: true } });
+  });
+
+  it("never adopts a name-only gap on a kind outside the allowlist", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    // A qualified but unknown agent kind: routable text, no derived-name grant.
+    const unknownSession = { source: "herdr:codex", agent: "codex", kind: "id", value: "session-codex" };
+    const unnamedAgent = { pane_id: "w1:p2", agent_id: "agent-7", agent_status: "idle", agent: "codex", terminal_id: "term-reviewer", agent_session: unknownSession };
+    const unnamedPane = { ...basePane, agent: "codex", agent_session: unknownSession };
+    harness.cli.runJson = vi.fn(async (argv, signal, preserve) => {
+      const key = argv.join(" ");
+      if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, unnamedPane], agents: [baseSnapshot.agents[0]!, unnamedAgent] } } };
+      if (key.startsWith("agent get")) return { id: "agent-get", result: { agent: unnamedAgent } };
+      if (key.startsWith("pane get")) return { id: "pane-get", result: { pane: unnamedPane } };
+      return base.call(harness.cli, argv, signal, preserve);
+    });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "must not send" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    expect(harness.calls.some((argv) => argv[0] === "agent" && argv[1] === "rename")).toBe(false);
+    expect(harness.prompt).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when every derived name for an unnamed target is already held", async () => {
+    const harness = makeCli();
+    const base = harness.cli.runJson;
+    const renameCalls: string[][] = [];
+    const unnamedAgent = { pane_id: "w1:p2", agent_id: "agent-7", agent_status: "idle", agent: "pi", ...targetIdentity };
+    harness.cli.runJson = vi.fn(async (argv, signal, preserve) => {
+      const key = argv.join(" ");
+      if (argv[0] === "api") return { id: "snapshot", result: { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, basePane], agents: [baseSnapshot.agents[0]!, unnamedAgent] } } };
+      if (key.startsWith("agent get")) return { id: "agent-get", result: { agent: unnamedAgent } };
+      if (key.startsWith("pane get")) return { id: "pane-get", result: { pane: basePane } };
+      if (key.startsWith("agent rename")) {
+        renameCalls.push(argv);
+        throw new CliProtocolError("CLI_PROTOCOL_ERROR", "taken", { errorEnvelope: { id: "x", error: { code: "agent_name_taken", message: "taken" } } });
+      }
+      return base.call(harness.cli, argv, signal, preserve);
+    });
+    await expect(execute(harness.cli, { target: "reviewer", operation: "prompt", text: "must not send" })).rejects.toMatchObject({ code: "TARGET_IDENTITY_UNAVAILABLE" });
+    // Every candidate was attempted; none bound, so nothing was sent.
+    expect(renameCalls.length).toBeGreaterThan(1);
+    expect(harness.prompt).not.toHaveBeenCalled();
   });
 
   it("still fails closed when a detected target misses identity fields beyond the name", async () => {

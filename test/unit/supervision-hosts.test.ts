@@ -132,7 +132,7 @@ describe("the Pi host supervision wiring", () => {
     expect(sent[0]!.content).toContain("HIGH PRIORITY: ");
     expect(sent[0]!.content).toContain("blocked");
     expect(sent[0]!.options).toEqual({ deliverAs: "steer", triggerTurn: true });
-    runtime.supervision.shutdown();
+    await runtime.supervision.shutdown();
   });
 });
 

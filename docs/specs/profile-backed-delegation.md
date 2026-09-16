@@ -50,6 +50,7 @@ The first implementation slice delivers a strict profile catalog and profile-bac
   - **AGY has no per-session selector at all** and runs with ambient workspace and user skills. Herdr never writes the real project's `.agents` configuration, never toggles installed AGY plugins, never mutates global or project skill/plugin state, and never substitutes a synthetic workspace root, because each of those is shared mutable state or would change project root, native `AGENTS.md` discovery, git/worktree behavior, and the logical cwd that the fallback contract carries across attempts.
   - Consequently, a strict Pi profile that falls back to Claude or AGY loses the exact-allowlist property for that attempt. Fallback chains are preserved as an availability decision, not an isolation guarantee.
 - Bundled role bodies are rewritten for Herdr; they do not preserve chain, artifact, fork, or `pi-subagents` implementation assumptions.
+- Each qualified Pi, Claude, or Devin run owns one **handoff artifact** at a launcher-generated path in endpoint-private Herdr Tools state. The fixed six-section Markdown record and run marker are validated independently from raw agent status. For authoritatively identified managed runs, `completed` and `terminal` waits remain unmatched until the current artifact validates; validation occurs before target aggregation. AGY remains unqualified. Turn-level cancellation does not end a run, and runtime-authored fallback requires confirmed run-level cancellation or authoritative exit. Restart restoration is deferred: shutdown leaves unresolved records `recovery_pending`, with endpoint-lifetime retention and same-UID cooperative trust. No database, daemon, watcher, transcript scraping, caller path, or static profile edit is introduced. See ADR-031.
 
 ## Layered delivery
 
@@ -93,7 +94,8 @@ Add to Herdr core and managed Pi/Claude integrations:
 - exact turn cancellation;
 - same-pane native `agent replace` preserving scrollback;
 - durable logical-run lineage and exact identity reconciliation;
-- owner-only local result/transcript storage with unguessable bearer refs.
+- owner-only local result/transcript storage with unguessable bearer refs;
+- run-owned handoff path allocation under Herdr state, normal completion blocked until the artifact validates, a distinct runtime-authored record for forced stop/crash, and artifact evidence surfaced through inspect, wait, and completion.
 
 ### Slice 3: Blocking delegate lifecycle
 

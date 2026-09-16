@@ -11,6 +11,8 @@ import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitPa
 import { boundedText, type JobOperationControl, type JobRegistry, type JobRequestSnapshot, type JobRunResult, type JobTargetError } from "../job-registry.js";
 import { createTargetGenerationRef, historicalTargetEvidence, requireWaitTargetIdentity, sameWaitTargetIdentity, type TargetEvidence, type WaitTargetIdentity } from "../wait-target-evidence.js";
 import { withoutEnvironment } from "../redaction.js";
+import { handoffGateMatches, type HandoffGate, type HandoffValidation, type HandoffValidationState } from "../handoff-gate.js";
+import type { HandoffStatus } from "../handoff.js";
 import { deltaLines } from "../transcript-delta.js";
 import { formatCall, resultForRender, textComponent } from "../tui.js";
 
@@ -60,6 +62,12 @@ export interface WaitTargetSnapshot {
   observedAtMs: number;
   matched: boolean;
   target_evidence?: TargetEvidence;
+  /**
+   * Bounded managed-handoff gate evidence, present only when a strict wait on
+   * a managed run evaluated a `completed`/`terminal` condition. `gate` is the
+   * current-cycle artifact verdict that decided `matched`.
+   */
+  handoff?: { runId: string; gate: HandoffValidationState; status?: HandoffStatus; reason?: string };
 }
 
 export interface ReviewerSummary {
@@ -118,6 +126,12 @@ export interface WaitDependencies {
   jobRegistry: JobRegistry;
   /** Enables strict identity sandwiches for protocol-capable wait runners. */
   requireTargetIdentity?: boolean;
+  /**
+   * The shared managed-handoff gate. Strict waits on a bound managed run gate
+   * `completed`/`terminal` on the durable artifact; identityless or unmanaged
+   * waits are untouched.
+   */
+  handoffs?: HandoffGate;
   targetGenerationRefFactory?: () => string;
 }
 
@@ -179,6 +193,17 @@ function retainableAgentState(agent: Record<string, unknown>): WaitRawState | un
   return typeof state === "string" && KNOWN_WAIT_STATES.has(state as WaitRawState) ? state as WaitRawState : undefined;
 }
 
+const HANDOFF_VALIDATION = Symbol("handoffValidation");
+type HandoffGatedSnapshot = WaitTargetSnapshot & { [HANDOFF_VALIDATION]?: HandoffValidation };
+
+function retainHandoffValidation(snapshot: WaitTargetSnapshot, validation: HandoffValidation): void {
+  Object.defineProperty(snapshot, HANDOFF_VALIDATION, { value: validation, enumerable: false, configurable: true });
+}
+
+function handoffValidation(snapshot: WaitTargetSnapshot): HandoffValidation | undefined {
+  return (snapshot as HandoffGatedSnapshot)[HANDOFF_VALIDATION];
+}
+
 function rawState(metadata: Record<string, unknown>): string {
   const value = metadata.agent_status;
   return typeof value === "string" ? value : "unknown";
@@ -200,7 +225,15 @@ export function matchesState(state: string, requested: string): boolean {
 }
 
 export function matches(snapshot: WaitTargetSnapshot, condition: WaitCondition, regex?: SafeRegex): boolean {
-  if (condition.kind === "state") return matchesState(rawState(snapshot.metadata), condition.state);
+  if (condition.kind === "state") {
+    // A managed target's completed/terminal verdict comes from the durable
+    // artifact, validated before this snapshot's matched flag is computed.
+    const validation = handoffValidation(snapshot);
+    if (validation !== undefined && (condition.state === "completed" || condition.state === "terminal")) {
+      return handoffGateMatches(validation, condition.state, rawState(snapshot.metadata));
+    }
+    return matchesState(rawState(snapshot.metadata), condition.state);
+  }
   const output = snapshot.recentUnwrappedLines.join("\n");
   const compactOutput = snapshot.recentUnwrappedLines.map((line) => line.trim()).join("");
   if (condition.match.kind === "literal") {
@@ -387,7 +420,33 @@ async function readStrictIdentity(cli: WaitCli, pane: Record<string, unknown>, p
   return { identity: waitIdentity([pane, agent], paneId), agent };
 }
 
-async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock, signal: AbortSignal, control?: JobOperationControl, strict = false): Promise<WaitTargetSnapshot> {
+/**
+ * A strict wait on a bound managed run must never match off raw lifecycle
+ * alone: the current-cycle artifact verdict attaches to the snapshot before
+ * `matched` is computed, and the bounded evidence rides the published target
+ * projection. Identityless or unmanaged targets attach nothing and stay raw.
+ */
+async function attachHandoffGate(
+  handoffs: HandoffGate | undefined,
+  item: ReadTargetInput,
+  snapshot: WaitTargetSnapshot,
+  condition: WaitCondition,
+): Promise<void> {
+  if (handoffs === undefined || item.identity === undefined || condition.kind !== "state"
+    || (condition.state !== "completed" && condition.state !== "terminal")) return;
+  const run = handoffs.lookup(item.identity);
+  if (run === undefined) return;
+  const validation = await handoffs.validate(run);
+  retainHandoffValidation(snapshot, validation);
+  snapshot.handoff = {
+    runId: run.runId,
+    gate: validation.state,
+    ...(validation.artifact?.status !== undefined ? { status: validation.artifact.status } : {}),
+    ...(validation.reason !== undefined ? { reason: validation.reason } : {})
+  };
+}
+
+async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock, signal: AbortSignal, condition: WaitCondition, control?: JobOperationControl, strict = false, handoffs?: HandoffGate): Promise<WaitTargetSnapshot> {
   checkAbort(signal);
   const paneId = item.target.paneId!;
   try {
@@ -412,7 +471,9 @@ async function readTarget(cli: WaitCli, item: ReadTargetInput, clock: WaitClock,
       finalAgentState = retainableAgentState(verified.agent);
     }
     checkAbort(signal);
-    return retainAuthoritativeState({ target: item.ref, targetId: paneId, metadata: metadataWithoutIdentity(pane), recentUnwrappedLines: boundedLines(output.value), outputTruncated: output.truncated, observedAtMs: clock.now(), matched: false }, finalAgentState);
+    const snapshot = retainAuthoritativeState({ target: item.ref, targetId: paneId, metadata: metadataWithoutIdentity(pane), recentUnwrappedLines: boundedLines(output.value), outputTruncated: output.truncated, observedAtMs: clock.now(), matched: false }, finalAgentState);
+    await attachHandoffGate(handoffs, item, snapshot, condition);
+    return snapshot;
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;
@@ -430,6 +491,7 @@ async function readCurrentStateTarget(
   deadline: number,
   condition: Extract<WaitCondition, { kind: "state" }>,
   control?: JobOperationControl,
+  handoffs?: HandoffGate,
 ): Promise<WaitTargetSnapshot> {
   checkAbort(signal);
   const paneId = item.target.paneId!;
@@ -456,15 +518,18 @@ async function readCurrentStateTarget(
       metadata = targetMetadata(item, agent, pane, { agent_status: status });
     }
     const observedAtMs = clock.now();
-    return retainAuthoritativeState({
+    const snapshot = retainAuthoritativeState({
       target: item.ref,
       targetId: paneId,
       metadata: metadataWithoutIdentity(metadata),
       recentUnwrappedLines: [],
       observedAtMs,
-      matched: observedAtMs < deadline && matchesState(status, condition.state),
+      matched: false,
       target_evidence: historicalTargetEvidence(agentAbsent ? "agent_absent_observed" : "predicate_observed", observedAtMs, item.targetGenerationRef, "composite_observation")
     }, agentAbsent ? undefined : status as WaitRawState);
+    await attachHandoffGate(handoffs, item, snapshot, condition);
+    snapshot.matched = observedAtMs < deadline && matches(snapshot, condition);
+    return snapshot;
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;
@@ -548,8 +613,9 @@ async function readCurrentState(
   condition: Extract<WaitCondition, { kind: "state" }>,
   match: WaitParams["match"],
   control?: JobOperationControl,
+  handoffs?: HandoffGate,
 ): Promise<WaitObservation> {
-  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readCurrentStateTarget(cli, item, clock, targetSignal, deadline, condition, control), (snapshot) => snapshot.matched && clock.now() < deadline);
+  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readCurrentStateTarget(cli, item, clock, targetSignal, deadline, condition, control, handoffs), (snapshot) => snapshot.matched && clock.now() < deadline);
   const snapshots = orderedSnapshots(fanout.values as Array<{ index: number; value: WaitTargetSnapshot }>);
   const targetErrors = orderedTargetErrors(fanout.errors, resolved);
   return { snapshots, targetErrors, expired: expired(clock, deadline, snapshots) };
@@ -565,8 +631,8 @@ function observeOutput(snapshot: WaitTargetSnapshot, item: ReadTargetInput, cloc
   return snapshot.matched;
 }
 
-async function readAndMatch(cli: WaitCli, resolved: ReadonlyArray<ReadTargetInput>, clock: WaitClock, signal: AbortSignal, deadline: number, condition: WaitCondition, match: WaitParams["match"], regex?: SafeRegex, control?: JobOperationControl, strict = false): Promise<WaitObservation> {
-  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readTarget(cli, item, clock, targetSignal, control, strict), (snapshot, index) => observeOutput(snapshot, resolved[index]!, clock, deadline, condition, regex));
+async function readAndMatch(cli: WaitCli, resolved: ReadonlyArray<ReadTargetInput>, clock: WaitClock, signal: AbortSignal, deadline: number, condition: WaitCondition, match: WaitParams["match"], regex?: SafeRegex, control?: JobOperationControl, strict = false, handoffs?: HandoffGate): Promise<WaitObservation> {
+  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readTarget(cli, item, clock, targetSignal, condition, control, strict, handoffs), (snapshot, index) => observeOutput(snapshot, resolved[index]!, clock, deadline, condition, regex));
   const snapshots = orderedSnapshots(fanout.values as Array<{ index: number; value: WaitTargetSnapshot }>);
   if (match === "all") snapshots.forEach((snapshot) => observeOutput(snapshot, resolved.find((item) => item.target.paneId === snapshot.targetId)!, clock, deadline, condition, regex));
   const targetErrors = orderedTargetErrors(fanout.errors, resolved);
@@ -638,6 +704,7 @@ async function readNativeTarget(
   condition: Extract<WaitCondition, { kind: "state" }>,
   control?: JobOperationControl,
   nativeWaitDeadline = deadline,
+  handoffs?: HandoffGate,
 ): Promise<WaitTargetSnapshot> {
   const until = nativeUntil(condition);
   const timeoutMs = Math.max(1, nativeWaitDeadline - clock.now());
@@ -671,16 +738,18 @@ async function readNativeTarget(
       if (!item.identity || !sameWaitTargetIdentity(identity, item.identity)) throw new WaitError("CLI_PROTOCOL_ERROR", "CLI_PROTOCOL_ERROR: native agent.wait target occupant changed");
     }
     const observedAtMs = clock.now();
-    const matched = observedAtMs < deadline && matchesState(status, condition.state);
     const metadata = agentAbsent ? pane : targetMetadata(item, record, agent, pane);
-    return retainAuthoritativeState(nativeSnapshot(item, metadata, status, observedAtMs, matched, agentAbsent), authoritativeAgentState);
+    const snapshot = retainAuthoritativeState(nativeSnapshot(item, metadata, status, observedAtMs, false, agentAbsent), authoritativeAgentState);
+    await attachHandoffGate(handoffs, item, snapshot, condition);
+    snapshot.matched = observedAtMs < deadline && matches(snapshot, condition);
+    return snapshot;
   } catch (error) {
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     // A typed timeout from the native command means its predicate expired; a
     // killed subprocess (or a post-match verification timeout) is a failure.
-    if (phase === "native_wait" && isNativePredicateTimeout(error)) return readCurrentStateTarget(cli, item, clock, signal, deadline, condition, control);
+    if (phase === "native_wait" && isNativePredicateTimeout(error)) return readCurrentStateTarget(cli, item, clock, signal, deadline, condition, control, handoffs);
     if (errorCode(error) === "CLI_TIMEOUT") {
-      if (clock.now() >= deadline) return readCurrentStateTarget(cli, item, clock, signal, deadline, condition, control);
+      if (clock.now() >= deadline) return readCurrentStateTarget(cli, item, clock, signal, deadline, condition, control, handoffs);
       throw new WaitError("CLI_TIMEOUT", "CLI_TIMEOUT: native wait or target verification timed out", { target: item.ref, targetId: item.target.paneId! });
     }
     if (error instanceof WaitError) throw error;
@@ -719,8 +788,9 @@ async function readNative(
   match: WaitParams["match"],
   control?: JobOperationControl,
   nativeWaitDeadline = deadline,
+  handoffs?: HandoffGate,
 ): Promise<WaitObservation> {
-  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readNativeTarget(cli, item, clock, targetSignal, deadline, condition, control, nativeWaitDeadline), (snapshot) => snapshot.matched && clock.now() < deadline);
+  const fanout = await fanOutTargets(resolved, signal, match, (item, targetSignal) => readNativeTarget(cli, item, clock, targetSignal, deadline, condition, control, nativeWaitDeadline, handoffs), (snapshot) => snapshot.matched && clock.now() < deadline);
   const snapshots = orderedSnapshots(fanout.values as Array<{ index: number; value: WaitTargetSnapshot }>);
   const targetErrors = orderedTargetErrors(fanout.errors, resolved);
   return { snapshots, targetErrors, expired: expired(clock, deadline, snapshots) };
@@ -738,11 +808,12 @@ async function readInitialObservation(
   control?: JobOperationControl,
   strict = false,
   nativeWaitDeadline = deadline,
+  handoffs?: HandoffGate,
 ): Promise<WaitObservation> {
   const native = cli.supportsNativeAgentWait === true && condition.kind === "state";
   return native
-    ? readNative(cli, resolved, clock, signal, deadline, condition, match, control, nativeWaitDeadline)
-    : readAndMatch(cli, resolved, clock, signal, deadline, condition, match, regex, control, strict);
+    ? readNative(cli, resolved, clock, signal, deadline, condition, match, control, nativeWaitDeadline, handoffs)
+    : readAndMatch(cli, resolved, clock, signal, deadline, condition, match, regex, control, strict, handoffs);
 }
 
 export function boundedBackgroundDetails(jobId: string, label: string, params: WaitParams, targetIds: string[]): BackgroundWaitDetails {
@@ -1048,14 +1119,14 @@ export async function runPreparedWait(
   let nextReview = start + cadenceMs;
   const initialNativeDeadline = nativePredicate && longWait ? Math.min(deadline, start + cadenceMs) : deadline;
   let read = nativePredicate
-    ? await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control)
-    : await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline);
+    ? await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control, deps.handoffs)
+    : await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline, deps.handoffs);
   let snapshots = read.snapshots;
   let targetErrors = read.targetErrors;
   let settled = observationResult(params, read);
   if (settled) return settled;
   if (nativePredicate) {
-    read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline);
+    read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, initialNativeDeadline, deps.handoffs);
     snapshots = read.snapshots;
     targetErrors = read.targetErrors;
     settled = observationResult(params, read);
@@ -1079,14 +1150,14 @@ export async function runPreparedWait(
     checkAbort(signal);
     if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries, targetErrors);
     if (nativePredicate) {
-      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
+      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control, deps.handoffs);
       snapshots = fresh.snapshots;
       targetErrors = fresh.targetErrors;
       settled = observationResult(params, fresh, reviewerSummaries);
       if (settled) return settled;
     }
     const nativePollDeadline = nativePredicate && longWait ? Math.min(deadline, nextReview) : deadline;
-    read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, nativePollDeadline);
+    read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, nativePollDeadline, deps.handoffs);
     snapshots = read.snapshots;
     targetErrors = read.targetErrors;
     settled = observationResult(params, read, reviewerSummaries);
@@ -1099,7 +1170,7 @@ export async function runPreparedWait(
     if (!longWait || clock.now() < nextReview) continue;
     nextReview += cadenceMs;
     if (nativePredicate) {
-      const reviewerRead = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity);
+      const reviewerRead = await readAndMatch(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, deps.handoffs);
       if (reviewerRead.expired) return timedOutResult(reviewerRead.snapshots, reviewerSummaries, reviewerRead.targetErrors);
       if (reviewerRead.targetErrors.length > 0) throwTargetReadFailure(reviewerRead, reviewerSummaries);
       // This composite refresh is reviewer context only. A native predicate can
@@ -1109,7 +1180,7 @@ export async function runPreparedWait(
       snapshots = reviewerRead.snapshots.map((snapshot) => ({ ...snapshot, matched: false }));
       targetErrors = reviewerRead.targetErrors;
       lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
-      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
+      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control, deps.handoffs);
       snapshots = fresh.snapshots;
       targetErrors = fresh.targetErrors;
       settled = observationResult(params, fresh, reviewerSummaries);
@@ -1150,7 +1221,7 @@ export async function runPreparedWait(
       throw mapReviewerFailure(error);
     }
     if (nativePredicate) {
-      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
+      const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control, deps.handoffs);
       snapshots = fresh.snapshots;
       targetErrors = fresh.targetErrors;
       settled = observationResult(params, fresh, reviewerSummaries);
@@ -1168,14 +1239,14 @@ export async function runPreparedWait(
     if (hardManagerJudgment || unknownReviews.length > 0) {
       if (expired(clock, deadline, snapshots)) return timedOutResult(snapshots, reviewerSummaries, targetErrors);
       if (nativePredicate) {
-        const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control);
+        const fresh = await readCurrentState(deps.cli, resolved, clock, signal, deadline, params.condition as Extract<WaitCondition, { kind: "state" }>, params.match, control, deps.handoffs);
         snapshots = fresh.snapshots;
         targetErrors = fresh.targetErrors;
         settled = observationResult(params, fresh, reviewerSummaries);
         if (settled) return settled;
       }
       const nativeReviewDeadline = nativePredicate ? Math.min(deadline, clock.now() + 1) : deadline;
-      read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, nativeReviewDeadline);
+      read = await readInitialObservation(deps.cli, resolved, clock, signal, deadline, params.condition, params.match, validation.regex, control, strictIdentity, nativeReviewDeadline, deps.handoffs);
       snapshots = read.snapshots;
       targetErrors = read.targetErrors;
       settled = observationResult(params, read, reviewerSummaries);

@@ -150,3 +150,105 @@ describe("coverage contract edges", () => {
     expect(classifySnapshotTarget(snapshot([pane()], [{ pane_id: "p1", agent: "pi", agent_session: session }]), "p1")).toMatchObject({ kind: "unique", occupant: { agentPresent: true } });
   });
 });
+
+describe("bounded managed-handoff projections", () => {
+  const gateVerdict = (handoff: unknown) => publicDetail({
+    jobId: "job_gate",
+    kind: "wait",
+    operation_phase: "settled",
+    sequence: 1,
+    createdAtMs: 0,
+    request: waitRequest,
+    result: {
+      wait_result: "condition_met",
+      matched: true,
+      targets: [{ target: "worker", targetId: "p1", metadata: {}, recentUnwrappedLines: [], observedAtMs: 0, matched: true, handoff }],
+    },
+  } as never);
+
+  const evidence = (handoff: unknown) => publicDetail({
+    jobId: "job_evidence",
+    kind: "supervisor",
+    operation_phase: "running",
+    sequence: 1,
+    createdAtMs: 0,
+    request: supervisorRequest,
+    handoff,
+  } as never);
+
+  it("re-validates every per-target gate verdict at the public boundary", () => {
+    const malformed: unknown[] = [
+      "not an object",
+      null,
+      [],
+      { gate: "accepted" },
+      { runId: "run-1", gate: 7 },
+      { runId: "run-1", gate: "accepted", status: 7 },
+      { runId: "run-1", gate: "accepted", reason: 7 },
+    ];
+    for (const value of malformed) {
+      const detail = gateVerdict(value);
+      expect(detail.result!.targets![0]).not.toHaveProperty("handoff");
+      expect(detail.truncation?.handoffEvidence).toBe(1);
+    }
+
+    // The optional halves of a well-formed verdict drop independently.
+    expect(gateVerdict({ runId: "run-1", gate: "accepted" }).result!.targets![0]!.handoff)
+      .toEqual({ runId: "run-1", gate: "accepted" });
+    expect(gateVerdict({ runId: "run-1", gate: "invalid", status: "done", reason: "headings_mismatch" }).result!.targets![0]!.handoff)
+      .toEqual({ runId: "run-1", gate: "invalid", status: "done", reason: "headings_mismatch" });
+
+    const clipped = gateVerdict({ runId: "r".repeat(400), gate: "accepted" });
+    expect(clipped.result!.targets![0]!.handoff!.runId.length).toBeLessThan(400);
+    expect(clipped.truncation?.handoffFieldsClipped).toBe(1);
+  });
+
+  it("re-validates supervisor handoff evidence field by field", () => {
+    const malformed: unknown[] = [
+      "not an object",
+      null,
+      [],
+      { gated: false },
+      { gated: false, reason: 7 },
+      { gated: true, runId: 7, path: "/tmp/handoff.md", state: "awaiting_handoff" },
+    ];
+    for (const value of malformed) {
+      const detail = evidence(value);
+      expect(detail).not.toHaveProperty("handoff");
+      expect(detail.truncation?.handoffEvidence).toBe(1);
+    }
+    expect(evidence({ gated: false, reason: "no_managed_run" }).handoff).toEqual({ gated: false, reason: "no_managed_run" });
+
+    const identity = { gated: true, runId: "run-1", path: "/tmp/handoff.md", state: "awaiting_handoff" };
+    // A run with no sub-objects at all projects its identity and nothing else.
+    const identityOnly = evidence(identity);
+    expect(identityOnly.handoff).toEqual(identity);
+    expect(identityOnly.truncation?.handoffFieldsClipped).toBeUndefined();
+
+    // A sub-object that is not an object at all, and one whose own fields are
+    // the wrong shape, both drop without taking the run's identity with them.
+    const notObjects = evidence({ ...identity, validation: "nope", artifact: [], repair: 7 });
+    expect(notObjects.handoff).toEqual(identity);
+    expect(notObjects.truncation?.handoffFieldsClipped).toBe(3);
+
+    const wrongFields = evidence({ ...identity, validation: { state: 7 }, artifact: { sha256: "a", version: 1.5, bytes: 2 }, repair: { attempts: "many" } });
+    expect(wrongFields.handoff).toEqual(identity);
+    expect(wrongFields.truncation?.handoffFieldsClipped).toBe(1);
+
+    const bare = evidence({ ...identity, validation: { state: "missing" }, artifact: { sha256: "b".repeat(64), version: 1, bytes: 10 }, repair: { attempts: 1 } });
+    expect(bare.handoff).toEqual({ ...identity, validation: { state: "missing" }, artifact: { sha256: "b".repeat(64), version: 1, bytes: 10 }, repair: { attempts: 1 } });
+
+    const full = evidence({
+      gated: true, runId: "run-1", path: "/tmp/handoff.md", state: "handed_off",
+      validation: { state: "invalid", reason: "changes" },
+      artifact: { status: "done", sha256: "c".repeat(64), version: 2, bytes: 120 },
+      repair: { attempts: 3, fenceVersion: 2 },
+    });
+    expect(full.handoff).toEqual({
+      gated: true, runId: "run-1", path: "/tmp/handoff.md", state: "handed_off",
+      validation: { state: "invalid", reason: "changes" },
+      artifact: { status: "done", sha256: "c".repeat(64), version: 2, bytes: 120 },
+      repair: { attempts: 3, fenceVersion: 2 },
+    });
+  });
+});

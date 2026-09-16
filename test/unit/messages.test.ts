@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ATTACHMENT_MAX_BYTES, ATTACHMENT_RETENTION_HOURS, ATTACHMENT_STORE_MAX_RECORDS, ATTACHMENT_STORE_QUOTA_BYTES, MESSAGE_INLINE_MAX_BYTES, assertDeliverySize, assertMessageText } from "../../src/messages/limits.js";
 import { RecipientRegistry, mintRecipientKey, recipientIdentity, verifyRecipient } from "../../src/messages/recipients.js";
 import { withDeliveryFailureEvidence } from "../../src/messages/failure.js";
-import { attachmentCapability } from "../../src/profiles/capability.js";
+import { attachmentCapability, handoffWriteCapability } from "../../src/profiles/capability.js";
 import { ATTACHMENT_GRANT_NAME, ATTACHMENT_LOCK_NAME, ATTACHMENT_LOCK_OWNER_FILE, DEFAULT_GRANT_LEASE_MS, DEFAULT_LOCK_LEASE_MS, attachmentMetadataBytes, createAttachmentStore, publishedAttachmentMatchesDirectory, type AttachmentDirEntry, type AttachmentStoreIo } from "../../src/messages/store.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import type { Profile } from "../../src/profiles/types.js";
@@ -106,6 +106,18 @@ describe("large message limits and recipient capabilities", () => {
     expect(attachmentCapability(profile("claude"), { disallowedTools: ["Read"] })).toMatchObject({ capable: false, reason: "Claude profile disallows Read" });
     expect(attachmentCapability(profile("claude"), { allowedTools: ["Bash"] })).toMatchObject({ capable: false, reason: "Claude profile allowlist excludes Read" });
     expect(attachmentCapability(profile("claude", { disallowedTools: ["Read"] }), { disallowedTools: [] })).toMatchObject({ capable: true });
+  });
+
+  it("derives handoff write capability from the effective post-override runtime", () => {
+    expect(handoffWriteCapability(profile("pi"))).toMatchObject({ kind: "pi", capable: true });
+    expect(handoffWriteCapability(profile("pi", { tools: ["read"] }))).toMatchObject({ capable: false, reason: "Pi profile excludes every write-capable tool" });
+    expect(handoffWriteCapability(profile("pi", { tools: ["read"] }), { tools: ["apply_patch"] })).toMatchObject({ capable: true });
+    expect(handoffWriteCapability(profile("claude"))).toMatchObject({ kind: "claude", capable: true });
+    expect(handoffWriteCapability(profile("claude", { disallowedTools: ["Write", "Bash"] }))).toMatchObject({ capable: false, reason: "Claude profile excludes Write and Bash" });
+    expect(handoffWriteCapability(profile("claude", { allowedTools: ["Bash"] }))).toMatchObject({ capable: true });
+    expect(handoffWriteCapability(profile("claude"), { disallowedTools: ["Write", "Bash"] })).toMatchObject({ capable: false });
+    // AGY has no tool allowlist to narrow, so it can always write its artifact.
+    expect(handoffWriteCapability(profile("agy"))).toMatchObject({ kind: "agy", capable: true, reason: "AGY profile can write its run handoff" });
   });
 
   it("tracks runtime-only recipient identities and resets them", () => {

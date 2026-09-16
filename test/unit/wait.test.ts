@@ -1,3 +1,6 @@
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { CliProtocolError } from "../../src/cli.js";
@@ -6,6 +9,8 @@ import { createJobsTool } from "../../src/tools/jobs.js";
 import { WaitError, boundedBackgroundDetails, createWaitTool, deriveWaitLabel, errorCode, linkedSignal, matches, matchesState, mapReviewerFailure, boundedLines, compactMetadata, prepareWait, realClock, runPreparedWait, type WaitClock, type WaitCli } from "../../src/tools/wait.js";
 import { JobRegistry } from "../../src/job-registry.js";
 import { createTargetGenerationRef, historicalTargetEvidence, isTargetEvidence, requireWaitTargetIdentity, sameWaitTargetIdentity } from "../../src/wait-target-evidence.js";
+import { createHandoffAllocator, type HandoffAllocation, type HandoffStatus } from "../../src/handoff.js";
+import { createHandoffGate, type HandoffRun } from "../../src/handoff-gate.js";
 import { deltaLines } from "../../src/transcript-delta.js";
 
 const snapshot = {
@@ -1894,5 +1899,209 @@ describe("herdr_wait", () => {
     await managerTool.execute("id", { targets: ["p1"], match: "all", condition: { kind: "state", state: "done" }, timeoutMs: 60_001 } as never, new AbortController().signal, undefined, extensionContext);
     for (let index = 0; index < 10; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     expect(managerRegistry.get("job_manager_bg")).toMatchObject({ operation_phase: "settled", wait_result: "manager_judgment_required" });
+  });
+});
+
+describe("herdr_wait managed handoff gate", () => {
+  const completed = { kind: "state" as const, state: "completed" as const };
+  const terminal = { kind: "state" as const, state: "terminal" as const };
+  // p1's strict wait identity exactly as the native fixture resolves it.
+  const MANAGED_IDENTITY = { paneId: "p1", terminalId: "term-p1", agentName: "one", agentKind: "pi", agentSession: { source: "pi", agent: "pi", kind: "id", value: "p1-session" } };
+
+  async function managedGate(): Promise<{ gate: ReturnType<typeof createHandoffGate>; run: HandoffRun; allocation: HandoffAllocation; writeArtifact(status?: HandoffStatus, summary?: string): Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), "herdr-wait-handoff-"));
+    await chmod(dir, 0o700);
+    const allocator = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+    const allocation = await allocator.allocate();
+    await allocator.persist(allocation, {
+      manager: { paneId: "p1", display: "caller", source: "injected" },
+      child: { agentName: "one", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: [] }
+    });
+    const gate = createHandoffGate();
+    const run = await gate.bind(allocation, MANAGED_IDENTITY);
+    const writeArtifact = async (status: HandoffStatus = "done", summary = "Implemented the change.") => writeFile(
+      allocation.artifactPath,
+      `${allocation.marker}\n\n## Status\n${status}\n\n## Summary\n${summary}\n\n## Changes\n- src/a.ts\n\n## Verification\nnpm test passed.\n\n## Blockers\nNone\n\n## Continuation\nNone\n`,
+      { mode: 0o600 }
+    );
+    return { gate, run, allocation, writeArtifact };
+  }
+
+  it("gates a managed completed wait on idle until the current artifact validates", async () => {
+    const { gate, run, writeArtifact } = await managedGate();
+    const cli = nativeCli({ statuses: { p1: "idle" } });
+    const params = { targets: ["p1"], match: "any" as const, condition: completed, timeoutMs: 10 };
+    const pending = await execute(cli, params, { handoffs: gate, clock: clock() });
+    expect(pending.wait_result).toBe("timed_out");
+    expect(pending.targets?.[0]?.matched).toBe(false);
+    expect(pending.targets?.[0]?.handoff).toMatchObject({ runId: run.runId, gate: "missing" });
+
+    await writeArtifact();
+    const met = await execute(cli, params, { handoffs: gate, clock: clock() });
+    expect(met.wait_result).toBe("condition_met");
+    expect(met.targets?.[0]?.handoff).toMatchObject({ runId: run.runId, gate: "accepted", status: "done" });
+  });
+
+  it("gates a managed completed wait on done the same way", async () => {
+    const { gate, writeArtifact } = await managedGate();
+    const cli = nativeCli({ statuses: { p1: "done" } });
+    const params = { targets: ["p1"], match: "any" as const, condition: completed, timeoutMs: 10 };
+    expect((await execute(cli, params, { handoffs: gate, clock: clock() })).wait_result).toBe("timed_out");
+    await writeArtifact();
+    expect((await execute(cli, params, { handoffs: gate, clock: clock() })).wait_result).toBe("condition_met");
+  });
+
+  it("gates terminal on the corresponding artifact status for every terminal outcome", async () => {
+    const { gate, writeArtifact } = await managedGate();
+    const blocked = nativeCli({ statuses: { p1: "blocked" } });
+    const idle = nativeCli({ statuses: { p1: "idle" } });
+    const params = { targets: ["p1"], match: "any" as const, condition: terminal, timeoutMs: 10 };
+
+    // Missing artifact keeps a blocked child unmatched.
+    const pending = await execute(blocked, params, { handoffs: gate, clock: clock() });
+    expect(pending.wait_result).toBe("timed_out");
+    expect(pending.targets?.[0]?.handoff).toMatchObject({ gate: "missing" });
+
+    // blocked raw needs a blocked artifact.
+    await writeArtifact("blocked");
+    const met = await execute(blocked, params, { handoffs: gate, clock: clock() });
+    expect(met.wait_result).toBe("condition_met");
+    expect(met.targets?.[0]?.handoff).toMatchObject({ gate: "accepted", status: "blocked" });
+
+    // A done artifact never satisfies a blocked child, and a blocked artifact
+    // never satisfies an idle one.
+    await writeArtifact("done");
+    expect((await execute(blocked, params, { handoffs: gate, clock: clock() })).wait_result).toBe("timed_out");
+    await writeArtifact("blocked");
+    expect((await execute(idle, params, { handoffs: gate, clock: clock() })).wait_result).toBe("timed_out");
+
+    // done/failed/cancelled all correspond to idle or done raw states.
+    await writeArtifact("failed");
+    const failed = await execute(idle, params, { handoffs: gate, clock: clock() });
+    expect(failed.wait_result).toBe("condition_met");
+    expect(failed.targets?.[0]?.handoff).toMatchObject({ gate: "accepted", status: "failed" });
+  });
+
+  it("refuses foreign-run and stale artifacts while keeping the target unmatched", async () => {
+    const { gate, run, allocation, writeArtifact } = await managedGate();
+    const cli = nativeCli({ statuses: { p1: "done" } });
+    const params = { targets: ["p1"], match: "any" as const, condition: completed, timeoutMs: 10 };
+    await writeFile(allocation.artifactPath, "herdr-run:bbbbbbbb-0000-0000-0000-000000000000\n\n## Status\ndone\n\n## Summary\nx\n\n## Changes\nNone\n\n## Verification\nok\n\n## Blockers\nNone\n\n## Continuation\nNone\n", { mode: 0o600 });
+    const foreign = await execute(cli, params, { handoffs: gate, clock: clock() });
+    expect(foreign.wait_result).toBe("timed_out");
+    expect(foreign.targets?.[0]?.handoff).toMatchObject({ gate: "invalid", reason: "foreign_run" });
+
+    await writeArtifact();
+    expect((await execute(cli, params, { handoffs: gate, clock: clock() })).wait_result).toBe("condition_met");
+    // A new work cycle opened: the previously accepted content is stale, so the
+    // wait is unmatched again until the child writes a fresh artifact.
+    gate.beginCycle(run);
+    const stale = await execute(cli, params, { handoffs: gate, clock: clock() });
+    expect(stale.wait_result).toBe("timed_out");
+    expect(stale.targets?.[0]?.handoff?.gate).toBe("stale");
+  });
+
+  it("validates each managed target before any/all aggregation and leaves unmanaged targets raw", async () => {
+    const { gate, writeArtifact } = await managedGate();
+    const cli = nativeCli({ statuses: { p1: "idle", p2: "idle" } });
+
+    // all: managed p1 unmatched while unmanaged p2 stays raw-matched.
+    const all = await execute(cli, { targets: ["p1", "p2"], match: "all" as const, condition: completed, timeoutMs: 10 }, { handoffs: gate, clock: clock() });
+    expect(all.wait_result).toBe("timed_out");
+    expect(all.targets?.find((target) => target.targetId === "p1")?.handoff).toMatchObject({ gate: "missing" });
+    expect(all.targets?.find((target) => target.targetId === "p2")?.handoff).toBeUndefined();
+
+    // any: unmanaged p2 alone satisfies; p1's missing artifact never blocks it.
+    const any = await execute(cli, { targets: ["p1", "p2"], match: "any" as const, condition: completed, timeoutMs: 10 }, { handoffs: gate, clock: clock() });
+    expect(any.wait_result).toBe("condition_met");
+    expect(any.matchedTargets).toEqual([{ target: "p2", targetId: "p2" }]);
+
+    await writeArtifact();
+    const metAll = await execute(cli, { targets: ["p1", "p2"], match: "all" as const, condition: completed, timeoutMs: 10 }, { handoffs: gate, clock: clock() });
+    expect(metAll.wait_result).toBe("condition_met");
+    expect(metAll.matchedTargets).toHaveLength(2);
+  });
+
+  it("leaves identityless observation-only waits ungated", async () => {
+    const { gate } = await managedGate();
+    // fakeCli has no native wait and no strict-identity opt-in, so the wait
+    // carries no target identity and the gate never attaches.
+    const result = await execute(fakeCli({ p1: "done" }), { targets: ["p1"], match: "any" as const, condition: completed, timeoutMs: 10 }, { handoffs: gate, clock: clock() });
+    expect(result.wait_result).toBe("condition_met");
+    expect(result.targets?.[0]?.handoff).toBeUndefined();
+  });
+});
+
+describe("lazy target adoption in wait binding", () => {
+  /** A detected pane whose only missing join field is the agent name. */
+  function unnamedSnapshot(kind: string) {
+    const base = structuredClone(snapshot) as unknown as { snapshot: { panes: Record<string, unknown>[]; agents: Record<string, unknown>[] } };
+    const session = { source: kind, agent: kind, kind: "id", value: "p1-session" };
+    base.snapshot.panes = base.snapshot.panes.map((pane) => {
+      const copy: Record<string, unknown> = { ...pane, agent: kind, terminal_id: "term-p1", agent_session: session };
+      delete copy.agent_name;
+      return copy;
+    });
+    base.snapshot.agents = base.snapshot.agents.map((agent) => {
+      const copy: Record<string, unknown> = { ...agent, agent: kind, terminal_id: "term-p1", agent_session: session };
+      delete copy.name;
+      return copy;
+    });
+    return base;
+  }
+
+  function adoptCli(options: { kind?: string; nameTaken?: boolean } = {}): WaitCli & { renames: string[][] } {
+    const kind = options.kind ?? "pi";
+    const live = unnamedSnapshot(kind);
+    const renames: string[][] = [];
+    let minted: string | undefined;
+    const withName = (record: Record<string, unknown>, key: string) => minted === undefined ? record : { ...record, [key]: minted };
+    const pane = () => withName(live.snapshot.panes[0]!, "agent_name");
+    const agent = () => withName(live.snapshot.agents[0]!, "name");
+    const cli = {
+      renames,
+      supportsNativeAgentWait: false,
+      async runJson(argv: string[]) {
+        const key = argv.join(" ");
+        if (key.startsWith("agent rename")) {
+          renames.push(argv);
+          if (options.nameTaken) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "taken", { errorEnvelope: { id: "x", error: { code: "agent_name_taken", message: "taken" } } });
+          minted = argv[3];
+          return { id: "rename", result: { type: "agent_info", agent: { ...agent(), name: argv[3] } } };
+        }
+        if (key.startsWith("pane report-metadata")) return { id: "meta", result: { ok: true } };
+        if (argv[0] === "pane" && argv[1] === "current") return { id: "current", result: { type: "pane_current", pane: pane() } };
+        if (argv[0] === "api") return { id: "snapshot", result: { ...live, snapshot: { ...live.snapshot, panes: [pane(), live.snapshot.panes[1]], agents: [agent(), live.snapshot.agents[1]] } } };
+        if (argv[0] === "agent" && argv[1] === "get") return { id: "agent", result: { agent: agent() } };
+        return { id: "pane", result: { pane: pane() } };
+      },
+      async runTextResult() { return { value: "needle", truncated: false }; },
+      async runText() { return "needle"; }
+    };
+    return cli as unknown as WaitCli & { renames: string[][] };
+  }
+
+  const outputWait = { targets: ["p1"], match: "any" as const, condition: { kind: "output" as const, match: { kind: "literal" as const, value: "needle" } }, timeoutMs: 1 };
+
+  it("mints a derived name so the wait binds to the detected target", async () => {
+    const cli = adoptCli();
+    const result = await execute(cli, outputWait, { clock: clock(), requireTargetIdentity: true });
+    expect(cli.renames).toEqual([["agent", "rename", "p1", "pi-p1"]]);
+    expect(result).toMatchObject({ wait_result: "condition_met", matched: true });
+  });
+
+  it("never adopts a kind outside the allowlist and still fails closed", async () => {
+    const cli = adoptCli({ kind: "agy" });
+    await expect(execute(cli, outputWait, { clock: clock(), requireTargetIdentity: true }))
+      .rejects.toThrowError(/wait target identity/iu);
+    expect(cli.renames).toEqual([]);
+  });
+
+  it("fails closed when every derived name is already held", async () => {
+    const cli = adoptCli({ nameTaken: true });
+    await expect(execute(cli, outputWait, { clock: clock(), requireTargetIdentity: true }))
+      .rejects.toThrowError(/wait target identity/iu);
+    // Every derived candidate was attempted before the wait refused to bind.
+    expect(cli.renames.length).toBeGreaterThan(1);
   });
 });

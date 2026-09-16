@@ -72,7 +72,7 @@ function uid(failure: (message: string) => Error, subject: string): number {
   return value;
 }
 
-function assertOwnerOnlyDirectory(path: string, value: Awaited<ReturnType<typeof lstat>>, failure: (message: string) => Error, subject: string): void {
+export function assertOwnerOnlyDirectory(path: string, value: Awaited<ReturnType<typeof lstat>>, failure: (message: string) => Error, subject: string): void {
   const mode = Number(value.mode);
   if (!value.isDirectory() || value.isSymbolicLink() || value.uid !== uid(failure, subject) || (mode & 0o22) !== 0) {
     throw failure(`${subject} directory is not trusted: ${path}`);

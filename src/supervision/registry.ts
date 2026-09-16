@@ -2,8 +2,8 @@
  * The session-scoped supervision coordinator.
  *
  * It owns the one event connection, the supervisor jobs, and the reserve → bind
- * → settle contract `herdr_launch` depends on. Nothing here persists across
- * manager sessions.
+ * → settle contract `herdr_launch` depends on. Supervisor objects remain
+ * session-scoped; managed handoff sidecars persist separately as recovery evidence.
  */
 
 import { createTargetGenerationRef } from "../wait-target-evidence.js";
@@ -16,8 +16,10 @@ import { ModelSupervisionReviewer, SUPERVISION_REVIEWER_MODEL, type SupervisionR
 import type { SupervisionModelService } from "./model-service.js";
 import type { ProvisionalSupervisionBinding } from "./identity.js";
 import type { SelfCloseTracker } from "./self-close.js";
+import type { HandoffGate, HandoffRun } from "../handoff-gate.js";
 import {
   Supervisor,
+  SupervisionBindError,
   type SupervisionBinding,
   type SupervisionChildRequest,
   type SupervisionScheduler,
@@ -60,6 +62,17 @@ export interface SupervisionRegistryDependencies {
   reviewerFactory?: () => SupervisionReviewer;
   /** The host's own-close ledger; forwarded to every supervisor it reserves. */
   selfClose?: SelfCloseTracker;
+  /**
+   * The shared managed-handoff gate. A binding that carries an allocation is
+   * bound to the exact identity through it before the child binding commits;
+   * a host without one cannot accept a managed binding at all.
+   */
+  handoffs?: HandoffGate;
+  /**
+   * Exact-child repair prompt transport, forwarded to every supervisor. A host
+   * without one still gates outcomes but never fences a repair attempt.
+   */
+  repairPrompt?: (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
   clock?: { now(): number };
   scheduler?: SupervisionScheduler;
   idFactory?: () => string;
@@ -150,6 +163,10 @@ export class SupervisionRegistry implements SupervisionCoordinator {
     };
     const ready = deferred<Supervisor>();
     const identity = { jobId: "" };
+    // The gate-bound run this reservation's bind created, if any. The runner
+    // forgets it once the supervisor settles it resolved; an unresolved run
+    // stays bound so a later shutdown can still mark it recovery_pending.
+    let boundHandoffRun: HandoffRun | undefined;
     const registered = this.deps.jobs.register(jobRequest, async (_signal, update) => {
       const supervisor = new Supervisor({
         jobId: identity.jobId,
@@ -161,6 +178,8 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         clock: this.deps.clock ?? { now: () => Date.now() },
         ...(this.deps.scheduler ? { scheduler: this.deps.scheduler } : {}),
         ...(this.deps.selfClose ? { selfClose: this.deps.selfClose } : {}),
+        ...(this.deps.handoffs ? { handoffs: this.deps.handoffs } : {}),
+        ...(this.deps.repairPrompt ? { repairPrompt: this.deps.repairPrompt } : {}),
         readTranscript: this.deps.readTranscript,
         ...(this.deps.idFactory ? { idFactory: this.deps.idFactory } : {}),
         update,
@@ -170,6 +189,9 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       ready.resolve(supervisor);
       const settlement = await supervisor.run();
       this.supervisors.delete(supervisor);
+      if (boundHandoffRun !== undefined && boundHandoffRun.lifecycle !== "awaiting_handoff") {
+        this.deps.handoffs?.drop(boundHandoffRun);
+      }
       return { supervision_result: settlement.outcome, reason: settlement.reason };
     }, generation);
     identity.jobId = registered.jobId;
@@ -185,6 +207,17 @@ export class SupervisionRegistry implements SupervisionCoordinator {
           paneId: binding.identity.paneId,
         });
         try {
+          if (binding.handoff !== undefined) {
+            // Persist the exact identity binding before the child binding is
+            // accepted: the run is gate-visible even if supervision then fails,
+            // because the durable contract was already delivered to the child.
+            const gate = this.deps.handoffs;
+            if (gate === undefined) throw new SupervisionBindError("The managed handoff gate is unavailable on this host", { supervisionJobId: registered.jobId });
+            boundHandoffRun = await gate.bind(binding.handoff.allocation, {
+              ...binding.identity,
+              agentId: binding.handoff.agentId ?? null,
+            });
+          }
           await bound.bind(binding, publication);
         } catch (error) {
           // Idempotent and required even when Supervisor already rolled back a
@@ -223,7 +256,12 @@ export class SupervisionRegistry implements SupervisionCoordinator {
   }
 
   /** Stop every supervisor and close the connection. Manager-session shutdown only. */
-  shutdown(): void {
+  async shutdown(): Promise<void> {
+    // Unresolved managed runs become recovery_pending before any supervisor
+    // settles; teardown itself fabricates no terminal status. The durable
+    // writes are awaited so a caller can rely on the sidecar surviving even
+    // when the process exits immediately after shutdown resolves.
+    await this.deps.handoffs?.shutdown();
     for (const supervisor of [...this.supervisors]) supervisor.shutdown();
     this.supervisors.clear();
     this.monitor.stop();
@@ -235,8 +273,8 @@ export class SupervisionRegistry implements SupervisionCoordinator {
    * them. Without this a post-shutdown session would keep a permanently stopped
    * monitor and every later launch would refuse at reservation.
    */
-  beginSession(): void {
-    this.shutdown();
+  async beginSession(): Promise<void> {
+    await this.shutdown();
     this.monitor = this.newMonitor();
   }
 }

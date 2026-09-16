@@ -16,12 +16,12 @@ import { defaultAttachmentStore, type AttachmentStore } from "../messages/store.
 import { resetOwnership, RuntimeOwnership } from "../ownership.js";
 import { discoverProfiles } from "../profiles/discovery.js";
 import type { ProfileCatalog } from "../profiles/types.js";
-import { ReviewerFailure } from "../reviewer.js";
+import { createPiModelReviewer } from "../reviewer.js";
 import { createCliTranscriptReader, SupervisionRegistry } from "../supervision/registry.js";
 import { createHandoffGate } from "../handoff-gate.js";
 import { createSelfCloseTracker } from "../supervision/self-close.js";
 import { CLAUDE_CHANNEL_CAPABILITY, createMcpHostWake } from "../supervision/notify.js";
-import { createBuiltinModelService } from "../supervision/model-service.js";
+import { createBuiltinModelRegistry, createBuiltinModelService, createBuiltinModels, type BuiltinModelsSeam } from "../supervision/model-service.js";
 import { loadSettings, type Settings } from "../settings.js";
 import type { CurrentContext } from "../targets.js";
 import { createPreflight, createToolSurface, type HerdrToolSurface } from "../tool-surface.js";
@@ -45,6 +45,8 @@ export interface McpRunDependencies {
   transport?: Transport;
   profiles?: { load: () => Promise<ProfileCatalog> };
   settingsLoader?: () => Promise<Settings>;
+  /** The builtin model catalogue both reviewers share; injectable so tests never touch the network or `auth.json`. */
+  models?: BuiltinModelsSeam;
   fileExists?: (path: string) => boolean;
   writeStderr?: (line: string) => void;
   exit?: (code: number) => void;
@@ -148,22 +150,34 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   // its per-pane cycles and the cross-process write lock it wraps them in.
   const queueFlush = createDevinQueueFlush({ cli, guard: createPaneWriteGuard({ namespace: resolvePaneWriteNamespace.bind(null, deps.env ?? process.env) }) });
   queueFlush.begin();
-  const hostWake = createMcpHostWake({ cli, context: startup.context, notifyChannel: (notification) => channel.current?.(notification), signal: wakeShutdown.signal, queueFlush });
+  const hostWake = createMcpHostWake({ cli, context: startup.context, notifyChannel: (notification) => {
+    // The sender exists only once the server below is built; a wake delivered
+    // in that window resolving to `undefined` would read as a successful write,
+    // so the missing sender throws and the pipeline's bounded retry covers it.
+    // c8 ignore next -- construction is synchronous; keep the guard if notification setup ever becomes re-entrant.
+    if (channel.current === undefined) throw new Error("claude channel sender is not installed");
+    return channel.current(notification);
+  }, signal: wakeShutdown.signal, queueFlush });
   const jobs = new JobRegistry({ onTerminal: (detail) => hostWake.notifyJobTerminal(detail) });
   // One ledger per host: the pane tool marks the closes this process proved,
   // and every supervisor this registry creates consults it before waking a
   // pane_closed. Both directions stay in this process; nothing persists.
   const selfClose = createSelfCloseTracker();
   const handoffs = createHandoffGate();
+  // The MCP host has no Pi model registry, and `hostContext` deliberately still
+  // throws for `context.modelRegistry`. Both reviewers instead resolve through
+  // one host-independent catalogue whose credentials live in the Pi agent's
+  // auth.json — the same login the Pi host uses, and one shared store so a
+  // refresh either performs is visible to both.
+  const models = deps.models ?? createBuiltinModels();
+  const modelService = createBuiltinModelService(models);
+  const waitModels = createBuiltinModelRegistry(models);
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
     readTranscript: createCliTranscriptReader(cli),
     notifier: hostWake.notifier,
-    // The MCP host has no Pi model registry, and `hostContext` deliberately
-    // still throws for `context.modelRegistry`. It resolves the supervisor's
-    // reviewer model through its own host-independent service instead.
-    models: () => createBuiltinModelService(),
+    models: () => modelService,
     monitorOptions: { ...(deps.env ? { env: deps.env } : {}) },
     selfClose,
     handoffs,
@@ -185,10 +199,10 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     selfClose,
     queueFlush,
     handoffs,
-    // Model-backed wait review is a Pi capability. Failing closed here keeps a
-    // wait beyond the configured review cadence from running unsupervised.
-    // Supervision review is separate and does run here, through its own service.
-    reviewerFactory: () => { throw new ReviewerFailure("model-backed wait review is unavailable on the MCP host"); }
+    // The same `PiModelReviewer` construction the Pi host reaches through
+    // `context.modelRegistry`, backed here by the shared builtin catalogue so
+    // the wait reviewer never reads the throwing host field.
+    reviewerFactory: (settings) => createPiModelReviewer({ modelRegistry: waitModels }, settings.reviewerModel),
   });
 
   let descriptors;

@@ -4,8 +4,10 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CORE_TOOL_NAMES } from "../../src/tool-surface.js";
+import type { BuiltinModelsSeam } from "../../src/supervision/model-service.js";
 import type { PiExec } from "../../src/cli.js";
 import type { AgentPromptClient } from "../../src/agent-prompt.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
@@ -45,6 +47,11 @@ vi.mock("../../src/mcp/adapter.js", async (importOriginal) => {
     }
   };
 });
+
+// The wait reviewer's model call stays off the network in unit tests; tests
+// that reach it set their own resolution. The default stays fail-closed.
+const completeMock = vi.hoisted(() => vi.fn());
+vi.mock("@earendil-works/pi-ai/compat", () => ({ complete: completeMock }));
 
 const stdioTransports = vi.hoisted(() => [] as Array<{ started: boolean; closed: boolean }>);
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
@@ -94,6 +101,26 @@ const snapshot = {
       { pane_id: "w:p2", name: "worker", agent: "pi", terminal_id: "term-worker", agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" }, agent_status: "working" }
     ]
   }
+};
+
+const reviewerModel = { id: "luna", name: "Luna", provider: "test", api: "openai-completions", baseUrl: "http://test", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_000, maxTokens: 1_000 } as Model<Api>;
+
+function reviewerMessage(text: string): AssistantMessage {
+  return { role: "assistant", content: [{ type: "text", text }], api: reviewerModel.api, provider: reviewerModel.provider, model: reviewerModel.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 };
+}
+
+/** A builtin catalogue where the configured reviewer resolves and authenticates. */
+const authenticatedModels: BuiltinModelsSeam = {
+  getModel: () => reviewerModel,
+  getModels: () => [reviewerModel],
+  getAuth: async () => ({ auth: { apiKey: "k" } }),
+};
+
+/** A builtin catalogue where no reviewer model resolves — failure before auth. */
+const unresolvableModels: BuiltinModelsSeam = {
+  getModel: () => undefined,
+  getModels: () => [],
+  getAuth: async () => undefined,
 };
 
 const projectDir = mkdtempSync(join(tmpdir(), "herdr-mcp-run-"));
@@ -175,6 +202,8 @@ beforeEach(() => {
   stdioTransports.length = 0;
   readFileMock.mockReset();
   readFileMock.mockRejectedValue(Object.assign(new Error("missing"), { code: "ENOENT" }));
+  completeMock.mockReset();
+  completeMock.mockRejectedValue(new Error("reviewer model call is not mocked in this test"));
 });
 
 afterEach(() => {
@@ -304,7 +333,9 @@ describe("MCP server startup", () => {
 
   it("serves the bundled catalog and the real settings file by default", async () => {
     vi.useFakeTimers();
-    const harness = await start({ profiles: undefined, settingsLoader: undefined });
+    // An unresolvable catalogue keeps this test hermetic: the real settings
+    // default model would otherwise resolve and reach for the real auth.json.
+    const harness = await start({ profiles: undefined, settingsLoader: undefined, models: unresolvableModels });
     const profiles = await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "profiles" } });
     expect(profiles.isError).toBeUndefined();
     expect(textOf(profiles)).toContain("manager-pi");
@@ -470,14 +501,41 @@ describe("MCP tool serving", () => {
 });
 
 describe("MCP wait and job semantics", () => {
+  it("runs the model-backed wait reviewer past the cadence instead of failing closed for being on MCP", async () => {
+    vi.useFakeTimers();
+    completeMock.mockResolvedValue(reviewerMessage(JSON.stringify({ classification: "progress", summary: "still progressing" })));
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }), models: authenticatedModels });
+    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
+    expect(outcome.isError).toBeUndefined();
+    const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.advanceTimersByTimeAsync(120_000 + 1);
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "timed_out" }));
+    expect(completeMock).toHaveBeenCalled();
+    expect(harness.handle.jobs.get(jobId)?.result?.reviewerSummaries).toEqual([expect.objectContaining({ targetId: "w:p2", classification: "progress", summary: "still progressing" })]);
+    await harness.handle.shutdown();
+  });
+
   it("records a reviewer failure in the detached job beyond the review cadence", async () => {
     vi.useFakeTimers();
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }), models: unresolvableModels });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
     await vi.advanceTimersByTimeAsync(60_000 + 1);
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("model-backed wait review is unavailable on the MCP host") } }));
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("could not be resolved") } }));
+    expect(completeMock).not.toHaveBeenCalled();
+    await harness.handle.shutdown();
+  });
+
+  it("still maps a genuine reviewer model failure to REVIEWER_FAILED", async () => {
+    vi.useFakeTimers();
+    completeMock.mockRejectedValue(new Error("model down"));
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }), models: authenticatedModels });
+    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
+    expect(outcome.isError).toBeUndefined();
+    const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.advanceTimersByTimeAsync(60_000 + 1);
+    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("model call failed") } }));
     await harness.handle.shutdown();
   });
 
@@ -653,6 +711,51 @@ describe("MCP server lifecycle", () => {
     releaseWait();
     await vi.waitFor(() => expect(harness.exits).toEqual([0]));
     expect(calls.some((argv) => argv[0] === "agent" && argv[1] === "send-keys")).toBe(false);
+  });
+
+  it("delivers a claude wake through the real channel notification wrapper", async () => {
+    const base = fakeExec();
+    const exec: PiExec = async (command, argv, options) => {
+      const result = await base.exec(command, argv, options);
+      // Recast the hosting pane as claude wherever it surfaces, so the settled
+      // wait job's wake takes the channel-notification path. `agent` and
+      // `agent_session.agent` must agree or the identity parse refuses.
+      const rewrite = (record: unknown): void => {
+        const pane = record as Record<string, unknown> | undefined;
+        if (pane?.pane_id === "w:p") {
+          pane.agent = "claude";
+          pane.agent_session = { source: "claude", agent: "claude", kind: "id", value: "claude-session" };
+        }
+      };
+      if (argv[0] === "pane" && (argv[1] === "get" || argv[1] === "current")) {
+        const parsed = JSON.parse(result.stdout);
+        rewrite(parsed.result?.pane);
+        return { ...result, stdout: JSON.stringify(parsed) };
+      }
+      if (argv[0] === "api" && argv[1] !== "schema") {
+        const parsed = JSON.parse(result.stdout);
+        for (const record of parsed.result?.snapshot?.panes ?? []) rewrite(record);
+        for (const record of parsed.result?.snapshot?.agents ?? []) rewrite(record);
+        return { ...result, stdout: JSON.stringify(parsed) };
+      }
+      return result;
+    };
+    const promptClient: AgentPromptClient = {
+      prompt: vi.fn(async () => ({ id: "request-1", result: { type: "agent_prompted", agent: {} } })),
+      ping: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const harness = await start({ exec, promptClient });
+    const notifications: Array<{ method: string; params?: { content?: string } }> = [];
+    harness.client.fallbackNotificationHandler = async (notification) => { notifications.push(notification as never); };
+    const wait = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
+    expect(wait.isError).toBeUndefined();
+    const jobId = (JSON.parse(textOf(wait).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
+    await vi.waitFor(() => expect(notifications).toHaveLength(1));
+    expect(notifications[0]!.method).toBe("notifications/claude/channel");
+    expect(notifications[0]!.params?.content).toContain(jobId);
+    expect(promptClient.prompt).not.toHaveBeenCalled();
+    await harness.handle.shutdown();
   });
 
   it("marks jobs shut down, resets ownership, and exits zero exactly once", async () => {

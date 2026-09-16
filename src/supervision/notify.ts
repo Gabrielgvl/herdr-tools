@@ -1,12 +1,14 @@
 /**
- * Manager wake delivery. Report-only, best effort, never retried.
+ * Manager wake delivery. Report-only and best effort.
  *
  * A dropped wake is recovered by asking — `herdr_jobs get` returns the pending
- * unobserved events and marks exactly those observed — so nothing here resends,
- * escalates, or waits for an acknowledgement. Delivery failure must never affect
- * supervision state.
+ * unobserved events and marks exactly those observed — so the only resend here
+ * is the Claude channel write's small bounded retry; nothing else escalates or
+ * waits for an acknowledgement. Delivery failure must never affect supervision
+ * state.
  */
 
+import { setTimeout as sleep } from "node:timers/promises";
 import { boundedText, type JobDetail } from "../job-registry.js";
 import { notificationForJob } from "../job-notification.js";
 import { resolveEffectiveContext } from "../context.js";
@@ -118,8 +120,9 @@ export interface McpHostWakeDeps {
  * The MCP host's one wake surface. The supervisor path feeds `notifier`; the
  * job registry's `onTerminal` feeds `notifyJobTerminal`. Both converge on a
  * single `deliver` that routes by the hosting pane's lazily resolved agent
- * kind, so every wake stays best effort: a failure is a drop, never a retry,
- * and `herdr_jobs get` remains the recovery contract.
+ * kind, so every wake stays best effort: only the Claude channel write retries,
+ * on a short bound, and a failure past that is a silent drop — `herdr_jobs get`
+ * remains the recovery contract.
  */
 export interface McpHostWake {
   readonly notifier: ManagerNotifier;
@@ -140,6 +143,15 @@ const PROMPT_WAKE_KINDS = new Set(["devin", "pi"]);
  */
 const SELF_ADOPT_KINDS = LAZY_ADOPT_KINDS;
 const WAKE_PIPELINE_TIMEOUT_MS = 15_000;
+/**
+ * The Claude channel write is the one wake send that retries: the identical
+ * payload at most this many times, with a short fixed backoff armed on the
+ * pipeline's combined timeout/shutdown signal. The Channels preview has no
+ * delivery acknowledgement, so transport write resolution is the ack;
+ * exhaustion or abort stays the same silent drop as any other wake failure.
+ */
+export const CLAUDE_WAKE_MAX_ATTEMPTS = 3;
+export const CLAUDE_WAKE_RETRY_DELAY_MS = 200;
 
 export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
   const ownPaneId = deps.context.paneId;
@@ -229,9 +241,24 @@ export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
       // Channels-only for Claude (owner decision): even though targeted prompt
       // delivery to Claude panes is qualified for tool calls, a self-wake is
       // the server prompting its own hosting pane — a deliberately different
-      // boundary. The send itself is unproven and ack-free, exactly like the
-      // standalone notifier, and `herdr_jobs` polling stays the contract.
-      await Promise.resolve(deps.notifyChannel({ method: CLAUDE_CHANNEL_NOTIFICATION_METHOD, params: { content, meta } }));
+      // boundary. The write retries the identical payload on the pipeline's
+      // signal, so a wake in the transport's connect window lands while a
+      // genuine drop still costs nothing past the bound.
+      const notification = { method: CLAUDE_CHANNEL_NOTIFICATION_METHOD, params: { content, meta } };
+      for (let attempt = 1; attempt <= CLAUDE_WAKE_MAX_ATTEMPTS; attempt += 1) {
+        // No write may leave once shutdown landed; the backoff is armed on the
+        // same signal, so an abort mid-wait also ends the pipeline at this
+        // check before any further send.
+        if (signal.aborted) return;
+        try {
+          await Promise.resolve(deps.notifyChannel(notification));
+          return;
+        } catch {
+          if (attempt === CLAUDE_WAKE_MAX_ATTEMPTS) return;
+          await sleep(CLAUDE_WAKE_RETRY_DELAY_MS, undefined, { signal });
+        }
+      }
+      // c8 ignore next -- every loop path returns or aborts; retained as an explicit branch boundary.
       return;
     }
     if (resolved === undefined || !PROMPT_WAKE_KINDS.has(resolved)) return;

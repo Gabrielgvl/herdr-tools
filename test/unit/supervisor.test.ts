@@ -1286,6 +1286,18 @@ describe("supervisor folding", () => {
     expect(h.progress.some((line) => line.includes("idle → working"))).toBe(true);
   });
 
+  it("treats done to idle normalization as noise", async () => {
+    const h = await bound();
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 7 })));
+    expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
+    expect(h.supervisor.view()).toMatchObject({ status: "idle" });
+    expect(h.supervisor.view().transitions.map(({ from, to }) => ({ from, to }))).toEqual([
+      { from: "working", to: "done" },
+    ]);
+    expect(h.progress.some((line) => line.includes("done → idle"))).toBe(false);
+  });
+
   it("reconciles rather than concluding from a thin or unprovable event", async () => {
     const closed = await bound({ snapshots: [snapshot([], [])] });
     await closed.supervisor.onEvent(thinEvent("pane_closed"));
@@ -2287,39 +2299,31 @@ describe("the supervisor job port", () => {
 describe("self-close wake suppression", () => {
   const absent = (): HerdrSnapshot => snapshot([], []);
 
-  it("records pane_closed but skips only its wake after a proven self-close", async () => {
+  it("records no event or wake after a proven self-close", async () => {
     const tracker = createSelfCloseTracker();
     const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
     await h.supervisor.bind({ identity, profileName: "worker-pi" });
     tracker.begin("p1")(true);
     await h.supervisor.onEvent(thinEvent("pane_closed"));
     expect(h.wakes).toEqual([]);
-    // The event, its settlement, and the soft receipt are the unsuppressed
-    // path: only the notification was skipped.
-    expect(h.supervisor.view().events).toEqual([
-      expect.objectContaining({ type: "pane_closed", details: { trigger: "event:pane_closed" } }),
-    ]);
-    expect(h.supervisor.view().unobservedEvents).toBe(1);
-    expect(h.supervisor.takePendingEvents().map((event) => event.type)).toEqual(["pane_closed"]);
+    expect(h.supervisor.view().events).toEqual([]);
+    expect(h.supervisor.view().unobservedEvents).toBe(0);
     expect(h.supervisor.takePendingEvents()).toEqual([]);
     expect(await h.supervisor.run()).toEqual({ outcome: "released", reason: "event:pane_closed" });
     tracker.clear();
   });
 
-  it("suppresses a wake whose absence was observed before the close finished", async () => {
+  it("suppresses the event when absence is observed before the close finishes", async () => {
     const tracker = createSelfCloseTracker();
     const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
     await h.supervisor.bind({ identity, profileName: "worker-pi" });
-    // The close is still proving itself: begin without a finisher is a pending
-    // attempt, which a plain post-success marker could never cover.
     const finish = tracker.begin("p1");
-    await h.supervisor.onEvent(thinEvent("pane_closed"));
-    expect(h.wakes).toEqual([]);
-    expect(h.supervisor.view().events.map((event) => event.type)).toEqual(["pane_closed"]);
-    expect(await h.supervisor.run()).toEqual({ outcome: "released", reason: "event:pane_closed" });
+    const observed = h.supervisor.onEvent(thinEvent("pane_closed"));
     finish(true);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await observed;
     expect(h.wakes).toEqual([]);
+    expect(h.supervisor.view().events).toEqual([]);
+    expect(await h.supervisor.run()).toEqual({ outcome: "released", reason: "event:pane_closed" });
     tracker.clear();
   });
 
@@ -2328,10 +2332,10 @@ describe("self-close wake suppression", () => {
     const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
     await h.supervisor.bind({ identity, profileName: "worker-pi" });
     const finish = tracker.begin("p1");
-    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    const observed = h.supervisor.onEvent(thinEvent("pane_closed"));
     expect(h.wakes).toEqual([]);
     finish(false);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await observed;
     expect(types(h.wakes)).toEqual(["pane_closed"]);
     tracker.clear();
   });
@@ -2421,7 +2425,7 @@ describe("self-close wake suppression", () => {
     tracker.begin("p2")(true);
     await held.supervisor.onReconciliationSnapshot(absent());
     expect(types(held.wakes)).toEqual(["reconciliation_degraded", "reconciliation_recovered"]);
-    expect(held.supervisor.view().events.at(-1)?.type).toBe("pane_closed");
+    expect(held.supervisor.view().events.some((event) => event.type === "pane_closed")).toBe(false);
     expect(await held.supervisor.run()).toEqual({ outcome: "released", reason: "periodic_snapshot" });
     tracker.clear();
   });

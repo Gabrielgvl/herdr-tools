@@ -335,24 +335,22 @@ describe("the MCP host supervision wiring", () => {
           const closing = server!.surface.pane.execute("close-call", { operation: "close", target: "p2" } as never, new AbortController().signal, undefined, { cwd: directory, hasUI: false } as never);
           await vi.waitFor(() => expect(closeApplied).toBe("p2"));
           socket.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p2", workspace_id: "w" } })}\n`);
-          // The event is recorded and the job settles while the close is still
-          // in flight; only the wake waits on its bounded outcome.
-          await vi.waitFor(() => expect(server!.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "settled", supervision_result: "released" }));
+          // The supervisor waits for the close's bounded proof before deciding
+          // whether this absence is manager-authored or externally meaningful.
+          expect(server!.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running" });
           releaseClose();
           const result = await closing;
           expect(result.details).toMatchObject({ operation: "close", outcome: "success", paneId: "p2" });
-          await new Promise((resolve) => setTimeout(resolve, 20));
+          await vi.waitFor(() => expect(server!.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "settled", supervision_result: "released" }));
           expect(socket.prompts).toHaveLength(0);
           expect(notifications).toHaveLength(0);
 
-          // The suppressed wake left the event record and its soft receipt.
+          // A manager-authored close settles silently: no event and no receipt.
           const detail = server!.jobs.get(reservation.jobId)!;
-          expect(detail.supervision?.events.map((event) => event.type)).toEqual(["pane_closed"]);
-          expect(detail.unobservedEvents).toBe(1);
-          const first = await server!.surface.jobs.execute("get-call", { operation: "get", jobId: reservation.jobId } as never, new AbortController().signal, undefined, {} as never);
-          expect((first.details as { pending_events?: Array<{ type: string }> }).pending_events?.map((event) => event.type)).toEqual(["pane_closed"]);
-          const second = await server!.surface.jobs.execute("get-call-2", { operation: "get", jobId: reservation.jobId } as never, new AbortController().signal, undefined, {} as never);
-          expect(second.details).not.toHaveProperty("pending_events");
+          expect(detail.supervision?.events).toEqual([]);
+          expect(detail.unobservedEvents).toBe(0);
+          const receipt = await server!.surface.jobs.execute("get-call", { operation: "get", jobId: reservation.jobId } as never, new AbortController().signal, undefined, {} as never);
+          expect(receipt.details).not.toHaveProperty("pending_events");
 
           // A close that finished before its absence was observed takes the
           // same suppression path: the confirmed marker is already waiting.
@@ -364,7 +362,7 @@ describe("the MCP host supervision wiring", () => {
           await vi.waitFor(() => expect(server!.jobs.get(later.jobId)).toMatchObject({ operation_phase: "settled", supervision_result: "released" }));
           await new Promise((resolve) => setTimeout(resolve, 20));
           expect(socket.prompts).toHaveLength(0);
-          expect(server!.jobs.get(later.jobId)!.supervision?.events.map((event) => event.type)).toEqual(["pane_closed"]);
+          expect(server!.jobs.get(later.jobId)!.supervision?.events).toEqual([]);
 
           // An absence this host did not close still wakes exactly once.
           const external = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });

@@ -1354,6 +1354,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const from = this.status!;
     if (from === next) return;
     this.status = next;
+    // Claude may normalize a completed turn from done to idle. It carries no
+    // new work or manager decision, so do not surface or re-evaluate it.
+    if (from === "done" && next === "idle") {
+      this.enterStatus(next);
+      return;
+    }
     this.transitions.push({ atMs: this.deps.clock.now(), from, to: next, revision, source });
     if (next === "working") {
       // An authoritative working transition opens a fresh artifact cycle: the
@@ -1529,35 +1535,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       child: this.childRef(),
       event,
     };
-    const selfClose = this.deps.selfClose;
-    if (type !== "pane_closed" || selfClose === undefined) {
-      this.deps.notifier.wake(wake);
-      return event;
-    }
-    // Only the pane judged absent can correlate with a tracked close: a
-    // retained move destination is that pane, not the origin still on the
-    // bound identity this wake reports.
-    let suppress: boolean | Promise<boolean>;
-    try {
-      suppress = selfClose.consume(this.pendingMoveDestination?.paneId ?? wake.child.paneId);
-    } catch {
-      suppress = false;
-    }
-    if (suppress === true) return event;
-    if (suppress === false) {
-      this.deps.notifier.wake(wake);
-      return event;
-    }
-    // The matching close is still proving itself: the event and settlement are
-    // already done, and only the wake waits on the attempt's bounded outcome.
-    void Promise.resolve(suppress).then(
-      (confirmed) => {
-        if (!confirmed) this.deps.notifier.wake(wake);
-      },
-      () => {
-        this.deps.notifier.wake(wake);
-      },
-    );
+    this.deps.notifier.wake(wake);
     return event;
   }
 
@@ -1570,6 +1548,20 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private async settleWithEvent(type: SupervisionEventType, outcome: SupervisionResult, trigger: string, summary: string): Promise<void> {
+    if (type === "pane_closed" && this.deps.selfClose !== undefined) {
+      // A manager-requested close is successful bookkeeping, not an event for
+      // that same manager. Wait for the bounded close proof before deciding so
+      // neither the event ledger nor its wake contains self-authored noise.
+      try {
+        const paneId = this.pendingMoveDestination?.paneId ?? this.childRef().paneId;
+        if (await this.deps.selfClose.consume(paneId)) {
+          await this.settle(outcome, trigger);
+          return;
+        }
+      } catch {
+        // Tracker failure is not proof; preserve the normal close event.
+      }
+    }
     this.emit(type, summary, { trigger });
     await this.settle(outcome, trigger);
   }

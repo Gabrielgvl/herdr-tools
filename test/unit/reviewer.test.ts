@@ -58,6 +58,10 @@ describe("Pi production reviewer adapter", () => {
     await expect(stringFailing.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { cause: "provider down" } });
     const stopped = new PiModelReviewer(registry(), "luna", async () => ({ ...message(JSON.stringify({ classification: "appears_complete", summary: "done" })), stopReason: "aborted" }));
     await expect(stopped.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { code: "ABORTED" } });
+    const providerError = new PiModelReviewer(registry(), "luna", async () => ({ ...message(""), stopReason: "error", errorMessage: "usage limit reached" }));
+    await expect(providerError.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED", message: "Reviewer model call failed", details: { cause: "usage limit reached" } });
+    const unspecifiedProviderError = new PiModelReviewer(registry(), "luna", async () => ({ ...message(""), stopReason: "error" }));
+    await expect(unspecifiedProviderError.review(request, new AbortController().signal)).rejects.toMatchObject({ details: { cause: "provider returned an unspecified error" } });
     const legacy = new PiModelReviewer(registry(), "luna", async () => message(JSON.stringify({ classification: "completed", summary: "done" })));
     await expect(legacy.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
   });

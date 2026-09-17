@@ -166,6 +166,12 @@ export class PiModelReviewer implements WaitReviewer {
         reasoningEffort: "low"
       });
       if (signal.aborted || message.stopReason === "aborted") throw new ReviewerFailure("Reviewer operation aborted", { targetId: request.targetId, code: "ABORTED" });
+      if (message.stopReason === "error") {
+        throw new ReviewerFailure("Reviewer model call failed", {
+          targetId: request.targetId,
+          cause: message.errorMessage ?? "provider returned an unspecified error",
+        });
+      }
       return strictResult(request.targetId, textFrom(message));
     } catch (error) {
       if (error instanceof ReviewerFailure) throw error;

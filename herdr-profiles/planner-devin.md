@@ -1,11 +1,11 @@
 ---
 name: planner-devin
-description: Plan implementation work from repository evidence and explicit constraints with a Devin SWE-2 Max planner.
+description: Plan implementation work from repository evidence and explicit constraints with a Devin Fusion (GPT-6 Astra lead, SWE-2 sidekick) planner.
 timeoutMinutes: 30
 sessionPersistence: true
 runtime:
   kind: devin
-  model: swe-2-max
+  model: fusion-gpt-6-astra-high-sidekick-swe-2-high
   permissionMode: dangerous
 fallbackProfiles: []
 ---

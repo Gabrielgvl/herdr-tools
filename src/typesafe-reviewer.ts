@@ -152,8 +152,9 @@ export function createConfiguredWaitReviewer(
   options?: TypeSafeReviewerOptions,
   fallback?: () => WaitReviewer,
 ): WaitReviewer {
+  if (fallback !== undefined) return fallback();
   if (modelIdentifier.startsWith(TYPESAFE_REVIEWER_PREFIX)) {
     return new TypeSafeReviewer(modelIdentifier.slice(TYPESAFE_REVIEWER_PREFIX.length), options);
   }
-  return fallback?.() ?? new PiModelReviewer(context.modelRegistry, modelIdentifier);
+  return new PiModelReviewer(context.modelRegistry, modelIdentifier);
 }

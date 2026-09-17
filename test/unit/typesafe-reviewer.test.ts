@@ -54,9 +54,13 @@ describe("TypeSafe wait reviewer", () => {
     });
     expect(selected).toBeInstanceOf(TypeSafeReviewer);
     expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "test/luna")).toBeInstanceOf(PiModelReviewer);
-    const fallback = vi.fn(() => new PiModelReviewer(registry(), "test/luna"));
-    expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "test/luna", undefined, fallback)).toBeInstanceOf(PiModelReviewer);
-    expect(fallback).toHaveBeenCalledOnce();
+    const fallbackReviewer = new PiModelReviewer(registry(), "test/luna");
+    const fallback = vi.fn(() => fallbackReviewer);
+    expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "test/luna", undefined, fallback)).toBe(fallbackReviewer);
+    const fetchCall = vi.fn<(input: string | URL, init?: RequestInit) => Promise<Response>>();
+    expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "typesafe/jev-latest", { apiKey: "key", fetch: fetchCall }, fallback)).toBe(fallbackReviewer);
+    expect(fallback).toHaveBeenCalledTimes(2);
+    expect(fetchCall).not.toHaveBeenCalled();
     expect(() => createConfiguredWaitReviewer({ modelRegistry: registry() }, "typesafe/")).toThrowError(ReviewerFailure);
     expect(() => new TypeSafeReviewer("bad model", { apiKey: "key" })).toThrowError(ReviewerFailure);
   });

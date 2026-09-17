@@ -3,5 +3,6 @@ dist/
 *.herdr-staging/
 .herdr-locks/
 coverage/
+.reviewer-benchmark/
 .env
 .env.*

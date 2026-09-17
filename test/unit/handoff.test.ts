@@ -681,6 +681,7 @@ describe("contract injection", () => {
     const block = renderHandoffContract(run);
     expect(block).toContain(run.artifactPath);
     expect(block).toContain(run.marker);
+    expect(block).toContain("chmod 600");
     for (const heading of HANDOFF_HEADINGS) expect(block).toContain(`## ${heading}`);
     // The injected template is itself a contract-valid skeleton only after the
     // agent replaces the guidance bodies; assert the shape, not acceptance.

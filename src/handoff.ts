@@ -438,6 +438,7 @@ export function renderHandoffContract(run: HandoffAllocation): string {
     "Handoff:",
     `When the assignment is done, blocked, cancelled, or failed, write exactly one Markdown file at this exact path: ${run.artifactPath}`,
     `The first line of the file must be this run marker verbatim: ${run.marker}`,
+    "After writing it, run `chmod 600` on that exact path so Tools can trust the artifact.",
     "It must then contain exactly these six headings in this order, each followed by non-empty content, and no other headings:",
     "",
     "## Status",

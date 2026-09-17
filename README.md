@@ -65,6 +65,8 @@ Two host differences are deliberate:
 - **Waits are detached and polled.** Every `herdr_wait` call performs its validation and target/context preflight, registers a session-scoped background job, and returns immediately with an opaque ID. Poll jobs with `herdr_jobs` `list` and `get`; cancel only through `herdr_jobs` `cancel`. Pi retains its existing terminal notification and active-wait UI, while the MCP host has no push notification.
 - **Explicit wait review on MCP is unavailable.** An unsupervised job whose timeout exceeds `wait.reviewCadenceMinutes` fails closed with `REVIEWER_FAILED` in its `herdr_jobs` result. A long wait whose targets are all covered by active exact supervisors constructs no wait reviewer and can continue authoritative polling. Supervisor review uses the host-independent bundled model service. Use repeated bounded waits for unsupervised MCP targets, or raise the cadence (maximum 30) in `config.json`.
 
+When `wait.reviewerModel` uses the opt-in `typesafe/<model>` form, `TYPESAFE_API_KEY` must be exported into the environment that launches the plugin; a `.env` file alone is not read.
+
 For refreshes, rebuild main, update the user-installed plugin, and restart Claude:
 
 ```bash

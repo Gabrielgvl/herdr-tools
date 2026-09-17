@@ -37,7 +37,7 @@ export class ReviewerFailure extends Error {
 }
 
 const MAX_PROMPT_BYTES = 16_000;
-const MAX_SUMMARY_CHARS = 500;
+export const MAX_SUMMARY_CHARS = 500;
 
 export function modelFor(registry: ModelRegistrySeam, identifier: string): Model<Api> {
   if (identifier.length === 0 || /\s/.test(identifier) || identifier.includes(String.fromCharCode(0))) throw new ReviewerFailure("Configured reviewer model identifier is invalid", { model: identifier });

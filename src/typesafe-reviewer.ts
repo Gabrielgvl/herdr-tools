@@ -1,3 +1,4 @@
+import { APIError, choice, TypeSafeClient, type EntryType, type Fetch } from "@typesafe-ai/sdk";
 import {
   MAX_SUMMARY_CHARS,
   PiModelReviewer,
@@ -11,7 +12,6 @@ import {
 
 export const TYPESAFE_REVIEW_CONFIDENCE_THRESHOLD = 0.5;
 export const TYPESAFE_REVIEWER_PREFIX = "typesafe/";
-const TYPESAFE_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone";
 
 const CHOICES = {
   progress: "Output shows the assignment advancing",
@@ -22,11 +22,10 @@ const CHOICES = {
 } as const;
 
 type TypeSafeClassification = keyof typeof CHOICES;
-type FetchSeam = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
 export interface TypeSafeReviewerOptions {
   apiKey?: string;
-  fetch?: FetchSeam;
+  fetch?: Fetch;
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -82,14 +81,14 @@ function summaryFor(
 /** System One Choice reviewer. It performs exactly one HTTP request and never invokes a chat model. */
 export class TypeSafeReviewer implements WaitReviewer {
   private readonly apiKey: string | undefined;
-  private readonly fetchCall: FetchSeam;
+  private readonly fetchCall: Fetch | undefined;
 
   constructor(private readonly modelId: string, options: TypeSafeReviewerOptions = {}) {
     if (modelId.length === 0 || /[\s\0]/u.test(modelId)) {
       throw new ReviewerFailure("Configured TypeSafe reviewer model identifier is invalid", { model: modelId });
     }
     this.apiKey = options.apiKey ?? process.env.TYPESAFE_API_KEY;
-    this.fetchCall = options.fetch ?? globalThis.fetch;
+    this.fetchCall = options.fetch;
   }
 
   async review(request: ReviewerRequest, signal: AbortSignal): Promise<ReviewerResult> {
@@ -98,35 +97,24 @@ export class TypeSafeReviewer implements WaitReviewer {
       throw new ReviewerFailure("TypeSafe reviewer is not authenticated", { targetId: request.targetId, model: this.modelId });
     }
     try {
-      const response = await this.fetchCall(TYPESAFE_SYSTEM_ONE_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          state: {
-            targetId: request.targetId,
-            metadata: request.metadata,
-            transcriptDelta: request.transcriptDelta,
-          },
-          model: this.modelId,
-          questions: {
-            classification: {
-              type: "choice",
-              instructions: "Judge only from the supplied evidence how this Herdr child agent is doing.",
-              criteria: CHOICES,
-            },
-          },
-        }),
-        signal,
+      const client = new TypeSafeClient({
+        apiKey: this.apiKey,
+        defaultModel: this.modelId,
+        logLevel: "off",
+        retry: { maxRetries: 0 },
+        ...(this.fetchCall === undefined ? {} : { fetch: this.fetchCall }),
       });
-      if (signal.aborted) throw aborted(request.targetId);
-      if (!response.ok) {
-        throw new ReviewerFailure("TypeSafe reviewer request failed", { targetId: request.targetId, model: this.modelId, status: response.status });
-      }
-      const answer = parseAnswer(request.targetId, await response.json());
-      if (signal.aborted) throw aborted(request.targetId);
+      const response = await client.systemOne({
+        state: {
+          targetId: request.targetId,
+          metadata: request.metadata,
+          transcriptDelta: request.transcriptDelta,
+        } as EntryType,
+        questions: {
+          classification: choice("Judge only from the supplied evidence how this Herdr child agent is doing.", CHOICES),
+        },
+      }, { signal });
+      const answer = parseAnswer(request.targetId, response);
       const derived: ReviewClassification = answer.confidence < TYPESAFE_REVIEW_CONFIDENCE_THRESHOLD ? "unknown" : answer.choice;
       return {
         targetId: request.targetId,
@@ -139,7 +127,8 @@ export class TypeSafeReviewer implements WaitReviewer {
       throw new ReviewerFailure("TypeSafe reviewer request failed", {
         targetId: request.targetId,
         model: this.modelId,
-        cause: error instanceof Error ? error.message : String(error),
+        ...(error instanceof APIError ? { status: error.status } : {}),
+        cause: (error as Error).message,
       });
     }
   }

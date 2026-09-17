@@ -26,6 +26,7 @@
     "@earendil-works/pi-coding-agent": "^0.83.0",
     "@earendil-works/pi-tui": "^0.83.0",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "@typesafe-ai/sdk": "^0.6.0",
     "pi-mcp-adapter": "2.20.1",
     "proper-lockfile": "^4.1.2",
     "re2": "^1.26.1",

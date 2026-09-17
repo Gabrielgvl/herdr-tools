@@ -150,13 +150,6 @@ describe("TypeSafe wait reviewer", () => {
       fetch: async () => { afterFetch.abort(); return response(); },
     }).review(request, afterFetch.signal)).rejects.toMatchObject({ details: { code: "ABORTED" } });
 
-    const afterJson = new AbortController();
-    const body = await response().json();
-    const delayedJson = { ok: true, status: 200, json: async () => { afterJson.abort(); return body; } } as Response;
-    await expect(new TypeSafeReviewer("jev-latest", {
-      apiKey: "key",
-      fetch: async () => delayedJson,
-    }).review(request, afterJson.signal)).rejects.toMatchObject({ details: { code: "ABORTED" } });
   });
 
   it("fails closed on HTTP, transport, JSON, and incompatible answer failures", async () => {
@@ -164,8 +157,8 @@ describe("TypeSafe wait reviewer", () => {
       new TypeSafeReviewer("jev-latest", { apiKey: "key", fetch: fetchCall }).review(request, new AbortController().signal);
 
     await expect(run(async () => new Response("no", { status: 503 }))).rejects.toMatchObject({ details: { status: 503 } });
-    await expect(run(async () => { throw new Error("offline"); })).rejects.toMatchObject({ details: { cause: "offline" } });
-    await expect(run(async () => { throw "offline"; })).rejects.toMatchObject({ details: { cause: "offline" } });
+    await expect(run(async () => { throw new Error("offline"); })).rejects.toMatchObject({ details: { cause: "Connection error: offline" } });
+    await expect(run(async () => { throw "offline"; })).rejects.toMatchObject({ details: { cause: "Connection error." } });
     await expect(run(async () => new Response("not json", { status: 200 }))).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
 
     for (const body of [

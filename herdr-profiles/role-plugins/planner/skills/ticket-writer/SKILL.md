@@ -1,13 +1,6 @@
 ---
 name: ticket-writer
-description: >
-  Break down a task into a single well-defined ticket for one engineer, suitable for Linear,
-  Jira, GitHub Issues, or any equivalent tracker. Use this skill whenever the user wants to
-  create a ticket, write up a task, file an issue, or document work for a single engineer —
-  even if they just say "make a ticket for X", "write this up", or "I need to file something
-  for this". Also triggers when a vague idea needs shaping into a concrete, actionable issue.
-  If a parent issue or epic is mentioned or linked, read it first to gather context and scope,
-  and file the result as a child of that parent.
+description: "Break down a task into one well-defined ticket for one engineer (Linear, Jira, GitHub Issues). Use for \"make a ticket for X\", \"write this up\", filing an issue, or a vague idea. Read any parent issue and file as a child."
 compatibility: "Works with any issue tracker MCP (Linear, Jira, GitHub Issues). Falls back to Markdown output if no tracker is connected."
 ---
 

@@ -1,10 +1,6 @@
 ---
 name: courier-pr-gates
-description: >-
-  Decide the review, approval, merge, and rebase gate for a Courier pull request. Use when a PR is
-  ready for review, a risk tier must be applied, choosing /claude-review versus human approval, a
-  rebase changes approval state, a single-commit check is behind, the pi-review round ceiling is
-  reached, a release PR needs a hold, or a PR is being armed for auto-merge.
+description: "Decide the review, approval, merge, and rebase gate for a Courier PR: risk tier, /claude-review versus human approval, rebase approval state, single-commit check, pi-review round ceiling, release hold, auto-merge."
 ---
 
 # Courier PR Gates
@@ -139,6 +135,13 @@ non-empty, printing depth and oldest-message age. Unlike the code checks above t
 judgement: either drain the staging backlog and fix its cause, or add `SFD-EXCEPTION: <reason>` on its own
 line to the PR body — the gate re-runs on the `edited` event, so the description edit alone clears it with
 no push. Do not arm auto-merge on a release PR while this check is red and unexplained.
+
+Observed 2026-09-15 (v0.1711.0):
+- The workflow arms auto-merge on the release PR itself, under the `system-courier` identity; lanes never arm it.
+- Any later `workflow_dispatch` refreshes the open PR in place to the new staging head and **dismisses every approval**; approvals must be re-given on the new head. A lane's "exactly once" approval can therefore end up dismissed and gating nothing.
+- `release-author-approvals` requires every human **commit-author email** in `main…staging` (mapped by `author-map.json`): a squash-merged PR requires the original author, not the merger. The requested-reviewer list can include people the gate does not require.
+- After merge, `setup production workflow` runs on the `main` push and the two regional production workflows fire by `workflow_run`; ~25 min to both regions green. Those regional runs carry the default branch's `head_sha` (staging), not the merge commit — identify them by display title and by starting seconds after the setup run.
+- `gh run list` sorts by `createdAt`: a re-run (attempt 3) of an old production run is invisible unless sorted by `updatedAt`, and it is a full redeploy of that old ref. `emergency-rollback.yml` takes an S3 artifact path, one region per dispatch, behind a Slack approval; nobody has documented the artifact path convention.
 
 ## Replying to review threads
 

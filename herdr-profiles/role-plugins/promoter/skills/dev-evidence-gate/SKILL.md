@@ -1,10 +1,6 @@
 ---
 name: dev-evidence-gate
-description: >-
-  Decide whether Courier work has the required development deployment and representative smoke
-  evidence. Use before marking a PR ready, before merging to staging, before the first staging or
-  production execution of a new path, when reusing smoke evidence after a rebase or squash, or when
-  asked whether a change must be redeployed.
+description: "Decide whether Courier work has required dev-deploy and smoke evidence: before PR ready, before staging merge, before a new path's first staging or production run, when reusing evidence after rebase, or before redeploy."
 ---
 
 # Dev Evidence Gate

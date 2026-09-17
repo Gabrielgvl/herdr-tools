@@ -1,12 +1,6 @@
 ---
 name: herdr-manager
-description: >-
-  Orchestrate a fleet of Herdr worker lanes as its manager. Use this whenever you are running or
-  taking over a Herdr front, deciding which profile a lane should use, writing or dispatching a worker
-  brief, arbitrating a worker's fail-closed stop, deciding whether a worker may retry a failure,
-  running a review gate over a lane's output, capturing a lane's final report, or deciding whether a
-  finished pane or tab is safe to close — even when the request just sounds like "spin up a worker",
-  "check on that lane", or "clean up these panes".
+description: "Orchestrate Herdr worker lanes as manager: run or take over a front, pick lane profiles, dispatch briefs, arbitrate a fail-closed stop, allow retries, gate lane output, capture reports, close a finished pane or tab."
 ---
 
 # Herdr Manager

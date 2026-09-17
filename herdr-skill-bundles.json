@@ -7,7 +7,6 @@
     "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills",
     "/home/gabriel/workspace/context-mode-pi-runtime/skills",
     "/home/gabriel/workspace/courier/.agents/skills",
-    "/home/gabriel/workspace/courier/.pi/skills",
     "/home/gabriel/workspace/courier/aicodeflow/common/skills"
   ],
   "bundles": {
@@ -25,23 +24,23 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
+      "treeHash": "30b8be77433bd67ba38b191ca7100fa8c931e8f0ba59b1ad5cac9a42a47aef63"
     },
     "herdr-profiles/profile-plugins/manager/skills/engineering-project-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/engineering-project-manager",
-      "treeHash": "c785a5e19179a2f790b214a27a75e43de9735d6c28ce9ff00ff7b8b4eeb3bdaf"
+      "treeHash": "fefed849343efa52c634e037a9268b6a35ab832547ea83ad2dd8afafcebca78a"
     },
     "herdr-profiles/profile-plugins/manager/skills/herdr-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/herdr-manager",
-      "treeHash": "80d036bf5eb1d40fd0f87b27a79f3ee11b13033cf9920a43b3a790382034c565"
+      "treeHash": "7d2f976e8b5da72d8e1ba1ca203bb6b3eff2f6ceb103fccca8ae8fdcd0506560"
     },
     "herdr-profiles/profile-plugins/manager/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "b4535594407765abfebfd6674ab3cafe7382389368dbd10ba97b09c1dda42609"
+      "treeHash": "e6aa4d134a72d928db72c8d18b1244c8bffacac307742ca1fcfe9dd79c6b6bbd"
     },
     "herdr-profiles/profile-plugins/manager/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "b7cfc6e90382c5a3e91c50425bb3bf71cfa06efeec37645a474844c53d5bd585"
+      "treeHash": "554a84f1476ba875904cd55812f97edfdfb5cf92637a2a25674089ddbf7c865f"
     },
     "herdr-profiles/role-plugins/planner/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -53,11 +52,11 @@
     },
     "herdr-profiles/role-plugins/planner/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
+      "treeHash": "30b8be77433bd67ba38b191ca7100fa8c931e8f0ba59b1ad5cac9a42a47aef63"
     },
     "herdr-profiles/role-plugins/planner/skills/engineering-project-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/engineering-project-manager",
-      "treeHash": "c785a5e19179a2f790b214a27a75e43de9735d6c28ce9ff00ff7b8b4eeb3bdaf"
+      "treeHash": "fefed849343efa52c634e037a9268b6a35ab832547ea83ad2dd8afafcebca78a"
     },
     "herdr-profiles/role-plugins/planner/skills/humanizer": {
       "source": "/home/gabriel/.codex/skills/humanizer",
@@ -65,7 +64,7 @@
     },
     "herdr-profiles/role-plugins/planner/skills/ticket-writer": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/ticket-writer",
-      "treeHash": "7478ef1e4ebdedcc047e568ed2082be331ed917c4e9449276a352590abee3ae9"
+      "treeHash": "8f69d71d8918628f89d2d22e6423a5eef8641ec4bbbe6d0ad79f29291417782a"
     },
     "herdr-profiles/role-plugins/planner/skills/ponytail": {
       "source": "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills/ponytail",
@@ -73,26 +72,26 @@
     },
     "herdr-profiles/role-plugins/promoter/skills/authenticated-staging-smoke": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/authenticated-staging-smoke",
-      "treeHash": "4f59efa8bcd296d146570182b5ff8951438af4a1f607c7c3dfd24a4505f64cc6"
+      "treeHash": "1336991ab5264ee1f90725d8e2127622da0aba66ccf732ee1536aa48a054d911"
     },
     "herdr-profiles/role-plugins/promoter/skills/courier-pr-gates": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/courier-pr-gates",
-      "treeHash": "235401c6689be72f137b898d0081164fc7e59b9274fb7a4747b572ddf0fada81"
+      "treeHash": "0731a7236df92d04771667ebb26394588f4109fc8a6fb1d1a99efdc95aaff54c"
     },
     "herdr-profiles/role-plugins/promoter/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
+      "treeHash": "30b8be77433bd67ba38b191ca7100fa8c931e8f0ba59b1ad5cac9a42a47aef63"
     },
     "herdr-profiles/role-plugins/promoter/skills/dev-evidence-gate": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/dev-evidence-gate",
-      "treeHash": "53df806d3c06254a93f5f1c576fd1a49fdf268bdaac22bebaf6cae4c56bac2fa"
+      "treeHash": "5d01c8c1bb4b1edee6cd701b8b48342e083d54ab510c3cb8964adf0bbadcbdeb"
     },
     "herdr-profiles/role-plugins/promoter/skills/git-flow": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/git-flow",
-      "treeHash": "3d7991d78cbafb9203518b5cb7b45aaf9f572212a7c467e52fd8994b053d14a4"
+      "treeHash": "15ccb6483ac3edcb2157335b84702fff7d7861b39be12bb58cca76cd980e351c"
     },
     "herdr-profiles/role-plugins/promoter/skills/release-pr-validation": {
-      "source": "/home/gabriel/workspace/courier/.pi/skills/release-pr-validation",
+      "source": "/home/gabriel/workspace/courier/.agents/skills/release-pr-validation",
       "treeHash": "3478ef2f41a34cca2c8935a17a0abdf971f9c18c47541aea78aa7ab1d080817c"
     },
     "herdr-profiles/role-plugins/promoter/skills/services-ci-gates": {
@@ -101,7 +100,7 @@
     },
     "herdr-profiles/role-plugins/promoter/skills/shared-dev-deploy": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/shared-dev-deploy",
-      "treeHash": "b1d95b542131f1bbb1b20c160664e22bd51da509c7f6ec4786a37fcc60845186"
+      "treeHash": "7d32253b8aab0e11e16f6367909d657d475da085b3ecb22ef77b6877fd119429"
     },
     "herdr-profiles/role-plugins/researcher/skills/humanizer": {
       "source": "/home/gabriel/.codex/skills/humanizer",
@@ -113,15 +112,15 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
+      "treeHash": "30b8be77433bd67ba38b191ca7100fa8c931e8f0ba59b1ad5cac9a42a47aef63"
     },
     "herdr-profiles/role-plugins/reviewer/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "b4535594407765abfebfd6674ab3cafe7382389368dbd10ba97b09c1dda42609"
+      "treeHash": "e6aa4d134a72d928db72c8d18b1244c8bffacac307742ca1fcfe9dd79c6b6bbd"
     },
     "herdr-profiles/role-plugins/reviewer/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "b7cfc6e90382c5a3e91c50425bb3bf71cfa06efeec37645a474844c53d5bd585"
+      "treeHash": "554a84f1476ba875904cd55812f97edfdfb5cf92637a2a25674089ddbf7c865f"
     },
     "herdr-profiles/role-plugins/reviewer/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",
@@ -137,11 +136,11 @@
     },
     "herdr-profiles/role-plugins/worker/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
-      "treeHash": "4f66c458bc617cb3a52fb15c8ef17b97bf5a022117dfac2a18ad1920660cb6b6"
+      "treeHash": "30b8be77433bd67ba38b191ca7100fa8c931e8f0ba59b1ad5cac9a42a47aef63"
     },
     "herdr-profiles/role-plugins/worker/skills/git-flow": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/git-flow",
-      "treeHash": "3d7991d78cbafb9203518b5cb7b45aaf9f572212a7c467e52fd8994b053d14a4"
+      "treeHash": "15ccb6483ac3edcb2157335b84702fff7d7861b39be12bb58cca76cd980e351c"
     },
     "herdr-profiles/role-plugins/worker/skills/tdd": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/tdd",
@@ -156,7 +155,7 @@
       "treeHash": "63be84c701fa7e28447afe64fa6add09454c8dfa96b4a19503725ec7f00e8bf3"
     },
     "herdr-profiles/profile-plugins/executor/skills/executor": {
-      "source": "/home/gabriel/workspace/courier/.pi/skills/executor",
+      "source": "/home/gabriel/workspace/courier/.agents/skills/executor",
       "treeHash": "866be4521bf4d5656ffc9c543b42611902e5b3d94a14e7c7b293462bd98b3411"
     },
     "herdr-profiles/pi-skills/context-mode": {

@@ -1,10 +1,6 @@
 ---
 name: authenticated-staging-smoke
-description: >-
-  Validate Courier staging changes with real authentication and end-to-end smoke
-  evidence. Use when asked to validate a staging cutover, rollout flag, feature
-  path, regional deployment, API/Studio behavior, or any change where unauthenticated
-  health checks are not sufficient.
+description: "Validate Courier staging changes with real authentication and smoke evidence. Use for a staging cutover, rollout flag, feature path, regional deployment, or API/Studio behavior where health checks are insufficient."
 ---
 
 # Authenticated Staging Smoke

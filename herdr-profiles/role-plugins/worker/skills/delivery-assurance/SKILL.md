@@ -1,9 +1,6 @@
 ---
 name: delivery-assurance
-description: >
-  Enforces the native Linear proof boundary for planning, implementation, review, readiness, merge,
-  and closure. Use for multi-surface deliveries, ownership or plan changes, exact-head evidence,
-  Scope Review reconciliation, or any ticket that may be moved to Done.
+description: "Enforces the Linear proof boundary for planning, implementation, review, readiness, and merge. Use for multi-surface work, ownership or plan changes, exact-head evidence, Scope Review, or moving a ticket to Done."
 compatibility: "Requires the repository's configured Linear/GitHub integrations; no separate workflow runtime is required."
 ---
 

@@ -12,11 +12,16 @@ task. Never infer authorization from criticality, risk, complexity, or review
 type. Without an explicit Oracle request, use `pi-review` for code and plan
 reviews.
 
-## Mandatory simplicity instruction
+## Mandatory two-track solution instruction
 
 Every prompt sent to Oracle must explicitly include this instruction:
 
-> Recommend the simplest correct solution that fully satisfies the stated requirements. Avoid overengineering, speculative abstractions, unnecessary configuration, compatibility layers, and broad refactors. Prefer existing code and dependencies, deletion, native platform features, and the smallest root-cause change. Do not simplify away validation at trust boundaries, data-loss prevention, security, accessibility, error handling, or anything explicitly requested.
+> Produce and compare two concrete solutions:
+>
+> 1. **Current-system path:** Recommend the simplest correct solution that fully satisfies the stated requirements within the existing architecture. Avoid overengineering, speculative abstractions, unnecessary configuration, compatibility layers, and broad refactors. Prefer existing code and dependencies, deletion, native platform features, and the smallest root-cause change.
+> 2. **Greenfield path:** Independently design the best solution you would choose if the system were being built today without constraints from the current implementation. Respect the stated product, platform, security, data-integrity, and operational requirements, but do not preserve existing architecture merely because it exists. Keep this design concrete enough to implement, not an aspirational rewrite.
+>
+> Compare both paths on correctness, complexity, maintainability, extensibility justified by known requirements, operational burden, performance, delivery risk, and migration/cutover cost. State which path you recommend and the evidence or threshold that would make the other path preferable. Do not automatically choose the fastest path when the greenfield design is materially better long term. Do not simplify away validation at trust boundaries, data-loss prevention, security, accessibility, error handling, or anything explicitly requested.
 
 Oracle bundles a prompt and selected files into a one-shot request so another
 model can answer with real repository context through the API or browser. A

@@ -1,10 +1,6 @@
 ---
 name: shared-dev-deploy
-description: >-
-  Deploy safely to the shared Courier development environment. Use before any Backend or Services
-  dev deploy, when the engineering-dev-env lock is held, when more than one lane needs the dev stack,
-  when creating a deploy worktree, when SLACK_BOT_TOKEN or COURIER_AUTH_TOKEN is absent, or when an
-  ARM64 image build or transform run is involved.
+description: "Deploy safely to the shared Courier dev environment: any Backend or Services dev deploy, the engineering-dev-env lock, a deploy worktree, absent SLACK_BOT_TOKEN or COURIER_AUTH_TOKEN, an ARM64 build or transform run."
 ---
 
 # Shared Dev Deploy

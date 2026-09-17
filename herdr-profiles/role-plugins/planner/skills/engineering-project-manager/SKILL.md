@@ -1,12 +1,6 @@
 ---
 name: engineering-project-manager
-description: >
-  Reconcile and summarize engineering project state from a Linear project URL
-  or parent issue ID using Linear, GitHub pull requests, and the local git
-  repository. Use when acting as a project manager for an engineer: determine
-  current status, explain what changed, identify blockers and blocked-by
-  relationships, connect tickets to active or merged PRs, compare tracker state
-  with local repo reality, and recommend the next best work items.
+description: "Reconcile engineering project state from a Linear project URL or parent issue using Linear, GitHub PRs, and the local git repo: status, what changed, blockers, ticket-to-PR links, tracker drift, next work items."
 ---
 
 # Engineering Project Manager

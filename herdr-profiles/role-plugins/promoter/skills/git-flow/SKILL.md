@@ -1,6 +1,6 @@
 ---
 name: git-flow
-description: Canonical git protocol for AI Code Flow — pre-flight checks, branch naming, worktree isolation for parallel multi-ticket waves, WIP commit cadence, squash-before-PR procedure, push, and failure recovery. Load this from any agent or command that performs git operations, and whenever deciding whether to fan several sibling tickets out concurrently or run them one at a time.
+description: "Canonical git protocol for AI Code Flow: pre-flight checks, branch naming, worktree isolation for parallel multi-ticket waves, WIP commits, squash-before-PR, push, failure recovery. Load before any git operation."
 ---
 
 # GitFlow Skill

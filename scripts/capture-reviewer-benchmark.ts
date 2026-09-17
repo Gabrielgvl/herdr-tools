@@ -25,8 +25,15 @@ interface Capture {
   paneId: string;
   lifecycle: string;
   artifactStatus?: string;
+  windowSha256?: string;
   recentUnwrappedLines?: string[];
+  repeatCount?: number;
   readUnavailable?: true;
+}
+
+interface WindowState {
+  sha256: string;
+  repeats: number;
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {
@@ -78,7 +85,12 @@ async function appendCapture(directory: string, capture: Capture): Promise<void>
   await chmod(path, 0o600);
 }
 
-async function tick(namespace: Awaited<ReturnType<typeof resolveHandoffNamespace>>, directory: string, tracked: Set<string>): Promise<number> {
+async function tick(
+  namespace: Awaited<ReturnType<typeof resolveHandoffNamespace>>,
+  directory: string,
+  tracked: Set<string>,
+  windows: Map<string, WindowState>,
+): Promise<number> {
   const entries = await readdir(namespace.dir, { withFileTypes: true });
   let written = 0;
   for (const entry of entries) {
@@ -93,16 +105,31 @@ async function tick(namespace: Awaited<ReturnType<typeof resolveHandoffNamespace
     if (typeof paneId !== "string" || typeof lifecycle !== "string") continue;
     const lines = await paneLines(paneId);
     const status = state.artifact?.status;
-    await appendCapture(directory, {
+    const base = {
       at: new Date().toISOString(),
       runId: state.runId,
       paneId,
       lifecycle,
       ...(typeof status === "string" ? { artifactStatus: status } : {}),
-      ...(lines === undefined ? { readUnavailable: true as const } : { recentUnwrappedLines: lines }),
-    });
+    };
+    if (lines === undefined) {
+      await appendCapture(directory, { ...base, readUnavailable: true });
+    } else {
+      const sha256 = createHash("sha256").update(JSON.stringify(lines)).digest("hex");
+      const previous = windows.get(state.runId);
+      if (previous?.sha256 === sha256) {
+        previous.repeats += 1;
+        await appendCapture(directory, { ...base, windowSha256: sha256, repeatCount: previous.repeats });
+      } else {
+        windows.set(state.runId, { sha256, repeats: 0 });
+        await appendCapture(directory, { ...base, windowSha256: sha256, recentUnwrappedLines: lines });
+      }
+    }
     written += 1;
-    if (!active) tracked.delete(state.runId);
+    if (!active) {
+      tracked.delete(state.runId);
+      windows.delete(state.runId);
+    }
   }
   return written;
 }
@@ -118,8 +145,9 @@ async function main(): Promise<void> {
   await chmod(resolve(".reviewer-benchmark/captures"), 0o700);
   await chmod(directory, 0o700);
   const tracked = new Set<string>();
+  const windows = new Map<string, WindowState>();
   do {
-    const written = await tick(namespace, directory, tracked);
+    const written = await tick(namespace, directory, tracked, windows);
     process.stdout.write(`${new Date().toISOString()} captured=${written} tracked=${tracked.size}\n`);
     if (!once) await new Promise<void>((resolveWait) => {
       const timer = setTimeout(resolveWait, intervalMs);

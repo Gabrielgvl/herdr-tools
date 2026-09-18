@@ -4,6 +4,8 @@
 
 Accepted (owner-directed, 2026-09-18). Implementation travels with ADR-033 in the same deliverable set and branch (`supervision-jev-reviewer`): node 1 = ADR-033 adapter and auth bridge (in flight), node 2 = this contract. The digest's launch-schema seam touches `launch.ts`, which the `jev-router-batch` branch also modifies; the small conflict is reconciled at integration, not by deferring this decision.
 
+**Amended 2026-09-18 (owner-directed):** the field is no longer optional — `supervisionDigest` is REQUIRED on both launch variants, with `doneWhen` (1–8 items) and `constraints` (1–8 items, may be `["none"]`) both required and non-empty. Rationale: launches without a digest produce `evidence_sufficient` below the gate on every cadence for quiet-work children (observed live: 0.23 then 0.42 on a max-thinking planner), i.e. permanent unjudgeable wakes. Grounding the evidence gate is a launch-time obligation, not a review-time hope. The successor spec shape (ADR-035) carries these as required fields.
+
 ## Date
 
 2026-09-18

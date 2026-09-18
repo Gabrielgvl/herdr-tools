@@ -52,14 +52,16 @@ export const LaunchAssignmentSchema = Type.Object({
 }, { additionalProperties: false });
 
 /**
- * The authorial supervision digest a caller may attach to a launch (ADR-034):
- * done-when conditions and constraints the supervisor's reviewer judges
- * against. Bounded and strict — extra fields are rejected.
+ * The authorial supervision digest every launch must carry (ADR-034, amended
+ * 2026-09-18): done-when conditions and constraints the supervisor's reviewer
+ * judges against. Both arrays are required and non-empty — a caller with no
+ * constraints authors `["none"]`. Bounded and strict — extra fields are
+ * rejected.
  */
-const SupervisionDigestItems = Type.Array(Type.String({ maxLength: 240 }), { maxItems: 8 });
+const SupervisionDigestItems = Type.Array(Type.String({ minLength: 1, maxLength: 240 }), { minItems: 1, maxItems: 8 });
 export const SupervisionDigestSchema = Type.Object({
-  doneWhen: Type.Optional(SupervisionDigestItems),
-  constraints: Type.Optional(SupervisionDigestItems)
+  doneWhen: SupervisionDigestItems,
+  constraints: SupervisionDigestItems
 }, { additionalProperties: false });
 
 const LaunchCommonProperties = {
@@ -70,7 +72,7 @@ const LaunchCommonProperties = {
   focus: Type.Optional(Type.Boolean()),
   assignment: LaunchAssignmentSchema,
   assignmentDelivery: Type.Optional(StringEnum(["inline", "attachment"] as const)),
-  supervisionDigest: Type.Optional(SupervisionDigestSchema)
+  supervisionDigest: SupervisionDigestSchema
 };
 
 const ProfileLaunchParamsSchema = Type.Object({
@@ -115,8 +117,8 @@ export interface LaunchRequest {
   focus?: boolean;
   assignment: LaunchAssignment;
   assignmentDelivery?: MessageDelivery;
-  /** Authorial done-when/constraints the supervisor's reviewer judges against (ADR-034). */
-  supervisionDigest?: { doneWhen?: string[]; constraints?: string[] };
+  /** Authorial done-when/constraints the supervisor's reviewer judges against (ADR-034). Required on every launch. */
+  supervisionDigest: { doneWhen: string[]; constraints: string[] };
 }
 
 export const LAUNCH_ASSIGNMENT_FIELDS = ["objective", "scope", "verification"] as const;

@@ -5,7 +5,7 @@
  * tool does without importing tool internals.
  */
 
-import { parsePromptTargetIdentityFields, PromptIdentityError } from "./prompt.js";
+import { PromptIdentityError } from "./prompt.js";
 import type { HerdrSnapshot } from "../targets.js";
 
 export type CommunicateState = "idle" | "working" | "blocked" | "done" | "unknown";
@@ -65,16 +65,6 @@ export function snapshotIdentityRecords(snapshot: HerdrSnapshot, paneId: string)
     throw new PromptIdentityError("TARGET_IDENTITY_UNAVAILABLE", "Fresh snapshot does not contain one authoritative target agent", { paneId, paneRecords: panes.length, agentRecords: agents.length });
   }
   return [panes[0]!, agents[0]!];
-}
-
-/** Unqualified text recipients are blocked before attachment or prompt effects. */
-export function assertQualifiedPromptTarget(records: readonly Record<string, unknown>[], paneId: string): void {
-  for (const value of records) {
-    const fields = parsePromptTargetIdentityFields(value, paneId);
-    if (fields.agentKind === "agy" || fields.agentSession?.agent === "agy") {
-      throw Object.assign(new Error("AGY text delivery is not qualified"), { code: "AGY_UNQUALIFIED", details: { target: paneId } });
-    }
-  }
 }
 
 export function stateOf(pane: Record<string, unknown>): CommunicateState {

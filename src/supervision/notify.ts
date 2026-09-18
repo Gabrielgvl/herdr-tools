@@ -15,7 +15,7 @@ import { resolveEffectiveContext } from "../context.js";
 import { adoptUnnamedTarget, LAZY_ADOPT_KINDS, type AdoptOutcome } from "../agent-identity.js";
 import type { JsonEnvelope } from "../cli.js";
 import type { DevinQueueFlush, DevinQueueFlushRequest } from "../messages/devin-queue-flush.js";
-import { agentFrom, assertQualifiedPromptTarget, assertSendableState, paneFrom, snapshotIdentityRecords } from "../messages/prompt-target.js";
+import { agentFrom, assertSendableState, paneFrom, snapshotIdentityRecords } from "../messages/prompt-target.js";
 import { parsePromptSubmission, parsePromptTargetIdentityFields, requirePromptTargetIdentity } from "../messages/prompt.js";
 import { buildEnvelope, resolveSender, type ProvenanceKind } from "../provenance.js";
 import type { CurrentContext } from "../targets.js";
@@ -283,7 +283,6 @@ export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
       // Defense in depth: the freshly proven identity must agree with the kind
       // that routed this wake and must itself be prompt-capable.
       if (!PROMPT_WAKE_KINDS.has(identity.agentKind) || identity.agentKind !== resolved) return undefined;
-      assertQualifiedPromptTarget(records, paneId);
       // Sendable-state gate only (owner decision): `working` and `blocked` still
       // send — the identical `agent.prompt` write the communicate "steer" route
       // makes without a busy gate — while `unknown` or unproven state drops. A

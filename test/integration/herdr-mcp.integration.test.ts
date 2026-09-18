@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -265,6 +265,12 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       if (!sessionStarted) throw new Error(`named Herdr server did not become ready: ${startupError}`);
       const namedSocket = record((Array.isArray(record(await run("session", "list", "--json")).sessions) ? (record(await run("session", "list", "--json")).sessions as unknown[]) : []).find((session) => record(session).name === REQUIRED_SESSION));
       expect(namedSocket.socket_path).toBe(socketPath);
+      // `herdr server` creates the session directory honoring the process umask,
+      // which is 002 on hosts whose primary group is the user: the dir lands
+      // 0775 and the handoff/lock namespaces reject any group-writable parent.
+      // The disposable session is deleted at teardown, so tightening it here is
+      // safe; it does not relax the production owner-only check.
+      await chmod(dirname(socketPath), 0o700);
 
       const liveBaseline = topologyIds(await defaultSnapshot());
       const created = record(record(await runNamed(["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"])).result);

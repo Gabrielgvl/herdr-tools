@@ -1,14 +1,15 @@
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { JobRegistry, SupervisionActiveError } from "../../src/job-registry.js";
 import { createHandoffAllocator, readHandoffState, type HandoffAllocation } from "../../src/handoff.js";
 import { createHandoffGate, type HandoffGate } from "../../src/handoff-gate.js";
+import { ReviewerFailure } from "../../src/reviewer.js";
 import { SessionEventMonitor } from "../../src/supervision/monitor.js";
 import { SupervisionRegistry } from "../../src/supervision/registry.js";
 import { scriptedServer } from "./supervision-peer.js";
-import type { SupervisionReviewer } from "../../src/supervision/reviewer.js";
+import { TypeSafeSupervisionReviewer, type SupervisionReviewer } from "../../src/supervision/reviewer.js";
 import type { ProvisionalSupervisedIdentity, SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
 import { createJobsTool } from "../../src/tools/jobs.js";
@@ -51,6 +52,8 @@ function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[
     readTranscript: async () => ["line"],
     notifier,
     monitorFactory: () => new SessionEventMonitor({ connect: () => server.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
+    // Tests never read the real auth.json: an empty store leaves env as the only leg.
+    typesafeCredentials: { read: async () => undefined },
     ...(options.reviewer ? { reviewerFactory: () => options.reviewer! } : {}),
     scheduler: { setTimer: () => "timer", clearTimer: () => undefined },
     idFactory: (() => { let id = 0; return () => `fixture-${++id}`; })(),
@@ -73,6 +76,10 @@ async function managedAllocation(): Promise<HandoffAllocation> {
 }
 
 describe("the supervision registry", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("registers a supervisor job whose request records the requested child", async () => {
     const f = fixture();
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
@@ -85,9 +92,28 @@ describe("the supervision registry", () => {
       // No pane exists at reservation time, so no target id is back-dated into the request.
       targetIds: [],
       child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
-      settings: { reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max", reviewCadenceMinutes: 5 },
+      settings: { reviewerModel: "typesafe/jev-latest", reviewerThinking: "max", reviewCadenceMinutes: 5 },
     });
     expect(detail.request.target_generation_refs?.[0]).toMatch(/^target_generation_/u);
+    await f.supervision.shutdown();
+  });
+
+  it("accepts a supervision digest at reservation without changing the public request view", async () => {
+    const f = fixture();
+    const digest = { doneWhen: ["tests pass"], constraints: ["read-only"] };
+    const reservation = await f.supervision.reserve({
+      child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
+      settings: { supervisionDigest: digest },
+    });
+    const detail = f.jobs.get(reservation.jobId)!;
+    // The digest is reservation-scoped evidence: the public request projection
+    // keeps its allowlisted settings shape and never exposes it.
+    expect(detail.request.settings).toEqual({
+      reviewerModel: "typesafe/jev-latest",
+      reviewerThinking: "max",
+      reviewCadenceMinutes: 5,
+    });
+    expect(detail.request.settings).not.toHaveProperty("supervisionDigest");
     await f.supervision.shutdown();
   });
 
@@ -299,14 +325,18 @@ describe("the supervision registry", () => {
     await f.supervision.shutdown();
   });
 
-  it("keeps a host with no model service visibly degraded rather than silently unreviewed", async () => {
+  it("keeps a host with no Jev credential visibly degraded rather than silently unreviewed", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
     const f = fixture();
     const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    expect(f.jobs.get(reservation.jobId)?.supervision?.reviewer).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max", degraded: false });
-    // The default reviewer for a host without a model service always fails.
-    const registry = f.supervision as unknown as { reviewer(): SupervisionReviewer };
-    await expect(registry.reviewer().review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: {}, transcriptDelta: [] }, new AbortController().signal))
-      .rejects.toThrow(/No supervision reviewer model service is available/u);
+    expect(f.jobs.get(reservation.jobId)?.supervision?.reviewer).toMatchObject({ model: "typesafe/jev-latest", degraded: false });
+    // The default reviewer is the shared Jev adapter; with no key anywhere it
+    // fails closed through the typed authentication path.
+    const registry = f.supervision as unknown as { reviewer(): Promise<SupervisionReviewer> };
+    const reviewer = await registry.reviewer();
+    expect(reviewer).toBeInstanceOf(TypeSafeSupervisionReviewer);
+    await expect(reviewer.review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: {}, transcriptDelta: [] }, new AbortController().signal))
+      .rejects.toThrowError(ReviewerFailure);
     await f.supervision.shutdown();
   });
 

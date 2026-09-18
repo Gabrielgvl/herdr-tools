@@ -16,6 +16,7 @@ import { parseProfile, profileSource, skillTreeDigest, SKILL_BUNDLE_REGISTRY_FIL
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { resultForRender } from "../../src/tui.js";
 import { stubSupervision, type StubSupervision } from "./supervision-fixtures.js";
+import type { SupervisionReserveRequest } from "../../src/supervision/registry.js";
 import { SupervisionBindError } from "../../src/supervision/supervisor.js";
 
 const testPreflight = async () => undefined;
@@ -4088,6 +4089,101 @@ describe("herdr_launch automatic child supervision", () => {
       .rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN" });
   });
 
+  it("declares a strict optional supervision digest in the launch schema and interface", () => {
+    const digest = (LaunchParamsSchema.properties as Record<string, any>).supervisionDigest;
+    expect(digest).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        doneWhen: { type: "array", maxItems: 8, items: { type: "string", maxLength: 240 } },
+        constraints: { type: "array", maxItems: 8, items: { type: "string", maxLength: 240 } },
+      },
+    });
+    // Optional: absent from the required list, and both arrays optional inside it.
+    expect(LaunchParamsSchema.required ?? []).not.toContain("supervisionDigest");
+    expect(digest.required ?? []).toEqual([]);
+  });
+
+  it("validates the supervision digest's bounds and refuses extra fields", () => {
+    const valid = { name: "worker", profile: "worker", assignment: assign("go") };
+    // Absent, empty, single-sided, and full-boundary digests are all accepted.
+    for (const digest of [
+      undefined,
+      {},
+      { doneWhen: [] },
+      { constraints: [] },
+      { doneWhen: Array.from({ length: 8 }, (_, index) => `done ${index}`), constraints: ["x".repeat(240)] },
+    ]) {
+      expect(() => validateLaunchParams({ ...valid, ...(digest === undefined ? {} : { supervisionDigest: digest }) } as never)).not.toThrow();
+    }
+    for (const digest of [
+      // Wrong container and wrong item types.
+      null, "done when", ["done"], { doneWhen: "text" }, { doneWhen: [1] }, { constraints: [null] }, { doneWhen: ["with \0 nul"] },
+      // Over the item-count and item-length bounds.
+      { doneWhen: Array.from({ length: 9 }, (_, index) => `done ${index}`) },
+      { constraints: Array.from({ length: 9 }, () => "c") },
+      { doneWhen: ["x".repeat(241)] },
+      { constraints: ["x".repeat(241)] },
+      // Extra fields are refused rather than carried through.
+      { doneWhen: [], env: { SECRET: "x" } },
+      { doneWhen: [], extra: "text" },
+      { doneWhen: [], constraints: [], other: [] },
+    ]) {
+      expect(() => validateLaunchParams({ ...valid, supervisionDigest: digest } as never)).toThrow(/INVALID|supervisionDigest|Unknown/i);
+    }
+  });
+
+  it("captures the allowlisted digest into the supervision reservation", async () => {
+    const stub = stubSupervision();
+    const reserveRequests: SupervisionReserveRequest[] = [];
+    const supervision: StubSupervision = {
+      ...stub,
+      reserve: async (request) => {
+        reserveRequests.push(request);
+        return stub.reserve(request);
+      },
+    };
+    const result = await launch(
+      {
+        assignment: assign("go"),
+        name: "worker",
+        profile: "worker",
+        supervisionDigest: { doneWhen: ["tests pass"], constraints: ["read-only"] },
+      },
+      catalog(profile("worker")),
+      makeCli().cli,
+      undefined,
+      { supervision },
+    );
+    expect(result.details).toMatchObject({ outcome: "launched" });
+    expect(reserveRequests).toHaveLength(1);
+    expect(reserveRequests[0]).toMatchObject({
+      child: { agentName: "worker", agentKind: "pi", profileName: "worker" },
+      settings: { supervisionDigest: { doneWhen: ["tests pass"], constraints: ["read-only"] } },
+    });
+    // Only the two allowlisted fields can persist — nothing else rode along.
+    expect(Object.keys(reserveRequests[0]!.settings!.supervisionDigest!).sort()).toEqual(["constraints", "doneWhen"]);
+  });
+
+  it("reserves without settings when no digest is supplied, and normalizes a partial digest", async () => {
+    const requests: SupervisionReserveRequest[] = [];
+    const wrap = (stub: StubSupervision): StubSupervision => ({
+      ...stub,
+      reserve: async (request) => {
+        requests.push(request);
+        return stub.reserve(request);
+      },
+    });
+    await launch({ assignment: assign("go"), name: "worker", profile: "worker" }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: wrap(stubSupervision()) });
+    expect(requests[0]).toMatchObject({ child: { agentName: "worker" } });
+    expect(requests[0]).not.toHaveProperty("settings");
+
+    await launch({ assignment: assign("go"), name: "worker", profile: "worker", supervisionDigest: { doneWhen: ["tests pass"] } }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: wrap(stubSupervision()) });
+    expect(requests[1]!.settings!.supervisionDigest).toEqual({ doneWhen: ["tests pass"], constraints: [] });
+
+    await launch({ assignment: assign("go"), name: "worker", profile: "worker", supervisionDigest: { constraints: ["read-only"] } }, catalog(profile("worker")), makeCli().cli, undefined, { supervision: wrap(stubSupervision()) });
+    expect(requests[2]!.settings!.supervisionDigest).toEqual({ doneWhen: [], constraints: ["read-only"] });
+  });
 });
 
 describe("launch identity provenance", () => {

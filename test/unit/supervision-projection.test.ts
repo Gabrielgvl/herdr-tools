@@ -3,7 +3,7 @@ import { JobRegistry, publicDetail, type JobDetail, type SupervisorJobRequestSna
 import { SUPERVISION_MAX_EVENTS, type SupervisionEvent } from "../../src/supervision/events.js";
 import { isSupervisionJobView, type SupervisionJobPort, type SupervisionJobView } from "../../src/supervision/state.js";
 import { SupervisionSocket, type SupervisionStream } from "../../src/supervision/socket.js";
-import { ModelSupervisionReviewer } from "../../src/supervision/reviewer.js";
+import { TypeSafeSupervisionReviewer } from "../../src/supervision/reviewer.js";
 
 const request: SupervisorJobRequestSnapshot = {
   kind: "supervisor",
@@ -12,7 +12,7 @@ const request: SupervisorJobRequestSnapshot = {
   targetIds: [],
   target_generation_refs: ["target_generation_projection"],
   child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
-  settings: { reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max" },
+  settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" },
 };
 
 function event(index: number, summary = `event-${index}`): SupervisionEvent {
@@ -23,7 +23,7 @@ function view(overrides: Partial<SupervisionJobView> = {}): SupervisionJobView {
   const merged = {
     state: "active" as const,
     monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
-    reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max" as const, cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+    reviewer: { model: "typesafe/jev-latest", thinking: "max" as const, cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
     transitions: [],
     truncatedTransitions: 0,
     events: [],
@@ -143,7 +143,7 @@ describe("the public supervision projection", () => {
         events: Array.from({ length: 20 }, (_, index) => event(index)),
         truncatedEvents: 4,
         unobservedEvents: 2,
-        reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: true, lastReviewAtMs: 9, truncatedReviews: 1, reviews: Array.from({ length: 12 }, (_, index) => ({ atMs: index, classification: "progress" as const, summary: `r-${index}` })) },
+        reviewer: { model: "typesafe/jev-latest", thinking: "max", cadenceMinutes: 5, degraded: true, lastReviewAtMs: 9, truncatedReviews: 1, reviews: Array.from({ length: 12 }, (_, index) => ({ atMs: index, classification: "progress" as const, summary: `r-${index}` })) },
         child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-claude", requestedProfileName: "worker-pi" },
         status: "working",
         settledReason: "event:pane_closed",
@@ -170,14 +170,14 @@ describe("the public supervision projection", () => {
     const projected = publicDetail(detail({
       supervision: view({
         events: [{ ...event(1), eventId: `sev_${"i".repeat(2_000)}`, summary: "s".repeat(2_000), details: { note: "n" } }],
-        reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, truncatedReviews: 0, reviews: [{ atMs: 1, classification: "risk", summary: "r".repeat(2_000) }] },
+        reviewer: { model: "typesafe/jev-latest", thinking: "max", cadenceMinutes: 5, degraded: false, truncatedReviews: 0, reviews: [{ atMs: 1, classification: "risk", summary: "r".repeat(2_000) }] },
       }),
     }));
     expect(projected.truncation?.supervisionFieldsClipped).toBe(2);
 
     // A clipped review with no clipped event starts the count on its own.
     const reviewOnly = publicDetail(detail({
-      supervision: view({ reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, truncatedReviews: 0, reviews: [{ atMs: 1, classification: "risk", summary: "r".repeat(2_000) }] } }),
+      supervision: view({ reviewer: { model: "typesafe/jev-latest", thinking: "max", cadenceMinutes: 5, degraded: false, truncatedReviews: 0, reviews: [{ atMs: 1, classification: "risk", summary: "r".repeat(2_000) }] } }),
     }));
     expect(reviewOnly.truncation?.supervisionFieldsClipped).toBe(1);
     expect(projected.supervision!.events[0]!.details).toEqual({ note: "n" });
@@ -218,7 +218,7 @@ describe("the public supervision projection", () => {
       supervision: view({
         transitions: [{ atMs: 1, from: "working", to: "idle", revision: 1, source: "event" }],
         events: [event(1, "e".repeat(30_000))],
-        reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, truncatedReviews: 0, reviews: [{ atMs: 1, classification: "progress", summary: "r" }] },
+        reviewer: { model: "typesafe/jev-latest", thinking: "max", cadenceMinutes: 5, degraded: false, truncatedReviews: 0, reviews: [{ atMs: 1, classification: "progress", summary: "r" }] },
       }),
       pending_events: Array.from({ length: SUPERVISION_MAX_EVENTS }, (_, index) => event(index, "p".repeat(20_000))),
     }), 4_000);
@@ -373,10 +373,12 @@ describe("residual supervision edges", () => {
     socket.close();
   });
 
-  it("reports a non-Error reviewer transport rejection without losing the cause", async () => {
-    const model = { id: "gpt-5.6-luna", provider: "openai-codex", api: "openai-completions" } as never;
-    const reviewer = new ModelSupervisionReviewer({ resolve: async () => ({ model }) }, async () => { throw "socket hangup"; });
+  it("reports a reviewer transport rejection without losing the cause", async () => {
+    const reviewer = new TypeSafeSupervisionReviewer({
+      apiKey: "key",
+      fetch: async () => { throw new Error("socket hangup"); },
+    });
     await expect(reviewer.review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: {}, transcriptDelta: [] }, new AbortController().signal))
-      .rejects.toMatchObject({ details: { cause: "socket hangup" } });
+      .rejects.toMatchObject({ details: { cause: expect.stringContaining("socket hangup") } });
   });
 });

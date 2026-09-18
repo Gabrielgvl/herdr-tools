@@ -28,7 +28,7 @@ const supervisorRequest: SupervisorJobRequestSnapshot = {
   targetIds: [],
   target_generation_refs: ["generation-1"],
   child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
-  settings: { reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max" },
+  settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" },
 };
 
 const session = { source: "pi", agent: "pi", kind: "id", value: "session-1" };
@@ -55,7 +55,7 @@ function installedView(request: SupervisorJobRequestSnapshot): SupervisionJobVie
   return {
     state: "active",
     monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
-    reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+    reviewer: { model: "typesafe/jev-latest", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
     transitions: [],
     truncatedTransitions: 0,
     events: [],

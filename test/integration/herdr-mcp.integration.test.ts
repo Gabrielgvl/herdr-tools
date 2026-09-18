@@ -403,7 +403,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       // starts. The MCP host has no explicit wait-review model service, so a
       // redundant reviewer would fail the job; remaining live proves the
       // supervisor retained sole semantic-review ownership.
-      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "scout-pi", assignment: { objective: "Stay idle as a supervised wait target.", scope: "Change nothing.", verification: "The pane stays live at the same identity." } });
+      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "scout-pi", assignment: { objective: "Stay idle as a supervised wait target.", scope: "Change nothing.", verification: "The pane stays live at the same identity." }, supervisionDigest: { doneWhen: ["The pane stays live at the same identity."], constraints: ["none"] } });
       expect(reviewerTargetLaunch.isError, text(reviewerTargetLaunch)).toBeUndefined();
       const reviewerTargetEvidence = evidence(reviewerTargetLaunch);
       expect(reviewerTargetEvidence).toMatchObject({
@@ -460,7 +460,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(prelaunchMetadata).not.toHaveProperty("agent_id");
       expect(prelaunchMetadata).not.toHaveProperty("agent");
       const launchStartedAt = performance.now();
-      const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", assignment: { objective: "Use the bash tool to run pwd, then report the working directory.", scope: "Run pwd only. Change nothing.", verification: "The reported directory is the working directory pwd printed." } });
+      const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", assignment: { objective: "Use the bash tool to run pwd, then report the working directory.", scope: "Run pwd only. Change nothing.", verification: "The reported directory is the working directory pwd printed." }, supervisionDigest: { doneWhen: ["The reported directory is the working directory pwd printed."], constraints: ["none"] } });
       const launchElapsedMs = performance.now() - launchStartedAt;
       if (launched.isError) {
         const diagnostic = launchFailureDiagnostic(launched);

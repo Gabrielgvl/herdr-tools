@@ -172,13 +172,18 @@ describe("MCP published schema parity", () => {
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: true }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } }, true],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, extra: true }, false],
-      // The typed assignment is required, exact, and non-empty.
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, true],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, extra: true }, false],
+      // The typed assignment and the supervision digest are both required.
       ["herdr_launch", { name: "worker", profile: "worker-pi" }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s" } }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "", scope: "s", verification: "v" } }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v", extra: "e" } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v", extra: "e" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: [], constraints: ["none"] } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: [] } }, false],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"] } }, false],
       ["herdr_launch", { name: "worker", profile: "worker-pi", initialPrompt: "o" }, false]
     ];
     for (const [name, args, accepted] of cases) {
@@ -224,7 +229,8 @@ describe("MCP argument validation", () => {
       name: "worker",
       profile: "worker-pi",
       assignmentDelivery: "attachment",
-      assignment: { objective: "x".repeat(1024 * 1024 + 1), scope: "bounded", verification: "bounded" }
+      assignment: { objective: "x".repeat(1024 * 1024 + 1), scope: "bounded", verification: "bounded" },
+      supervisionDigest: { doneWhen: ["The oversized objective is written."], constraints: ["none"] }
     };
     const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
     // No schema gate on field size, so the request is not turned into INVALID_INPUT.
@@ -248,7 +254,7 @@ describe("MCP argument validation", () => {
       ["herdr_communicate", { target: "w:p2", operation: "prompt" }],
       ["herdr_wait", { targets: [], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }],
       ["herdr_jobs", { operation: "get" }],
-      ["herdr_launch", { name: "Worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } }],
+      ["herdr_launch", { name: "Worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }],
       ["herdr_pane", { operation: "split" }],
       ["herdr_tab", { operation: "create" }]
     ];

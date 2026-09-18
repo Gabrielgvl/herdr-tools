@@ -371,7 +371,8 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
           objective: `Use Bash to write exactly ${piBody} to ${piBodyPath} with no trailing newline, capture that command's exit code, and write the decimal code to ${piBodyPath}.exit before replying with exactly ${piBody}. Remain ready for subsequent normal and attachment prompts.`,
           scope: `Write only ${piBodyPath} and ${piBodyPath}.exit; do not change any other resource.`,
           verification: `The recipient-generated file ${piBodyPath} contains exactly ${piBody}.`
-        }
+        },
+        supervisionDigest: { doneWhen: [`The recipient-generated file ${piBodyPath} contains exactly ${piBody}.`], constraints: ["none"] }
       });
       state.confirmedPanes.push(String(pi.paneId));
       expect(pi).toMatchObject({ initialPromptDelivery: "inline", promptSubmitted: true, promptConsumption: "confirmed", recipient: { kind: "pi" }, promptDispatch: { state: "acknowledged" } });
@@ -408,7 +409,8 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
           objective: `Use Bash to run the bounded condition command timeout 90s bash -c 'IFS= read -r gate < ${steerGatePath} && test "$gate" = "${steerGateToken}"' in the foreground. Do not use sleep. Remain in this turn until that condition exits, then remain ready for the subsequent steer instruction. Do not write a body or send a final response before the steer.`,
           scope: `Read only ${steerGatePath}; write only ${steerPath} and ${steerPath}.exit; do not change any other resource.`,
           verification: "The bounded gate remains pending until the subsequent steer instruction."
-        }
+        },
+        supervisionDigest: { doneWhen: ["The bounded gate remains pending until the subsequent steer instruction."], constraints: ["none"] }
       });
       state.confirmedPanes.push(String(steer.paneId));
       const working = await waitForCondition(

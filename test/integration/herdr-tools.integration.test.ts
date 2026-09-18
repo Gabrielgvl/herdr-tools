@@ -625,7 +625,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
           objective: `Read this assignment attachment through the granted directory. Respond with only this exact token: ${nonce}`,
           scope: "Read the attachment only. Change nothing.",
           verification: "The reply is exactly the token and nothing else."
-        }
+        },
+        supervisionDigest: { doneWhen: ["The reply is exactly the attachment token and nothing else."], constraints: ["none"] }
       }, signal(), undefined, toolContext());
       details = resultObject(launched.details);
     } catch (error) {
@@ -730,7 +731,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       name: agentName,
       profile: "researcher-agy",
       placement: { mode: "new_tab", tabLabel: "agy-zero-effect-fallback" },
-      assignment: { objective: "Reply with the single word ready.", scope: "Change nothing.", verification: "The reply is the single word ready." }
+      assignment: { objective: "Reply with the single word ready.", scope: "Change nothing.", verification: "The reply is the single word ready." },
+      supervisionDigest: { doneWhen: ["The reply is the single word ready."], constraints: ["none"] }
     }, signal(), undefined, toolContext());
     const details = resultObject(launched.details);
     const paneId = String(details.paneId);
@@ -769,7 +771,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       profile: "worker-pi",
       overrides: piLaunchOverrides,
       placement: { mode: "new_tab", tabLabel: "unconfirmed-recovery" },
-      assignment: { objective: `Recovery integration canary: ${canary}. Do not close or move this pane.`, scope: "Change nothing in the repository.", verification: "The pane stays open at the same identity." }
+      assignment: { objective: `Recovery integration canary: ${canary}. Do not close or move this pane.`, scope: "Change nothing in the repository.", verification: "The pane stays open at the same identity." },
+      supervisionDigest: { doneWhen: ["The pane stays open at the same identity."], constraints: ["none"] }
     }, signal(), undefined, toolContext()));
     expect(launched.confirmed).toBe(false);
     if (launched.confirmed) throw new Error("forced confirmation uncertainty unexpectedly returned launch success");
@@ -793,7 +796,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         objective: `Use Bash to execute exactly ${turnScriptPath} now. Do not use any other tool. Remain in this turn until the script exits; do not finish the task or send a final response.`,
         scope: `Run only ${turnScriptPath}. Use no other tool and change nothing else.`,
         verification: "The turn stays open until the script exits."
-      }
+      },
+      supervisionDigest: { doneWhen: ["The turn stays open until the script exits."], constraints: ["none"] }
     }, signal(), undefined, toolContext()));
     if (!launched.confirmed) return;
     expect(await waitForMarker(turnMarkerPath, turnMarker, 60_000), "turn-control fixture did not reach its deterministic sleep command").toBe(true);
@@ -846,7 +850,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     if (state.unconfirmedRecoveries.length >= 2) return;
     const inlineBody = ["integration assignment", ...Array.from({ length: 320 }, (_value, index) => `long assignment line ${index}`)].join("\n");
     const inlineAssignment = { objective: inlineBody, scope: "Change nothing.", verification: "No verification is required for this transport smoke." };
-    const inline = await deliverLaunch("pi-inline-launch", "integration assignment", () => tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", overrides: piLaunchOverrides, placement: { mode: "new_tab", tabLabel: "profile-launch" }, assignment: inlineAssignment }, signal(), undefined, toolContext()));
+    const inline = await deliverLaunch("pi-inline-launch", "integration assignment", () => tool("herdr_launch").execute("launch-profile", { name: "integration-profile-worker", profile: "worker-pi", overrides: piLaunchOverrides, placement: { mode: "new_tab", tabLabel: "profile-launch" }, assignment: inlineAssignment, supervisionDigest: { doneWhen: ["The long inline assignment is received."], constraints: ["none"] } }, signal(), undefined, toolContext()));
     if (!inline.confirmed) return;
     expect(inline.details).toMatchObject({ initialPromptDelivery: "inline", initialPromptSubmission: { confirmed: true } });
     const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes("integration-profile-worker"));
@@ -874,7 +878,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
     const body = `Transport smoke body.\n${"detail line\n".repeat(200)}`;
     const bodyAssignment = { objective: body, scope: "Change nothing.", verification: "No verification is required for this transport smoke." };
-    const attachmentLaunch = await deliverLaunch("pi-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-pi-attachment", { name: "integration-pi-attach", profile: "worker-pi", overrides: piLaunchOverrides, placement: { mode: "new_tab", tabLabel: "pi-attachment" }, assignment: bodyAssignment, assignmentDelivery: "attachment" }, signal(), undefined, toolContext()));
+    const attachmentLaunch = await deliverLaunch("pi-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-pi-attachment", { name: "integration-pi-attach", profile: "worker-pi", overrides: piLaunchOverrides, placement: { mode: "new_tab", tabLabel: "pi-attachment" }, assignment: bodyAssignment, assignmentDelivery: "attachment", supervisionDigest: { doneWhen: ["The attachment body is received."], constraints: ["none"] } }, signal(), undefined, toolContext()));
     if (!attachmentLaunch.confirmed) return;
     const attachment = resultObject(attachmentLaunch.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
@@ -912,7 +916,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       "Then stop. Do not change anything else and do not reply."
     ].join("\n");
 
-    const launched = await deliverLaunch("pi-acceptance-launch", nonce, () => tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", overrides: piLaunchOverrides, placement: { mode: "new_tab", tabLabel: "accept-pi" }, assignment: { objective: body, scope: `Write only ${markerPath}. Change nothing else.`, verification: `${markerPath} contains exactly the token.` }, assignmentDelivery: "attachment" }, signal(), undefined, toolContext()));
+    const launched = await deliverLaunch("pi-acceptance-launch", nonce, () => tool("herdr_launch").execute("accept-pi", { name: "integration-accept-pi", profile: "worker-pi", overrides: piLaunchOverrides, placement: { mode: "new_tab", tabLabel: "accept-pi" }, assignment: { objective: body, scope: `Write only ${markerPath}. Change nothing else.`, verification: `${markerPath} contains exactly the token.` }, assignmentDelivery: "attachment", supervisionDigest: { doneWhen: ["The marker file contains exactly the token."], constraints: ["none"] } }, signal(), undefined, toolContext()));
     if (!launched.confirmed) return;
     const attachment = resultObject(launched.details.attachment);
     state.attachmentPaths.push(String(attachment.path));
@@ -942,7 +946,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         objective: "Stand by in this pane for one follow-up assignment attachment, then carry it out exactly as written.",
         scope: "Change nothing until that follow-up arrives, and then change only what it names.",
         verification: "The follow-up assignment's own verification is the only check for this launch."
-      }
+      },
+      supervisionDigest: { doneWhen: ["The follow-up assignment is carried out exactly as written."], constraints: ["none"] }
     }, signal(), undefined, toolContext());
     const details = resultObject(launched.details);
     expect(details).toMatchObject({ recipient: { capable: true, kind: "claude", profileName: "worker-claude" } });

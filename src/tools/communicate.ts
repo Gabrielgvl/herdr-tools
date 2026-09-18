@@ -9,8 +9,8 @@ import { queueFlushEligible, type DevinQueueFlush } from "../messages/devin-queu
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import { classifyPromptObservation, compactPromptSubmission, requirePromptTargetIdentity, parsePromptSubmission, parsePromptTargetIdentityFields, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
-import { agentFrom, assertQualifiedPromptTarget, assertSendableState, compactPane, paneFrom, snapshotIdentityRecords, stateOf, type CommunicateState } from "../messages/prompt-target.js";
-import type { AttachmentStore, PublishedAttachment } from "../messages/store.js";
+import { agentFrom, assertSendableState, compactPane, paneFrom, snapshotIdentityRecords, stateOf, type CommunicateState } from "../messages/prompt-target.js";
+import { publishedAttachmentMatchesDirectory, type AttachmentStore, type PublishedAttachment } from "../messages/store.js";
 import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
@@ -143,12 +143,6 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         if (sender && target.paneId === sender.paneId) {
           throw Object.assign(new Error("Communication cannot target the caller pane"), { code: "SELF_TARGET_REJECTED", details: { target: target.paneId } });
         }
-        if (legacyParams.operation !== "keys") {
-          assertQualifiedPromptTarget([
-            ...snapshot.panes.filter((pane) => pane.pane_id === target.paneId),
-            ...snapshot.agents.filter((agent) => agent.pane_id === target.paneId)
-          ], target.paneId!);
-        }
         // Cooperative worker/manager routing (ADR-030): classify the effective
         // caller after exact target resolution so an alias for the bound
         // manager pane compares equal, and before any recipient lookup,
@@ -159,6 +153,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         else assertSendScope(callerPolicy, legacyParams.operation, target.paneId);
         let recipientKey: string | undefined;
         let recipientAgentName: string | undefined;
+        let recipientAttachmentDirectory: string | undefined;
         let recipientRecord: ReturnType<RecipientRegistry["get"]>;
         if (delivery === "attachment") {
           phase = "verify_recipient";
@@ -172,6 +167,18 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           }
           recipientKey = recipientRecord!.recipientKey;
           recipientAgentName = verification.identity.agentName;
+          if (recipientRecord!.kind === "agy") {
+            recipientAttachmentDirectory = recipientRecord!.attachmentDirectory;
+            let currentDirectory: string | undefined;
+            try {
+              currentDirectory = deps.attachments.recipientDirectory(recipientKey);
+            } catch {
+              // Report every store/key disagreement as an unavailable capability.
+            }
+            if (currentDirectory !== recipientAttachmentDirectory) {
+              throw Object.assign(new Error("Attachment target directory is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: "recipient attachment directory does not match the current store" } });
+            }
+          }
         }
         phase = "pre_state";
         if (params.operation !== "keys") {
@@ -187,7 +194,6 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             agentFrom(preAgentEnvelope!.result),
             before
           ];
-          assertQualifiedPromptTarget(preIdentityRecords, target.paneId!);
           // Lazy target adoption (ADR-028): a detected pane whose only missing
           // join field is the agent name gets a derived name minted before the
           // send fails closed. The minted record satisfies this join; fresh
@@ -222,7 +228,6 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
               agentFrom(finalAgentEnvelope.result),
               finalPane
             ];
-            assertQualifiedPromptTarget(finalIdentityRecords, target.paneId!);
             const identity = requirePromptTargetIdentity(finalIdentityRecords, target.paneId!);
             return { identity, state: finalState };
           };
@@ -235,12 +240,16 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             published = await deps.attachments!.publish({
               body: legacyParams.text,
               recipientKey: recipientKey!,
+              ...(recipientAttachmentDirectory ? { expectedRecipientDirectory: recipientAttachmentDirectory } : {}),
               recipientPaneId: target.paneId,
               recipientAgentName,
               senderPaneId: sender!.paneId,
               senderDisplay: sender!.display,
               operation: legacyParams.operation
             });
+            if (recipientAttachmentDirectory && !publishedAttachmentMatchesDirectory(published, recipientAttachmentDirectory)) {
+              throw Object.assign(new Error("Published attachment directory is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: "published attachment does not match the registered recipient directory" } });
+            }
           }
           phase = "send";
           let sentState: CommunicateState | undefined;

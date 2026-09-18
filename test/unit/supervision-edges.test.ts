@@ -23,7 +23,7 @@ const request: SupervisorJobRequestSnapshot = {
   targets: ["worker"],
   targetIds: [],
   child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
-  settings: { reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max" },
+  settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" },
 };
 
 function paneRecord(status = "working", revision = 5, paneId = "p1"): Record<string, unknown> {
@@ -298,7 +298,7 @@ describe("monitor and registry seams", () => {
       reviewerFactory: () => { reviewerCalls += 1; return { review: async () => ({ classification: "progress", summary: "s" }) }; },
       idFactory: () => "fixed",
     });
-    expect((supervision as unknown as { reviewer(): unknown }).reviewer()).toBeDefined();
+    await expect((supervision as unknown as { reviewer(): Promise<unknown> }).reviewer()).resolves.toBeDefined();
     expect(reviewerCalls).toBe(1);
     // No monitorOptions and no HERDR_SOCKET_PATH means the default monitor refuses.
     const previous = process.env.HERDR_SOCKET_PATH;

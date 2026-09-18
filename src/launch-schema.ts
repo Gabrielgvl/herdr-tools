@@ -51,6 +51,17 @@ export const LaunchAssignmentSchema = Type.Object({
   verification: AssignmentText("How the child must prove the result, including the checks and commands to run.")
 }, { additionalProperties: false });
 
+/**
+ * The authorial supervision digest a caller may attach to a launch (ADR-034):
+ * done-when conditions and constraints the supervisor's reviewer judges
+ * against. Bounded and strict — extra fields are rejected.
+ */
+const SupervisionDigestItems = Type.Array(Type.String({ maxLength: 240 }), { maxItems: 8 });
+export const SupervisionDigestSchema = Type.Object({
+  doneWhen: Type.Optional(SupervisionDigestItems),
+  constraints: Type.Optional(SupervisionDigestItems)
+}, { additionalProperties: false });
+
 const LaunchCommonProperties = {
   name: AgentName,
   placement: Type.Optional(LaunchPlacementSchema),
@@ -58,7 +69,8 @@ const LaunchCommonProperties = {
   cwd: Type.Optional(Identifier),
   focus: Type.Optional(Type.Boolean()),
   assignment: LaunchAssignmentSchema,
-  assignmentDelivery: Type.Optional(StringEnum(["inline", "attachment"] as const))
+  assignmentDelivery: Type.Optional(StringEnum(["inline", "attachment"] as const)),
+  supervisionDigest: Type.Optional(SupervisionDigestSchema)
 };
 
 const ProfileLaunchParamsSchema = Type.Object({
@@ -103,6 +115,8 @@ export interface LaunchRequest {
   focus?: boolean;
   assignment: LaunchAssignment;
   assignmentDelivery?: MessageDelivery;
+  /** Authorial done-when/constraints the supervisor's reviewer judges against (ADR-034). */
+  supervisionDigest?: { doneWhen?: string[]; constraints?: string[] };
 }
 
 export const LAUNCH_ASSIGNMENT_FIELDS = ["objective", "scope", "verification"] as const;

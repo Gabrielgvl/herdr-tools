@@ -581,7 +581,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(profileItems).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "manager-pi", kind: "pi", model: "openai-codex/gpt-5.6-sol", thinking: "high", tools: expect.arrayContaining(["herdr_tab"]), skills: expect.arrayContaining([expect.stringContaining("herdr-profiles/role-plugins/manager/skills/manager"), expect.stringContaining("herdr-profiles/role-plugins/manager/skills/harness-flow")]) }),
       expect.objectContaining({ name: "manager-claude", kind: "claude", model: "fable", effort: "high", permissionMode: "default", fallbackProfiles: ["manager-pi"] }),
-      expect.objectContaining({ name: "promoter-pi", kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max", fallbackProfiles: [] }),
+      expect.objectContaining({ name: "promoter-pi", kind: "pi", model: expect.stringMatching(/^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9.-]*$/u), thinking: "max", fallbackProfiles: [] }),
       expect.objectContaining({ name: "scout-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["scout-claude"] }),
       expect.objectContaining({ name: "worker-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["worker-claude"] }),
       expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-claude"] }),

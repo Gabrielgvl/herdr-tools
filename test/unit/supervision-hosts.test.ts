@@ -120,9 +120,6 @@ describe("the Pi host supervision wiring", () => {
       } as never,
       { HERDR_SOCKET_PATH: socket.path, HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "t", HERDR_PANE_ID: "p1" },
     );
-    // The reviewer resolves through the registry the session context supplies.
-    runtime.bindModelRegistry({ find: () => undefined, getAll: () => [], getApiKeyAndHeaders: async () => ({ ok: false, error: "no credential" }) });
-
     const reservation = await runtime.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
     await reservation.bind({ identity, profileName: "worker-pi" });
     expect(runtime.jobs.get(reservation.jobId)).toMatchObject({ kind: "supervisor", supervision: { state: "active" } });

@@ -366,7 +366,7 @@ function validateParams(params: LaunchRequest): void {
   if (typeof params.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
     throw new LaunchError("INVALID_INPUT", "name must start with a lowercase letter and contain only lowercase letters, digits, - or _ (1-32 characters)");
   }
-  const allowedKeys = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery"]);
+  const allowedKeys = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery", "supervisionDigest"]);
   for (const key of Object.keys(params)) if (!allowedKeys.has(key)) throw new LaunchError("INVALID_INPUT", `Unknown launch field: ${key}`);
   profileIdentifier(params.profile);
   if (params.overrides !== undefined) {
@@ -402,6 +402,20 @@ function validateParams(params: LaunchRequest): void {
   }
   if (params.assignmentDelivery !== undefined && params.assignmentDelivery !== "inline" && params.assignmentDelivery !== "attachment") {
     throw new LaunchError("INVALID_INPUT", "assignmentDelivery must be inline or attachment");
+  }
+  if (params.supervisionDigest !== undefined) {
+    const digest = params.supervisionDigest;
+    if (!record(digest)) throw new LaunchError("INVALID_INPUT", "supervisionDigest must be an object with doneWhen and constraints");
+    for (const key of Object.keys(digest)) {
+      if (key !== "doneWhen" && key !== "constraints") throw new LaunchError("INVALID_INPUT", `Unknown supervisionDigest field: ${key}`);
+    }
+    for (const field of ["doneWhen", "constraints"] as const) {
+      const items = digest[field];
+      if (items === undefined) continue;
+      if (!Array.isArray(items) || items.length > 8 || items.some((item) => typeof item !== "string" || item.length > 240 || /\0/.test(item))) {
+        throw new LaunchError("INVALID_INPUT", `supervisionDigest.${field} must be at most 8 strings of at most 240 characters without NUL`);
+      }
+    }
   }
   if (params.focus !== undefined && typeof params.focus !== "boolean") throw new LaunchError("INVALID_INPUT", "focus must be a boolean");
   const placement = params.placement;
@@ -2043,7 +2057,18 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         phase = "supervision_reserve";
         progress(onUpdate, phase, created);
         try {
-          reservation = await deps.supervision.reserve({ child: { agentName: params.name, agentKind: profiles[0]!.runtime.kind, profileName: profiles[0]!.name } });
+          // The supervision digest is caller-authored evidence the supervisor
+          // persists with the reservation: allowlist the two digest fields
+          // before modelSafeJson so nothing else a caller smuggled in can ride
+          // along, and the schema bound (8 items x 240 chars) is its byte bound.
+          const supervisionDigest = params.supervisionDigest === undefined ? undefined : modelSafeJson({
+            doneWhen: params.supervisionDigest.doneWhen ?? [],
+            constraints: params.supervisionDigest.constraints ?? []
+          }) as { doneWhen: string[]; constraints: string[] };
+          reservation = await deps.supervision.reserve({
+            child: { agentName: params.name, agentKind: profiles[0]!.runtime.kind, profileName: profiles[0]!.name },
+            ...(supervisionDigest === undefined ? {} : { settings: { supervisionDigest } })
+          });
         } catch (error) {
           throw new LaunchError("SUPERVISION_UNAVAILABLE", "Automatic child supervision could not be reserved", {
             causeCode: safeDiagnosticString(record(error) && typeof error.code === "string" ? error.code : undefined, 120) ?? "SUPERVISION_UNAVAILABLE"

@@ -31,7 +31,7 @@ const provisionalRequest: SupervisorJobRequestSnapshot = {
   targetIds: [],
   target_generation_refs: ["target_generation_provisional"],
   child: { agentName: "agy", agentKind: "agy", profileName: "researcher-agy" },
-  settings: { reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-luna", reviewerThinking: "max" },
+  settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" },
 };
 
 const provisionalIdentity: SupervisedIdentity = {
@@ -72,7 +72,7 @@ describe("JobRegistry", () => {
     const provisionalView: SupervisionJobView = {
       state: "provisional",
       monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
-      reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+      reviewer: { model: "typesafe/jev-latest", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
       transitions: [],
       truncatedTransitions: 0,
       events: [],
@@ -738,7 +738,7 @@ describe("JobRegistry", () => {
     const pending = async () => new Promise<never>(() => undefined);
     const common = {
       monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
-      reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max" as const, cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+      reviewer: { model: "typesafe/jev-latest", thinking: "max" as const, cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
       transitions: [],
       truncatedTransitions: 0,
       events: [],
@@ -831,7 +831,7 @@ describe("JobRegistry", () => {
     const installed: SupervisionJobView = {
       state: "provisional",
       monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
-      reviewer: { model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
+      reviewer: { model: "typesafe/jev-latest", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
       transitions: [], truncatedTransitions: 0, events: [], truncatedEvents: 0, unobservedEvents: 0,
       provisional: { agentName: "agy", agentKind: "agy", paneId: "p1", terminalId: "t1", profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 1, revision: 1 } },
     };

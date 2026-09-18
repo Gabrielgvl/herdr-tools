@@ -21,7 +21,7 @@ import { createCliTranscriptReader, SupervisionRegistry } from "../supervision/r
 import { createHandoffGate } from "../handoff-gate.js";
 import { createSelfCloseTracker } from "../supervision/self-close.js";
 import { CLAUDE_CHANNEL_CAPABILITY, createMcpHostWake } from "../supervision/notify.js";
-import { createBuiltinModelRegistry, createBuiltinModelService, createBuiltinModels, type BuiltinModelsSeam } from "../supervision/model-service.js";
+import { createBuiltinModelRegistry, createBuiltinModels, type BuiltinModelsSeam } from "../supervision/model-service.js";
 import { loadSettings, type Settings } from "../settings.js";
 import type { CurrentContext } from "../targets.js";
 import { createPreflight, createToolSurface, type HerdrToolSurface } from "../tool-surface.js";
@@ -165,19 +165,16 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   const selfClose = createSelfCloseTracker();
   const handoffs = createHandoffGate();
   // The MCP host has no Pi model registry, and `hostContext` deliberately still
-  // throws for `context.modelRegistry`. Both reviewers instead resolve through
-  // one host-independent catalogue whose credentials live in the Pi agent's
-  // auth.json — the same login the Pi host uses, and one shared store so a
-  // refresh either performs is visible to both.
+  // throws for `context.modelRegistry`. The wait reviewer instead resolves
+  // through one host-independent catalogue whose credentials live in the Pi
+  // agent's auth.json — the same login the Pi host uses.
   const models = deps.models ?? createBuiltinModels();
-  const modelService = createBuiltinModelService(models);
   const waitModels = createBuiltinModelRegistry(models);
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
     readTranscript: createCliTranscriptReader(cli),
     notifier: hostWake.notifier,
-    models: () => modelService,
     monitorOptions: { ...(deps.env ? { env: deps.env } : {}) },
     selfClose,
     handoffs,

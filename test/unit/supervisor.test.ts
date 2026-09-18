@@ -11,7 +11,7 @@ import { classifySnapshotTarget, type ProvisionalSupervisedIdentity, type Provis
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
 import { createSelfCloseTracker, type SelfCloseTracker } from "../../src/supervision/self-close.js";
 import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervision/protocol.js";
-import type { SupervisionReviewResult, SupervisionReviewer } from "../../src/supervision/reviewer.js";
+import type { SupervisionReviewRequest, SupervisionReviewResult, SupervisionReviewer } from "../../src/supervision/reviewer.js";
 import { Supervisor, SupervisionBindError, type SupervisionBinding, type SupervisionScheduler, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 
@@ -91,6 +91,8 @@ interface Harness {
   reviews: number;
   /** The pane of every review that actually reached the model, in order. */
   reviewedPanes: string[];
+  /** Every request that reached the reviewer, in order. */
+  reviewRequests: SupervisionReviewRequest[];
   observers: number;
   degradeMonitor(): void;
   recoverMonitor(): void;
@@ -102,6 +104,7 @@ interface HarnessOptions {
   transcript?: (paneId: string) => Promise<string[]>;
   cadenceMs?: number;
   child?: SupervisorDependencies["child"];
+  assignmentDigest?: SupervisorDependencies["assignmentDigest"];
   selfClose?: SelfCloseTracker;
   handoffs?: HandoffGate;
   repairPrompt?: SupervisorDependencies["repairPrompt"];
@@ -122,10 +125,12 @@ function harness(options: HarnessOptions = {}): Harness {
   };
   const notifier: ManagerNotifier = { wake: (wake) => { wakes.push(wake); } };
   const reviewedPanes: string[] = [];
+  const reviewRequests: SupervisionReviewRequest[] = [];
   const reviewer: SupervisionReviewer = {
     review: async (request) => {
       reviews += 1;
       reviewedPanes.push(request.paneId);
+      reviewRequests.push(request);
       if (!options.review) return { classification: "progress", summary: "moving" };
       return options.review(reviews);
     },
@@ -147,6 +152,7 @@ function harness(options: HarnessOptions = {}): Harness {
     },
     notifier,
     reviewer,
+    ...(options.assignmentDigest === undefined ? {} : { assignmentDigest: options.assignmentDigest }),
     cadenceMs: options.cadenceMs ?? 300_000,
     clock: { now: () => 1_000 },
     scheduler,
@@ -168,6 +174,7 @@ function harness(options: HarnessOptions = {}): Harness {
     timerArmed: () => timer !== undefined,
     get reviews() { return reviews; },
     reviewedPanes,
+    reviewRequests,
     get observers() { return observers; },
     degradeMonitor: () => { degraded = true; },
     recoverMonitor: () => { degraded = false; },
@@ -209,7 +216,7 @@ describe("supervisor binding", () => {
     expect(view.state).toBe("active");
     expect(view.status).toBe("working");
     expect(view.child).toEqual({ agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-pi" });
-    expect(view.reviewer).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max", cadenceMinutes: 5, degraded: false });
+    expect(view.reviewer).toMatchObject({ model: "typesafe/jev-latest", cadenceMinutes: 5, degraded: false });
     expect(h.supervisor.childLive()).toBe(true);
     // A working child arms the review cadence immediately.
     expect(h.timerArmed()).toBe(true);
@@ -2211,6 +2218,71 @@ describe("supervisor review cadence", () => {
     expect(h.timerArmed()).toBe(true);
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
     expect(h.timerArmed()).toBe(false);
+  });
+
+  it("carries the assignment digest and the new-line count into every review", async () => {
+    const h = await working({
+      assignmentDigest: { doneWhen: ["tests pass"], constraints: ["read-only"] },
+      transcript: async () => ["a", "b", "c"],
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]).toMatchObject({
+      assignmentDigest: { doneWhen: ["tests pass"], constraints: ["read-only"] },
+      linesSinceLastReview: 3,
+      transcriptDelta: ["a", "b", "c"],
+    });
+  });
+
+  it("omits previousReview on the first review and supplies it on the second", async () => {
+    const signals = { progress: 0.9, stalled: 0.1, blocked: 0.05, risk: 0.01, appears_complete: 0.02 };
+    const h = await working({ review: async () => ({ classification: "progress", summary: "moving", signals, evidenceSufficiency: 0.95, reason: "artifact_produced" }) });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]).not.toHaveProperty("previousReview");
+
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    // The second review consumes the first review's classification and signals,
+    // plus the progress watermark the first crossing set.
+    expect(h.reviewRequests[1]!.previousReview).toEqual({
+      classification: "progress",
+      signals,
+      lastMeaningfulProgressAtMs: 1_000,
+    });
+  });
+
+  it("never backdates the meaningful-progress watermark and omits it until progress crosses", async () => {
+    const h = await working({
+      review: async (call) => call === 1
+        ? { classification: "blocked", summary: "waiting", signals: { progress: 0.5, stalled: 0.1, blocked: 0.9, risk: 0.01, appears_complete: 0.02 }, evidenceSufficiency: 0.9, reason: "missing_permission" }
+        : { classification: "progress", summary: "moving", signals: { progress: 0.8, stalled: 0.1, blocked: 0.2, risk: 0.01, appears_complete: 0.02 }, evidenceSufficiency: 0.9, reason: "artifact_produced" },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    // A blocked review that did not cross the progress threshold leaves no watermark.
+    expect(h.reviewRequests[0]).not.toHaveProperty("previousReview");
+
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(h.reviewRequests[1]!.previousReview).toEqual({
+      classification: "blocked",
+      signals: { progress: 0.5, stalled: 0.1, blocked: 0.9, risk: 0.01, appears_complete: 0.02 },
+    });
+    expect(h.reviewRequests[1]!.previousReview).not.toHaveProperty("lastMeaningfulProgressAtMs");
+  });
+
+  it("persists every signal probability, the reason, and the evidence sufficiency on the review record", async () => {
+    const signals = { progress: 0.88, stalled: 0.1, blocked: 0.2, risk: 0.72, appears_complete: 0.02 };
+    const h = await working({ review: async () => ({ classification: "risk", summary: "wrong way", signals, evidenceSufficiency: 0.9, reason: "incorrect_direction" }) });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.supervisor.view().reviewer.reviews).toHaveLength(1));
+    const record = h.supervisor.view().reviewer.reviews[0] as { signals?: unknown; reason?: string; evidenceSufficiency?: number };
+    expect(record.signals).toEqual(signals);
+    expect(record.reason).toBe("incorrect_direction");
+    expect(record.evidenceSufficiency).toBe(0.9);
+    // The public triple is unchanged.
+    expect(record).toMatchObject({ atMs: 1_000, classification: "risk", summary: "wrong way" });
   });
 });
 

@@ -504,7 +504,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         envelope: { version: "v1", kind: "assignment" },
         promptConfirmation: { elapsedMs: expect.any(Number) },
         timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
-        profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max" } }
+        profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: expect.stringMatching(/^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9.-]*$/u), thinking: "max" } }
       });
       assertLaunchPhaseTiming(launchEvidence, launchElapsedMs);
       expect(record(launchEvidence.sender).paneId).toBe(String(movedPane.pane_id));

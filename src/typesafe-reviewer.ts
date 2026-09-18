@@ -1,4 +1,5 @@
 import { APIError, choice, TypeSafeClient, type EntryType, type Fetch } from "@typesafe-ai/sdk";
+import { AuthJsonCredentialStore } from "./supervision/auth-json-credential-store.js";
 import {
   MAX_SUMMARY_CHARS,
   PiModelReviewer,
@@ -26,6 +27,26 @@ type TypeSafeClassification = keyof typeof CHOICES;
 export interface TypeSafeReviewerOptions {
   apiKey?: string;
   fetch?: Fetch;
+}
+
+/**
+ * The key every System One reviewer uses: an explicit option, then the
+ * environment. Resolution to the Pi auth store happens once at the caller —
+ * `resolveTypesafeApiKey` — and arrives here as the explicit option.
+ */
+export function typeSafeReviewerApiKey(options: TypeSafeReviewerOptions): string | undefined {
+  return options.apiKey ?? process.env.TYPESAFE_API_KEY;
+}
+
+/** The one client construction every System One reviewer shares: logging off, retries off, an optional injected fetch. */
+export function createTypeSafeClient(options: { apiKey: string; defaultModel: string; fetch?: Fetch }): TypeSafeClient {
+  return new TypeSafeClient({
+    apiKey: options.apiKey,
+    defaultModel: options.defaultModel,
+    logLevel: "off",
+    retry: { maxRetries: 0 },
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  });
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -87,7 +108,7 @@ export class TypeSafeReviewer implements WaitReviewer {
     if (modelId.length === 0 || /[\s\0]/u.test(modelId)) {
       throw new ReviewerFailure("Configured TypeSafe reviewer model identifier is invalid", { model: modelId });
     }
-    this.apiKey = options.apiKey ?? process.env.TYPESAFE_API_KEY;
+    this.apiKey = typeSafeReviewerApiKey(options);
     this.fetchCall = options.fetch;
   }
 
@@ -97,11 +118,9 @@ export class TypeSafeReviewer implements WaitReviewer {
       throw new ReviewerFailure("TypeSafe reviewer is not authenticated", { targetId: request.targetId, model: this.modelId });
     }
     try {
-      const client = new TypeSafeClient({
+      const client = createTypeSafeClient({
         apiKey: this.apiKey,
         defaultModel: this.modelId,
-        logLevel: "off",
-        retry: { maxRetries: 0 },
         ...(this.fetchCall === undefined ? {} : { fetch: this.fetchCall }),
       });
       const response = await client.systemOne({
@@ -132,6 +151,23 @@ export class TypeSafeReviewer implements WaitReviewer {
       });
     }
   }
+}
+
+/**
+ * Resolve the Jev API key in precedence order. A caller-supplied explicit
+ * option always wins by construction (`TypeSafeReviewer` prefers
+ * `options.apiKey`); this helper supplies the next two legs —
+ * `TYPESAFE_API_KEY`, then the "typesafe" `api_key` entry in the Pi auth
+ * credential store, the same file the Pi host logs into. A missing,
+ * unreadable, or non-api-key entry resolves to `undefined`, which leaves the
+ * reviewer's own "not authenticated" failure to surface at review time. Key
+ * material is never logged or persisted here.
+ */
+export async function resolveTypesafeApiKey(store: Pick<AuthJsonCredentialStore, "read"> = new AuthJsonCredentialStore()): Promise<string | undefined> {
+  const fromEnv = process.env.TYPESAFE_API_KEY;
+  if (fromEnv !== undefined && fromEnv.length > 0) return fromEnv;
+  const credential = await store.read("typesafe").catch(() => undefined);
+  return credential?.type === "api_key" ? credential.key : undefined;
 }
 
 /** Select the opt-in System One path or preserve the existing Pi reviewer unchanged. */

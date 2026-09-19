@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -11,6 +11,7 @@ import { classifySnapshotTarget, type ProvisionalSupervisedIdentity, type Provis
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
 import { createSelfCloseTracker, type SelfCloseTracker } from "../../src/supervision/self-close.js";
 import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervision/protocol.js";
+import { reviewLogPaths, ReviewLogError, type SupervisionLogRecord, type SupervisionReviewLogEntry } from "../../src/supervision/review-log.js";
 import type { SupervisionReviewRequest, SupervisionReviewResult, SupervisionReviewer } from "../../src/supervision/reviewer.js";
 import { Supervisor, SupervisionBindError, type SupervisionBinding, type SupervisionScheduler, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
@@ -93,6 +94,8 @@ interface Harness {
   reviewedPanes: string[];
   /** Every request that reached the reviewer, in order. */
   reviewRequests: SupervisionReviewRequest[];
+  /** Every entry the supervisor handed the review-log seam, in order. */
+  logged: SupervisionReviewLogEntry[];
   observers: number;
   degradeMonitor(): void;
   recoverMonitor(): void;
@@ -108,6 +111,10 @@ interface HarnessOptions {
   selfClose?: SelfCloseTracker;
   handoffs?: HandoffGate;
   repairPrompt?: SupervisorDependencies["repairPrompt"];
+  /** The review-log append seam; `"default"` exercises the real `appendSupervisionReview` — always pair it with `reviewLogRoot`. */
+  reviewLog?: SupervisorDependencies["reviewLog"] | "default";
+  /** The trusted root the default seam appends under. */
+  reviewLogRoot?: string;
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -126,6 +133,7 @@ function harness(options: HarnessOptions = {}): Harness {
   const notifier: ManagerNotifier = { wake: (wake) => { wakes.push(wake); } };
   const reviewedPanes: string[] = [];
   const reviewRequests: SupervisionReviewRequest[] = [];
+  const logged: SupervisionReviewLogEntry[] = [];
   const reviewer: SupervisionReviewer = {
     review: async (request) => {
       reviews += 1;
@@ -153,6 +161,8 @@ function harness(options: HarnessOptions = {}): Harness {
     notifier,
     reviewer,
     ...(options.assignmentDigest === undefined ? {} : { assignmentDigest: options.assignmentDigest }),
+    ...(options.reviewLog === "default" ? {} : { reviewLog: options.reviewLog ?? (async (entry: SupervisionReviewLogEntry) => { logged.push(entry); }) }),
+    ...(options.reviewLogRoot === undefined ? {} : { reviewLogRoot: options.reviewLogRoot }),
     cadenceMs: options.cadenceMs ?? 300_000,
     clock: { now: () => 1_000 },
     scheduler,
@@ -175,6 +185,7 @@ function harness(options: HarnessOptions = {}): Harness {
     get reviews() { return reviews; },
     reviewedPanes,
     reviewRequests,
+    logged,
     get observers() { return observers; },
     degradeMonitor: () => { degraded = true; },
     recoverMonitor: () => { degraded = false; },
@@ -2283,6 +2294,136 @@ describe("supervisor review cadence", () => {
     expect(record.evidenceSufficiency).toBe(0.9);
     // The public triple is unchanged.
     expect(record).toMatchObject({ atMs: 1_000, classification: "risk", summary: "wrong way" });
+  });
+
+  it("hands every completed review to the log seam with the allowlisted entry", async () => {
+    const signals = { progress: 0.9, stalled: 0.1, blocked: 0.05, risk: 0.01, appears_complete: 0.02 };
+    const h = await working({ review: async () => ({ classification: "progress", summary: "moving", signals, evidenceSufficiency: 0.95, reason: "artifact_produced" }) });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.logged).toHaveLength(1));
+    expect(h.logged[0]).toEqual({
+      jobId: "job_supervisor",
+      agentName: "worker",
+      agentKind: "pi",
+      atMs: 1_000,
+      classification: "progress",
+      attention: false,
+      signals,
+      evidenceSufficiency: 0.95,
+      reason: "artifact_produced",
+      lastMeaningfulProgressAtMs: 1_000,
+      linesSinceLastReview: 1,
+      evidence: {
+        paneId: "p1",
+        terminalId: "t1",
+        agentSession: session,
+        revision: 5,
+        transcriptLines: 1,
+        workingForMs: 0,
+      },
+    });
+    // The next review names the classification this review read as its predecessor.
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.logged).toHaveLength(2));
+    expect(h.logged[1]).toMatchObject({ classification: "progress", previousClassification: "progress" });
+  });
+
+  it("logs the wake entry with the emitted event id when a review wakes the manager", async () => {
+    const h = await working({ review: async () => ({ classification: "stalled", summary: "no output" }) });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    await vi.waitFor(() => expect(h.logged).toHaveLength(1));
+    expect(h.logged[0]).toMatchObject({ classification: "stalled", attention: true });
+    expect(h.logged[0]!.wake).toEqual({ eventId: h.wakes[0]!.event.eventId, eventType: "reviewer_attention", atMs: 1_000 });
+  });
+
+  it("degrades like a reviewer failure when the log write fails, then retries on the next cadence", async () => {
+    const entries: SupervisionReviewLogEntry[] = [];
+    let fail = true;
+    const h = await working({
+      reviewLog: async (entry) => {
+        if (fail) throw new ReviewLogError();
+        entries.push(entry);
+      },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded"]));
+    // The review still completed and stored; only the dataset row was lost.
+    expect(h.supervisor.view().reviewer.reviews).toHaveLength(1);
+    expect(h.supervisor.view().reviewer.degraded).toBe(true);
+    expect(h.supervisor.childLive()).toBe(true);
+    expect(h.timerArmed()).toBe(true);
+
+    fail = false;
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded", "reviewer_recovered"]));
+    expect(entries).toHaveLength(1);
+    expect(h.supervisor.view().reviewer.degraded).toBe(false);
+  });
+
+  it("still wakes the manager when an attention review's log write fails", async () => {
+    const h = await working({
+      review: async () => ({ classification: "stalled", summary: "no output" }),
+      reviewLog: async () => { throw new ReviewLogError(); },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded"]));
+    expect(h.supervisor.view().reviewer.reviews).toHaveLength(1);
+    expect(h.supervisor.childLive()).toBe(true);
+  });
+
+  it("persists nothing for a review abandoned when its run ended in flight", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await working({ review: async () => { await gate; return { classification: "progress", summary: "moving" }; } });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    release();
+    await vi.waitFor(() => expect(h.supervisor.view().reviewer.reviews).toEqual([]));
+    expect(h.logged).toEqual([]);
+  });
+
+  it("writes the review and wake records into .herdr/supervision/reviews.jsonl through the default seam", async () => {
+    const root = await mkdtemp(join(tmpdir(), "herdr-supervisor-log-"));
+    try {
+      const h = harness({
+        reviewLog: "default",
+        reviewLogRoot: root,
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 9 })])],
+        review: async () => ({ classification: "stalled", summary: "no output" }),
+      });
+      await h.supervisor.bind({ identity, profileName: "worker-pi", stateChangeSeq: 9 });
+      h.fireTimer();
+      await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+      const paths = reviewLogPaths(root);
+      await vi.waitFor(async () => {
+        const records = (await readFile(paths.reviews, "utf8")).split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line) as SupervisionLogRecord);
+        expect(records).toHaveLength(2);
+        expect(records[0]).toMatchObject({
+          type: "review",
+          jobId: "job_supervisor",
+          agentName: "worker",
+          agentKind: "pi",
+          atMs: 1_000,
+          classification: "stalled",
+          attention: true,
+          reason: null,
+          evidence: { paneId: "p1", terminalId: "t1", agentSession: session, revision: 5, stateChangeSeq: 9, transcriptLines: 1, workingForMs: 0 },
+        });
+        expect(records[1]).toMatchObject({
+          type: "wake",
+          eventId: h.wakes[0]!.event.eventId,
+          eventType: "reviewer_attention",
+          classification: "stalled",
+          reviewAtMs: 1_000,
+          disposition: "unknown",
+        });
+      });
+      expect((await lstat(paths.reviews)).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

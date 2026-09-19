@@ -49,7 +49,16 @@ import {
   type SupervisionSocketEvent,
 } from "./protocol.js";
 import { deltaLines } from "../transcript-delta.js";
-import { needsManagerAttention, SUPERVISION_REVIEWER_MODEL, type SupervisionReviewer } from "./reviewer.js";
+import {
+  needsManagerAttention,
+  SUPERVISION_PROGRESS_THRESHOLD,
+  SUPERVISION_REVIEWER_MODEL,
+  type SupervisionAssignmentDigest,
+  type SupervisionPreviousReview,
+  type SupervisionReason,
+  type SupervisionReviewer,
+  type SupervisionSignalProbabilities,
+} from "./reviewer.js";
 import type {
   SupervisionChildView,
   SupervisionJobPort,
@@ -79,6 +88,19 @@ export interface SupervisionChildRequest {
   profileName: string;
 }
 
+/**
+ * The V2 review record: the public `{atMs, classification, summary}` triple
+ * plus the telemetry ADR-034 persists on every review — all signal
+ * probabilities including the non-activating ones, the reason code, and the
+ * evidence-sufficiency probability. The public projection keeps only the
+ * triple, so existing consumers never see a shape change.
+ */
+interface SupervisionReviewRecord extends SupervisionReviewView {
+  signals?: SupervisionSignalProbabilities;
+  reason?: SupervisionReason;
+  evidenceSufficiency?: number;
+}
+
 /** What binding proves. Every field comes from the launch's own readiness evidence. */
 export interface SupervisionBinding {
   identity: SupervisedIdentity;
@@ -104,6 +126,8 @@ export interface SupervisorDependencies {
   monitor: Pick<SessionEventMonitor, "addObserver" | "removeObserver" | "snapshot" | "generation" | "isDegraded">;
   notifier: ManagerNotifier;
   reviewer: SupervisionReviewer;
+  /** The reservation's authorial done-when/constraints, supplied to every review as state (ADR-034). */
+  assignmentDigest?: SupervisionAssignmentDigest;
   cadenceMs: number;
   clock: { now(): number };
   scheduler?: SupervisionScheduler;
@@ -179,7 +203,7 @@ const inertBindingPublication: SupervisionChildBindingPublication = {
 export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private readonly log: SupervisionEventLog;
   private readonly transitions = new BoundedHistory<SupervisionTransition>(SUPERVISION_MAX_TRANSITIONS);
-  private readonly reviews = new BoundedHistory<SupervisionReviewView>(SUPERVISION_MAX_REVIEWS);
+  private readonly reviews = new BoundedHistory<SupervisionReviewRecord>(SUPERVISION_MAX_REVIEWS);
   private readonly scheduler: SupervisionScheduler;
   private readonly settled: Promise<Settlement>;
   private resolveSettled!: (settlement: Settlement) => void;
@@ -249,6 +273,15 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private workingRun = 0;
   /** The transcript window the previous completed review consumed. */
   private reviewedTranscript: string[] = [];
+  /**
+   * The V2 temporal memory handed back as state on the next review: the prior
+   * classification and signals plus the progress watermark. In-memory only for
+   * the life of the reservation — a restart resets it, which is acceptable on
+   * a five-minute cadence (ADR-034).
+   */
+  private previousReview: SupervisionPreviousReview | undefined;
+  /** The last review whose progress signal crossed its threshold; once set it only moves forward. */
+  private lastMeaningfulProgressAtMs: number | undefined;
   private reviewTimer: unknown;
   private reviewing = false;
   private settlement: Settlement | undefined;
@@ -1446,20 +1479,42 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // is abandoned before the model call rather than stored or announced. The
       // transcript cursor does not advance: those lines were never reviewed.
       if (!this.reviewable(run, paneIdentity)) return;
+      // Only what is new since the previous completed review. Handing the whole
+      // window back every cadence would let stale output keep reading as fresh
+      // progress from a stalled child.
+      const transcriptDelta = deltaLines(this.reviewedTranscript, transcript);
       const result = await this.deps.reviewer.review({
         paneId: reviewed.paneId,
         agentName: reviewed.agentName,
         workingForMs: Math.max(0, this.deps.clock.now() - workingSinceMs),
         metadata: { agentKind: reviewed.agentKind, status: this.status, revision: this.lastRevision },
-        // Only what is new since the previous completed review. Handing the whole
-        // window back every cadence would let stale output keep reading as fresh
-        // progress from a stalled child.
-        transcriptDelta: deltaLines(this.reviewedTranscript, transcript),
+        transcriptDelta,
+        ...(this.deps.assignmentDigest === undefined ? {} : { assignmentDigest: this.deps.assignmentDigest }),
+        ...(this.previousReview === undefined ? {} : { previousReview: this.previousReview }),
+        linesSinceLastReview: transcriptDelta.length,
       }, this.abort.signal);
       if (!this.reviewable(run, paneIdentity)) return;
       this.reviewedTranscript = transcript;
       this.lastReviewAtMs = this.deps.clock.now();
-      this.reviews.push({ atMs: this.lastReviewAtMs, classification: result.classification, summary: result.summary });
+      this.reviews.push({
+        atMs: this.lastReviewAtMs,
+        classification: result.classification,
+        summary: result.summary,
+        ...(result.signals === undefined ? {} : { signals: result.signals }),
+        ...(result.evidenceSufficiency === undefined ? {} : { evidenceSufficiency: result.evidenceSufficiency }),
+        ...(result.reason === undefined ? {} : { reason: result.reason }),
+      });
+      // Meaningful progress is the signal crossing its threshold, not the
+      // classification: a child can advance and then block in one window, and
+      // the advancement still happened.
+      if (result.signals !== undefined && result.signals.progress >= SUPERVISION_PROGRESS_THRESHOLD) {
+        this.lastMeaningfulProgressAtMs = this.lastReviewAtMs;
+      }
+      this.previousReview = {
+        classification: result.classification,
+        ...(result.signals === undefined ? {} : { signals: result.signals }),
+        ...(this.lastMeaningfulProgressAtMs === undefined ? {} : { lastMeaningfulProgressAtMs: this.lastMeaningfulProgressAtMs }),
+      };
       if (this.reviewerDegraded) {
         this.reviewerDegraded = false;
         this.emit("reviewer_recovered", "the supervision reviewer recovered");

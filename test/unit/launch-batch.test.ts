@@ -8,7 +8,9 @@ import { existingNameTargets, validateLaunchParams } from "../../src/tools/launc
 
 const assign = (objective: string): LaunchAssignment => ({ objective, scope: `scope for ${objective}`, verification: `verify ${objective}` });
 
-const auto = (overrides: Partial<AutoLaunchRequest> = {}): AutoLaunchRequest => ({ name: "task", assignment: assign("go"), ...overrides });
+const digest = (): AutoLaunchRequest["supervisionDigest"] => ({ doneWhen: ["The assigned objective is complete and verified."], constraints: ["none"] });
+
+const auto = (overrides: Partial<AutoLaunchRequest> = {}): AutoLaunchRequest => ({ name: "task", assignment: assign("go"), supervisionDigest: digest(), ...overrides });
 
 const decision = (assignments: Array<{ profile: string; count: number }>): RouteDecision => ({
   kind: "route",
@@ -42,25 +44,25 @@ describe("dual launch schema", () => {
   });
 
   it("keeps the auto variant free of profile and overrides while sharing the common fields", () => {
-    expect(AutoLaunchParamsSchema.required).toEqual(expect.arrayContaining(["name", "assignment"]));
+    expect(AutoLaunchParamsSchema.required).toEqual(expect.arrayContaining(["name", "assignment", "supervisionDigest"]));
     expect(AutoLaunchParamsSchema.required).not.toContain("profile");
     expect(AutoLaunchParamsSchema.properties).not.toHaveProperty("profile");
     expect(AutoLaunchParamsSchema.properties).not.toHaveProperty("overrides");
-    for (const field of ["name", "assignment", "assignmentDelivery", "cwd", "focus", "label", "placement"]) {
+    for (const field of ["name", "assignment", "assignmentDelivery", "cwd", "focus", "label", "placement", "supervisionDigest"]) {
       expect(AutoLaunchParamsSchema.properties).toHaveProperty(field);
     }
-    expect(Value.Check(AutoLaunchParamsSchema, { name: "task", assignment: assign("go") })).toBe(true);
-    expect(Value.Check(AutoLaunchParamsSchema, { name: "task", assignment: assign("go"), profile: "worker-pi" })).toBe(false);
-    expect(Value.Check(ProfileLaunchParamsSchema, { name: "task", assignment: assign("go") })).toBe(false);
+    expect(Value.Check(AutoLaunchParamsSchema, { name: "task", assignment: assign("go"), supervisionDigest: digest() })).toBe(true);
+    expect(Value.Check(AutoLaunchParamsSchema, { name: "task", assignment: assign("go"), supervisionDigest: digest(), profile: "worker-pi" })).toBe(false);
+    expect(Value.Check(ProfileLaunchParamsSchema, { name: "task", assignment: assign("go"), supervisionDigest: digest() })).toBe(false);
   });
 
   it("lets schema and direct validation agree on valid explicit and auto requests", () => {
     const valid: unknown[] = [
-      { name: "worker", profile: "worker-pi", assignment: assign("go") },
-      { name: "worker", profile: "worker-pi", assignment: assign("go"), overrides: { model: "m" }, placement: { mode: "same_tab" } },
-      { name: "task", assignment: assign("go") },
-      { name: "task", assignment: assign("go"), label: "lbl", cwd: "/repo", focus: true, assignmentDelivery: "attachment", placement: { mode: "new_tab", tabLabel: "tab" } },
-      { name: "task", assignment: assign("go"), placement: { mode: "existing_pane", target: "w:p1" } }
+      { name: "worker", profile: "worker-pi", assignment: assign("go"), supervisionDigest: digest() },
+      { name: "worker", profile: "worker-pi", assignment: assign("go"), supervisionDigest: digest(), overrides: { model: "m" }, placement: { mode: "same_tab" } },
+      { name: "task", assignment: assign("go"), supervisionDigest: digest() },
+      { name: "task", assignment: assign("go"), supervisionDigest: digest(), label: "lbl", cwd: "/repo", focus: true, assignmentDelivery: "attachment", placement: { mode: "new_tab", tabLabel: "tab" } },
+      { name: "task", assignment: assign("go"), supervisionDigest: digest(), placement: { mode: "existing_pane", target: "w:p1" } }
     ];
     for (const value of valid) {
       expect(Value.Check(LaunchParamsSchema, value), JSON.stringify(value)).toBe(true);
@@ -69,7 +71,7 @@ describe("dual launch schema", () => {
   });
 
   it("accepts an omitted profile as auto and rejects every malformed present profile", () => {
-    const base = { name: "task", assignment: assign("go") };
+    const base = { name: "task", assignment: assign("go"), supervisionDigest: digest() };
     expect(Value.Check(LaunchParamsSchema, base)).toBe(true);
     expect(() => validateLaunchParams(base as never)).not.toThrow();
     for (const profile of [null, "", 7, {}, [], "UPPER", "bad name", "-lead", "worker-pi\n"]) {
@@ -84,7 +86,7 @@ describe("dual launch schema", () => {
   });
 
   it("treats a literal profile named auto as an ordinary explicit profile", () => {
-    const value = { name: "task", profile: "auto", assignment: assign("go") };
+    const value = { name: "task", profile: "auto", assignment: assign("go"), supervisionDigest: digest() };
     expect(Value.Check(LaunchParamsSchema, value)).toBe(true);
     expect(() => validateLaunchParams(value as never)).not.toThrow();
     const withOverrides = { ...value, overrides: { model: "m" } };
@@ -93,7 +95,7 @@ describe("dual launch schema", () => {
   });
 
   it("rejects raw fields, extra keys, and overrides without a named profile in both layers", () => {
-    const autoBase = { name: "task", assignment: assign("go") };
+    const autoBase = { name: "task", assignment: assign("go"), supervisionDigest: digest() };
     const invalid: unknown[] = [
       { ...autoBase, kind: "pi" },
       { ...autoBase, argv: ["--model", "x"] },
@@ -103,8 +105,8 @@ describe("dual launch schema", () => {
       { ...autoBase, overrides: { model: "m" } },
       { ...autoBase, overrides: {} },
       { ...autoBase, extensions: ["./ext"] },
-      { name: "task", profile: "worker-pi", assignment: assign("go"), kind: "pi" },
-      { name: "task", profile: "worker-pi", assignment: assign("go"), extra: true }
+      { name: "task", profile: "worker-pi", assignment: assign("go"), supervisionDigest: digest(), kind: "pi" },
+      { name: "task", profile: "worker-pi", assignment: assign("go"), supervisionDigest: digest(), extra: true }
     ];
     for (const value of invalid) {
       expect(Value.Check(LaunchParamsSchema, value), JSON.stringify(value)).toBe(false);
@@ -114,7 +116,7 @@ describe("dual launch schema", () => {
 
   it("keeps the exact assignment and placement rules on both variants", () => {
     const full = assign("go");
-    const bases = [{ name: "task", profile: "worker-pi" }, { name: "task" }];
+    const bases = [{ name: "task", profile: "worker-pi", supervisionDigest: digest() }, { name: "task", supervisionDigest: digest() }];
     for (const base of bases) {
       const missing = { ...base, assignment: { objective: "o", scope: "s" } };
       const extra = { ...base, assignment: { ...full, extra: "e" } };
@@ -131,7 +133,7 @@ describe("dual launch schema", () => {
       expect(() => validateLaunchParams(goodPlacement as never)).not.toThrow();
     }
     // Explicit-only override rules stay intact on the named-Profile variant.
-    const explicit = { name: "task", profile: "worker-pi", assignment: full };
+    const explicit = { name: "task", profile: "worker-pi", assignment: full, supervisionDigest: digest() };
     expect(Value.Check(LaunchParamsSchema, { ...explicit, overrides: { model: "m" } })).toBe(true);
     expect(() => validateLaunchParams({ ...explicit, overrides: { model: "m" } } as never)).not.toThrow();
     expect(Value.Check(LaunchParamsSchema, { ...explicit, overrides: { bogus: 1 } })).toBe(false);

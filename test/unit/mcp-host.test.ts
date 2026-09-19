@@ -148,7 +148,7 @@ describe("MCP host capability proxy", () => {
       herdr_communicate: { target: "w:p2", operation: "prompt", text: "hello" },
       herdr_wait: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5 },
       herdr_jobs: { operation: "list" },
-      herdr_launch: { name: "worker", profile: "worker-pi" },
+      herdr_launch: { name: "worker", profile: "worker-pi", supervisionDigest: { doneWhen: ["done"], constraints: ["none"] } },
       herdr_pane: { operation: "focus", target: "w:p2" },
       herdr_tab: { operation: "focus", target: "w:t" }
     };
@@ -161,7 +161,7 @@ describe("MCP host capability proxy", () => {
     const fallbackCommunicate = createCommunicateTool({ cli, context, preflight: createPreflight(cli) });
     await fallbackCommunicate.execute("id", { target: "w:p2", operation: "keys", keys: ["enter"] } as never, undefined, undefined, hostContext(host));
     const fallbackLaunch = createLaunchTool({ cli, context, preflight: async () => undefined, supervision: stubSupervision() });
-    await fallbackLaunch.execute("id", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } } as never, signal, undefined, hostContext(host)).catch(() => undefined);
+    await fallbackLaunch.execute("id", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } } as never, signal, undefined, hostContext(host)).catch(() => undefined);
     expect([...new Set(reads)].sort()).toEqual(["cwd", "signal"]);
   });
 });

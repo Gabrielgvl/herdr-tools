@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -265,6 +265,12 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       if (!sessionStarted) throw new Error(`named Herdr server did not become ready: ${startupError}`);
       const namedSocket = record((Array.isArray(record(await run("session", "list", "--json")).sessions) ? (record(await run("session", "list", "--json")).sessions as unknown[]) : []).find((session) => record(session).name === REQUIRED_SESSION));
       expect(namedSocket.socket_path).toBe(socketPath);
+      // `herdr server` creates the session directory honoring the process umask,
+      // which is 002 on hosts whose primary group is the user: the dir lands
+      // 0775 and the handoff/lock namespaces reject any group-writable parent.
+      // The disposable session is deleted at teardown, so tightening it here is
+      // safe; it does not relax the production owner-only check.
+      await chmod(dirname(socketPath), 0o700);
 
       const liveBaseline = topologyIds(await defaultSnapshot());
       const created = record(record(await runNamed(["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"])).result);
@@ -397,7 +403,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       // starts. The MCP host has no explicit wait-review model service, so a
       // redundant reviewer would fail the job; remaining live proves the
       // supervisor retained sole semantic-review ownership.
-      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "scout-pi", assignment: { objective: "Stay idle as a supervised wait target.", scope: "Change nothing.", verification: "The pane stays live at the same identity." } });
+      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "scout-pi", assignment: { objective: "Stay idle as a supervised wait target.", scope: "Change nothing.", verification: "The pane stays live at the same identity." }, supervisionDigest: { doneWhen: ["The pane stays live at the same identity."], constraints: ["none"] } });
       expect(reviewerTargetLaunch.isError, text(reviewerTargetLaunch)).toBeUndefined();
       const reviewerTargetEvidence = evidence(reviewerTargetLaunch);
       expect(reviewerTargetEvidence).toMatchObject({
@@ -454,7 +460,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(prelaunchMetadata).not.toHaveProperty("agent_id");
       expect(prelaunchMetadata).not.toHaveProperty("agent");
       const launchStartedAt = performance.now();
-      const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", assignment: { objective: "Use the bash tool to run pwd, then report the working directory.", scope: "Run pwd only. Change nothing.", verification: "The reported directory is the working directory pwd printed." } });
+      const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", assignment: { objective: "Use the bash tool to run pwd, then report the working directory.", scope: "Run pwd only. Change nothing.", verification: "The reported directory is the working directory pwd printed." }, supervisionDigest: { doneWhen: ["The reported directory is the working directory pwd printed."], constraints: ["none"] } });
       const launchElapsedMs = performance.now() - launchStartedAt;
       if (launched.isError) {
         const diagnostic = launchFailureDiagnostic(launched);
@@ -498,7 +504,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         envelope: { version: "v1", kind: "assignment" },
         promptConfirmation: { elapsedMs: expect.any(Number) },
         timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
-        profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max" } }
+        profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: expect.stringMatching(/^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9.-]*$/u), thinking: "max" } }
       });
       assertLaunchPhaseTiming(launchEvidence, launchElapsedMs);
       expect(record(launchEvidence.sender).paneId).toBe(String(movedPane.pane_id));

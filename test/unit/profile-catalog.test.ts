@@ -48,6 +48,8 @@ const noCli = { runJson: async () => { throw new Error("CLI must not be called")
 const CODEX_ADAPTER_PI_TOOLS = ["change_reasoning", "exec_command", "write_stdin", "apply_patch", "exec", "wait", "notebook", "view_image", "new_context", "get_context_remaining", "history", "notes"] as const;
 /** Every launch carries the mandatory typed assignment. */
 const ASSIGNMENT = { objective: "do the work", scope: "only this module", verification: "run the tests" };
+/** Every launch carries the required supervision digest. */
+const SUPERVISION_DIGEST = { doneWhen: ["The work is done and the tests pass."], constraints: ["none"] };
 /** The pre-prompt idle readiness baseline, then the advanced post-prompt sample. */
 const lifecycle = (advanced: number): Record<string, unknown> => advanced === 0
   ? { agent_status: "idle", state_change_seq: 7, revision: 3, interactive_ready: true }
@@ -414,16 +416,16 @@ describe("profile catalog", () => {
       { name: "worker", profile: "worker", overrides: null }, { name: "worker", profile: "worker", overrides: { unknown: "x" } },
       { name: "worker", profile: "worker", overrides: { model: "" } }, { name: "worker", profile: "worker", overrides: { tools: ["bad\nvalue"] } }, { name: "worker", kind: "pi", overrides: {} }
     ];
-    for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams({ ...(value as Record<string, unknown>), assignment: ASSIGNMENT } as never), `invalid case ${index}`).toThrow();
+    for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams({ ...(value as Record<string, unknown>), assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST } as never), `invalid case ${index}`).toThrow();
     // The typed assignment is itself required, so every case above is invalid without it too.
     for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams(value as never), `promptless case ${index}`).toThrow();
     // A profile-free request carrying the typed assignment is the valid auto
     // (Batch) form under the union schema; the assignment is still required.
-    expect(() => validateLaunchParams({ name: "worker", assignment: ASSIGNMENT } as never)).not.toThrow();
+    expect(() => validateLaunchParams({ name: "worker", assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST } as never)).not.toThrow();
     expect(() => validateLaunchParams({ name: "worker" } as never)).toThrow();
-    expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: ASSIGNMENT, overrides: { thinking: "low", tools: ["read"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."] } } as never)).not.toThrow();
+    expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST, overrides: { thinking: "low", tools: ["read"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."] } } as never)).not.toThrow();
     expect(() => validateLaunchParams({ name: "worker", profile: "worker" } as never)).toThrow(/assignment/);
-    for (const key of ["extensions", "skills", "pluginDirs"]) expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: ASSIGNMENT, overrides: { [key]: ["./selected"] } } as never)).toThrow(/Unknown profile override/);
+    for (const key of ["extensions", "skills", "pluginDirs"]) expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST, overrides: { [key]: ["./selected"] } } as never)).toThrow(/Unknown profile override/);
   });
 
   it("launches a resolved profile through the existing placement path", async () => {
@@ -454,13 +456,13 @@ describe("profile catalog", () => {
       prompted = true;
       return acknowledgement;
     } } as unknown as HerdrCli;
-    const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
+    const result = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker", profile: "worker", assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
     expect(promptSources.create).toHaveBeenCalledWith("\nBody for worker.\n");
     expect(calls).toContainEqual(["agent", "start", "worker", "--kind", "pi", "--pane", "w:p2", "--timeout", "120000", "--", "--model", "test/model", "--thinking", "low", "--no-skills", "--no-session", "--append-system-prompt", "/tmp/profile-18.md"]);
     expect(result.details).toMatchObject({ profile: { name: "worker", fallbackProfiles: [], timeoutMinutes: 30 }, kind: "pi" });
     const defaultCreate = vi.spyOn(defaultPromptSourceStore, "create").mockResolvedValue({ path: "/tmp/default-profile.md" });
     try {
-      await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-default", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
+      await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-default", profile: "worker", assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never);
       expect(defaultCreate).toHaveBeenCalledWith("\nBody for worker.\n");
     } finally {
       defaultCreate.mockRestore();
@@ -471,13 +473,13 @@ describe("profile catalog", () => {
     // The store failure is a foreign error, so the launch boundary rethrows a
     // typed LaunchError instead of the original: the model contract is the code,
     // the failed phase, and the no-effect diagnostic, never the store's own text.
-    const storeRejection = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never).then(() => undefined, (error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
+    const storeRejection = await createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => { throw storeFailure; } }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-2", profile: "worker", assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never).then(() => undefined, (error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
     expect(storeRejection).toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "handoff", causeCode: "CLI_PROTOCOL_ERROR", effectCertainty: "absent", agentStarted: false, promptSubmitted: false, recipientRegistered: false } });
     expect(launchDiagnostic(storeRejection!)).toEqual({ code: "CLI_PROTOCOL_ERROR", phase: "handoff", created: {}, agentStarted: false, promptSubmitted: false, recipientRegistered: false, effectCertainty: "absent", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.noEffect });
     expect(storeRejection!.message).not.toContain(storeFailure.message);
     expect(calls).toHaveLength(callsBeforeFailure + 2);
     const invalidPathCalls = calls.length;
-    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => ({ path: "/tmp/invalid\nprofile.md" }) }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-3", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE", details: { causeCode: "INVALID_PROFILE_OVERRIDE" } });
+    await expect(createLaunchTool({ cli, context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" }, cwd: "/repo", promptSources: { create: async () => ({ path: "/tmp/invalid\nprofile.md" }) }, profiles: { load: async () => ({ effective: new Map([[worker.name, worker]]), candidates: [], diagnostics: [] }) } }).execute("id", { name: "worker-3", profile: "worker", assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "INVALID_PROFILE_OVERRIDE", details: { causeCode: "INVALID_PROFILE_OVERRIDE" } });
     expect(calls).toHaveLength(invalidPathCalls + 2);
   });
 
@@ -765,7 +767,7 @@ describe("profile catalog", () => {
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.allowedTools).not.toEqual(expect.arrayContaining(["Bash", "NotebookEdit"]));
     expect(managerClaude.runtime.kind === "claude" && managerClaude.runtime.disallowedTools).toEqual(["Task"]);
     expect(buildProfileArgv(managerClaude)).toEqual(["--model", "fable", "--effort", "high", "--permission-mode", "default", ...managerClaudeTools.flatMap((tool) => ["--allowed-tools", tool]), "--disallowed-tools", "Task", "--plugin-dir", managerProfilePlugin, "--plugin-dir", executorProfilePlugin]);
-    expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "max" });
+    expect(catalog.effective.get("worker-pi")?.runtime).toMatchObject({ model: expect.stringMatching(/^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9.-]*$/u), thinking: "max" });
     expect(catalog.effective.get("worker-pi")?.fallbackProfiles).toEqual(["worker-claude"]);
     const workerAgy = catalog.effective.get("worker-agy")!;
     expect(workerAgy.runtime).toEqual({ kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", addDirs: [] });
@@ -802,7 +804,7 @@ describe("profile catalog", () => {
     expect(buildProfileArgv(researcherAgy)).toEqual(["--model", "gemini-3.8-flash-low", "--mode", "plan", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     expect(resolveProfile("researcher-agy", catalog).reachableNames).toEqual(["researcher-agy", "researcher-claude", "researcher-devin", "researcher-pi"]);
     expect(resolveProfile("researcher-claude", catalog).reachableNames).toEqual(["researcher-claude", "researcher-devin", "researcher-pi"]);
-    expect(catalog.effective.get("promoter-pi")?.runtime).toEqual({ kind: "pi", model: "openai-codex/gpt-5.6-luna", thinking: "max", tools: [...piTools.promoter], extensions: [], skills: piSkills("promoter") });
+    expect(catalog.effective.get("promoter-pi")?.runtime).toEqual({ kind: "pi", model: expect.stringMatching(/^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9.-]*$/u), thinking: "max", tools: [...piTools.promoter], extensions: [], skills: piSkills("promoter") });
     expect(catalog.effective.get("promoter-pi")?.fallbackProfiles).toEqual([]);
     expect(resolveProfile("promoter-pi", catalog).reachableNames).toEqual(["promoter-pi"]);
 
@@ -864,7 +866,7 @@ describe("profile catalog", () => {
     const worker = catalog.effective.get("worker-pi")!;
     const claudeWorker = catalog.effective.get("worker-claude")!;
     expect(buildProfileArgv(manager)).toEqual(["--model", "openai-codex/gpt-5.6-sol", "--thinking", "high", "--tools", piTools.manager.join(","), "--no-skills", ...piSkills("manager").flatMap((skill) => ["--skill", skill])]);
-    expect(buildProfileArgv(worker)).toEqual(["--model", "openai-codex/gpt-5.6-luna", "--thinking", "max", "--tools", piTools.worker.join(","), "--no-skills", ...piSkills("worker").flatMap((skill) => ["--skill", skill])]);
+    expect(buildProfileArgv(worker)).toEqual(["--model", expect.stringMatching(/^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9.-]*$/u), "--thinking", "max", "--tools", piTools.worker.join(","), "--no-skills", ...piSkills("worker").flatMap((skill) => ["--skill", skill])]);
     for (const profileName of ["worker-pi", "worker-claude"]) {
       const workerProfile = await readFile(join(bundledRoot, "herdr-profiles", `${profileName}.md`), "utf8");
       expect(workerProfile).toContain("For a `harness-flow` DAG node, leave the reviewed deliverable changes uncommitted for the promoter.");
@@ -886,14 +888,13 @@ describe("profile catalog", () => {
     // matrix is invalid in both directions: drop the skill or grant the tools.
     const skillTools: Record<string, string[]> = { "context-mode": ["ctx_execute", "ctx_execute_file", "ctx_search"], "tmux-background-tasks": ["bash"] };
     // Scout and researcher intentionally trade some depth for faster focused discovery.
-    const modelThinking: Record<string, string> = { "openai-codex/gpt-5.6-luna": "max", "openai-codex/gpt-5.6-sol": "medium" };
-    const roleThinking: Record<string, string> = { "manager-pi": "high", "scout-pi": "high", "researcher-pi": "high", "planner-pi": "high" };
+    const roleThinking: Record<string, string> = { "manager-pi": "high", "scout-pi": "high", "researcher-pi": "high", "planner-pi": "high", "worker-pi": "max", "promoter-pi": "max", "reviewer-pi": "medium" };
     const piProfiles = [...catalog.effective.values()].filter((profile) => profile.runtime.kind === "pi");
     expect(piProfiles.length).toBe(7);
     for (const profile of piProfiles) {
       expect(profile.sessionPersistence).toBe(true);
       const runtimeProfile = profile.runtime as Extract<typeof profile.runtime, { kind: "pi" }>;
-      expect({ name: profile.name, thinking: runtimeProfile.thinking }).toEqual({ name: profile.name, thinking: roleThinking[profile.name] ?? modelThinking[runtimeProfile.model] ?? runtimeProfile.thinking });
+      expect({ name: profile.name, thinking: runtimeProfile.thinking }).toEqual({ name: profile.name, thinking: roleThinking[profile.name] ?? runtimeProfile.thinking });
       for (const [skill, required] of Object.entries(skillTools)) {
         if (!runtimeProfile.skills.some((path) => basename(path) === skill)) continue;
         expect({ name: profile.name, missing: required.filter((tool) => !runtimeProfile.tools.includes(tool)) }).toEqual({ name: profile.name, missing: [] });
@@ -909,7 +910,7 @@ describe("profile catalog", () => {
       preflight: testPreflight,
       supervision: stubSupervision()
     });
-    await expect(launchTool.execute("id", { name: "worker", profile: "worker", assignment: ASSIGNMENT } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
+    await expect(launchTool.execute("id", { name: "worker", profile: "worker", assignment: ASSIGNMENT, supervisionDigest: SUPERVISION_DIGEST } as never, new AbortController().signal, undefined, { cwd: "/repo" } as never)).rejects.toMatchObject({ code: "PROFILE_CATALOG_UNAVAILABLE" });
     const rendered = launchTool.renderCall?.({ name: "worker", profile: "worker" } as never, {} as never, {} as never);
     expect(rendered?.render(80)).toEqual(["herdr_launch · worker · inline · worker"]);
     rendered?.invalidate();

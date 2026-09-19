@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PiModelReviewer, ReviewerFailure, type ModelRegistrySeam, type ReviewerRequest } from "../../src/reviewer.js";
 import {
   createConfiguredWaitReviewer,
+  resolveTypesafeApiKey,
   TypeSafeReviewer,
   TYPESAFE_REVIEW_CONFIDENCE_THRESHOLD,
 } from "../../src/typesafe-reviewer.js";
@@ -179,5 +180,45 @@ describe("TypeSafe wait reviewer", () => {
     const longRequest = { ...request, transcriptDelta: Array.from({ length: 1_000_000 }, () => "line") };
     const result = await new TypeSafeReviewer("jev-latest", { apiKey: "key", fetch: async () => response() }).review(longRequest, new AbortController().signal);
     expect(result.summary.length).toBeLessThanOrEqual(500);
+  });
+});
+
+describe("the Jev API key resolver", () => {
+  const storeWith = (credential: unknown) => ({ read: async () => credential as never });
+
+  it("reads the typesafe api_key entry from the credential store when env is absent", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    await expect(resolveTypesafeApiKey(storeWith({ type: "api_key", key: "store-key" }))).resolves.toBe("store-key");
+  });
+
+  it("prefers the environment over the credential store", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "env-key");
+    const store = vi.fn(async () => ({ type: "api_key" as const, key: "store-key" }));
+    await expect(resolveTypesafeApiKey({ read: store })).resolves.toBe("env-key");
+    expect(store).not.toHaveBeenCalled();
+  });
+
+  it("refuses non-api-key entries and degrades on store or missing-key failures", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    await expect(resolveTypesafeApiKey(storeWith({ type: "oauth", refresh: "r", access: "a", expires: 1 }))).resolves.toBeUndefined();
+    await expect(resolveTypesafeApiKey(storeWith({ type: "api_key" }))).resolves.toBeUndefined();
+    await expect(resolveTypesafeApiKey(storeWith(undefined))).resolves.toBeUndefined();
+    await expect(resolveTypesafeApiKey({ read: async () => { throw new Error("io"); } })).resolves.toBeUndefined();
+  });
+
+  it("leaves a clean typed authentication failure when nothing resolves, with no key material in it", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    const apiKey = await resolveTypesafeApiKey(storeWith({ type: "api_key", key: "store-key" }));
+    expect(apiKey).toBe("store-key");
+    const missing = await resolveTypesafeApiKey(storeWith(undefined));
+    expect(missing).toBeUndefined();
+    const fetchCall = vi.fn(async () => response());
+    const failure = await new TypeSafeReviewer("jev-latest", { apiKey: missing, fetch: fetchCall })
+      .review(request, new AbortController().signal)
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ReviewerFailure);
+    expect((failure as Error).message).toContain("not authenticated");
+    expect(JSON.stringify(failure)).not.toContain("store-key");
+    expect(fetchCall).not.toHaveBeenCalled();
   });
 });

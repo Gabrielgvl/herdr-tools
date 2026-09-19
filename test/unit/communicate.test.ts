@@ -601,22 +601,88 @@ describe("herdr_communicate", () => {
     expect(result.details).toMatchObject({ delivery: "attachment", attachment: { attachmentId: "attachment-1" } });
   });
 
-  it.each([["AGY", "agy", "AGY_UNQUALIFIED"]] as const)("rejects %s %s before attachment publication or prompt send", async (_label, kind, code) => {
+  it.each(["prompt", "steer"] as const)("delivers an AGY %s attachment to a strengthened recipient", async (operation) => {
     const harness = makeCli();
-    const targetPane = { ...basePane, agent: kind, terminal_id: `term-${kind}`, agent_session: { source: kind, agent: kind, kind: "id", value: `session-${kind}` } };
-    const targetAgent = { ...baseSnapshot.agents[1]!, agent: kind, terminal_id: `term-${kind}`, agent_session: targetPane.agent_session };
+    const agySession = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-agy" };
+    const targetPane = { ...basePane, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
+    const targetAgent = { ...baseSnapshot.agents[1]!, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
     const baseExec = harness.exec.getMockImplementation()!;
     harness.exec.mockImplementation(async (_command, argv, options) => {
-      if (argv[0] === "api") return execResponse(`snapshot-${kind}`, { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
+      if (argv[0] === "api") return execResponse("snapshot-agy", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
+      if (argv[0] === "agent" && argv[1] === "get") return execResponse("agent-get", { agent: targetAgent });
+      if (argv[0] === "pane" && argv[1] === "get") return execResponse("pane-agy", { pane: targetPane });
+      return baseExec(_command, argv, options);
+    });
+    harness.prompt.mockImplementation(async (_target, input) => {
+      harness.promptInputs.push(input);
+      return { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { ...targetAgent, name: "reviewer", agent_status: "working", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } } };
+    });
+    const publish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/recipient-key/attachment-1/body.txt", bytes: 7, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
+    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
+    const recipients = new RecipientRegistry();
+    recipients.register({ paneId: "w1:p2", terminalId: "term-agy", agentName: "reviewer", agentKind: "agy", agentSession: agySession, recipientKey: "recipient-key", profileName: "worker-agy", kind: "agy", capable: true, reason: "read", agentId: "agent-7", agyStrengthened: true, attachmentDirectory: "/cache/recipient-key" });
+
+    const result = await createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation, text: "agy body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
+
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ body: "agy body", recipientKey: "recipient-key", expectedRecipientDirectory: "/cache/recipient-key" }));
+    expect(harness.promptInputs[0]).toContain("delivery: attachment");
+    expect(harness.promptInputs[0]).not.toContain("agy body");
+    expect(result.details).toMatchObject({ delivery: "attachment", attachment: { attachmentId: "attachment-1" }, submission: { confirmed: true } });
+  });
+
+  it("rejects AGY attachment sends whose registered or published directory is unverified", async () => {
+    const agySession = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-agy" };
+    const targetPane = { ...basePane, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
+    const targetAgent = { ...baseSnapshot.agents[1]!, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
+    const agyHarness = () => {
+      const harness = makeCli();
+      const baseExec = harness.exec.getMockImplementation()!;
+      harness.exec.mockImplementation(async (_command, argv, options) => {
+        if (argv[0] === "api") return execResponse("snapshot-agy", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
+        if (argv[0] === "agent" && argv[1] === "get") return execResponse("agent-get", { agent: targetAgent });
+        if (argv[0] === "pane" && argv[1] === "get") return execResponse("pane-agy", { pane: targetPane });
+        return baseExec(_command, argv, options);
+      });
+      return harness;
+    };
+    const agyRecipient = (attachmentDirectory: string) => ({ paneId: "w1:p2", terminalId: "term-agy", agentName: "reviewer", agentKind: "agy", agentSession: agySession, recipientKey: "recipient-key", profileName: "worker-agy", kind: "agy" as const, capable: true, reason: "read", agentId: "agent-7", agyStrengthened: true as const, attachmentDirectory });
+    const store = (publish: AttachmentStore["publish"]): AttachmentStore => ({ root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish });
+
+    // The registered directory must agree with the store's current directory.
+    const stale = agyHarness();
+    const staleRecipients = new RecipientRegistry();
+    staleRecipients.register(agyRecipient("/cache/elsewhere"));
+    const stalePublish = vi.fn();
+    await expect(createCommunicateTool({ cli: stale.cli, context, attachments: store(stalePublish), recipients: staleRecipients }).execute("id", { target: "reviewer", operation: "prompt", text: "blocked", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "recipient attachment directory does not match the current store" } });
+    expect(stalePublish).not.toHaveBeenCalled();
+    expect(stale.prompt).not.toHaveBeenCalled();
+
+    // A published body outside the verified directory is rejected after publication.
+    const moved = agyHarness();
+    const movedRecipients = new RecipientRegistry();
+    movedRecipients.register(agyRecipient("/cache/recipient-key"));
+    const movedPublish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/other/body.txt", bytes: 7, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
+    await expect(createCommunicateTool({ cli: moved.cli, context, attachments: store(movedPublish), recipients: movedRecipients }).execute("id", { target: "reviewer", operation: "prompt", text: "blocked", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "published attachment does not match the registered recipient directory" } });
+    expect(moved.prompt).not.toHaveBeenCalled();
+  });
+
+  it.each(["prompt", "steer"] as const)("rejects an unstrengthened AGY recipient before %s attachment publication", async (operation) => {
+    const harness = makeCli();
+    const agySession = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-agy" };
+    const targetPane = { ...basePane, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
+    const targetAgent = { ...baseSnapshot.agents[1]!, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
+    const baseExec = harness.exec.getMockImplementation()!;
+    harness.exec.mockImplementation(async (_command, argv, options) => {
+      if (argv[0] === "api") return execResponse("snapshot-agy", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
       return baseExec(_command, argv, options);
     });
     const publish = vi.fn();
     const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
     const recipients = new RecipientRegistry();
-    for (const operation of ["prompt", "steer"] as const) {
-      await expect(createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation, text: "blocked", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
-        .rejects.toMatchObject({ code, details: { phase: "resolve_target", delivery: "attachment", route: `${operation}_direct` } });
-    }
+    await expect(createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation, text: "blocked", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
+      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { delivery: "attachment", route: `${operation}_direct` } });
     expect(publish).not.toHaveBeenCalled();
     expect(harness.prompt).not.toHaveBeenCalled();
   });
@@ -629,7 +695,7 @@ describe("herdr_communicate", () => {
     expect(harness.prompt).not.toHaveBeenCalled();
   });
 
-  it.each([["AGY", "agy", "AGY_UNQUALIFIED"]] as const)("rejects a partial %s %s identity before the strict join", async (_label, kind, code) => {
+  it.each([["AGY", "agy", "TARGET_IDENTITY_UNAVAILABLE"]] as const)("rejects a partial %s %s identity before the strict join", async (_label, kind, code) => {
     const harness = makeCli();
     const targetPane = { ...basePane, agent: kind };
     delete (targetPane as Record<string, unknown>).agent_session;
@@ -638,6 +704,8 @@ describe("herdr_communicate", () => {
     const baseExec = harness.exec.getMockImplementation()!;
     harness.exec.mockImplementation(async (_command, argv, options) => {
       if (argv[0] === "api") return execResponse(`snapshot-${kind}-partial`, { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
+      if (argv[0] === "agent" && argv[1] === "get") return execResponse("agent-get", { agent: targetAgent });
+      if (argv[0] === "pane" && argv[1] === "get") return execResponse(`pane-${kind}`, { pane: targetPane });
       return baseExec(_command, argv, options);
     });
     for (const operation of ["prompt", "steer"] as const) {
@@ -647,8 +715,8 @@ describe("herdr_communicate", () => {
   });
 
   it.each([
-    ["AGY", "agy", "AGY_UNQUALIFIED", "prompt", "inline"], ["AGY", "agy", "AGY_UNQUALIFIED", "prompt", "attachment"],
-    ["AGY", "agy", "AGY_UNQUALIFIED", "steer", "inline"], ["AGY", "agy", "AGY_UNQUALIFIED", "steer", "attachment"],
+    ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "prompt", "inline"], ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "prompt", "attachment"],
+    ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "steer", "inline"], ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "steer", "attachment"],
     ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "prompt", "inline"], ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "prompt", "attachment"],
     ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "steer", "inline"], ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "steer", "attachment"]
   ] as const)("rejects a %s final-read replacement before %s %s delivery", async (_label, kind, code, operation, delivery) => {

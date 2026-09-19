@@ -66,6 +66,23 @@ describe("Pi production reviewer adapter", () => {
     await expect(legacy.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
   });
 
+  it("recovers the answer from one fenced JSON body and rejects other wrappers", async () => {
+    const request = { targetId: "p", metadata: {}, transcriptDelta: [] };
+    const tagged = new PiModelReviewer(registry(), "luna", async () => message("The result:\n```json\n{\"classification\":\"progress\",\"summary\":\"ok\"}\n```"));
+    await expect(tagged.review(request, new AbortController().signal)).resolves.toEqual({ targetId: "p", classification: "progress", summary: "ok" });
+    const untagged = new PiModelReviewer(registry(), "luna", async () => message("```\n{\"classification\":\"stalled\",\"summary\":\"quiet\"}\n```"));
+    await expect(untagged.review(request, new AbortController().signal)).resolves.toMatchObject({ classification: "stalled", summary: "quiet" });
+    for (const [raw, shape] of [
+      ["   ", "empty response"],
+      ["prefix ```json {\"classification\":\"risk\"", "no single JSON fence"],
+      ["```\n{}\n``` trailing ```", "no single JSON fence"],
+      ["```json\n{not json}\n```", "fenced body did not parse"],
+    ] as const) {
+      const reviewer = new PiModelReviewer(registry(), "luna", async () => message(raw));
+      await expect(reviewer.review(request, new AbortController().signal)).rejects.toMatchObject({ code: "REVIEWER_FAILED", details: { responseShape: expect.stringContaining(shape) } });
+    }
+  });
+
   it("bounds reviewer prompts and summaries while preserving only text content", async () => {
     let prompt = "";
     const reviewer = new PiModelReviewer(registry(), "test/luna", async (_selected, context) => {

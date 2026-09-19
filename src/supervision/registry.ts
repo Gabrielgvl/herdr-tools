@@ -11,8 +11,9 @@ import type { JobGeneration, JobRegistry, SupervisorJobRequestSnapshot } from ".
 import type { Settings } from "../settings.js";
 import { SessionEventMonitor, type SupervisionMonitorDependencies } from "./monitor.js";
 import { inertNotifier, type ManagerNotifier } from "./notify.js";
-import { ReviewerFailure } from "../reviewer.js";
-import { ModelSupervisionReviewer, SUPERVISION_REVIEWER_MODEL, type SupervisionReviewer } from "./reviewer.js";
+import { SUPERVISION_REVIEWER_MODEL, TypeSafeSupervisionReviewer, type SupervisionAssignmentDigest, type SupervisionReviewer } from "./reviewer.js";
+import { resolveTypesafeApiKey } from "../typesafe-reviewer.js";
+import type { AuthJsonCredentialStore } from "./auth-json-credential-store.js";
 import type { SupervisionModelService } from "./model-service.js";
 import type { ProvisionalSupervisionBinding } from "./identity.js";
 import type { SelfCloseTracker } from "./self-close.js";
@@ -55,10 +56,16 @@ export interface SupervisionRegistryDependencies {
   monitorFactory?: () => SessionEventMonitor;
   monitorOptions?: SupervisionMonitorDependencies;
   /**
-   * Resolved lazily: the Pi host only learns its model registry when a session
-   * context exists. Returning undefined keeps the reviewer visibly degraded.
+   * Retained for the hosts that still wire one; the Jev reviewer no longer
+   * consults it, so a supplied or missing service changes nothing.
    */
   models?: () => SupervisionModelService | undefined;
+  /**
+   * The Jev credential source the default reviewer consults when
+   * `TYPESAFE_API_KEY` is unset. Tests inject a fake so no real auth file is
+   * read; production leaves it undefined for the shared auth.json store.
+   */
+  typesafeCredentials?: Pick<AuthJsonCredentialStore, "read">;
   reviewerFactory?: () => SupervisionReviewer;
   /** The host's own-close ledger; forwarded to every supervisor it reserves. */
   selfClose?: SelfCloseTracker;
@@ -79,8 +86,15 @@ export interface SupervisionRegistryDependencies {
   targetGenerationRefFactory?: () => string;
 }
 
+/** Reservation-scoped settings. Callers pass the digest already bounded and redacted. */
+export interface SupervisionReservationSettings {
+  /** The launch's authorial done-when/constraints the reviewer judges against (ADR-034). */
+  supervisionDigest?: SupervisionAssignmentDigest;
+}
+
 export interface SupervisionReserveRequest {
   child: SupervisionChildRequest;
+  settings?: SupervisionReservationSettings;
 }
 
 /** What a launch holds between reserving supervision and binding it. */
@@ -95,17 +109,6 @@ export interface SupervisionReservation {
 /** The seam `herdr_launch` depends on. Required, so a launch cannot skip supervision. */
 export interface SupervisionCoordinator {
   reserve(request: SupervisionReserveRequest, generation?: JobGeneration): Promise<SupervisionReservation>;
-}
-
-/**
- * A reviewer that always fails, for a host with no model service. It keeps the
- * supervisor visibly degraded on cadence instead of silently unreviewed, and it
- * never substitutes another model.
- */
-class UnavailableReviewer implements SupervisionReviewer {
-  async review(): Promise<never> {
-    throw new ReviewerFailure("No supervision reviewer model service is available on this host");
-  }
 }
 
 interface Deferred<T> {
@@ -131,10 +134,10 @@ export class SupervisionRegistry implements SupervisionCoordinator {
     this.notifier = deps.notifier ?? inertNotifier;
   }
 
-  private reviewer(): SupervisionReviewer {
+  private async reviewer(): Promise<SupervisionReviewer> {
     if (this.deps.reviewerFactory) return this.deps.reviewerFactory();
-    const models = this.deps.models?.();
-    return models ? new ModelSupervisionReviewer(models) : new UnavailableReviewer();
+    const apiKey = await resolveTypesafeApiKey(this.deps.typesafeCredentials);
+    return new TypeSafeSupervisionReviewer({ apiKey });
   }
 
   /**
@@ -148,6 +151,9 @@ export class SupervisionRegistry implements SupervisionCoordinator {
     const monitor = this.monitor;
     await monitor.ensureStarted();
     const settings = await this.deps.settingsLoader();
+    // The reservation-scoped digest persists on the request record the job
+    // keeps; the public projection allowlists request fields and drops it.
+    const supervisionDigest = request.settings?.supervisionDigest;
     const jobRequest: SupervisorJobRequestSnapshot = {
       kind: "supervisor",
       label: `supervise ${request.child.agentName}`,
@@ -159,6 +165,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         reviewCadenceMinutes: settings.reviewCadenceMinutes,
         reviewerModel: SUPERVISION_REVIEWER_MODEL,
         reviewerThinking: "max",
+        ...(supervisionDigest === undefined ? {} : { supervisionDigest }),
       },
     };
     const ready = deferred<Supervisor>();
@@ -171,9 +178,10 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       const supervisor = new Supervisor({
         jobId: identity.jobId,
         child: { ...request.child },
+        ...(supervisionDigest === undefined ? {} : { assignmentDigest: supervisionDigest }),
         monitor,
         notifier: this.notifier,
-        reviewer: this.reviewer(),
+        reviewer: await this.reviewer(),
         cadenceMs: settings.reviewCadenceMinutes * 60_000,
         clock: this.deps.clock ?? { now: () => Date.now() },
         ...(this.deps.scheduler ? { scheduler: this.deps.scheduler } : {}),

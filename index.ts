@@ -11,8 +11,6 @@ import { notificationForJob } from "./src/job-notification.js";
 import { createCliTranscriptReader, SupervisionRegistry } from "./src/supervision/registry.js";
 import { createHandoffGate, type HandoffGate } from "./src/handoff-gate.js";
 import { createPiSupervisionNotifier } from "./src/supervision/notify.js";
-import { createRegistryModelService, type SupervisionModelService } from "./src/supervision/model-service.js";
-import type { ModelRegistrySeam } from "./src/reviewer.js";
 import { WaitJobsUi } from "./src/wait-jobs-ui.js";
 import { RuntimeOwnership, resetOwnership, type OwnedResource } from "./src/ownership.js";
 import { loadSettings, type Settings } from "./src/settings.js";
@@ -37,8 +35,6 @@ export interface ExtensionRuntime {
   supervision: SupervisionRegistry;
   /** The host's shared managed-handoff gate: one registry for launch binding and wait gating. */
   handoffs: HandoffGate;
-  /** Bound when a Pi session context first exists; before that review degrades visibly. */
-  bindModelRegistry: (registry: ModelRegistrySeam) => void;
   waitJobsUi: WaitJobsUi;
   attachments: AttachmentStore;
   recipients: RecipientRegistry;
@@ -82,17 +78,12 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   // the runtime still performs no filesystem or Herdr calls.
   const queueFlush = createDevinQueueFlush({ cli, guard: createPaneWriteGuard({ namespace: resolvePaneWriteNamespace.bind(null, env) }) });
   queueFlush.begin();
-  // The Pi host only learns its model registry once a session context exists, so
-  // the supervision reviewer resolves through this holder rather than a
-  // construction-time value.
-  const models: { current?: SupervisionModelService } = {};
   const handoffs = createHandoffGate();
   const supervision = new SupervisionRegistry({
     jobs,
     settingsLoader: () => loadSettings(),
     readTranscript: createCliTranscriptReader(cli),
     ...(pi.sendMessage ? { notifier: createPiSupervisionNotifier((message, deliveryOptions) => pi.sendMessage!(message, deliveryOptions)) } : {}),
-    models: () => models.current,
     monitorOptions: { env },
     handoffs,
     repairPrompt: (paneId, text, signal) => cli.prompt(paneId, text, signal),
@@ -104,7 +95,6 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
     jobs,
     supervision,
     handoffs,
-    bindModelRegistry: (registry) => { models.current = createRegistryModelService(registry); },
     waitJobsUi,
     attachments: options.attachments ?? defaultAttachmentStore,
     recipients: options.recipients ?? new RecipientRegistry(),
@@ -138,7 +128,6 @@ export default function herdrToolsExtension(pi: ExtensionAPI): void {
     resetOwnership(runtime.ownership);
   });
   pi.on("session_start", async (_event, context) => {
-    runtime.bindModelRegistry(context.modelRegistry);
     // A fresh controller per session: cycles a dead session left pending keep
     // their aborted signal and can never revive under the new one.
     runtime.queueFlush.begin();

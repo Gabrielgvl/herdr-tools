@@ -8,7 +8,7 @@ import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { createHandoffAllocator, renderHandoffContract, type HandoffAllocation, type HandoffAllocator } from "../handoff.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
-import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
+import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type AgentSessionIdentity, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
 import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
 import { attachmentCapability, handoffWriteCapability } from "../profiles/capability.js";
@@ -25,6 +25,7 @@ import { buildRuntimeArgv, defaultPromptSourceStore, refreshBundledProfileResour
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, DEVIN_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
+import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
 import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
 
@@ -191,7 +192,8 @@ export interface LaunchDetails extends LaunchResourceIds {
   provenanceWarning?: string;
   phase?: "validate" | "resolve_profile" | "handoff" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification" | "supervision_bind";
   supervision?:
-    { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; profileName: string } };
+    | { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; profileName: string } }
+    | { jobId: string; state: "provisional"; provisional: { agentName: string; agentKind: "agy"; paneId: string; terminalId: string; profileName: string; baseline: PromptObservationBaseline } };
   created?: LaunchResourceIds;
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
@@ -257,6 +259,8 @@ export interface LaunchBatchDetails {
 const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
 const PROMPT_CONFIRMATION_TIMEOUT_MS = 5_000;
 const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
+const AGENT_PANE_SHELL_SETTLE_MS = 10_000;
+const AGENT_PANE_SHELL_POLL_MS = 150;
 const LAUNCH_RECONCILIATION_TIMEOUT_MS = 5_000;
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
@@ -432,8 +436,8 @@ function profileIdentifier(value: unknown): asserts value is string {
   }
 }
 
-const EXPLICIT_LAUNCH_FIELDS = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery"]);
-const AUTO_LAUNCH_FIELDS = new Set(["name", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery"]);
+const EXPLICIT_LAUNCH_FIELDS = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery", "supervisionDigest"]);
+const AUTO_LAUNCH_FIELDS = new Set(["name", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery", "supervisionDigest"]);
 
 function validateParams(params: LaunchRequest | AutoLaunchRequest): void {
   if (!record(params)) throw new LaunchError("INVALID_INPUT", "launch parameters must be an object");
@@ -482,6 +486,17 @@ function validateParams(params: LaunchRequest | AutoLaunchRequest): void {
   }
   if (params.assignmentDelivery !== undefined && params.assignmentDelivery !== "inline" && params.assignmentDelivery !== "attachment") {
     throw new LaunchError("INVALID_INPUT", "assignmentDelivery must be inline or attachment");
+  }
+  const digest = params.supervisionDigest;
+  if (!record(digest)) throw new LaunchError("INVALID_INPUT", "supervisionDigest must be an object with doneWhen and constraints");
+  for (const key of Object.keys(digest)) {
+    if (key !== "doneWhen" && key !== "constraints") throw new LaunchError("INVALID_INPUT", `Unknown supervisionDigest field: ${key}`);
+  }
+  for (const field of ["doneWhen", "constraints"] as const) {
+    const items = digest[field];
+    if (!Array.isArray(items) || items.length === 0 || items.length > 8 || items.some((item) => typeof item !== "string" || item.length === 0 || item.length > 240 || /\0/.test(item))) {
+      throw new LaunchError("INVALID_INPUT", `supervisionDigest.${field} must be 1-8 non-empty strings of at most 240 characters without NUL`);
+    }
   }
   if (params.focus !== undefined && typeof params.focus !== "boolean") throw new LaunchError("INVALID_INPUT", "focus must be a boolean");
   const placement = params.placement;
@@ -818,7 +833,7 @@ function startFailureEvidence(error: unknown): { code: string; message: string }
   return { ...envelope.error };
 }
 
-type QualifiedRuntime = Extract<RuntimeProfile, { kind: "pi" | "devin" | "claude" }>;
+type QualifiedRuntime = RuntimeProfile;
 
 function effectiveDetails(profile: Profile, runtime: QualifiedRuntime): { runtime: Record<string, unknown>; permissions: Record<string, unknown> } {
   if (runtime.kind === "devin") {
@@ -831,6 +846,12 @@ function effectiveDetails(profile: Profile, runtime: QualifiedRuntime): { runtim
     return {
       runtime: { kind: "claude", model: runtime.model, effort: runtime.effort },
       permissions: { sessionPersistence: profile.sessionPersistence, permissionMode: runtime.permissionMode, allowedTools: [...runtime.allowedTools], disallowedTools: [...runtime.disallowedTools], addDirs: [...runtime.addDirs], pluginDirs: [...runtime.pluginDirs] }
+    };
+  }
+  if (runtime.kind === "agy") {
+    return {
+      runtime: { kind: "agy", model: runtime.model, mode: runtime.mode, dangerouslySkipPermissions: true },
+      permissions: { sessionPersistence: profile.sessionPersistence, addDirs: [...runtime.addDirs] }
     };
   }
   return {
@@ -849,7 +870,7 @@ interface ReadinessRecord {
 }
 
 interface LaunchReadinessResult {
-  identity: PromptTargetIdentity;
+  identity: PromptTargetIdentity | ProvisionalSupervisedIdentity;
   agent: Record<string, unknown>;
   pane: Record<string, unknown>;
   baseline?: PromptObservationBaseline;
@@ -948,6 +969,27 @@ function completeReadinessIdentity(fields: Partial<PromptTargetIdentity>, paneId
   }
   if (fields.terminalId === undefined || fields.agentName === undefined || fields.agentKind === undefined || fields.agentSession === undefined) return undefined;
   return { paneId, terminalId: fields.terminalId, agentName: fields.agentName, agentKind: fields.agentKind, agentSession: fields.agentSession };
+}
+
+function completeProvisionalReadinessIdentity(fields: Partial<PromptTargetIdentity>, paneId: string, expectedName: string): ProvisionalSupervisedIdentity | undefined {
+  completeReadinessIdentity({ ...fields, agentSession: undefined }, paneId, expectedName, "agy");
+  if (fields.terminalId === undefined || fields.agentName === undefined || fields.agentKind === undefined) return undefined;
+  return { paneId, terminalId: fields.terminalId, agentName: fields.agentName, agentKind: "agy" };
+}
+
+function agyInteractiveReadiness(records: ReadinessRecord[]): string[] {
+  const pending: string[] = [];
+  for (const { source, value } of records) {
+    if (!own(value, "interactive_ready") || value.interactive_ready === null || value.interactive_ready === undefined) {
+      if (source === "agent_get") pending.push("agent_get_interactive_ready_missing");
+      continue;
+    }
+    if (typeof value.interactive_ready !== "boolean") {
+      throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "AGY launch readiness interactive state is malformed", { field: "interactive_ready", source, evidenceKind: "malformed" });
+    }
+    if (!value.interactive_ready) pending.push(`${source}_not_interactive`);
+  }
+  return pending;
 }
 
 function requiredReadinessPaneId(value: Record<string, unknown>, paneId: string, source: string): string | undefined {
@@ -1056,10 +1098,12 @@ function readinessLifecycleSkew(records: Array<{ source: ReadinessRecord["source
   return pending;
 }
 
-function readinessBaseline(agent: Record<string, unknown>, identity: PromptTargetIdentity, lifecycle: ReadinessLifecycle): { baseline?: PromptObservationBaseline; pending: string[] } {
+function readinessBaseline(agent: Record<string, unknown>, identity: PromptTargetIdentity | ProvisionalSupervisedIdentity, lifecycle: ReadinessLifecycle): { baseline?: PromptObservationBaseline; pending: string[] } {
   const pending: string[] = [];
   const fields = mergeReadinessIdentity([agent], identity.paneId);
-  const independent = completeReadinessIdentity(fields, identity.paneId, identity.agentName, identity.agentKind);
+  const independent = identity.agentKind === "agy" && !("agentSession" in identity)
+    ? completeProvisionalReadinessIdentity(fields, identity.paneId, identity.agentName)
+    : completeReadinessIdentity(fields, identity.paneId, identity.agentName, identity.agentKind);
   if (independent === undefined) pending.push("agent_get_identity_incomplete");
 
   const state = lifecycle.agentStatus;
@@ -1167,6 +1211,21 @@ function waitForReadPoll(window: ReadWindow, intervalMs: number): Promise<void> 
   });
 }
 
+function waitForAgentStartSettle(signal: AbortSignal, intervalMs: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? new Error("caller aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, intervalMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function monotonicDurationMs(clock: LaunchClock, startedAt: number): number {
   const elapsed = clock.now() - startedAt;
   return Number.isFinite(elapsed) && elapsed > 0
@@ -1240,7 +1299,8 @@ async function waitForLaunchReadiness(
   expected: StartedAgent,
   attemptStartedAt: number,
   baselineRequired: boolean,
-  clock: LaunchClock
+  clock: LaunchClock,
+  allowMissingAgentSession = false
 ): Promise<LaunchReadinessResult> {
   const deadline = attemptStartedAt + HERDR_AGENT_START_TIMEOUT_MS;
   const window = createReadWindow(callerSignal, deadline, clock);
@@ -1295,11 +1355,14 @@ async function waitForLaunchReadiness(
         const sampleLifecycles = sampleRecords.map(({ source, value }) => ({ source, lifecycle: readinessLifecycle(value, source) }));
 
         const merged = mergeReadinessIdentity([
-          expected.startRecord,
+          ...(allowMissingAgentSession ? [] : [expected.startRecord]),
           ...sampleRecords.map(({ value }) => value)
         ], paneId);
-        const identity = completeReadinessIdentity(merged, paneId, expectedName, expectedKind);
+        const identity = allowMissingAgentSession
+          ? completeProvisionalReadinessIdentity(merged, paneId, expectedName)
+          : completeReadinessIdentity(merged, paneId, expectedName, expectedKind);
         if (identity === undefined) pending.push("identity_incomplete");
+        if (allowMissingAgentSession) pending.push(...agyInteractiveReadiness(sampleRecords));
 
         let baseline: PromptObservationBaseline | undefined;
         const authoritativeAgent = agentRecord.record?.value;
@@ -1458,6 +1521,222 @@ async function confirmPromptConsumption(
   }
 }
 
+interface AgyPromptAcknowledgement {
+  operationId: string;
+  identity: ProvisionalSupervisedIdentity;
+  agentSession?: AgentSessionIdentity;
+  revision: number;
+  stateChangeSeq?: number;
+  screenDetectionSkipped?: boolean;
+}
+
+interface AgyPromptSubmissionEvidence extends ProvisionalSupervisedIdentity {
+  confirmed: true;
+  operationId: string;
+  interactiveReady: true;
+  agentSession?: AgentSessionIdentity;
+  revision: number;
+  stateChangeSeq?: number;
+  screenDetectionSkipped?: boolean;
+}
+
+function agyPromptSubmissionEvidence(acknowledgement: AgyPromptAcknowledgement): AgyPromptSubmissionEvidence {
+  return {
+    confirmed: true,
+    operationId: acknowledgement.operationId,
+    ...acknowledgement.identity,
+    interactiveReady: true,
+    ...(acknowledgement.agentSession === undefined ? {} : { agentSession: acknowledgement.agentSession }),
+    revision: acknowledgement.revision,
+    ...(acknowledgement.stateChangeSeq === undefined ? {} : { stateChangeSeq: acknowledgement.stateChangeSeq }),
+    ...(acknowledgement.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: acknowledgement.screenDetectionSkipped })
+  };
+}
+
+function parseAgyPromptAcknowledgement(response: JsonEnvelope, expected: ProvisionalSupervisedIdentity): AgyPromptAcknowledgement {
+  if (typeof response.id !== "string"
+    || response.id.length === 0
+    || /[\0\r\n]/u.test(response.id)
+    || !record(response.result)
+    || response.result.type !== "agent_prompted"
+    || !record(response.result.agent)) {
+    throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr prompt acknowledgement is incompatible");
+  }
+  const agent = response.result.agent;
+  let fields: Partial<PromptTargetIdentity>;
+  try {
+    fields = parsePromptTargetIdentityFields(agent, expected.paneId);
+  } catch (error) {
+    const identityError = error as PromptIdentityError;
+    throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr AGY prompt acknowledgement identity is malformed or contradictory", { causeCode: identityError.code, ...identityError.details });
+  }
+  const identity = completeProvisionalReadinessIdentity(fields, expected.paneId, expected.agentName);
+  if (fields.paneId === undefined || identity === undefined || identity.terminalId !== expected.terminalId || identity.agentKind !== expected.agentKind) {
+    throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr AGY prompt acknowledgement does not match the provisional target identity", {
+      expectedPaneId: expected.paneId,
+      actualPaneId: fields.paneId,
+      expectedTerminalId: expected.terminalId,
+      actualTerminalId: fields.terminalId,
+      expectedName: expected.agentName,
+      actualName: fields.agentName,
+      expectedKind: expected.agentKind,
+      actualKind: fields.agentKind
+    });
+  }
+  if (agent.interactive_ready !== true) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr AGY prompt acknowledgement did not prove an interactive target");
+  const lifecycle = readinessLifecycle(agent, "agent_get");
+  if (lifecycle.revision === undefined) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr AGY prompt acknowledgement omitted the authoritative revision", { field: "revision" });
+  return {
+    operationId: response.id,
+    identity,
+    ...(fields.agentSession === undefined ? {} : { agentSession: fields.agentSession }),
+    revision: lifecycle.revision,
+    ...(lifecycle.stateChangeSeq === undefined ? {} : { stateChangeSeq: lifecycle.stateChangeSeq }),
+    ...(lifecycle.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: lifecycle.screenDetectionSkipped })
+  };
+}
+
+function agyPromptUnconfirmed(
+  acknowledgement: AgyPromptAcknowledgement,
+  clock: LaunchClock,
+  startedAt: number,
+  samples: number,
+  reason: PromptConfirmationEvidence["reason"],
+  baseline: PromptObservationBaseline,
+  last?: PromptObservation,
+  sourceCode?: string
+): LaunchError {
+  return new LaunchError("PROMPT_UNCONFIRMED", "AGY initial prompt consumption and native session identity were not proven", {
+    causeCode: "PROMPT_UNCONFIRMED",
+    promptSubmitted: true,
+    promptConsumption: "unconfirmed",
+    initialPromptSubmission: agyPromptSubmissionEvidence(acknowledgement),
+    ...(last === undefined ? {} : { initialPromptObservation: last }),
+    promptConfirmation: promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last, sourceCode)
+  });
+}
+
+async function confirmAgyNativeSession(
+  cli: LaunchCli,
+  callerSignal: AbortSignal,
+  acknowledgement: AgyPromptAcknowledgement,
+  baseline: PromptObservationBaseline,
+  clock: LaunchClock,
+  startedAt: number
+): Promise<{ identity: PromptTargetIdentity; agent: Record<string, unknown>; pane: Record<string, unknown>; submission: PromptSubmissionEvidence; observation: PromptObservation; confirmation: PromptConfirmationEvidence }> {
+  const window = createReadWindow(callerSignal, startedAt + PROMPT_CONFIRMATION_TIMEOUT_MS, clock);
+  let samples = 0;
+  let last: PromptObservation | undefined;
+  let observedSession = acknowledgement.agentSession;
+  try {
+    while (true) {
+      window.assertActive();
+      samples += 1;
+      let snapshot: HerdrSnapshot;
+      let agent: Record<string, unknown>;
+      let pane: Record<string, unknown>;
+      try {
+        snapshot = snapshotOf(await readWithinWindow(cli, ["api", "snapshot"], window));
+        agent = agentGetRecord(await readWithinWindow(cli, ["agent", "get", acknowledgement.identity.paneId], window));
+        pane = paneRecord(await readWithinWindow(cli, ["pane", "get", acknowledgement.identity.paneId], window), acknowledgement.identity.paneId);
+      } catch (error) {
+        if (window.cancellation()) throw error;
+        const sourceCode = record(error) && typeof error.code === "string" ? error.code : "POSTSTATE_UNAVAILABLE";
+        throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "read_failed", baseline, last, sourceCode);
+      }
+
+      const snapshotRecords = snapshotReadinessRecords(snapshot, acknowledgement.identity.paneId);
+      if (snapshotRecords.duplicates !== undefined) {
+        throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, "contradictory", baseline, last, "TARGET_IDENTITY_UNAVAILABLE");
+      }
+      if (snapshotRecords.pending.length > 0) {
+        throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, "identity_unavailable", baseline, last, "TARGET_IDENTITY_UNAVAILABLE");
+      }
+      const records = [...snapshotRecords.records, { source: "agent_get" as const, value: agent }, { source: "pane_get" as const, value: pane }];
+      try {
+        for (const item of records) {
+          const pending = requiredReadinessPaneId(item.value, acknowledgement.identity.paneId, item.source);
+          if (pending) throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "AGY native-session confirmation record omitted its pane identity", { source: item.source });
+        }
+        const merged = mergeReadinessIdentity(records.map(({ value }) => value), acknowledgement.identity.paneId);
+        const provisional = completeProvisionalReadinessIdentity(merged, acknowledgement.identity.paneId, acknowledgement.identity.agentName);
+        if (provisional === undefined || provisional.terminalId !== acknowledgement.identity.terminalId) {
+          throw new LaunchError("TARGET_IDENTITY_CHANGED", "AGY native-session confirmation does not match the provisional target");
+        }
+        const identity = completeReadinessIdentity(merged, acknowledgement.identity.paneId, acknowledgement.identity.agentName, "agy");
+        if (identity === undefined) {
+          last = { status: "unavailable", code: "POSTSTATE_IDENTITY_UNAVAILABLE" };
+          await waitForReadPoll(window, PROMPT_CONFIRMATION_POLL_INTERVAL_MS);
+          continue;
+        }
+        if (observedSession !== undefined && !sameSession(observedSession, identity.agentSession)) {
+          throw new LaunchError("TARGET_IDENTITY_CHANGED", "AGY native session changed during confirmation");
+        }
+        observedSession = identity.agentSession;
+
+        // Lifecycle is coherent only within the authoritative agent-get record.
+        // Snapshot and pane records prove identity continuity across the sequential
+        // reads, but their lifecycle values may describe adjacent observations.
+        const lifecycleAgent = { ...agent };
+        delete lifecycleAgent.screen_detection_skipped;
+        const authoritative = readinessLifecycle(lifecycleAgent, "agent_get");
+        if (typeof agent.screen_detection_skipped === "boolean") authoritative.screenDetectionSkipped = agent.screen_detection_skipped;
+        const completeLifecycle = authoritative.agentStatus !== undefined
+          && authoritative.stateChangeSeq !== undefined
+          && authoritative.revision !== undefined;
+        last = {
+          status: authoritative.agentStatus === undefined
+            ? "unavailable"
+            : authoritative.agentStatus === "working"
+              ? "working"
+              : authoritative.agentStatus === "unknown" ? "unknown" : "not_working",
+          ...(authoritative.agentStatus === undefined ? {} : { state: authoritative.agentStatus }),
+          ...(authoritative.stateChangeSeq === undefined ? {} : { stateChangeSeq: authoritative.stateChangeSeq }),
+          ...(authoritative.revision === undefined ? {} : { revision: authoritative.revision }),
+          ...(authoritative.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: authoritative.screenDetectionSkipped })
+        };
+        if (!completeLifecycle
+          || authoritative.agentStatus === "unknown"
+          || authoritative.stateChangeSeq! <= baseline.stateChangeSeq
+          || authoritative.revision! < Math.max(baseline.revision, acknowledgement.revision)) {
+          await waitForReadPoll(window, PROMPT_CONFIRMATION_POLL_INTERVAL_MS);
+          continue;
+        }
+        last.consumption = "confirmed";
+        const confirmation = promptConfirmationEvidence(clock, startedAt, samples, authoritative.agentStatus === "working" ? "working" : "state_change_seq_advanced", baseline, last);
+        return {
+          identity,
+          agent,
+          pane,
+          submission: {
+            confirmed: true,
+            operationId: acknowledgement.operationId,
+            ...identity,
+            interactiveReady: true,
+            interactiveProof: "managed" as const,
+            revision: acknowledgement.revision,
+            ...(acknowledgement.stateChangeSeq === undefined ? {} : { stateChangeSeq: acknowledgement.stateChangeSeq }),
+            ...(acknowledgement.screenDetectionSkipped === undefined ? {} : { screenDetectionSkipped: acknowledgement.screenDetectionSkipped })
+          },
+          observation: last,
+          confirmation
+        };
+      } catch (error) {
+        if (window.cancellation()) throw error;
+        const sourceCode = error instanceof LaunchError ? error.code : "POSTSTATE_UNAVAILABLE";
+        const reason: PromptConfirmationEvidence["reason"] = sourceCode === "TARGET_IDENTITY_CHANGED" ? "identity_changed" : sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "contradictory";
+        throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, reason, baseline, last, sourceCode);
+      }
+    }
+  } catch (error) {
+    if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") throw error;
+    if (window.cancellation()?.reason === "deadline") throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, "timeout", baseline, last);
+    throw agyPromptUnconfirmed(acknowledgement, clock, startedAt, samples, "caller_aborted", baseline, last, "ABORTED");
+  } finally {
+    window.cleanup();
+  }
+}
+
 function existingAgentNames(snapshot: HerdrSnapshot): string[] {
   const names = snapshot.agents.flatMap((agent) => typeof agent.name === "string" ? [agent.name] : []);
   for (const pane of snapshot.panes) {
@@ -1601,7 +1880,7 @@ function partialError(
   created: LaunchResourceIds,
   phase: LaunchPhase,
   grant: RecipientGrant,
-  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; promptDispatch?: PromptDispatchEvidence; assignmentState?: "confirmed" | "unconfirmed"; readiness?: LaunchReadinessEvidence; supervision?: NonNullable<LaunchDetails["supervision"]>; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
+  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; promptDispatch?: PromptDispatchEvidence; assignmentState?: "confirmed" | "unconfirmed"; initialPromptSubmission?: AgyPromptSubmissionEvidence; readiness?: LaunchReadinessEvidence; supervision?: NonNullable<LaunchDetails["supervision"]>; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
   delivery?: MessageDelivery,
   published?: PublishedAttachment,
   reconciliation?: LaunchReconciliationEvidence
@@ -1631,7 +1910,9 @@ function partialError(
     ? compactReadinessErrorMetadata(errorDetails)
     : errorDetails;
   const effectCertainty = failureEffectCertainty(effects, effects.mutationDispatched, reconciliation);
-  const supervisionPaneId = effects.supervision?.child.paneId;
+  const supervisionPaneId = effects.supervision?.state === "active"
+    ? effects.supervision.child.paneId
+    : effects.supervision?.provisional.paneId;
   const details = {
     ...supplementalDetails,
     phase,
@@ -1642,6 +1923,7 @@ function partialError(
     promptSubmitted: effects.promptSubmitted,
     recipientRegistered: effects.recipientRegistered,
     ...(effects.assignmentState === undefined ? {} : { assignmentState: effects.assignmentState }),
+    ...(effects.initialPromptSubmission === undefined ? {} : { initialPromptSubmission: effects.initialPromptSubmission }),
     ...(effects.promptDispatch === undefined ? {} : { promptDispatch: effects.promptDispatch }),
     ...(effects.supervision === undefined ? {} : { paneId: supervisionPaneId, supervisorJobId: effects.supervision.jobId, supervision: effects.supervision }),
     effectCertainty,
@@ -1815,15 +2097,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           return profile;
         });
         const primaryProfile = reachableProfiles[0]!;
-        if (primaryProfile.runtime.kind === "agy") {
-          throw new LaunchError("AGY_UNQUALIFIED", "AGY launch qualification is not available", { profile: primaryProfile.name });
-        }
         profiles = [primaryProfile];
         for (const profile of reachableProfiles.slice(1)) {
-          if (profile.runtime.kind === "agy") {
-            attempts.push({ profile: profile.name, outcome: "fallback_refused", errorCode: "AGY_UNQUALIFIED", message: "AGY fallback qualification is not available" });
-            continue;
-          }
           profiles.push(profile);
         }
         // Devin's mandatory self-contained assignment is the initial prompt.
@@ -1922,7 +2197,18 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         phase = "supervision_reserve";
         progress(onUpdate, phase, created);
         try {
-          reservation = await deps.supervision.reserve({ child: { agentName: params.name, agentKind: profiles[0]!.runtime.kind, profileName: profiles[0]!.name } });
+          // The supervision digest is caller-authored evidence the supervisor
+          // persists with the reservation: allowlist the two digest fields
+          // before modelSafeJson so nothing else a caller smuggled in can ride
+          // along, and the schema bound (8 items x 240 chars) is its byte bound.
+          const supervisionDigest = modelSafeJson({
+            doneWhen: params.supervisionDigest.doneWhen,
+            constraints: params.supervisionDigest.constraints
+          }) as { doneWhen: string[]; constraints: string[] };
+          reservation = await deps.supervision.reserve({
+            child: { agentName: params.name, agentKind: profiles[0]!.runtime.kind, profileName: profiles[0]!.name },
+            settings: { supervisionDigest }
+          });
         } catch (error) {
           throw new LaunchError("SUPERVISION_UNAVAILABLE", "Automatic child supervision could not be reserved", {
             causeCode: safeDiagnosticString(record(error) && typeof error.code === "string" ? error.code : undefined, 120) ?? "SUPERVISION_UNAVAILABLE"
@@ -1944,6 +2230,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
       let promptSubmitted = false;
       let promptDispatch: PromptDispatchEvidence | undefined;
       let assignmentState: "confirmed" | "unconfirmed" | undefined;
+      let agyAcknowledgement: AgyPromptAcknowledgement | undefined;
+      let agyInitialPromptSubmission: AgyPromptSubmissionEvidence | undefined;
       let recipientRegistered = false;
       let supervisionBound = false;
       let provenanceWarning: string | undefined;
@@ -2006,7 +2294,23 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path, handoffRun!.directory)];
           const attemptStartedAt = clock.now();
           try {
-            started = await dispatchMutation(() => run(deps.cli, startArgs, abortSignal, true));
+            // A pane created moments ago can reject agent start with
+            // agent_pane_busy while its shell finishes registering. The
+            // rejection is zero-effect, so a bounded settle wait is safe on
+            // panes this launch created; an existing_pane rejection means the
+            // pane is genuinely occupied and must not be retried.
+            const shellSettleDeadline = attemptStartedAt + AGENT_PANE_SHELL_SETTLE_MS;
+            while (true) {
+              try {
+                started = await dispatchMutation(() => run(deps.cli, startArgs, abortSignal, true));
+                break;
+              } catch (startError) {
+                const envelope = cliErrorEnvelope(startError);
+                const shellPending = envelope?.id === "cli:agent:start" && envelope.error.code === "agent_pane_busy";
+                if (!shellPending || placement.mode === "existing_pane" || clock.now() >= shellSettleDeadline || abortSignal.aborted) throw startError;
+                await waitForAgentStartSettle(abortSignal, AGENT_PANE_SHELL_POLL_MS);
+              }
+            }
             agentStarted = true;
             attempts.push({ profile: profile.name, outcome: "selected" });
             selectedAttemptStartedAt = attemptStartedAt;
@@ -2051,23 +2355,38 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           chosenAgent,
           selectedAttemptStartedAt!,
           true,
-          clock
+          clock,
+          chosenRuntime.kind === "agy"
         );
         readiness = ready.evidence;
         timing.selectedStartReadinessMs = readiness.elapsedMs;
-        const capturedIdentity = ready.identity;
+        let capturedIdentity = ready.identity;
         agentId ??= idFrom(ready.agent, "agent_id") ?? idFrom(ready.agent, "id") ?? idFrom(ready.pane, "agent_id");
         phase = "supervision_bind";
         progress(onUpdate, phase, created);
         // Every launch requires the readiness baseline, so the anchor always
         // comes from the same coherent sample that captured identity.
         try {
-          await reservation!.bind({ identity: capturedIdentity, profileName: chosenProfile.name, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
-          boundSupervision = {
-            jobId: reservation!.jobId,
-            state: "active",
-            child: { agentName: capturedIdentity.agentName, agentKind: capturedIdentity.agentKind, paneId: resolvedPaneId, terminalId: capturedIdentity.terminalId, profileName: chosenProfile.name }
-          };
+          // AGY publishes only reduced evidence before assignment. Existing
+          // runtimes keep their exact pre-prompt session binding unchanged.
+          if (chosenRuntime.kind === "agy") {
+            const provisionalIdentity = capturedIdentity as ProvisionalSupervisedIdentity;
+            const provisionalBaseline = { ...ready.baseline!, state: "idle" as const };
+            await reservation!.bindProvisional({ identity: provisionalIdentity, profileName: chosenProfile.name, baseline: provisionalBaseline });
+            boundSupervision = {
+              jobId: reservation!.jobId,
+              state: "provisional",
+              provisional: { ...provisionalIdentity, profileName: chosenProfile.name, baseline: provisionalBaseline }
+            };
+          } else {
+            const exactIdentity = capturedIdentity as PromptTargetIdentity;
+            await reservation!.bind({ identity: exactIdentity, profileName: chosenProfile.name, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
+            boundSupervision = {
+              jobId: reservation!.jobId,
+              state: "active",
+              child: { agentName: exactIdentity.agentName, agentKind: exactIdentity.agentKind, paneId: resolvedPaneId, terminalId: exactIdentity.terminalId, profileName: chosenProfile.name }
+            };
+          }
         } catch (error) {
           if (!(error instanceof SupervisionBindError)) throw error;
           throw new LaunchError("SUPERVISION_UNCONFIRMED", "Automatic child supervision could not be bound to the launched agent", {
@@ -2080,16 +2399,19 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         // Advisory provenance only: the tokens are forgeable diagnostics — any
         // source can overwrite them — so they are never consulted for
         // authorization and a failed write degrades to a detail, never a
-        // launch failure.
-        provenanceWarning = await writeIdentityProvenance(
-      deps.cli,
-      resolvedPaneId,
-      "launched",
-      sender?.paneId,
-      capturedIdentity.agentSession,
-      abortSignal,
-      /^(?:manager|planner)(?:-|$)/u.test(chosenProfile.name) ? "orchestrator" : undefined,
-    );
+        // launch failure. AGY has no native session to attest until after
+        // strengthening, so its provenance write happens there instead.
+        if (chosenRuntime.kind !== "agy") {
+          provenanceWarning = await writeIdentityProvenance(
+            deps.cli,
+            resolvedPaneId,
+            "launched",
+            sender?.paneId,
+            (capturedIdentity as PromptTargetIdentity).agentSession,
+            abortSignal,
+            /^(?:manager|planner)(?:-|$)/u.test(chosenProfile.name) ? "orchestrator" : undefined,
+          );
+        }
         if (params.focus === true) {
           phase = "focus";
           progress(onUpdate, phase, created);
@@ -2144,7 +2466,12 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
             throw error;
           }
           try {
-            initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity);
+            if (chosenRuntime.kind === "agy") {
+              agyAcknowledgement = parseAgyPromptAcknowledgement(promptResponse, capturedIdentity as ProvisionalSupervisedIdentity);
+              agyInitialPromptSubmission = agyPromptSubmissionEvidence(agyAcknowledgement);
+            } else {
+              initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity as PromptTargetIdentity);
+            }
           } catch (error) {
             promptDispatch = { state: "unknown", requestId: promptResponse.id };
             throw error;
@@ -2157,12 +2484,41 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
 
         const confirmationStartedAt = clock.now();
         try {
-          const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt);
-          initialPromptObservation = confirmed.observation;
-          promptConfirmation = confirmed.confirmation;
-          timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
-          postState = confirmed.pane;
-          agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+          if (chosenRuntime.kind === "agy") {
+            const confirmed = await confirmAgyNativeSession(deps.cli, abortSignal, agyAcknowledgement!, baseline, clock, confirmationStartedAt);
+            initialPromptSubmission = confirmed.submission;
+            initialPromptObservation = confirmed.observation;
+            promptConfirmation = confirmed.confirmation;
+            timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
+            postState = confirmed.pane;
+            capturedIdentity = confirmed.identity;
+            agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+            phase = "supervision_bind";
+            progress(onUpdate, phase, created);
+            await reservation!.strengthen({ identity: confirmed.identity, profileName: chosenProfile.name, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
+            boundSupervision = {
+              jobId: reservation!.jobId,
+              state: "active",
+              child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, profileName: chosenProfile.name }
+            };
+            provenanceWarning = await writeIdentityProvenance(
+              deps.cli,
+              resolvedPaneId,
+              "launched",
+              sender?.paneId,
+              confirmed.identity.agentSession,
+              abortSignal,
+              /^(?:manager|planner)(?:-|$)/u.test(chosenProfile.name) ? "orchestrator" : undefined,
+            );
+            phase = "prompt_verification";
+          } else {
+            const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt);
+            initialPromptObservation = confirmed.observation;
+            promptConfirmation = confirmed.confirmation;
+            timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
+            postState = confirmed.pane;
+            agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+          }
         } catch (error) {
           const errorDetails = record(error) && record(error.details) ? error.details : undefined;
           const confirmation = errorDetails?.promptConfirmation;
@@ -2189,7 +2545,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           resolvedPaneId,
           recipient.recipientKey,
           capability,
-          { ...exactIdentity, ...(agentId ? { agentId } : {}) }
+          { ...exactIdentity, ...(agentId ? { agentId } : {}) },
+          chosenRuntime.kind === "agy" ? { agyStrengthened: true, attachmentDirectory: grant!.path } : undefined
         );
         recipientRegistered = deps.recipients !== undefined;
         const effective = effectiveDetails(chosenProfile, chosenRuntime);
@@ -2275,6 +2632,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           recipientRegistered,
           mutationDispatched: topologyMutationDispatched,
           ...(assignmentState === undefined ? {} : { assignmentState }),
+          ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }),
           ...(promptDispatch === undefined ? {} : { promptDispatch }),
           ...(readiness === undefined ? {} : { readiness }),
           ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }),
@@ -2415,6 +2773,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         name: child.name,
         profile: child.profile,
         placement: child.placement,
+        supervisionDigest: params.supervisionDigest,
         ...(child.label === undefined ? {} : { label: child.label }),
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         ...(params.focus === undefined ? {} : { focus: params.focus }),
@@ -2482,7 +2841,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
   return {
     name: "herdr_launch",
     label: "Herdr Launch",
-    description: "Launch a named Pi, Devin, or Claude Herdr agent from a strict profile in an explicitly selected pane placement; AGY launches are not qualified.",
+    description: "Launch a named Pi, Devin, Claude, or AGY Herdr agent from a strict profile in an explicitly selected pane placement; AGY launches run under reduced-assurance provisional supervision that strengthens after the first prompt.",
     parameters: LaunchParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, ctx) {
       // The same discriminator as validateParams: a present `profile` field —

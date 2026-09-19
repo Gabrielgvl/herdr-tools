@@ -7,7 +7,7 @@ import { loadSettings, type Settings } from "../settings.js";
 import { parsePromptTargetIdentityFields } from "../messages/prompt.js";
 import { resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
-import { createConfiguredWaitReviewer } from "../typesafe-reviewer.js";
+import { createConfiguredWaitReviewer, resolveTypesafeApiKey } from "../typesafe-reviewer.js";
 import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams, type WaitRawState, type WaitSemanticState } from "../wait-schema.js";
 import { boundedText, type JobOperationControl, type JobRegistry, type JobRequestSnapshot, type JobRunResult, type JobTargetError } from "../job-registry.js";
 import { createTargetGenerationRef, historicalTargetEvidence, requireWaitTargetIdentity, sameWaitTargetIdentity, type TargetEvidence, type WaitTargetIdentity } from "../wait-target-evidence.js";
@@ -1215,7 +1215,7 @@ export async function runPreparedWait(
       reviewer ??= createConfiguredWaitReviewer(
         context,
         settings.reviewerModel,
-        undefined,
+        { apiKey: await resolveTypesafeApiKey() },
         deps.reviewerFactory ? () => deps.reviewerFactory!(settings, context) : undefined,
       );
       const reviewerRun = await runReviewersWithDeadline(reviewer, requests, signal, deadline, clock, control);

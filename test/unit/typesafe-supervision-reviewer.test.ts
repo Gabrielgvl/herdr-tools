@@ -13,6 +13,7 @@ const request: SupervisionReviewRequest = {
   workingForMs: 300_000,
   metadata: { agentKind: "pi", status: "working", revision: 7 },
   transcriptDelta: ["one", "two"],
+  previousReview: { classification: "progress" },
 };
 
 const REASON_DISTRIBUTION = Object.fromEntries(SUPERVISION_REASONS.map((name) => [name, name === "repetition" ? 0.7 : 0.025]));
@@ -127,6 +128,7 @@ describe("TypeSafe supervision reviewer", () => {
       metadata: { agentKind: "pi", status: "working", revision: 7, agentName: "worker", workingForMs: 300_000 },
       transcriptDelta: ["one", "two"],
       assignmentDigest: { doneWhen: [], constraints: [] },
+      previousReview: { classification: "progress" },
       linesSinceLastReview: undefined,
     });
     // The caller's metadata is folded into a copy, never mutated in place.
@@ -158,8 +160,19 @@ describe("TypeSafe supervision reviewer", () => {
 
   it("omits previousReview on the first review", async () => {
     const calls: Array<{ init?: RequestInit }> = [];
-    await reviewerFor(async (_input, init) => { calls.push({ init }); return response(); }).review(request, new AbortController().signal);
+    await reviewerFor(async (_input, init) => { calls.push({ init }); return response(); }).review({ ...request, previousReview: undefined }, new AbortController().signal);
     expect(bodyOf(calls).state).not.toHaveProperty("previousReview");
+  });
+
+  it("raises the stalled bar on a first observation and keeps the standard bar once a review exists", async () => {
+    const firstRequest: SupervisionReviewRequest = { ...request, previousReview: undefined };
+    const below = reviewerFor(async () => response({ stalled: noul(0.82) }));
+    await expect(below.review(firstRequest, new AbortController().signal)).resolves.toMatchObject({ classification: "unknown" });
+    const atBar = reviewerFor(async () => response({ stalled: noul(0.85) }));
+    await expect(atBar.review(firstRequest, new AbortController().signal)).resolves.toMatchObject({ classification: "stalled" });
+    // The shared fixture carries a previous review: the same 0.82 clears the standard bar.
+    const grounded = reviewerFor(async () => response({ stalled: noul(0.82) }));
+    await expect(grounded.review(request, new AbortController().signal)).resolves.toMatchObject({ classification: "stalled" });
   });
 
   it("gates on evidence sufficiency before reading any signal", async () => {

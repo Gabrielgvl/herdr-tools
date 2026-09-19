@@ -1,6 +1,16 @@
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { PiModelReviewer, ReviewerFailure, createPiModelReviewer, type ModelRegistrySeam } from "../../src/reviewer.js";
+import {
+  PiModelReviewer,
+  reduceSupervisionReview,
+  ReviewerFailure,
+  createPiModelReviewer,
+  SUPERVISION_PROGRESS_THRESHOLD,
+  SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD,
+  SUPERVISION_STALLED_THRESHOLD,
+  type ModelRegistrySeam,
+  type SupervisionSignalProbabilities,
+} from "../../src/reviewer.js";
 
 const model = { id: "luna", name: "Luna", provider: "test", api: "openai-completions", baseUrl: "http://test", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000, maxTokens: 1000 } as Model<Api>;
 const message = (text: string): AssistantMessage => ({ role: "assistant", content: [{ type: "text", text }], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 });
@@ -92,5 +102,32 @@ describe("Pi production reviewer adapter", () => {
     const result = await reviewer.review({ targetId: "p", metadata: { label: "x".repeat(20_000) }, transcriptDelta: ["y".repeat(20_000)] }, new AbortController().signal);
     expect(prompt.length).toBe(16_000);
     expect(result.summary).toHaveLength(500);
+  });
+});
+
+describe("the ADR-036 first-observation stalled rule", () => {
+  const quiet: SupervisionSignalProbabilities = { progress: 0, stalled: 0, blocked: 0, risk: 0, appears_complete: 0 };
+  const reduce = (stalled: number, firstObservation: boolean, signals: Partial<SupervisionSignalProbabilities> = {}) =>
+    reduceSupervisionReview(1, { ...quiet, stalled, ...signals }, { firstObservation });
+
+  it("requires the raised bar when no prior review grounds the trajectory", () => {
+    expect(reduce(SUPERVISION_STALLED_THRESHOLD, true)).toBe("unknown");
+    expect(reduce(SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD - 0.01, true)).toBe("unknown");
+    expect(reduce(SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD, true)).toBe("stalled");
+  });
+
+  it("keeps the standard bar once a prior review exists, and when the option is omitted", () => {
+    expect(reduce(SUPERVISION_STALLED_THRESHOLD, false)).toBe("stalled");
+    expect(reduce(SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD - 0.01, false)).toBe("stalled");
+    expect(reduceSupervisionReview(1, { ...quiet, stalled: SUPERVISION_STALLED_THRESHOLD })).toBe("stalled");
+  });
+
+  it("falls through to the progress check when the raised bar is unmet", () => {
+    expect(reduce(0.8, true, { progress: SUPERVISION_PROGRESS_THRESHOLD })).toBe("progress");
+    expect(reduce(0.8, true, { progress: SUPERVISION_PROGRESS_THRESHOLD - 0.01 })).toBe("unknown");
+  });
+
+  it("leaves the signals ahead of stalled in precedence order untouched", () => {
+    expect(reduce(0.8, true, { appears_complete: 0.75 })).toBe("appears_complete");
   });
 });

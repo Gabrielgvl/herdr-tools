@@ -17,7 +17,16 @@
  */
 
 import { APIError, choice, noul, type EntryType, type Fetch } from "@typesafe-ai/sdk";
-import { MAX_SUMMARY_CHARS, ReviewerFailure, type ReviewClassification } from "../reviewer.js";
+import {
+  MAX_SUMMARY_CHARS,
+  REASON_CRITERIA,
+  reduceSupervisionReview,
+  ReviewerFailure,
+  SUPERVISION_REASONS,
+  type ReviewClassification,
+  type SupervisionReason,
+  type SupervisionSignalProbabilities,
+} from "../reviewer.js";
 import { createTypeSafeClient, typeSafeReviewerApiKey, type TypeSafeReviewerOptions } from "../typesafe-reviewer.js";
 
 /** The exact supervisor review model. Not configurable: see ADR-033. */
@@ -33,49 +42,22 @@ export function needsManagerAttention(classification: ReviewClassification): boo
   return (SUPERVISION_ATTENTION_CLASSIFICATIONS as readonly string[]).includes(classification);
 }
 
-/**
- * The owner-ratified activation thresholds (ADR-034). The evidence gate runs
- * before any signal; each signal then activates independently — none requires
- * the others to be low — and the first crossing in precedence order classifies.
- * The cost of error differs per signal: `risk` wakes a human so it favours
- * recall, while `appears_complete` and `stalled` sit higher because coding
- * agents habitually claim done early and a five-minute window makes builds,
- * tests, and idle subprocesses look like stalls.
- */
-export const SUPERVISION_EVIDENCE_THRESHOLD = 0.60;
-export const SUPERVISION_RISK_THRESHOLD = 0.60;
-export const SUPERVISION_BLOCKED_THRESHOLD = 0.65;
-export const SUPERVISION_APPEARS_COMPLETE_THRESHOLD = 0.70;
-export const SUPERVISION_STALLED_THRESHOLD = 0.70;
-export const SUPERVISION_PROGRESS_THRESHOLD = 0.60;
-
-/** The five non-exclusive judgment signals and their probabilities. */
-export interface SupervisionSignalProbabilities {
-  progress: number;
-  stalled: number;
-  blocked: number;
-  risk: number;
-  appears_complete: number;
-}
-
-/** The fixed reason-code set the `reason` choice picks exactly one of. */
-export const SUPERVISION_REASONS = [
-  "none",
-  "repetition",
-  "no_output",
-  "oscillation",
-  "external_dependency",
-  "missing_permission",
-  "tool_failure",
-  "scope_drift",
-  "destructive_action",
-  "incorrect_direction",
-  "completion_claim",
-  "artifact_produced",
-  "verification_passed",
-] as const;
-
-export type SupervisionReason = (typeof SUPERVISION_REASONS)[number];
+// The reducer, thresholds, signal probabilities, and reason taxonomy live in
+// the shared reviewer module (src/reviewer.ts) — both this module and
+// typesafe-reviewer.ts already depend on it, and the reverse import would
+// cycle. Re-exported here so every existing consumer is unchanged.
+export {
+  reduceSupervisionReview,
+  SUPERVISION_APPEARS_COMPLETE_THRESHOLD,
+  SUPERVISION_BLOCKED_THRESHOLD,
+  SUPERVISION_EVIDENCE_THRESHOLD,
+  SUPERVISION_PROGRESS_THRESHOLD,
+  SUPERVISION_RISK_THRESHOLD,
+  SUPERVISION_REASONS,
+  SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD,
+  SUPERVISION_STALLED_THRESHOLD,
+} from "../reviewer.js";
+export type { SupervisionReason, SupervisionSignalProbabilities } from "../reviewer.js";
 
 /** The launch's authorial contract, carried to the reviewer as state. Either array may be empty. */
 export interface SupervisionAssignmentDigest {
@@ -121,38 +103,6 @@ export interface SupervisionReviewResult {
 export interface SupervisionReviewer {
   review(request: SupervisionReviewRequest, signal: AbortSignal): Promise<SupervisionReviewResult>;
 }
-
-/**
- * The deterministic precedence reducer. The evidence gate classifies
- * `unknown` before any signal is read; otherwise the first crossing signal in
- * precedence order wins, and no crossing at all falls through to `unknown`
- * rather than forcing a label from a low-resolution zone.
- */
-export function reduceSupervisionReview(evidenceSufficiency: number, signals: SupervisionSignalProbabilities): ReviewClassification {
-  if (evidenceSufficiency < SUPERVISION_EVIDENCE_THRESHOLD) return "unknown";
-  if (signals.risk >= SUPERVISION_RISK_THRESHOLD) return "risk";
-  if (signals.blocked >= SUPERVISION_BLOCKED_THRESHOLD) return "blocked";
-  if (signals.appears_complete >= SUPERVISION_APPEARS_COMPLETE_THRESHOLD) return "appears_complete";
-  if (signals.stalled >= SUPERVISION_STALLED_THRESHOLD) return "stalled";
-  if (signals.progress >= SUPERVISION_PROGRESS_THRESHOLD) return "progress";
-  return "unknown";
-}
-
-const REASON_CRITERIA: Record<SupervisionReason, string> = {
-  none: "No specific factor stands out",
-  repetition: "The same action, output, or failure repeats without new effect",
-  no_output: "Little or no new output appeared in the window",
-  oscillation: "The agent flips between approaches without converging",
-  external_dependency: "Progress waits on an external service, resource, or event",
-  missing_permission: "A credential, grant, or approval the agent needs is missing",
-  tool_failure: "A tool or command fails and blocks the current approach",
-  scope_drift: "The work is drifting outside the assignment's scope",
-  destructive_action: "The agent is taking or approaching a destructive or irreversible action",
-  incorrect_direction: "The work is converging on a wrong answer or outcome",
-  completion_claim: "The agent claims or signals the assignment is finished",
-  artifact_produced: "A deliverable artifact exists and looks ready",
-  verification_passed: "The assignment's verification checks have passed",
-};
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -275,7 +225,7 @@ export class TypeSafeSupervisionReviewer implements SupervisionReviewer {
         },
       }, { signal });
       const answer = parseAnswers(request.paneId, response);
-      const classification = reduceSupervisionReview(answer.evidenceSufficiency, answer.signals);
+      const classification = reduceSupervisionReview(answer.evidenceSufficiency, answer.signals, { firstObservation: request.previousReview === undefined });
       return {
         classification,
         summary: summaryFor(classification, answer.evidenceSufficiency, answer.signals, answer.reason, request.transcriptDelta.length),

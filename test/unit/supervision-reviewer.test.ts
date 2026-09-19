@@ -14,6 +14,7 @@ import {
   SUPERVISION_BLOCKED_THRESHOLD,
   SUPERVISION_PROGRESS_THRESHOLD,
   SUPERVISION_RISK_THRESHOLD,
+  SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD,
   SUPERVISION_STALLED_THRESHOLD,
   type SupervisionSignalProbabilities,
 } from "../../src/supervision/reviewer.js";
@@ -77,7 +78,7 @@ describe("the supervision reviewer's attention gate", () => {
 
 describe("the ADR-034 supervision reducer", () => {
   const quiet: SupervisionSignalProbabilities = { progress: 0, stalled: 0, blocked: 0, risk: 0, appears_complete: 0 };
-  const cases: Array<{ name: string; evidence: number; signals: Partial<SupervisionSignalProbabilities>; expected: string }> = [
+  const cases: Array<{ name: string; evidence: number; signals: Partial<SupervisionSignalProbabilities>; firstObservation?: boolean; expected: string }> = [
     // The evidence gate classifies unknown before any signal is read, even with firing signals.
     { name: "evidence 0.59 gates below threshold", evidence: 0.59, signals: { risk: 1 }, expected: "unknown" },
     { name: "evidence 0.60 admits signals", evidence: 0.60, signals: { risk: 1 }, expected: "risk" },
@@ -98,13 +99,19 @@ describe("the ADR-034 supervision reducer", () => {
     { name: "blocked + appears_complete is blocked", evidence: 1, signals: { blocked: 0.9, appears_complete: 0.9 }, expected: "blocked" },
     { name: "appears_complete + stalled is appears_complete", evidence: 1, signals: { appears_complete: 0.9, stalled: 0.9 }, expected: "appears_complete" },
     { name: "stalled + progress is stalled", evidence: 1, signals: { stalled: 0.9, progress: 0.9 }, expected: "stalled" },
+    // ADR-036 first observation: no trajectory exists to ground the standard stalled bar.
+    { name: "first observation stalled at standard bar", evidence: 1, signals: { stalled: SUPERVISION_STALLED_THRESHOLD }, firstObservation: true, expected: "unknown" },
+    { name: "first observation stalled just below raised bar", evidence: 1, signals: { stalled: SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD - 0.01 }, firstObservation: true, expected: "unknown" },
+    { name: "first observation stalled at raised bar", evidence: 1, signals: { stalled: SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD }, firstObservation: true, expected: "stalled" },
+    { name: "first observation stalled below raised bar still reaches progress", evidence: 1, signals: { stalled: 0.8, progress: SUPERVISION_PROGRESS_THRESHOLD }, firstObservation: true, expected: "progress" },
+    { name: "later observation stalled at standard bar", evidence: 1, signals: { stalled: SUPERVISION_STALLED_THRESHOLD }, firstObservation: false, expected: "stalled" },
     // No signal crossing falls through to unknown rather than forcing a label.
     { name: "all quiet falls through", evidence: 1, signals: {}, expected: "unknown" },
     { name: "middling signals fall through", evidence: 0.9, signals: { progress: 0.4, stalled: 0.5, blocked: 0.5, risk: 0.5, appears_complete: 0.5 }, expected: "unknown" },
   ];
-  for (const { name, evidence, signals, expected } of cases) {
+  for (const { name, evidence, signals, firstObservation, expected } of cases) {
     it(name, () => {
-      expect(reduceSupervisionReview(evidence, { ...quiet, ...signals })).toBe(expected);
+      expect(reduceSupervisionReview(evidence, { ...quiet, ...signals }, { firstObservation })).toBe(expected);
     });
   }
 });

@@ -12,8 +12,11 @@
  * an overlong name is a typed `BATCH_CHILD_NAME_INVALID` failure, never a
  * truncation -- and claimed against a supplied set of existing agent names
  * and pane labels, because a pane label can shadow a name in the exact-target
- * resolvers. A colliding or invalid child yields a structured failure entry
- * while unrelated children still expand. An `existing_pane` placement is
+ * resolvers. Derived pane labels are claimed against the same set for the
+ * same reason: a minted label colliding with an existing name or label is
+ * the same typed collision, never a silent shadowing. A colliding or invalid
+ * child yields a structured failure entry while unrelated children still
+ * expand. An `existing_pane` placement is
  * valid only when expansion yields exactly one child; anything else is a
  * typed `BATCH_PLACEMENT_INVALID` decided before any launch effect. This
  * module performs no effects itself; the executor consumes the result.
@@ -68,7 +71,9 @@ export type BatchExpansion =
  * Expand an auto (Batch) request against a RouteDecision into planned
  * children. `existing` is the supplied set of existing agent names and pane
  * labels; both can shadow a name during exact-target resolution, so a hit is
- * a collision even when no agent carries the name. Pure: no launch effects.
+ * a collision even when no agent carries the name. Derived pane labels are
+ * claimed against it the same way, because a label shadows an exact target
+ * as surely as a name does. Pure: no launch effects.
  */
 export function expandBatchRequest(request: AutoLaunchRequest, decision: RouteDecision, existing: ReadonlySet<string>): BatchExpansion {
   const placement = request.placement ?? { mode: "same_tab" as const };
@@ -96,12 +101,23 @@ export function expandBatchRequest(request: AutoLaunchRequest, decision: RouteDe
         failures.push({ ...identity, code: "BATCH_NAME_COLLISION", message: "derived child name is already held by an existing agent name or pane label, or by another planned child" });
         continue;
       }
+      // The pane label shadows an exact target the same way a name does, so
+      // a derived label is claimed against the same set — an existing agent
+      // name, an existing pane label, or a sibling's claimed identity. The
+      // check runs before the name claim so a label equal to the child's own
+      // name cannot collide with itself.
+      const label = request.label === undefined ? undefined : `${request.label}-${role}-${ordinal}`;
+      if (label !== undefined && claimed.has(label)) {
+        failures.push({ ...identity, code: "BATCH_NAME_COLLISION", message: "derived child label is already held by an existing agent name or pane label, or by another planned child" });
+        continue;
+      }
       claimed.add(name);
+      if (label !== undefined) claimed.add(label);
       children.push({
         ...identity,
         count: assignment.count,
         purpose: assignment.purpose,
-        ...(request.label === undefined ? {} : { label: `${request.label}-${role}-${ordinal}` }),
+        ...(label === undefined ? {} : { label }),
         placement: placement.mode === "new_tab" ? { mode: "new_tab", tabLabel: `${placement.tabLabel}-${role}-${ordinal}` } : placement
       });
     }

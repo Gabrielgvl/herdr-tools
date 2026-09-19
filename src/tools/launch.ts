@@ -2153,6 +2153,13 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         if (nameTaken) {
           throw new LaunchError(batch === undefined ? "INVALID_INPUT" : "BATCH_NAME_COLLISION", `Agent name is already in use: ${params.name}`);
         }
+        // The effective pane label gets the same fresh re-check: an explicit
+        // label claimed between expansion and dispatch would shadow an exact
+        // target into TARGET_AMBIGUOUS instead of failing as a typed
+        // collision. An absent label reuses the already-checked name.
+        if (batch !== undefined && label !== params.name && (existingNameTargets(snapshot).has(label) || batch.reservedNames.has(label))) {
+          throw new LaunchError("BATCH_NAME_COLLISION", `Pane label is already in use: ${label}`);
+        }
         existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, currentContext) : undefined;
         workspaceId = placement.mode === "new_tab" ? currentContext.workspaceId : undefined;
         // The sidecar is committed before the first topology effect so the run

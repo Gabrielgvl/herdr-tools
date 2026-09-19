@@ -5365,6 +5365,89 @@ describe("herdr_launch auto batch", () => {
     expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
   });
 
+  it("detects a derived-label collision against the fresh snapshot immediately before a child", async () => {
+    const harness = makeBatchCli();
+    const collided: HerdrSnapshot = {
+      ...snapshot,
+      panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "lbl-worker-2", agent_status: "idle" }],
+      agents: []
+    };
+    const snapshots = [snapshot, snapshot, collided];
+    let reads = 0;
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: snapshots[Math.min(reads++, snapshots.length - 1)]!,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ label: "lbl" }), catalog(profile("worker")), harness.cli, { router, routerLog, contextResolver });
+    const children = result.details?.children ?? [];
+    expect(children).toHaveLength(2);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ name: "task-worker-2", status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    // The collided child never mutated topology.
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("fails a child whose derived label collides with an existing pane label before any effect", async () => {
+    const harness = makeBatchCli();
+    const taken: HerdrSnapshot = {
+      ...snapshot,
+      panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "lbl-worker-2", agent_status: "idle" }]
+    };
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: taken,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ label: "lbl" }), catalog(profile("worker")), harness.cli, { router, routerLog, contextResolver });
+    const children = result.details?.children ?? [];
+    expect(children.map((child) => child.name)).toEqual(["task-worker-1", "task-worker-2"]);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    expect(result.details?.outcome).toBe("partial");
+    // The collided child was never dispatched: only its sibling split.
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("fails a child whose derived label collides with an existing agent name before any effect", async () => {
+    const harness = makeBatchCli();
+    const taken: HerdrSnapshot = {
+      ...snapshot,
+      agents: [{ name: "lbl-worker-2", pane_id: "w1:p7", agent: "pi", agent_status: "idle" } as HerdrSnapshot["agents"][number]]
+    };
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: taken,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ label: "lbl" }), catalog(profile("worker")), harness.cli, { router, routerLog, contextResolver });
+    const children = result.details?.children ?? [];
+    expect(children.map((child) => child.name)).toEqual(["task-worker-1", "task-worker-2"]);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("launches labelled children and applies each derived pane label unchanged", async () => {
+    const harness = makeBatchCli();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ label: "lbl" }), catalog(profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details?.outcome).toBe("launched");
+    expect(result.details?.children.map((child) => child.name)).toEqual(["task-worker-1", "task-worker-2"]);
+    const renames = harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "rename");
+    expect(renames.map((argv) => argv[3])).toEqual(["lbl-worker-1", "lbl-worker-2"]);
+  });
+
   it("fails an overlong child name without truncating or renaming", async () => {
     const harness = makeBatchCli();
     const { router } = stubRouter(batchRoute([{ profile: "worker", count: 1 }]));

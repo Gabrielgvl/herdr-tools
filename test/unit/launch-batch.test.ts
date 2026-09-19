@@ -239,6 +239,59 @@ describe("expandBatchRequest", () => {
     expect(result.failures).toMatchObject([{ code: "BATCH_NAME_COLLISION", name: "task-worker-1" }]);
   });
 
+  it("fails a derived label already held by an existing pane label while siblings still expand", () => {
+    const snapshot = {
+      version: "1",
+      protocol: 1,
+      workspaces: [{ workspace_id: "w", label: "w" }],
+      tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
+      panes: [
+        // A pane label shadows an exact target even when no agent carries it.
+        { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "lbl-worker-1" }
+      ],
+      agents: []
+    } as HerdrSnapshot;
+    const result = expanded(expandBatchRequest(auto({ label: "lbl" }), decision([
+      { profile: "worker-pi", count: 2 },
+      { profile: "scout-agy", count: 1 }
+    ]), existingNameTargets(snapshot)));
+    expect(result.children.map((child) => child.name)).toEqual(["task-worker-2", "task-scout-1"]);
+    expect(result.failures).toMatchObject([
+      { code: "BATCH_NAME_COLLISION", name: "task-worker-1", role: "worker", profile: "worker-pi", ordinal: 1 }
+    ]);
+    expect(result.failures[0]!.message).toContain("label");
+  });
+
+  it("fails a derived label already held by an existing agent name", () => {
+    const snapshot = {
+      version: "1",
+      protocol: 1,
+      workspaces: [{ workspace_id: "w", label: "w" }],
+      tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
+      panes: [{ pane_id: "w:p1", tab_id: "w:t", workspace_id: "w", label: "caller", agent_name: "lbl-scout-1" }],
+      agents: [{ pane_id: "w:p1", name: "lbl-scout-1" }]
+    } as HerdrSnapshot;
+    const result = expanded(expandBatchRequest(auto({ label: "lbl" }), decision([
+      { profile: "worker-pi", count: 1 },
+      { profile: "scout-agy", count: 1 }
+    ]), existingNameTargets(snapshot)));
+    expect(result.children.map((child) => child.name)).toEqual(["task-worker-1"]);
+    expect(result.failures).toMatchObject([
+      { code: "BATCH_NAME_COLLISION", name: "task-scout-1", role: "scout", profile: "scout-agy", ordinal: 1 }
+    ]);
+  });
+
+  it("does not collide a derived label equal to the child's own name", () => {
+    // name === label makes the derived label the derived name: the label
+    // check runs before the name claim, so the child cannot hit itself.
+    const result = expanded(expandBatchRequest(auto({ label: "task" }), decision([{ profile: "worker-pi", count: 2 }]), empty));
+    expect(result.children.map((child) => [child.name, child.label] as const)).toEqual([
+      ["task-worker-1", "task-worker-1"],
+      ["task-worker-2", "task-worker-2"]
+    ]);
+    expect(result.failures).toEqual([]);
+  });
+
   it("suffixes explicit labels and new-tab labels with -{role}-{N}", () => {
     const result = expanded(expandBatchRequest(auto({ label: "lbl", placement: { mode: "new_tab", tabLabel: "tab" } }), decision([{ profile: "worker-pi", count: 2 }]), empty));
     expect(result.children.map((child) => child.label)).toEqual(["lbl-worker-1", "lbl-worker-2"]);
@@ -475,6 +528,47 @@ describe("batch executor boundary", () => {
     const children = result.details?.children ?? [];
     expect(children).toHaveLength(2);
     expect(children[1]).toMatchObject({ name: "task-worker-2", status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+  });
+
+  it("re-checks the effective pane label against the fresh snapshot immediately before a child", async () => {
+    const calls: string[][] = [];
+    const collided = batchSnapshot({
+      panes: [...batchSnapshot().panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "lbl-worker-2", agent_status: "idle" }]
+    });
+    const result = await executeAuto(auto({ label: "lbl" }), {
+      cli: deadCli(calls),
+      profiles: batchCatalog(batchProfile("worker-pi")),
+      router: { route: async () => ({ result: decision([{ profile: "worker-pi", count: 2 }]), probabilities: {} }) },
+      routerLog: async () => undefined,
+      // Expansion sees an empty namespace; child two's fresh check meets the
+      // derived label a concurrent launch claimed after the decision was logged.
+      contextResolver: resolverFor(batchSnapshot(), batchSnapshot(), collided)
+    });
+    const children = result.details?.children ?? [];
+    expect(children).toHaveLength(2);
+    expect(children[1]).toMatchObject({ name: "task-worker-2", status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    // The collided child never mutated: only its sibling reached a split.
+    expect(calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("surfaces a derived-label expansion collision as a failed entry while siblings dispatch", async () => {
+    const calls: string[][] = [];
+    const taken = batchSnapshot({
+      panes: [...batchSnapshot().panes, { pane_id: "w1:p8", tab_id: "w1:t1", workspace_id: "w1", label: "lbl-worker-1", agent_status: "idle" }]
+    });
+    const result = await executeAuto(auto({ label: "lbl" }), {
+      cli: deadCli(calls),
+      profiles: batchCatalog(batchProfile("worker-pi")),
+      router: { route: async () => ({ result: decision([{ profile: "worker-pi", count: 2 }]), probabilities: {} }) },
+      routerLog: async () => undefined,
+      contextResolver: resolverFor(taken)
+    });
+    const children = result.details?.children ?? [];
+    expect(children).toHaveLength(2);
+    expect(children[0]).toMatchObject({ name: "task-worker-1", status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    expect(children[1]?.name).toBe("task-worker-2");
+    // The collided child was never dispatched: only its sibling attempted a mutation.
+    expect(calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
   });
 
   it("refuses a multi-child existing-pane batch before any child dispatch", async () => {

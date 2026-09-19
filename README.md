@@ -36,6 +36,26 @@ If AGY qualification is enabled in a future gate, every AGY launch must still re
 
 `worker-devin` is the default implementation profile and its chain is exactly `worker-devin -> worker-pi -> worker-claude`. `reviewer-devin` is the default review profile with `reviewer-devin -> reviewer-pi -> reviewer-claude`; it runs the same Devin runtime and stays read-only by assignment, never editing, committing, or promoting the work it reviews. Both launch Devin with `--model swe-2-max --permission-mode dangerous`; Devin's reasoning depth rides on the model tier because the CLI exposes no separate effort flag, and sessions always persist. Callers may override only `model` and `permissionMode` (canonical `normal`, `accept-edits`, `smart`, `dangerous`). The profile body is catalog metadata that never reaches Devin, so every launch requires the same visible, self-contained, provenance-wrapped `assignment` as AGY. `dangerous` auto-approves every tool call, so manager assignments must bound scope and tests. Devin reports its native session through the installed `herdr:devin` hook at session start, so it keeps the strict exact-identity launch contract and never enters AGY's provisional path. Launch readiness verifies agent identity/lifecycle after `herdr agent start`; it does not gate shell-prompt readiness before upstream Herdr injects the runtime command. Shell startup/update prompts can consume that command; fixing this race belongs in upstream Herdr.
 
+## Batch launch and the Jev Router
+
+`herdr_launch` discriminates on the `profile` field alone:
+
+- **Explicit** — a named `profile` is the existing single launch and the escape hatch: it performs zero Router work, needs no `TYPESAFE_API_KEY`, and is the only variant that accepts `overrides`.
+- **Batch** — `assignment` with no `profile` field runs one Jev routing decision over the same effective catalog. The Router decides Roles, Profiles, and Fan-out, and deterministic code expands each Assignment into children that each walk the unchanged launch lifecycle.
+
+```text
+herdr_launch({"name":"task","assignment":{"objective":"Implement the parser","scope":"src/parser only","verification":"npm test passes"}})
+herdr_launch({"name":"reviewer","profile":"reviewer-devin","assignment":{"objective":"Inspect the current changes","scope":"Read-only review of the working tree","verification":"Report findings with file and line references"}})
+```
+
+Every Batch child is named exactly `{name}-{role}-{N}` with a one-based N within its Role (`task-worker-1`, `task-worker-2`, `task-scout-1`) and stays an exact target for `herdr_wait`, `herdr_communicate`, and close. The result is typed `launch_batch`: an `outcome` of `abstained`, `launched`, `partial`, or `failed`, the Router result, and one entry per child carrying its exact `name`, `role`, requested `profile`, `ordinal`, and `status` — `launched` with the complete single-launch details, `failed` with the redacted structured failure evidence, or `not_started` with a bounded code. `partial` retains mixed outcomes as they stand: nothing is closed, rolled back, or resubmitted after partial effects, and a Batch is never retried as a whole — inspect surviving children by name and delegate the remainder explicitly.
+
+When any applicable routing component is uncertain or unavailable, the Router returns a typed Abstain. The caller sees `outcome: "abstained"`, `router: {kind: "abstain", reason}` with `reason` one of `low_confidence`, `no_assignments`, `catalog_unavailable`, `invalid_response`, `authentication_unavailable`, `transport_failed`, or `aborted`, and `children: []` — zero launch effects and no default Profile. The fallback path is the same objective delegated through explicit named-Profile launches.
+
+Batch mode requires `TYPESAFE_API_KEY` exported into the host's environment — the same requirement as the opt-in `typesafe/<model>` wait reviewer — since the Router reads the process environment, not the Pi auth store. Every Router outcome is appended once to `.herdr/router/decisions.jsonl` under the session project root before any child launches: one redaction-aware JSONL record with the timestamp, caller name, state digest, validated probabilities, and the Assignments or Abstain reason. A failed append stops the Batch with `ROUTER_LOG_UNAVAILABLE` before any child effect.
+
+The normative contract is [the `herdr_launch` section of SPEC.md](SPEC.md#herdr_launch); the design rationale is [ADR-032](docs/decisions/032-active-jev-routing-auto-batch-launch.md).
+
 ## Claude Fable manager
 
 A Claude Fable session running in a Herdr pane can act as the manager through the local stdio MCP server. Build the server, add the bundled marketplace, install the plugin globally for the user, then restart Claude:
@@ -176,7 +196,7 @@ The Pi-only hotfix is a local release gate, not the original full integration qu
 - `herdr-profiles/role-plugins/promoter/` carries the no-edit finalization skill used by `promoter-devin -> promoter-claude -> promoter-pi`.
 - `src/cli.ts` bounds and validates CLI responses.
 - `src/context.ts` resolves the live effective caller context from the injected pane identity and authoritative topology; `src/targets.ts` resolves exact targets against that context.
-- `src/tools/` contains the seven public tools. `src/tools/turn-control.ts` owns the internal identity-bound cancel/interrupt protocol. Profile discovery and typed Pi, Claude, and AGY adapters live under `src/profiles/`; `herdr_launch` is strict profile-only: no profile, no launch.
+- `src/tools/` contains the seven public tools. `src/tools/turn-control.ts` owns the internal identity-bound cancel/interrupt protocol. Profile discovery and typed Pi, Claude, and AGY adapters live under `src/profiles/`; `herdr_launch` is strict profile-only: every executed child uses a validated Profile — a named `profile` is the explicit single launch, and an omitted `profile` is a Router-decided Batch (see Batch launch and the Jev Router).
 - `src/reviewer.ts` contains the tool-less in-process model reviewer used by long waits.
 - `src/supervision/` owns automatic child supervision: strict validation of every supervision-socket value (`protocol.ts`), the newline-delimited JSON client (`socket.ts`), the one multiplexed session event connection (`monitor.ts`), exact-child pinning and move continuity (`identity.ts`), transitions and soft receipts (`events.ts`), the Luna-max supervisor reviewer and its host-independent model service (`reviewer.ts`, `model-service.ts`), Pi and Claude Channel wakes (`notify.ts`), one child's state machine (`supervisor.ts`), and the reserve/bind/settle coordinator (`registry.ts`). `src/agent-prompt.ts` separately owns the protocol-22 prompt endpoint used by both hosts; neither path falls back to literal stdin.
 - `src/wait-jobs-ui.ts` owns session-scoped footer/widget rendering for active detached jobs of both kinds.

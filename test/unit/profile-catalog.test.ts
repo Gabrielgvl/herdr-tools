@@ -409,7 +409,7 @@ describe("profile catalog", () => {
 
   it("validates profile launch input before placement", () => {
     const invalid = [
-      { name: "worker" }, { name: "worker", kind: "pi", profile: "worker" }, { name: "worker", profile: "" },
+      { name: "worker", kind: "pi", profile: "worker" }, { name: "worker", profile: "" },
       { name: "worker", profile: "worker", argv: [] }, { name: "worker", profile: "worker", env: {} },
       { name: "worker", profile: "worker", overrides: null }, { name: "worker", profile: "worker", overrides: { unknown: "x" } },
       { name: "worker", profile: "worker", overrides: { model: "" } }, { name: "worker", profile: "worker", overrides: { tools: ["bad\nvalue"] } }, { name: "worker", kind: "pi", overrides: {} }
@@ -417,6 +417,10 @@ describe("profile catalog", () => {
     for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams({ ...(value as Record<string, unknown>), assignment: ASSIGNMENT } as never), `invalid case ${index}`).toThrow();
     // The typed assignment is itself required, so every case above is invalid without it too.
     for (const [index, value] of invalid.entries()) expect(() => validateLaunchParams(value as never), `promptless case ${index}`).toThrow();
+    // A profile-free request carrying the typed assignment is the valid auto
+    // (Batch) form under the union schema; the assignment is still required.
+    expect(() => validateLaunchParams({ name: "worker", assignment: ASSIGNMENT } as never)).not.toThrow();
+    expect(() => validateLaunchParams({ name: "worker" } as never)).toThrow();
     expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: ASSIGNMENT, overrides: { thinking: "low", tools: ["read"], allowedTools: ["Read"], disallowedTools: ["Bash"], addDirs: ["."] } } as never)).not.toThrow();
     expect(() => validateLaunchParams({ name: "worker", profile: "worker" } as never)).toThrow(/assignment/);
     for (const key of ["extensions", "skills", "pluginDirs"]) expect(() => validateLaunchParams({ name: "worker", profile: "worker", assignment: ASSIGNMENT, overrides: { [key]: ["./selected"] } } as never)).toThrow(/Unknown profile override/);

@@ -1,4 +1,4 @@
-import type { AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { writeIdentityProvenance } from "../agent-identity.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
 import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope } from "../cli.js";
@@ -16,7 +16,11 @@ import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
-import { LAUNCH_ASSIGNMENT_FIELDS, LaunchParamsSchema, renderAssignment, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
+import { expandBatchRequest, type BatchExpansion } from "../launch-batch.js";
+import { LAUNCH_ASSIGNMENT_FIELDS, LaunchParamsSchema, renderAssignment, type AutoLaunchRequest, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
+import { projectRouterCatalog, roleForProfile, type RouterResult, type RouterState } from "../router.js";
+import { appendRouterDecision, type AppendRouterLogOptions, type RouterLogEntry, type UnavailableRouterState } from "../router-log.js";
+import { TypeSafeRouter, type RouteOutcome } from "../typesafe-router.js";
 import { buildRuntimeArgv, defaultPromptSourceStore, refreshBundledProfileResourceSelection, RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, DEVIN_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
@@ -69,7 +73,27 @@ export interface LaunchDependencies {
    * cannot supervise cannot launch. See ADR-019.
    */
   supervision: SupervisionCoordinator;
+  /**
+   * The auto (Batch) routing client. Explicit named-Profile calls never touch
+   * it and never need `TYPESAFE_API_KEY`; an auto call constructs a
+   * `TypeSafeRouter` only when none is injected.
+   */
+  router?: LaunchRouter;
+  /**
+   * The one-shot decision-log append sink, run once per Router outcome before
+   * any child mutation. Defaults to the local JSONL record rooted at the
+   * trusted host working directory — never the caller-controlled child `cwd`.
+   */
+  routerLog?: LaunchRouterLog;
 }
+
+/** The routing client seam the Batch executor consumes once per auto call. */
+export interface LaunchRouter {
+  route(state: RouterState, signal: AbortSignal): Promise<RouteOutcome>;
+}
+
+/** The decision-log append seam; `appendRouterDecision` satisfies it directly. */
+export type LaunchRouterLog = (entry: RouterLogEntry, options: AppendRouterLogOptions) => Promise<void>;
 
 export interface LaunchResourceIds {
   tabId?: string;
@@ -177,6 +201,57 @@ export interface LaunchDetails extends LaunchResourceIds {
   handoff?: { runId: string; path: string };
   recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; profileName: string; kind: ProfileKind; capable: boolean; reason: string };
   profile?: LaunchEffectiveProfile & { name: string; sessionPersistence: boolean };
+}
+
+/**
+ * Internal Batch wiring handed to the shared single-child executor. Explicit
+ * calls pass neither field: the catalog is loaded inside the child lifecycle
+ * and the name check stays the existing agent-name-only test.
+ */
+interface LaunchBatchContext {
+  /** The single catalog snapshot that fed the Router decision and every child. */
+  catalog: ProfileCatalog;
+  /**
+   * Names and pane labels sibling children of this Batch will claim. A hit at
+   * the pre-mutation identity check is a `BATCH_NAME_COLLISION`, because a
+   * planned label shadows an exact target the same way an existing one does.
+   */
+  reservedNames: ReadonlySet<string>;
+}
+
+export type LaunchBatchChildStatus = "launched" | "failed" | "not_started";
+
+/** One expanded child's retained outcome inside a Batch result. */
+export interface LaunchBatchChild {
+  /** The exact derived `{name}-{role}-{N}` wait/communicate/close target. */
+  name: string;
+  role: string;
+  /** The Router-selected Profile that headed its own unchanged fallback chain. */
+  profile: string;
+  ordinal: number;
+  status: LaunchBatchChildStatus;
+  /** The complete existing success details when status is "launched". */
+  launch?: LaunchDetails;
+  /** The complete redacted structured failure evidence when status is "failed". */
+  failure?: { code: string; details: Record<string, unknown> };
+  /** The bounded stop code when status is "not_started". */
+  code?: string;
+}
+
+/**
+ * The discriminated auto-Batch result: the one Router decision, then one
+ * entry per expanded child. `failed` means no child confirmed a launch —
+ * including log, placement, expansion, and dispatch refusals — `partial`
+ * retains mixed outcomes without rollback, and `abstained` is the explicit
+ * zero-effect result.
+ */
+export interface LaunchBatchDetails {
+  operation: "launch_batch";
+  outcome: "abstained" | "launched" | "partial" | "failed";
+  router: RouterResult;
+  children: LaunchBatchChild[];
+  /** A whole-Batch failure decided without per-child dispatch. */
+  failure?: { code: string; message?: string };
 }
 
 const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
@@ -357,25 +432,34 @@ function profileIdentifier(value: unknown): asserts value is string {
   }
 }
 
-function validateParams(params: LaunchRequest): void {
+const EXPLICIT_LAUNCH_FIELDS = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery"]);
+const AUTO_LAUNCH_FIELDS = new Set(["name", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery"]);
+
+function validateParams(params: LaunchRequest | AutoLaunchRequest): void {
   if (!record(params)) throw new LaunchError("INVALID_INPUT", "launch parameters must be an object");
   if (typeof params.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
     throw new LaunchError("INVALID_INPUT", "name must start with a lowercase letter and contain only lowercase letters, digits, - or _ (1-32 characters)");
   }
-  const allowedKeys = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery"]);
+  // A present `profile` field is always explicit mode, even a malformed one:
+  // "auto" is never a routing sentinel, and overrides need a named Profile.
+  const explicit = "profile" in params;
+  const allowedKeys = explicit ? EXPLICIT_LAUNCH_FIELDS : AUTO_LAUNCH_FIELDS;
   for (const key of Object.keys(params)) if (!allowedKeys.has(key)) throw new LaunchError("INVALID_INPUT", `Unknown launch field: ${key}`);
-  profileIdentifier(params.profile);
-  if (params.overrides !== undefined) {
-    if (!record(params.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
-    if (RESERVED_BUNDLED_PROFILE_NAMES.has(params.profile)) throw new LaunchError("INVALID_INPUT", `Reserved profile ${params.profile} does not accept runtime overrides`);
-    for (const key of Object.keys(params.overrides)) if (!["model", "thinking", "effort", "tools", "permissionMode", "allowedTools", "disallowedTools", "addDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
-    if (params.overrides.model !== undefined) identifier(params.overrides.model, "overrides.model");
-    if (params.overrides.thinking !== undefined && (typeof params.overrides.thinking !== "string" || !THINKING_LEVELS.includes(params.overrides.thinking as typeof THINKING_LEVELS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.thinking is invalid");
-    if (params.overrides.effort !== undefined && (typeof params.overrides.effort !== "string" || !CLAUDE_EFFORTS.includes(params.overrides.effort as typeof CLAUDE_EFFORTS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.effort is invalid");
-    if (params.overrides.permissionMode !== undefined && (typeof params.overrides.permissionMode !== "string" || (!CLAUDE_PERMISSION_MODES.includes(params.overrides.permissionMode as typeof CLAUDE_PERMISSION_MODES[number]) && !DEVIN_PERMISSION_MODES.includes(params.overrides.permissionMode as typeof DEVIN_PERMISSION_MODES[number])))) throw new LaunchError("INVALID_INPUT", "overrides.permissionMode is invalid");
-    for (const key of ["tools", "allowedTools", "disallowedTools", "addDirs"] as const) {
-      const value = params.overrides[key];
-      if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0 || /[\0\r\n]/.test(item)))) throw new LaunchError("INVALID_INPUT", `overrides.${key} must be non-empty strings without NUL or newlines`);
+  if (explicit) {
+    const request = params as LaunchRequest;
+    profileIdentifier(request.profile);
+    if (request.overrides !== undefined) {
+      if (!record(request.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
+      if (RESERVED_BUNDLED_PROFILE_NAMES.has(request.profile)) throw new LaunchError("INVALID_INPUT", `Reserved profile ${request.profile} does not accept runtime overrides`);
+      for (const key of Object.keys(request.overrides)) if (!["model", "thinking", "effort", "tools", "permissionMode", "allowedTools", "disallowedTools", "addDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
+      if (request.overrides.model !== undefined) identifier(request.overrides.model, "overrides.model");
+      if (request.overrides.thinking !== undefined && (typeof request.overrides.thinking !== "string" || !THINKING_LEVELS.includes(request.overrides.thinking as typeof THINKING_LEVELS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.thinking is invalid");
+      if (request.overrides.effort !== undefined && (typeof request.overrides.effort !== "string" || !CLAUDE_EFFORTS.includes(request.overrides.effort as typeof CLAUDE_EFFORTS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.effort is invalid");
+      if (request.overrides.permissionMode !== undefined && (typeof request.overrides.permissionMode !== "string" || (!CLAUDE_PERMISSION_MODES.includes(request.overrides.permissionMode as typeof CLAUDE_PERMISSION_MODES[number]) && !DEVIN_PERMISSION_MODES.includes(request.overrides.permissionMode as typeof DEVIN_PERMISSION_MODES[number])))) throw new LaunchError("INVALID_INPUT", "overrides.permissionMode is invalid");
+      for (const key of ["tools", "allowedTools", "disallowedTools", "addDirs"] as const) {
+        const value = request.overrides[key];
+        if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0 || /[\0\r\n]/.test(item)))) throw new LaunchError("INVALID_INPUT", `overrides.${key} must be non-empty strings without NUL or newlines`);
+      }
     }
   }
   if (params.label !== undefined) identifier(params.label, "label");
@@ -1383,6 +1467,20 @@ function existingAgentNames(snapshot: HerdrSnapshot): string[] {
   return names;
 }
 
+/**
+ * Every name an exact pane/agent target resolution could already match:
+ * existing agent names plus pane labels, which shadow a name in the shared
+ * resolvers, so name-only uniqueness is not sufficient. Batch child
+ * expansion checks this set rather than parsing identity a second way.
+ */
+export function existingNameTargets(snapshot: HerdrSnapshot): Set<string> {
+  const names = new Set(existingAgentNames(snapshot));
+  for (const pane of snapshot.panes) {
+    if (typeof pane.label === "string" && pane.label.length > 0) names.add(pane.label);
+  }
+  return names;
+}
+
 function paneForPlacement(snapshot: HerdrSnapshot, target: string, context: CurrentContext): ResolvedTarget {
   return resolveTarget(snapshot, target, "pane", context);
 }
@@ -1598,15 +1696,53 @@ async function runPrompt(cli: LaunchCli, paneId: string, envelope: string, signa
   return cli.prompt(paneId, envelope, signal);
 }
 
-export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeof LaunchParamsSchema, LaunchDetails> {
+/** The complete redacted structured evidence one failed child retains. */
+function batchChildFailure(error: unknown): { code: string; details: Record<string, unknown> } {
+  const source = error instanceof LaunchError ? error.details : record(error) && record(error.details) ? error.details : {};
+  const projected = modelSafeJson(source);
+  const details = record(projected) ? { ...projected } : {};
+  const message = causeMessage(error);
+  if (details.causeMessage === undefined && message !== undefined) details.causeMessage = message;
+  return { code: safeLaunchCode(launchTransportCode(error)), details };
+}
+
+/**
+ * The all-child manifest rendered ahead of verbose details. Every expanded
+ * child gets exactly one line, so a bounded response can never masquerade as
+ * a smaller Batch.
+ */
+function batchManifest(details: LaunchBatchDetails): string {
+  const router = details.router;
+  const head = `herdr_launch batch outcome=${details.outcome} router=${router.kind}${router.kind === "abstain" ? ` reason=${router.reason}` : ` assignments=${router.assignments.length}`} children=${details.children.length}${details.failure === undefined ? "" : ` failure=${details.failure.code}`}`;
+  const lines = details.children.map((child) => {
+    const selected = child.launch?.profile?.selected;
+    const failureDetails = child.failure?.details;
+    const createdValue = failureDetails?.created;
+    const created = record(createdValue) ? createdValue : undefined;
+    const paneId = child.launch?.paneId ?? safeDiagnosticString(failureDetails?.paneId) ?? safeDiagnosticString(created?.paneId);
+    const supervisorJobId = child.launch?.supervision?.jobId ?? safeDiagnosticString(failureDetails?.supervisorJobId);
+    const code = child.failure?.code ?? child.code;
+    return `- ${child.name} requested=${child.profile}${selected !== undefined && selected !== child.profile ? ` selected=${selected}` : ""} outcome=${child.status}${code === undefined ? "" : ` code=${code}`}${paneId === undefined ? "" : ` pane=${paneId}`}${supervisorJobId === undefined ? "" : ` supervisor=${supervisorJobId}`}`;
+  });
+  return [head, ...lines].join("\n");
+}
+
+export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeof LaunchParamsSchema, LaunchDetails | LaunchBatchDetails> {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
-  return {
-    name: "herdr_launch",
-    label: "Herdr Launch",
-    description: "Launch a named Pi, Devin, or Claude Herdr agent from a strict profile in an explicitly selected pane placement; AGY launches are not qualified.",
-    parameters: LaunchParamsSchema,
-    async execute(_id, rawParams, signal, onUpdate, ctx) {
-      const params = rawParams as unknown as LaunchRequest;
+
+  /**
+   * The single existing child lifecycle, shared by an explicit named-Profile
+   * call and every expanded Batch child. Explicit calls pass no `batch`
+   * context, so the catalog load, identity check, and every other lifecycle
+   * step keep their existing behavior.
+   */
+  const executeSingle = async (
+    params: LaunchRequest,
+    signal: AbortSignal | undefined,
+    onUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined,
+    ctx: ExtensionContext,
+    batch?: LaunchBatchContext
+  ): Promise<AgentToolResult<LaunchDetails>> => {
       let launchGate: LaunchGateLease | undefined;
       try {
         launchGate = await (deps.launchGate ?? (() => acquireLaunchGate()))();
@@ -1670,8 +1806,8 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         placement = params.placement ?? { mode: "same_tab" as const };
         label = params.label ?? params.name;
         phase = "resolve_profile";
-        if (!deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
-        const catalog = await deps.profiles.load();
+        if (batch === undefined && !deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
+        const catalog = batch?.catalog ?? await deps.profiles!.load();
         profileResolution = resolveProfile(params.profile, catalog);
         const reachableProfiles = profileResolution.reachableNames.map((name) => {
           const profile = catalog.effective.get(name);
@@ -1732,8 +1868,15 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
         effectiveContext = effective.context;
         const currentContext = effective.context;
         sender = resolveSender(snapshot, currentContext.paneId);
-        if (existingAgentNames(snapshot).filter((name) => name === params.name).length > 0) {
-          throw new LaunchError("INVALID_INPUT", `Agent name is already in use: ${params.name}`);
+        // A Batch child re-checks the fresh names *and* pane labels — a label
+        // shadows an exact target the same way a name does — plus the names
+        // and labels sibling children already claimed. Explicit calls keep
+        // the existing agent-name-only check and INVALID_INPUT code.
+        const nameTaken = batch === undefined
+          ? existingAgentNames(snapshot).includes(params.name)
+          : existingNameTargets(snapshot).has(params.name) || batch.reservedNames.has(params.name);
+        if (nameTaken) {
+          throw new LaunchError(batch === undefined ? "INVALID_INPUT" : "BATCH_NAME_COLLISION", `Agent name is already in use: ${params.name}`);
         }
         existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, currentContext) : undefined;
         workspaceId = placement.mode === "new_tab" ? currentContext.workspaceId : undefined;
@@ -2146,13 +2289,217 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
           await launchGate?.release();
         }
       }
+  };
+
+  /**
+   * The auto-Batch orchestration: one authoritative catalog snapshot feeds
+   * exactly one Router call and exactly one decision-log append, both before
+   * any child mutation, then the pure expansion drives sequential children
+   * through the shared single-child lifecycle.
+   */
+  const executeBatch = async (
+    params: AutoLaunchRequest,
+    signal: AbortSignal | undefined,
+    onUpdate: AgentToolUpdateCallback<LaunchDetails | LaunchBatchDetails> | undefined,
+    ctx: ExtensionContext
+  ): Promise<AgentToolResult<LaunchBatchDetails>> => {
+    const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
+    const batchResult = (details: LaunchBatchDetails): AgentToolResult<LaunchBatchDetails> => ({
+      content: [{ type: "text", text: batchManifest(details) }],
+      details
+    });
+    const batchFailure = (router: RouterResult, code: string, message?: string): AgentToolResult<LaunchBatchDetails> =>
+      batchResult({ operation: "launch_batch", outcome: "failed", router, children: [], failure: { code, ...(message === undefined ? {} : { message }) } });
+    // The same fail-closed gate and freeze check leads, exactly like the
+    // explicit path, but the lease is released before routing so nothing is
+    // held across the Jev call and children never run under a nested lease.
+    let launchGate: LaunchGateLease | undefined;
+    try {
+      launchGate = await (deps.launchGate ?? (() => acquireLaunchGate()))();
+      await launchGate.check();
+    } catch {
+      await launchGate?.release().catch(() => undefined);
+      throw new LaunchError("PROFILE_LAUNCH_FROZEN", "Profile launch is frozen");
+    }
+    try {
+      // Preserve the existing ordering: validation, freeze, assignment size,
+      // compatibility preflight — all before the Router decision.
+      validateParams(params);
+      const assignmentText = renderAssignment(params.assignment);
+      assertMessageText(assignmentText);
+      assertDeliverySize(assignmentText, params.assignmentDelivery === "attachment" ? "attachment" : "inline");
+      if (typeof deps.cli.prompt !== "function") throw new LaunchError("CLI_INCOMPATIBLE", "Herdr prompt transport is unavailable");
+      await deps.preflight(abortSignal, "agent.prompt");
+    } catch (error) {
+      await launchGate.release();
+      throw earlyLaunchFailure(error, "validate");
+    }
+    await launchGate.release();
+
+    // One catalog snapshot supplies both the Router state and the selected
+    // children. An unavailable or untrusted catalog is a typed abstain with
+    // the unavailable-state marker — never a filter, never an error.
+    let catalog: ProfileCatalog | undefined;
+    let state: RouterState | UnavailableRouterState;
+    let outcome: RouteOutcome | undefined;
+    try {
+      if (!deps.profiles) throw new Error("Profile catalog is unavailable");
+      const loaded = await deps.profiles.load();
+      if (!(loaded.effective instanceof Map) || (loaded.unreadableScopes?.length ?? 0) > 0) {
+        throw new Error("Profile catalog is unavailable");
+      }
+      catalog = loaded;
+      state = { assignment: params.assignment, catalog: projectRouterCatalog(loaded) };
+    } catch {
+      catalog = undefined;
+      state = { status: "unavailable", reason: "catalog_unavailable" };
+      outcome = { result: { kind: "abstain", reason: "catalog_unavailable", component: "catalog" }, probabilities: {} };
+    }
+    if (outcome === undefined) {
+      const router = deps.router ?? new TypeSafeRouter();
+      try {
+        outcome = await router.route(state as RouterState, abortSignal);
+      } catch {
+        outcome = {
+          result: abortSignal.aborted ? { kind: "abstain", reason: "aborted" } : { kind: "abstain", reason: "transport_failed", component: "transport" },
+          probabilities: {}
+        };
+      }
+    }
+    const decision = outcome.result;
+    const routerLog = deps.routerLog ?? appendRouterDecision;
+    try {
+      await routerLog({ name: params.name, state, result: decision, probabilities: outcome.probabilities }, { root: deps.cwd ?? ctx.cwd });
+    } catch {
+      // The decision is retained in the failure evidence; nothing launched.
+      return batchFailure(decision, "ROUTER_LOG_UNAVAILABLE", "Router decision could not be persisted");
+    }
+    if (decision.kind === "abstain") {
+      return batchResult({ operation: "launch_batch", outcome: "abstained", router: decision, children: [] });
+    }
+
+    // Expansion is pure: exact names, labels, and the one-child existing-pane
+    // rule are decided here, before any effect, against the caller snapshot.
+    let expansion: BatchExpansion;
+    try {
+      const effective = await contextResolver(abortSignal);
+      expansion = expandBatchRequest(params, decision, existingNameTargets(effective.snapshot));
+    } catch (error) {
+      return batchFailure(decision, safeLaunchCode(launchTransportCode(error)), causeMessage(error));
+    }
+    if (expansion.kind === "invalid") {
+      return batchFailure(decision, expansion.code, expansion.message);
+    }
+
+    // Children dispatch strictly one at a time — mutating placement and start
+    // calls are never raced — and every child re-runs the existing lifecycle's
+    // freeze, abort, resource, and identity checks on a fresh snapshot.
+    const planned = expansion.children;
+    const dispatched = new Map<string, LaunchBatchChild>();
+    let halted = false;
+    for (const child of planned) {
+      const key = `${child.profile}:${child.ordinal}`;
+      if (halted || abortSignal.aborted) {
+        // A caller abort stops dispatch but keeps every remaining child visible.
+        halted = true;
+        dispatched.set(key, { name: child.name, role: child.role, profile: child.profile, ordinal: child.ordinal, status: "not_started", code: "ABORTED" });
+        continue;
+      }
+      const reservedNames = new Set<string>();
+      for (const sibling of planned) {
+        if (sibling === child) continue;
+        reservedNames.add(sibling.name);
+        reservedNames.add(sibling.label ?? sibling.name);
+      }
+      const request: LaunchRequest = {
+        name: child.name,
+        profile: child.profile,
+        placement: child.placement,
+        ...(child.label === undefined ? {} : { label: child.label }),
+        ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
+        ...(params.focus === undefined ? {} : { focus: params.focus }),
+        assignment: {
+          objective: `${params.assignment.objective}\n\n${child.purpose}\nInstance ${child.ordinal} of ${child.count} for this role.`,
+          scope: params.assignment.scope,
+          verification: params.assignment.verification
+        },
+        ...(params.assignmentDelivery === undefined ? {} : { assignmentDelivery: params.assignmentDelivery })
+      };
+      const childUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined = onUpdate === undefined
+        ? undefined
+        // Progress is attributed by a leading block instead of rewriting each
+        // block, so non-text content passes through untouched.
+        : (update) => onUpdate({ ...update, content: [{ type: "text", text: `[${child.name}]` }, ...update.content] });
+      try {
+        const result = await executeSingle(request, abortSignal, childUpdate, ctx, { catalog: catalog!, reservedNames });
+        dispatched.set(key, { name: child.name, role: child.role, profile: child.profile, ordinal: child.ordinal, status: "launched", launch: result.details });
+      } catch (error) {
+        // Best effort: a failed child is retained as evidence and unrelated
+        // siblings still dispatch. Successful children are never rolled back.
+        dispatched.set(key, { name: child.name, role: child.role, profile: child.profile, ordinal: child.ordinal, status: "failed", failure: batchChildFailure(error) });
+      }
+    }
+    // Re-merge expansion failures back into the decision's own order so the
+    // manifest reads positionally and no child — including tail entries — is
+    // ever dropped from the result. Ordinals count within the Role across
+    // assignments, matching expandBatchRequest's derivation.
+    const children: LaunchBatchChild[] = [];
+    const roleCursors = new Map<string, number>();
+    for (const assignment of decision.assignments) {
+      const role = roleForProfile(assignment.profile);
+      for (let index = 0; index < assignment.count; index += 1) {
+        const ordinal = (roleCursors.get(role) ?? 0) + 1;
+        roleCursors.set(role, ordinal);
+        const entry = dispatched.get(`${assignment.profile}:${ordinal}`);
+        if (entry !== undefined) {
+          children.push(entry);
+          continue;
+        }
+        // Expansion partitions every decision position into a planned child or
+        // a named failure, so a miss here is a defect, never a silent skip.
+        const failure = expansion.failures.find((item) => item.profile === assignment.profile && item.ordinal === ordinal)!;
+        children.push({
+          name: failure.name,
+          role: failure.role,
+          profile: failure.profile,
+          ordinal: failure.ordinal,
+          status: "failed",
+          failure: { code: failure.code, details: { code: failure.code, message: failure.message } }
+        });
+      }
+    }
+    const launched = children.filter((child) => child.status === "launched").length;
+    const batchOutcome: LaunchBatchDetails["outcome"] = launched === 0 ? "failed" : launched === children.length ? "launched" : "partial";
+    return batchResult({
+      operation: "launch_batch",
+      outcome: batchOutcome,
+      router: decision,
+      children,
+      ...(children.length === 0 ? { failure: { code: "BATCH_ROUTE_EMPTY", message: "route decision expanded to no children" } } : {})
+    });
+  };
+
+  return {
+    name: "herdr_launch",
+    label: "Herdr Launch",
+    description: "Launch a named Pi, Devin, or Claude Herdr agent from a strict profile in an explicitly selected pane placement; AGY launches are not qualified.",
+    parameters: LaunchParamsSchema,
+    async execute(_id, rawParams, signal, onUpdate, ctx) {
+      // The same discriminator as validateParams: a present `profile` field —
+      // even a malformed one — stays explicit; only an absent field is auto.
+      if (!record(rawParams) || "profile" in rawParams) {
+        return executeSingle(rawParams as unknown as LaunchRequest, signal, onUpdate, ctx);
+      }
+      return executeBatch(rawParams as unknown as AutoLaunchRequest, signal, onUpdate, ctx);
     },
     renderCall(args, theme) {
       const delivery = args.assignmentDelivery ?? "inline";
-      return textComponent(formatCall("herdr_launch", `${args.profile} · ${delivery}`, args.name), theme, "accent");
+      const profile = "profile" in args ? args.profile : "auto";
+      return textComponent(formatCall("herdr_launch", `${profile} · ${delivery}`, args.name), theme, "accent");
     },
     renderResult(result, options, theme) {
-      return renderResultComponent("launch", result, options, theme, result.details?.paneId);
+      const details = result.details;
+      return renderResultComponent("launch", result, options, theme, details?.operation === "launch" ? details.paneId : undefined);
     }
   };
 }

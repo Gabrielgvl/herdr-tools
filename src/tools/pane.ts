@@ -1,4 +1,5 @@
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
 import { adoptAgentIdentity, assertAgentName } from "../agent-identity.js";
 import type { HerdrCli } from "../cli.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver, type EffectiveContext } from "../context.js";
@@ -9,7 +10,7 @@ import { paneCloseTopology, snapshotIds, topologySummary, validateClose } from "
 import { closeWithReadback } from "../mutations.js";
 import type { SelfCloseTracker } from "../supervision/self-close.js";
 import { withoutEnvironment } from "../redaction.js";
-import { assertSafeEnvironment, assertSafeIdentifier, PaneParamsSchema, type PaneParams } from "../topology-schema.js";
+import { assertSafeEnvironment, assertSafeIdentifier, PaneParamsSchema, PublishedPaneParamsSchema, type PaneParams } from "../topology-schema.js";
 import { parseSnapshotResult, resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot, type PaneRecord, type ResolvedTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
@@ -197,16 +198,17 @@ async function closePane(deps: PaneDependencies, params: Extract<PaneParams, { o
   }
 }
 
-export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof PaneParamsSchema, PaneDetails> {
+export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof PublishedPaneParamsSchema, PaneDetails> {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   return {
     name: "herdr_pane",
     label: "Herdr Pane",
     description: "Inspect and mutate exact Herdr pane topology through explicit stable targets; adopt binds a verified agent name to a detected pane for prompt routing.",
     executionMode: "sequential",
-    parameters: PaneParamsSchema,
+    parameters: PublishedPaneParamsSchema,
     async execute(_id, rawParams, signal, _onUpdate, ctx) {
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
+      if (!Value.Check(PaneParamsSchema, rawParams)) throw Object.assign(new Error("INVALID_INPUT: arguments do not match the herdr_pane schema"), { code: "INVALID_INPUT" });
       const params = rawParams as unknown as PaneParams;
       if (params.operation === "split") {
         await deps.preflight(activeSignal);
@@ -273,7 +275,6 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
         return result({ operation: "focus", outcome: "success", paneId: postState.pane_id, tabId: postState.tab_id, workspaceId: postState.workspace_id, postState: withoutEnvironment(postState), ...contextRebindingDetails(effective.diagnostics) }, "focus", postState.pane_id);
       }
       if (params.operation === "resize") {
-        if (typeof params.amount !== "number" || !Number.isFinite(params.amount) || params.amount <= 0) throw Object.assign(new Error("resize amount must be finite and positive"), { code: "INVALID_INPUT" });
         await deps.preflight(activeSignal);
         const effective = await contextResolver(activeSignal);
         const snapshot = effective.snapshot;
@@ -326,7 +327,7 @@ export function createPaneTool(deps: PaneDependencies): ToolDefinition<typeof Pa
       return { content: [{ type: "text", text: formatResult({ operation: "pane", outcome: details.outcome, targetId: details.paneId }) }], details };
     },
     renderCall(args, theme) {
-      return textComponent(formatCall("herdr_pane", args.operation, "target" in args ? args.target : "source" in args ? args.source : undefined), theme, "accent");
+      return textComponent(formatCall("herdr_pane", args.operation ?? "pane", "target" in args ? args.target : "source" in args ? args.source : undefined), theme, "accent");
     },
     renderResult(output: AgentToolResult<PaneDetails>, options, theme) {
       return renderResultComponent("pane", output, options, theme, output.details?.paneId);

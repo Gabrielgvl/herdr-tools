@@ -390,6 +390,9 @@ describe("herdr_tab", () => {
     const targetedCall = tool.renderCall?.({ operation: "focus", target: "t2" } as never, {} as never, {} as never);
     expect(targetedCall?.render(80)).toEqual(["herdr_tab · focus · t2"]);
     targetedCall?.invalidate();
+    const defaultCall = tool.renderCall?.({} as never, {} as never, {} as never);
+    expect(defaultCall?.render(80)).toEqual(["herdr_tab · tab"]);
+    defaultCall?.invalidate();
     call?.invalidate();
     const result = tool.renderResult?.({ content: [], details: { operation: "create", outcome: "success", tabId: "t2" } } as never, { expanded: false, isPartial: false } as never, {} as never, { isError: false } as never);
     expect(result?.render(80)).toEqual(["tab · t2"]);

@@ -1,5 +1,5 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { JobsParamsSchema, validateJobsParams, type JobsParams } from "../jobs-schema.js";
+import { PublishedJobsParamsSchema, validateJobsParams, type JobsParams } from "../jobs-schema.js";
 import { jobDetailContent, JOB_OUTPUT_LIMITS, type JobDetail, type JobListResult, type JobRegistry } from "../job-registry.js";
 import { formatCall, textComponent } from "../tui.js";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
@@ -38,12 +38,12 @@ function resultFor(value: JobsDetails): { content: Array<{ type: "text"; text: s
   return { content: [{ type: "text", text: boundedContent(value) }], details: value };
 }
 
-export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof JobsParamsSchema, JobsDetails> {
+export function createJobsTool(registry: JobRegistry): ToolDefinition<typeof PublishedJobsParamsSchema, JobsDetails> {
   return {
     name: "herdr_jobs",
     label: "Herdr Jobs",
     description: "List, inspect, or cancel the detached Herdr jobs this session owns: wait jobs and the supervisor jobs herdr_launch creates for every child. list accepts an optional kind filter and shows unobserved supervision event counts; get returns a supervisor's pending events and marks exactly those observed; cancel is refused for a supervisor whose exact child is still live.",
-    parameters: JobsParamsSchema,
+    parameters: PublishedJobsParamsSchema,
     async execute(_id, rawParams) {
       let params: JobsParams;
       try {

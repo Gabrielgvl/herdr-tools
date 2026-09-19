@@ -2,11 +2,11 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { JobRegistry } from "../../src/job-registry.js";
-import { LaunchParamsSchema } from "../../src/launch-schema.js";
+import { PublishedLaunchParamsSchema } from "../../src/launch-schema.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
-import { CommunicateParamsSchema, InspectParamsSchema } from "../../src/schemas.js";
-import { JobsParamsSchema } from "../../src/jobs-schema.js";
-import { PaneParamsSchema, TabParamsSchema } from "../../src/topology-schema.js";
+import { PublishedCommunicateParamsSchema, PublishedInspectParamsSchema } from "../../src/schemas.js";
+import { PublishedJobsParamsSchema } from "../../src/jobs-schema.js";
+import { PublishedPaneParamsSchema, PublishedTabParamsSchema } from "../../src/topology-schema.js";
 import { WaitParamsSchema } from "../../src/wait-schema.js";
 import { CORE_TOOL_NAMES, createPreflight, createToolSurface, readInjectedContext, type HerdrToolSurfaceDependencies } from "../../src/tool-surface.js";
 import { createInspectTool } from "../../src/tools/inspect.js";
@@ -104,13 +104,13 @@ describe("shared tool surface", () => {
   it("publishes the same schemas, labels, and descriptions the Pi host registers", () => {
     const { surface, deps } = surfaceFor();
     expect(surface.definitions.map((definition) => definition.parameters)).toEqual([
-      InspectParamsSchema,
-      CommunicateParamsSchema,
+      PublishedInspectParamsSchema,
+      PublishedCommunicateParamsSchema,
       WaitParamsSchema,
-      JobsParamsSchema,
-      LaunchParamsSchema,
-      PaneParamsSchema,
-      TabParamsSchema
+      PublishedJobsParamsSchema,
+      PublishedLaunchParamsSchema,
+      PublishedPaneParamsSchema,
+      PublishedTabParamsSchema
     ]);
     const direct = [
       createInspectTool({ cli: deps.cli, context, environment: deps.environment, profiles: deps.profiles }),

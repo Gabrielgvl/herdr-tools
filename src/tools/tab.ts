@@ -1,4 +1,5 @@
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
 import type { HerdrCli } from "../cli.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver, type EffectiveContext } from "../context.js";
 import type { CompatibilityPreflight } from "../health.js";
@@ -6,7 +7,7 @@ import { runtimeOwnership, type RuntimeOwnership } from "../ownership.js";
 import { tabCloseTopology, snapshotIds, topologySummary, validateClose } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
 import { withoutEnvironment } from "../redaction.js";
-import { assertSafeEnvironment, assertSafeIdentifier, TabParamsSchema, type TabParams } from "../topology-schema.js";
+import { assertSafeEnvironment, assertSafeIdentifier, PublishedTabParamsSchema, TabParamsSchema, type TabParams } from "../topology-schema.js";
 import { parseSnapshotResult, type CurrentContext, type HerdrSnapshot, type TabRecord } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 
@@ -151,16 +152,17 @@ async function closeTab(deps: TabDependencies, params: Extract<TabParams, { oper
   };
 }
 
-export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabParamsSchema, TabDetails> {
+export function createTabTool(deps: TabDependencies): ToolDefinition<typeof PublishedTabParamsSchema, TabDetails> {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   return {
     name: "herdr_tab",
     label: "Herdr Tab",
     description: "Create and mutate Herdr tabs using stable tab IDs or the explicit current tab.",
     executionMode: "sequential",
-    parameters: TabParamsSchema,
+    parameters: PublishedTabParamsSchema,
     async execute(_id, rawParams, signal, _onUpdate, ctx) {
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
+      if (!Value.Check(TabParamsSchema, rawParams)) throw Object.assign(new Error("INVALID_INPUT: arguments do not match the herdr_tab schema"), { code: "INVALID_INPUT" });
       const params = rawParams as unknown as TabParams;
       if (params.operation === "create") {
         await deps.preflight(activeSignal);
@@ -203,7 +205,7 @@ export function createTabTool(deps: TabDependencies): ToolDefinition<typeof TabP
       return { content: [{ type: "text", text: formatResult({ operation: "tab", outcome: details.outcome, targetId: details.tabId }) }], details };
     },
     renderCall(args, theme) {
-      return textComponent(formatCall("herdr_tab", args.operation, "target" in args ? args.target : undefined), theme, "accent");
+      return textComponent(formatCall("herdr_tab", args.operation ?? "tab", "target" in args ? args.target : undefined), theme, "accent");
     },
     renderResult(output: AgentToolResult<TabDetails>, options, theme) {
       return renderResultComponent("tab", output, options, theme, output.details?.tabId);

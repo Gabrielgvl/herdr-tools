@@ -7,6 +7,7 @@ import { loadSettings, type Settings } from "../settings.js";
 import { parsePromptTargetIdentityFields } from "../messages/prompt.js";
 import { resolveTarget, type CurrentContext, type ResolvedTarget } from "../targets.js";
 import { ReviewerFailure, type ReviewerRequest, type ReviewerResult, type WaitReviewer } from "../reviewer.js";
+import type { SupervisionPreviousReview, SupervisionSignalProbabilities } from "../supervision/reviewer.js";
 import { createConfiguredWaitReviewer, resolveTypesafeApiKey } from "../typesafe-reviewer.js";
 import { validateWaitParams, WAIT_LABEL_MAX_BYTES, WAIT_LABEL_MAX_LENGTH, WaitParamsSchema, type SafeRegex, type WaitCondition, type WaitParams, type WaitRawState, type WaitSemanticState } from "../wait-schema.js";
 import { boundedText, type JobOperationControl, type JobRegistry, type JobRequestSnapshot, type JobRunResult, type JobTargetError } from "../job-registry.js";
@@ -1136,6 +1137,7 @@ export async function runPreparedWait(
   let reviewer: WaitReviewer | undefined;
   const reviewerSummaries: ReviewerSummary[] = [];
   const sentLines = new Map<string, string[]>();
+  const previousReviews = new Map<string, SupervisionPreviousReview>();
   let lastStates = snapshots.map((snapshot) => rawState(snapshot.metadata));
   const progress = (text: string) => update(text.slice(0, 500), progressDetails(params, label, snapshots, reviewerSummaries, contextRebinding));
   progress("waiting");
@@ -1207,7 +1209,19 @@ export async function runPreparedWait(
       const previous = sentLines.get(snapshot.targetId) ?? [];
       const delta = deltaLines(previous, snapshot.recentUnwrappedLines);
       sentLines.set(snapshot.targetId, snapshot.recentUnwrappedLines.slice(-100));
-      return { targetId: snapshot.targetId, metadata: compactMetadata(snapshot.metadata), transcriptDelta: delta.slice(-100) };
+      const previousReview = previousReviews.get(snapshot.targetId);
+      // The shared request contract has no temporal fields, so the previous
+      // review folds into the copied metadata object — both reviewer
+      // implementations forward metadata verbatim into the model's evidence.
+      return {
+        targetId: snapshot.targetId,
+        metadata: {
+          ...compactMetadata(snapshot.metadata),
+          ...(previousReview === undefined ? {} : { previousReview }),
+          linesSinceLastReview: delta.length
+        },
+        transcriptDelta: delta.slice(-100)
+      };
     });
     let reviews: ReviewerResult[];
     try {
@@ -1236,6 +1250,8 @@ export async function runPreparedWait(
     let hardManagerJudgment = false;
     const unknownReviews: ReviewerResult[] = [];
     for (const review of reviews) {
+      const signals = (review as ReviewerResult & { signals?: SupervisionSignalProbabilities }).signals;
+      previousReviews.set(review.targetId, { classification: review.classification, ...(signals === undefined ? {} : { signals }) });
       const summary: ReviewerSummary = { target: resolved.find((item) => item.target.paneId === review.targetId)?.ref ?? review.targetId, targetId: review.targetId, classification: review.classification, summary: review.summary.slice(0, 500) };
       reviewerSummaries.push(summary);
       hardManagerJudgment ||= review.classification === "stalled" || review.classification === "blocked" || review.classification === "risk";

@@ -95,6 +95,8 @@ function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: EdgeOp
     clock: { now: () => 0 },
     // Omitting the scheduler exercises the real-timer default.
     ...(options.scheduler === false ? {} : { scheduler: { setTimer: (_callback, ms) => { arms.push(ms); return "timer"; }, clearTimer: () => undefined } }),
+    // Reviews that complete here must not reach the real review log on disk.
+    reviewLog: async () => undefined,
     readTranscript: options.transcript ?? (async () => []),
     update: () => undefined,
   };

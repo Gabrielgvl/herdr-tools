@@ -9,7 +9,7 @@
  * observed.
  */
 
-import { ReviewerFailure } from "../reviewer.js";
+import { ReviewerFailure, type ReviewClassification } from "../reviewer.js";
 import { renderHandoffContract, type HandoffAllocation } from "../handoff.js";
 import { handoffGateMatches, type HandoffGate, type HandoffInspection, type HandoffRun, type HandoffValidation } from "../handoff-gate.js";
 import type { HerdrSnapshot } from "../targets.js";
@@ -57,8 +57,10 @@ import {
   type SupervisionPreviousReview,
   type SupervisionReason,
   type SupervisionReviewer,
+  type SupervisionReviewResult,
   type SupervisionSignalProbabilities,
 } from "./reviewer.js";
+import { appendSupervisionReview, defaultReviewLogRoot, type SupervisionReviewLog } from "./review-log.js";
 import type {
   SupervisionChildView,
   SupervisionJobPort,
@@ -128,6 +130,19 @@ export interface SupervisorDependencies {
   reviewer: SupervisionReviewer;
   /** The reservation's authorial done-when/constraints, supplied to every review as state (ADR-034). */
   assignmentDigest?: SupervisionAssignmentDigest;
+  /**
+   * The durable review-log append seam; `appendSupervisionReview` satisfies it
+   * directly. A failed append degrades exactly like a reviewer failure —
+   * telemetry is not a launch precondition, so a logging failure must never
+   * blind the supervisor or kill the child.
+   */
+  reviewLog?: SupervisionReviewLog;
+  /**
+   * The trusted project root the review log appends under; defaults to
+   * `HERDR_PROJECT_DIR` when set, else the host's own launch directory — the
+   * same anchoring rule `resolveStartup` applies.
+   */
+  reviewLogRoot?: string;
   cadenceMs: number;
   clock: { now(): number };
   scheduler?: SupervisionScheduler;
@@ -1510,6 +1525,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       if (result.signals !== undefined && result.signals.progress >= SUPERVISION_PROGRESS_THRESHOLD) {
         this.lastMeaningfulProgressAtMs = this.lastReviewAtMs;
       }
+      // The classification this review read as its predecessor, captured
+      // before this review becomes that predecessor for the next cadence.
+      const previousClassification = this.previousReview?.classification;
       this.previousReview = {
         classification: result.classification,
         ...(result.signals === undefined ? {} : { signals: result.signals }),
@@ -1519,12 +1537,21 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         this.reviewerDegraded = false;
         this.emit("reviewer_recovered", "the supervision reviewer recovered");
       }
+      let wake: SupervisionEvent | undefined;
       if (needsManagerAttention(result.classification)) {
-        this.emit("reviewer_attention", `supervision review says ${result.classification}: ${result.summary}`, { classification: result.classification });
+        wake = this.emit("reviewer_attention", `supervision review says ${result.classification}: ${result.summary}`, { classification: result.classification });
       } else {
         // Progress stores silently.
         this.publish(`review ${result.classification}: ${result.summary}`);
       }
+      // The durable append runs strictly last: the in-memory record, the
+      // watermark, the temporal memory, and the wake itself all already
+      // happened, so a failed write loses only the dataset row and degrades
+      // exactly like a reviewer failure (one reported episode, retry next
+      // cadence). That deliberately differs from the router decision log's
+      // ROUTER_LOG_UNAVAILABLE veto — that log is a launch precondition and
+      // review telemetry never is.
+      await this.persistReview(result, reviewed, workingSinceMs, transcriptDelta.length, transcript.length, previousClassification, wake);
     } catch (error) {
       // A failure that belongs to a run which has already ended, or to a pane the
       // child has left, is not evidence about anything either: it must not
@@ -1544,6 +1571,51 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // it by a whole interval.
       if (!this.stopped && this.reviewRunLive(run)) this.armReview(this.deps.cadenceMs);
     }
+  }
+
+  /**
+   * Persist one completed review — and the wake's pending disposition entry
+   * when it woke the manager — to the durable review log. Runs strictly after
+   * every supervision effect so a sink failure can only ever cost the dataset
+   * row itself; the caller's catch degrades it like a reviewer failure.
+   */
+  private async persistReview(
+    result: SupervisionReviewResult,
+    reviewed: SupervisedIdentity,
+    workingSinceMs: number,
+    linesSinceLastReview: number,
+    transcriptLines: number,
+    previousClassification: ReviewClassification | undefined,
+    wake: SupervisionEvent | undefined,
+  ): Promise<void> {
+    const append = this.deps.reviewLog ?? appendSupervisionReview;
+    await append({
+      jobId: this.deps.jobId,
+      agentName: reviewed.agentName,
+      agentKind: reviewed.agentKind,
+      atMs: this.lastReviewAtMs!,
+      classification: result.classification,
+      attention: wake !== undefined,
+      ...(result.signals === undefined ? {} : { signals: result.signals }),
+      ...(result.evidenceSufficiency === undefined ? {} : { evidenceSufficiency: result.evidenceSufficiency }),
+      ...(result.reason === undefined ? {} : { reason: result.reason }),
+      ...(this.lastMeaningfulProgressAtMs === undefined ? {} : { lastMeaningfulProgressAtMs: this.lastMeaningfulProgressAtMs }),
+      linesSinceLastReview,
+      ...(previousClassification === undefined ? {} : { previousClassification }),
+      evidence: {
+        paneId: reviewed.paneId,
+        terminalId: reviewed.terminalId,
+        agentSession: reviewed.agentSession,
+        revision: this.lastRevision,
+        ...(this.lastStateChangeSeq === undefined ? {} : { stateChangeSeq: this.lastStateChangeSeq }),
+        transcriptLines,
+        workingForMs: Math.max(0, this.lastReviewAtMs! - workingSinceMs),
+      },
+      ...(wake === undefined ? {} : { wake: { eventId: wake.eventId, eventType: wake.type, atMs: wake.atMs } }),
+    }, {
+      root: this.deps.reviewLogRoot ?? defaultReviewLogRoot(),
+      now: () => new Date(this.deps.clock.now()),
+    });
   }
 
   /**

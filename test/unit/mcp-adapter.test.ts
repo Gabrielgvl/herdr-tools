@@ -101,15 +101,36 @@ describe("MCP input schema publication", () => {
     expect(published.anyOf.every((variant) => variant.additionalProperties === false)).toBe(true);
   });
 
-  it("publishes herdr_launch as an object root over two strict variants", () => {
+  it("publishes herdr_launch as a flat object root with every variant field optional", () => {
     const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
-    const published = publishedInputSchema(definition.parameters) as { type: string; anyOf: Array<Record<string, unknown>>; additionalProperties?: unknown };
+    const published = publishedInputSchema(definition.parameters) as { type: string; properties: Record<string, unknown>; required?: unknown; anyOf?: unknown; additionalProperties?: unknown };
     expect(published.type).toBe("object");
-    expect(published.anyOf).toHaveLength(2);
-    expect(published.anyOf.every((variant) => variant.additionalProperties === false)).toBe(true);
-    // A root additionalProperties:false would reject every argument object.
-    expect(published.additionalProperties).toBeUndefined();
+    expect(published.anyOf).toBeUndefined();
+    // Every field is optional at publication; validateParams stays the
+    // enforcement authority for the variant rules the union expressed.
+    expect(published.required).toBeUndefined();
+    expect(published.additionalProperties).toBe(false);
+    for (const field of ["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery", "supervisionDigest"]) {
+      expect(published.properties).toHaveProperty(field);
+    }
   });
+
+  // Regression coverage for the incident where the pi harness dropped every
+  // argument of a tool whose declared parameters were a root Type.Union — calls
+  // arrived as {} — so every tool now publishes a flat object root, never a
+  // union. The union schemas remain each tool's internal runtime contract.
+  for (const name of CORE_TOOL_NAMES) {
+    it(`${name} publishes a flat object root, never a union`, () => {
+      const definition = realSurface().definitions.find((candidate) => candidate.name === name)!;
+      const schema = definition.parameters as Record<string, unknown>;
+      expect(schema.type).toBe("object");
+      expect(schema.anyOf).toBeUndefined();
+      expect(schema.oneOf).toBeUndefined();
+      const published = publishedInputSchema(definition.parameters) as Record<string, unknown>;
+      expect(published.anyOf).toBeUndefined();
+      expect(published.oneOf).toBeUndefined();
+    });
+  }
 
   it("refuses any other root shape instead of publishing a permissive schema", () => {
     expect(() => publishedInputSchema(Type.String())).toThrowError(AdapterContractError);
@@ -126,7 +147,8 @@ describe("MCP input schema publication", () => {
     expect(descriptors.map((descriptor) => descriptor.description)).toEqual(surface.definitions.map((definition) => definition.description));
     expect(descriptors.every((descriptor) => descriptor.inputSchema.type === "object")).toBe(true);
     expect(descriptors[0]!.inputSchema).not.toBe(surface.definitions[0]!.parameters);
-    expect(descriptors[0]!.inputSchema).toMatchObject({ anyOf: expect.any(Array) as unknown as unknown[] });
+    expect(descriptors[0]!.inputSchema).toMatchObject({ properties: expect.any(Object) as unknown as Record<string, unknown> });
+    expect(descriptors.every((descriptor) => !("anyOf" in descriptor.inputSchema))).toBe(true);
   });
 });
 
@@ -140,11 +162,11 @@ describe("MCP published schema parity", () => {
     }
   });
 
-  it("accepts and rejects exactly the same arguments as server-side validation", async () => {
+  it("admits every variant-shaped call at the flat root while keeping strict keys and field types", () => {
     const surface = realSurface();
-    // The mixed and extra-field shapes are the ones a manager session actually
-    // tried; every union variant is strict, so a field from another mode is an
-    // additional property in the mode it was mixed into.
+    // The flat publication deliberately accepts missing required fields and
+    // cross-variant fields — the tools' runtime validation owns the union
+    // contract now — but it still rejects undeclared keys and mistyped values.
     const cases: Array<[string, unknown, boolean]> = [
       ["herdr_inspect", {}, true],
       ["herdr_inspect", { mode: "context" }, true],
@@ -153,42 +175,45 @@ describe("MCP published schema parity", () => {
       ["herdr_inspect", { mode: "collection", collection: "panes" }, true],
       ["herdr_inspect", { mode: "collection", collection: "profiles" }, true],
       ["herdr_inspect", { mode: "profile", profile: "worker-pi" }, true],
-      ["herdr_inspect", { mode: "context", collection: "panes" }, false],
-      ["herdr_inspect", { mode: "context", profile: "worker-pi" }, false],
-      ["herdr_inspect", { mode: "context", target: "w:p2" }, false],
-      ["herdr_inspect", { mode: "health", target: "w:p2" }, false],
-      ["herdr_inspect", { mode: "collection", collection: "panes", profile: "worker-pi" }, false],
-      ["herdr_inspect", { mode: "target" }, false],
-      ["herdr_inspect", { mode: "profile" }, false],
+      ["herdr_inspect", { mode: "context", collection: "panes" }, true],
+      ["herdr_inspect", { mode: "context", profile: "worker-pi" }, true],
+      ["herdr_inspect", { mode: "context", target: "w:p2" }, true],
+      ["herdr_inspect", { mode: "health", target: "w:p2" }, true],
+      ["herdr_inspect", { mode: "collection", collection: "panes", profile: "worker-pi" }, true],
+      ["herdr_inspect", { mode: "target" }, true],
+      ["herdr_inspect", { mode: "profile" }, true],
       ["herdr_inspect", { mode: "bogus" }, false],
-      ["herdr_inspect", { collection: "panes" }, false],
+      ["herdr_inspect", { collection: "panes" }, true],
       ["herdr_inspect", { mode: "context", extra: true }, false],
       ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi" }, true],
+      ["herdr_communicate", { target: "w:p2", operation: "prompt" }, true],
       ["herdr_communicate", { target: "w:p2", operation: "cancel" }, true],
       ["herdr_communicate", { target: "w:p2", operation: "interrupt" }, true],
       ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["escape"] }, true],
       ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["not-a-supported-key"] }, false],
       ["herdr_communicate", { target: "w:p2", operation: "cancel", extra: true }, false],
-      ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi", keys: ["enter"] }, false],
-      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["enter"], text: "hi" }, false],
+      ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi", keys: ["enter"] }, true],
+      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["enter"], text: "hi" }, true],
       ["herdr_jobs", { operation: "list" }, true],
-      ["herdr_jobs", { operation: "list", jobId: "job_1" }, false],
+      ["herdr_jobs", { operation: "list", jobId: "job_1" }, true],
       ["herdr_jobs", { operation: "get", jobId: "job_1", status: "running" }, false],
       ["herdr_pane", { operation: "focus", target: "w:p2" }, true],
-      ["herdr_pane", { operation: "focus", target: "w:p2", label: "worker" }, false],
+      ["herdr_pane", { operation: "focus", target: "w:p2", label: "worker" }, true],
+      ["herdr_pane", { operation: "split", direction: "left" }, true],
       ["herdr_tab", { operation: "focus", target: "w:t" }, true],
-      ["herdr_tab", { operation: "focus", target: "w:t", label: "review" }, false],
+      ["herdr_tab", { operation: "focus", target: "w:t", label: "review" }, true],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5 }, true],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: true }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }, false],
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, true],
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, extra: true }, false],
-      // The typed assignment and the supervision digest are both required.
-      ["herdr_launch", { name: "worker", profile: "worker-pi" }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
+      // The typed assignment and the supervision digest are both required, but
+      // only at runtime: the flat root publishes them as optional.
+      ["herdr_launch", { name: "worker", profile: "worker-pi" }, true],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, true],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } }, true],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, true],
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v", extra: "e" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: [], constraints: ["none"] } }, false],
@@ -199,14 +224,14 @@ describe("MCP published schema parity", () => {
       // required on it exactly as on the explicit variant.
       ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, true],
       ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, placement: { mode: "existing_pane", target: "w:p" } }, true],
-      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" } }, false],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" } }, true],
       ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, extra: true }, false],
-      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, overrides: { model: "m" } }, false],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, overrides: { model: "m" } }, true],
       ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, profile: null }, false],
       ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, profile: "" }, false],
       // A literal profile named "auto" is an ordinary explicit profile.
       ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, profile: "auto" }, true],
-      ["herdr_launch", { name: "task", profile: "worker-pi" }, false]
+      ["herdr_launch", { name: "task", profile: "worker-pi" }, true]
     ];
     for (const [name, args, accepted] of cases) {
       const definition = surface.definitions.find((candidate) => candidate.name === name)!;
@@ -214,8 +239,62 @@ describe("MCP published schema parity", () => {
       const label = `${name} ${JSON.stringify(args)}`;
       expect(Value.Check(published, args), `published: ${label}`).toBe(accepted);
       expect(Value.Check(definition.parameters, args), `validation: ${label}`).toBe(accepted);
-      if (accepted) continue;
+    }
+  });
+
+  it("keeps the union contract at runtime: every contract-invalid call is still INVALID_INPUT", async () => {
+    const surface = realSurface();
+    // Every case the union used to reject — missing required fields, mixed
+    // variant fields, strict-key violations, bad value domains — still fails
+    // with the same code, now enforced by each tool's own validation.
+    const rejected: Array<[string, unknown]> = [
+      ["herdr_inspect", { mode: "context", collection: "panes" }],
+      ["herdr_inspect", { mode: "context", profile: "worker-pi" }],
+      ["herdr_inspect", { mode: "context", target: "w:p2" }],
+      ["herdr_inspect", { mode: "health", target: "w:p2" }],
+      ["herdr_inspect", { mode: "collection", collection: "panes", profile: "worker-pi" }],
+      ["herdr_inspect", { mode: "target" }],
+      ["herdr_inspect", { mode: "profile" }],
+      ["herdr_inspect", { mode: "bogus" }],
+      ["herdr_inspect", { collection: "panes" }],
+      ["herdr_inspect", { mode: "context", extra: true }],
+      ["herdr_communicate", { target: "w:p2", operation: "prompt" }],
+      ["herdr_communicate", { target: "w:p2", operation: "keys" }],
+      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["not-a-supported-key"] }],
+      ["herdr_communicate", { target: "w:p2", operation: "cancel", text: "x" }],
+      ["herdr_communicate", { target: "w:p2", operation: "cancel", extra: true }],
+      ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi", keys: ["enter"] }],
+      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["enter"], text: "hi" }],
+      ["herdr_jobs", { operation: "list", jobId: "job_1" }],
+      ["herdr_jobs", { operation: "get", jobId: "job_1", status: "running" }],
+      ["herdr_pane", { operation: "focus", target: "w:p2", label: "worker" }],
+      ["herdr_pane", { operation: "split", direction: "left" }],
+      ["herdr_pane", { operation: "close" }],
+      ["herdr_tab", { operation: "focus", target: "w:t", label: "review" }],
+      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: true }],
+      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }],
+      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, extra: true }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi" }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" } }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v", extra: "e" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: [], constraints: ["none"] } }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: [] } }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"] } }],
+      ["herdr_launch", { name: "worker", profile: "worker-pi", initialPrompt: "o" }],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" } }],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, extra: true }],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, overrides: { model: "m" } }],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, profile: null }],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, profile: "" }],
+      ["herdr_launch", { name: "task", profile: "worker-pi" }]
+    ];
+    for (const [name, args] of rejected) {
       const outcome = await callTool({ surface, name, args, host, callId: "c", queue: new SequentialToolQueue() });
+      const label = `${name} ${JSON.stringify(args)}`;
       expect(outcome.isError, label).toBe(true);
       expect(payload(outcome).code, label).toBe("INVALID_INPUT");
     }
@@ -236,7 +315,7 @@ describe("MCP argument validation", () => {
     const body = payload(invalid);
     expect(body.code).toBe("INVALID_INPUT");
     expect(body.message).toContain("herdr_inspect");
-    expect((body.details as { errors: unknown[] }).errors).toHaveLength(3);
+    expect((body.details as { errors: unknown[] }).errors).toHaveLength(1);
     expect((body.details as { errors: Array<Record<string, string>> }).errors[0]).toMatchObject({ keyword: expect.any(String) as unknown as string, message: expect.any(String) as unknown as string });
   });
 
@@ -270,7 +349,7 @@ describe("MCP argument validation", () => {
     });
   });
 
-  it("rejects invalid arguments for every union and object schema before execution", async () => {
+  it("rejects invalid arguments for every tool before mutation", async () => {
     const surface = realSurface();
     const rejected: Array<[string, unknown]> = [
       ["herdr_communicate", { target: "w:p2", operation: "prompt" }],

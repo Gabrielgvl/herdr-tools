@@ -922,6 +922,9 @@ describe("herdr_communicate", () => {
     const call = tool.renderCall?.({ target: "reviewer", operation: "prompt", text: "hi" } as never, {} as never, {} as never);
     expect(call?.render(80)).toEqual(["herdr_communicate · prompt · inline · reviewer"]);
     call?.invalidate();
+    const defaultCall = tool.renderCall?.({} as never, {} as never, {} as never);
+    expect(defaultCall?.render(80)).toEqual(["herdr_communicate · communicate · inline"]);
+    defaultCall?.invalidate();
     const result = tool.renderResult?.({ content: [], details: { operation: "prompt", outcome: "sent", delivery: "inline", target: { paneId: "w1:p2" }, preState: {}, postState: { agent_status: "working" }, operationIds: {} }, isError: false } as never, {} as never, {} as never, {} as never);
     expect(result?.render(80)).toEqual(["sent · inline · w1:p2 · working"]);
     result?.invalidate();

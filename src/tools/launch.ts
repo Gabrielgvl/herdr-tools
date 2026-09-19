@@ -17,7 +17,7 @@ import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.j
 import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { expandBatchRequest, type BatchExpansion } from "../launch-batch.js";
-import { LAUNCH_ASSIGNMENT_FIELDS, LaunchParamsSchema, renderAssignment, type AutoLaunchRequest, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
+import { LAUNCH_ASSIGNMENT_FIELDS, PublishedLaunchParamsSchema, renderAssignment, type AutoLaunchRequest, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
 import { projectRouterCatalog, roleForProfile, type RouterResult, type RouterState } from "../router.js";
 import { appendRouterDecision, type AppendRouterLogOptions, type RouterLogEntry, type UnavailableRouterState } from "../router-log.js";
 import { TypeSafeRouter, type RouteOutcome } from "../typesafe-router.js";
@@ -2009,7 +2009,7 @@ function batchManifest(details: LaunchBatchDetails): string {
   return [head, ...lines].join("\n");
 }
 
-export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeof LaunchParamsSchema, LaunchDetails | LaunchBatchDetails> {
+export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeof PublishedLaunchParamsSchema, LaunchDetails | LaunchBatchDetails> {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
 
   /**
@@ -2849,7 +2849,7 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
     name: "herdr_launch",
     label: "Herdr Launch",
     description: "Launch a named Pi, Devin, Claude, or AGY Herdr agent from a strict profile in an explicitly selected pane placement; AGY launches run under reduced-assurance provisional supervision that strengthens after the first prompt.",
-    parameters: LaunchParamsSchema,
+    parameters: PublishedLaunchParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, ctx) {
       // The same discriminator as validateParams: a present `profile` field —
       // even a malformed one — stays explicit; only an absent field is auto.

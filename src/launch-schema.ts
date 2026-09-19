@@ -96,6 +96,32 @@ export const AutoLaunchParamsSchema = Type.Object({
 
 export const LaunchParamsSchema = Type.Union([ProfileLaunchParamsSchema, AutoLaunchParamsSchema]);
 
+/**
+ * Flat publication shape: the pi harness drops every argument of a tool whose
+ * parameters are a root union, so the variants' fields are published as one
+ * optional-all object. `LaunchParamsSchema` stays the internal contract and
+ * `validateParams` in tools/launch.ts stays the enforcement authority —
+ * required fields, the profile/auto discriminator, and per-variant rejections
+ * are all re-derived there. `assignment` keeps strict keys but optional fields;
+ * `supervisionDigest` keeps its required fields when present.
+ */
+export const PublishedLaunchParamsSchema = Type.Object({
+  name: Type.Optional(AgentName),
+  profile: Type.Optional(ProfileName),
+  overrides: Type.Optional(ProfileLaunchOverridesSchema),
+  placement: Type.Optional(LaunchPlacementSchema),
+  label: Type.Optional(Identifier),
+  cwd: Type.Optional(Identifier),
+  focus: Type.Optional(Type.Boolean()),
+  assignment: Type.Optional(Type.Object({
+    objective: Type.Optional(LaunchAssignmentSchema.properties.objective),
+    scope: Type.Optional(LaunchAssignmentSchema.properties.scope),
+    verification: Type.Optional(LaunchAssignmentSchema.properties.verification)
+  }, { additionalProperties: false })),
+  assignmentDelivery: Type.Optional(StringEnum(["inline", "attachment"] as const)),
+  supervisionDigest: Type.Optional(SupervisionDigestSchema)
+}, { additionalProperties: false });
+
 export type LaunchPlacement =
   | { mode: "same_tab" }
   | { mode: "new_tab"; tabLabel: string }

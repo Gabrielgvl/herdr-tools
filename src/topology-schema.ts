@@ -86,6 +86,38 @@ export const TabParamsSchema = Type.Union([
   Type.Object({ operation: Type.Literal("close"), target: Identifier }, { additionalProperties: false })
 ]);
 
+/**
+ * Flat publication shapes: the pi harness drops every argument of a tool whose
+ * parameters are a root union, so the per-operation fields are published as one
+ * optional-all object each. The union schemas stay the internal contract —
+ * each tool's execute checks incoming params against them, so required fields
+ * and per-variant field sets keep their enforcement authority.
+ */
+export const PublishedPaneParamsSchema = Type.Object({
+  operation: Type.Optional(StringEnum(["split", "move", "rename", "focus", "resize", "swap", "zoom", "adopt", "close"] as const)),
+  target: Type.Optional(Identifier),
+  source: Type.Optional(Identifier),
+  label: Type.Optional(Identifier),
+  name: Type.Optional(AgentName),
+  direction: Type.Optional(Direction),
+  destination: Type.Optional(TabDestination),
+  with: Type.Optional(Type.Union([Identifier, Direction])),
+  amount: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+  mode: Type.Optional(StringEnum(["toggle", "on", "off"] as const)),
+  focus: Type.Optional(Focus),
+  cwd: Type.Optional(Identifier),
+  env: Type.Optional(Env)
+}, { additionalProperties: false });
+
+export const PublishedTabParamsSchema = Type.Object({
+  operation: Type.Optional(StringEnum(["create", "rename", "focus", "close"] as const)),
+  target: Type.Optional(Identifier),
+  label: Type.Optional(Identifier),
+  cwd: Type.Optional(Identifier),
+  env: Type.Optional(Env),
+  focus: Type.Optional(Focus)
+}, { additionalProperties: false });
+
 export type DirectionValue = "right" | "down" | "left" | "up";
 export type SplitDirectionValue = "right" | "down";
 export type PaneParams =

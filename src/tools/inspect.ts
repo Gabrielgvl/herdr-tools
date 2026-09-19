@@ -5,7 +5,7 @@ import { contextRebindingDetails, createContextResolver, type ContextResolutionD
 import { projectHandoffEvidence, type HandoffGate, type HandoffInspection, type HandoffUngatedReason } from "../handoff-gate.js";
 import { parseHealth } from "../health.js";
 import { PromptIdentityError } from "../messages/prompt.js";
-import { InspectParamsSchema, type InspectParams } from "../schemas.js";
+import { PublishedInspectParamsSchema, type InspectParams } from "../schemas.js";
 import { resolvePaneOrAgentTarget, type CurrentContext, type HerdrSnapshot } from "../targets.js";
 import { requireWaitTargetIdentity, type WaitTargetIdentity } from "../wait-target-evidence.js";
 import { formatCall, renderResultComponent, textComponent } from "../tui.js";
@@ -461,14 +461,14 @@ async function targetHandoff(deps: InspectDependencies, pane: Record<string, unk
   return projectHandoffEvidence(gate, identity, reason);
 }
 
-export function createInspectTool(deps: InspectDependencies): ToolDefinition<typeof InspectParamsSchema, InspectDetails> {
+export function createInspectTool(deps: InspectDependencies): ToolDefinition<typeof PublishedInspectParamsSchema, InspectDetails> {
   return {
     name: "herdr_inspect",
     label: "Herdr Inspect",
     description: "Inspect exact Herdr context, targets, compact collections, profiles, or health.",
-    parameters: InspectParamsSchema,
-    async execute(_id, params: InspectParams, signal) {
-      const input = params as InspectParams;
+    parameters: PublishedInspectParamsSchema,
+    async execute(_id, rawParams, signal) {
+      const input = rawParams as InspectParams;
       const activeSignal = signal ?? new AbortController().signal;
       const mode = input.mode ?? "context";
       const profileMode = mode === "profile" || (mode === "collection" && input.collection === "profiles");

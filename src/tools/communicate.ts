@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
 import type { HerdrCli, JsonEnvelope } from "../cli.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
 import { adoptUnnamedTarget, LAZY_ADOPT_KINDS, nameOnlyGap } from "../agent-identity.js";
@@ -13,7 +14,7 @@ import { agentFrom, assertSendableState, compactPane, paneFrom, snapshotIdentity
 import { publishedAttachmentMatchesDirectory, type AttachmentStore, type PublishedAttachment } from "../messages/store.js";
 import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
-import { CommunicateParamsSchema, isNamedKey, type CommunicateParams } from "../schemas.js";
+import { CommunicateParamsSchema, isNamedKey, PublishedCommunicateParamsSchema, type CommunicateParams } from "../schemas.js";
 import { resolveTarget, type CurrentContext } from "../targets.js";
 import { executeTurnControl, type TurnControlDetails } from "./turn-control.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
@@ -78,17 +79,19 @@ function operationId(envelope: JsonEnvelope | undefined): string | undefined {
   return envelope?.id;
 }
 
-export function createCommunicateTool(deps: CommunicateDependencies): ToolDefinition<typeof CommunicateParamsSchema, CommunicateDetails> {
+export function createCommunicateTool(deps: CommunicateDependencies): ToolDefinition<typeof PublishedCommunicateParamsSchema, CommunicateDetails> {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   return {
     name: "herdr_communicate",
     label: "Herdr Communicate",
     description: "Send a normal prompt, explicitly steer, send validated named keys, or perform strict cancel/interrupt turn control on an exact Herdr agent target.",
     executionMode: "sequential",
-    parameters: CommunicateParamsSchema,
-    async execute(_id, params: CommunicateParams, signal, _onUpdate, ctx) {
+    parameters: PublishedCommunicateParamsSchema,
+    async execute(_id, rawParams, signal, _onUpdate, ctx) {
       const activeSignal = signal ?? ctx.signal ?? new AbortController().signal;
+      const params = rawParams as CommunicateParams;
       if (params.operation === "cancel" || params.operation === "interrupt") {
+        if (!Value.Check(CommunicateParamsSchema, rawParams)) throw Object.assign(new Error("INVALID_INPUT: arguments do not match the herdr_communicate schema"), { code: "INVALID_INPUT" });
         return executeTurnControl(params, { cli: deps.cli, context: deps.context, contextResolver, preflight: deps.preflight }, activeSignal);
       }
       // Establish the route before any precondition so every refusal names it.
@@ -118,7 +121,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         if (legacyParams.operation === "keys") {
           if (Object.prototype.hasOwnProperty.call(legacyParams, "delivery")) throw Object.assign(new Error("delivery is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "delivery" } });
           if (Object.prototype.hasOwnProperty.call(legacyParams, "kind")) throw Object.assign(new Error("kind is only valid for prompt and steer"), { code: "INVALID_INPUT", details: { field: "kind" } });
-          if (legacyParams.keys.some((key) => !isNamedKey(key))) {
+          if (Array.isArray(legacyParams.keys) && legacyParams.keys.some((key) => !isNamedKey(key))) {
             throw Object.assign(new Error("Unsupported named key"), { code: "KEY_REJECTED" });
           }
         } else {
@@ -127,6 +130,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           if (legacyParams.kind !== undefined && legacyParams.kind !== "result") throw Object.assign(new Error("kind must be result"), { code: "INVALID_INPUT", details: { field: "kind" } });
           assertDeliverySize(legacyParams.text, delivery!);
         }
+        if (!Value.Check(CommunicateParamsSchema, rawParams)) throw Object.assign(new Error("INVALID_INPUT: arguments do not match the herdr_communicate schema"), { code: "INVALID_INPUT" });
 
         phase = "resolve_target";
         if (legacyParams.operation === "keys") await deps.preflight(activeSignal);
@@ -370,7 +374,8 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
     },
     renderCall(args, theme) {
       const delivery = args.operation === "keys" || args.operation === "cancel" || args.operation === "interrupt" ? undefined : args.delivery ?? "inline";
-      return textComponent(formatCall("herdr_communicate", delivery ? `${args.operation} · ${delivery}` : args.operation, args.target), theme, "accent");
+      const operation = args.operation ?? "communicate";
+      return textComponent(formatCall("herdr_communicate", delivery ? `${operation} · ${delivery}` : operation, args.target), theme, "accent");
     },
     renderResult(result, options, theme) {
       return renderResultComponent("communicate", result, options, theme, result.details?.target.paneId);

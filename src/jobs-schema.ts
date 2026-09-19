@@ -21,6 +21,21 @@ export const JobsParamsSchema = Type.Union([
 
 export type JobsParams = Static<typeof JobsParamsSchema>;
 
+/**
+ * Flat publication shape: the pi harness drops every argument of a tool whose
+ * parameters are a root union, so the per-operation fields are published as one
+ * optional-all object. `JobsParamsSchema` stays the internal contract and
+ * `validateJobsParams` stays the enforcement authority.
+ */
+export const PublishedJobsParamsSchema = Type.Object({
+  operation: Type.Optional(StringEnum(["list", "get", "cancel"] as const)),
+  jobId: Type.Optional(JobId),
+  operation_phase: Type.Optional(OperationPhase),
+  kind: Type.Optional(JobKind),
+  offset: Type.Optional(Type.Integer({ minimum: 0 })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 }))
+}, { additionalProperties: false });
+
 function invalid(message: string): never {
   throw Object.assign(new Error(message), { code: "INVALID_INPUT" });
 }

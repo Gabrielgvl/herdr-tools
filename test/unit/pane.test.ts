@@ -494,6 +494,9 @@ describe("herdr_pane", () => {
     const swapCall = tool.renderCall?.({ operation: "swap", source: "p1", with: "right" } as never, {} as never, {} as never);
     expect(swapCall?.render(80)).toEqual(["herdr_pane · swap · p1"]);
     swapCall?.invalidate();
+    const defaultCall = tool.renderCall?.({} as never, {} as never, {} as never);
+    expect(defaultCall?.render(80)).toEqual(["herdr_pane · pane"]);
+    defaultCall?.invalidate();
     call?.invalidate();
     const result = tool.renderResult?.({ content: [], details: { operation: "rename", outcome: "success", paneId: "p2" } } as never, { expanded: false, isPartial: false } as never, {} as never, { isError: false } as never);
     expect(result?.render(80)).toEqual(["pane · p2"]);

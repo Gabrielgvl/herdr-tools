@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { Value } from "typebox/value";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentPromptError } from "../../src/agent-prompt.js";
 import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
 import { errorOutcome } from "../../src/mcp/adapter.js";
-import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchCli, type LaunchClock, type LaunchDependencies } from "../../src/tools/launch.js";
-import { LaunchParamsSchema, renderAssignment, type LaunchAssignment, type LaunchParams, type LaunchRequest } from "../../src/launch-schema.js";
+import { boundedLaunchReconciliationRead, createLaunchTool as createLaunchToolImplementation, LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_MAX_BYTES, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE, validateLaunchParams, type LaunchBatchDetails, type LaunchCli, type LaunchClock, type LaunchDependencies, type LaunchDetails, type LaunchRouter, type LaunchRouterLog } from "../../src/tools/launch.js";
+import { LaunchParamsSchema, ProfileLaunchParamsSchema, renderAssignment, type LaunchAssignment, type LaunchParams, type LaunchRequest } from "../../src/launch-schema.js";
+import type { Abstain, RouteDecision, RouterState } from "../../src/router.js";
 import { createHandoffAllocator, renderHandoffContract, type HandoffAllocation, type HandoffAllocator } from "../../src/handoff.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
@@ -368,7 +369,10 @@ function launch(
     ...(extras.queueFlush === undefined ? {} : { queueFlush: extras.queueFlush }),
     ...(extras.handoffs === undefined ? {} : { handoffs: extras.handoffs })
   });
-  return tool.execute("id", params, new AbortController().signal, undefined, extensionContext);
+  return tool.execute("id", params, new AbortController().signal, undefined, extensionContext).then((result) => {
+    if (result.details?.operation !== "launch") throw new Error("expected a single launch result");
+    return result as AgentToolResult<LaunchDetails>;
+  });
 }
 
 describe("herdr_launch evidence redaction", () => {
@@ -1386,7 +1390,7 @@ describe("herdr_launch profile-only contract", () => {
     });
     const fallbackFailure = await fallbackTool.execute("id", { supervisionDigest: digest(), assignment: assign("go"), name: "worker", profile: "worker", focus: true }, new AbortController().signal, undefined, extensionContext)
       .catch((error: unknown) => error as Error & { code: string; details: Record<string, unknown> });
-    expect((fallbackFailure.details.reconciliation as Record<string, unknown>).readFailures).toEqual(["reconciliation:READ_FAILED"]);
+    expect(((fallbackFailure.details as Record<string, unknown>).reconciliation as Record<string, unknown>).readFailures).toEqual(["reconciliation:READ_FAILED"]);
   });
 
   it("projects fixed reconciliation metadata without reading transcript or output content", async () => {
@@ -2295,8 +2299,8 @@ describe("herdr_launch profile-only contract", () => {
   });
 
   it("rejects raw kind, argv, and env schemas", () => {
-    expect(LaunchParamsSchema).toMatchObject({ type: "object", additionalProperties: false, required: expect.arrayContaining(["name", "profile"]) });
-    expect(LaunchParamsSchema).not.toHaveProperty("anyOf");
+    expect(ProfileLaunchParamsSchema).toMatchObject({ type: "object", additionalProperties: false, required: expect.arrayContaining(["name", "profile"]) });
+    expect(ProfileLaunchParamsSchema).not.toHaveProperty("anyOf");
     for (const value of [
       { name: "worker", kind: "pi" },
       { name: "worker", profile: "worker", argv: ["--model", "x"] },
@@ -2308,7 +2312,7 @@ describe("herdr_launch profile-only contract", () => {
 
   it("requires exactly the typed objective, scope and verification assignment", () => {
     const base = { name: "worker", profile: "worker" };
-    expect(LaunchParamsSchema).toMatchObject({
+    expect(ProfileLaunchParamsSchema).toMatchObject({
       required: expect.arrayContaining(["name", "profile", "assignment"]),
       properties: {
         assignment: {
@@ -2324,9 +2328,9 @@ describe("herdr_launch profile-only contract", () => {
         assignmentDelivery: { enum: ["inline", "attachment"] }
       }
     });
-    expect(LaunchParamsSchema.properties).not.toHaveProperty("initialPrompt");
-    expect(LaunchParamsSchema.properties).not.toHaveProperty("initialPromptDelivery");
-    expect(Object.keys(LaunchParamsSchema.properties.assignment.properties)).toEqual(["objective", "scope", "verification"]);
+    expect(ProfileLaunchParamsSchema.properties).not.toHaveProperty("initialPrompt");
+    expect(ProfileLaunchParamsSchema.properties).not.toHaveProperty("initialPromptDelivery");
+    expect(Object.keys(ProfileLaunchParamsSchema.properties.assignment.properties)).toEqual(["objective", "scope", "verification"]);
 
     const full = assign("objective text");
     for (const value of [
@@ -3317,7 +3321,8 @@ describe("herdr_launch profile-only contract", () => {
     });
     const tool = createLaunchTool({ cli: harness.cli, context, cwd: "/repo", profiles: { load: async () => catalog(profile("worker")) }, attachments: fakeAttachments(), recipients: new RecipientRegistry() });
     await tool.execute("id", { name: "worker", profile: "worker", supervisionDigest: digest(), assignment: assign("phase") }, new AbortController().signal, (update) => {
-      if (typeof update.details?.phase === "string") updates.push(update.details.phase);
+      const phase = (update.details as LaunchDetails | undefined)?.phase;
+      if (typeof phase === "string") updates.push(phase);
     }, extensionContext);
     expect(updates).toContain("ready");
     expect(updates.filter((phase) => phase === "prompt_verification")).toHaveLength(1);
@@ -4331,6 +4336,8 @@ describe("herdr_launch profile-only contract", () => {
     expect(inlineCall?.render(80)).toEqual(["herdr_launch · worker · inline · worker"]);
     const attachmentCall = tool.renderCall?.({ name: "worker", profile: "worker", supervisionDigest: digest(), assignment: assign("go"), assignmentDelivery: "attachment" } as never, {} as never, {} as never);
     expect(attachmentCall?.render(80)).toEqual(["herdr_launch · worker · attachment · worker"]);
+    const autoCall = tool.renderCall?.({ name: "worker", assignment: assign("go") } as never, {} as never, {} as never);
+    expect(autoCall?.render(80)).toEqual(["herdr_launch · auto · inline · worker"]);
   });
 });
 
@@ -4669,19 +4676,21 @@ describe("herdr_launch automatic child supervision", () => {
   });
 
   it("declares a strict required supervision digest in the launch schema and interface", () => {
-    const digestSchema = (LaunchParamsSchema.properties as Record<string, any>).supervisionDigest;
-    expect(digestSchema).toMatchObject({
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        doneWhen: { type: "array", minItems: 1, maxItems: 8, items: { type: "string", minLength: 1, maxLength: 240 } },
-        constraints: { type: "array", minItems: 1, maxItems: 8, items: { type: "string", minLength: 1, maxLength: 240 } },
-      },
-    });
-    // Required: on the required list of every launch variant's shared properties,
-    // and both arrays required inside it.
-    expect(LaunchParamsSchema.required ?? []).toContain("supervisionDigest");
-    expect([...(digestSchema.required ?? [])].sort()).toEqual(["constraints", "doneWhen"]);
+    for (const variant of LaunchParamsSchema.anyOf) {
+      const digestSchema = variant.properties.supervisionDigest;
+      expect(digestSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          doneWhen: { type: "array", minItems: 1, maxItems: 8, items: { type: "string", minLength: 1, maxLength: 240 } },
+          constraints: { type: "array", minItems: 1, maxItems: 8, items: { type: "string", minLength: 1, maxLength: 240 } },
+        },
+      });
+      // Required: on the required list of every launch variant's shared properties,
+      // and both arrays required inside it.
+      expect(variant.required ?? []).toContain("supervisionDigest");
+      expect([...(digestSchema.required ?? [])].sort()).toEqual(["constraints", "doneWhen"]);
+    }
   });
 
   it("validates the supervision digest's bounds and refuses extra fields", () => {
@@ -4842,5 +4851,775 @@ describe("launch acknowledgement proof", () => {
       promptConsumption: "confirmed",
       initialPromptSubmission: { interactiveReady: true, interactiveProof: "detection" }
     });
+  });
+});
+
+/* ======================= auto Batch ======================= */
+
+/**
+ * A multi-child CLI stub for the auto-Batch suite. Unlike `makeCli`, every
+ * split or tab pane carries its own started identity so each sequential child
+ * walks the same launch lifecycle against per-pane authoritative state.
+ */
+function makeBatchCli(options: { calls?: string[][]; promptInputs?: string[]; startFailures?: Map<string, unknown>; promptError?: unknown } = {}) {
+  const calls = options.calls ?? [];
+  const promptInputs = options.promptInputs ?? [];
+  type PaneState = { name?: string; kind?: string; terminalId?: string; session?: Record<string, unknown>; tabId: string; prompted: boolean };
+  const panes = new Map<string, PaneState>();
+  let splits = 0;
+  let tabs = 0;
+  const paneRecord = (paneId: string) => {
+    const pane = panes.get(paneId);
+    if (pane === undefined) throw new CliProtocolError("CLI_PROTOCOL_ERROR", `pane not found: ${paneId}`, { exitCode: 1 });
+    return {
+      pane_id: paneId,
+      tab_id: pane.tabId,
+      workspace_id: "w1",
+      ...(pane.name === undefined ? {} : { agent_name: pane.name }),
+      ...(pane.kind === undefined ? {} : { agent: pane.kind }),
+      ...(pane.terminalId === undefined ? {} : { terminal_id: pane.terminalId }),
+      ...(pane.session === undefined ? {} : { agent_session: pane.session }),
+      agent_status: pane.name === undefined ? "unknown" : pane.prompted ? "working" : "idle",
+      state_change_seq: pane.prompted ? 8 : 7,
+      revision: pane.prompted ? 4 : 3,
+      interactive_ready: pane.name !== undefined
+    };
+  };
+  const agentRecord = (paneId: string) => {
+    const pane = panes.get(paneId);
+    if (pane?.name === undefined || pane.kind === undefined) throw new CliProtocolError("CLI_PROTOCOL_ERROR", `no agent on pane: ${paneId}`, { exitCode: 1 });
+    return { name: pane.name, pane_id: paneId, agent: pane.kind, terminal_id: pane.terminalId, agent_session: pane.session, agent_status: pane.prompted ? "working" : "idle", state_change_seq: pane.prompted ? 8 : 7, revision: pane.prompted ? 4 : 3, interactive_ready: true };
+  };
+  const currentSnapshot = (): HerdrSnapshot => ({
+    ...snapshot,
+    panes: [...snapshot.panes, ...[...panes.keys()].map((paneId) => paneRecord(paneId))],
+    agents: [...snapshot.agents, ...[...panes.keys()].filter((paneId) => panes.get(paneId)?.name !== undefined).map((paneId) => agentRecord(paneId))]
+  });
+  const cli: LaunchCli = {
+    prompt: vi.fn<LaunchCli["prompt"]>(async (target, text) => {
+      calls.push(PROMPT_CALL(target));
+      promptInputs.push(text);
+      if (options.promptError !== undefined) throw options.promptError;
+      const pane = panes.get(target);
+      if (pane?.name === undefined) throw new CliProtocolError("CLI_PROTOCOL_ERROR", `no agent on pane: ${target}`, { exitCode: 1 });
+      pane.prompted = true;
+      return ok("cli:agent:prompt", { type: "agent_prompted", agent: { ...agentRecord(target), agent_status: "idle", interactive_ready: true, revision: 3, state_change_seq: 7, screen_detection_skipped: true } });
+    }),
+    runJson: vi.fn<LaunchCli["runJson"]>(async (argv) => {
+      calls.push(argv);
+      if (argv[0] === "pane" && argv[1] === "current") return ok("current", { type: "pane_current", pane: { pane_id: context.paneId, tab_id: context.tabId, workspace_id: context.workspaceId } });
+      if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: currentSnapshot() });
+      if (argv[0] === "pane" && argv[1] === "split") {
+        const paneId = `w1:p${10 + ++splits}`;
+        panes.set(paneId, { tabId: "w1:t1", prompted: false });
+        return ok("split", { pane: { pane_id: paneId, tab_id: "w1:t1", workspace_id: "w1" } });
+      }
+      if (argv[0] === "pane" && argv[1] === "rename") return ok("rename", {});
+      if (argv[0] === "tab" && argv[1] === "create") {
+        const tabId = `w1:t${10 + ++tabs}`;
+        const paneId = `w1:p${30 + tabs}`;
+        panes.set(paneId, { tabId, prompted: false });
+        return ok("tab", { tab: { tab_id: tabId, workspace_id: "w1" }, root_pane: { pane_id: paneId, tab_id: tabId, workspace_id: "w1" } });
+      }
+      if (argv[0] === "agent" && argv[1] === "start") {
+        const name = String(argv[2]);
+        const kind = String(argv[4]);
+        const paneId = String(argv[6]);
+        const failure = options.startFailures?.get(`${name}|${kind}`) ?? options.startFailures?.get(name);
+        if (failure !== undefined) throw failure;
+        const session = { source: `herdr:${kind}`, agent: kind, kind: "id", value: `session-${name}` };
+        const pane = panes.get(paneId) ?? { tabId: "w1:t1", prompted: false };
+        pane.name = name;
+        pane.kind = kind;
+        pane.terminalId = `terminal-${name}`;
+        pane.session = session;
+        panes.set(paneId, pane);
+        return ok("start", { agent: { name, pane_id: paneId, agent: kind, terminal_id: pane.terminalId, agent_session: session } });
+      }
+      if (argv[0] === "agent" && argv[1] === "focus") return ok("focus", {});
+      if (argv[0] === "pane" && argv[1] === "report-metadata") return ok("metadata", { ok: true });
+      if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: agentRecord(String(argv[2])) });
+      if (argv[0] === "pane" && argv[1] === "get") return ok("get", { pane: paneRecord(String(argv[2])) });
+      if (argv[0] === "tab" && argv[1] === "get") return ok("tab-get", { pane: { pane_id: String(argv[2]), tab_id: panes.get(String(argv[2]))?.tabId ?? "w1:t10", workspace_id: "w1" } });
+      throw new Error(`unexpected argv: ${argv.join(" ")}`);
+    })
+  };
+  return { cli, calls, promptInputs, currentSnapshot };
+}
+
+/** A supervision coordinator that mints a distinct job id per reservation. */
+function batchSupervision() {
+  const reserved: Array<{ agentName: string; jobId: string }> = [];
+  const bound: string[] = [];
+  const released: string[] = [];
+  let jobs = 0;
+  const coordinator: LaunchDependencies["supervision"] = {
+    reserve: async (request) => {
+      const jobId = `job-${++jobs}`;
+      reserved.push({ agentName: request.child.agentName, jobId });
+      return {
+        jobId,
+        bind: async () => { bound.push(jobId); },
+        bindProvisional: async () => { bound.push(`${jobId}-provisional`); },
+        strengthen: async () => undefined,
+        release: (reason) => { released.push(`${jobId}:${reason}`); }
+      };
+    }
+  };
+  return { coordinator, reserved, bound, released };
+}
+
+const batchRoute = (assignments: Array<{ profile: string; count: number; purpose?: string }>): { result: RouteDecision; probabilities: Record<string, never> } => ({
+  result: {
+    kind: "route",
+    assignments: assignments.map(({ profile, count, purpose }) => ({
+      profile,
+      count,
+      purpose: purpose ?? `Perform the ${profile.split("-")[0]} role for the supplied objective.`
+    }))
+  },
+  probabilities: {}
+});
+const batchAbstain = (reason: string): { result: Abstain; probabilities: Record<string, never> } => ({
+  result: { kind: "abstain", reason: reason as Abstain["reason"] },
+  probabilities: {}
+});
+const stubRouter = (outcome: ReturnType<typeof batchRoute> | ReturnType<typeof batchAbstain>, calls: RouterState[] = []) => {
+  const route = vi.fn(async (state: RouterState) => {
+    calls.push(state);
+    return outcome;
+  });
+  return { router: { route } satisfies LaunchRouter, route, calls };
+};
+const stubLog = (entries: Array<{ name: string; state: unknown; result: unknown; probabilities: unknown }> = [], error?: unknown) => {
+  const append = vi.fn(async (entry: { name: string; state: unknown; result: unknown; probabilities: unknown }) => {
+    if (error !== undefined) throw error;
+    entries.push(entry);
+  });
+  return { routerLog: append as unknown as LaunchRouterLog, append, entries };
+};
+
+const autoRequest = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({ name: "task", assignment: assign("go"), supervisionDigest: digest(), ...overrides });
+
+async function batch(
+  params: Record<string, unknown>,
+  profiles: ProfileCatalog | undefined,
+  cli: LaunchCli,
+  extras: {
+    router?: LaunchRouter;
+    routerLog?: LaunchRouterLog;
+    attachments?: AttachmentStore;
+    recipients?: RecipientRegistry;
+    supervision?: LaunchDependencies["supervision"];
+    contextResolver?: LaunchDependencies["contextResolver"];
+    launchGate?: LaunchDependencies["launchGate"];
+    handoffs?: HandoffAllocator;
+    preflight?: LaunchDependencies["preflight"];
+    signal?: AbortSignal;
+    onUpdate?: (update: AgentToolResult<LaunchDetails | LaunchBatchDetails>) => void;
+  } = {}
+) {
+  const tool = createLaunchTool({
+    cli,
+    context,
+    cwd: "/repo",
+    profiles: profiles === undefined ? undefined : { load: async () => profiles },
+    promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) },
+    attachments: extras.attachments ?? fakeAttachments(),
+    recipients: extras.recipients ?? new RecipientRegistry(),
+    ...(extras.supervision === undefined ? {} : { supervision: extras.supervision }),
+    ...(extras.contextResolver === undefined ? {} : { contextResolver: extras.contextResolver }),
+    ...(extras.launchGate === undefined ? {} : { launchGate: extras.launchGate }),
+    ...(extras.handoffs === undefined ? {} : { handoffs: extras.handoffs }),
+    ...(extras.preflight === undefined ? {} : { preflight: extras.preflight }),
+    ...(extras.router === undefined ? {} : { router: extras.router }),
+    ...(extras.routerLog === undefined ? {} : { routerLog: extras.routerLog })
+  });
+  const result = await tool.execute("id", params as never, extras.signal ?? new AbortController().signal, extras.onUpdate, extensionContext);
+  if (result.details?.operation !== "launch_batch") throw new Error("expected a batch result");
+  return result as AgentToolResult<LaunchBatchDetails>;
+}
+
+describe("herdr_launch auto batch", () => {
+  it("explicit mode performs zero Router and zero log calls without an API key", async () => {
+    const harness = makeCli();
+    const routerCalls: RouterState[] = [];
+    const { router, route } = stubRouter(batchRoute([{ profile: "worker", count: 1 }]), routerCalls);
+    const { routerLog, append } = stubLog();
+    const tool = createLaunchTool({
+      cli: harness.cli,
+      context,
+      cwd: "/repo",
+      profiles: { load: async () => catalog(profile("worker")) },
+      promptSources: { create: vi.fn(async () => ({ path: "/cache/body.md" })) },
+      attachments: fakeAttachments(),
+      recipients: new RecipientRegistry(),
+      router,
+      routerLog
+    });
+    const result = await tool.execute("id", { name: "worker", profile: "worker", supervisionDigest: digest(), assignment: assign("go") }, new AbortController().signal, undefined, extensionContext);
+    expect(result.details?.operation).toBe("launch");
+    expect(route).not.toHaveBeenCalled();
+    expect(append).not.toHaveBeenCalled();
+    expect(routerCalls).toHaveLength(0);
+  });
+
+  it("auto performs exactly one Router call and one log append before the first child mutation", async () => {
+    const events: string[] = [];
+    const routerStates: RouterState[] = [];
+    const logEntries: Array<{ name: string; state: unknown; result: unknown; probabilities: unknown }> = [];
+    const harness = makeBatchCli();
+    const mutating = (argv: string[]) =>
+      (argv[0] === "pane" && ["split", "rename", "report-metadata"].includes(String(argv[1]))) ||
+      (argv[0] === "tab" && argv[1] === "create") ||
+      (argv[0] === "agent" && ["start", "focus"].includes(String(argv[1])));
+    const baseRunJson = harness.cli.runJson;
+    harness.cli.runJson = vi.fn<LaunchCli["runJson"]>(async (argv, signal, preserve) => {
+      if (mutating(argv)) events.push(`mutation:${argv.join(" ")}`);
+      return baseRunJson(argv, signal, preserve);
+    });
+    const basePrompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn<LaunchCli["prompt"]>(async (target, text, signal) => {
+      events.push(`mutation:prompt:${target}`);
+      return basePrompt(target, text, signal);
+    });
+    const router: LaunchRouter = { route: vi.fn(async (state) => { events.push("route"); routerStates.push(state); return batchRoute([{ profile: "worker", count: 2 }]); }) };
+    const routerLog: LaunchRouterLog = async (entry) => { events.push("log"); logEntries.push(entry); };
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details?.outcome).toBe("launched");
+    expect(result.details?.children.map((child) => child.name)).toEqual(["task-worker-1", "task-worker-2"]);
+    expect(routerStates).toHaveLength(1);
+    expect(routerStates[0]?.assignment).toEqual(assign("go"));
+    expect(routerStates[0]?.catalog).toEqual([{ name: "worker", description: "worker", runner: "pi", model: "test/model", timeout: 30 }]);
+    expect(logEntries).toHaveLength(1);
+    expect(logEntries[0]?.name).toBe("task");
+    expect(logEntries[0]?.result).toMatchObject({ kind: "route" });
+    const firstMutation = events.findIndex((event) => event.startsWith("mutation:"));
+    expect(events[0]).toBe("route");
+    expect(events[1]).toBe("log");
+    expect(firstMutation).toBeGreaterThan(1);
+  });
+
+  it.each(["low_confidence", "no_assignments", "invalid_response", "authentication_unavailable", "transport_failed", "aborted"] as const)(
+    "abstain %s produces an explicit zero-effect result",
+    async (reason) => {
+      const harness = makeBatchCli();
+      const supervision = batchSupervision();
+      const recipients = new RecipientRegistry();
+      const registerSpy = vi.spyOn(recipients, "register");
+      const allocate = vi.fn(fakeHandoffs().allocate);
+      const { router } = stubRouter(batchAbstain(reason));
+      const { routerLog, entries } = stubLog();
+      const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, {
+        router,
+        routerLog,
+        supervision: supervision.coordinator,
+        recipients,
+        handoffs: { allocate, persist: async () => undefined }
+      });
+      expect(result.details).toMatchObject({ operation: "launch_batch", outcome: "abstained", router: { kind: "abstain", reason }, children: [] });
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.result).toMatchObject({ kind: "abstain", reason });
+      expect(harness.calls).toEqual([]);
+      expect(harness.promptInputs).toEqual([]);
+      expect(supervision.reserved).toEqual([]);
+      expect(allocate).not.toHaveBeenCalled();
+      expect(registerSpy).not.toHaveBeenCalled();
+    }
+  );
+
+  it("an unavailable catalog abstains with the unavailable-state marker and zero effects", async () => {
+    const harness = makeBatchCli();
+    const { router, route } = stubRouter(batchRoute([{ profile: "worker", count: 1 }]));
+    const { routerLog, entries } = stubLog();
+    const result = await batch(autoRequest(), undefined, harness.cli, { router, routerLog });
+    expect(result.details).toMatchObject({ outcome: "abstained", router: { kind: "abstain", reason: "catalog_unavailable" }, children: [] });
+    expect(route).not.toHaveBeenCalled();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.state).toEqual({ status: "unavailable", reason: "catalog_unavailable" });
+    expect(harness.calls).toEqual([]);
+  });
+
+  it("a router-log failure launches zero children but retains the decision", async () => {
+    const harness = makeBatchCli();
+    const supervision = batchSupervision();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog([], new Error("log sink unavailable"));
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, {
+      router,
+      routerLog,
+      supervision: supervision.coordinator
+    });
+    expect(result.details).toMatchObject({
+      operation: "launch_batch",
+      outcome: "failed",
+      router: { kind: "route", assignments: [{ profile: "worker", count: 2 }] },
+      children: [],
+      failure: { code: "ROUTER_LOG_UNAVAILABLE" }
+    });
+    expect(harness.calls).toEqual([]);
+    expect(supervision.reserved).toEqual([]);
+  });
+
+  it("runs children sequentially with exact names, complete evidence, and distinct handoff/supervisor/recipient", async () => {
+    const harness = makeBatchCli();
+    const supervision = batchSupervision();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }, { profile: "scout", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker"), profile("scout")), harness.cli, {
+      router,
+      routerLog,
+      supervision: supervision.coordinator
+    });
+    expect(result.details?.outcome).toBe("launched");
+    const children = result.details?.children ?? [];
+    expect(children.map((child) => [child.name, child.role, child.profile, child.ordinal, child.status])).toEqual([
+      ["task-worker-1", "worker", "worker", 1, "launched"],
+      ["task-worker-2", "worker", "worker", 2, "launched"],
+      ["task-scout-1", "scout", "scout", 1, "launched"]
+    ]);
+    for (const child of children) {
+      expect(child.launch).toMatchObject({ operation: "launch", outcome: "launched", name: child.name, promptSubmitted: true, promptConsumption: "confirmed" });
+    }
+    const paneIds = children.map((child) => child.launch?.paneId);
+    expect(new Set(paneIds).size).toBe(3);
+    const jobIds = children.map((child) => child.launch?.supervision?.jobId);
+    expect(new Set(jobIds).size).toBe(3);
+    const runIds = children.map((child) => child.launch?.handoff?.runId);
+    expect(new Set(runIds).size).toBe(3);
+    const recipientKeys = children.map((child) => child.launch?.recipient?.recipientKey);
+    expect(new Set(recipientKeys).size).toBe(3);
+    // Sequential: the first child's prompt lands before the second child's split.
+    const firstPrompt = harness.calls.findIndex((argv) => argv[0] === "agent" && argv[1] === "prompt");
+    const splits = harness.calls.map((argv, index) => [argv, index] as const).filter(([argv]) => argv[0] === "pane" && argv[1] === "split");
+    expect(splits).toHaveLength(3);
+    expect(splits[1]?.[1]).toBeGreaterThan(firstPrompt);
+    // Every child's rendered assignment keeps scope/verification verbatim plus the instance context.
+    expect(harness.promptInputs).toHaveLength(3);
+    expect(harness.promptInputs[0]).toContain("go\n\nPerform the worker role for the supplied objective.\nInstance 1 of 2 for this role.");
+    expect(harness.promptInputs[1]).toContain("Instance 2 of 2 for this role.");
+    expect(harness.promptInputs[2]).toContain("Perform the scout role");
+    for (const text of harness.promptInputs) {
+      expect(text).toContain("assigned scope");
+      expect(text).toContain("assigned verification");
+    }
+    // The manifest names every child before the verbose details block.
+    const manifest = result.content[0];
+    expect(manifest?.type).toBe("text");
+    if (manifest?.type === "text") {
+      expect(manifest.text).toContain("task-worker-1");
+      expect(manifest.text).toContain("task-worker-2");
+      expect(manifest.text).toContain("task-scout-1");
+      expect(manifest.text).toContain("requested=worker");
+      expect(manifest.text).toContain("outcome=launched");
+    }
+  });
+
+  it("continues unaffected children after a failure with no close or rollback", async () => {
+    const harness = makeBatchCli({ startFailures: new Map([["task-worker-2", new CliProtocolError("CLI_PROTOCOL_ERROR", "transport lost", { exitCode: 1 })]]) });
+    const supervision = batchSupervision();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }, { profile: "scout", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker"), profile("scout")), harness.cli, {
+      router,
+      routerLog,
+      supervision: supervision.coordinator
+    });
+    expect(result.details?.outcome).toBe("partial");
+    const children = result.details?.children ?? [];
+    expect(children).toHaveLength(3);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]?.status).toBe("failed");
+    expect(children[1]?.failure?.code).toBeDefined();
+    expect(children[2]).toMatchObject({ name: "task-scout-1", status: "launched" });
+    // No rollback: nothing issues a close for the surviving or failed children.
+    expect(harness.calls.filter((argv) => argv[1] === "close" || argv.includes("close"))).toEqual([]);
+    // The failed child fell back to nothing: only one start attempt per child name.
+    expect(harness.calls.filter((argv) => argv[0] === "agent" && argv[1] === "start" && argv[2] === "task-worker-2")).toHaveLength(1);
+  });
+
+  it("does not fall back on non-envelope start errors inside a child", async () => {
+    const harness = makeBatchCli({ startFailures: new Map([["task-primary-1", new CliProtocolError("CLI_PROTOCOL_ERROR", "transport lost", { exitCode: 1 })]]) });
+    const { router } = stubRouter(batchRoute([{ profile: "primary", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("primary", "pi", ["fallback"]), profile("fallback")), harness.cli, { router, routerLog });
+    expect(result.details?.children[0]).toMatchObject({ name: "task-primary-1", status: "failed" });
+    expect(harness.calls.filter((argv) => argv[0] === "agent" && argv[1] === "start")).toHaveLength(1);
+  });
+
+  it("enters the Router-selected profile as the head of only its own fallback chain", async () => {
+    const harness = makeBatchCli({ startFailures: new Map([["task-worker-1|pi", startFailure()]]) });
+    const { router } = stubRouter(batchRoute([{ profile: "worker-pi", count: 1 }, { profile: "scout-pi", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(
+      autoRequest(),
+      catalog(profile("worker-pi", "pi", ["worker-claude"]), profile("worker-claude", "claude"), profile("scout-pi")),
+      harness.cli,
+      { router, routerLog }
+    );
+    const children = result.details?.children ?? [];
+    expect(children[0]?.status).toBe("launched");
+    expect(children[0]?.launch?.profile?.attempts).toEqual([
+      { profile: "worker-pi", outcome: "agent_start_failed", errorCode: "agent_start_failed", message: "agent process exited before becoming interactive", postState: { pane_id: "w1:p11", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown", state_change_seq: 7 } },
+      { profile: "worker-claude", outcome: "selected" }
+    ]);
+    expect(children[0]?.launch?.profile?.selected).toBe("worker-claude");
+    // The sibling chain stayed its own: scout-pi was never pulled into worker's chain.
+    expect(children[1]?.launch?.profile?.attempts).toEqual([{ profile: "scout-pi", outcome: "selected" }]);
+    const startKinds = harness.calls.filter((argv) => argv[0] === "agent" && argv[1] === "start").map((argv) => [argv[2], argv[4]]);
+    expect(startKinds).toEqual([["task-worker-1", "pi"], ["task-worker-1", "claude"], ["task-scout-1", "pi"]]);
+  });
+
+  it("launches an AGY selection per child through the provisional path", async () => {
+    const harness = makeBatchCli();
+    const { router } = stubRouter(batchRoute([{ profile: "scout-agy", count: 1 }, { profile: "worker", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("scout-agy", "agy"), profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details?.outcome).toBe("launched");
+    const children = result.details?.children ?? [];
+    // The AGY provisional-launch restoration retired AGY_UNQUALIFIED: an AGY
+    // child takes the same per-child lifecycle, strengthened to active
+    // supervision after its native session is proven.
+    expect(children[0]).toMatchObject({ name: "task-scout-1", profile: "scout-agy", status: "launched" });
+    expect(children[0]?.launch?.supervision).toMatchObject({ state: "active", child: { agentKind: "agy" } });
+    expect(children[1]).toMatchObject({ name: "task-worker-1", status: "launched" });
+  });
+
+  it("rechecks the launch freeze before every child", async () => {
+    const harness = makeBatchCli();
+    let leases = 0;
+    const launchGate: LaunchDependencies["launchGate"] = async () => {
+      const mine = ++leases;
+      return {
+        check: async () => {
+          if (mine >= 3) throw Object.assign(new Error("frozen"), { code: "PROFILE_LAUNCH_FROZEN" });
+        },
+        release: async () => undefined
+      };
+    };
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 3 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, { router, routerLog, launchGate });
+    const children = result.details?.children ?? [];
+    expect(children).toHaveLength(3);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ status: "failed", failure: { code: "PROFILE_LAUNCH_FROZEN" } });
+    expect(children[2]).toMatchObject({ status: "failed", failure: { code: "PROFILE_LAUNCH_FROZEN" } });
+    expect(result.details?.outcome).toBe("partial");
+  });
+
+  it("marks the undispatched tail not_started after a mid-batch abort", async () => {
+    const harness = makeBatchCli();
+    const controller = new AbortController();
+    let leases = 0;
+    // The outer preflight lease releases before routing; the first child's
+    // release aborts the caller so the loop sees the signal between children.
+    const launchGate: LaunchDependencies["launchGate"] = async () => {
+      const mine = ++leases;
+      return {
+        check: async () => undefined,
+        release: async () => { if (mine === 2) controller.abort(); }
+      };
+    };
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 3 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, {
+      router,
+      routerLog,
+      launchGate,
+      signal: controller.signal
+    });
+    const children = result.details?.children ?? [];
+    expect(children).toHaveLength(3);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ name: "task-worker-2", status: "not_started", code: "ABORTED" });
+    expect(children[2]).toMatchObject({ name: "task-worker-3", status: "not_started", code: "ABORTED" });
+    expect(result.details?.outcome).toBe("partial");
+    // Only the first child dispatched a topology mutation.
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("detects a label collision against the fresh snapshot immediately before a child", async () => {
+    const harness = makeBatchCli();
+    const collided: HerdrSnapshot = {
+      ...snapshot,
+      panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "task-worker-2", agent_status: "idle" }],
+      agents: []
+    };
+    const snapshots = [snapshot, snapshot, collided];
+    let reads = 0;
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: snapshots[Math.min(reads++, snapshots.length - 1)]!,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, { router, routerLog, contextResolver });
+    const children = result.details?.children ?? [];
+    expect(children).toHaveLength(2);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ name: "task-worker-2", status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    // The collided child never mutated topology.
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("detects a derived-label collision against the fresh snapshot immediately before a child", async () => {
+    const harness = makeBatchCli();
+    const collided: HerdrSnapshot = {
+      ...snapshot,
+      panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "lbl-worker-2", agent_status: "idle" }],
+      agents: []
+    };
+    const snapshots = [snapshot, snapshot, collided];
+    let reads = 0;
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: snapshots[Math.min(reads++, snapshots.length - 1)]!,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ label: "lbl" }), catalog(profile("worker")), harness.cli, { router, routerLog, contextResolver });
+    const children = result.details?.children ?? [];
+    expect(children).toHaveLength(2);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ name: "task-worker-2", status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    // The collided child never mutated topology.
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("fails a child whose derived label collides with an existing pane label before any effect", async () => {
+    const harness = makeBatchCli();
+    const taken: HerdrSnapshot = {
+      ...snapshot,
+      panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "lbl-worker-2", agent_status: "idle" }]
+    };
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: taken,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ label: "lbl" }), catalog(profile("worker")), harness.cli, { router, routerLog, contextResolver });
+    const children = result.details?.children ?? [];
+    expect(children.map((child) => child.name)).toEqual(["task-worker-1", "task-worker-2"]);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    expect(result.details?.outcome).toBe("partial");
+    // The collided child was never dispatched: only its sibling split.
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("fails a child whose derived label collides with an existing agent name before any effect", async () => {
+    const harness = makeBatchCli();
+    const taken: HerdrSnapshot = {
+      ...snapshot,
+      agents: [{ name: "lbl-worker-2", pane_id: "w1:p7", agent: "pi", agent_status: "idle" } as HerdrSnapshot["agents"][number]]
+    };
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: taken,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ label: "lbl" }), catalog(profile("worker")), harness.cli, { router, routerLog, contextResolver });
+    const children = result.details?.children ?? [];
+    expect(children.map((child) => child.name)).toEqual(["task-worker-1", "task-worker-2"]);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toHaveLength(1);
+  });
+
+  it("launches labelled children and applies each derived pane label unchanged", async () => {
+    const harness = makeBatchCli();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ label: "lbl" }), catalog(profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details?.outcome).toBe("launched");
+    expect(result.details?.children.map((child) => child.name)).toEqual(["task-worker-1", "task-worker-2"]);
+    const renames = harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "rename");
+    expect(renames.map((argv) => argv[3])).toEqual(["lbl-worker-1", "lbl-worker-2"]);
+  });
+
+  it("fails an overlong child name without truncating or renaming", async () => {
+    const harness = makeBatchCli();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest({ name: "a".repeat(24) }), catalog(profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details?.outcome).toBe("failed");
+    expect(result.details?.children).toEqual([
+      { name: `${"a".repeat(24)}-worker-1`, role: "worker", profile: "worker", ordinal: 1, status: "failed", failure: { code: "BATCH_CHILD_NAME_INVALID", details: { code: "BATCH_CHILD_NAME_INVALID", message: expect.any(String) } } }
+    ]);
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toEqual([]);
+  });
+
+  it("rejects a multi-child existing-pane batch before any effect", async () => {
+    const harness = makeBatchCli();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(
+      autoRequest({ placement: { mode: "existing_pane", target: "w1:p1" } }),
+      catalog(profile("worker")),
+      harness.cli,
+      { router, routerLog }
+    );
+    expect(result.details).toMatchObject({ outcome: "failed", failure: { code: "BATCH_PLACEMENT_INVALID" }, children: [] });
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toEqual([]);
+  });
+
+  it("launches a single child into the resolved existing pane", async () => {
+    const harness = makeBatchCli();
+    const withTarget: HerdrSnapshot = {
+      ...snapshot,
+      panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "existing", agent_status: "idle" }]
+    };
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: withTarget,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(
+      autoRequest({ placement: { mode: "existing_pane", target: "w1:p9" } }),
+      catalog(profile("worker")),
+      harness.cli,
+      { router, routerLog, contextResolver }
+    );
+    expect(result.details?.outcome).toBe("launched");
+    expect(result.details?.children[0]).toMatchObject({ name: "task-worker-1", status: "launched" });
+    expect(result.details?.children[0]?.launch?.paneId).toBe("w1:p9");
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "split")).toEqual([]);
+  });
+
+  it("reports failed when every child fails", async () => {
+    const harness = makeBatchCli({ startFailures: new Map([["task-worker-1", new CliProtocolError("CLI_PROTOCOL_ERROR", "transport lost", { exitCode: 1 })], ["task-worker-2", new CliProtocolError("CLI_PROTOCOL_ERROR", "transport lost", { exitCode: 1 })]]) });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details?.outcome).toBe("failed");
+    expect(result.details?.children).toHaveLength(2);
+    expect(result.details?.children.every((child) => child.status === "failed")).toBe(true);
+    const manifest = result.content[0];
+    if (manifest?.type === "text") {
+      expect(manifest.text).toContain("task-worker-1");
+      expect(manifest.text).toContain("task-worker-2");
+    }
+  });
+
+  it("a route with zero assignments fails with zero effects and a complete manifest", async () => {
+    const harness = makeBatchCli();
+    const { router } = stubRouter({ result: { kind: "route", assignments: [] }, probabilities: {} });
+    const { routerLog, entries } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details).toMatchObject({ outcome: "failed", router: { kind: "route", assignments: [] }, children: [], failure: { code: "BATCH_ROUTE_EMPTY" } });
+    expect(entries).toHaveLength(1);
+    // Context resolution reads are allowed; no mutating call may be issued.
+    expect(harness.calls.filter((argv) => !(argv[0] === "api" || (argv[0] === "pane" && argv[1] === "current")))).toEqual([]);
+  });
+
+  it("keeps every tail entry in order and in the manifest even when one child fails expansion", async () => {
+    const harness = makeBatchCli();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }, { profile: "scout", count: 1 }]));
+    const { routerLog } = stubLog();
+    // Force the middle child to collide with a pre-existing agent name at expansion time.
+    const taken: HerdrSnapshot = {
+      ...snapshot,
+      agents: [{ name: "task-worker-2", pane_id: "w1:p7", agent: "pi", agent_status: "idle" } as HerdrSnapshot["agents"][number]]
+    };
+    const contextResolver: LaunchDependencies["contextResolver"] = async () => ({
+      context,
+      snapshot: taken,
+      diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 },
+      operationIds: { current: "current", snapshot: "snapshot" }
+    });
+    const result = await batch(autoRequest(), catalog(profile("worker"), profile("scout")), harness.cli, { router, routerLog, contextResolver });
+    const children = result.details?.children ?? [];
+    expect(children.map((child) => child.name)).toEqual(["task-worker-1", "task-worker-2", "task-scout-1"]);
+    expect(children[0]?.status).toBe("launched");
+    expect(children[1]).toMatchObject({ status: "failed", failure: { code: "BATCH_NAME_COLLISION" } });
+    expect(children[2]?.status).toBe("launched");
+    const manifest = result.content[0];
+    if (manifest?.type === "text") {
+      expect(manifest.text).toContain("task-worker-1");
+      expect(manifest.text).toContain("task-worker-2");
+      expect(manifest.text).toContain("task-scout-1");
+    }
+    expect(result.details?.outcome).toBe("partial");
+  });
+
+  it("keeps every child when one Role expands across multiple profiles", async () => {
+    const harness = makeBatchCli();
+    // Role ordinals count across assignments sharing the role prefix, so the
+    // claude sibling is worker-2, not a second worker-1.
+    const { router } = stubRouter(batchRoute([{ profile: "worker-pi", count: 1 }, { profile: "worker-claude", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker-pi"), profile("worker-claude", "claude")), harness.cli, { router, routerLog });
+    const children = result.details?.children ?? [];
+    expect(children.map((child) => [child.name, child.profile, child.ordinal, child.status])).toEqual([
+      ["task-worker-1", "worker-pi", 1, "launched"],
+      ["task-worker-2", "worker-claude", 2, "launched"]
+    ]);
+    expect(result.details?.outcome).toBe("launched");
+  });
+
+  it("refuses before routing when the request itself is invalid", async () => {
+    const harness = makeBatchCli();
+    const { router, route } = stubRouter(batchRoute([{ profile: "worker", count: 1 }]));
+    const { routerLog, append } = stubLog();
+    await expect(batch(autoRequest({ unknownField: true }), catalog(profile("worker")), harness.cli, { router, routerLog })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(route).not.toHaveBeenCalled();
+    expect(append).not.toHaveBeenCalled();
+    expect(harness.calls).toEqual([]);
+  });
+
+  it("refuses before routing when the outer launch gate is frozen", async () => {
+    const harness = makeBatchCli();
+    const { router, route } = stubRouter(batchRoute([{ profile: "worker", count: 1 }]));
+    const { routerLog, append } = stubLog();
+    const launchGate: LaunchDependencies["launchGate"] = async () => ({
+      check: async () => { throw Object.assign(new Error("frozen"), { code: "PROFILE_LAUNCH_FROZEN" }); },
+      release: async () => undefined
+    });
+    await expect(batch(autoRequest(), catalog(profile("worker")), harness.cli, { router, routerLog, launchGate })).rejects.toMatchObject({ code: "PROFILE_LAUNCH_FROZEN" });
+    expect(route).not.toHaveBeenCalled();
+    expect(append).not.toHaveBeenCalled();
+    expect(harness.calls).toEqual([]);
+  });
+
+  it("keeps raw failure evidence free of environment-shaped secrets", async () => {
+    const secretCarrier = Object.assign(new Error("cli exploded"), {
+      code: "CLI_PROTOCOL_ERROR",
+      details: { environment: { SECRET_KEY: "s3cr3t-value" }, exitCode: 1, stderr: "boom" }
+    });
+    const harness = makeBatchCli({ startFailures: new Map([["task-worker-1", secretCarrier]]) });
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 1 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details?.children[0]?.status).toBe("failed");
+    expect(JSON.stringify(result.details)).not.toContain("s3cr3t-value");
+    expect(JSON.stringify(result.content)).not.toContain("s3cr3t-value");
+  });
+
+  it("launches children that exact wait/communicate/close resolvers can find", async () => {
+    const harness = makeBatchCli();
+    const { router } = stubRouter(batchRoute([{ profile: "worker", count: 2 }]));
+    const { routerLog } = stubLog();
+    const result = await batch(autoRequest(), catalog(profile("worker")), harness.cli, { router, routerLog });
+    expect(result.details?.outcome).toBe("launched");
+    const postSnapshot = harness.currentSnapshot();
+    const { resolveTarget } = await import("../../src/targets.js");
+    for (const child of result.details?.children ?? []) {
+      const resolved = resolveTarget(postSnapshot, child.name, "agent", context);
+      expect(resolved).toMatchObject({ kind: "agent", agentName: child.name, paneId: child.launch?.paneId });
+    }
   });
 });

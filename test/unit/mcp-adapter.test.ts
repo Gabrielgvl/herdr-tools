@@ -101,6 +101,16 @@ describe("MCP input schema publication", () => {
     expect(published.anyOf.every((variant) => variant.additionalProperties === false)).toBe(true);
   });
 
+  it("publishes herdr_launch as an object root over two strict variants", () => {
+    const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
+    const published = publishedInputSchema(definition.parameters) as { type: string; anyOf: Array<Record<string, unknown>>; additionalProperties?: unknown };
+    expect(published.type).toBe("object");
+    expect(published.anyOf).toHaveLength(2);
+    expect(published.anyOf.every((variant) => variant.additionalProperties === false)).toBe(true);
+    // A root additionalProperties:false would reject every argument object.
+    expect(published.additionalProperties).toBeUndefined();
+  });
+
   it("refuses any other root shape instead of publishing a permissive schema", () => {
     expect(() => publishedInputSchema(Type.String())).toThrowError(AdapterContractError);
     expect(() => publishedInputSchema(Type.Array(Type.String()))).toThrowError(AdapterContractError);
@@ -184,7 +194,19 @@ describe("MCP published schema parity", () => {
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: [], constraints: ["none"] } }, false],
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: [] } }, false],
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"] } }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", initialPrompt: "o" }, false]
+      ["herdr_launch", { name: "worker", profile: "worker-pi", initialPrompt: "o" }, false],
+      // The auto Batch variant: an assignment and no profile. The digest is
+      // required on it exactly as on the explicit variant.
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, true],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, placement: { mode: "existing_pane", target: "w:p" } }, true],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" } }, false],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, extra: true }, false],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, overrides: { model: "m" } }, false],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, profile: null }, false],
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, profile: "" }, false],
+      // A literal profile named "auto" is an ordinary explicit profile.
+      ["herdr_launch", { name: "task", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] }, profile: "auto" }, true],
+      ["herdr_launch", { name: "task", profile: "worker-pi" }, false]
     ];
     for (const [name, args, accepted] of cases) {
       const definition = surface.definitions.find((candidate) => candidate.name === name)!;
@@ -340,6 +362,36 @@ describe("MCP result mapping", () => {
     expect(multibyteEnvelope.preview.startsWith('{"blob":"🐑')).toBe(true);
     expect(multibyte.content[0]!.text).not.toContain("�");
     expect(outcomeBytes(multibyte)).toBeLessThanOrEqual(MCP_RESULT_MAX_BYTES);
+  });
+
+  it("keeps a complete all-child batch manifest when verbose details exceed the bound", async () => {
+    // The batch result contract: the compact manifest leads the content so a
+    // bounded response can never masquerade as a smaller fan-out.
+    const names = Array.from({ length: 20 }, (_, index) => `task-worker-${index + 1}`);
+    const manifest = [
+      `herdr_launch batch outcome=launched router=route assignments=1 children=${names.length}`,
+      ...names.map((name, index) => `- ${name} requested=worker outcome=launched pane=w1:p${index + 10} supervisor=job-${index + 1}`)
+    ].join("\n");
+    const details = {
+      operation: "launch_batch",
+      outcome: "launched",
+      router: { kind: "route", assignments: [{ profile: "worker", count: names.length, purpose: "Perform the worker role." }] },
+      children: names.map((name, index) => ({
+        name,
+        role: "worker",
+        profile: "worker",
+        ordinal: index + 1,
+        status: "launched",
+        launch: { operation: "launch", outcome: "launched", paneId: `w1:p${index + 10}`, supervision: { jobId: `job-${index + 1}` }, postState: { blob: "x".repeat(4_000) } }
+      }))
+    };
+    const outcome = await call(stub({ execute: async () => ({ content: [{ type: "text", text: manifest }], details }) }));
+    // Every expanded child is still named in the leading block, verbatim.
+    expect(outcome.content[0]!.text).toBe(manifest);
+    for (const name of names) expect(outcome.content[0]!.text).toContain(name);
+    const envelope = detailsOf(outcome) as { truncated: boolean };
+    expect(envelope.truncated).toBe(true);
+    expect(outcomeBytes(outcome)).toBeLessThanOrEqual(MCP_RESULT_MAX_BYTES);
   });
 
   it("keeps every details block parseable at and around the block boundary", async () => {

@@ -4,5 +4,6 @@ dist/
 .herdr-locks/
 coverage/
 .reviewer-benchmark/
+.herdr/
 .env
 .env.*

@@ -57,7 +57,7 @@ function reviewerFor(fetchCall: FetchCall): TypeSafeSupervisionReviewer {
   return new TypeSafeSupervisionReviewer({ apiKey: "key", fetch: fetchCall });
 }
 
-function bodyOf(calls: Array<{ init?: RequestInit }>): Record<string, any> {
+function bodyOf(calls: Array<{ init?: RequestInit }>) {
   return JSON.parse(calls[0]!.init!.body as string);
 }
 

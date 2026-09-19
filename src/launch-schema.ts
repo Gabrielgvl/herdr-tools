@@ -75,13 +75,26 @@ const LaunchCommonProperties = {
   supervisionDigest: SupervisionDigestSchema
 };
 
-const ProfileLaunchParamsSchema = Type.Object({
+/**
+ * Explicit request: a named Profile is the single-child launch path and the
+ * only variant that may carry `overrides`, because they apply to that Profile.
+ */
+export const ProfileLaunchParamsSchema = Type.Object({
   ...LaunchCommonProperties,
   profile: ProfileName,
   overrides: Type.Optional(ProfileLaunchOverridesSchema)
 }, { additionalProperties: false });
 
-export const LaunchParamsSchema = ProfileLaunchParamsSchema;
+/**
+ * Auto (Batch) request: an assignment with no `profile`. The Router chooses
+ * Role, Profile, and fan-out, so there is no `profile` and no `overrides` --
+ * no primary Profile has been named to receive them.
+ */
+export const AutoLaunchParamsSchema = Type.Object({
+  ...LaunchCommonProperties
+}, { additionalProperties: false });
+
+export const LaunchParamsSchema = Type.Union([ProfileLaunchParamsSchema, AutoLaunchParamsSchema]);
 
 export type LaunchPlacement =
   | { mode: "same_tab" }
@@ -100,6 +113,9 @@ export interface ProfileLaunchOverrides {
 }
 
 export type LaunchParams = Static<typeof LaunchParamsSchema>;
+
+/** Batch request: the strict auto variant of the public launch schema. */
+export type AutoLaunchRequest = Static<typeof AutoLaunchParamsSchema>;
 
 export interface LaunchAssignment {
   objective: string;

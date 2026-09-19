@@ -1,0 +1,328 @@
+# Herdr category catalog (ADR-035). The spec launch path resolves a caller's
+# optional `category` into the first eligible, quota-available chain candidate;
+# the remainder is the pre-execution fallback. Pools are the reviewed resource
+# sets Jev may select from — never a grant by themselves.
+version: 1
+
+# ADR-026's ratified four-attempt bound, carried forward as the declared chain
+# depth (plan R4). A chain longer than this fails closed; it is never truncated.
+maxAttempts: 4
+
+categories:
+  frontier:
+    - runner: devin
+      model: swe-2-max
+    - runner: claude
+      model: claude-fable-5
+    - runner: pi
+      model: openai-codex/gpt-6-astra
+    - runner: claude
+      model: claude-opus-5
+  balanced:
+    - runner: claude
+      model: claude-opus-5
+    - runner: pi
+      model: openai-codex/gpt-5.6-sol
+    - runner: devin
+      model: swe-2-max
+    - runner: pi
+      model: openai-codex/gpt-5.6-luna
+  cheap:
+    - runner: agy
+      model: gemini-3.8-flash-low
+    - runner: pi
+      model: openai-codex/gpt-5.6-luna
+    - runner: claude
+      model: claude-sonnet-5
+    - runner: agy
+      model: gemini-3.8-flash-high
+
+# Reviewed skill trees (Pi `--skill` units), relative to the package root.
+skills:
+  - herdr-profiles/pi-skills/context-mode
+  - herdr-profiles/pi-skills/tmux-background-tasks
+  - herdr-profiles/profile-plugins/executor/skills/executor
+  - herdr-profiles/profile-plugins/manager/skills/decision-batch
+  - herdr-profiles/profile-plugins/manager/skills/delivery-assurance
+  - herdr-profiles/profile-plugins/manager/skills/engineering-project-manager
+  - herdr-profiles/profile-plugins/manager/skills/harness-flow
+  - herdr-profiles/profile-plugins/manager/skills/herdr-manager
+  - herdr-profiles/profile-plugins/manager/skills/manager
+  - herdr-profiles/profile-plugins/manager/skills/oracle
+  - herdr-profiles/profile-plugins/manager/skills/pi-review-pr
+  - herdr-profiles/role-plugins/manager/skills/harness-flow
+  - herdr-profiles/role-plugins/manager/skills/manager
+  - herdr-profiles/role-plugins/planner/skills/adr
+  - herdr-profiles/role-plugins/planner/skills/blueprint
+  - herdr-profiles/role-plugins/planner/skills/delivery-assurance
+  - herdr-profiles/role-plugins/planner/skills/engineering-project-manager
+  - herdr-profiles/role-plugins/planner/skills/humanizer
+  - herdr-profiles/role-plugins/planner/skills/planner
+  - herdr-profiles/role-plugins/planner/skills/ponytail
+  - herdr-profiles/role-plugins/planner/skills/ticket-writer
+  - herdr-profiles/role-plugins/promoter/skills/authenticated-staging-smoke
+  - herdr-profiles/role-plugins/promoter/skills/courier-pr-gates
+  - herdr-profiles/role-plugins/promoter/skills/delivery-assurance
+  - herdr-profiles/role-plugins/promoter/skills/dev-evidence-gate
+  - herdr-profiles/role-plugins/promoter/skills/git-flow
+  - herdr-profiles/role-plugins/promoter/skills/promoter
+  - herdr-profiles/role-plugins/promoter/skills/release-pr-validation
+  - herdr-profiles/role-plugins/promoter/skills/services-ci-gates
+  - herdr-profiles/role-plugins/promoter/skills/shared-dev-deploy
+  - herdr-profiles/role-plugins/researcher/skills/humanizer
+  - herdr-profiles/role-plugins/researcher/skills/researcher
+  - herdr-profiles/role-plugins/reviewer/skills/adr
+  - herdr-profiles/role-plugins/reviewer/skills/delivery-assurance
+  - herdr-profiles/role-plugins/reviewer/skills/oracle
+  - herdr-profiles/role-plugins/reviewer/skills/pi-review-pr
+  - herdr-profiles/role-plugins/reviewer/skills/ponytail
+  - herdr-profiles/role-plugins/reviewer/skills/reviewer
+  - herdr-profiles/role-plugins/reviewer/skills/typescript
+  - herdr-profiles/role-plugins/scout/skills/scout
+  - herdr-profiles/role-plugins/worker/skills/adr
+  - herdr-profiles/role-plugins/worker/skills/delivery-assurance
+  - herdr-profiles/role-plugins/worker/skills/git-flow
+  - herdr-profiles/role-plugins/worker/skills/ponytail
+  - herdr-profiles/role-plugins/worker/skills/tdd
+  - herdr-profiles/role-plugins/worker/skills/typescript
+  - herdr-profiles/role-plugins/worker/skills/worker
+
+# Reviewed plugin roots (Claude `--plugin-dir` units). Claude skill/MCP loading
+# is additive on top of ambient config — not isolation.
+plugins:
+  - herdr-profiles/profile-plugins/executor
+  - herdr-profiles/profile-plugins/manager
+  - herdr-profiles/role-plugins/planner
+  - herdr-profiles/role-plugins/promoter
+  - herdr-profiles/role-plugins/researcher
+  - herdr-profiles/role-plugins/reviewer
+  - herdr-profiles/role-plugins/scout
+  - herdr-profiles/role-plugins/worker
+
+# Reviewed MCP servers, keyed by server name with the plugin that provides it.
+mcp:
+  herdr:
+    plugin: herdr-tools
+  executor:
+    plugin: herdr-executor
+
+runners:
+  pi:
+    models:
+      - openai-codex/gpt-5.6-luna
+      - openai-codex/gpt-5.6-sol
+      - openai-codex/gpt-6-astra
+    quota:
+      provider: openai-codex
+      billingProduct: codex
+      account: primary
+      scope: account
+    defaults:
+      thinking: high
+      timeoutMinutes: 30
+      sessionPersistence: true
+    plumbing:
+      sessionPersistence: optional
+      promptDelivery: file
+      skillSelection: exact
+      toolSelection: allowlist
+    pools:
+      # Union of every pi profile's tool allowlist, including the Codex adapter
+      # surface (the adapter deactivates itself if any owned tool is missing).
+      tools:
+        - read
+        - bash
+        - bash_bg
+        - grep
+        - find
+        - ls
+        - edit
+        - write
+        - ask_user_question
+        - mcp
+        - ffgrep
+        - fffind
+        - ctx_execute
+        - ctx_execute_file
+        - ctx_search
+        - web_search
+        - source_check
+        - fetch_content
+        - get_search_content
+        - executor_execute
+        - executor_skills
+        - executor_resume
+        - herdr_inspect
+        - herdr_launch
+        - herdr_communicate
+        - herdr_wait
+        - herdr_jobs
+        - herdr_pane
+        - herdr_tab
+        - jobs
+        - job_decide
+        - monitor
+        - change_reasoning
+        - exec_command
+        - write_stdin
+        - apply_patch
+        - exec
+        - wait
+        - notebook
+        - view_image
+        - new_context
+        - get_context_remaining
+        - history
+        - notes
+      # The reviewed Pi extension set is empty today.
+      extensions: []
+      skills:
+        - herdr-profiles/pi-skills/context-mode
+        - herdr-profiles/pi-skills/tmux-background-tasks
+        - herdr-profiles/profile-plugins/executor/skills/executor
+        - herdr-profiles/profile-plugins/manager/skills/decision-batch
+        - herdr-profiles/profile-plugins/manager/skills/delivery-assurance
+        - herdr-profiles/profile-plugins/manager/skills/engineering-project-manager
+        - herdr-profiles/profile-plugins/manager/skills/harness-flow
+        - herdr-profiles/profile-plugins/manager/skills/herdr-manager
+        - herdr-profiles/profile-plugins/manager/skills/manager
+        - herdr-profiles/profile-plugins/manager/skills/oracle
+        - herdr-profiles/profile-plugins/manager/skills/pi-review-pr
+        - herdr-profiles/role-plugins/manager/skills/harness-flow
+        - herdr-profiles/role-plugins/manager/skills/manager
+        - herdr-profiles/role-plugins/planner/skills/adr
+        - herdr-profiles/role-plugins/planner/skills/blueprint
+        - herdr-profiles/role-plugins/planner/skills/delivery-assurance
+        - herdr-profiles/role-plugins/planner/skills/engineering-project-manager
+        - herdr-profiles/role-plugins/planner/skills/humanizer
+        - herdr-profiles/role-plugins/planner/skills/planner
+        - herdr-profiles/role-plugins/planner/skills/ponytail
+        - herdr-profiles/role-plugins/planner/skills/ticket-writer
+        - herdr-profiles/role-plugins/promoter/skills/authenticated-staging-smoke
+        - herdr-profiles/role-plugins/promoter/skills/courier-pr-gates
+        - herdr-profiles/role-plugins/promoter/skills/delivery-assurance
+        - herdr-profiles/role-plugins/promoter/skills/dev-evidence-gate
+        - herdr-profiles/role-plugins/promoter/skills/git-flow
+        - herdr-profiles/role-plugins/promoter/skills/promoter
+        - herdr-profiles/role-plugins/promoter/skills/release-pr-validation
+        - herdr-profiles/role-plugins/promoter/skills/services-ci-gates
+        - herdr-profiles/role-plugins/promoter/skills/shared-dev-deploy
+        - herdr-profiles/role-plugins/researcher/skills/humanizer
+        - herdr-profiles/role-plugins/researcher/skills/researcher
+        - herdr-profiles/role-plugins/reviewer/skills/adr
+        - herdr-profiles/role-plugins/reviewer/skills/delivery-assurance
+        - herdr-profiles/role-plugins/reviewer/skills/oracle
+        - herdr-profiles/role-plugins/reviewer/skills/pi-review-pr
+        - herdr-profiles/role-plugins/reviewer/skills/ponytail
+        - herdr-profiles/role-plugins/reviewer/skills/reviewer
+        - herdr-profiles/role-plugins/reviewer/skills/typescript
+        - herdr-profiles/role-plugins/scout/skills/scout
+        - herdr-profiles/role-plugins/worker/skills/adr
+        - herdr-profiles/role-plugins/worker/skills/delivery-assurance
+        - herdr-profiles/role-plugins/worker/skills/git-flow
+        - herdr-profiles/role-plugins/worker/skills/ponytail
+        - herdr-profiles/role-plugins/worker/skills/tdd
+        - herdr-profiles/role-plugins/worker/skills/typescript
+        - herdr-profiles/role-plugins/worker/skills/worker
+      mcp:
+        - herdr
+        - executor
+  claude:
+    models:
+      - claude-opus-5
+      - claude-fable-5
+      - fable
+      - claude-sonnet-5
+    quota:
+      provider: anthropic
+      billingProduct: claude
+      account: primary
+      scope: account
+    defaults:
+      effort: high
+      permissionMode: dontAsk
+      timeoutMinutes: 30
+      sessionPersistence: true
+    plumbing:
+      sessionPersistence: required
+      promptDelivery: file
+      skillSelection: additive
+      toolSelection: allowlist
+    pools:
+      tools:
+        - AskUserQuestion
+        - Bash
+        - Edit
+        - Glob
+        - Grep
+        - NotebookEdit
+        - Read
+        - Skill
+        - ToolSearch
+        - WebFetch
+        - WebSearch
+        - Write
+      plugins:
+        - herdr-profiles/profile-plugins/executor
+        - herdr-profiles/profile-plugins/manager
+        - herdr-profiles/role-plugins/planner
+        - herdr-profiles/role-plugins/promoter
+        - herdr-profiles/role-plugins/researcher
+        - herdr-profiles/role-plugins/reviewer
+        - herdr-profiles/role-plugins/scout
+        - herdr-profiles/role-plugins/worker
+      mcp:
+        - herdr
+        - executor
+  agy:
+    models:
+      - gemini-3.8-flash-high
+      - gemini-3.8-flash-low
+    quota:
+      provider: google
+      billingProduct: antigravity
+      account: primary
+      scope: account
+    defaults:
+      mode: plan
+      timeoutMinutes: 30
+      sessionPersistence: true
+    plumbing:
+      sessionPersistence: required
+      promptDelivery: bootstrap
+      skillSelection: ambient
+      toolSelection: ambient
+  devin:
+    models:
+      - swe-2-max
+      - fusion-gpt-6-astra-high-sidekick-swe-2-high
+    quota:
+      provider: cognition
+      billingProduct: devin
+      account: primary
+      scope: account
+    defaults:
+      permissionMode: dangerous
+      timeoutMinutes: 30
+      sessionPersistence: true
+    plumbing:
+      sessionPersistence: required
+      promptDelivery: none
+      skillSelection: ambient
+      toolSelection: ambient
+
+# The reactive classified-failure cooldown floor is mandatory for every runner
+# (B2 owns the record). Proactive sources are declared where they exist so B12
+# can attach them without changing this schema.
+quotaSources:
+  - name: reactive-cooldowns
+    kind: floor
+  - name: pi-quotas
+    kind: proactive
+    runner: pi
+  - name: claude-account-windows
+    kind: proactive
+    runner: claude
+  - name: devin-analytics
+    kind: coarse
+    runner: devin

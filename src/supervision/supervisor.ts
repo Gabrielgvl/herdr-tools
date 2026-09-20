@@ -139,6 +139,12 @@ interface SupervisionReviewRecord extends SupervisionReviewView {
   evidenceSufficiency?: number;
 }
 
+/** Reservation-local trajectory memory, including the exact compiled trace range of that review. */
+interface SupervisorPreviousReview extends SupervisionPreviousReview {
+  traceFromCursor: string | null;
+  traceToCursor: string | null;
+}
+
 /** What binding proves. Every field comes from the launch's own readiness evidence. */
 export interface SupervisionBinding {
   identity: SupervisedIdentity;
@@ -390,7 +396,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * the life of the reservation — a restart resets it, which is acceptable on
    * a five-minute cadence (ADR-034).
    */
-  private previousReview: SupervisionPreviousReview | undefined;
+  private previousReview: SupervisorPreviousReview | undefined;
   /** The last review whose progress signal crossed its threshold; once set it only moves forward. */
   private lastMeaningfulProgressAtMs: number | undefined;
   private reviewTimer: unknown;
@@ -1642,7 +1648,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       const transcriptDelta = trace.source === "tmux-fallback"
         ? trace.events.map((event) => event.record as string)
         : deltaLines(this.reviewedTranscript, transcript);
-      const workspace = await this.cadenceWorkspace(this.abort.signal);
+      // This trace begins at the prior completed cadence's cursor. Only its
+      // non-error edit targets may select files for the recent-hunk slot.
+      const writtenFiles = buildExecutionDigest(trace).actions.flatMap((action) => (
+        action.class === "edit" && action.error !== true && action.target !== undefined ? [action.target] : []
+      ));
+      const workspace = await this.cadenceWorkspace(writtenFiles, this.abort.signal);
       // The child may have finished its work cycle — or left this very pane —
       // while the reads were in flight. A review of a run that is over, or of a
       // pane the child no longer occupies, is not evidence about anything, so it
@@ -1728,6 +1739,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         classification: result.classification,
         ...(result.signals === undefined ? {} : { signals: result.signals }),
         ...(this.lastMeaningfulProgressAtMs === undefined ? {} : { lastMeaningfulProgressAtMs: this.lastMeaningfulProgressAtMs }),
+        traceFromCursor: digestCursorLabel(build.state.trace.cursorFrom),
+        traceToCursor: digestCursorLabel(build.state.trace.cursorTo),
       };
       if (this.reviewerDegraded) {
         this.reviewerDegraded = false;
@@ -1903,7 +1916,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * root and the base that `reserve()` pinned before dispatch. A missing or
    * failed pin stays typed evidence. The cadence never invents a later base.
    */
-  private async cadenceWorkspace(signal: AbortSignal): Promise<WorkspaceView> {
+  private async cadenceWorkspace(writtenFiles: readonly string[], signal: AbortSignal): Promise<WorkspaceView> {
     const root = this.deps.workspaceRoot;
     if (root?.available !== true) {
       // The reservation's typed gap is the view's refusal — the W0 reason
@@ -1923,7 +1936,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       };
     }
     if (!base.available) return base;
-    return buildWorkspaceView({ root: root.root, baseRevision: base.baseRevision }, { run: this.workspaceRunner }, signal);
+    return buildWorkspaceView({ root: root.root, baseRevision: base.baseRevision, writtenFiles }, { run: this.workspaceRunner }, signal);
   }
 
   /**

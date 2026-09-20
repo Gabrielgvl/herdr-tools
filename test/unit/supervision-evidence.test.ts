@@ -13,6 +13,7 @@ import {
   EVIDENCE_ASSIGNMENT_MAX_BYTES,
   EVIDENCE_CONTRACT_VERSION,
   EVIDENCE_IDENTITY_FIELDS,
+  EVIDENCE_PATCH_MAX_BYTES,
   EVIDENCE_STATE_VERSION,
   EVIDENCE_TERMINAL_MAX_BYTES,
   EVIDENCE_TOTAL_MAX_BYTES,
@@ -22,6 +23,7 @@ import {
   executionDigestHash,
   scanEvidenceText,
   WORKSPACE_CHANGED_FILES_MAX,
+  WORKSPACE_PATCH_FILES_MAX,
   WORKSPACE_VIEW_VERSION,
   type EvidenceBuild,
   type EvidenceIdentityInput,
@@ -31,6 +33,7 @@ import {
   type EvidenceVersionIdentity,
   type WorkspaceChangedFile,
   type WorkspaceCommandRunner,
+  type WorkspacePatch,
   type WorkspaceView,
 } from "../../src/supervision/evidence.js";
 import { createDevinSessionReader } from "../../src/supervision/devin-trace.js";
@@ -767,6 +770,8 @@ const GIT_HEAD = "rev-parse --verify HEAD";
 const GIT_STATUS = "status --porcelain=v1 -z --untracked-files=normal";
 const gitNameStatus = (base: string) => `diff -M --name-status -z ${base} --`;
 const gitNumstat = (base: string) => `diff -M --numstat -z ${base} --`;
+const gitPatch = (base: string, path: string) => `diff --no-ext-diff --no-color --unified=3 ${base} -- :(literal)${path}`;
+const gitUntrackedPatch = (path: string) => `diff --no-index --no-ext-diff --no-color --unified=3 -- /dev/null ./${path}`;
 
 interface WorkspaceCall {
   argv: string[];
@@ -819,6 +824,7 @@ describe("buildWorkspaceView — evidence", () => {
       omittedFiles: 0,
       stats: { filesChanged: 0, insertions: 0, deletions: 0, untrackedFiles: 0 },
       fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+      patch: { hunks: [], omittedHunks: 0, omittedFiles: 0 },
     });
     // Every command ran at the trusted root — never at this process's cwd.
     expect(WS_ROOT).not.toBe(process.cwd());
@@ -954,6 +960,115 @@ describe("buildWorkspaceView — evidence", () => {
         { path: "b.ts", status: "modified", added: 1, deleted: 0 },
       ],
     });
+  });
+});
+
+describe("buildWorkspaceView — recent hunks", () => {
+  it("reads whole hunks only for changed files named by this cadence's writes", async () => {
+    const patch = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,2 +1,2 @@ function a()",
+      " keep",
+      "-old",
+      "+new",
+      "@@ -10 +10 @@",
+      "-before",
+      "+after",
+      "",
+    ].join("\n");
+    const { run, calls } = git({
+      [GIT_HEAD]: `${WS_HEAD}\n`,
+      [GIT_STATUS]: " M src/a.ts\x00 M src/b.ts\x00",
+      [gitNameStatus(WS_HEAD)]: "M\x00src/a.ts\x00M\x00src/b.ts\x00",
+      [gitNumstat(WS_HEAD)]: "2\t2\tsrc/a.ts\x001\t1\tsrc/b.ts\x00",
+      [gitPatch(WS_HEAD, "src/a.ts")]: patch,
+    });
+    const view = await buildWorkspaceView({
+      root: WS_ROOT,
+      writtenFiles: [42 as unknown as string, "", "bad\npath", WS_ROOT, "/outside/b.ts", "missing.ts", `${WS_ROOT}/src/a.ts`, "src/a.ts"],
+    }, { run }, new AbortController().signal);
+    if (!view.available) throw new Error("unreachable");
+    expect(view.patch).toEqual({
+      hunks: [
+        { path: "src/a.ts", header: "@@ -1,2 +1,2 @@ function a()", lines: [" keep", "-old", "+new"] },
+        { path: "src/a.ts", header: "@@ -10 +10 @@", lines: ["-before", "+after"] },
+      ],
+      omittedHunks: 0,
+      omittedFiles: 0,
+    });
+    expect(calls.at(-1)!.argv).toEqual([
+      "git", "diff", "--no-ext-diff", "--no-color", "--unified=3", WS_HEAD, "--", ":(literal)src/a.ts",
+    ]);
+    expect(calls.some((call) => call.argv.includes(":(literal)src/b.ts"))).toBe(false);
+  });
+
+  it("orders selected files deterministically and emits an empty patch when git has no hunks", async () => {
+    const { run, calls } = git({
+      [GIT_HEAD]: `${WS_HEAD}\n`,
+      [GIT_STATUS]: " M a.ts\x00 M b.ts\x00",
+      [gitNameStatus(WS_HEAD)]: "M\x00a.ts\x00M\x00b.ts\x00",
+      [gitNumstat(WS_HEAD)]: "1\t1\ta.ts\x001\t1\tb.ts\x00",
+      [gitPatch(WS_HEAD, "a.ts")]: "",
+      [gitPatch(WS_HEAD, "b.ts")]: "",
+    });
+    const view = await buildWorkspaceView({ root: WS_ROOT, writtenFiles: ["b.ts", "a.ts"] }, { run }, new AbortController().signal);
+    if (!view.available) throw new Error("unreachable");
+    expect(view.patch).toEqual({ hunks: [], omittedHunks: 0, omittedFiles: 0 });
+    expect(calls.slice(-2).map((call) => call.argv.at(-1))).toEqual([":(literal)a.ts", ":(literal)b.ts"]);
+  });
+
+  it("reads an untracked file with no-index and accepts git's difference exit", async () => {
+    const { run, calls } = git({
+      [GIT_HEAD]: `${WS_HEAD}\n`,
+      [GIT_STATUS]: "?? fresh.txt\x00",
+      [gitNameStatus(WS_HEAD)]: "",
+      [gitNumstat(WS_HEAD)]: "",
+      [gitUntrackedPatch("fresh.txt")]: { stdout: "@@ -0,0 +1 @@\n+fresh", exitCode: 1 },
+    });
+    const view = await buildWorkspaceView({ root: WS_ROOT, writtenFiles: ["fresh.txt"] }, { run }, new AbortController().signal);
+    if (!view.available) throw new Error("unreachable");
+    expect(view.patch).toEqual({
+      hunks: [{ path: "fresh.txt", header: "@@ -0,0 +1 @@", lines: ["+fresh"] }],
+      omittedHunks: 0,
+      omittedFiles: 0,
+    });
+    expect(calls.at(-1)!.argv.slice(1).join(" ")).toBe(gitUntrackedPatch("fresh.txt"));
+  });
+
+  it("fails closed when an untracked patch read exits with more than git's difference code", async () => {
+    const view = await buildWorkspaceView({ root: WS_ROOT, writtenFiles: ["fresh.txt"] }, git({
+      [GIT_HEAD]: `${WS_HEAD}\n`,
+      [GIT_STATUS]: "?? fresh.txt\x00",
+      [gitNameStatus(WS_HEAD)]: "",
+      [gitNumstat(WS_HEAD)]: "",
+      [gitUntrackedPatch("fresh.txt")]: { stdout: "private content", exitCode: 2 },
+    }), new AbortController().signal);
+    expect(view).toEqual({
+      version: WORKSPACE_VIEW_VERSION,
+      available: false,
+      failure: { reason: "command_failed", detail: { command: "diff", exitCode: 2 } },
+    });
+    expect(JSON.stringify(view)).not.toContain("private content");
+  });
+
+  it("bounds the patch at 16 KiB and reports hunk and file omissions", async () => {
+    const total = WORKSPACE_PATCH_FILES_MAX + 1;
+    const paths = Array.from({ length: total }, (_, index) => `f${String(index).padStart(2, "0")}.ts`);
+    const names = paths.map((path) => `M\x00${path}\x00`).join("");
+    const counts = paths.map((path) => `1\t1\t${path}\x00`).join("");
+    const huge = `@@ -1 +1 @@\n-${"x".repeat(EVIDENCE_PATCH_MAX_BYTES)}\n+replacement\n`;
+    const view = await buildWorkspaceView({ root: WS_ROOT, writtenFiles: paths }, git({
+      [GIT_HEAD]: `${WS_HEAD}\n`,
+      [GIT_STATUS]: "",
+      [gitNameStatus(WS_HEAD)]: names,
+      [gitNumstat(WS_HEAD)]: counts,
+      [gitPatch(WS_HEAD, paths[0]!)]: huge,
+    }), new AbortController().signal);
+    if (!view.available) throw new Error("unreachable");
+    expect(Buffer.byteLength(canonicalJson(view.patch), "utf8")).toBeLessThanOrEqual(EVIDENCE_PATCH_MAX_BYTES);
+    expect(view.patch).toEqual({ hunks: [], omittedHunks: 1, omittedFiles: total - 1 });
   });
 });
 
@@ -1166,7 +1281,11 @@ describe("buildWorkspaceView — through the real git runner", () => {
     await writeFile(join(dir, "sub", "b.txt"), "two\nthree\n");
     await writeFile(join(dir, "untracked.txt"), "new\n");
 
-    const view = await buildWorkspaceView({ root: dir, baseRevision: first.baseRevision }, { run }, new AbortController().signal);
+    const view = await buildWorkspaceView({
+      root: dir,
+      baseRevision: first.baseRevision,
+      writtenFiles: ["sub/b.txt", "untracked.txt"],
+    }, { run }, new AbortController().signal);
     expect(view).toMatchObject({
       ...okView,
       baseRevision: first.baseRevision,
@@ -1181,6 +1300,7 @@ describe("buildWorkspaceView — through the real git runner", () => {
     if (!view.available) throw new Error("unreachable");
     expect(view.headRevision).not.toBe(first.baseRevision);
     expect(view.fingerprint).not.toBe(first.fingerprint);
+    expect(view.patch!.hunks.map((hunk) => hunk.path)).toEqual(["sub/b.txt", "untracked.txt"]);
   });
 
   it("reports an unborn HEAD and a non-repo directory as unavailable, not clean", async () => {
@@ -1248,7 +1368,10 @@ function e3Identity(over: Partial<EvidenceIdentityInput> = {}): EvidenceIdentity
   };
 }
 
-function e3Workspace(changedFiles: WorkspaceChangedFile[] = []): WorkspaceView {
+function e3Workspace(
+  changedFiles: WorkspaceChangedFile[] = [],
+  patch: WorkspacePatch = { hunks: [], omittedHunks: 0, omittedFiles: 0 },
+): WorkspaceView {
   return {
     version: WORKSPACE_VIEW_VERSION,
     available: true,
@@ -1259,6 +1382,7 @@ function e3Workspace(changedFiles: WorkspaceChangedFile[] = []): WorkspaceView {
     omittedFiles: 0,
     stats: { filesChanged: changedFiles.length, insertions: 0, deletions: 0, untrackedFiles: 0 },
     fingerprint: "f".repeat(64),
+    patch,
   };
 }
 
@@ -1294,6 +1418,21 @@ describe("buildEvidenceState — assembly and assignment normalization", () => {
     ]);
     expect(state.workspace.available).toBe(true);
     expect(state.terminal).toEqual({ lines: ["line one", "line two"], droppedLines: 0 });
+  });
+
+  it("carries an unavailable workspace unchanged and spends no patch bytes", () => {
+    const workspace: WorkspaceView = { version: WORKSPACE_VIEW_VERSION, available: false, failure: { reason: "adapter_unavailable" } };
+    const build = e3Ok(buildEvidenceState(e3Request({ workspace })));
+    expect(build.state.workspace).toEqual(workspace);
+    expect(build.bytes.patch).toBe(0);
+  });
+
+  it("normalizes an available pre-V2.2 workspace with no patch slot", () => {
+    const workspace = e3Workspace();
+    if (!workspace.available) throw new Error("unreachable");
+    delete workspace.patch;
+    const build = e3Ok(buildEvidenceState(e3Request({ workspace })));
+    expect(build.state.workspace).toMatchObject({ patch: { hunks: [], omittedHunks: 0, omittedFiles: 0 } });
   });
 
   it("emits an empty assignment section when none is carried", () => {
@@ -1414,6 +1553,21 @@ describe("buildEvidenceState — UTF-8 byte budgets", () => {
     expect("state" in build).toBe(false);
   });
 
+  it("bounds patch to 16 KiB as a deterministic prefix of whole hunks", () => {
+    const hunks = Array.from({ length: 80 }, (_, index) => ({
+      path: `src/f${index}.ts`,
+      header: `@@ -${index + 1} +${index + 1} @@`,
+      lines: [`-${"é".repeat(100)}`, `+${"x".repeat(100)}`],
+    }));
+    const build = e3Ok(buildEvidenceState(e3Request({ workspace: e3Workspace([], { hunks, omittedHunks: 2, omittedFiles: 3 }) })));
+    if (!build.state.workspace.available) throw new Error("unreachable");
+    expect(build.bytes.patch).toBeLessThanOrEqual(EVIDENCE_PATCH_MAX_BYTES);
+    expect(build.state.workspace.patch!.hunks.length).toBeGreaterThan(0);
+    expect(build.state.workspace.patch!.hunks.length).toBeLessThan(hunks.length);
+    expect(build.state.workspace.patch!.omittedHunks).toBe(2 + hunks.length - build.state.workspace.patch!.hunks.length);
+    expect(build.state.workspace.patch!.omittedFiles).toBe(3);
+  });
+
   it("bounds terminal to its own 8 KiB, keeping a contiguous newest suffix of whole lines", () => {
     // A line bigger than the whole budget is dropped whole, never sliced.
     const build = e3Ok(buildEvidenceState(e3Request({ terminal: ["oldest", "h".repeat(9000), "new-1", "new-2"] })));
@@ -1457,6 +1611,32 @@ describe("buildEvidenceState — UTF-8 byte budgets", () => {
     expect(tight.state.workspace).toMatchObject({ changedFiles: files });
     expect(tight.state.assignment.objective).toBe("ship it");
     expect(tight.state.trace.actions).toHaveLength(1);
+  });
+
+  it("sacrifices terminal before shrinking the 16 KiB patch slot against the total", () => {
+    const files = Array.from({ length: 240 }, (_, index) => ({
+      path: `f/${String(index).padStart(3, "0")}${"x".repeat(205)}.ts`,
+      status: "modified" as const,
+    }));
+    const inputPatch: WorkspacePatch = {
+      hunks: Array.from({ length: 30 }, (_, index) => ({
+        path: `src/p${index}.ts`,
+        header: `@@ -${index + 1} +${index + 1} @@`,
+        lines: [`-${"a".repeat(250)}`, `+${"b".repeat(250)}`],
+      })),
+      omittedHunks: 0,
+      omittedFiles: 0,
+    };
+    const withoutTerminal = e3Ok(buildEvidenceState(e3Request({ workspace: e3Workspace(files, inputPatch), terminal: [] })));
+    const withTerminal = e3Ok(buildEvidenceState(e3Request({
+      workspace: e3Workspace(files, inputPatch),
+      terminal: Array.from({ length: 12 }, (_, index) => `t${index}:${"z".repeat(1000)}`),
+    })));
+    if (!withoutTerminal.state.workspace.available || !withTerminal.state.workspace.available) throw new Error("unreachable");
+    expect(withTerminal.state.workspace.patch).toEqual(withoutTerminal.state.workspace.patch);
+    expect(withTerminal.state.workspace.patch!.omittedHunks).toBeGreaterThan(0);
+    expect(withTerminal.state.terminal).toEqual({ lines: [], droppedLines: 12 });
+    expect(withTerminal.bytes.total).toBeLessThanOrEqual(EVIDENCE_TOTAL_MAX_BYTES);
   });
 
   it("returns reviewer_unavailable when even an empty terminal cannot fit — structural overflow", () => {
@@ -1530,6 +1710,29 @@ describe("buildEvidenceState — the outbound safety boundary", () => {
     // canary is not outbound, so it is neither scanned nor sent.
     for (const text of seen) expect(text).not.toContain(E3_PEM);
     expect(JSON.stringify(state)).not.toContain(E3_PEM);
+  });
+
+  it("scans only patch hunks that survive bounding", () => {
+    const dropped = e3Ok(buildEvidenceState(e3Request({
+      workspace: e3Workspace([], {
+        hunks: [{ path: "src/a.ts", header: "@@ -1 +1 @@", lines: [`+${E3_GH_TOKEN}${"x".repeat(EVIDENCE_PATCH_MAX_BYTES)}`] }],
+        omittedHunks: 0,
+        omittedFiles: 0,
+      }),
+    })));
+    expect(JSON.stringify(dropped.state)).not.toContain(E3_GH_TOKEN);
+    if (!dropped.state.workspace.available) throw new Error("unreachable");
+    expect(dropped.state.workspace.patch).toEqual({ hunks: [], omittedHunks: 1, omittedFiles: 0 });
+
+    const kept = buildEvidenceState(e3Request({
+      workspace: e3Workspace([], {
+        hunks: [{ path: "src/a.ts", header: "@@ -1 +1 @@", lines: [`+${E3_GH_TOKEN}`] }],
+        omittedHunks: 0,
+        omittedFiles: 0,
+      }),
+    }));
+    if (kept.available) throw new Error("expected unavailable");
+    expect(kept.failure).toMatchObject({ cause: "sensitive", detail: { section: "workspace", detector: "github_token" } });
   });
 
   it("sends nothing when a section scans sensitive — the canary never reaches output or diagnostics", () => {
@@ -1733,7 +1936,12 @@ describe("buildEvidenceState — byte accounting and determinism", () => {
     expect(build.bytes.total).toBe(Buffer.byteLength(canonicalJson(build.state), "utf8"));
     expect(build.bytes.assignment).toBe(Buffer.byteLength(canonicalJson(build.state.assignment), "utf8"));
     expect(build.bytes.trace).toBe(Buffer.byteLength(canonicalJson(build.state.trace), "utf8"));
-    expect(build.bytes.workspace).toBe(Buffer.byteLength(canonicalJson(build.state.workspace), "utf8"));
+    if (!build.state.workspace.available) throw new Error("unreachable");
+    const structuralWorkspace = { ...build.state.workspace };
+    const patch = structuralWorkspace.patch!;
+    delete structuralWorkspace.patch;
+    expect(build.bytes.workspace).toBe(Buffer.byteLength(canonicalJson(structuralWorkspace), "utf8"));
+    expect(build.bytes.patch).toBe(Buffer.byteLength(canonicalJson(patch), "utf8"));
     expect(build.bytes.terminal).toBe(Buffer.byteLength(canonicalJson(build.state.terminal), "utf8"));
     expect(build.bytes.total).toBeLessThanOrEqual(EVIDENCE_TOTAL_MAX_BYTES);
   });

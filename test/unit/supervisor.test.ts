@@ -2322,6 +2322,8 @@ describe("supervisor review cadence", () => {
       classification: "progress",
       signals,
       lastMeaningfulProgressAtMs: 1_000,
+      traceFromCursor: null,
+      traceToCursor: expect.stringMatching(/^pi-jsonl@0:[0-9a-f]{64}$/u),
     });
   });
 
@@ -2341,6 +2343,8 @@ describe("supervisor review cadence", () => {
     expect(h.reviewRequests[1]!.previousReview).toEqual({
       classification: "blocked",
       signals: { progress: 0.5, stalled: 0.1, blocked: 0.9, risk: 0.01, appears_complete: 0.02 },
+      traceFromCursor: null,
+      traceToCursor: expect.stringMatching(/^pi-jsonl@0:[0-9a-f]{64}$/u),
     });
     expect(h.reviewRequests[1]!.previousReview).not.toHaveProperty("lastMeaningfulProgressAtMs");
   });
@@ -2531,10 +2535,10 @@ describe("the ADR-036 evidence cadence", () => {
   };
 
   const piJsonl = (records: unknown[]): string => `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
-  const piToolCall = (name: string): unknown => ({
+  const piToolCall = (name: string, args: Record<string, unknown> = { command: "do the thing" }): unknown => ({
     type: "message",
     timestamp: 1,
-    message: { role: "assistant", content: [{ type: "toolCall", id: `c-${name}`, name, arguments: { command: "do the thing" } }] },
+    message: { role: "assistant", content: [{ type: "toolCall", id: `c-${name}`, name, arguments: args }] },
   });
   function exitEvent(paneId: string, exit: Record<string, unknown> = {}): SupervisionSocketEvent {
     return parseSocketLine(JSON.stringify({ event: "pane_exited", data: { type: "pane_exited", pane_id: paneId, workspace_id: "w1", ...exit } })) as SupervisionSocketEvent;
@@ -2568,6 +2572,45 @@ describe("the ADR-036 evidence cadence", () => {
     await vi.waitFor(() => expect(h.reviews).toBe(2));
     expect(h.reviewRequests[1]!.evidence!.trace.cursorFrom).toMatchObject({ source: "pi-jsonl" });
     expect(h.reviewRequests[1]!.evidence!.trace.cursorFrom).toEqual(h.reviewRequests[0]!.evidence!.trace.cursorTo);
+  });
+
+  it("carries each compiled cursor range in previousReview and emits hunks only for writes in that range", async () => {
+    const patchCalls: string[][] = [];
+    const h = await working({
+      traceFile: piJsonl([piToolCall("Write", { file_path: `${workspaceRoot.root}/src/a.ts`, content: "new" })]),
+      workspaceRoot,
+      workspaceRunner: async (argv) => {
+        if (argv[1] === "rev-parse") return { stdout: `${baseSha}\n`, exitCode: 0 };
+        if (argv[1] === "status") return { stdout: " M src/a.ts\0", exitCode: 0 };
+        if (argv.includes("--name-status")) return { stdout: "M\0src/a.ts\0", exitCode: 0 };
+        if (argv.includes("--numstat")) return { stdout: "1\t1\tsrc/a.ts\0", exitCode: 0 };
+        patchCalls.push([...argv]);
+        return { stdout: "@@ -1 +1 @@\n-old\n+new\n", exitCode: 0 };
+      },
+    });
+
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.workspace).toMatchObject({
+      patch: {
+        hunks: [{ path: "src/a.ts", header: "@@ -1 +1 @@", lines: ["-old", "+new"] }],
+        omittedHunks: 0,
+        omittedFiles: 0,
+      },
+    });
+
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(h.reviewRequests[1]!.previousReview).toMatchObject({
+      traceFromCursor: null,
+      traceToCursor: expect.stringMatching(/^pi-jsonl@\d+:[0-9a-f]{64}$/u),
+    });
+    expect(h.reviewRequests[1]!.evidence!.trace.cursorFrom).toEqual(h.reviewRequests[0]!.evidence!.trace.cursorTo);
+    expect(h.reviewRequests[1]!.evidence!.workspace).toMatchObject({ patch: { hunks: [], omittedHunks: 0, omittedFiles: 0 } });
+    expect(patchCalls).toHaveLength(1);
+    expect(patchCalls[0]).toEqual([
+      "git", "diff", "--no-ext-diff", "--no-color", "--unified=3", baseSha, "--", ":(literal)src/a.ts",
+    ]);
   });
 
   it("selects the terminal fallback for a runner without a structured trace and reads the pane once", async () => {
@@ -3156,7 +3199,7 @@ describe("the ADR-036 evidence cadence", () => {
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     const json = JSON.stringify(h.supervisor.view());
-    for (const key of ["traceCursor", "workspaceRoot", "workspaceBaseRevision", "forbiddenTools", "assignmentDigest", "readOnly", "unreportedExit", "evidenceBaseline", "traceSource", "evidenceScanner"]) {
+    for (const key of ["traceCursor", "traceFromCursor", "traceToCursor", "previousReview", "patch", "workspaceRoot", "workspaceBaseRevision", "forbiddenTools", "assignmentDigest", "readOnly", "unreportedExit", "evidenceBaseline", "traceSource", "evidenceScanner"]) {
       expect(json).not.toContain(`"${key}"`);
     }
     // The public review record keeps the consumer shape — no evidence payload.

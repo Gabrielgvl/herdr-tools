@@ -139,7 +139,7 @@ function responseFor(pick = "frontier", composition: { missing_area: number; ass
     kind: "response",
     response: {
       quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 },
-      category: { category: pick, confidence: 0.9 },
+      category: { category: pick, confidence: 0.9, probabilities: { frontier: pick === "frontier" ? 0.9 : 0.1, cheap: pick === "cheap" ? 0.9 : 0.1 } },
       candidates,
       composition,
     },

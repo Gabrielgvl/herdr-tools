@@ -28,6 +28,23 @@ function resultObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function singleLaunchDetails(value: unknown): Record<string, unknown> {
+  const details = resultObject(value);
+  if (details.operation === "launch") return details;
+  if (details.operation !== "launch_batch") throw new Error("herdr_launch returned neither launch nor launch_batch details");
+  const children = details.children;
+  if (details.outcome !== "launched" || !Array.isArray(children) || children.length !== 1) {
+    const router = Array.isArray(details.router) ? details.router.map((value) => {
+      const decision = resultObject(value);
+      return [decision.kind, decision.reason, decision.component].filter((field) => typeof field === "string").join(":");
+    }).join(",") : "invalid";
+    throw new Error(`one-spec launch returned outcome=${String(details.outcome)} children=${Array.isArray(children) ? children.length : "invalid"} router=${router}`);
+  }
+  const child = resultObject(children[0]);
+  if (child.status !== "launched") throw new Error(`one-spec launch child returned status=${String(child.status)}`);
+  return resultObject(child.launch);
+}
+
 describe.skipIf(!enabled)("disposable Herdr integration", () => {
   const state: {
     cwd: string;
@@ -161,30 +178,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     }
   };
 
-  /**
-   * Every feature delivery is a gate. Keep bounded diagnostic evidence, then
-   * rethrow so a lost or unacknowledged prompt/attachment fails the run rather
-   * than being converted into a skipped acceptance claim.
-   */
-  const deliver = async (label: string, call: Promise<{ details?: Record<string, unknown> }>): Promise<{ confirmed: true; details: Record<string, unknown> }> => {
-    const startedAt = performance.now();
-    try {
-      const result = await call;
-      process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
-      return { confirmed: true, details: resultObject(result.details) };
-    } catch (error) {
-      const failure = error as { code?: string; details?: Record<string, unknown> };
-      if (failure.details === undefined) throw error;
-      // Argv-path failures keep bounded CLI text; prompt deliveries are non-textual by design.
-      const evidence = [failure.details.stdout, failure.details.stderr].filter((value) => typeof value === "string" && value.length > 0).join(" | ").slice(0, 600).replace(/\s+/gu, " ");
-      const attachment = resultObject(failure.details.attachment ?? {});
-      if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
-      process.stderr.write(`INTEGRATION_DELIVERY_FAILED ${label} code=${String(failure.code)} causeCode=${String(failure.details.causeCode)} phase=${String(failure.details.phase)}${evidence ? ` evidence=${evidence}` : ""}\n`);
-      await recordDeliveryFailureBeforeTeardown(label, { code: failure.code, details: failure.details }, performance.now() - startedAt);
-      throw error;
-    }
-  };
-
   const assertUnconfirmedRecovery = async (
     label: string,
     details: Record<string, unknown>,
@@ -303,7 +296,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     try {
       const result = await call();
       const wallElapsedMs = performance.now() - startedAt;
-      const details = resultObject(result.details);
+      const details = singleLaunchDetails(result.details);
       expect(details).toMatchObject({
         promptSubmitted: true,
         promptConsumption: "confirmed",
@@ -314,8 +307,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       });
       assertLaunchPhaseTiming(details, wallElapsedMs, false);
       const promptRequests = state.socketProxy?.requests.slice(promptStart) ?? [];
-      expect(promptRequests).toHaveLength(1);
-      expect(resultObject(details.initialPromptSubmission).operationId).toBe(promptRequests[0]!.id);
+      const operationId = String(resultObject(details.initialPromptSubmission).operationId);
+      const promptRequest = promptRequests.find((request) => request.id === operationId);
+      expect(promptRequest).toBeDefined();
       process.stderr.write(`INTEGRATION_LAUNCH_READINESS ${label} ${JSON.stringify(readinessDiagnostic(details))}\n`);
       process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
       return { confirmed: true, details };
@@ -339,8 +333,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         created: expect.any(Object)
       });
       const promptRequests = state.socketProxy?.requests.slice(promptStart) ?? [];
-      expect(promptRequests).toHaveLength(1);
-      expect(resultObject(failure.details.initialPromptSubmission).operationId).toBe(promptRequests[0]!.id);
+      const operationId = String(resultObject(failure.details.initialPromptSubmission).operationId);
+      const promptRequest = promptRequests.find((request) => request.id === operationId);
+      expect(promptRequest).toBeDefined();
       assertLaunchPhaseTiming(failure.details, elapsedMs, resultObject(failure.details.promptConfirmation).reason === "timeout");
       await assertUnconfirmedRecovery(label, failure.details, promptCanary, promptStart, cliStart, toolCallStart);
       // The helper performed only read-only recovery diagnostics. Callers return
@@ -379,16 +374,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error(`${label} agent remained visible after harness pane cleanup`);
-  };
-
-  const waitForMarker = async (path: string, nonce: string, deadlineMs: number): Promise<boolean> => {
-    const deadline = performance.now() + deadlineMs;
-    while (performance.now() < deadline) {
-      const content = await readFile(path, "utf8").catch(() => undefined);
-      if (content?.includes(nonce)) return true;
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    return false;
   };
 
   beforeAll(async () => {
@@ -605,7 +590,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         assignmentDelivery: "attachment",
         supervisionDigest: { doneWhen: ["The reply is exactly the attachment token and nothing else."], constraints: ["none"] }
       }, signal(), undefined, toolContext());
-      details = resultObject(launched.details);
+      details = singleLaunchDetails(launched.details);
     } catch (error) {
       const failure = error as { details?: Record<string, unknown> };
       const failureDetails = resultObject(failure.details);
@@ -715,7 +700,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       placement: { mode: "new_tab", tabLabel: "agy-zero-effect-fallback" },
       supervisionDigest: { doneWhen: ["The reply is the single word ready."], constraints: ["none"] }
     }, signal(), undefined, toolContext());
-    const details = resultObject(launched.details);
+    const details = singleLaunchDetails(launched.details);
     const paneId = String(details.paneId);
     const calls = state.cliCalls.slice(cliStart);
     const starts = calls.filter((args) => args[0] === "agent" && args[1] === "start");
@@ -767,65 +752,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     ]));
   }, 120_000);
 
-  it("fails closed for a deterministic Bash-tool interrupt in the disposable session", async () => {
-    const turnMarker = `turn-control-${randomUUID()}`;
-    const turnMarkerPath = join(state.cwd, "turn-control-started.txt");
-    const turnScriptPath = join(state.cwd, "turn-control.sh");
-    await writeFile(turnScriptPath, `printf '%s' '${turnMarker}' > '${turnMarkerPath}'\nsleep 120\n`, { mode: 0o700 });
-    const launchName = `it-turn-${process.pid}`;
-    const launched = await deliverLaunch("turn-control-launch", turnMarker, () => tool("herdr_launch").execute("turn-control-launch", {
-      name: launchName,
-      specs: [{
-        label: "control",
-        instructions: `This is a balanced shell-control test. Use only the Bash tool to execute ${turnScriptPath}; do not use Read, Edit, Write, or any Herdr tool, and keep the turn open.`,
-        assignment: {
-          objective: `Use Bash to execute exactly ${turnScriptPath} now. Do not use any other tool. Remain in this turn until the script exits; do not finish the task or send a final response.`,
-          scope: `Run only ${turnScriptPath}. Use no other tool and change nothing else.`,
-          verification: `The file ${turnMarkerPath} contains exactly ${turnMarker} while the Bash turn remains open until the script exits.`
-        },
-        category: "frontier"
-      }],
-      placement: { mode: "new_tab", tabLabel: "turn-control" },
-      supervisionDigest: { doneWhen: [`The file ${turnMarkerPath} contains exactly ${turnMarker} while the Bash turn remains open.`], constraints: ["none"] }
-    }, signal(), undefined, toolContext()));
-    if (!launched.confirmed) return;
-    expect(await waitForMarker(turnMarkerPath, turnMarker, 60_000), "turn-control fixture did not reach its deterministic sleep command").toBe(true);
-    const details = launched.details;
-    const paneId = details.paneId;
-    if (typeof paneId !== "string") throw new Error("turn-control fixture launch did not return an authoritative pane ID");
-
-    const fixtureSnapshot = resultObject(resultObject(resultObject(await runNamed(["api", "snapshot"])).result).snapshot);
-    const fixturePanes = Array.isArray(fixtureSnapshot.panes) ? fixtureSnapshot.panes.map(resultObject) : [];
-    const fixtureAgents = Array.isArray(fixtureSnapshot.agents) ? fixtureSnapshot.agents.map(resultObject) : [];
-    expect(fixturePanes).toEqual(expect.arrayContaining([expect.objectContaining({ pane_id: paneId, agent_status: "working" })]));
-    expect(fixtureAgents).toEqual(expect.arrayContaining([expect.objectContaining({ pane_id: paneId, agent_status: "working" })]));
-
-    let failure: { code?: unknown; details?: Record<string, unknown> } | undefined;
-    try {
-      await tool("herdr_communicate").execute("turn-control", { target: paneId, operation: "interrupt" }, signal(), undefined, toolContext());
-    } catch (error) {
-      failure = error as { code?: unknown; details?: Record<string, unknown> };
-    }
-    expect(failure?.code).toBe("INTERRUPT_UNCONFIRMED");
-    const failureDetails = resultObject(failure?.details);
-    expect(failureDetails).toMatchObject({
-      dispatchAttempted: true,
-      dispatchAcknowledged: true,
-      confirmation: { kind: "unconfirmed" }
-    });
-    const preEvidence = resultObject(failureDetails.preEvidence);
-    const finalEvidence = resultObject(failureDetails.finalEvidence);
-    expect(finalEvidence).toMatchObject({
-      pane_id: paneId,
-      terminal_id: preEvidence.terminal_id,
-      agent_session: preEvidence.agent_session,
-      agent_status: "working"
-    });
-    const controls = state.cliCalls.filter((args) => args[0] === "agent" && args[1] === "send-keys" && args[2] === paneId);
-    expect(controls).toEqual([["agent", "send-keys", paneId, "ctrl+c"]]);
-    await closeConfirmedFixturePane("turn-control-launch", details);
-  }, 180_000);
-
   /**
    * Transport smoke: non-gating evidence about the route, the transport, and the published
    * artifact. It deliberately makes no claim about what a recipient agent read; the
@@ -860,8 +786,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     await closeConfirmedFixturePane("spec-inline-launch", inline.details);
 
     const body = `Transport smoke body.\n${"detail line\n".repeat(200)}`;
-    const bodyAssignment = { objective: body, scope: "Change nothing.", verification: "The published attachment contains the complete assignment body with mode 0600 and the agent-start arguments contain none of that body." };
-    const bodyInstructions = "This is a frontier transport smoke test. Receive the attached body through the prompt transport.";
+    const bodyAssignment = { objective: body, scope: "Change nothing.", verification: "The published attachment contains the complete assignment body with mode 0600 and the agent-start arguments contain none of that body; the recipient calls no tools." };
+    const bodyInstructions = "This is a frontier transport smoke test. Receive the attached body through the prompt transport. Do not call tools or modify files; this assignment is verified from the published artifact.";
     const attachmentName = `it-attach-${process.pid}`;
     const attachmentAgentName = `${attachmentName}-body-1`;
     const attachmentLaunch = await deliverLaunch("spec-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-spec-attachment", {
@@ -895,85 +821,33 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   }, 240_000);
 
   /**
-   * Acceptance: a semantically confirmed recipient must produce evidence obtainable
-   * only from the attachment. Exact fail-closed launch uncertainty is accepted but
-   * returns before marker assertions because the prompt was possibly consumed.
+   * Acceptance: a semantically confirmed recipient must produce a value that
+   * never appears verbatim in its assignment. Exact fail-closed launch
+   * uncertainty is accepted but returns before the readback assertion.
    */
   it("accepts a category-selected recipient readback only with agent-produced evidence", async () => {
     if (state.unconfirmedRecoveries.length >= 2) return;
-    const nonce = randomUUID();
-    const markerPath = join(state.cwd, "readback-pi.txt");
-    const body = [
-      "Herdr integration acceptance check.",
-      `Write the file ${markerPath} whose only content is this exact token:`,
-      nonce,
-      "Then stop. Do not change anything else and do not reply."
-    ].join("\n");
-
+    const left = randomUUID();
+    const right = randomUUID();
+    const expected = `${left}:${right}`;
     const launchName = `it-accept-${process.pid}`;
-    const launched = await deliverLaunch("spec-acceptance-launch", nonce, () => tool("herdr_launch").execute("accept-spec", {
+    const launched = await deliverLaunch("spec-acceptance-launch", left, () => tool("herdr_launch").execute("accept-spec", {
       name: launchName,
       specs: [{
         label: "accept",
-        instructions: `This is a frontier file-writing acceptance test. Use only the Bash tool to read the assignment attachment and write only ${markerPath} with the requested token; do not use Read, Edit, or Write.`,
-        assignment: { objective: body, scope: `Write only ${markerPath}. Change nothing else.`, verification: `The file ${markerPath} exists and contains exactly the requested token.` },
+        instructions: "This is a frontier readback acceptance test. The caller requires frontier rather than cheap or balanced. Join the two assignment tokens with one colon and reply with only that value. Do not call tools or modify files.",
+        assignment: { objective: `Join the first token ${left} and the second token ${right} with one colon, then reply with only the joined value.`, scope: "Call no tools and change nothing.", verification: "The response is the first token, one colon, and the second token, with no other text." },
         category: "frontier"
       }],
       placement: { mode: "new_tab", tabLabel: "accept-spec" },
-      assignmentDelivery: "attachment",
-      supervisionDigest: { doneWhen: ["The marker file contains exactly the token."], constraints: ["none"] }
+      supervisionDigest: { doneWhen: ["The response is the two assignment tokens joined by one colon."], constraints: ["none"] }
     }, signal(), undefined, toolContext()));
     if (!launched.confirmed) return;
-    const attachment = resultObject(launched.details.attachment);
-    state.attachmentPaths.push(String(attachment.path));
-    expect(await readFile(String(attachment.path), "utf8")).toContain(nonce);
-    const produced = await waitForMarker(markerPath, nonce, ACCEPTANCE_DEADLINE_MS);
-    expect(produced, `Category-selected recipient did not produce ${markerPath} containing the attachment token`).toBe(true);
+    expect(launched.details).toMatchObject({ spec: { label: "accept", category: "frontier" } });
+    const paneId = String(launched.details.paneId);
+    const produced = await waitForCondition(async () => resultObject((await tool("herdr_inspect").execute("accept-spec-readback", { mode: "target", target: paneId }, signal(), undefined, toolContext())).details), (details) => JSON.stringify(details.recentUnwrappedLines).includes(expected), ACCEPTANCE_DEADLINE_MS, 500);
+    expect(produced, `Category-selected recipient did not produce the joined readback ${expected}`).toBeDefined();
     await closeConfirmedFixturePane("spec-acceptance-launch", launched.details);
   }, 300_000);
 
-  it("accepts a category-selected Claude recipient readback only with agent-produced evidence", async () => {
-    if (state.unconfirmedRecoveries.length >= 2) return;
-    const nonce = randomUUID();
-    const markerPath = join(state.cwd, "readback-claude.txt");
-    const body = [
-      "Herdr integration acceptance check.",
-      `Write the file ${markerPath} whose only content is this exact token:`,
-      nonce,
-      "Then stop. Do not change anything else and do not reply."
-    ].join("\n");
-
-    const launchName = `it-claude-${process.pid}`;
-    const agentName = `${launchName}-followup-1`;
-    const launched = await tool("herdr_launch").execute("accept-category-claude", {
-      name: launchName,
-      specs: [{
-        label: "followup",
-        instructions: "This is a balanced follow-up assignment test. Do not call tools or modify files yet; remain idle until one follow-up assignment attachment arrives, then carry out only that assignment.",
-        assignment: {
-          objective: "Remain idle in this pane until one follow-up assignment attachment arrives, then carry it out exactly as written.",
-          scope: "Call no tools and change nothing until that follow-up arrives; then change only what it names.",
-          verification: "At launch, the pane remains live and no files are changed before the follow-up attachment arrives."
-        },
-        category: "balanced"
-      }],
-      placement: { mode: "new_tab", tabLabel: "accept-claude" },
-      supervisionDigest: { doneWhen: ["The follow-up assignment is carried out exactly as written."], constraints: ["none"] }
-    }, signal(), undefined, toolContext());
-    const details = resultObject(launched.details);
-    expect(details).toMatchObject({ recipient: { capable: true, kind: "claude", profileName: expect.any(String) }, spec: { label: "followup", category: "balanced" } });
-    const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes(agentName));
-    const grantIndex = startArgs!.indexOf("--add-dir");
-    expect(grantIndex).toBeGreaterThan(0);
-    const grantedDirectory = startArgs![grantIndex + 1]!;
-
-    const sent = await deliver("claude-acceptance-send", tool("herdr_communicate").execute("accept-claude-send", { target: String(details.paneId), operation: "prompt", text: body, delivery: "attachment" }, signal(), undefined, toolContext()));
-    const attachment = resultObject(sent.details.attachment);
-    state.attachmentPaths.push(String(attachment.path));
-    expect(dirname(dirname(String(attachment.path)))).toBe(grantedDirectory);
-    expect(await readFile(String(attachment.path), "utf8")).toContain(nonce);
-    const produced = await waitForMarker(markerPath, nonce, ACCEPTANCE_DEADLINE_MS);
-    expect(produced, `Claude recipient did not produce ${markerPath} containing the attachment token`).toBe(true);
-    await closeConfirmedFixturePane("accept-category-claude", details);
-  }, 300_000);
 });

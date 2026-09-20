@@ -1,5 +1,7 @@
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import { writeIdentityProvenance } from "../agent-identity.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
@@ -1950,16 +1952,18 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     return exec === undefined ? undefined : createWorktreeManager({ exec, ...(deps.selfClose === undefined ? {} : { selfClose: deps.selfClose }) });
   })();
 
-  const loadLaunchCatalog = async (root: string): Promise<Catalog> => {
+  let packageRoot = dirname(fileURLToPath(import.meta.url));
+  while (!existsSync(join(packageRoot, "package.json"))) packageRoot = dirname(packageRoot);
+  const loadLaunchCatalog = async (): Promise<Catalog> => {
     if (deps.catalog !== undefined) return deps.catalog.load();
-    return loadCatalog(join(root, CATALOG_PATH));
+    return loadCatalog(join(packageRoot, CATALOG_PATH));
   };
 
   const routeRequest = async (params: SpecLaunchRequest, signal: AbortSignal, ctx: ExtensionContext): Promise<{ catalog?: Catalog; records: SpecRouteRecord[] }> => {
     const root = deps.cwd ?? ctx.cwd;
     let catalog: Catalog;
     try {
-      catalog = await loadLaunchCatalog(root);
+      catalog = await loadLaunchCatalog();
     } catch {
       return {
         records: params.specs.map((spec) => ({ spec, decision: { kind: "abstained", reason: "catalog_unavailable", component: "catalog" }, state: { status: "unavailable", reason: "catalog_unavailable" } }))

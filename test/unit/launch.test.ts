@@ -626,6 +626,35 @@ quotaSources:
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "focus")).toBe(true);
   });
 
+  it("loads the shipped catalog when the project cwd has no catalog", async () => {
+    let loaded: Catalog | undefined;
+    const tool = createLaunchTool({
+      cli: makeCli().cli,
+      context,
+      cwd: "/tmp/project-without-a-catalog",
+      preflight: async () => undefined,
+      supervision: stubSupervision(),
+      specClient: {
+        evaluate: vi.fn(async ({ catalog }) => {
+          loaded = catalog;
+          return {
+            kind: "response" as const,
+            response: {
+              quality: { instructions_adequate: 0.1, assignment_verifiable: 0.1 },
+              category: { category: "frontier", confidence: 0.95 },
+              candidates: [],
+            },
+          };
+        }),
+      },
+      routerLog: vi.fn(async () => undefined) as LaunchRouterLog,
+    });
+    const result = await tool.execute("call", request({ specs: [spec({ category: "frontier" })] }), new AbortController().signal, undefined, extensionContext);
+    expect(loaded?.categories.has("frontier")).toBe(true);
+    expect(result.details).toMatchObject({ operation: "launch_batch", outcome: "abstained", router: [{ kind: "rejected", quality: "rejected" }] });
+    expect(result.details).not.toMatchObject({ router: [{ reason: "catalog_unavailable" }] });
+  });
+
   it("rechecks the child gate and rejects an unavailable prompt transport", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const gate = { check: vi.fn(async () => undefined), release: vi.fn(async () => undefined) };
@@ -634,9 +663,6 @@ quotaSources:
     const harness = makeCli();
     const noPrompt = { runJson: harness.cli.runJson } as unknown as LaunchCli;
     await expect(toolFor({ catalog, cli: noPrompt }).execute("call", request(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
-    const noCatalog = createLaunchTool({ cli: makeCli().cli, context, cwd: "/tmp", preflight: async () => undefined, supervision: stubSupervision() });
-    const unavailable = await noCatalog.execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(unavailable.details).toMatchObject({ outcome: "abstained", router: [{ reason: "catalog_unavailable" }] });
   });
 
   it("cannot bypass the freeze gate", async () => {

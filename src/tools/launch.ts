@@ -249,6 +249,7 @@ const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
 const AGENT_PANE_SHELL_SETTLE_MS = 10_000;
 const AGENT_PANE_SHELL_POLL_MS = 150;
 const LAUNCH_RECONCILIATION_TIMEOUT_MS = 5_000;
+const SPEC_EVALUATION_TIMEOUT_MS = 20_000;
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
 /**
@@ -1974,10 +1975,25 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     for (const spec of params.specs) {
       const state = specRouterState(spec, catalog);
       let evaluation: Awaited<ReturnType<TypeSafeSpecClient["evaluate"]>>;
+      const timeoutController = new AbortController();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
-        evaluation = await specClient.evaluate({ spec, catalog }, signal);
+        evaluation = await Promise.race([
+          specClient.evaluate({ spec, catalog }, AbortSignal.any([signal, timeoutController.signal])),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              const reason = new DOMException("Spec evaluation timed out", "TimeoutError");
+              timeoutController.abort(reason);
+              reject(reason);
+            }, SPEC_EVALUATION_TIMEOUT_MS);
+          }),
+        ]);
       } catch {
-        evaluation = { kind: "abstained", reason: signal.aborted ? "aborted" : "transport_failed", component: "transport" };
+        evaluation = timeoutController.signal.aborted && !signal.aborted
+          ? { kind: "abstained", reason: "transport_failed", component: "evaluation" }
+          : { kind: "abstained", reason: signal.aborted ? "aborted" : "transport_failed", component: "transport" };
+      } finally {
+        clearTimeout(timeout);
       }
       let decision: SpecDecision;
       if (evaluation.kind === "response") {

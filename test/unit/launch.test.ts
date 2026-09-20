@@ -626,6 +626,26 @@ quotaSources:
     expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "focus")).toBe(true);
   });
 
+  it("times out and logs a hung spec evaluation without starting a child", async () => {
+    vi.useFakeTimers();
+    try {
+      const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+      const harness = makeCli();
+      const routerLog = vi.fn(async () => undefined) as LaunchRouterLog;
+      const evaluate = vi.fn(async () => new Promise<never>(() => undefined));
+      const tool = toolFor({ catalog, cli: harness.cli, routerLog, specClient: { evaluate } });
+      const pending = tool.execute("call", request(), new AbortController().signal, undefined, extensionContext);
+      await vi.waitFor(() => expect(evaluate).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await pending;
+      expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({ result: { kind: "abstained", reason: "transport_failed", component: "evaluation" } }), expect.objectContaining({ root: "/repo" }));
+      expect(result.details).toMatchObject({ operation: "launch_batch", outcome: "abstained", router: [{ kind: "abstained", reason: "transport_failed", component: "evaluation" }], children: [] });
+      expect(harness.children).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("loads the shipped catalog when the project cwd has no catalog", async () => {
     let loaded: Catalog | undefined;
     const tool = createLaunchTool({

@@ -462,6 +462,7 @@ describe("response boundary parsing", () => {
     { name: "array record with no operand", entry: candidateEntry({ selection: { tools: [{ name: "read" }] } }), expected: invalid("candidates") },
     { name: "array with non-record items", entry: candidateEntry({ selection: { tools: [5] } }), expected: invalid("candidates") },
     { name: "non-array non-map pool value", entry: candidateEntry({ selection: { tools: 5 } }), expected: invalid("candidates") },
+    { name: "map with unbounded resource name", entry: candidateEntry({ selection: { tools: { "": 0.9 } } }), expected: invalid("candidates") },
     { name: "unparseable pool operand", entry: candidateEntry({ selection: { tools: { read: "x" } } }), expected: invalid("candidates") },
     { name: "record operand with no tolerated key", entry: candidateEntry({ selection: { tools: { read: { weird: 1 } } } }), expected: invalid("candidates") },
     { name: "explicit confidence override on a record operand", entry: candidateEntry({ selection: { tools: { read: { selected: 0.9, confidence: 0.85 } } } }), expected: admitted },
@@ -475,11 +476,22 @@ describe("response boundary parsing", () => {
     });
   }
 
-  it("abstains low_confidence on the named resource from maps and arrays, before later candidates", async () => {
+  it("excludes indecisive resources, records the noul, and keeps later candidates parseable", async () => {
     for (const tools of [{ read: 0.7 }, [{ name: "read", selected: 0.7 }]]) {
-      const result = await routeSpec(withEntry(candidateEntry({ selection: { tools } })));
-      expect(result).toMatchObject({ kind: "abstained", reason: "low_confidence", component: "tools:read" });
+      const seen: ResourceSelection[] = [];
+      const input = withEntry(candidateEntry({ selection: { tools } }));
+      input.compile = async (_catalog, _spec, resolved, selection) => {
+        seen.push(selection);
+        return configuration(resolved.index, resolved.candidate.model);
+      };
+      const result = await routeSpec(input);
+      expect(result).toMatchObject({
+        kind: "admitted",
+        evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] },
+      });
+      expect(seen).toEqual([{}]);
     }
+
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }, { runner: "claude", model: "claude-model" }]);
     const input = baseInput(catalog);
     input.response = {
@@ -490,8 +502,46 @@ describe("response boundary parsing", () => {
       ],
     };
     const result = await routeSpec(input);
-    expect(result).toMatchObject({ kind: "abstained", reason: "low_confidence", component: "tools:read" });
-    expect(result).not.toMatchObject({ component: "claude-model" });
+    expect(result).toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] } });
+  });
+
+  it("keeps confident YES resources and excludes confident NO resources", async () => {
+    const yesSeen: ResourceSelection[] = [];
+    const yes = withEntry(candidateEntry({ selection: { tools: { read: 0.95 } } }));
+    yes.compile = async (_catalog, _spec, resolved, selection) => {
+      yesSeen.push(selection);
+      return configuration(resolved.index, resolved.candidate.model);
+    };
+    await expect(routeSpec(yes)).resolves.toMatchObject({ kind: "admitted" });
+    expect(yesSeen).toEqual([{ tools: ["read"] }]);
+
+    const noSeen: ResourceSelection[] = [];
+    const no = withEntry(candidateEntry({ selection: { tools: { read: 0.1 } } }));
+    no.compile = async (_catalog, _spec, resolved, selection) => {
+      noSeen.push(selection);
+      return configuration(resolved.index, resolved.candidate.model);
+    };
+    await expect(routeSpec(no)).resolves.toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.1 }] } });
+    expect(noSeen).toEqual([{}]);
+  });
+
+  it("abstains when an excluded resource is explicitly required by the instructions", async () => {
+    const input = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
+    input.spec = { ...SPEC, instructions: "You must use read to complete this assignment." };
+    await expect(routeSpec(input)).resolves.toMatchObject({
+      kind: "abstained",
+      reason: "low_confidence",
+      component: "tools:read",
+      evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] },
+    });
+
+    const imperative = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
+    imperative.spec = { ...SPEC, instructions: "Use read to complete this assignment." };
+    await expect(routeSpec(imperative)).resolves.toMatchObject({ kind: "abstained", reason: "low_confidence" });
+
+    const forbidden = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
+    forbidden.spec = { ...SPEC, instructions: "Do not use read for this assignment." };
+    await expect(routeSpec(forbidden)).resolves.toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] } });
   });
 
   it("assembles the bypass binding only from a complete bounded field set", async () => {

@@ -70,6 +70,7 @@ export interface RouterEvidence {
     status: CandidateAvailability["status"];
     retryNotBefore: string | null;
   }[];
+  exclusions?: readonly ResourceExclusion[];
   bypass?: {
     label: "transport-abstain" | "abstain";
     quality: QualityOutcome;
@@ -241,9 +242,20 @@ interface QualityGateResult {
   assignment?: ParsedBinary;
 }
 
+export interface ResourceExclusion {
+  field: PoolField;
+  name: string;
+  noul: number;
+}
+
 interface CandidateSelectionResult {
   selection: ResourceSelection;
-  evidence?: { lowConfidence: string };
+  exclusions: ResourceExclusion[];
+}
+
+interface CandidateSelectionsResult {
+  selections: Map<number, ResourceSelection>;
+  exclusions: Map<number, ResourceExclusion[]>;
 }
 
 const POOL_FIELDS = ["tools", "extensions", "skills", "plugins", "mcp"] as const;
@@ -384,21 +396,29 @@ function candidateEntryFor(entries: readonly unknown[] | Record<string, unknown>
   return (entries as Record<string, unknown>)[String(index)];
 }
 
-function selectedFromJudgment(value: unknown): { selected: boolean; confidence: number } | undefined {
-  if (typeof value === "boolean") return { selected: value, confidence: 1 };
-  if (finiteProbability(value)) return { selected: value >= 0.5, confidence: Math.max(value, 1 - value) };
+function selectedFromJudgment(value: unknown): { selected: boolean; confidence: number; probability: number } | undefined {
+  if (typeof value === "boolean") return { selected: value, confidence: 1, probability: value ? 1 : 0 };
+  if (finiteProbability(value)) return { selected: value >= 0.5, confidence: Math.max(value, 1 - value), probability: value };
   if (!record(value)) return undefined;
   const raw = value.selected ?? value.permitted ?? value.noul ?? value.probability ?? value.value ?? value.choice;
   const parsed = parseBinary(raw);
   if (parsed === undefined) return undefined;
   const confidence = value.confidence === undefined ? parsed.confidence : value.confidence;
-  return finiteProbability(confidence) ? { selected: parsed.probability >= 0.5, confidence } : undefined;
+  return finiteProbability(confidence) ? { selected: parsed.probability >= 0.5, confidence, probability: parsed.probability } : undefined;
 }
 
-function selectionForField(value: unknown, field: PoolField): { names: string[]; lowConfidence?: string } | undefined {
-  if (value === undefined) return { names: [] };
+function selectionForField(value: unknown, field: PoolField): { names: string[]; exclusions: ResourceExclusion[] } | undefined {
+  if (value === undefined) return { names: [], exclusions: [] };
+  const names: string[] = [];
+  const exclusions: ResourceExclusion[] = [];
+  const consider = (name: string, judgment: { selected: boolean; confidence: number; probability: number }): void => {
+    if (judgment.confidence < ROUTER_CONFIDENCE_THRESHOLD || !judgment.selected) {
+      exclusions.push({ field, name, noul: judgment.probability });
+      return;
+    }
+    names.push(name);
+  };
   if (Array.isArray(value)) {
-    const names: string[] = [];
     for (const item of value) {
       if (typeof item === "string") {
         names.push(item);
@@ -408,38 +428,37 @@ function selectionForField(value: unknown, field: PoolField): { names: string[];
       const name = item.name ?? item.resource;
       const judgment = selectedFromJudgment(item);
       if (!bounded(name) || judgment === undefined) return undefined;
-      if (judgment.confidence < ROUTER_CONFIDENCE_THRESHOLD) return { names, lowConfidence: `${field}:${name}` };
-      if (judgment.selected) names.push(name);
+      consider(name, judgment);
     }
-    return { names };
+    return { names, exclusions };
   }
   if (!record(value)) return undefined;
-  const names: string[] = [];
   for (const [name, judgmentValue] of Object.entries(value)) {
     const judgment = selectedFromJudgment(judgmentValue);
-    if (!judgment) return undefined;
-    if (judgment.confidence < ROUTER_CONFIDENCE_THRESHOLD) return { names, lowConfidence: `${field}:${name}` };
-    if (judgment.selected) names.push(name);
+    if (!bounded(name) || !judgment) return undefined;
+    consider(name, judgment);
   }
-  return { names };
+  return { names, exclusions };
 }
 
 function candidateSelection(value: Record<string, unknown>): CandidateSelectionResult | undefined {
   const raw = record(value.selection) ? value.selection : record(value.resources) ? value.resources : value;
   const selection: ResourceSelection = {};
+  const exclusions: ResourceExclusion[] = [];
   for (const field of POOL_FIELDS) {
     const parsed = selectionForField(raw[field], field);
     if (parsed === undefined) return undefined;
-    if (parsed.lowConfidence !== undefined) return { selection, evidence: { lowConfidence: parsed.lowConfidence } };
     if (parsed.names.length > 0) selection[field] = parsed.names;
+    exclusions.push(...parsed.exclusions);
   }
-  return { selection };
+  return { selection, exclusions };
 }
 
-function candidateSelections(response: Record<string, unknown>, chain: readonly ChainCandidate[]): { selections: Map<number, ResourceSelection>; lowConfidence?: string } | undefined {
+function candidateSelections(response: Record<string, unknown>, chain: readonly ChainCandidate[]): CandidateSelectionsResult | undefined {
   const entries = candidateEntries(response);
   if (entries === undefined) return undefined;
   const selections = new Map<number, ResourceSelection>();
+  const exclusions = new Map<number, ResourceExclusion[]>();
   for (let index = 0; index < chain.length; index += 1) {
     const entry = candidateEntryFor(entries, index);
     if (!record(entry)) return undefined;
@@ -447,10 +466,20 @@ function candidateSelections(response: Record<string, unknown>, chain: readonly 
     if (entry.model !== undefined && entry.model !== chain[index]!.model) return undefined;
     const parsed = candidateSelection(entry);
     if (parsed === undefined) return undefined;
-    if (parsed.evidence !== undefined) return { selections, lowConfidence: parsed.evidence.lowConfidence };
     selections.set(index, parsed.selection);
+    exclusions.set(index, parsed.exclusions);
   }
-  return { selections };
+  return { selections, exclusions };
+}
+
+/** Only explicit requirements are derivable from free-form instructions. */
+function requiredByInstructions(instructions: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const mention = new RegExp(`(?:^|[^A-Za-z0-9_])${escaped}(?=$|[^A-Za-z0-9_])`, "i");
+  return instructions.split(/[\n.!?;]+/u).some((clause) => {
+    if (!mention.test(clause) || /\b(?:do not|don't|must not|should not|never|without|avoid|optional|may|can|could|not required|not necessary|not needed|not use)\b/i.test(clause)) return false;
+    return /\b(?:must|required|requires|require|needs|need|necessary|essential)\b/i.test(clause) || /^\s*(?:use|call|run|invoke|execute)\b/i.test(clause);
+  });
 }
 
 function outcomeBinding(input: SpecRouteInput): RouterBinding | undefined {
@@ -664,7 +693,6 @@ export async function routeSpec(input: SpecRouteInput): Promise<SpecDecision> {
   }
   const selections = candidateSelections(response, chain);
   if (selections === undefined) return abstain("invalid_response", "candidates");
-  if (selections.lowConfidence !== undefined) return abstain("low_confidence", selections.lowConfidence);
 
   const statuses = new Map<number, CandidateAvailability>();
   const availabilityGate = input.availability ?? defaultAvailability;
@@ -709,6 +737,18 @@ export async function routeSpec(input: SpecRouteInput): Promise<SpecDecision> {
     });
   }
 
+  const selectedExclusions = selections.exclusions.get(resolution.selected.index)!;
+  const requiredExclusion = selectedExclusions.find((exclusion) => requiredByInstructions(input.spec.instructions, exclusion.name));
+  if (requiredExclusion !== undefined) {
+    return abstain("low_confidence", `${requiredExclusion.field}:${requiredExclusion.name}`, {
+      ...qualityEvidence("not_rejected", quality.gate.instructions, quality.gate.assignment),
+      category: { name: category.category, confidence: category.confidence },
+      selectedCandidate: { index: resolution.selected.index, runner: resolution.selected.candidate.runner, model: resolution.selected.candidate.model },
+      availability: resolutionEvidence(statuses),
+      exclusions: selectedExclusions
+    });
+  }
+
   const compile = input.compile ?? compileCandidateContract;
   let configuration: CompiledContract;
   try {
@@ -730,7 +770,8 @@ export async function routeSpec(input: SpecRouteInput): Promise<SpecDecision> {
       ...qualityEvidence("not_rejected", quality.gate.instructions, quality.gate.assignment),
       category: { name: category.category, confidence: category.confidence },
       selectedCandidate: { index: resolution.selected.index, runner: resolution.selected.candidate.runner, model: resolution.selected.candidate.model },
-      availability: resolutionEvidence(statuses)
+      availability: resolutionEvidence(statuses),
+      ...(selectedExclusions.length === 0 ? {} : { exclusions: selectedExclusions })
     }
   };
 }

@@ -4,6 +4,7 @@ import { SUPERVISION_MAX_EVENTS, type SupervisionEvent } from "../../src/supervi
 import { isSupervisionJobView, type SupervisionJobPort, type SupervisionJobView } from "../../src/supervision/state.js";
 import { SupervisionSocket, type SupervisionStream } from "../../src/supervision/socket.js";
 import { TypeSafeSupervisionReviewer } from "../../src/supervision/reviewer.js";
+import type { EvidenceState } from "../../src/supervision/evidence.js";
 
 const request: SupervisorJobRequestSnapshot = {
   kind: "supervisor",
@@ -378,7 +379,10 @@ describe("residual supervision edges", () => {
       apiKey: "key",
       fetch: async () => { throw new Error("socket hangup"); },
     });
-    await expect(reviewer.review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: {}, transcriptDelta: [] }, new AbortController().signal))
+    // The transport rejection is what this test exercises; the evidence stub
+    // only needs to exist (ADR-036 V2-02's mandatory slot) — `drift` is the
+    // one field read before the request leaves.
+    await expect(reviewer.review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: { agentKind: "pi", status: "working", revision: 0 }, evidence: { drift: { drifted: false, fields: [] } } as unknown as EvidenceState }, new AbortController().signal))
       .rejects.toMatchObject({ details: { cause: expect.stringContaining("socket hangup") } });
   });
 });

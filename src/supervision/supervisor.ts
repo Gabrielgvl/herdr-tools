@@ -49,18 +49,48 @@ import {
   type SupervisionSocketEvent,
 } from "./protocol.js";
 import { deltaLines } from "../transcript-delta.js";
+import { createDevinSessionReader } from "./devin-trace.js";
 import {
-  needsManagerAttention,
+  buildEvidenceState,
+  buildExecutionDigest,
+  buildWorkspaceView,
+  createNodeWorkspaceRunner,
+  executionDigestHash,
+  WORKSPACE_VIEW_VERSION,
+  type DigestCursorRef,
+  type EvidenceBuild,
+  type EvidenceScanner,
+  type EvidenceVersionIdentity,
+  type WorkspaceCommandRunner,
+  type WorkspaceView,
+} from "./evidence.js";
+import {
+  createNodeFileReader,
+  createTraceSource,
+  type TraceCursor,
+  type TraceSource,
+  type TraceSourceKind,
+  type TraceWindow,
+} from "./trace-source.js";
+import {
+  supervisionAttention,
+  supervisionReviewerUnavailable,
   SUPERVISION_PROGRESS_THRESHOLD,
+  SUPERVISION_REVIEWER_IDENTITY,
   SUPERVISION_REVIEWER_MODEL,
-  type SupervisionAssignmentDigest,
   type SupervisionPreviousReview,
   type SupervisionReason,
   type SupervisionReviewer,
   type SupervisionReviewResult,
   type SupervisionSignalProbabilities,
 } from "./reviewer.js";
-import { appendSupervisionReview, defaultReviewLogRoot, type SupervisionReviewLog } from "./review-log.js";
+import {
+  appendSupervisionReview,
+  defaultReviewLogRoot,
+  representationForTraceSource,
+  type SupervisionReviewLog,
+  type SupervisionTier0Violation,
+} from "./review-log.js";
 import type {
   SupervisionChildView,
   SupervisionJobPort,
@@ -68,7 +98,13 @@ import type {
   SupervisionReviewView,
   SupervisionState,
 } from "./state.js";
-import type { SupervisionChildBindingPublication, SupervisionResult } from "../job-registry.js";
+import type {
+  SupervisionChildBindingPublication,
+  SupervisionForbiddenTools,
+  SupervisionReservationDigest,
+  SupervisionResult,
+  SupervisionWorkspaceRoot,
+} from "../job-registry.js";
 
 export interface SupervisionScheduler {
   setTimer(callback: () => void, milliseconds: number): unknown;
@@ -128,8 +164,28 @@ export interface SupervisorDependencies {
   monitor: Pick<SessionEventMonitor, "addObserver" | "removeObserver" | "snapshot" | "generation" | "isDegraded">;
   notifier: ManagerNotifier;
   reviewer: SupervisionReviewer;
-  /** The reservation's authorial done-when/constraints, supplied to every review as state (ADR-034). */
-  assignmentDigest?: SupervisionAssignmentDigest;
+  /**
+   * The reservation's authorial digest plus its bounded `readOnly` claim,
+   * supplied to every review as state (ADR-034; ADR-036 W0). Private: it is
+   * never part of the public projection.
+   */
+  assignmentDigest?: SupervisionReservationDigest;
+  /**
+   * The reservation's deny-list resolver (ADR-036 W0), keyed by the runner
+   * identity that actually bound — fallback may have started a different
+   * reserved candidate. Absent means no rule is armed; a typed gap answer
+   * means the armed rule is unenforceable and reports its coverage gap once
+   * as `evidence_gap` (ADR-036 V2-07).
+   */
+  resolveForbiddenTools?: (bound: { agentKind: string; candidateName: string }) => SupervisionForbiddenTools;
+  /**
+   * The trusted launch workspace root the per-cadence workspace evidence reads
+   * (ADR-036 W0). Absent or a typed gap ⇒ the view reports the gap verbatim;
+   * the supervisor's own `cwd` is never consulted.
+   */
+  workspaceRoot?: SupervisionWorkspaceRoot;
+  /** The workspace view completed by `reserve()` before any child effect. */
+  workspaceBase?: WorkspaceView;
   /**
    * The durable review-log append seam; `appendSupervisionReview` satisfies it
    * directly. A failed append degrades exactly like a reviewer failure —
@@ -165,6 +221,17 @@ export interface SupervisorDependencies {
   repairPrompt?: (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
   /** Bounded transcript delta source for the reviewer; the CLI's authoritative pane read. */
   readTranscript: (paneId: string, signal: AbortSignal) => Promise<string[]>;
+  /**
+   * The per-runner structured-trace seam (ADR-036 T1/T2). Defaults to the
+   * production readers: Pi session JSONL by `agent_session.kind = "path"`,
+   * Devin session records by `kind = "id"`, and this same transcript reader as
+   * the explicitly-labelled `tmux-fallback` for every other runner.
+   */
+  traceSource?: TraceSource;
+  /** The workspace command seam (ADR-036 E2); defaults to the stdlib git runner. */
+  workspaceRunner?: WorkspaceCommandRunner;
+  /** The local sensitive-context scan (ADR-036 E3); defaults to `scanEvidenceText`. */
+  evidenceScanner?: EvidenceScanner;
   idFactory?: () => string;
   update: (text: string, details?: unknown) => void;
 }
@@ -214,6 +281,35 @@ const inertBindingPublication: SupervisionChildBindingPublication = {
   rollback: () => undefined,
   publish: () => undefined,
 };
+
+/** The build-side causes that are ADR-036 E3 byte-budget overflows. */
+const EVIDENCE_OVERFLOW_CAUSES: ReadonlySet<string> = new Set(["assignment_over_budget", "trace_over_budget", "state_over_budget"]);
+/** The seam-side failures that are those same budgets refusing a window. */
+const EVIDENCE_OVERFLOW_FAILURES: ReadonlySet<string> = new Set(["record_exceeds_budget", "window_exceeds_budget"]);
+
+/** One emitted Tier-0 wake paired with its closed violation kind, for the durable append that follows it. */
+interface Tier0ViolationReport {
+  violation: SupervisionTier0Violation;
+  event: SupervisionEvent;
+}
+
+/** A digest cursor ref as the `source@position:hash` label the reviewer's provenance uses; absent positions omit the segment. */
+function digestCursorLabel(cursor: DigestCursorRef | undefined): string | null {
+  if (cursor === undefined) return null;
+  return cursor.position === undefined ? `${cursor.source}:${cursor.hash}` : `${cursor.source}@${cursor.position}:${cursor.hash}`;
+}
+
+/** The process-exit violation's detail string and bounded evidence scalars — shared by the cadence emit and the settle-time flush. */
+function exitViolationEvidence(exit: { exitCode?: number; signal?: string }): { detail: string; evidence: Record<string, string | number | boolean> } {
+  return {
+    detail: `the child process exited (${exit.signal ?? `code ${exit.exitCode}`})`,
+    evidence: {
+      violation: "process_exit",
+      ...(exit.exitCode === undefined ? {} : { exitCode: exit.exitCode }),
+      ...(exit.signal === undefined ? {} : { signal: exit.signal }),
+    },
+  };
+}
 
 export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private readonly log: SupervisionEventLog;
@@ -299,6 +395,25 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private lastMeaningfulProgressAtMs: number | undefined;
   private reviewTimer: unknown;
   private reviewing = false;
+  /** The per-runner structured-trace seam (ADR-036 T1/T2). */
+  private readonly traceSource: TraceSource;
+  /** The injected workspace command seam (ADR-036 E2). */
+  private readonly workspaceRunner: WorkspaceCommandRunner;
+  /** The trace cursor the last completed cadence consumed — opaque, minted by the source. */
+  private traceCursor: TraceCursor | undefined;
+  /** The reservation's evidence version identity; drift is measured against it. */
+  private evidenceBaseline: EvidenceVersionIdentity | undefined;
+  /**
+   * An authoritative process-exit fact folded from `pane_exited` but not yet
+   * reported (ADR-036 W0). The next cadence's Tier-0 check consumes it —
+   * unless the exit settles the supervisor first, in which case settlement
+   * flushes it (`reportLatchedExit`, ADR-036 V2-05): a settled supervisor
+   * never runs another cadence. An adopted move clears it — the exited
+   * pane's process is no longer this child.
+   */
+  private unreportedExit: { exitCode?: number; signal?: string } | undefined;
+  /** Whether the armed-but-unenforceable forbidden-tool rule already reported its typed gap (ADR-036 V2-07). */
+  private forbiddenToolGapReported = false;
   private settlement: Settlement | undefined;
   private selectedCandidateName: string | undefined;
   private bindStarted = false;
@@ -315,6 +430,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   constructor(private readonly deps: SupervisorDependencies) {
     this.log = new SupervisionEventLog(deps.idFactory);
     this.scheduler = deps.scheduler ?? realSupervisionScheduler;
+    this.traceSource = deps.traceSource ?? createTraceSource({
+      readFileRange: createNodeFileReader(),
+      readTerminal: deps.readTranscript,
+      devinSession: createDevinSessionReader(),
+    });
+    this.workspaceRunner = deps.workspaceRunner ?? createNodeWorkspaceRunner();
     this.settled = new Promise<Settlement>((resolve) => { this.resolveSettled = resolve; });
   }
 
@@ -734,6 +855,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.pendingMoveEndpoints.length = 0;
     this.pendingMoveInitialStateChangeSeq = undefined;
     this.selectedCandidateName = undefined;
+    // An unreported exit belongs to the identity that folded it; a failed
+    // binding drops both together so the latch can never outlive its pane.
+    this.unreportedExit = undefined;
     this.eventStreamDegraded = false;
     this.bindingPublished = false;
     this.provisionalPublished = false;
@@ -973,6 +1097,19 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (!isPaneRecordEvent(event.event)) {
       // A thin event carries only a pane id, and Herdr reuses pane ids, so it is
       // a reconciliation trigger and never a conclusion.
+      const exit = event.event === "pane_exited" && this.pendingMoveDestination === undefined && event.paneId === this.identity?.paneId
+        ? event.exit
+        : undefined;
+      // ADR-036 W0: an authoritative non-clean exit while the child is still
+      // bound is a Tier-0 crash fact, latched for the next cadence's code
+      // check. A thin event reporting no status is a typed gap — pane loss
+      // alone is never a crash.
+      if (exit?.available === true && (exit.signal !== undefined || (exit.exitCode ?? 0) !== 0)) {
+        this.unreportedExit = {
+          ...(exit.exitCode === undefined ? {} : { exitCode: exit.exitCode }),
+          ...(exit.signal === undefined ? {} : { signal: exit.signal }),
+        };
+      }
       await this.reconcile(`event:${event.event}`);
       return;
     }
@@ -1125,6 +1262,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const initialStateChangeSeq = this.pendingMoveInitialStateChangeSeq;
     this.pendingMoveDestination = undefined;
     this.pendingMoveInitialStateChangeSeq = undefined;
+    // The exited-pane fact was folded against the origin pane; an adopted move
+    // means that pane's process is no longer this child.
+    this.unreportedExit = undefined;
     this.paneIdentityGeneration += 1;
     this.identity = next;
     this.paneId = next.paneId;
@@ -1461,10 +1601,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   // ------------------------------------------------------------------ reviewer
 
   /**
-   * Review a child that has been working for a whole cadence. A failure enters
-   * one visible degraded episode and retries at the next cadence; the first
-   * success afterwards notifies recovery once. The supervisor stays active
-   * either way.
+   * Review a child that has been working for a whole cadence. A reviewer
+   * infrastructure failure is silent — it normalizes to the unavailable
+   * result and retries at the next cadence (ADR-036 V2-08); an evidence-read
+   * or telemetry-sink failure instead enters one visible degraded episode,
+   * and the first success afterwards notifies recovery once. The supervisor
+   * stays active either way.
    */
   private async review(): Promise<void> {
     if (this.reviewing || this.pendingMoveDestination !== undefined) {
@@ -1480,36 +1622,90 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (!this.reviewable()) return;
     this.reviewing = true;
     const run = this.workingRun;
-    // The exact pane this review is about, pinned before the read. Everything
-    // downstream reads the pinned identity, so the transcript can never be
-    // relabelled with a pane the child moved to while it was being read.
+    // The exact pane this review is about, pinned before any evidence read.
+    // Everything downstream reads the pinned identity, so the trace, the
+    // terminal window, and the workspace can never be relabelled with a pane
+    // the child moved to while they were being read.
     const paneIdentity = this.paneIdentityGeneration;
     const reviewed = this.identity!;
     const workingSinceMs = this.workingSinceMs!;
     try {
-      const transcript = await this.deps.readTranscript(reviewed.paneId, this.abort.signal);
+      // Evidence order (ADR-036): the runner's own structured trace is the
+      // primary "what happened"; the bounded terminal read is supplemental
+      // only. A `tmux-fallback` window already IS that read — its events are
+      // the delta and its cursor the reviewed window — so it issues no second
+      // pane read.
+      const trace = await this.traceSource.read(reviewed, this.traceCursor, this.abort.signal);
+      const transcript = trace.source === "tmux-fallback"
+        ? (trace.cursorTo?.source === "tmux-fallback" ? trace.cursorTo.window : this.reviewedTranscript)
+        : await this.deps.readTranscript(reviewed.paneId, this.abort.signal);
+      const transcriptDelta = trace.source === "tmux-fallback"
+        ? trace.events.map((event) => event.record as string)
+        : deltaLines(this.reviewedTranscript, transcript);
+      const workspace = await this.cadenceWorkspace(this.abort.signal);
       // The child may have finished its work cycle — or left this very pane —
-      // while the read was in flight. A review of a run that is over, or of a
+      // while the reads were in flight. A review of a run that is over, or of a
       // pane the child no longer occupies, is not evidence about anything, so it
       // is abandoned before the model call rather than stored or announced. The
-      // transcript cursor does not advance: those lines were never reviewed.
+      // cursors do not advance: that evidence was never reviewed.
       if (!this.reviewable(run, paneIdentity)) return;
-      // Only what is new since the previous completed review. Handing the whole
-      // window back every cadence would let stale output keep reading as fresh
-      // progress from a stalled child.
-      const transcriptDelta = deltaLines(this.reviewedTranscript, transcript);
+      // Deterministic assembly: compaction, byte budgets, then the local
+      // sensitive scan — only a `safe` state may reach the reviewer.
+      const build = buildEvidenceState({
+        ...(this.deps.assignmentDigest === undefined ? {} : { assignment: this.deps.assignmentDigest }),
+        trace,
+        workspace,
+        terminal: transcriptDelta,
+        identity: SUPERVISION_REVIEWER_IDENTITY,
+        ...(this.evidenceBaseline === undefined ? {} : { baselineIdentity: this.evidenceBaseline }),
+      }, this.deps.evidenceScanner === undefined ? {} : { scan: this.deps.evidenceScanner });
+      // The reservation's version identity pins once on the first build — a
+      // refused build's identity still counts, since drift compares truth.
+      this.evidenceBaseline ??= build.available ? build.state.identity : build.identity;
+      // Tier-0 code attention runs before any model call: each violation is a
+      // deterministic fact reported as a high-priority attention event — typed
+      // violation evidence, never a probabilistic claim. A cadence that
+      // reports one consumed this window, so the cursors advance with it and
+      // no Jev request leaves.
+      const violations = this.emitTier0Violations(reviewed, trace, workspace, build);
+      if (violations.length > 0) {
+        this.reviewedTranscript = transcript;
+        this.traceCursor = trace.cursorTo;
+        // The same append-last contract as persistReview: the wakes and the
+        // cursor advance already happened, so a sink failure costs only the
+        // dataset rows and degrades like a reviewer failure.
+        await this.persistTier0Violations(violations, reviewed, trace, workspace, build);
+        return;
+      }
+      // A source that failed closed, or a state the budget/scan gate refused,
+      // is `reviewer_unavailable`: silent, unrecorded, and retried at the next
+      // cadence — never an empty-trace review.
+      if (!build.available) {
+        const result = supervisionReviewerUnavailable({ identity: build.identity });
+        this.publish(`review unavailable (evidence ${build.failure.cause}): ${result.summary}`);
+        return;
+      }
+      if (trace.typedFailure !== undefined) {
+        const result = supervisionReviewerUnavailable({ evidence: build.state });
+        this.publish(`review unavailable (trace ${trace.typedFailure.kind}): ${result.summary}`);
+        return;
+      }
+      const workingForMs = Math.max(0, this.deps.clock.now() - workingSinceMs);
       const result = await this.deps.reviewer.review({
         paneId: reviewed.paneId,
         agentName: reviewed.agentName,
-        workingForMs: Math.max(0, this.deps.clock.now() - workingSinceMs),
-        metadata: { agentKind: reviewed.agentKind, status: this.status, revision: this.lastRevision },
-        transcriptDelta,
-        ...(this.deps.assignmentDigest === undefined ? {} : { assignmentDigest: this.deps.assignmentDigest }),
+        workingForMs,
+        // The dispatch context is closed scalars only — the digest and the
+        // delta ride the assembled evidence, never raw caller fields (V2-02).
+        metadata: { agentKind: reviewed.agentKind, status: this.status!, revision: this.lastRevision },
         ...(this.previousReview === undefined ? {} : { previousReview: this.previousReview }),
         linesSinceLastReview: transcriptDelta.length,
+        evidence: build.state,
+        cadenceMs: this.deps.cadenceMs,
       }, this.abort.signal);
       if (!this.reviewable(run, paneIdentity)) return;
       this.reviewedTranscript = transcript;
+      this.traceCursor = trace.cursorTo;
       this.lastReviewAtMs = this.deps.clock.now();
       this.reviews.push({
         atMs: this.lastReviewAtMs,
@@ -1538,7 +1734,17 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         this.emit("reviewer_recovered", "the supervision reviewer recovered");
       }
       let wake: SupervisionEvent | undefined;
-      if (needsManagerAttention(result.classification)) {
+      // The code-owned ADR-036 attention policy decides, never the
+      // classification's legacy table: the result carries the decision, and
+      // the local recompute is the fallback for a reviewer that omitted it.
+      const attention = result.attention ?? supervisionAttention({
+        classification: result.classification,
+        ...(result.outcome === undefined ? {} : { outcome: result.outcome }),
+        firstObservation: previousClassification === undefined || result.drift?.drifted === true,
+        workingForMs,
+        cadenceMs: this.deps.cadenceMs,
+      });
+      if (attention === "wake_manager") {
         wake = this.emit("reviewer_attention", `supervision review says ${result.classification}: ${result.summary}`, { classification: result.classification });
       } else {
         // Progress stores silently.
@@ -1551,13 +1757,27 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // cadence). That deliberately differs from the router decision log's
       // ROUTER_LOG_UNAVAILABLE veto — that log is a launch precondition and
       // review telemetry never is.
-      await this.persistReview(result, reviewed, workingSinceMs, transcriptDelta.length, transcript.length, previousClassification, wake);
+      await this.persistReview(result, reviewed, workingSinceMs, transcriptDelta.length, transcript.length, previousClassification, wake, {
+        source: trace.source,
+        stateBytes: build.bytes.total,
+        terminalBytes: build.bytes.terminal,
+      });
     } catch (error) {
       // A failure that belongs to a run which has already ended, or to a pane the
       // child has left, is not evidence about anything either: it must not
       // degrade the reviewer, wake anyone, or publish, exactly as an obsolete
       // success must not.
       if (!this.reviewable(run, paneIdentity)) return;
+      // ADR-036 V2-08: a reviewer infrastructure failure — transport, auth,
+      // HTTP, malformed response — is not evidence about the child and never
+      // wakes the manager. It normalizes to the silent unavailable result and
+      // the finally re-arms, so the next cadence retries. A cancelled run's
+      // abort never reaches this guard: stopping the run is what made the
+      // failure obsolete above, so lifecycle cancellation stays intact.
+      if (error instanceof ReviewerFailure) {
+        this.publish(`review unavailable (${reviewerReason(error)})`);
+        return;
+      }
       if (!this.reviewerDegraded) {
         this.reviewerDegraded = true;
         this.emit("reviewer_degraded", `the supervision reviewer failed (${reviewerReason(error)}) and will retry at the next cadence`, { reason: reviewerReason(error) });
@@ -1587,6 +1807,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     transcriptLines: number,
     previousClassification: ReviewClassification | undefined,
     wake: SupervisionEvent | undefined,
+    sent: { source: TraceSourceKind; stateBytes: number; terminalBytes: number },
   ): Promise<void> {
     const append = this.deps.reviewLog ?? appendSupervisionReview;
     await append({
@@ -1611,11 +1832,277 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         transcriptLines,
         workingForMs: Math.max(0, this.lastReviewAtMs! - workingSinceMs),
       },
+      provenance: {
+        traceSource: sent.source,
+        representation: representationForTraceSource(sent.source),
+        traceFromCursor: result.evidence?.traceFromCursor ?? null,
+        traceToCursor: result.evidence?.traceToCursor ?? null,
+        traceDigestHash: result.evidence?.traceDigestHash ?? null,
+        workspaceFingerprint: result.evidence?.workspaceFingerprint ?? null,
+        stateBytes: sent.stateBytes,
+        terminalBytes: sent.terminalBytes,
+        identityHash: result.identityHash ?? null,
+      },
       ...(wake === undefined ? {} : { wake: { eventId: wake.eventId, eventType: wake.type, atMs: wake.atMs } }),
     }, {
       root: this.deps.reviewLogRoot ?? defaultReviewLogRoot(),
       now: () => new Date(this.deps.clock.now()),
     });
+  }
+
+  /**
+   * Persist one `violation` record per emitted Tier-0 wake — the closed
+   * violation kind, the wake's bounded detail scalars, and the cadence's
+   * provenance — through the same append seam. The digest the violations were
+   * judged on is the sent state's own when the build produced one, else a
+   * fresh digest of the same window (identical input, identical hash). Runs
+   * strictly after the wakes and the cursor advance, so a sink failure costs
+   * only the dataset rows and degrades like a reviewer failure.
+   */
+  private async persistTier0Violations(
+    violations: Tier0ViolationReport[],
+    reviewed: SupervisedIdentity,
+    trace: TraceWindow,
+    workspace: WorkspaceView,
+    build: EvidenceBuild,
+  ): Promise<void> {
+    const append = this.deps.reviewLog ?? appendSupervisionReview;
+    const digest = build.available ? build.state.trace : buildExecutionDigest(trace);
+    const identity = build.available ? build.state.identity : build.identity;
+    await append({
+      jobId: this.deps.jobId,
+      agentName: reviewed.agentName,
+      agentKind: reviewed.agentKind,
+      provenance: {
+        traceSource: trace.source,
+        representation: representationForTraceSource(trace.source),
+        traceFromCursor: digestCursorLabel(digest.cursorFrom),
+        traceToCursor: digestCursorLabel(digest.cursorTo),
+        traceDigestHash: executionDigestHash(digest),
+        workspaceFingerprint: workspace.available ? workspace.fingerprint : null,
+        stateBytes: build.available ? build.bytes.total : null,
+        terminalBytes: build.available ? build.bytes.terminal : null,
+        /* c8 ignore next -- every violation-reachable build already minted an identity; null stays honest if a future pre-identity refusal reaches here. */
+        identityHash: identity?.hash ?? null,
+      },
+      violations: violations.map(({ violation, event }) => ({
+        eventId: event.eventId,
+        eventType: event.type,
+        atMs: event.atMs,
+        violation,
+        details: event.details,
+      })),
+    }, {
+      root: this.deps.reviewLogRoot ?? defaultReviewLogRoot(),
+      now: () => new Date(this.deps.clock.now()),
+    });
+  }
+
+  /**
+   * One cadence's workspace view (ADR-036 E2), read under the trusted launch
+   * root and the base that `reserve()` pinned before dispatch. A missing or
+   * failed pin stays typed evidence. The cadence never invents a later base.
+   */
+  private async cadenceWorkspace(signal: AbortSignal): Promise<WorkspaceView> {
+    const root = this.deps.workspaceRoot;
+    if (root?.available !== true) {
+      // The reservation's typed gap is the view's refusal — the W0 reason
+      // verbatim in the detail, under the view vocabulary's `root_invalid`.
+      return {
+        version: WORKSPACE_VIEW_VERSION,
+        available: false,
+        failure: { reason: "root_invalid", detail: { gap: root?.available === false ? root.reason : "root_unavailable" } },
+      };
+    }
+    const base = this.deps.workspaceBase;
+    if (base === undefined) {
+      return {
+        version: WORKSPACE_VIEW_VERSION,
+        available: false,
+        failure: { reason: "base_invalid", detail: { gap: "base_unpinned" } },
+      };
+    }
+    if (!base.available) return base;
+    return buildWorkspaceView({ root: root.root, baseRevision: base.baseRevision }, { run: this.workspaceRunner }, signal);
+  }
+
+  /**
+   * ADR-036 Tier-0: deterministic attention evaluated before Jev. Each
+   * violation emits one high-priority attention event carrying typed
+   * violation evidence — no probabilistic classification, no review record —
+   * and the cadence is consumed (the emitted reports drive the violation-log
+   * append and tell the caller to return). Everything here is a code fact: a
+   * read-only reservation whose workspace went dirty, a deny-listed tool the
+   * structured trace observed, an E3 byte budget that refused, or an
+   * authoritative non-clean process exit.
+   */
+  private emitTier0Violations(
+    reviewed: SupervisedIdentity,
+    trace: TraceWindow,
+    workspace: WorkspaceView,
+    build: EvidenceBuild,
+  ): Tier0ViolationReport[] {
+    const violations: { reason: SupervisionTier0Violation; detail: string; evidence: Record<string, string | number | boolean> }[] = [];
+    if (this.deps.assignmentDigest?.readOnly === true && workspace.available) {
+      // ADR-036 V2-04: the violation is ANY delta from the reservation's
+      // pinned base — a clean worktree does not hide commits. `dirty` covers
+      // uncommitted and untracked work; head movement and the base-relative
+      // file delta cover what a commit leaves behind.
+      const headMoved = workspace.headRevision !== workspace.baseRevision;
+      const deltaPaths = workspace.changedFiles.length + workspace.omittedFiles;
+      if (workspace.dirty || headMoved || deltaPaths > 0) {
+        const delta = [
+          ...(workspace.dirty ? ["dirty"] : []),
+          ...(headMoved ? ["head moved"] : []),
+          ...(deltaPaths > 0 ? [`${deltaPaths} changed paths`] : []),
+        ].join(", ");
+        violations.push({
+          reason: "read_only_dirty_workspace",
+          detail: `read-only assignment, but the reserved workspace changed (${delta})`,
+          evidence: {
+            violation: "read_only_dirty_workspace",
+            delta,
+            baseRevision: workspace.baseRevision,
+            headRevision: workspace.headRevision,
+            filesChanged: workspace.stats.filesChanged,
+            untrackedFiles: workspace.stats.untrackedFiles,
+            omittedFiles: workspace.omittedFiles,
+          },
+        });
+      }
+    }
+    const forbidden = this.deps.resolveForbiddenTools?.({
+      agentKind: reviewed.agentKind,
+      candidateName: this.selectedCandidateName!,
+    });
+    if (forbidden !== undefined) {
+      // ADR-036 V2-07: the matcher enforces only where a real deny-list fact
+      // meets a trace source that can observe tool calls. A typed resolver
+      // gap — or the terminal fallback, which produces no tool entries by
+      // construction — means the armed rule is unenforceable: report that
+      // coverage gap once rather than silently claiming the check ran.
+      if (forbidden.available === false) {
+        this.reportForbiddenToolGap(forbidden.reason);
+      } else if (trace.source === "tmux-fallback" && forbidden.tools.length > 0) {
+        // An empty deny list is trivially enforceable — nothing to observe.
+        this.reportForbiddenToolGap("no_tool_observations");
+      } else {
+        // Tool names the digest observed — classified and unclassified alike.
+        // Case-insensitive: a deny-listed tool is the same tool in any spelling.
+        const digest = build.available ? build.state.trace : buildExecutionDigest(trace);
+        const observed = new Set([...digest.actions, ...digest.other].map((entry) => entry.tool.toLowerCase()));
+        const matched = forbidden.tools.filter((tool) => observed.has(tool.toLowerCase()));
+        if (matched.length > 0) {
+          violations.push({
+            reason: "forbidden_tool_observed",
+            detail: `forbidden tools observed in the trace: ${matched.join(", ")}`,
+            evidence: { violation: "forbidden_tool_observed", tools: matched.join(",") },
+          });
+        }
+      }
+    }
+    // The typed detail rides the record too — bounded scalars (bytes, budget,
+    // offset) are the violation's own provenance.
+    const overflow = trace.typedFailure !== undefined && EVIDENCE_OVERFLOW_FAILURES.has(trace.typedFailure.kind)
+      ? { kind: trace.typedFailure.kind, detail: trace.typedFailure.detail }
+      : !build.available && EVIDENCE_OVERFLOW_CAUSES.has(build.failure.cause)
+        ? { kind: build.failure.cause, detail: build.failure.detail }
+        : undefined;
+    if (overflow !== undefined) {
+      violations.push({
+        reason: "evidence_budget_exceeded",
+        detail: `the evidence byte budget refused this cadence: ${overflow.kind}`,
+        evidence: { ...overflow.detail, violation: "evidence_budget_exceeded", cause: overflow.kind },
+      });
+    }
+    const exit = this.unreportedExit;
+    if (exit !== undefined) {
+      const { detail, evidence } = exitViolationEvidence(exit);
+      violations.push({ reason: "process_exit", detail, evidence });
+    }
+    const reported: Tier0ViolationReport[] = [];
+    for (const violation of violations) {
+      reported.push({
+        violation: violation.reason,
+        event: this.emit("reviewer_attention", `supervision violation ${violation.reason}: ${violation.detail}`, violation.evidence),
+      });
+    }
+    // Cleared only after the emit: a notifier that throws leaves the fact
+    // latched so the next cadence still reports it.
+    if (exit !== undefined) this.unreportedExit = undefined;
+    return reported;
+  }
+
+  /**
+   * ADR-036 V2-07: an armed forbidden-tool rule that cannot enforce — the
+   * resolver returned a typed gap, or the bound trace source can never carry
+   * a tool observation — reports its coverage gap once as `evidence_gap`
+   * rather than silently claiming the check ran. The matcher itself stays
+   * for the pairing where a real deny list meets a tool-observing source.
+   */
+  private reportForbiddenToolGap(reason: string): void {
+    if (this.forbiddenToolGapReported) return;
+    this.forbiddenToolGapReported = true;
+    this.emit("evidence_gap", `the forbidden-tool Tier-0 check is unenforced for this child (${reason})`, { gap: "forbidden_tool_policy", reason });
+  }
+
+  /**
+   * Emit and persist a latched non-clean exit that settlement is about to
+   * make unreachable (ADR-036 V2-05): a settled supervisor never runs the
+   * cadence that consumes `unreportedExit`, so the fact is flushed here —
+   * the violation wake precedes the lifecycle event it explains. Clearing
+   * follows the emit, exactly like the cadence's own consume.
+   */
+  private async reportLatchedExit(): Promise<void> {
+    const exit = this.unreportedExit;
+    if (exit === undefined) return;
+    // The latch only exists on a bound exact identity — the fold set it after
+    // matching this pane, and resetPreparedBinding clears both together.
+    const identity = this.identity!;
+    const { detail, evidence } = exitViolationEvidence(exit);
+    const event = this.emit("reviewer_attention", `supervision violation process_exit: ${detail}`, evidence);
+    this.unreportedExit = undefined;
+    try {
+      const append = this.deps.reviewLog ?? appendSupervisionReview;
+      // No cadence produced this violation, so its provenance is the honest
+      // absence of one: the bound trace-source kind, the minted baseline
+      // hash, and nulls where a window, digest, or state would have been.
+      const source = this.traceSource.select(identity);
+      await append({
+        jobId: this.deps.jobId,
+        agentName: identity.agentName,
+        agentKind: identity.agentKind,
+        provenance: {
+          traceSource: source,
+          representation: representationForTraceSource(source),
+          traceFromCursor: null,
+          traceToCursor: null,
+          traceDigestHash: null,
+          workspaceFingerprint: null,
+          stateBytes: null,
+          terminalBytes: null,
+          identityHash: this.evidenceBaseline?.hash ?? null,
+        },
+        violations: [{
+          eventId: event.eventId,
+          eventType: event.type,
+          atMs: event.atMs,
+          violation: "process_exit",
+          details: event.details,
+        }],
+      }, {
+        root: this.deps.reviewLogRoot ?? defaultReviewLogRoot(),
+        now: () => new Date(this.deps.clock.now()),
+      });
+    } catch (error) {
+      // The wake already fired — a sink failure costs only the dataset row.
+      // The degrade episode mirrors the cadence's append failure: reported
+      // once, supervision state untouched.
+      if (!this.reviewerDegraded) {
+        this.reviewerDegraded = true;
+        this.emit("reviewer_degraded", `the violation record could not be persisted (${reviewerReason(error)})`, { reason: reviewerReason(error) });
+      }
+    }
   }
 
   /**
@@ -1675,6 +2162,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private async settleWithEvent(type: SupervisionEventType, outcome: SupervisionResult, trigger: string, summary: string): Promise<void> {
+    // A latched non-clean exit reports before the lifecycle event it explains
+    // — a settled supervisor never runs the cadence that would consume it
+    // (ADR-036 V2-05).
+    await this.reportLatchedExit();
     if (type === "pane_closed" && this.deps.selfClose !== undefined) {
       // A manager-requested close is successful bookkeeping, not an event for
       // that same manager. Wait for the bounded close proof before deciding so
@@ -1695,6 +2186,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   private async settle(outcome: SupervisionResult, reason: string): Promise<void> {
     if (this.state === "settled") return;
+    // The same settle-time flush for direct settle callers (identity_lost has
+    // no settleWithEvent wrapper of its own); idempotent via the latch.
+    await this.reportLatchedExit();
     // `identity_lost` is the one settling outcome reached without its own event,
     // because a move or a reconnect proves it directly rather than observing it.
     if (outcome === "identity_lost") this.emit("identity_lost", `supervision lost the exact child's identity (${reason})`, { reason });

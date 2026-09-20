@@ -120,6 +120,35 @@ describe("supervision socket protocol", () => {
     }
   });
 
+  it("carries a bounded typed exit fact on pane_exited — observed status or an explicit gap, never a crash claim", () => {
+    const exited = (data: Record<string, unknown>): SupervisionSocketEvent =>
+      parseSocketLine(JSON.stringify({ event: "pane_exited", data })) as SupervisionSocketEvent;
+    // Herdr's transport reports no status or signal: a thin pane_exited proves
+    // only that the pane's process ended, so the fact is a typed evidence gap.
+    expect(exited({ type: "pane_exited", pane_id: "p1", workspace_id: "w1" })).toMatchObject({ paneId: "p1", exit: { available: false, reason: "exit_status_not_reported" } });
+    // A transport that does report the fields yields the observed variant.
+    expect(exited({ type: "pane_exited", pane_id: "p1", exit_code: 0 })).toMatchObject({ exit: { available: true, exitCode: 0 } });
+    expect(exited({ type: "pane_exited", pane_id: "p1", exit_code: 137, signal: "SIGKILL" })).toMatchObject({ exit: { available: true, exitCode: 137, signal: "SIGKILL" } });
+    expect(exited({ type: "pane_exited", pane_id: "p1", signal: "SIGTERM" })).toMatchObject({ exit: { available: true, signal: "SIGTERM" } });
+    // Null placeholders count as absent, not as zero.
+    expect(exited({ type: "pane_exited", pane_id: "p1", exit_code: null, signal: null })).toMatchObject({ exit: { available: false, reason: "exit_status_not_reported" } });
+    // A malformed authoritative field fails closed rather than degrading into a guess.
+    for (const data of [
+      { type: "pane_exited", pane_id: "p1", exit_code: "0" },
+      { type: "pane_exited", pane_id: "p1", exit_code: 1.5 },
+      { type: "pane_exited", pane_id: "p1", exit_code: Number.MAX_SAFE_INTEGER + 1 },
+      { type: "pane_exited", pane_id: "p1", signal: "" },
+      { type: "pane_exited", pane_id: "p1", signal: 9 },
+      { type: "pane_exited", pane_id: "p1", signal: "SIG\nTERM" },
+      { type: "pane_exited", pane_id: "p1", signal: "S".repeat(65) },
+    ]) {
+      expect(() => exited(data), JSON.stringify(data)).toThrow(SupervisionProtocolError);
+    }
+    // No other event kind grows an exit fact.
+    const closed = parseSocketLine(JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1", exit_code: 1 } })) as SupervisionSocketEvent;
+    expect(closed.exit).toBeUndefined();
+  });
+
   it("requires the subscription acknowledgement before any event", () => {
     expect(() => assertSubscriptionAck({ type: "subscription_started" })).not.toThrow();
     expect(() => assertSubscriptionAck({ type: "pong" })).toThrow(/did not acknowledge/u);

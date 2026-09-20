@@ -447,6 +447,28 @@ describe("the session event monitor", () => {
     monitor.stop();
   });
 
+  it("delivers the typed pane_exited exit fact — observed status or the unavailable gap, never a crash claim", async () => {
+    const peer = scriptedServer();
+    const monitor = new SessionEventMonitor({ connect: () => peer.connect(), env, clock: instantClock });
+    const watcher = observer("p1");
+    monitor.addObserver(watcher);
+    await monitor.ensureStarted();
+
+    // The 0.9.0 transport emits no status: the thin event is a lifecycle gap.
+    peer.push(`${JSON.stringify({ event: "pane_exited", data: { type: "pane_exited", pane_id: "p1", workspace_id: "w1" } })}\n`);
+    // A transport that reports authoritative fields delivers the observed fact.
+    peer.push(`${JSON.stringify({ event: "pane_exited", data: { type: "pane_exited", pane_id: "p1", workspace_id: "w1", exit_code: 3 } })}\n`);
+    peer.push(`${JSON.stringify({ event: "pane_exited", data: { type: "pane_exited", pane_id: "p1", workspace_id: "w1", signal: "SIGKILL" } })}\n`);
+    await vi.waitFor(() => expect(watcher.events).toHaveLength(3));
+
+    expect(watcher.events.map((event) => event.exit)).toEqual([
+      { available: false, reason: "exit_status_not_reported" },
+      { available: true, exitCode: 3 },
+      { available: true, signal: "SIGKILL" },
+    ]);
+    monitor.stop();
+  });
+
   it("reconnects, reports one degraded episode, and then recovers", async () => {
     const peer = scriptedServer();
     let failures = 1;

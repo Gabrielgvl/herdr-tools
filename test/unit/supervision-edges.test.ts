@@ -7,13 +7,14 @@ import { Supervisor, type SupervisorDependencies } from "../../src/supervision/s
 import type { SupervisedIdentity } from "../../src/supervision/identity.js";
 import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervision/protocol.js";
 import type { SupervisionReviewRequest } from "../../src/supervision/reviewer.js";
+import { createTraceSource } from "../../src/supervision/trace-source.js";
 import type { SupervisionWake } from "../../src/supervision/notify.js";
 import { scriptedServer } from "./supervision-peer.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 
 const types = (wakes: SupervisionWake[]): string[] => wakes.map((wake) => wake.event.type);
 
-const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
+const session = { source: "herdr:pi", agent: "pi", kind: "path", value: "/pi/session.jsonl" };
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
 const settings = { reviewCadenceMinutes: 5, reviewerModel: "testmodel", reviewerThinking: "low" as const };
 
@@ -67,6 +68,7 @@ function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: EdgeOp
   let release!: () => void;
   const arms: number[] = [];
   const pending = new Promise<void>((resolve) => { release = resolve; });
+  const readTranscript: SupervisorDependencies["readTranscript"] = options.transcript ?? (async () => []);
   const deps: SupervisorDependencies = {
     jobId: "job_edge",
     child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
@@ -97,7 +99,8 @@ function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: EdgeOp
     ...(options.scheduler === false ? {} : { scheduler: { setTimer: (_callback, ms) => { arms.push(ms); return "timer"; }, clearTimer: () => undefined } }),
     // Reviews that complete here must not reach the real review log on disk.
     reviewLog: async () => undefined,
-    readTranscript: options.transcript ?? (async () => []),
+    readTranscript,
+    traceSource: createTraceSource({ readFileRange: async () => new Uint8Array(), readTerminal: readTranscript }),
     update: () => undefined,
   };
   const supervisor = new Supervisor(deps);
@@ -404,7 +407,7 @@ describe("review-round remediations", () => {
     const h = edgeSupervisor([snapshot([paneRecord("working")])], {
       scheduler: false,
       transcript: async () => windows[Math.min(read++, windows.length - 1)]!,
-      onReview: (request) => { deltas.push(request.transcriptDelta); },
+      onReview: (request) => { deltas.push(request.evidence.terminal.lines); },
     });
     await h.supervisor.bind({ identity, candidateName: "worker-pi" });
     const first = (h.supervisor as unknown as { review(): Promise<void> }).review();

@@ -11,11 +11,15 @@ import {
   appendSupervisionDisposition,
   appendSupervisionReview,
   defaultReviewLogRoot,
+  representationForTraceSource,
   reviewLogPaths,
   type SupervisionDispositionLogEntry,
+  type SupervisionLogProvenance,
   type SupervisionLogRecord,
   type SupervisionReviewLogEntry,
   type SupervisionReviewLogPaths,
+  type SupervisionViolationLogEntry,
+  type SupervisionViolationLogRecord,
 } from "../../src/supervision/review-log.js";
 
 /** fs failures the filesystem alone cannot schedule deterministically. */
@@ -111,6 +115,19 @@ async function seedLogDir(root: string): Promise<SupervisionReviewLogPaths> {
 const SIGNALS = { progress: 0.88, stalled: 0.1, blocked: 0.2, risk: 0.72, appears_complete: 0.02 };
 const AGENT_SESSION = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
 
+/** A fully-populated bounded provenance block — closed labels, cursor labels, hashes, counts. */
+const PROVENANCE: SupervisionLogProvenance = {
+  traceSource: "pi-jsonl",
+  representation: "B-runner-trace",
+  traceFromCursor: `pi-jsonl@0:${"a".repeat(64)}`,
+  traceToCursor: `pi-jsonl@42:${"b".repeat(64)}`,
+  traceDigestHash: "c".repeat(64),
+  workspaceFingerprint: "d".repeat(64),
+  stateBytes: 12_345,
+  terminalBytes: 1_234,
+  identityHash: "e".repeat(64),
+};
+
 function entry(overrides: Record<string, unknown> = {}): SupervisionReviewLogEntry {
   return {
     jobId: "job_supervisor",
@@ -169,7 +186,7 @@ describe("appendSupervisionReview records", () => {
     expect(Object.keys(record)).toEqual([
       "type", "timestamp", "jobId", "agentName", "agentKind", "atMs", "classification", "attention",
       "signals", "evidenceSufficiency", "reason", "lastMeaningfulProgressAtMs", "linesSinceLastReview",
-      "previousClassification", "evidence",
+      "previousClassification", "evidence", "provenance",
     ]);
     expect(record).toMatchObject({
       type: "review",
@@ -255,6 +272,7 @@ describe("appendSupervisionReview records", () => {
       linesSinceLastReview: null,
       previousClassification: null,
       evidence: null,
+      provenance: null,
     });
   });
 
@@ -264,6 +282,90 @@ describe("appendSupervisionReview records", () => {
     const records = await readRecords(reviewLogPaths(root).reviews);
     expect(records[0]!.type).toBe("review");
     expect((records[0] as { evidence: unknown }).evidence).toEqual({ paneId: "p1", terminalId: "t1" });
+  });
+
+  it("persists the bounded provenance block verbatim on the review record", async () => {
+    const root = await tempdir();
+    await appendSupervisionReview(entry({ provenance: { ...PROVENANCE } }), { root });
+    const records = await readRecords(reviewLogPaths(root).reviews);
+    expect(records).toHaveLength(1);
+    expect((records[0] as { provenance: unknown }).provenance).toEqual(PROVENANCE);
+  });
+
+  it("records honestly absent provenance fields as null rather than refusing", async () => {
+    const root = await tempdir();
+    await appendSupervisionReview(entry({
+      provenance: {
+        traceSource: "tmux-fallback",
+        representation: "A-tmux-lines",
+        traceFromCursor: null,
+        traceToCursor: null,
+        traceDigestHash: null,
+        workspaceFingerprint: null,
+        stateBytes: null,
+        terminalBytes: null,
+        identityHash: null,
+      },
+    }), { root });
+    const records = await readRecords(reviewLogPaths(root).reviews);
+    expect((records[0] as { provenance: unknown }).provenance).toEqual({
+      traceSource: "tmux-fallback",
+      representation: "A-tmux-lines",
+      traceFromCursor: null,
+      traceToCursor: null,
+      traceDigestHash: null,
+      workspaceFingerprint: null,
+      stateBytes: null,
+      terminalBytes: null,
+      identityHash: null,
+    });
+  });
+
+  it("normalizes malformed cursor labels, including a secret-shaped canary, to null without refusing the append", async () => {
+    const secretCanary = "sk-live-CANARY-0123456789abcdef0123456789abcdef";
+    const labels: unknown[] = [
+      42,
+      `unknown-source@42:${"a".repeat(64)}`,
+      `pi-jsonl@not-a-position:${"a".repeat(64)}`,
+      `pi-jsonl@42:${"A".repeat(64)}`,
+      `pi-jsonl@42:${"a".repeat(63)}`,
+      "pi-jsonl@42\nforged",
+      `pi-jsonl@${"f".repeat(300)}`,
+      secretCanary,
+    ];
+    for (const label of labels) {
+      const root = await tempdir();
+      const paths = reviewLogPaths(root);
+      await appendSupervisionReview(entry({ provenance: { ...PROVENANCE, traceFromCursor: label } }), { root });
+      const records = await readRecords(paths.reviews);
+      expect(records).toHaveLength(1);
+      expect((records[0] as { provenance: SupervisionLogProvenance }).provenance.traceFromCursor).toBeNull();
+      if (label === secretCanary) expect(await readFile(paths.reviews, "utf8")).not.toContain(secretCanary);
+    }
+  });
+
+  it("admits the hook-only C label when a caller supplies it — the schema carries it, V2.1 never emits it", async () => {
+    // The sink's job is a closed allowlist, not a policy: C lands only when a
+    // pipeline actually built that representation. The V2.1 mapper proves the
+    // producer side can only ever produce A or B.
+    const root = await tempdir();
+    await appendSupervisionReview(entry({ provenance: { ...PROVENANCE, representation: "C-vcc-supervision-view" } }), { root });
+    const records = await readRecords(reviewLogPaths(root).reviews);
+    expect((records[0] as { provenance: unknown }).provenance).toMatchObject({ representation: "C-vcc-supervision-view" });
+    expect(representationForTraceSource("tmux-fallback")).toBe("A-tmux-lines");
+    expect(representationForTraceSource("pi-jsonl")).toBe("B-runner-trace");
+    expect(representationForTraceSource("devin-session")).toBe("B-runner-trace");
+    for (const source of ["pi-jsonl", "devin-session", "tmux-fallback"] as const) {
+      expect(representationForTraceSource(source)).not.toBe("C-vcc-supervision-view");
+    }
+  });
+
+  it("drops non-allowlisted provenance keys rather than persisting them", async () => {
+    const root = await tempdir();
+    await appendSupervisionReview(entry({ provenance: { ...PROVENANCE, note: "CANARY-note", raw: ["CANARY-lines"] } }), { root });
+    const content = await readFile(reviewLogPaths(root).reviews, "utf8");
+    expect(content).not.toContain("CANARY");
+    expect((JSON.parse(content.trim()) as { provenance: unknown }).provenance).toEqual(PROVENANCE);
   });
 
   it("preserves the first line across two appends", async () => {
@@ -294,6 +396,148 @@ describe("appendSupervisionReview records", () => {
       seen.push(record.jobId);
     }
     expect(seen.sort()).toEqual(jobs);
+  });
+});
+
+function violationEntry(overrides: Record<string, unknown> = {}): SupervisionViolationLogEntry {
+  return {
+    jobId: "job_supervisor",
+    agentName: "worker",
+    agentKind: "pi",
+    provenance: { ...PROVENANCE },
+    violations: [
+      { eventId: "sev_1", eventType: "reviewer_attention", atMs: 1_000, violation: "process_exit", details: { violation: "process_exit", exitCode: 137 } },
+    ],
+    ...overrides,
+  } as SupervisionViolationLogEntry;
+}
+
+describe("appendSupervisionReview violation records", () => {
+  it("persists one violation record per Tier-0 wake — typed facts and provenance, never a Jev field", async () => {
+    const root = await tempdir();
+    const paths = reviewLogPaths(root);
+    await appendSupervisionReview(violationEntry(), { root, now: () => new Date("2026-09-18T10:00:00.000Z") });
+    const records = await readRecords(paths.reviews);
+    expect(records).toHaveLength(1);
+    const record = records[0]!;
+    expect(Object.keys(record)).toEqual([
+      "type", "timestamp", "jobId", "agentName", "agentKind",
+      "eventId", "eventType", "atMs", "disposition", "violation", "details", "provenance",
+    ]);
+    expect(record).toMatchObject({
+      type: "violation",
+      timestamp: "2026-09-18T10:00:00.000Z",
+      jobId: "job_supervisor",
+      agentName: "worker",
+      agentKind: "pi",
+      eventId: "sev_1",
+      eventType: "reviewer_attention",
+      atMs: 1_000,
+      disposition: "unknown",
+      violation: "process_exit",
+      details: { violation: "process_exit", exitCode: 137 },
+      provenance: PROVENANCE,
+    });
+    // A deterministic finding carries no probabilistic claim — the fields do not exist.
+    for (const key of ["classification", "signals", "evidenceSufficiency", "reason", "attention", "wake", "linesSinceLastReview"]) {
+      expect(record).not.toHaveProperty(key);
+    }
+    expect((await lstat(paths.reviews)).mode & 0o777).toBe(0o600);
+  });
+
+  it("persists every violation of a multi-wake cadence, each carrying the shared provenance", async () => {
+    const root = await tempdir();
+    await appendSupervisionReview(violationEntry({
+      violations: [
+        { eventId: "sev_1", eventType: "reviewer_attention", atMs: 1_000, violation: "read_only_dirty_workspace", details: { violation: "read_only_dirty_workspace", workspace: "dirty" } },
+        { eventId: "sev_2", eventType: "reviewer_attention", atMs: 1_000, violation: "forbidden_tool_observed", details: { violation: "forbidden_tool_observed", tools: "deploy", retried: true } },
+        { eventId: "sev_3", eventType: "reviewer_attention", atMs: 1_000, violation: "process_exit" },
+        { eventId: "sev_4", eventType: "reviewer_attention", atMs: 1_000, violation: "process_exit", details: null },
+      ],
+    }), { root });
+    const records = await readRecords(reviewLogPaths(root).reviews);
+    expect(records).toHaveLength(4);
+    expect(records.map((item) => (item as { violation: string }).violation)).toEqual(["read_only_dirty_workspace", "forbidden_tool_observed", "process_exit", "process_exit"]);
+    expect(records.map((item) => (item as { eventId: string }).eventId)).toEqual(["sev_1", "sev_2", "sev_3", "sev_4"]);
+    // Boolean detail scalars persist verbatim.
+    expect(records[1]).toMatchObject({ details: { retried: true } });
+    // Details are honestly null when the emitted wake carried none.
+    expect(records[2]).toMatchObject({ details: null });
+    expect(records[3]).toMatchObject({ details: null });
+    for (const record of records) {
+      expect((record as { provenance: unknown }).provenance).toEqual(PROVENANCE);
+      expect(record).toMatchObject({ disposition: "unknown" });
+    }
+  });
+
+  it("supersedes a violation's disposition by event id through the same stream, exactly like a wake", async () => {
+    const root = await tempdir();
+    const paths = reviewLogPaths(root);
+    await appendSupervisionReview(violationEntry(), { root });
+    await appendSupervisionDisposition(dispositionEntry({ eventId: "sev_1", disposition: "overruled" }), { root });
+    const records = await readRecords(paths.reviews);
+    expect(records.map((item) => item.type)).toEqual(["violation", "disposition"]);
+    expect(records[0]).toMatchObject({ eventId: "sev_1", disposition: "unknown" });
+    expect(records[1]).toMatchObject({ type: "disposition", eventId: "sev_1", disposition: "overruled" });
+  });
+
+  it("refuses untrusted violation entries without persisting a line", async () => {
+    const cases: Array<{ name: string; mutate: (input: SupervisionViolationLogEntry) => unknown }> = [
+      { name: "a non-array violations field", mutate: (input) => ({ ...input, violations: "junk" }) },
+      { name: "an empty violations batch", mutate: (input) => ({ ...input, violations: [] }) },
+      { name: "an unbounded violations batch", mutate: (input) => ({ ...input, violations: Array.from({ length: 17 }, () => input.violations[0]) }) },
+      { name: "a non-record violation item", mutate: (input) => ({ ...input, violations: ["junk"] }) },
+      { name: "a violation without an event id", mutate: (input) => ({ ...input, violations: [{ eventType: "reviewer_attention", atMs: 1, violation: "process_exit" }] }) },
+      { name: "a violation with a multi-line event id", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, eventId: "sev\nforged" }] }) },
+      { name: "a violation with a foreign event type", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, eventType: "bogus" }] }) },
+      { name: "a violation with a negative atMs", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, atMs: -1 }] }) },
+      { name: "a violation with an invented kind", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, violation: "smells_bad" }] }) },
+      { name: "a violation with a non-record details", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, details: "junk" }] }) },
+      { name: "a violation with too many detail keys", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, details: Object.fromEntries(Array.from({ length: 17 }, (_e, i) => [`k${i}`, i])) }] }) },
+      { name: "a violation with an over-long detail key", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, details: { ["k".repeat(65)]: 1 } }] }) },
+      { name: "a violation with an over-long detail string", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, details: { note: "x".repeat(257) } }] }) },
+      { name: "a violation with a nested detail object", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, details: { nested: { raw: true } } }] }) },
+      { name: "a violation with a non-finite detail number", mutate: (input) => ({ ...input, violations: [{ ...input.violations[0]!, details: { exitCode: Number.NaN } }] }) },
+      { name: "a violation batch without provenance", mutate: (input) => { const copy = { ...input } as Record<string, unknown>; delete copy.provenance; return copy; } },
+      { name: "a violation batch with a non-record provenance", mutate: (input) => ({ ...input, provenance: "junk" }) },
+      { name: "a violation batch with a foreign representation", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, representation: "Z" } }) },
+      { name: "a violation batch with an untrusted agent name", mutate: (input) => ({ ...input, agentName: "Bad Name" }) },
+    ];
+    for (const { name, mutate } of cases) {
+      const root = await tempdir();
+      const paths = reviewLogPaths(root);
+      await expect(appendSupervisionReview(mutate(violationEntry()) as SupervisionViolationLogEntry, { root }), name).rejects.toMatchObject({ code: "REVIEW_LOG_UNAVAILABLE" });
+      await expect(readFile(paths.reviews, "utf8"), name).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("never persists canary strings planted outside the violation allowlist", async () => {
+    const root = await tempdir();
+    const dirty = {
+      ...violationEntry(),
+      summary: "CANARY-summary",
+      provenance: { ...PROVENANCE, raw: "CANARY-trace" },
+      violations: [{ eventId: "sev_1", eventType: "reviewer_attention", atMs: 1_000, violation: "process_exit", transcript: "CANARY-line", details: { violation: "process_exit", exitCode: 137 } }],
+    } as unknown as SupervisionViolationLogEntry;
+    await appendSupervisionReview(dirty, { root });
+    const content = await readFile(reviewLogPaths(root).reviews, "utf8");
+    expect(content).not.toContain("CANARY");
+    const record = JSON.parse(content.trim()) as SupervisionViolationLogRecord;
+    expect(record.provenance).toEqual(PROVENANCE);
+    expect(record).toMatchObject({ violation: "process_exit", details: { violation: "process_exit", exitCode: 137 } });
+  });
+
+  it("serializes violation appends with the same flock section as reviews", async () => {
+    const root = await tempdir();
+    const paths = reviewLogPaths(root);
+    await Promise.all([
+      appendSupervisionReview(violationEntry({ jobId: "job_a" }), { root }),
+      appendSupervisionReview(entry({ jobId: "job_b" }), { root }),
+      appendSupervisionReview(violationEntry({ jobId: "job_c" }), { root }),
+    ]);
+    const lines = (await readFile(paths.reviews, "utf8")).split("\n").filter((line) => line.length > 0);
+    expect(lines).toHaveLength(3);
+    for (const line of lines) expect(JSON.parse(line).jobId).toMatch(/^job_[abc]$/u);
   });
 });
 
@@ -340,6 +584,17 @@ describe("appendSupervisionReview refusal", () => {
     { name: "a wake with a multi-line event id", mutate: (input) => ({ ...input, wake: { eventId: "sev\nforged", eventType: "reviewer_attention", atMs: 1 } }) },
     { name: "a wake with a foreign event type", mutate: (input) => ({ ...input, wake: { eventId: "sev_1", eventType: "bogus", atMs: 1 } }) },
     { name: "a wake with a negative atMs", mutate: (input) => ({ ...input, wake: { eventId: "sev_1", eventType: "reviewer_attention", atMs: -1 } }) },
+    { name: "a non-record provenance", mutate: (input) => ({ ...input, provenance: "junk" }) },
+    { name: "a provenance with a foreign trace source", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, traceSource: "forged-source" } }) },
+    { name: "a provenance with a non-string trace source", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, traceSource: 7 } }) },
+    { name: "a provenance with a foreign representation label", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, representation: "D-invented" } }) },
+    { name: "a provenance with a non-string representation", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, representation: 42 } }) },
+    { name: "a provenance with a non-hash trace digest", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, traceDigestHash: "not-a-hash" } }) },
+    { name: "a provenance with a non-string digest", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, traceDigestHash: 12_345 } }) },
+    { name: "a provenance with an uppercase digest", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, workspaceFingerprint: "D".repeat(64) } }) },
+    { name: "a provenance with a negative state byte count", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, stateBytes: -1 } }) },
+    { name: "a provenance with a non-integer terminal count", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, terminalBytes: 1.5 } }) },
+    { name: "a provenance with a non-hash identity", mutate: (input) => ({ ...input, provenance: { ...PROVENANCE, identityHash: "v2.1" } }) },
   ];
 
   for (const { name, mutate } of cases) {

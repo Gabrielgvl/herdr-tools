@@ -11,12 +11,15 @@ import { classifySnapshotTarget, type ProvisionalSupervisedIdentity, type Provis
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
 import { createSelfCloseTracker, type SelfCloseTracker } from "../../src/supervision/self-close.js";
 import { parseSocketLine, type SupervisionSocketEvent } from "../../src/supervision/protocol.js";
-import { reviewLogPaths, ReviewLogError, type SupervisionLogRecord, type SupervisionReviewLogEntry } from "../../src/supervision/review-log.js";
+import { reviewLogPaths, ReviewLogError, type SupervisionLogEntry, type SupervisionLogRecord, type SupervisionReviewLogEntry } from "../../src/supervision/review-log.js";
+import { buildWorkspaceView, executionDigestHash, type EvidenceScanner, type WorkspaceCommandRunner, type WorkspaceView } from "../../src/supervision/evidence.js";
 import type { SupervisionReviewRequest, SupervisionReviewResult, SupervisionReviewer } from "../../src/supervision/reviewer.js";
+import { createTraceSource, type DevinSessionReader, type TraceSource } from "../../src/supervision/trace-source.js";
+import type { SupervisionWorkspaceRoot } from "../../src/job-registry.js";
 import { Supervisor, SupervisionBindError, type SupervisionBinding, type SupervisionScheduler, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 
-const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
+const session = { source: "herdr:pi", agent: "pi", kind: "path", value: "/pi/session.jsonl" };
 
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
 const agyIdentity: ProvisionalSupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy" };
@@ -94,8 +97,8 @@ interface Harness {
   reviewedPanes: string[];
   /** Every request that reached the reviewer, in order. */
   reviewRequests: SupervisionReviewRequest[];
-  /** Every entry the supervisor handed the review-log seam, in order. */
-  logged: SupervisionReviewLogEntry[];
+  /** Every entry the supervisor handed the review-log seam, in order — reviews and violation batches alike. */
+  logged: SupervisionLogEntry[];
   observers: number;
   degradeMonitor(): void;
   recoverMonitor(): void;
@@ -103,7 +106,7 @@ interface Harness {
 
 interface HarnessOptions {
   snapshots?: Array<HerdrSnapshot | Error | Promise<HerdrSnapshot>>;
-  review?: (call: number) => Promise<SupervisionReviewResult>;
+  review?: (call: number, request: SupervisionReviewRequest) => Promise<SupervisionReviewResult>;
   transcript?: (paneId: string) => Promise<string[]>;
   cadenceMs?: number;
   child?: SupervisorDependencies["child"];
@@ -115,6 +118,22 @@ interface HarnessOptions {
   reviewLog?: SupervisorDependencies["reviewLog"] | "default";
   /** The trusted root the default seam appends under. */
   reviewLogRoot?: string;
+  /** Pi session-JSONL bytes the default file reader serves. */
+  traceFile?: string | Uint8Array;
+  /** Full trace-source override; the default wires the real source against `traceFile`/`devinSession`. */
+  traceSource?: TraceSource;
+  /** The Devin structured-session reader the default source plugs in. */
+  devinSession?: DevinSessionReader;
+  /** The reservation's deny-list resolver, keyed by the bound identity. */
+  resolveForbiddenTools?: SupervisorDependencies["resolveForbiddenTools"];
+  /** The trusted launch workspace root the cadence reads. */
+  workspaceRoot?: SupervisionWorkspaceRoot;
+  /** The reserve-time workspace base handed to the cadence. */
+  workspaceBase?: WorkspaceView;
+  /** The workspace command seam. */
+  workspaceRunner?: WorkspaceCommandRunner;
+  /** The local sensitive-context scan. */
+  evidenceScanner?: EvidenceScanner;
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -133,14 +152,18 @@ function harness(options: HarnessOptions = {}): Harness {
   const notifier: ManagerNotifier = { wake: (wake) => { wakes.push(wake); } };
   const reviewedPanes: string[] = [];
   const reviewRequests: SupervisionReviewRequest[] = [];
-  const logged: SupervisionReviewLogEntry[] = [];
+  const logged: SupervisionLogEntry[] = [];
+  const readTranscript: SupervisorDependencies["readTranscript"] = options.transcript ?? (async () => ["line"]);
+  const traceFile = typeof options.traceFile === "string" || options.traceFile === undefined
+    ? new TextEncoder().encode(options.traceFile ?? "")
+    : options.traceFile;
   const reviewer: SupervisionReviewer = {
     review: async (request) => {
       reviews += 1;
       reviewedPanes.push(request.paneId);
       reviewRequests.push(request);
       if (!options.review) return { classification: "progress", summary: "moving" };
-      return options.review(reviews);
+      return options.review(reviews, request);
     },
   };
   const deps: SupervisorDependencies = {
@@ -161,7 +184,7 @@ function harness(options: HarnessOptions = {}): Harness {
     notifier,
     reviewer,
     ...(options.assignmentDigest === undefined ? {} : { assignmentDigest: options.assignmentDigest }),
-    ...(options.reviewLog === "default" ? {} : { reviewLog: options.reviewLog ?? (async (entry: SupervisionReviewLogEntry) => { logged.push(entry); }) }),
+    ...(options.reviewLog === "default" ? {} : { reviewLog: options.reviewLog ?? (async (entry: SupervisionLogEntry) => { logged.push(entry); }) }),
     ...(options.reviewLogRoot === undefined ? {} : { reviewLogRoot: options.reviewLogRoot }),
     cadenceMs: options.cadenceMs ?? 300_000,
     clock: { now: () => 1_000 },
@@ -169,7 +192,17 @@ function harness(options: HarnessOptions = {}): Harness {
     ...(options.selfClose ? { selfClose: options.selfClose } : {}),
     ...(options.handoffs ? { handoffs: options.handoffs } : {}),
     ...(options.repairPrompt ? { repairPrompt: options.repairPrompt } : {}),
-    readTranscript: options.transcript ?? (async () => ["line"]),
+    readTranscript,
+    traceSource: options.traceSource ?? createTraceSource({
+      readFileRange: async (_path, offset, maxBytes) => traceFile.subarray(offset, offset + maxBytes),
+      readTerminal: readTranscript,
+      devinSession: options.devinSession ?? (async () => ({ position: undefined, events: [] })),
+    }),
+    ...(options.resolveForbiddenTools === undefined ? {} : { resolveForbiddenTools: options.resolveForbiddenTools }),
+    ...(options.workspaceRoot === undefined ? {} : { workspaceRoot: options.workspaceRoot }),
+    ...(options.workspaceBase === undefined ? {} : { workspaceBase: options.workspaceBase }),
+    ...(options.workspaceRunner === undefined ? {} : { workspaceRunner: options.workspaceRunner }),
+    ...(options.evidenceScanner === undefined ? {} : { evidenceScanner: options.evidenceScanner }),
     idFactory: (() => { let id = 0; return () => `e${++id}`; })(),
     update: (text) => { progress.push(text); },
   };
@@ -1993,20 +2026,47 @@ describe("supervisor review cadence", () => {
     expect(h.supervisor.childLive()).toBe(true);
   });
 
-  it("degrades once, retries on the next cadence, and notifies recovery once", async () => {
+  it("keeps a reviewer infrastructure failure silent and retries it on the next cadence", async () => {
+    // ADR-036 V2-08: transport/auth/HTTP/malformed failures normalize to the
+    // silent unavailable result — no degraded episode, no wake — and the
+    // cadence re-arms so the next tick retries.
     const h = await working({ review: async (call) => { if (call <= 2) throw new ReviewerFailure("model unavailable"); return { classification: "progress", summary: "moving" }; } });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.wakes).toEqual([]);
+    expect(h.supervisor.view().reviewer.degraded).toBe(false);
+    expect(h.timerArmed()).toBe(true);
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(h.wakes).toEqual([]);
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.supervisor.view().reviewer.reviews).toHaveLength(1));
+    expect(h.wakes).toEqual([]);
+  });
+
+  it("still degrades once for a non-reviewer failure — an evidence read — and notifies recovery once", async () => {
+    // The silent path is reviewer infrastructure only: a transcript read that
+    // throws is an evidence failure, which still opens one degraded episode —
+    // a repeat failure inside it republishes locally instead of waking again.
+    let transcriptCalls = 0;
+    const h = await working({
+      transcript: async () => { if (transcriptCalls++ < 2) throw new Error("pane read failed"); return ["line"]; },
+      review: async () => ({ classification: "progress", summary: "moving" }),
+    });
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded"]));
     expect(h.supervisor.view().reviewer.degraded).toBe(true);
+    expect(h.reviews).toBe(0);
     h.fireTimer();
-    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    await vi.waitFor(() => expect(h.progress.some((line) => line.includes("review failed again"))).toBe(true));
     expect(types(h.wakes)).toEqual(["reviewer_degraded"]);
     h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded", "reviewer_recovered"]));
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(types(h.wakes)).toEqual(["reviewer_degraded", "reviewer_recovered"]);
     expect(h.supervisor.view().reviewer.degraded).toBe(false);
   });
 
-  it("treats an unreadable transcript as a reviewer failure", async () => {
+  it("treats an unreadable transcript as an evidence-read failure that degrades — not a silent reviewer failure", async () => {
     const h = await working({ transcript: async () => { throw new Error("pane read failed"); } });
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded"]));
@@ -2231,18 +2291,20 @@ describe("supervisor review cadence", () => {
     expect(h.timerArmed()).toBe(false);
   });
 
-  it("carries the assignment digest and the new-line count into every review", async () => {
+  it("carries the assignment digest and the new-line count into every review — inside the assembled evidence", async () => {
     const h = await working({
       assignmentDigest: { doneWhen: ["tests pass"], constraints: ["read-only"] },
       transcript: async () => ["a", "b", "c"],
     });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
-    expect(h.reviewRequests[0]).toMatchObject({
-      assignmentDigest: { doneWhen: ["tests pass"], constraints: ["read-only"] },
-      linesSinceLastReview: 3,
-      transcriptDelta: ["a", "b", "c"],
-    });
+    // The digest and the delta ride the assembled evidence state — the request
+    // has no raw transcript or digest fields at all anymore (V2-02).
+    expect(h.reviewRequests[0]).toMatchObject({ linesSinceLastReview: 3 });
+    expect(h.reviewRequests[0]!.evidence!.assignment).toMatchObject({ doneWhen: ["tests pass"], constraints: ["read-only"] });
+    expect(h.reviewRequests[0]!.evidence!.terminal.lines).toEqual(["a", "b", "c"]);
+    expect(h.reviewRequests[0]).not.toHaveProperty("transcriptDelta");
+    expect(h.reviewRequests[0]).not.toHaveProperty("assignmentDigest");
   });
 
   it("omits previousReview on the first review and supplies it on the second", async () => {
@@ -2321,6 +2383,20 @@ describe("supervisor review cadence", () => {
         transcriptLines: 1,
         workingForMs: 0,
       },
+      // Bounded provenance rides every review: the structured source, its A/B
+      // representation, the byte counts, and honest nulls for the reviewer-
+      // reported fields this stub never supplied.
+      provenance: {
+        traceSource: "pi-jsonl",
+        representation: "B-runner-trace",
+        traceFromCursor: null,
+        traceToCursor: null,
+        traceDigestHash: null,
+        workspaceFingerprint: null,
+        stateBytes: expect.any(Number),
+        terminalBytes: expect.any(Number),
+        identityHash: null,
+      },
     });
     // The next review names the classification this review read as its predecessor.
     h.fireTimer();
@@ -2334,11 +2410,12 @@ describe("supervisor review cadence", () => {
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
     await vi.waitFor(() => expect(h.logged).toHaveLength(1));
     expect(h.logged[0]).toMatchObject({ classification: "stalled", attention: true });
-    expect(h.logged[0]!.wake).toEqual({ eventId: h.wakes[0]!.event.eventId, eventType: "reviewer_attention", atMs: 1_000 });
+    const loggedEntry = h.logged[0] as SupervisionReviewLogEntry;
+    expect(loggedEntry.wake).toEqual({ eventId: h.wakes[0]!.event.eventId, eventType: "reviewer_attention", atMs: 1_000 });
   });
 
   it("degrades like a reviewer failure when the log write fails, then retries on the next cadence", async () => {
-    const entries: SupervisionReviewLogEntry[] = [];
+    const entries: SupervisionLogEntry[] = [];
     let fail = true;
     const h = await working({
       reviewLog: async (entry) => {
@@ -2421,6 +2498,929 @@ describe("supervisor review cadence", () => {
         });
       });
       expect((await lstat(paths.reviews)).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the ADR-036 evidence cadence", () => {
+  async function working(options: HarnessOptions = {}): Promise<Harness> {
+    const workspaceBase = options.workspaceBase ?? (
+      options.workspaceRoot?.available === true && options.workspaceRunner !== undefined
+        ? await buildWorkspaceView({ root: options.workspaceRoot.root }, { run: options.workspaceRunner }, new AbortController().signal)
+        : undefined
+    );
+    const h = harness({ ...options, workspaceBase, snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), ...(options.snapshots ?? [])] });
+    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    return h;
+  }
+
+  const workspaceRoot: SupervisionWorkspaceRoot = { available: true, root: "/child/workspace" };
+  const baseSha = "a".repeat(40);
+
+  const cleanRunner: WorkspaceCommandRunner = async (argv) => {
+    if (argv[1] === "rev-parse") return { stdout: `${baseSha}\n`, exitCode: 0 };
+    return { stdout: "", exitCode: 0 };
+  };
+  const dirtyRunner: WorkspaceCommandRunner = async (argv) => {
+    if (argv[1] === "rev-parse") return { stdout: `${baseSha}\n`, exitCode: 0 };
+    if (argv[1] === "status") return { stdout: " M src/changed.ts\0", exitCode: 0 };
+    if (argv.includes("--name-status")) return { stdout: "M\0src/changed.ts\0", exitCode: 0 };
+    return { stdout: "3\t1\tsrc/changed.ts\0", exitCode: 0 };
+  };
+
+  const piJsonl = (records: unknown[]): string => `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+  const piToolCall = (name: string): unknown => ({
+    type: "message",
+    timestamp: 1,
+    message: { role: "assistant", content: [{ type: "toolCall", id: `c-${name}`, name, arguments: { command: "do the thing" } }] },
+  });
+  function exitEvent(paneId: string, exit: Record<string, unknown> = {}): SupervisionSocketEvent {
+    return parseSocketLine(JSON.stringify({ event: "pane_exited", data: { type: "pane_exited", pane_id: paneId, workspace_id: "w1", ...exit } })) as SupervisionSocketEvent;
+  }
+
+  it("assembles assignment → trace → workspace → terminal evidence and sends exactly one reviewer request per cadence", async () => {
+    const h = await working({
+      assignmentDigest: { doneWhen: ["tests pass"], constraints: ["read-only"], readOnly: true },
+      traceFile: piJsonl([piToolCall("Read"), piToolCall("Bash")]),
+      workspaceRoot,
+      workspaceRunner: cleanRunner,
+      transcript: async () => ["t1", "t2"],
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests).toHaveLength(1);
+    const evidence = h.reviewRequests[0]!.evidence!;
+    expect(evidence.scan).toBe("safe");
+    expect(evidence.assignment).toEqual({ doneWhen: ["tests pass"], progressMarkers: [], constraints: ["read-only"] });
+    expect(evidence.trace.source).toBe("pi-jsonl");
+    expect(evidence.trace.actions.map((action) => action.tool)).toEqual(["Read", "Bash"]);
+    expect(evidence.trace.cursorFrom).toBeUndefined();
+    expect(evidence.workspace).toMatchObject({ available: true, dirty: false, baseRevision: baseSha, headRevision: baseSha });
+    expect(evidence.terminal).toEqual({ lines: ["t1", "t2"], droppedLines: 0 });
+    expect(evidence.identity.hash).toMatch(/^[0-9a-f]{64}$/u);
+    expect(h.reviewRequests[0]!.cadenceMs).toBe(300_000);
+
+    // The completed cadence consumed the window: the next request's cursor is
+    // the first one's cursorTo.
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(h.reviewRequests[1]!.evidence!.trace.cursorFrom).toMatchObject({ source: "pi-jsonl" });
+    expect(h.reviewRequests[1]!.evidence!.trace.cursorFrom).toEqual(h.reviewRequests[0]!.evidence!.trace.cursorTo);
+  });
+
+  it("selects the terminal fallback for a runner without a structured trace and reads the pane once", async () => {
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
+    const reads: string[] = [];
+    const h = harness({
+      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
+      transcript: async (paneId) => { reads.push(paneId); return ["a", "b"]; },
+    });
+    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    // One pane read — the fallback window IS the terminal evidence, so there is
+    // no second supplemental read.
+    expect(reads).toEqual(["p1"]);
+    const request = h.reviewRequests[0]!;
+    expect(request.evidence!.trace.source).toBe("tmux-fallback");
+    expect(request.evidence!.terminal.lines).toEqual(["a", "b"]);
+  });
+
+  it("selects the Devin structured source for a devin runner and digests its records", async () => {
+    const devinSession = { source: "devin", agent: "devin", kind: "id", value: "devin-1" };
+    const devinIdentity: SupervisedIdentity = { ...identity, agentKind: "devin", agentSession: devinSession };
+    const h = harness({
+      child: { agentName: "worker", agentKind: "devin", candidateName: "worker-devin" },
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })])],
+      devinSession: async () => ({
+        position: { steps: 1 },
+        events: [{ kind: "agent", offset: 0, bytes: 12, record: { tool_calls: [{ function_name: "shell", arguments: "ls", tool_call_id: "t1" }] } }],
+      }),
+    });
+    await h.supervisor.bind({ identity: devinIdentity, candidateName: "worker-devin" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.trace.source).toBe("devin-session");
+    expect(h.reviewRequests[0]!.evidence!.trace.actions.map((action) => action.tool)).toEqual(["shell"]);
+  });
+
+  it("reviews a devin runner through the default empty session reader", async () => {
+    const devinSession = { source: "devin", agent: "devin", kind: "id", value: "devin-1" };
+    const devinIdentity: SupervisedIdentity = { ...identity, agentKind: "devin", agentSession: devinSession };
+    const h = harness({
+      child: { agentName: "worker", agentKind: "devin", candidateName: "worker-devin" },
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })])],
+    });
+    await h.supervisor.bind({ identity: devinIdentity, candidateName: "worker-devin" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.trace.source).toBe("devin-session");
+  });
+
+  it("keeps a typed trace failure silent as reviewer_unavailable and retries next cadence", async () => {
+    const badSession = { ...session, kind: "id" };
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentSession: badSession })])] });
+    await h.supervisor.bind({ identity: { ...identity, agentSession: badSession }, candidateName: "worker-pi" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.progress.some((line) => line.includes("review unavailable"))).toBe(true));
+    // The window is a typed gap — no Jev call, no wake, nothing stored.
+    expect(h.reviews).toBe(0);
+    expect(h.wakes).toEqual([]);
+    expect(h.supervisor.view().reviewer.reviews).toEqual([]);
+    expect(h.logged).toEqual([]);
+    // The cadence re-armed, and the next tick retries the same read.
+    expect(h.timerArmed()).toBe(true);
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.progress.filter((line) => line.includes("review unavailable"))).toHaveLength(2));
+    expect(h.reviews).toBe(0);
+  });
+
+  it.each(["sensitive", "indeterminate"] as const)("keeps a %s scan verdict silent — no reviewer call and no wake", async (outcome) => {
+    const h = await working({ evidenceScanner: () => ({ outcome }) });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.progress.some((line) => line.includes("review unavailable"))).toBe(true));
+    expect(h.reviews).toBe(0);
+    expect(h.wakes).toEqual([]);
+    expect(h.supervisor.view().reviewer.reviews).toEqual([]);
+  });
+
+  it("reports an evidence-budget overflow as Tier-0 attention with typed evidence and no reviewer call", async () => {
+    const h = await working({ assignmentDigest: { doneWhen: ["x".repeat(9_000)], constraints: [] } });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    expect(h.wakes[0]!.event.priority).toBe("high");
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "evidence_budget_exceeded", cause: "assignment_over_budget" });
+    expect(h.wakes[0]!.event.details).not.toHaveProperty("classification");
+    expect(h.reviews).toBe(0);
+    // The violation persists as one typed entry — its code facts and the
+    // cadence's provenance, no Jev fields. A refused build reports byte counts
+    // honestly as null while the minted identity still lands.
+    expect(h.logged).toHaveLength(1);
+    const violation = h.logged[0]!;
+    expect("violations" in violation).toBe(true);
+    expect(violation).toMatchObject({
+      jobId: "job_supervisor",
+      agentName: "worker",
+      agentKind: "pi",
+      provenance: {
+        traceSource: "pi-jsonl",
+        representation: "B-runner-trace",
+        traceFromCursor: null,
+        traceToCursor: expect.any(String),
+        traceDigestHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        workspaceFingerprint: null,
+        stateBytes: null,
+        terminalBytes: null,
+        identityHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      },
+      violations: [{
+        eventId: h.wakes[0]!.event.eventId,
+        eventType: "reviewer_attention",
+        atMs: 1_000,
+        violation: "evidence_budget_exceeded",
+        details: { violation: "evidence_budget_exceeded", cause: "assignment_over_budget", bytes: expect.any(Number), budget: expect.any(Number) },
+      }],
+    });
+  });
+
+  it("reports a trace record that can never fit the window as evidence_budget_exceeded", async () => {
+    const h = await working({ traceFile: new TextEncoder().encode("x".repeat(40_000)) });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "evidence_budget_exceeded", cause: "record_exceeds_budget" });
+    expect(h.reviews).toBe(0);
+    // The window was refused before any cursor existed: both labels are honest
+    // nulls, and the typed failure's offset/bytes ride the violation details.
+    expect(h.logged).toHaveLength(1);
+    expect(h.logged[0]).toMatchObject({
+      provenance: { traceSource: "pi-jsonl", representation: "B-runner-trace", traceFromCursor: null, traceToCursor: null, traceDigestHash: expect.stringMatching(/^[0-9a-f]{64}$/u) },
+      violations: [{ violation: "evidence_budget_exceeded", details: { cause: "record_exceeds_budget", offset: expect.any(Number), bytes: expect.any(Number) } }],
+    });
+  });
+
+  it("reports a deny-listed tool observed in the trace, resolved against the bound identity", async () => {
+    const boundArgs: Array<{ agentKind: string; candidateName: string }> = [];
+    const h = await working({
+      traceFile: piJsonl([piToolCall("Deploy")]),
+      resolveForbiddenTools: (bound) => { boundArgs.push(bound); return { available: true, tools: ["deploy"] }; },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    // The resolver saw the runner identity that actually bound — pi/worker-pi.
+    expect(boundArgs).toEqual([{ agentKind: "pi", candidateName: "worker-pi" }]);
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "forbidden_tool_observed", tools: "deploy" });
+    expect(h.wakes[0]!.event.details).not.toHaveProperty("classification");
+    expect(h.reviews).toBe(0);
+    // The digest hash persisted is the digest the violation was judged on —
+    // recomputable from the same window the violation cadence consumed.
+    expect(h.logged).toHaveLength(1);
+    expect(h.logged[0]).toMatchObject({
+      provenance: {
+        traceSource: "pi-jsonl",
+        representation: "B-runner-trace",
+        traceFromCursor: null,
+        traceToCursor: expect.stringMatching(/^pi-jsonl@\d+:[0-9a-f]{64}$/u),
+        traceDigestHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        stateBytes: expect.any(Number),
+        terminalBytes: expect.any(Number),
+      },
+      violations: [{ violation: "forbidden_tool_observed", details: { violation: "forbidden_tool_observed", tools: "deploy" } }],
+    });
+    // The violation cadence consumed its window: the next cadence reviews
+    // normally and sees no new terminal delta.
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.terminal.lines).toEqual([]);
+    expect(h.reviewRequests[0]!.evidence!.trace.cursorFrom).toMatchObject({ source: "pi-jsonl" });
+  });
+
+  it("reviews normally when the deny-list has no match", async () => {
+    const noMatch = await working({
+      traceFile: piJsonl([piToolCall("Bash")]),
+      resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
+    });
+    noMatch.fireTimer();
+    await vi.waitFor(() => expect(noMatch.reviews).toBe(1));
+    expect(noMatch.wakes).toEqual([]);
+  });
+
+  it("reports a typed policy gap — once — when the armed deny list is a typed resolver gap", async () => {
+    // ADR-036 V2-07: the armed rule is unenforceable without a real deny-list
+    // fact, so it reports the typed gap as evidence_gap instead of claiming
+    // the check ran — while the review itself proceeds normally.
+    const h = await working({
+      resolveForbiddenTools: () => ({ available: false, reason: "candidate_not_reserved" }),
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(types(h.wakes)).toEqual(["evidence_gap"]);
+    expect(h.wakes[0]!.event.details).toMatchObject({ gap: "forbidden_tool_policy", reason: "candidate_not_reserved" });
+    // Once: a persistent typed gap does not wake again on later cadences.
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(types(h.wakes)).toEqual(["evidence_gap"]);
+  });
+
+  it("reports a typed policy gap when the bound trace source can never observe tools", async () => {
+    // Claude carries a deny list but binds tmux-fallback, whose window emits
+    // no tool entries — armed but unenforceable, reported once (V2-07).
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
+    const h = harness({
+      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
+      resolveForbiddenTools: () => ({ available: true, tools: ["Bash"] }),
+    });
+    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(types(h.wakes)).toEqual(["evidence_gap"]);
+    expect(h.wakes[0]!.event.details).toMatchObject({ gap: "forbidden_tool_policy", reason: "no_tool_observations" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(types(h.wakes)).toEqual(["evidence_gap"]);
+  });
+
+  it("stays silent when the armed deny list is empty — trivially enforceable is not a gap", async () => {
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
+    const h = harness({
+      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
+      resolveForbiddenTools: () => ({ available: true, tools: [] }),
+    });
+    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.wakes).toEqual([]);
+  });
+
+  it("reports a dirty workspace under a read-only reservation as a Tier-0 violation", async () => {
+    const h = await working({
+      assignmentDigest: { doneWhen: ["x"], constraints: [], readOnly: true },
+      workspaceRoot,
+      workspaceRunner: dirtyRunner,
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    // Any delta from the pinned base is the violation — the detail names it.
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "read_only_dirty_workspace", delta: "dirty, 1 changed paths", filesChanged: 1 });
+    expect(h.reviews).toBe(0);
+    // The observed dirty view's fingerprint persisted with the violation —
+    // the code's own observation, since no reviewer ever ran.
+    expect(h.logged).toHaveLength(1);
+    expect(h.logged[0]).toMatchObject({
+      provenance: {
+        traceSource: "pi-jsonl",
+        representation: "B-runner-trace",
+        workspaceFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        stateBytes: expect.any(Number),
+      },
+      violations: [{ violation: "read_only_dirty_workspace", details: { violation: "read_only_dirty_workspace", delta: "dirty, 1 changed paths" } }],
+    });
+  });
+
+  it("flags a committed mutation under a read-only reservation — a clean worktree does not hide head movement", async () => {
+    // V2-04: the child commits before the first cadence and leaves a clean
+    // porcelain — head movement alone is the read-only violation.
+    const otherSha = "b".repeat(40);
+    let revParse = 0;
+    const h = await working({
+      assignmentDigest: { doneWhen: ["x"], constraints: [], readOnly: true },
+      workspaceRoot,
+      workspaceRunner: async (argv) => {
+        // The pin lands at reserve (the first read); the child's commit moved
+        // HEAD before the first cadence, and the worktree reports clean.
+        if (argv[1] === "rev-parse") { revParse += 1; return { stdout: `${revParse === 1 ? baseSha : otherSha}\n`, exitCode: 0 }; }
+        return { stdout: "", exitCode: 0 };
+      },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "read_only_dirty_workspace", delta: "head moved", baseRevision: baseSha, headRevision: otherSha });
+    expect(h.reviews).toBe(0);
+    expect(h.logged).toHaveLength(1);
+    expect(h.logged[0]).toMatchObject({
+      violations: [{ violation: "read_only_dirty_workspace", details: { violation: "read_only_dirty_workspace", delta: "head moved", baseRevision: baseSha, headRevision: otherSha } }],
+    });
+  });
+
+  it("does not flag workspace drift without a read-only claim or a proven dirty view", async () => {
+    // A dirty workspace is ordinary evidence when the reservation is not read-only.
+    const writable = await working({ workspaceRoot, workspaceRunner: dirtyRunner });
+    writable.fireTimer();
+    await vi.waitFor(() => expect(writable.reviews).toBe(1));
+    expect(writable.reviewRequests[0]!.evidence!.workspace).toMatchObject({ available: true, dirty: true });
+    expect(writable.wakes).toEqual([]);
+
+    // A clean workspace under a read-only reservation is not a violation.
+    const clean = await working({ assignmentDigest: { doneWhen: [], constraints: [], readOnly: true }, workspaceRoot, workspaceRunner: cleanRunner });
+    clean.fireTimer();
+    await vi.waitFor(() => expect(clean.reviews).toBe(1));
+    expect(clean.wakes).toEqual([]);
+
+    // And a read-only claim the workspace view cannot prove stays unflagged.
+    const unproven = await working({
+      assignmentDigest: { doneWhen: [], constraints: [], readOnly: true },
+      workspaceRoot: { available: false, reason: "root_unavailable" },
+    });
+    unproven.fireTimer();
+    await vi.waitFor(() => expect(unproven.reviews).toBe(1));
+    expect(unproven.reviewRequests[0]!.evidence!.workspace).toMatchObject({ available: false, failure: { reason: "root_invalid", detail: { gap: "root_unavailable" } } });
+    expect(unproven.wakes).toEqual([]);
+  });
+
+  it("carries an unavailable workspace view as typed evidence rather than fabricating a clean one", async () => {
+    const h = await working({
+      workspaceRoot,
+      workspaceRunner: async () => { throw Object.assign(new Error("spawn refused"), { code: "ENOENT" }); },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.workspace).toMatchObject({ available: false, failure: { reason: "command_failed" } });
+  });
+
+  it("pins the workspace base revision at reserve time and re-supplies it while HEAD moves", async () => {
+    const otherSha = "b".repeat(40);
+    const diffs: string[] = [];
+    let revParse = 0;
+    const h = await working({
+      workspaceRoot,
+      workspaceRunner: async (argv) => {
+        if (argv[1] === "rev-parse") { revParse += 1; return { stdout: `${revParse === 1 ? baseSha : otherSha}\n`, exitCode: 0 }; }
+        if (argv[1] === "diff") diffs.push(argv[argv.length - 2]!);
+        return { stdout: "", exitCode: 0 };
+      },
+    });
+    // The pin ran at reservation construction — before any cadence — so the
+    // first cadence already measures against the reserve-time base.
+    await vi.waitFor(() => expect(revParse).toBe(1));
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    // A HEAD move between reserve and the first cadence is already a delta —
+    // it can never be minted as the base.
+    expect(h.reviewRequests[0]!.evidence!.workspace).toMatchObject({ available: true, baseRevision: baseSha, headRevision: otherSha });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(h.reviewRequests[1]!.evidence!.workspace).toMatchObject({ baseRevision: baseSha, headRevision: otherSha });
+    expect(diffs.every((base) => base === baseSha)).toBe(true);
+  });
+
+  it("keeps a failed reserve-time pin typed instead of re-anchoring on cadence", async () => {
+    let revParse = 0;
+    const h = await working({
+      workspaceRoot,
+      workspaceRunner: async (argv) => {
+        if (argv[1] === "rev-parse") { revParse += 1; throw new Error("spawn refused"); }
+        return { stdout: "", exitCode: 0 };
+      },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.workspace).toMatchObject({ available: false, failure: { reason: "command_failed" } });
+    expect(revParse).toBe(1);
+  });
+
+  it("refuses to invent a cadence base when reserve supplied no pin", async () => {
+    const runner = vi.fn<WorkspaceCommandRunner>(cleanRunner);
+    const h = harness({
+      workspaceRoot,
+      workspaceRunner: runner,
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])],
+    });
+    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.workspace).toEqual({
+      version: 1,
+      available: false,
+      failure: { reason: "base_invalid", detail: { gap: "base_unpinned" } },
+    });
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("reports an authoritative non-clean pane exit as a process_exit violation on the next cadence", async () => {
+    const h = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    expect(h.wakes[0]!.event.priority).toBe("high");
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "process_exit", exitCode: 137 });
+    expect(h.wakes[0]!.event.details).not.toHaveProperty("classification");
+    expect(h.reviews).toBe(0);
+    // The persisted violation carries the exit fact and the cadence provenance.
+    expect(h.logged).toHaveLength(1);
+    expect(h.logged[0]).toMatchObject({
+      provenance: { traceSource: "pi-jsonl", representation: "B-runner-trace" },
+      violations: [{ eventId: h.wakes[0]!.event.eventId, violation: "process_exit", details: { violation: "process_exit", exitCode: 137 } }],
+    });
+    // The fact is consumed once: the following cadence reviews normally.
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(types(h.wakes)).toEqual(["reviewer_attention"]);
+  });
+
+  it("flushes a latched non-clean exit before settlement — the violation precedes pane_closed", async () => {
+    // ADR-036 V2-05: when pane loss settles the supervisor between the exit
+    // event and the next cadence, the latched fact is still reported — first.
+    const h = await working({ snapshots: [snapshot([], [])] });
+    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
+    expect(types(h.wakes)).toEqual(["reviewer_attention", "pane_closed"]);
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "process_exit", exitCode: 137 });
+    // Settle-time provenance is the honest absence of a cadence: bound trace
+    // source kind, nulls for window/digest/state — the baseline identity was
+    // never minted either, since no evidence build ever ran.
+    expect(h.logged).toHaveLength(1);
+    expect(h.logged[0]).toMatchObject({
+      provenance: { traceSource: "pi-jsonl", traceFromCursor: null, traceDigestHash: null, identityHash: null },
+      violations: [{ violation: "process_exit", details: { violation: "process_exit", exitCode: 137 } }],
+    });
+    h.supervisor.shutdown();
+  });
+
+  it("persists the settle-flushed violation through the default review-log seam", async () => {
+    const root = await mkdtemp(join(tmpdir(), "herdr-supervisor-v205-"));
+    try {
+      const h = harness({
+        reviewLog: "default",
+        reviewLogRoot: root,
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), snapshot([], [])],
+      });
+      await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+      await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
+      await h.supervisor.onEvent(thinEvent("pane_closed"));
+      await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
+      expect(types(h.wakes)).toEqual(["reviewer_attention", "pane_closed"]);
+      const paths = reviewLogPaths(root);
+      const records = (await readFile(paths.reviews, "utf8")).split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line) as SupervisionLogRecord);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        type: "violation",
+        eventId: h.wakes[0]!.event.eventId,
+        eventType: "reviewer_attention",
+        disposition: "unknown",
+        violation: "process_exit",
+        details: { violation: "process_exit", exitCode: 137 },
+        provenance: { traceSource: "pi-jsonl", traceFromCursor: null, identityHash: null },
+      });
+      h.supervisor.shutdown();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("still settles when the settle-flushed violation's append fails — the wake fired, only the row is lost", async () => {
+    const h = await working({
+      snapshots: [snapshot([], [])],
+      reviewLog: async () => { throw new Error("disk full"); },
+    });
+    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
+    // The violation wake precedes the lifecycle event; the sink failure opens
+    // the one degraded episode between them.
+    expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded", "pane_closed"]);
+    h.supervisor.shutdown();
+  });
+
+  it("does not reopen the episode when the settle-flushed append fails while already degraded", async () => {
+    // The cadence's evidence-read failure opened the episode first; the
+    // violation's own append failure inside it is a second sink loss, not a
+    // second wake.
+    const h = await working({
+      snapshots: [snapshot([], [])],
+      transcript: async () => { throw new Error("pane read failed"); },
+      reviewLog: async () => { throw new Error("disk full"); },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded"]));
+    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
+    expect(types(h.wakes)).toEqual(["reviewer_degraded", "reviewer_attention", "pane_closed"]);
+    h.supervisor.shutdown();
+  });
+
+  it("reports a signal-only exit with the signal fact and no invented code", async () => {
+    const h = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    await h.supervisor.onEvent(exitEvent("p1", { signal: "SIGKILL" }));
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "process_exit", signal: "SIGKILL" });
+    expect(h.wakes[0]!.event.details).not.toHaveProperty("exitCode");
+    expect(h.logged[0]).toMatchObject({ violations: [{ violation: "process_exit", details: { violation: "process_exit", signal: "SIGKILL" } }] });
+  });
+
+  it("treats a thin pane_exited with no exit status as a lifecycle gap, never a crash", async () => {
+    const h = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    await h.supervisor.onEvent(thinEvent("pane_exited"));
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.wakes).toEqual([]);
+
+    // A clean exit code is not a crash either.
+    const clean = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    await clean.supervisor.onEvent(exitEvent("p1", { exit_code: 0 }));
+    clean.fireTimer();
+    await vi.waitFor(() => expect(clean.reviews).toBe(1));
+    expect(clean.wakes).toEqual([]);
+  });
+
+  it("does not latch an exit for a different pane or a pending move", async () => {
+    // An exit attributed to a pane this supervisor does not own is not its fact.
+    const otherPane = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+    await otherPane.supervisor.onEvent(exitEvent("p9", { exit_code: 9 }));
+    otherPane.fireTimer();
+    await vi.waitFor(() => expect(otherPane.reviews).toBe(1));
+    expect(otherPane.wakes).toEqual([]);
+
+    // The origin pane's exit while a move is unresolved is move cleanup.
+    const resolved = snapshot([paneRecord({ paneId: "p2", revision: 1, status: "working" })], [{ pane_id: "p2", name: "worker" }]);
+    const moved = await working({ snapshots: [invalidDestination(), resolved, snapshot([paneRecord({ paneId: "p2", status: "working", revision: 1 })])] });
+    await moved.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "working" }), { previous_pane_id: "p1" }));
+    await moved.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
+    await moved.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ paneId: "p2", revision: 1, status: "working" })));
+    expect(moved.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p2" } });
+    moved.fireTimer();
+    await vi.waitFor(() => expect(moved.reviews).toBe(1));
+    expect(types(moved.wakes)).not.toContain("reviewer_attention");
+  });
+
+  it("does not advance the trace cursor for a review abandoned in flight", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await working({
+      traceFile: piJsonl([piToolCall("Read")]),
+      review: async () => { await gate; return { classification: "progress", summary: "moving" }; },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    release();
+    await vi.waitFor(() => expect(h.supervisor.view().reviewer.reviews).toEqual([]));
+
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7 })));
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    // The abandoned window was never reviewed, so the next cadence re-reads it:
+    // the completed review still starts from no cursor.
+    expect(h.reviewRequests[1]!.evidence!.trace.cursorFrom).toBeUndefined();
+  });
+
+  it("honors the result's own attention decision and recomputes only when absent", async () => {
+    const decided = await working({ review: async () => ({ classification: "stalled", summary: "quiet", attention: "none", outcome: "classified" }) });
+    decided.fireTimer();
+    await vi.waitFor(() => expect(decided.reviews).toBe(1));
+    expect(decided.wakes).toEqual([]);
+
+    // The code-owned fallback: a first-observation `unknown` inside baseline
+    // grace is silent; the same classification past its first observation wakes.
+    const undecided = await working({
+      cadenceMs: 60_000,
+      review: async () => ({ classification: "unknown", summary: "calibrating" }),
+    });
+    undecided.fireTimer();
+    await vi.waitFor(() => expect(undecided.reviews).toBe(1));
+    expect(undecided.wakes).toEqual([]);
+    undecided.fireTimer();
+    await vi.waitFor(() => expect(types(undecided.wakes)).toEqual(["reviewer_attention"]));
+  });
+
+  it("treats drifted evidence identity as a first observation for baseline grace", async () => {
+    const h = await working({
+      review: async (call) => call === 1
+        ? { classification: "progress", summary: "moving" }
+        : { classification: "unknown", summary: "recalibrating", drift: { drifted: true, fields: ["model"] } },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(h.wakes).toEqual([]);
+  });
+
+  it("keeps evidence state, cursors, and policy facts out of the public projection", async () => {
+    const h = await working({
+      assignmentDigest: { doneWhen: ["tests pass"], constraints: [], readOnly: true },
+      workspaceRoot,
+      workspaceRunner: cleanRunner,
+      resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
+      traceFile: piJsonl([piToolCall("Read")]),
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    const json = JSON.stringify(h.supervisor.view());
+    for (const key of ["traceCursor", "workspaceRoot", "workspaceBaseRevision", "forbiddenTools", "assignmentDigest", "readOnly", "unreportedExit", "evidenceBaseline", "traceSource", "evidenceScanner"]) {
+      expect(json).not.toContain(`"${key}"`);
+    }
+    // The public review record keeps the consumer shape — no evidence payload.
+    expect(h.supervisor.view().reviewer.reviews[0]).not.toHaveProperty("evidence");
+  });
+
+  it("keeps a failed terminal-window read silent — no cursor minted, no reviewer call, no wake", async () => {
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
+    const h = harness({
+      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
+      transcript: async () => { throw new Error("pane gone"); },
+    });
+    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.progress.some((line) => line.includes("review unavailable"))).toBe(true));
+    expect(h.reviews).toBe(0);
+    expect(h.wakes).toEqual([]);
+    // The unreadable window minted no cursor and recorded no review, so the
+    // next cadence retries the same read and stays silent the same way.
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.progress.filter((line) => line.includes("review unavailable"))).toHaveLength(2));
+  });
+
+  it("still detects a forbidden tool from the raw trace when the build refuses the cadence", async () => {
+    const h = await working({
+      traceFile: piJsonl([piToolCall("Write")]),
+      resolveForbiddenTools: () => ({ available: true, tools: ["write"] }),
+      evidenceScanner: () => ({ outcome: "sensitive" }),
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "forbidden_tool_observed", tools: "write" });
+    expect(h.reviews).toBe(0);
+    // The refused build's byte counts are honest nulls; the recomputed digest
+    // hash still pins the exact window the violation was judged on.
+    expect(h.logged).toHaveLength(1);
+    expect(h.logged[0]).toMatchObject({
+      provenance: {
+        traceSource: "pi-jsonl",
+        representation: "B-runner-trace",
+        traceDigestHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        workspaceFingerprint: null,
+        stateBytes: null,
+        terminalBytes: null,
+        identityHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      },
+      violations: [{ violation: "forbidden_tool_observed", details: { violation: "forbidden_tool_observed", tools: "write" } }],
+    });
+  });
+
+  it("forwards a carried outcome into the attention fallback", async () => {
+    // A `reviewer_unavailable` outcome silences even a waking classification:
+    // if the outcome did not reach the local recompute, `blocked` would wake.
+    const h = await working({
+      review: async () => ({ classification: "blocked", summary: "stuck", outcome: "reviewer_unavailable" }),
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.wakes).toEqual([]);
+  });
+
+  it("drops a reviewer failure that lands after the run it belonged to ended", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await working({
+      review: async (call) => {
+        if (call !== 1) return { classification: "progress", summary: "moving" };
+        await gate;
+        throw new Error("jev down");
+      },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
+    release();
+    // The failure belonged to the dead run, so it degrades nothing: the next
+    // run's cadence reviews cleanly and emits neither degradation nor recovery.
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7 })));
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(2));
+    expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
+  });
+
+  /** The cursor-label format the reviewer's provenance uses: `source@position:hash`, or `source:hash` when the source has no position. */
+  const cursorLabel = (ref: { source: string; position?: number; hash: string } | undefined): string | null =>
+    ref === undefined ? null : ref.position === undefined ? `${ref.source}:${ref.hash}` : `${ref.source}@${ref.position}:${ref.hash}`;
+
+  it("round-trips the reviewer-reported provenance onto the review entry verbatim", async () => {
+    const h = await working({
+      traceFile: piJsonl([piToolCall("Read")]),
+      workspaceRoot,
+      workspaceRunner: cleanRunner,
+      review: async (_call, request) => {
+        const evidence = request.evidence!;
+        return {
+          classification: "progress",
+          summary: "moving",
+          evidence: {
+            traceFromCursor: cursorLabel(evidence.trace.cursorFrom),
+            traceToCursor: cursorLabel(evidence.trace.cursorTo),
+            traceDigestHash: executionDigestHash(evidence.trace),
+            workspaceFingerprint: evidence.workspace.available ? evidence.workspace.fingerprint : null,
+          },
+          identityHash: evidence.identity.hash,
+        };
+      },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.logged).toHaveLength(1));
+    const first = h.logged[0] as SupervisionReviewLogEntry;
+    const evidence = h.reviewRequests[0]!.evidence!;
+    // Every provenance field lands verbatim and recomputes from the sent state:
+    // the closed representation label, both cursor labels, the digest hash, the
+    // workspace fingerprint, the byte counts, and the version-identity hash.
+    expect(first.provenance).toEqual({
+      traceSource: "pi-jsonl",
+      representation: "B-runner-trace",
+      traceFromCursor: null,
+      traceToCursor: cursorLabel(evidence.trace.cursorTo),
+      traceDigestHash: executionDigestHash(evidence.trace),
+      workspaceFingerprint: evidence.workspace.available ? evidence.workspace.fingerprint : null,
+      stateBytes: expect.any(Number),
+      terminalBytes: expect.any(Number),
+      identityHash: evidence.identity.hash,
+    });
+    // The consumed window's cursor joins the next record's traceFromCursor —
+    // the provenance chain links without inference.
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.logged).toHaveLength(2));
+    const second = h.logged[1] as SupervisionReviewLogEntry;
+    expect(second.provenance?.traceFromCursor).toBe(first.provenance?.traceToCursor);
+    expect(second.provenance?.representation).toBe("B-runner-trace");
+  });
+
+  it("labels the terminal fallback representation A — V2.1 emits only A or B, never C", async () => {
+    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
+    const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
+    const h = harness({
+      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
+      transcript: async () => ["a", "b"],
+    });
+    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.logged).toHaveLength(1));
+    const logged = h.logged[0] as SupervisionReviewLogEntry;
+    expect(logged.provenance).toMatchObject({ traceSource: "tmux-fallback", representation: "A-tmux-lines" });
+    expect(logged.provenance?.representation).not.toBe("C-vcc-supervision-view");
+  });
+
+  it("labels a position-less devin cursor with source and hash only", async () => {
+    const devinSession = { source: "devin", agent: "devin", kind: "id", value: "devin-1" };
+    const devinIdentity: SupervisedIdentity = { ...identity, agentKind: "devin", agentSession: devinSession };
+    const h = harness({
+      child: { agentName: "worker", agentKind: "devin", candidateName: "worker-devin" },
+      snapshots: [
+        snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })]),
+        snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })]),
+      ],
+      devinSession: async () => ({ position: "opaque-token", events: [] }),
+    });
+    await h.supervisor.bind({ identity: devinIdentity, candidateName: "worker-devin" });
+    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 9 }));
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+    expect(h.logged).toHaveLength(1);
+    expect(h.logged[0]).toMatchObject({
+      provenance: { traceSource: "devin-session", representation: "B-runner-trace", traceToCursor: expect.stringMatching(/^devin-session:[0-9a-f]{64}$/u) },
+      violations: [{ violation: "process_exit" }],
+    });
+  });
+
+  it("writes violation records to disk through the default seam — typed, provenance-bound, and Jev-free", async () => {
+    const root = await mkdtemp(join(tmpdir(), "herdr-supervisor-m1-"));
+    try {
+      const h = harness({
+        reviewLog: "default",
+        reviewLogRoot: root,
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])],
+        traceFile: piJsonl([piToolCall("Deploy")]),
+        resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
+      });
+      await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+      h.fireTimer();
+      await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
+      const paths = reviewLogPaths(root);
+      await vi.waitFor(async () => {
+        const records = (await readFile(paths.reviews, "utf8")).split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line) as SupervisionLogRecord);
+        expect(records).toHaveLength(1);
+        const violation = records[0]!;
+        expect(Object.keys(violation)).toEqual([
+          "type", "timestamp", "jobId", "agentName", "agentKind",
+          "eventId", "eventType", "atMs", "disposition", "violation", "details", "provenance",
+        ]);
+        expect(violation).toMatchObject({
+          type: "violation",
+          eventId: h.wakes[0]!.event.eventId,
+          eventType: "reviewer_attention",
+          atMs: 1_000,
+          disposition: "unknown",
+          violation: "forbidden_tool_observed",
+          details: { violation: "forbidden_tool_observed", tools: "deploy" },
+          provenance: {
+            traceSource: "pi-jsonl",
+            representation: "B-runner-trace",
+            traceDigestHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+            identityHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          },
+        });
+      });
+      expect((await lstat(paths.reviews)).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades like a reviewer failure when a violation's log write fails — the wake already fired and the child is untouched", async () => {
+    const persisted: SupervisionLogEntry[] = [];
+    let fail = true;
+    const h = await working({
+      traceFile: piJsonl([piToolCall("Deploy")]),
+      resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
+      reviewLog: async (entry) => { if (fail) throw new ReviewLogError(); persisted.push(entry); },
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded"]));
+    expect(h.reviews).toBe(0);
+    expect(h.supervisor.view().reviewer.degraded).toBe(true);
+    expect(h.supervisor.childLive()).toBe(true);
+    expect(h.timerArmed()).toBe(true);
+    // The next cadence retries the sink; a clean window reviews normally and
+    // the recovered reviewer emits the recovery wake.
+    fail = false;
+    h.fireTimer();
+    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded", "reviewer_recovered"]));
+    expect(persisted).toHaveLength(1);
+  });
+
+  it("persists no raw evidence — a canary in the trace, terminal, or assignment never reaches the log", async () => {
+    const root = await mkdtemp(join(tmpdir(), "herdr-supervisor-canary-"));
+    try {
+      const canary = "CANARY-m1-secret-9f8e7d";
+      const h = harness({
+        reviewLog: "default",
+        reviewLogRoot: root,
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])],
+        assignmentDigest: { doneWhen: [canary], constraints: [] },
+        traceFile: piJsonl([{ type: "message", timestamp: 1, message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "Bash", arguments: { command: canary } }] } }]),
+        transcript: async () => ["ordinary line", canary],
+      });
+      await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+      h.fireTimer();
+      await vi.waitFor(() => expect(h.reviews).toBe(1));
+      const paths = reviewLogPaths(root);
+      await vi.waitFor(async () => expect((await readFile(paths.reviews, "utf8")).length).toBeGreaterThan(0));
+      const content = await readFile(paths.reviews, "utf8");
+      expect(content).not.toContain(canary);
+      expect(content).not.toContain("CANARY");
+      // The record still carries its bounded provenance — the canary only ever
+      // influenced a hash.
+      const record = JSON.parse(content.trim()) as SupervisionLogRecord;
+      expect(record).toMatchObject({ type: "review", provenance: { traceDigestHash: null, stateBytes: expect.any(Number) } });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

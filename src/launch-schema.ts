@@ -56,12 +56,14 @@ export const LaunchAssignmentSchema = Type.Object({
  * 2026-09-18): done-when conditions and constraints the supervisor's reviewer
  * judges against. Both arrays are required and non-empty — a caller with no
  * constraints authors `["none"]`. Bounded and strict — extra fields are
- * rejected.
+ * rejected. `readOnly` (ADR-036 W0) is the caller's claim that the assignment
+ * must not mutate the workspace: optional, boolean, absent means false.
  */
 const SupervisionDigestItems = Type.Array(Type.String({ minLength: 1, maxLength: 240 }), { minItems: 1, maxItems: 8 });
 export const SupervisionDigestSchema = Type.Object({
   doneWhen: SupervisionDigestItems,
-  constraints: SupervisionDigestItems
+  constraints: SupervisionDigestItems,
+  readOnly: Type.Optional(Type.Boolean())
 }, { additionalProperties: false });
 
 const LaunchCommonProperties = {
@@ -186,7 +188,7 @@ type FlatLaunchParams = {
   focus?: boolean;
   assignment?: { objective?: string; scope?: string; verification?: string };
   assignmentDelivery?: MessageDelivery;
-  supervisionDigest?: { doneWhen: string[]; constraints: string[] };
+  supervisionDigest?: { doneWhen: string[]; constraints: string[]; readOnly?: boolean };
 };
 
 /**
@@ -242,8 +244,8 @@ export interface LaunchRequest {
   focus?: boolean;
   assignment: LaunchAssignment;
   assignmentDelivery?: MessageDelivery;
-  /** Authorial done-when/constraints the supervisor's reviewer judges against (ADR-034). Required on every launch. */
-  supervisionDigest: { doneWhen: string[]; constraints: string[] };
+  /** Authorial done-when/constraints the supervisor's reviewer judges against (ADR-034), plus the bounded readOnly claim (ADR-036 W0). Required on every launch. */
+  supervisionDigest: { doneWhen: string[]; constraints: string[]; readOnly?: boolean };
 }
 
 export const LAUNCH_ASSIGNMENT_FIELDS = ["objective", "scope", "verification"] as const;

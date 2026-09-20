@@ -20,10 +20,10 @@ export interface SupervisionChildView {
   agentKind: string;
   paneId: string;
   terminalId: string;
-  /** The profile that actually started this child. */
-  profileName: string;
-  /** Present only when fallback selection changed the profile after reservation. */
-  requestedProfileName?: string;
+  /** The compiled candidate that actually started this child. */
+  candidateName: string;
+  /** Present only when fallback selection changed the candidate after reservation. */
+  requestedCandidateName?: string;
   /** Present only when fallback selection changed the kind after reservation. */
   requestedAgentKind?: string;
 }
@@ -39,10 +39,10 @@ export interface SupervisionProvisionalView {
   agentKind: "agy";
   paneId: string;
   terminalId: string;
-  /** The profile that actually started this child. */
-  profileName: string;
-  /** Present only when fallback selection changed the profile after reservation. */
-  requestedProfileName?: string;
+  /** The compiled candidate that actually started this child. */
+  candidateName: string;
+  /** Present only when fallback selection changed the candidate after reservation. */
+  requestedCandidateName?: string;
   baseline: {
     state: "idle";
     stateChangeSeq: number;
@@ -158,13 +158,13 @@ function status(value: unknown): value is SupervisionAgentStatus {
 }
 
 function child(value: unknown): value is SupervisionChildView {
-  if (!record(value) || !text(value.agentName) || !text(value.agentKind) || !text(value.paneId) || !text(value.terminalId) || !text(value.profileName)) return false;
-  return (value.requestedProfileName === undefined || text(value.requestedProfileName)) && (value.requestedAgentKind === undefined || text(value.requestedAgentKind));
+  if (!record(value) || !text(value.agentName) || !text(value.agentKind) || !text(value.paneId) || !text(value.terminalId) || !text(value.candidateName)) return false;
+  return (value.requestedCandidateName === undefined || text(value.requestedCandidateName)) && (value.requestedAgentKind === undefined || text(value.requestedAgentKind));
 }
 
 function provisional(value: unknown): value is SupervisionProvisionalView {
-  if (!record(value) || value.agentKind !== "agy" || !text(value.agentName) || !text(value.paneId) || !text(value.terminalId) || !text(value.profileName)) return false;
-  if (value.requestedProfileName !== undefined && !text(value.requestedProfileName)) return false;
+  if (!record(value) || value.agentKind !== "agy" || !text(value.agentName) || !text(value.paneId) || !text(value.terminalId) || !text(value.candidateName)) return false;
+  if (value.requestedCandidateName !== undefined && !text(value.requestedCandidateName)) return false;
   return record(value.baseline) && value.baseline.state === "idle" && safeCounter(value.baseline.stateChangeSeq) && safeCounter(value.baseline.revision);
 }
 

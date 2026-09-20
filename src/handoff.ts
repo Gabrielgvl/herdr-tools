@@ -150,9 +150,9 @@ export interface HandoffState {
   child: {
     agentName: string;
     agentKind: string;
-    profileName: string;
-    requestedProfile: string;
-    fallbackProfiles: string[];
+    candidateName: string;
+    specLabel: string;
+    fallbackCandidates: string[];
     paneId: string | null;
     terminalId: string | null;
     agentId: string | null;
@@ -165,7 +165,7 @@ export interface HandoffState {
 
 export interface HandoffRunIdentity {
   manager: { paneId: string; display: string; source: string };
-  child: { agentName: string; agentKind: string; profileName: string; requestedProfile: string; fallbackProfiles: string[] };
+  child: { agentName: string; agentKind: string; candidateName: string; specLabel: string; fallbackCandidates: string[] };
 }
 
 function allocateIn(namespace: HandoffNamespace): HandoffAllocation {
@@ -317,9 +317,9 @@ export function createHandoffAllocator(options: {
         child: {
           agentName: identity.child.agentName,
           agentKind: identity.child.agentKind,
-          profileName: identity.child.profileName,
-          requestedProfile: identity.child.requestedProfile,
-          fallbackProfiles: [...identity.child.fallbackProfiles],
+          candidateName: identity.child.candidateName,
+          specLabel: identity.child.specLabel,
+          fallbackCandidates: [...identity.child.fallbackCandidates],
           paneId: null,
           terminalId: null,
           agentId: null

@@ -72,6 +72,23 @@ function evidence(result: ToolResult): Record<string, unknown> {
   return record(JSON.parse(only.text));
 }
 
+function singleLaunchEvidence(result: ToolResult): Record<string, unknown> {
+  const details = evidence(result);
+  if (details.operation === "launch") return details;
+  if (details.operation !== "launch_batch") throw new Error("herdr_launch returned neither launch nor launch_batch evidence");
+  const children = details.children;
+  if (details.outcome !== "launched" || !Array.isArray(children) || children.length !== 1) {
+    const router = Array.isArray(details.router) ? details.router.map((value) => {
+      const decision = record(value);
+      return [decision.kind, decision.reason, decision.component].filter((field) => typeof field === "string").join(":");
+    }).join(",") : "invalid";
+    throw new Error(`one-spec launch returned outcome=${String(details.outcome)} children=${Array.isArray(children) ? children.length : "invalid"} router=${router}`);
+  }
+  const child = record(children[0]);
+  if (child.status !== "launched") throw new Error(`one-spec launch child returned status=${String(child.status)}`);
+  return record(child.launch);
+}
+
 function text(result: ToolResult): string {
   return result.content.map((block) => block.text).join("\n");
 }
@@ -359,27 +376,10 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       const mixedShape = await call("herdr_inspect", { mode: "context", collection: "panes" });
       expect(mixedShape.isError).toBe(true);
       expect(text(mixedShape)).toContain("INVALID_INPUT");
-      expect(text(mixedShape)).toContain("additionalProperties");
 
       const health = await call("herdr_inspect", { mode: "health" });
       expect(health.isError).toBeUndefined();
       expect(evidence(health)).toMatchObject({ operation: "inspect", kind: "health", outcome: "success", socketReachable: true, compatible: true, environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true } });
-
-      const profiles = await call("herdr_inspect", { mode: "collection", collection: "profiles" });
-      const catalog = evidence(profiles);
-      expect(catalog).toMatchObject({ operation: "inspect", kind: "collection", collection: "profiles", outcome: "success" });
-      expect(Array.isArray(catalog.items) ? catalog.items : []).toHaveLength(24);
-      expect(catalog.items).toEqual(expect.arrayContaining([
-        expect.objectContaining({ name: "worker-pi", kind: "pi" }),
-        expect.objectContaining({ name: "promoter-pi", kind: "pi", fallbackProfiles: [] }),
-        expect.objectContaining({ name: "manager-claude", kind: "claude", model: "fable", effort: "high", permissionMode: "default", fallbackProfiles: ["manager-pi"] }),
-        expect.objectContaining({ name: "scout-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["scout-claude"] }),
-        expect.objectContaining({ name: "worker-agy", kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["worker-claude"] }),
-        expect.objectContaining({ name: "researcher-agy", kind: "agy", model: "gemini-3.8-flash-low", mode: "plan", dangerouslySkipPermissions: true, addDirs: [], fallbackProfiles: ["researcher-claude"] }),
-        expect.objectContaining({ name: "worker-devin", kind: "devin", model: "swe-2-max", permissionMode: "dangerous", fallbackProfiles: ["worker-pi"] }),
-        expect.objectContaining({ name: "reviewer-devin", kind: "devin", model: "swe-2-max", permissionMode: "dangerous", fallbackProfiles: ["reviewer-pi"] })
-      ]));
-      expect(catalog.diagnostics ?? []).toEqual([]);
 
       // Create a disposable pane through this same runtime so the result still
       // proves environment redaction, then let the launch exercise its default
@@ -403,20 +403,20 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       // starts. The MCP host has no explicit wait-review model service, so a
       // redundant reviewer would fail the job; remaining live proves the
       // supervisor retained sole semantic-review ownership.
-      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", profile: "scout-pi", assignment: { objective: "Stay idle as a supervised wait target.", scope: "Change nothing.", verification: "The pane stays live at the same identity." }, supervisionDigest: { doneWhen: ["The pane stays live at the same identity."], constraints: ["none"] } });
+      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", specs: [{ label: "wait", instructions: "This is a frontier supervised-wait smoke test. Do not call tools or modify files; remain idle in this pane.", assignment: { objective: "Stay idle as a supervised wait target.", scope: "Call no tools and change nothing.", verification: "The pane stays live at the same identity." }, category: "frontier" }], supervisionDigest: { doneWhen: ["The pane stays live at the same identity."], constraints: ["none"] } });
       expect(reviewerTargetLaunch.isError, text(reviewerTargetLaunch)).toBeUndefined();
-      const reviewerTargetEvidence = evidence(reviewerTargetLaunch);
-      expect(reviewerTargetEvidence).toMatchObject({
+      const reviewerLaunchEvidence = singleLaunchEvidence(reviewerTargetLaunch);
+      expect(reviewerLaunchEvidence).toMatchObject({
         operation: "launch",
         outcome: "launched",
         placement: { mode: "same_tab" },
-        kind: "pi",
+        kind: expect.stringMatching(/^(?:pi|claude|devin|agy)$/u),
         initialPromptSent: true,
         promptSubmitted: true,
         supervision: { jobId: expect.any(String), state: "active" }
       });
-      const reviewerPaneId = String(reviewerTargetEvidence.paneId);
-      const supervisorJobId = String(record(reviewerTargetEvidence.supervision).jobId);
+      const reviewerPaneId = String(reviewerLaunchEvidence.paneId);
+      const supervisorJobId = String(record(reviewerLaunchEvidence.supervision).jobId);
       const supervisedWait = await call("herdr_wait", {
         targets: [reviewerPaneId],
         match: "any",
@@ -460,7 +460,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(prelaunchMetadata).not.toHaveProperty("agent_id");
       expect(prelaunchMetadata).not.toHaveProperty("agent");
       const launchStartedAt = performance.now();
-      const launched = await call("herdr_launch", { name: "mcp-integration-worker", profile: "worker-pi", assignment: { objective: "Use the bash tool to run pwd, then report the working directory.", scope: "Run pwd only. Change nothing.", verification: "The reported directory is the working directory pwd printed." }, supervisionDigest: { doneWhen: ["The reported directory is the working directory pwd printed."], constraints: ["none"] } });
+      const launched = await call("herdr_launch", { name: "mcp-integration-worker", specs: [{ label: "worker", instructions: "This is a frontier readback smoke test. The caller requires frontier rather than cheap or balanced. Join the two assignment words with one colon and reply with only that value. Do not call tools or modify files.", assignment: { objective: "Join the first word HERDR and the second word MCP with one colon, then reply with only the joined value.", scope: "Call no tools and change nothing.", verification: "The response is HERDR:MCP with no other text." }, category: "frontier" }], supervisionDigest: { doneWhen: ["The response is HERDR:MCP with no other text."], constraints: ["none"] } });
       const launchElapsedMs = performance.now() - launchStartedAt;
       if (launched.isError) {
         const diagnostic = launchFailureDiagnostic(launched);
@@ -492,28 +492,28 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         // against an assignment whose consumption was not proven.
         return;
       }
-      const launchEvidence = evidence(launched);
-      const workerPaneId = String(launchEvidence.paneId);
-      expect(launchEvidence).toMatchObject({
+      const childLaunch = singleLaunchEvidence(launched);
+      const workerPaneId = String(childLaunch.paneId);
+      expect(childLaunch).toMatchObject({
         operation: "launch",
         outcome: "launched",
         placement: { mode: "same_tab" },
-        kind: "pi",
+        kind: expect.stringMatching(/^(?:pi|claude|devin|agy)$/u),
         paneId: workerPaneId,
         initialPromptSent: true,
         envelope: { version: "v1", kind: "assignment" },
         promptConfirmation: { elapsedMs: expect.any(Number) },
         timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
-        profile: { name: "worker-pi", selected: "worker-pi", runtime: { kind: "pi", model: expect.stringMatching(/^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9.-]*$/u), thinking: "max" } }
+        spec: { label: "worker", category: "frontier" }
       });
-      assertLaunchPhaseTiming(launchEvidence, launchElapsedMs);
-      expect(record(launchEvidence.sender).paneId).toBe(String(movedPane.pane_id));
-      expect(record(record(launchEvidence.profile).source).kind).toBe("bundled");
+      assertLaunchPhaseTiming(childLaunch, launchElapsedMs);
+      expect(record(childLaunch.sender).paneId).toBe(String(movedPane.pane_id));
+      expect(record(childLaunch.spec).label).toBe("worker");
       const launchedSnapshot = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);
       const launchedPane = (Array.isArray(launchedSnapshot.panes) ? launchedSnapshot.panes.map(record) : []).find((pane) => pane.pane_id === workerPaneId);
       expect(launchedPane).toMatchObject({ pane_id: workerPaneId, tab_id: movedTabId, workspace_id: reboundWorkspaceId });
 
-      const confirmedState = record(launchEvidence.initialPromptObservation).state;
+      const confirmedState = record(childLaunch.initialPromptObservation).state;
       const confirmedWaitState = confirmedState === "working" ? "working" : confirmedState === "blocked" ? "needs_input" : "completed";
       const shortWait = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: confirmedWaitState }, timeoutMs: 10_000 });
       expect(shortWait.isError, text(shortWait)).toBeUndefined();

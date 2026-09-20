@@ -38,7 +38,7 @@ const snapshot = {
 
 const health = { client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } };
 const context = { workspaceId: "w", tabId: "w:t", paneId: "w:p" };
-const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" as const };
 
 function fakeExec(): { exec: PiExec; calls: string[][] } {
   const calls: string[][] = [];
@@ -117,7 +117,7 @@ describe("shared tool surface", () => {
       createCommunicateTool({ cli: deps.cli, context, preflight: deps.preflight }),
       createWaitTool({ cli: deps.cli, context, settingsLoader: deps.settingsLoader, jobRegistry: deps.jobs }),
       createJobsTool(deps.jobs),
-      createLaunchTool({ cli: deps.cli, context, cwd: deps.cwd, ownership: deps.ownership, profiles: deps.profiles, preflight: deps.preflight, supervision: deps.supervision }),
+      createLaunchTool({ cli: deps.cli, context, cwd: deps.cwd, ownership: deps.ownership, preflight: deps.preflight, supervision: deps.supervision }),
       createPaneTool({ cli: deps.cli, context, cwd: deps.cwd, ownership: deps.ownership, preflight: deps.preflight }),
       createTabTool({ cli: deps.cli, context, cwd: deps.cwd, ownership: deps.ownership, preflight: deps.preflight })
     ];

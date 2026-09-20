@@ -21,7 +21,7 @@ const snapshot = {
 
 const context = { workspaceId: "w", tabId: "w:t", paneId: "p1" };
 const extensionContext = { modelRegistry: {} } as ExtensionContext;
-const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" as const };
 
 function fakeCli(transcript: (paneId: string) => string): WaitCli {
   return {

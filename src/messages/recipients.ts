@@ -20,7 +20,7 @@ export interface RecipientIdentity {
 
 export interface RecipientRecord extends RecipientIdentity {
   recipientKey: string;
-  profileName: string;
+  candidateName: string;
   kind: ProfileKind;
   capable: boolean;
   reason: string;
@@ -149,7 +149,7 @@ export class RecipientRegistry {
     return record ? { ...record, agentSession: { ...record.agentSession } } : undefined;
   }
 
-  recordFor(profileName: string, paneId: string, recipientKey: string, capability: AttachmentCapability & { kind: ProfileKind }, identity: PromptTargetIdentity & { agentId?: string }, evidence: RecipientRegistrationEvidence = {}): RecipientRecord {
+  recordFor(candidateName: string, paneId: string, recipientKey: string, capability: AttachmentCapability & { kind: ProfileKind }, identity: PromptTargetIdentity & { agentId?: string }, evidence: RecipientRegistrationEvidence = {}): RecipientRecord {
     if (identity.paneId !== paneId || capability.kind !== identity.agentKind || !completeIdentity(identity)) {
       throw new Error("Recipient registration identity does not match the launched profile and pane");
     }
@@ -164,7 +164,7 @@ export class RecipientRegistry {
       agentSession: { ...identity.agentSession },
       ...(identity.agentId ? { agentId: identity.agentId } : {}),
       recipientKey,
-      profileName,
+      candidateName,
       kind: capability.kind,
       capable: capability.capable,
       reason: capability.reason,

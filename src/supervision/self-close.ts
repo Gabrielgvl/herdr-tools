@@ -17,6 +17,15 @@
  * cadence plus socket latency with margin); at most 128 live entries are
  * retained, and admission beyond that fails toward an ordinary wake.
  *
+ * `onPaneClosed` registers cleanup listeners fired each time a pane's absence
+ * is proven to this host: every `consume` — the supervisor consults the
+ * tracker only after observing the pane missing — and every own-close finisher
+ * confirmed by readback that no pending claim already reported. Listeners are
+ * advisory only: they run after the tracker's own decision, their errors are
+ * swallowed so a cleanup failure can never corrupt a wake, and `clear` retires
+ * them. A finisher that is stale or superseded proves nothing about the
+ * current pane and fires nothing.
+ *
  * ponytail: this is pane-id plus timing correlation, not proof that this host's
  * close caused the observed absence. An unconsumed confirmed marker can still
  * collide with a recycled pane id inside its TTL; if that ceiling ever becomes
@@ -44,9 +53,18 @@ export interface SelfCloseTracker {
    * attempt still in flight. A second claim on the same attempt gets `false`.
    */
   consume(paneId: string): boolean | Promise<boolean>;
+  /**
+   * Register a listener fired each time this host proves a pane absent — every
+   * `consume` call and every readback-confirmed own-close. Returns an
+   * unsubscribe; on a cleared tracker the listener is never added.
+   */
+  onPaneClosed(listener: PaneClosedListener): () => void;
   /** Permanently retire the tracker: clear timers, resolve pending claims `false`. */
   clear(): void;
 }
+
+/** Cleanup hook invoked with a pane id this host proved absent. */
+export type PaneClosedListener = (paneId: string) => void;
 
 interface SelfCloseEntry {
   paneId: string;
@@ -63,9 +81,20 @@ const noopFinisher: SelfCloseFinisher = () => undefined;
 
 export function createSelfCloseTracker(): SelfCloseTracker {
   const entries = new Map<string, SelfCloseEntry>();
+  const closedListeners = new Set<PaneClosedListener>();
   let cleared = false;
 
   const now = (): number => performance.now();
+
+  const notifyClosed = (paneId: string): void => {
+    for (const listener of [...closedListeners]) {
+      try {
+        listener(paneId);
+      } catch {
+        // A cleanup hook's failure must not corrupt the wake decision.
+      }
+    }
+  };
 
   const retire = (entry: SelfCloseEntry, suppress: boolean): void => {
     clearTimeout(entry.timer);
@@ -116,8 +145,9 @@ export function createSelfCloseTracker(): SelfCloseTracker {
         return;
       }
       if (entry.claimed) {
-        // The claim was already made; the attempt's outcome decides it and the
-        // entry is spent either way.
+        // The claim was already made; consume already proved and reported the
+        // absence, the attempt's outcome decides it, and the entry is spent
+        // either way.
         retire(entry, confirmed);
         return;
       }
@@ -125,6 +155,7 @@ export function createSelfCloseTracker(): SelfCloseTracker {
         retire(entry, false);
         return;
       }
+      notifyClosed(paneId);
       entry.confirmed = true;
       entry.deadline = now() + SELF_CLOSE_CONFIRMED_TTL_MS;
       rearm(entry);
@@ -132,6 +163,9 @@ export function createSelfCloseTracker(): SelfCloseTracker {
   };
 
   const consume = (paneId: string): boolean | Promise<boolean> => {
+    // The supervisor reaches this point only after observing the pane absent,
+    // so the call itself is the pane-gone proof cleanup listeners ride on.
+    notifyClosed(paneId);
     const entry = entries.get(paneId);
     if (entry === undefined) return false;
     if (now() >= entry.deadline) {
@@ -151,11 +185,20 @@ export function createSelfCloseTracker(): SelfCloseTracker {
     });
   };
 
+  const onPaneClosed = (listener: PaneClosedListener): (() => void) => {
+    if (cleared) return () => undefined;
+    closedListeners.add(listener);
+    return () => {
+      closedListeners.delete(listener);
+    };
+  };
+
   const clear = (): void => {
     if (cleared) return;
     cleared = true;
     for (const entry of [...entries.values()]) retire(entry, false);
+    closedListeners.clear();
   };
 
-  return { begin, consume, clear };
+  return { begin, consume, onPaneClosed, clear };
 }

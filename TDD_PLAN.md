@@ -1,5 +1,7 @@
 # TDD Plan: Global Pi Herdr Tools
 
+> Historical planning artifact — superseded by the ratified ADR-035 migration plan; model references are historical.
+
 ## Scope and non-goals
 
 This plan is the tests-first contract for a new global extension at

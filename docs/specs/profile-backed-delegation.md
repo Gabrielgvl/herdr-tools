@@ -1,5 +1,7 @@
 # Spec: Profile-backed Herdr delegation
 
+> **Superseded by the ADR-035 spec-launch migration.** Retained for historical context; profile, role, chain, and model references below describe the retired architecture.
+
 ## Objective
 
 Replace the normal `pi-subagents` delegation path with visible, pane-backed Pi, Claude, and AGY agents launched from reusable profiles. Build it in working layers rather than coupling the first release to every lifecycle feature.
@@ -34,12 +36,12 @@ The first implementation slice delivers a strict profile catalog and profile-bac
 - Automatic fallback is allowed only after the installed CLI failure envelope `{id:"cli:agent:start",error:{code:"agent_start_failed",message:"agent process exited before becoming interactive"}}` with non-killed exit 1 and untruncated stderr, followed by an authoritative pane read with `agent_status:"unknown"` and no agent identity/session fields. Timeout, malformed protocol, identity, kind, prompt, provisional supervision, strengthening, and uncertain-state failures stop. After any possible prompt effect, launch never retries, falls back, cleans up, or releases the recovery handle.
 - Fallback targets use their own untouched defaults. Typed overrides apply only to the requested primary. The logical cwd, task, placement, and provenance carry across attempts.
 - Bundled roles are `manager`, `scout`, `planner`, `worker`, `reviewer`, `researcher`, and `promoter`. `manager-pi` uses `openai-codex/gpt-6-astra` with xhigh thinking as the generic advisory profile. Pi thinking is profile-specific. Claude effort, AGY mode, and the recurring supervisor reviewer's thinking are unaffected. `manager-claude` uses the rolling `fable` alias with high effort, default permission mode, persistent session state, and the manager plugin; the manager chain is `manager-claude -> manager-pi -> manager-devin`. The other role directions and models are:
-  - scout: `gemini-3.8-flash-low` -> `claude-sonnet-5` -> `swe-2-max` -> `openai-codex/gpt-5.6-luna`;
-  - researcher: `gemini-3.8-flash-low` -> `claude-sonnet-5` -> `swe-2-max` -> `openai-codex/gpt-5.6-luna`;
-  - worker: `swe-2-max` -> `openai-codex/gpt-5.6-luna` with max thinking -> `claude-opus-5`;
+  - scout: `gemini-3.8-flash-low` -> `claude-sonnet-5` -> `swe-2-max` -> `openai-codex/gpt-5.6-sol`;
+  - researcher: `gemini-3.8-flash-low` -> `claude-sonnet-5` -> `swe-2-max` -> `openai-codex/gpt-5.6-sol`;
+  - worker: `swe-2-max` -> `openai-codex/gpt-5.6-sol` with max thinking -> `claude-opus-5`;
   - reviewer: `swe-2-max` -> `openai-codex/gpt-5.6-sol` -> `claude-opus-5`;
   - planner: `openai-codex/gpt-6-astra` with xhigh thinking -> `claude-fable-5` -> `swe-2-max`;
-  - promoter: `swe-2-max` -> `claude-opus-5` -> `openai-codex/gpt-5.6-luna`.
+  - promoter: `swe-2-max` -> `claude-opus-5` -> `openai-codex/gpt-5.6-sol`.
   AGY research uses fixed plan mode and permission bypass. `worker-agy` (`gemini-3.8-flash-high`, fixed `accept-edits`) is no longer on the default implementation chain and remains directly selectable with `worker-agy -> worker-claude`.
 - Every bundled Pi and Claude profile has one role-scoped skill; `manager-pi` additionally loads the cross-role `harness-flow` skill. Claude profiles load the corresponding scope-local plugin directory; Pi profiles load the same skill path directly. Manager, planner, researcher, and promoter also load the canonical Executor skill and allowlist its tools; Pi uses the global `pi-mcp-adapter`, while Claude loads the profile-scoped Executor plugin. Scout, worker, reviewer, and every AGY profile do not expose Executor tools. Each role additionally carries the owner-approved generated skill bundles for its role plugin, plus, for the Pi lanes that hold the tools those skills need, the `context-mode` and `tmux-background-tasks` bundles under `herdr-profiles/pi-skills` — kept outside every plugin directory so no Claude role receives them. A profile never selects a skill whose required tools its allowlist withholds, and the tool allowlist is never widened to justify a skill. Normal installed extension discovery remains enabled, while profile allowlists omit hidden delegation, durable-memory mutation, and unapproved lifecycle capabilities.
 - **The manager role plugin is the globally installed package, so profile extras never enter it.** `herdr-profiles/role-plugins/manager` is the plugin published as `herdr-tools` through `.claude-plugin/marketplace.json`; anything added there lands in every ordinary Claude session's skill and tool namespace. It therefore stays at exactly four files — manifest, `mcp-servers.json`, `skills/harness-flow`, `skills/manager` — and it alone owns the `herdr` stdio server and the `mcp__plugin_herdr-tools_herdr__*` tool names. The manager profile's selected extras live in a distinct **session-only generated plugin**, `herdr-profiles/profile-plugins/manager`, named `herdr-manager-profile` with no server map: a tracked manifest plus generated `skills/` holding the manager matrix (`manager`, `harness-flow`, and the six approved extras) as ordinary files. `manager-claude` loads that plugin plus the profile-scoped Executor plugin; `manager-pi` reads the same generated extras but keeps its own two skills at their tracked canonical paths, because copying a package-owned skill for Pi buys nothing. The two package-owned skills are consequently registered bundles with in-scope relative sources, pinned like any other, so a drift between the tracked skill and the generated plugin copy fails launch closed. Herdr installs, enables, disables, or mutates no global plugin state to achieve this.
@@ -104,7 +106,7 @@ Add `herdr_delegate` as a blocking high-level tool:
 - creates only owned no-focus worker panes on worker tabs separate from the manager/caller tab; a right-side split is permitted only when adding another worker pane to an existing worker tab with fewer than three panes; the manager/caller tab is never used;
 - one logical 1-60 minute deadline, profile default 30 minutes;
 - eligible fallback on structured quota/rate-limit/overload/model-provider capacity failures;
-- continuation after prior activity uses a low-thinking direct model summary (default exact Luna) plus a Herdr `transcriptRef`;
+- continuation after prior activity uses a low-thinking direct model summary plus a Herdr `transcriptRef`;
 - original sender remains the mandatory outer provenance; handoff summary provenance is nested and explicitly not user/owner authority;
 - blocked runs return `needs_input` plus durable bearer `runRef` and support resume/cancel from any Herdr pane;
 - configurable nesting depth 1-4, default 2, with leaf-first cancellation;
@@ -112,7 +114,7 @@ Add `herdr_delegate` as a blocking high-level tool:
 
 ### Slice 4: Acceptance and cutover
 
-- Dogfood the bundled Luna profiles for implementation/review work.
+- Dogfood the bundled profiles for implementation/review work.
 - Complete unit, integration, and disposable-session end-to-end tests.
 - Remove/disable `pi-subagents` only after the replacement gates pass.
 - Do not add compatibility parsing for old profiles.
@@ -220,7 +222,7 @@ Reject unknown fields, ambiguity, cycles, malformed paths, oversized files, and 
 - [ ] Exact profile inspection is bounded and redacts sensitive runtime values.
 - [ ] Pi and Claude adapters produce typed, shell-free argv with appended-system-prompt semantics; AGY produces fixed plan and permission-bypass argv without a profile-body prompt source.
 - [ ] Profile-backed launch works in a disposable Herdr session and preserves the v1 assignment envelope.
-- [ ] At least one bundled Luna profile is used to perform real repository work after deployment.
+- [ ] At least one bundled profile is used to perform real repository work after deployment.
 - [ ] Unit, typecheck, lint, build, and integration gates are green.
 
 ## Open questions deferred beyond Slice 1

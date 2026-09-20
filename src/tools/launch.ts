@@ -1,7 +1,11 @@
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Value } from "typebox/value";
 import { writeIdentityProvenance } from "../agent-identity.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
-import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope } from "../cli.js";
+import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope, type PiExec } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
@@ -11,23 +15,28 @@ import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type AgentSessionIdentity, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
 import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
-import { attachmentCapability, handoffWriteCapability } from "../profiles/capability.js";
-import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
+import type { AttachmentCapability } from "../profiles/capability.js";
+import { resolveSender, type SenderIdentity } from "../provenance.js";
 import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
 import { parseSnapshotResult, resolveTarget } from "../targets.js";
 import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
 import { expandBatchRequest, type BatchExpansion } from "../launch-batch.js";
-import { LAUNCH_ASSIGNMENT_FIELDS, PublishedLaunchParamsSchema, renderAssignment, type AutoLaunchRequest, type LaunchPlacement, type LaunchRequest } from "../launch-schema.js";
-import { projectRouterCatalog, roleForProfile, type RouterResult, type RouterState } from "../router.js";
-import { appendRouterDecision, type AppendRouterLogOptions, type RouterLogEntry, type UnavailableRouterState } from "../router-log.js";
-import { TypeSafeRouter, type RouteOutcome } from "../typesafe-router.js";
-import { buildRuntimeArgv, defaultPromptSourceStore, refreshBundledProfileResourceSelection, RESERVED_BUNDLED_PROFILE_NAMES, resolveProfile, resolveProfileRuntime, SkillSelectionError, validateProfileResourceSelection, type Profile, type ProfileCatalog, type ProfileResolution, type PromptSourceStore } from "../profiles/index.js";
-import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, DEVIN_PERMISSION_MODES, THINKING_LEVELS, type ProfileKind, type RuntimeProfile } from "../profiles/types.js";
+import { renderAssignment, SpecLaunchParamsSchema, type LaunchPlacement, type LaunchSpec, type SpecLaunchRequest } from "../launch-schema.js";
+import { renderSpecInstructions } from "../spec-baseline.js";
+import { routeSpec, type RouterState, type SpecDecision, type SpecModelDecision } from "../router.js";
+import { appendRouterDecision, type AppendRouterLogOptions, type SpecRouterLogEntry } from "../router-log.js";
+import { TypeSafeSpecClient } from "../typesafe-spec.js";
+import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/index.js";
+import type { ProfileKind } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
 import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
+import type { SelfCloseTracker } from "../supervision/self-close.js";
+import { CATALOG_PATH, loadCatalog, resolveChain, type Catalog, type ResolvedCandidate, type RunnerKind } from "../catalog.js";
+import { createWorktreeManager, type WorktreeManager } from "../worktree.js";
+import { compileCandidateContract, contractArgv, type CompiledContract, type ResourceSelection } from "../compile.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -51,7 +60,6 @@ export interface LaunchDependencies {
   preflight: CompatibilityPreflight;
   cwd?: string;
   ownership?: LaunchResourceRegistry;
-  profiles?: { load: () => Promise<ProfileCatalog> };
   promptSources?: PromptSourceStore;
   attachments?: AttachmentStore;
   /**
@@ -74,27 +82,24 @@ export interface LaunchDependencies {
    * cannot supervise cannot launch. See ADR-019.
    */
   supervision: SupervisionCoordinator;
+  /** The host's shared close ledger, forwarded to per-replica worktree managers. */
+  selfClose?: SelfCloseTracker;
+  /** Compatibility-only host field; the cutover never reads a profile catalog. */
+  profiles?: unknown;
+  /** B8's immutable catalog and spec evaluator seams. */
+  catalog?: { load: () => Promise<Catalog> };
+  specClient?: Pick<TypeSafeSpecClient, "evaluate">;
+  worktrees?: WorktreeManager;
   /**
-   * The auto (Batch) routing client. Explicit named-Profile calls never touch
-   * it and never need `TYPESAFE_API_KEY`; an auto call constructs a
-   * `TypeSafeRouter` only when none is injected.
-   */
-  router?: LaunchRouter;
-  /**
-   * The one-shot decision-log append sink, run once per Router outcome before
+   * The one-shot decision-log append sink, run once per spec decision before
    * any child mutation. Defaults to the local JSONL record rooted at the
    * trusted host working directory — never the caller-controlled child `cwd`.
    */
   routerLog?: LaunchRouterLog;
 }
 
-/** The routing client seam the Batch executor consumes once per auto call. */
-export interface LaunchRouter {
-  route(state: RouterState, signal: AbortSignal): Promise<RouteOutcome>;
-}
-
-/** The decision-log append seam; `appendRouterDecision` satisfies it directly. */
-export type LaunchRouterLog = (entry: RouterLogEntry, options: AppendRouterLogOptions) => Promise<void>;
+/** The ADR-035 decision-log append seam; `appendRouterDecision` satisfies it. */
+export type LaunchRouterLog = (entry: SpecRouterLogEntry, options: AppendRouterLogOptions) => Promise<void>;
 
 export interface LaunchResourceIds {
   tabId?: string;
@@ -103,23 +108,20 @@ export interface LaunchResourceIds {
 }
 
 export interface LaunchAttemptEvidence {
-  profile: string;
+  candidate: { index: number; runner: string; model: string };
   outcome: "selected" | "agent_start_failed" | "fallback_refused";
   errorCode?: string;
   message?: string;
   postState?: Record<string, unknown>;
 }
 
-export interface LaunchEffectiveProfile {
-  requested: string;
-  selected: string;
-  source: { kind: string; path: string };
-  timeoutMinutes: number;
-  runtime: Record<string, unknown>;
-  permissions: Record<string, unknown>;
+export interface LaunchSpecEvidence {
+  label: string;
+  category: string;
+  count: number;
+  selected: { index: number; runner: string; model: string };
   attempts: LaunchAttemptEvidence[];
-  fallbackProfiles: string[];
-  reachableNames: string[];
+  fallbackCandidates: Array<{ index: number; runner: string; model: string }>;
 }
 
 export interface LaunchReadinessEvidence {
@@ -190,7 +192,7 @@ export interface LaunchDetails extends LaunchResourceIds {
   /** Advisory identity provenance tokens were written; `provenanceWarning` is set when that write failed. */
   identityProvenance?: "launched";
   provenanceWarning?: string;
-  phase?: "validate" | "resolve_profile" | "handoff" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification" | "supervision_bind";
+  phase?: "validate" | "route_spec" | "compile" | "handoff" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification" | "supervision_bind";
   supervision?:
     | { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; profileName: string } }
     | { jobId: string; state: "provisional"; provisional: { agentName: string; agentKind: "agy"; paneId: string; terminalId: string; profileName: string; baseline: PromptObservationBaseline } };
@@ -202,7 +204,7 @@ export interface LaunchDetails extends LaunchResourceIds {
   /** The generated Tools-owned run and its agent-writable artifact path. */
   handoff?: { runId: string; path: string };
   recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; profileName: string; kind: ProfileKind; capable: boolean; reason: string };
-  profile?: LaunchEffectiveProfile & { name: string; sessionPersistence: boolean };
+  spec?: LaunchSpecEvidence;
 }
 
 /**
@@ -211,48 +213,33 @@ export interface LaunchDetails extends LaunchResourceIds {
  * and the name check stays the existing agent-name-only test.
  */
 interface LaunchBatchContext {
-  /** The single catalog snapshot that fed the Router decision and every child. */
-  catalog: ProfileCatalog;
-  /**
-   * Names and pane labels sibling children of this Batch will claim. A hit at
-   * the pre-mutation identity check is a `BATCH_NAME_COLLISION`, because a
-   * planned label shadows an exact target the same way an existing one does.
-   */
+  /** The single catalog snapshot that fed every spec decision and child. */
+  catalog: Catalog;
+  /** Names and pane labels sibling children will claim. */
   reservedNames: ReadonlySet<string>;
+  /** Original replica count; each expanded child still gets its own worktree. */
+  worktreeCount?: number;
 }
 
 export type LaunchBatchChildStatus = "launched" | "failed" | "not_started";
 
-/** One expanded child's retained outcome inside a Batch result. */
+/** One expanded spec replica's retained outcome inside a Batch result. */
 export interface LaunchBatchChild {
-  /** The exact derived `{name}-{role}-{N}` wait/communicate/close target. */
+  /** The exact derived `{name}-{spec.label}-{N}` target. */
   name: string;
-  role: string;
-  /** The Router-selected Profile that headed its own unchanged fallback chain. */
-  profile: string;
+  specLabel: string;
   ordinal: number;
   status: LaunchBatchChildStatus;
-  /** The complete existing success details when status is "launched". */
   launch?: LaunchDetails;
-  /** The complete redacted structured failure evidence when status is "failed". */
   failure?: { code: string; details: Record<string, unknown> };
-  /** The bounded stop code when status is "not_started". */
   code?: string;
 }
 
-/**
- * The discriminated auto-Batch result: the one Router decision, then one
- * entry per expanded child. `failed` means no child confirmed a launch —
- * including log, placement, expansion, and dispatch refusals — `partial`
- * retains mixed outcomes without rollback, and `abstained` is the explicit
- * zero-effect result.
- */
 export interface LaunchBatchDetails {
   operation: "launch_batch";
   outcome: "abstained" | "launched" | "partial" | "failed";
-  router: RouterResult;
+  router: SpecDecision[];
   children: LaunchBatchChild[];
-  /** A whole-Batch failure decided without per-child dispatch. */
   failure?: { code: string; message?: string };
 }
 
@@ -262,6 +249,7 @@ const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
 const AGENT_PANE_SHELL_SETTLE_MS = 10_000;
 const AGENT_PANE_SHELL_POLL_MS = 150;
 const LAUNCH_RECONCILIATION_TIMEOUT_MS = 5_000;
+const SPEC_EVALUATION_TIMEOUT_MS = 20_000;
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
 /**
@@ -404,22 +392,6 @@ class LaunchError extends Error {
   }
 }
 
-/**
- * Fail-closed resource validation for one profile, with the skill-selection
- * verdict carried through as a launch failure and any unexpected IO error
- * re-raised as itself.
- */
-async function assertResourceSelection(profile: Profile, runtime: RuntimeProfile, refresh = false): Promise<void> {
-  try {
-    await (refresh ? refreshBundledProfileResourceSelection(profile, runtime) : validateProfileResourceSelection(profile, runtime));
-  } catch (error) {
-    if (!(error instanceof SkillSelectionError)) throw error;
-    // `causeCode` keeps the skill-selection verdict legible when this runs after
-    // the first effect, where the outer handler reports `LAUNCH_FAILED`.
-    throw new LaunchError(error.code, error.message, { causeCode: error.code, profile: profile.name, ...error.details });
-  }
-}
-
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -430,94 +402,28 @@ function identifier(value: unknown, field: string): asserts value is string {
   }
 }
 
-function profileIdentifier(value: unknown): asserts value is string {
-  if (typeof value !== "string" || !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(value)) {
-    throw new LaunchError("INVALID_INPUT", "profile must be lowercase kebab-case");
+function validateParams(params: SpecLaunchRequest): void {
+  if (!record(params) || !Value.Check(SpecLaunchParamsSchema, params)) {
+    throw new LaunchError("INVALID_INPUT", "launch parameters must be a valid spec request");
   }
 }
 
-const EXPLICIT_LAUNCH_FIELDS = new Set(["name", "profile", "overrides", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery", "supervisionDigest"]);
-const AUTO_LAUNCH_FIELDS = new Set(["name", "placement", "label", "cwd", "focus", "assignment", "assignmentDelivery", "supervisionDigest"]);
+function normalizedParams(params: SpecLaunchRequest): SpecLaunchRequest {
+  validateParams(params);
+  return {
+    ...params,
+    specs: params.specs.map((spec) => ({ ...spec, count: spec.count ?? 1 }))
+  };
+}
 
-function validateParams(params: LaunchRequest | AutoLaunchRequest): void {
-  if (!record(params)) throw new LaunchError("INVALID_INPUT", "launch parameters must be an object");
-  if (typeof params.name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(params.name)) {
-    throw new LaunchError("INVALID_INPUT", "name must start with a lowercase letter and contain only lowercase letters, digits, - or _ (1-32 characters)");
-  }
-  // A present `profile` field is always explicit mode, even a malformed one:
-  // "auto" is never a routing sentinel, and overrides need a named Profile.
-  const explicit = "profile" in params;
-  const allowedKeys = explicit ? EXPLICIT_LAUNCH_FIELDS : AUTO_LAUNCH_FIELDS;
-  for (const key of Object.keys(params)) if (!allowedKeys.has(key)) throw new LaunchError("INVALID_INPUT", `Unknown launch field: ${key}`);
-  if (explicit) {
-    const request = params as LaunchRequest;
-    profileIdentifier(request.profile);
-    if (request.overrides !== undefined) {
-      if (!record(request.overrides)) throw new LaunchError("INVALID_INPUT", "profile overrides must be an object");
-      if (RESERVED_BUNDLED_PROFILE_NAMES.has(request.profile)) throw new LaunchError("INVALID_INPUT", `Reserved profile ${request.profile} does not accept runtime overrides`);
-      for (const key of Object.keys(request.overrides)) if (!["model", "thinking", "effort", "tools", "permissionMode", "allowedTools", "disallowedTools", "addDirs"].includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown profile override: ${key}`);
-      if (request.overrides.model !== undefined) identifier(request.overrides.model, "overrides.model");
-      if (request.overrides.thinking !== undefined && (typeof request.overrides.thinking !== "string" || !THINKING_LEVELS.includes(request.overrides.thinking as typeof THINKING_LEVELS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.thinking is invalid");
-      if (request.overrides.effort !== undefined && (typeof request.overrides.effort !== "string" || !CLAUDE_EFFORTS.includes(request.overrides.effort as typeof CLAUDE_EFFORTS[number]))) throw new LaunchError("INVALID_INPUT", "overrides.effort is invalid");
-      if (request.overrides.permissionMode !== undefined && (typeof request.overrides.permissionMode !== "string" || (!CLAUDE_PERMISSION_MODES.includes(request.overrides.permissionMode as typeof CLAUDE_PERMISSION_MODES[number]) && !DEVIN_PERMISSION_MODES.includes(request.overrides.permissionMode as typeof DEVIN_PERMISSION_MODES[number])))) throw new LaunchError("INVALID_INPUT", "overrides.permissionMode is invalid");
-      for (const key of ["tools", "allowedTools", "disallowedTools", "addDirs"] as const) {
-        const value = request.overrides[key];
-        if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0 || /[\0\r\n]/.test(item)))) throw new LaunchError("INVALID_INPUT", `overrides.${key} must be non-empty strings without NUL or newlines`);
-      }
-    }
-  }
-  if (params.label !== undefined) identifier(params.label, "label");
-  if (params.cwd !== undefined) identifier(params.cwd, "cwd");
-  // Every launch carries the typed assignment, so it is validated in full here,
-  // before the preflight and before any topology or prompt mutation.
-  const assignment = params.assignment;
-  if (!record(assignment)) throw new LaunchError("INVALID_INPUT", "assignment must be an object with objective, scope and verification");
-  for (const key of Object.keys(assignment)) {
-    if (!(LAUNCH_ASSIGNMENT_FIELDS as readonly string[]).includes(key)) throw new LaunchError("INVALID_INPUT", `Unknown assignment field: ${key}`);
-  }
-  // Shape only. Size has exactly one authority -- the UTF-8 byte length of the
-  // rendered assignment against the selected delivery bound -- so no per-field
-  // limit is repeated here to pre-empt it with a weaker error.
-  for (const field of LAUNCH_ASSIGNMENT_FIELDS) {
-    const value = assignment[field];
-    if (typeof value !== "string" || value.length === 0 || /\0/.test(value)) {
-      throw new LaunchError("INVALID_INPUT", `assignment.${field} must be a non-empty string without NUL`);
-    }
-  }
-  if (params.assignmentDelivery !== undefined && params.assignmentDelivery !== "inline" && params.assignmentDelivery !== "attachment") {
-    throw new LaunchError("INVALID_INPUT", "assignmentDelivery must be inline or attachment");
-  }
-  const digest = params.supervisionDigest;
-  if (!record(digest)) throw new LaunchError("INVALID_INPUT", "supervisionDigest must be an object with doneWhen and constraints");
-  for (const key of Object.keys(digest)) {
-    if (key !== "doneWhen" && key !== "constraints") throw new LaunchError("INVALID_INPUT", `Unknown supervisionDigest field: ${key}`);
-  }
-  for (const field of ["doneWhen", "constraints"] as const) {
-    const items = digest[field];
-    if (!Array.isArray(items) || items.length === 0 || items.length > 8 || items.some((item) => typeof item !== "string" || item.length === 0 || item.length > 240 || /\0/.test(item))) {
-      throw new LaunchError("INVALID_INPUT", `supervisionDigest.${field} must be 1-8 non-empty strings of at most 240 characters without NUL`);
-    }
-  }
-  if (params.focus !== undefined && typeof params.focus !== "boolean") throw new LaunchError("INVALID_INPUT", "focus must be a boolean");
-  const placement = params.placement;
-  if (placement === undefined) return;
-  if (!record(placement) || typeof placement.mode !== "string") throw new LaunchError("INVALID_INPUT", "placement is invalid");
-  if (placement.mode === "same_tab") {
-    if (Object.keys(placement).length !== 1) throw new LaunchError("INVALID_INPUT", "same_tab placement has no additional fields");
-  } else if (placement.mode === "new_tab") {
-    identifier(placement.tabLabel, "placement.tabLabel");
-    if (Object.keys(placement).some((key) => key !== "mode" && key !== "tabLabel")) throw new LaunchError("INVALID_INPUT", "new_tab placement has unknown fields");
-  } else if (placement.mode === "existing_pane") {
-    identifier(placement.target, "placement.target");
-    if (Object.keys(placement).some((key) => key !== "mode" && key !== "target")) throw new LaunchError("INVALID_INPUT", "existing_pane placement has unknown fields");
-  } else {
-    throw new LaunchError("INVALID_INPUT", "Unsupported placement mode");
-  }
+function specPayload(spec: LaunchSpec): string {
+  return `${spec.instructions}\n\n${renderAssignment(spec.assignment)}`;
 }
 
 function paneRecord(value: unknown, expectedPaneId: string): Record<string, unknown> {
-  if (!record(value) || !record(value.pane)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr did not return a pane post-state");
+  if (!record(value)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr did not return a pane post-state");
   const pane = value.pane;
+  if (!record(pane)) throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr did not return a pane post-state");
   const actualPaneId = idFrom(pane, "pane_id");
   if (actualPaneId !== expectedPaneId) {
     throw new LaunchError("POSTSTATE_UNAVAILABLE", "Herdr pane post-state does not match the resolved pane", { expectedPaneId, actualPaneId });
@@ -565,7 +471,7 @@ function agentIdentity(value: unknown, expectedName: string, expectedPaneId: str
     throw new LaunchError("CLI_PROTOCOL_ERROR", "Herdr agent-start response does not match the requested identity", { expectedName, ...(actualName === undefined ? {} : { actualName }), expectedPaneId, ...(fields.paneId === undefined ? {} : { actualPaneId: fields.paneId }), expectedKind, ...(actualKind === undefined ? {} : { actualKind }) });
   }
   const agentId = idFrom(agent, "agent_id") ?? idFrom(agent, "id");
-  return { startRecord: agent, ...(agentId ? { agentId } : {}) };
+  return { startRecord: agent, agentId };
 }
 
 function idFrom(value: unknown, field: string): string | undefined {
@@ -831,33 +737,6 @@ function startFailureEvidence(error: unknown): { code: string; message: string }
   if (!envelope || envelope.id !== "cli:agent:start") return undefined;
   if (envelope.error.code !== "agent_start_failed" || envelope.error.message !== "agent process exited before becoming interactive") return undefined;
   return { ...envelope.error };
-}
-
-type QualifiedRuntime = RuntimeProfile;
-
-function effectiveDetails(profile: Profile, runtime: QualifiedRuntime): { runtime: Record<string, unknown>; permissions: Record<string, unknown> } {
-  if (runtime.kind === "devin") {
-    return {
-      runtime: { kind: "devin", model: runtime.model, permissionMode: runtime.permissionMode },
-      permissions: { sessionPersistence: profile.sessionPersistence }
-    };
-  }
-  if (runtime.kind === "claude") {
-    return {
-      runtime: { kind: "claude", model: runtime.model, effort: runtime.effort },
-      permissions: { sessionPersistence: profile.sessionPersistence, permissionMode: runtime.permissionMode, allowedTools: [...runtime.allowedTools], disallowedTools: [...runtime.disallowedTools], addDirs: [...runtime.addDirs], pluginDirs: [...runtime.pluginDirs] }
-    };
-  }
-  if (runtime.kind === "agy") {
-    return {
-      runtime: { kind: "agy", model: runtime.model, mode: runtime.mode, dangerouslySkipPermissions: true },
-      permissions: { sessionPersistence: profile.sessionPersistence, addDirs: [...runtime.addDirs] }
-    };
-  }
-  return {
-    runtime: { kind: "pi", model: runtime.model, thinking: runtime.thinking },
-    permissions: { sessionPersistence: profile.sessionPersistence, tools: [...runtime.tools], extensions: [...runtime.extensions], skills: [...runtime.skills] }
-  };
 }
 
 function snapshotOf(result: unknown): HerdrSnapshot {
@@ -1981,8 +1860,8 @@ async function runPrompt(cli: LaunchCli, paneId: string, envelope: string, signa
 /** The complete redacted structured evidence one failed child retains. */
 function batchChildFailure(error: unknown): { code: string; details: Record<string, unknown> } {
   const source = error instanceof LaunchError ? error.details : record(error) && record(error.details) ? error.details : {};
-  const projected = modelSafeJson(source);
-  const details = record(projected) ? { ...projected } : {};
+  const projected = modelSafeJson(source) as Record<string, unknown>;
+  const details = { ...projected };
   const message = causeMessage(error);
   if (details.causeMessage === undefined && message !== undefined) details.causeMessage = message;
   return { code: safeLaunchCode(launchTransportCode(error)), details };
@@ -1994,874 +1873,760 @@ function batchChildFailure(error: unknown): { code: string; details: Record<stri
  * a smaller Batch.
  */
 function batchManifest(details: LaunchBatchDetails): string {
-  const router = details.router;
-  const head = `herdr_launch batch outcome=${details.outcome} router=${router.kind}${router.kind === "abstain" ? ` reason=${router.reason}` : ` assignments=${router.assignments.length}`} children=${details.children.length}${details.failure === undefined ? "" : ` failure=${details.failure.code}`}`;
+  const router = details.router.map((decision) => decision.kind).join(",") || "none";
+  const head = `herdr_launch batch outcome=${details.outcome} router=${router} children=${details.children.length}${details.failure === undefined ? "" : ` failure=${details.failure.code}`}`;
   const lines = details.children.map((child) => {
-    const selected = child.launch?.profile?.selected;
+    const selected = child.launch?.spec?.selected.model;
     const failureDetails = child.failure?.details;
     const createdValue = failureDetails?.created;
     const created = record(createdValue) ? createdValue : undefined;
     const paneId = child.launch?.paneId ?? safeDiagnosticString(failureDetails?.paneId) ?? safeDiagnosticString(created?.paneId);
     const supervisorJobId = child.launch?.supervision?.jobId ?? safeDiagnosticString(failureDetails?.supervisorJobId);
     const code = child.failure?.code ?? child.code;
-    return `- ${child.name} requested=${child.profile}${selected !== undefined && selected !== child.profile ? ` selected=${selected}` : ""} outcome=${child.status}${code === undefined ? "" : ` code=${code}`}${paneId === undefined ? "" : ` pane=${paneId}`}${supervisorJobId === undefined ? "" : ` supervisor=${supervisorJobId}`}`;
+    return `- ${child.name} spec=${child.specLabel}${selected === undefined ? "" : ` selected=${selected}`} outcome=${child.status}${code === undefined ? "" : ` code=${code}`}${paneId === undefined ? "" : ` pane=${paneId}`}${supervisorJobId === undefined ? "" : ` supervisor=${supervisorJobId}`}`;
   });
   return [head, ...lines].join("\n");
 }
 
-export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeof PublishedLaunchParamsSchema, LaunchDetails | LaunchBatchDetails> {
+type AdmittedSpecDecision = Extract<SpecDecision, { kind: "admitted" }>;
+
+type SpecRouteRecord = {
+  spec: LaunchSpec;
+  decision: SpecDecision;
+  response?: SpecModelDecision;
+  state?: SpecRouterLogEntry["state"];
+};
+
+function candidateIdentity(candidate: { index: number; runner: string; model: string }): { index: number; runner: string; model: string } {
+  return { index: candidate.index, runner: candidate.runner, model: candidate.model };
+}
+
+function candidateKey(candidate: { index: number; runner: string; model: string }): string {
+  return `${candidate.index}:${candidate.runner}:${candidate.model}`;
+}
+
+function resolvedCandidateIdentity(candidate: ResolvedCandidate): { index: number; runner: string; model: string } {
+  return { index: candidate.index, runner: candidate.candidate.runner, model: candidate.candidate.model };
+}
+
+function resolvedCandidateKey(candidate: ResolvedCandidate): string {
+  return candidateKey(resolvedCandidateIdentity(candidate));
+}
+
+function isAdmitted(decision: SpecDecision): decision is AdmittedSpecDecision {
+  return decision.kind === "admitted";
+}
+
+function recipientCapability(kind: RunnerKind): AttachmentCapability & { kind: ProfileKind } {
+  return { kind: kind as ProfileKind, capable: true, reason: "compiled spec contract grants the launch runtime" };
+}
+
+function specRouterState(spec: LaunchSpec, catalog: Catalog): RouterState {
+  const entries = [...catalog.categories.entries()].flatMap(([category, chain]) => chain.map((candidate) => {
+    const runner = catalog.runners.get(candidate.runner);
+    return {
+      name: `${category}-${candidate.runner}-${candidate.model}`,
+      description: category,
+      runner: candidate.runner,
+      model: candidate.model,
+      timeout: runner?.defaults.timeoutMinutes ?? 0
+    };
+  }));
+  return { assignment: spec.assignment, catalog: entries };
+}
+
+function specRouteLogEntry(name: string, record: SpecRouteRecord): SpecRouterLogEntry {
+  return {
+    caller: name,
+    name,
+    result: record.decision,
+    ...(record.decision.evidence === undefined ? {} : { evidence: record.decision.evidence }),
+    ...(record.state === undefined ? {} : { state: record.state })
+  };
+}
+
+export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDefinition<typeof SpecLaunchParamsSchema, LaunchDetails | LaunchBatchDetails> {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
+  const specClient = deps.specClient ?? new TypeSafeSpecClient();
+  const worktrees = deps.worktrees ?? (() => {
+    const exec = (deps.cli as unknown as { exec?: PiExec }).exec;
+    return exec === undefined ? undefined : createWorktreeManager({ exec, ...(deps.selfClose === undefined ? {} : { selfClose: deps.selfClose }) });
+  })();
 
-  /**
-   * The single existing child lifecycle, shared by an explicit named-Profile
-   * call and every expanded Batch child. Explicit calls pass no `batch`
-   * context, so the catalog load, identity check, and every other lifecycle
-   * step keep their existing behavior.
-   */
-  const executeSingle = async (
-    params: LaunchRequest,
-    signal: AbortSignal | undefined,
-    onUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined,
-    ctx: ExtensionContext,
-    batch?: LaunchBatchContext
-  ): Promise<AgentToolResult<LaunchDetails>> => {
-      let launchGate: LaunchGateLease | undefined;
-      try {
-        launchGate = await (deps.launchGate ?? (() => acquireLaunchGate()))();
-        await launchGate.check();
-      } catch {
-        await launchGate?.release().catch(() => undefined);
-        throw new LaunchError("PROFILE_LAUNCH_FROZEN", "Profile launch is frozen");
-      }
-      // Establish the requested route before any precondition so every refusal names it.
-      const requestedDelivery: MessageDelivery = record(params) && params.assignmentDelivery === "attachment" ? "attachment" : "inline";
-      const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
-      const attachmentStore = deps.attachments ?? defaultAttachmentStore;
-      const handoffs = deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({}));
-      const clock = deps.clock ?? realLaunchClock;
-      let initialPromptDelivery: MessageDelivery | undefined;
-      let assignmentText: string | undefined;
-      let profileResolution: ProfileResolution | undefined;
-      let profiles: Profile[] = [];
-      const promptPaths = new Map<string, string>();
-      const effectiveRuntimes = new Map<string, RuntimeProfile>();
-      const capabilities = new Map<string, ReturnType<typeof attachmentCapability>>();
-      let cwd: string;
-      let placement: LaunchPlacement;
-      let label: string;
-      let recipientKey: string | undefined;
-      let grant: RecipientGrant | undefined;
-      let published: PublishedAttachment | undefined;
-      let sender: SenderIdentity | undefined;
-      let existingTarget: ResolvedTarget | undefined;
-      let workspaceId: string | undefined;
-      let contextDiagnostics: ContextResolutionDiagnostics | undefined;
-      let effectiveContext: CurrentContext | undefined;
-      let topologyBaseline: HerdrSnapshot | undefined;
-      let topologyMutationDispatched = false;
-      let reservation: SupervisionReservation | undefined;
-      let handoffRun: HandoffAllocation | undefined;
-      let phase: LaunchPhase = "validate";
-      const created: LaunchResourceIds = {};
-      const attempts: LaunchAttemptEvidence[] = [];
-      const dispatchMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
-        // A pre-aborted caller has not dispatched a mutation. Once the signal is
-        // live, mark before invoking the adapter because an in-flight failure can
-        // still have committed a topology or prompt effect.
-        if (abortSignal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
-        topologyMutationDispatched = true;
-        return operation();
-      };
-      try {
-        validateParams(params);
-        initialPromptDelivery = requestedDelivery;
-        // Refuse a payload that is already too large before transport or profile
-        // work. The generated handoff contract is appended and checked again
-        // after the managed profile has been accepted and a run is allocated.
-        assignmentText = renderAssignment(params.assignment);
-        assertMessageText(assignmentText);
-        assertDeliverySize(assignmentText, initialPromptDelivery);
-        if (typeof deps.cli.prompt !== "function") throw new LaunchError("CLI_INCOMPATIBLE", "Herdr prompt transport is unavailable");
-        await deps.preflight(abortSignal, "agent.prompt");
-        cwd = params.cwd ?? deps.cwd ?? ctx.cwd;
-        identifier(cwd, "cwd");
-        placement = params.placement ?? { mode: "same_tab" as const };
-        label = params.label ?? params.name;
-        phase = "resolve_profile";
-        if (batch === undefined && !deps.profiles) throw new LaunchError("PROFILE_CATALOG_UNAVAILABLE", "Profile catalog is unavailable");
-        const catalog = batch?.catalog ?? await deps.profiles!.load();
-        profileResolution = resolveProfile(params.profile, catalog);
-        const reachableProfiles = profileResolution.reachableNames.map((name) => {
-          const profile = catalog.effective.get(name);
-          if (!profile) throw new LaunchError("PROFILE_RESOLUTION_INVALID", `Resolved profile ${name} is unavailable`);
-          return profile;
-        });
-        const primaryProfile = reachableProfiles[0]!;
-        profiles = [primaryProfile];
-        for (const profile of reachableProfiles.slice(1)) {
-          profiles.push(profile);
-        }
-        // Devin's mandatory self-contained assignment is the initial prompt.
-        // The typed assignment is required for every launch, so no profile in
-        // the chain can ever be started without one. Every allowed reachable
-        // fallback profile is checked before the first launch effect. Bundled
-        // canonical edits are materialized here; unsafe trees and edited
-        // generated copies still fail before any effect.
-        for (const profile of profiles) {
-          const overrides = profile.name === params.profile ? params.overrides : {};
-          const runtime = resolveProfileRuntime(profile, overrides);
-          effectiveRuntimes.set(profile.name, runtime);
-          await assertResourceSelection(profile, runtime, true);
-        }
-        for (const profile of profiles) {
-          const overrides = profile.name === params.profile ? params.overrides : {};
-          const capability = attachmentCapability(profile, overrides);
-          capabilities.set(profile.name, capability);
-          // Any profile the fallback chain can start may be the one that receives the
-          // reference, so an attachment launch requires every one of them to be capable.
-          if (initialPromptDelivery === "attachment" && !capability.capable) {
-            throw new LaunchError("ATTACHMENT_TARGET_UNVERIFIED", "Profile cannot read a local attachment", { profile: profile.name, reason: capability.reason });
-          }
-          // Every profile the chain can start must be able to persist the exact
-          // artifact. Prove this before allocating any handoff or recipient state.
-          const writeCapability = handoffWriteCapability(profile, overrides);
-          if (!writeCapability.capable) {
-            throw new LaunchError("HANDOFF_TARGET_UNVERIFIED", "Profile cannot write the run handoff artifact", { profile: profile.name, reason: writeCapability.reason });
-          }
-        }
-        // Allocate only after every reachable profile is accepted. The generated
-        // contract is part of the mandatory assignment and its bytes count toward
-        // the selected delivery limit.
-        handoffRun = await handoffs.allocate();
-        assignmentText += renderHandoffContract(handoffRun);
-        assertMessageText(assignmentText);
-        assertDeliverySize(assignmentText, initialPromptDelivery);
-        const effective = await contextResolver(abortSignal);
-        contextDiagnostics = effective.diagnostics;
-        const snapshot = effective.snapshot;
-        topologyBaseline = snapshot;
-        effectiveContext = effective.context;
-        const currentContext = effective.context;
-        sender = resolveSender(snapshot, currentContext.paneId);
-        // A Batch child re-checks the fresh names *and* pane labels — a label
-        // shadows an exact target the same way a name does — plus the names
-        // and labels sibling children already claimed. Explicit calls keep
-        // the existing agent-name-only check and INVALID_INPUT code.
-        const nameTaken = batch === undefined
-          ? existingAgentNames(snapshot).includes(params.name)
-          : existingNameTargets(snapshot).has(params.name) || batch.reservedNames.has(params.name);
-        if (nameTaken) {
-          throw new LaunchError(batch === undefined ? "INVALID_INPUT" : "BATCH_NAME_COLLISION", `Agent name is already in use: ${params.name}`);
-        }
-        // The effective pane label gets the same fresh re-check: an explicit
-        // label claimed between expansion and dispatch would shadow an exact
-        // target into TARGET_AMBIGUOUS instead of failing as a typed
-        // collision. An absent label reuses the already-checked name.
-        if (batch !== undefined && label !== params.name && (existingNameTargets(snapshot).has(label) || batch.reservedNames.has(label))) {
-          throw new LaunchError("BATCH_NAME_COLLISION", `Pane label is already in use: ${label}`);
-        }
-        existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, currentContext) : undefined;
-        workspaceId = placement.mode === "new_tab" ? currentContext.workspaceId : undefined;
-        // The sidecar is committed before the first topology effect so the run
-        // is recoverable even when the launch dies between allocation and start.
-        phase = "handoff";
-        progress(onUpdate, phase, created);
-        await handoffs.persist(handoffRun!, {
-          manager: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
-          child: {
-            agentName: params.name,
-            agentKind: profiles[0]!.runtime.kind,
-            profileName: profiles[0]!.name,
-            requestedProfile: params.profile,
-            fallbackProfiles: profiles.slice(1).map((profile) => profile.name)
-          }
-        });
-        recipientKey = mintRecipientKey();
-        grant = await attachmentStore.ensureRecipient(recipientKey);
-        const promptStore = deps.promptSources ?? defaultPromptSourceStore;
-        for (const profile of profiles) {
-          const runtime = effectiveRuntimes.get(profile.name)!;
-          const promptPath = runtime.kind === "agy" || runtime.kind === "devin" ? undefined : (await promptStore.create(profile.body)).path;
-          if (promptPath !== undefined) promptPaths.set(profile.name, promptPath);
-          buildRuntimeArgv(profile, runtime, promptPath, grant.path, handoffRun.directory);
-        }
-        if (initialPromptDelivery === "attachment") {
-          phase = "attachment_publish";
-          progress(onUpdate, phase, created);
-          published = await attachmentStore.publish({
-            body: assignmentText,
-            recipientKey,
-            ...(existingTarget?.paneId ? { recipientPaneId: existingTarget.paneId } : {}),
-            recipientAgentName: params.name,
-            senderPaneId: sender!.paneId,
-            senderDisplay: sender!.display,
-            operation: "assignment"
-          });
-        }
-        // Supervision is reserved before the first topology mutation, so a host
-        // that cannot supervise refuses the launch with no effect at all rather
-        // than leaving a child nobody is watching.
-        phase = "supervision_reserve";
-        progress(onUpdate, phase, created);
-        try {
-          // The supervision digest is caller-authored evidence the supervisor
-          // persists with the reservation: allowlist the two digest fields
-          // before modelSafeJson so nothing else a caller smuggled in can ride
-          // along, and the schema bound (8 items x 240 chars) is its byte bound.
-          const supervisionDigest = modelSafeJson({
-            doneWhen: params.supervisionDigest.doneWhen,
-            constraints: params.supervisionDigest.constraints
-          }) as { doneWhen: string[]; constraints: string[] };
-          reservation = await deps.supervision.reserve({
-            child: { agentName: params.name, agentKind: profiles[0]!.runtime.kind, profileName: profiles[0]!.name },
-            settings: { supervisionDigest }
-          });
-        } catch (error) {
-          throw new LaunchError("SUPERVISION_UNAVAILABLE", "Automatic child supervision could not be reserved", {
-            causeCode: safeDiagnosticString(record(error) && typeof error.code === "string" ? error.code : undefined, 120) ?? "SUPERVISION_UNAVAILABLE"
-          });
-        }
-      } catch (error) {
-        const failure = withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published, handoffRunId: handoffRun?.runId });
-        try {
-          await grant?.release();
-          reservation?.release("launch_precondition_failed");
-        } finally {
-          await launchGate?.release();
-        }
-        throw earlyLaunchFailure(failure, phase);
-      }
-      let paneId: string | undefined;
-      let tabId: string | undefined;
-      let agentStarted = false;
-      let promptSubmitted = false;
-      let promptDispatch: PromptDispatchEvidence | undefined;
-      let assignmentState: "confirmed" | "unconfirmed" | undefined;
-      let agyAcknowledgement: AgyPromptAcknowledgement | undefined;
-      let agyInitialPromptSubmission: AgyPromptSubmissionEvidence | undefined;
-      let recipientRegistered = false;
-      let supervisionBound = false;
-      let provenanceWarning: string | undefined;
-      let boundSupervision: LaunchDetails["supervision"] | undefined;
-      let readiness: LaunchReadinessEvidence | undefined;
-      let selectedAttemptStartedAt: number | undefined;
-      const timing: LaunchTimingEvidence = {};
-      try {
-        phase = "placement";
-        progress(onUpdate, phase, created);
-        if (placement.mode === "existing_pane") {
-          paneId = existingTarget!.paneId!;
-          tabId = existingTarget!.tabId;
-        } else if (placement.mode === "new_tab") {
-          const result = tabRefFrom(await dispatchMutation(() => run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", cwd, "--label", placement.tabLabel, ...noFocusArgs()], abortSignal, true)));
-          tabId = result.tabId;
-          paneId = result.paneId;
-          created.tabId = tabId;
-          deps.ownership?.record({ kind: "tab", id: tabId, parentId: workspaceId });
-          if (!paneId) {
-            const tab = await run(deps.cli, ["tab", "get", tabId], abortSignal);
-            paneId = paneRefFrom(tab).paneId;
-          }
-          created.paneId = paneId;
-          deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
-        } else {
-          const result = paneRefFrom(await dispatchMutation(() => run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...noFocusArgs(), "--cwd", cwd], abortSignal, true)));
-          paneId = result.paneId;
-          tabId = result.tabId ?? effectiveContext!.tabId;
-          created.paneId = paneId;
-          created.tabId = tabId;
-          deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId! });
-        }
-        const resolvedPaneId = paneId!;
-        if (placement.mode !== "existing_pane") {
-          await dispatchMutation(() => run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal));
-        }
-        phase = "agent_start";
-        progress(onUpdate, phase, created);
-        let started: unknown;
-        let selectedProfile: Profile | undefined;
-        let selectedRuntime: RuntimeProfile | undefined;
-        let startedAgent: StartedAgent | undefined;
-        for (const profile of profiles) {
-          const runtime = effectiveRuntimes.get(profile.name)!;
-          await launchGate!.check();
-          // Re-validated for this attempt immediately before its argv is built,
-          // because the preflight above is separated from the spawn by recipient
-          // creation, prompt-source writes, context resolution, supervision
-          // reservation, and topology mutation -- a window of seconds and several
-          // CLI round-trips in which a swapped skill tree or repointed symlink
-          // would otherwise reach the agent unchecked. This narrows that window
-          // to the gap between the last digest read and the child's own open();
-          // it does not close it, because the CLI accepts paths rather than open
-          // handles. The residual is bounded: winning it needs write access to
-          // the profile scope root or a canonical source tree, and anyone with
-          // that access can already edit the package's own code or registry, so
-          // the race grants no capability they lack.
-          await assertResourceSelection(profile, runtime);
-          const startArgs = ["agent", "start", params.name, "--kind", runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...buildRuntimeArgv(profile, runtime, promptPaths.get(profile.name), grant!.path, handoffRun!.directory)];
-          const attemptStartedAt = clock.now();
-          try {
-            // A pane created moments ago can reject agent start with
-            // agent_pane_busy while its shell finishes registering. The
-            // rejection is zero-effect, so a bounded settle wait is safe on
-            // panes this launch created; an existing_pane rejection means the
-            // pane is genuinely occupied and must not be retried.
-            const shellSettleDeadline = attemptStartedAt + AGENT_PANE_SHELL_SETTLE_MS;
-            while (true) {
-              try {
-                started = await dispatchMutation(() => run(deps.cli, startArgs, abortSignal, true));
-                break;
-              } catch (startError) {
-                const envelope = cliErrorEnvelope(startError);
-                const shellPending = envelope?.id === "cli:agent:start" && envelope.error.code === "agent_pane_busy";
-                if (!shellPending || placement.mode === "existing_pane" || clock.now() >= shellSettleDeadline || abortSignal.aborted) throw startError;
-                await waitForAgentStartSettle(abortSignal, AGENT_PANE_SHELL_POLL_MS);
-              }
-            }
-            agentStarted = true;
-            attempts.push({ profile: profile.name, outcome: "selected" });
-            selectedAttemptStartedAt = attemptStartedAt;
-            selectedProfile = profile;
-            selectedRuntime = runtime;
-            startedAgent = agentIdentity(started, params.name, resolvedPaneId, runtime.kind);
-            break;
-          } catch (error) {
-            const eligible = startFailureEvidence(error);
-            if (!eligible) throw error;
-            let failedPane: Record<string, unknown>;
-            try {
-              failedPane = paneRecord(await run(deps.cli, ["pane", "get", resolvedPaneId], abortSignal), resolvedPaneId);
-            } catch (readError) {
-              throw new LaunchError("POSTSTATE_UNAVAILABLE", "Fallback eligibility could not be proven from authoritative pane state", { causeCode: "POSTSTATE_UNAVAILABLE", startFailureCode: eligible.code, readError: readError instanceof Error ? readError.message : String(readError), attempts });
-            }
-            const evidence: LaunchAttemptEvidence = { profile: profile.name, outcome: "agent_start_failed", errorCode: eligible.code, message: eligible.message, postState: compactAttemptState(failedPane) };
-            attempts.push(evidence);
-            if (!noAgentFromPane(failedPane)) {
-              attempts.push({ profile: profile.name, outcome: "fallback_refused", errorCode: eligible.code, message: "authoritative pane still reports an agent", postState: compactAttemptState(failedPane) });
-              throw new LaunchError("LAUNCH_FAILED", "Automatic fallback refused because the failed pane still has an agent", { causeCode: eligible.code, attempts });
-            }
-            if (profile === profiles.at(-1)) throw new LaunchError("LAUNCH_FAILED", "Profile fallback chain exhausted after agent start failure", { causeCode: eligible.code, attempts });
-          }
-        }
-        const chosenProfile = selectedProfile!;
-        const chosenRuntime = selectedRuntime! as QualifiedRuntime;
-        const chosenAgent = startedAgent!;
-        let agentId = chosenAgent.agentId;
-        if (agentId) created.agentId = agentId;
-        phase = "ready";
-        progress(onUpdate, phase, created);
-        // Keep the grant alive while the selected start attempt's remaining
-        // absolute startup budget is spent on read-only readiness sampling.
-        await grant?.renew();
-        const ready = await waitForLaunchReadiness(
-          deps.cli,
-          resolvedPaneId,
-          abortSignal,
-          params.name,
-          chosenRuntime.kind,
-          chosenAgent,
-          selectedAttemptStartedAt!,
-          true,
-          clock,
-          chosenRuntime.kind === "agy"
-        );
-        readiness = ready.evidence;
-        timing.selectedStartReadinessMs = readiness.elapsedMs;
-        let capturedIdentity = ready.identity;
-        agentId ??= idFrom(ready.agent, "agent_id") ?? idFrom(ready.agent, "id") ?? idFrom(ready.pane, "agent_id");
-        phase = "supervision_bind";
-        progress(onUpdate, phase, created);
-        // Every launch requires the readiness baseline, so the anchor always
-        // comes from the same coherent sample that captured identity.
-        try {
-          // AGY publishes only reduced evidence before assignment. Existing
-          // runtimes keep their exact pre-prompt session binding unchanged.
-          if (chosenRuntime.kind === "agy") {
-            const provisionalIdentity = capturedIdentity as ProvisionalSupervisedIdentity;
-            const provisionalBaseline = { ...ready.baseline!, state: "idle" as const };
-            await reservation!.bindProvisional({ identity: provisionalIdentity, profileName: chosenProfile.name, baseline: provisionalBaseline });
-            boundSupervision = {
-              jobId: reservation!.jobId,
-              state: "provisional",
-              provisional: { ...provisionalIdentity, profileName: chosenProfile.name, baseline: provisionalBaseline }
-            };
-          } else {
-            const exactIdentity = capturedIdentity as PromptTargetIdentity;
-            await reservation!.bind({ identity: exactIdentity, profileName: chosenProfile.name, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
-            boundSupervision = {
-              jobId: reservation!.jobId,
-              state: "active",
-              child: { agentName: exactIdentity.agentName, agentKind: exactIdentity.agentKind, paneId: resolvedPaneId, terminalId: exactIdentity.terminalId, profileName: chosenProfile.name }
-            };
-          }
-        } catch (error) {
-          if (!(error instanceof SupervisionBindError)) throw error;
-          throw new LaunchError("SUPERVISION_UNCONFIRMED", "Automatic child supervision could not be bound to the launched agent", {
-            causeCode: "SUPERVISION_UNCONFIRMED",
-            supervisionJobId: reservation!.jobId,
-            supervisionEvidence: boundAgentSessionStrings(error.details)
-          });
-        }
-        supervisionBound = true;
-        // Advisory provenance only: the tokens are forgeable diagnostics — any
-        // source can overwrite them — so they are never consulted for
-        // authorization and a failed write degrades to a detail, never a
-        // launch failure. AGY has no native session to attest until after
-        // strengthening, so its provenance write happens there instead.
-        if (chosenRuntime.kind !== "agy") {
-          provenanceWarning = await writeIdentityProvenance(
-            deps.cli,
-            resolvedPaneId,
-            "launched",
-            sender?.paneId,
-            (capturedIdentity as PromptTargetIdentity).agentSession,
-            abortSignal,
-            /^(?:manager|planner)(?:-|$)/u.test(chosenProfile.name) ? "orchestrator" : undefined,
-          );
-        }
-        if (params.focus === true) {
-          phase = "focus";
-          progress(onUpdate, phase, created);
-          await dispatchMutation(() => run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal));
-        }
-        if (agentId) created.agentId = agentId;
-
-        let initialPromptSubmission: PromptSubmissionEvidence | undefined;
-        let initialPromptObservation: PromptObservation | undefined;
-        let promptConfirmation: PromptConfirmationEvidence | undefined;
-        let postState: Record<string, unknown> | undefined = ready.pane;
-        assignmentState = "unconfirmed";
-        // Readiness returned this baseline from the same coherent sample that
-        // captured identity; there is no later one-shot baseline read.
-        const baseline = ready.baseline!;
-        const envelope = initialPromptDelivery === "attachment"
-          ? buildEnvelope(sender!, "assignment", assignmentText!, "attachment", { ...published!, encoding: "utf-8" })
-          : buildEnvelope(sender!, "assignment", assignmentText!, "inline");
-        phase = "prompt_verification";
-        progress(onUpdate, phase, created);
-        const promptSubmissionStartedAt = clock.now();
-        try {
-          let promptResponse: JsonEnvelope;
-          try {
-            promptResponse = await dispatchMutation(async () => {
-              // The Devin initial write rides inside the shared pane-write
-              // section like every participating text write, so a peer's flush
-              // proof/Enter cannot interleave with it. Launch readiness and
-              // semantic confirmation are unchanged; the lock buys ordering
-              // only, never eligibility for a flush.
-              if (capturedIdentity.agentKind !== "devin" || deps.queueFlush === undefined) {
-                return runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
-              }
-              const lease = await deps.queueFlush.writeSection(resolvedPaneId);
-              try {
-                return await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
-              } finally {
-                await lease.release();
-              }
-            });
-          } catch (error) {
-            const details = record(error) && record(error.details) ? error.details : undefined;
-            const dispatch = details?.promptDispatch;
-            if (record(dispatch)
-              && (dispatch.state === "not_written" || dispatch.state === "rejected" || dispatch.state === "acknowledged" || dispatch.state === "unknown")) {
-              const requestId = dispatch.requestId;
-              promptDispatch = {
-                state: dispatch.state,
-                ...(typeof requestId === "string" && requestId.length > 0 && requestId.length <= 256 && !/[\0\r\n]/u.test(requestId) ? { requestId } : {})
-              };
-            }
-            throw error;
-          }
-          try {
-            if (chosenRuntime.kind === "agy") {
-              agyAcknowledgement = parseAgyPromptAcknowledgement(promptResponse, capturedIdentity as ProvisionalSupervisedIdentity);
-              agyInitialPromptSubmission = agyPromptSubmissionEvidence(agyAcknowledgement);
-            } else {
-              initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity as PromptTargetIdentity);
-            }
-          } catch (error) {
-            promptDispatch = { state: "unknown", requestId: promptResponse.id };
-            throw error;
-          }
-          promptSubmitted = true;
-          promptDispatch = { state: "acknowledged", requestId: promptResponse.id };
-        } finally {
-          timing.promptSubmissionAckMs = monotonicDurationMs(clock, promptSubmissionStartedAt);
-        }
-
-        const confirmationStartedAt = clock.now();
-        try {
-          if (chosenRuntime.kind === "agy") {
-            const confirmed = await confirmAgyNativeSession(deps.cli, abortSignal, agyAcknowledgement!, baseline, clock, confirmationStartedAt);
-            initialPromptSubmission = confirmed.submission;
-            initialPromptObservation = confirmed.observation;
-            promptConfirmation = confirmed.confirmation;
-            timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
-            postState = confirmed.pane;
-            capturedIdentity = confirmed.identity;
-            agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
-            phase = "supervision_bind";
-            progress(onUpdate, phase, created);
-            await reservation!.strengthen({ identity: confirmed.identity, profileName: chosenProfile.name, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
-            boundSupervision = {
-              jobId: reservation!.jobId,
-              state: "active",
-              child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, profileName: chosenProfile.name }
-            };
-            provenanceWarning = await writeIdentityProvenance(
-              deps.cli,
-              resolvedPaneId,
-              "launched",
-              sender?.paneId,
-              confirmed.identity.agentSession,
-              abortSignal,
-              /^(?:manager|planner)(?:-|$)/u.test(chosenProfile.name) ? "orchestrator" : undefined,
-            );
-            phase = "prompt_verification";
-          } else {
-            const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt);
-            initialPromptObservation = confirmed.observation;
-            promptConfirmation = confirmed.confirmation;
-            timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
-            postState = confirmed.pane;
-            agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
-          }
-        } catch (error) {
-          const errorDetails = record(error) && record(error.details) ? error.details : undefined;
-          const confirmation = errorDetails?.promptConfirmation;
-          if (record(confirmation) && typeof confirmation.elapsedMs === "number") timing.postAckConfirmationMs = confirmation.elapsedMs;
-          if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") {
-            throw new LaunchError(error.code, error.message, {
-              ...error.details,
-              paneId: resolvedPaneId,
-              supervisorJobId: reservation!.jobId,
-              assignmentState: "unconfirmed",
-              supervision: boundSupervision!,
-            });
-          }
-          throw error;
-        }
-        assignmentState = "confirmed";
-        if (agentId) created.agentId = agentId;
-        const exactIdentity = capturedIdentity as PromptTargetIdentity;
-        const authoritativeName = exactIdentity.agentName;
-        const capability = capabilities.get(chosenProfile.name)!;
-        const recipient = { recipientKey: recipientKey!, paneId: resolvedPaneId, agentName: authoritativeName, ...(agentId ? { agentId } : {}), profileName: chosenProfile.name, kind: capability.kind, capable: capability.capable, reason: capability.reason };
-        deps.recipients?.recordFor(
-          chosenProfile.name,
-          resolvedPaneId,
-          recipient.recipientKey,
-          capability,
-          { ...exactIdentity, ...(agentId ? { agentId } : {}) },
-          chosenRuntime.kind === "agy" ? { agyStrengthened: true, attachmentDirectory: grant!.path } : undefined
-        );
-        recipientRegistered = deps.recipients !== undefined;
-        const effective = effectiveDetails(chosenProfile, chosenRuntime);
-        const launchDetails: LaunchDetails = {
-          operation: "launch", outcome: "launched", name: authoritativeName, kind: chosenRuntime.kind, placement, tabId, paneId: resolvedPaneId,
-          ...contextRebindingDetails(contextDiagnostics!),
-          ...(agentId ? { agentId } : {}),
-          postState: boundAgentSessionStrings(modelSafeJson(postState)) as Record<string, unknown>,
-          agentStarted,
-          initialPromptSent: true,
-          promptSubmitted,
-          recipientRegistered,
-          readiness,
-          promptConsumption: "confirmed",
-          promptDispatch: promptDispatch!,
-          assignmentState: assignmentState!,
-          initialPromptDelivery: initialPromptDelivery!,
-          ...(initialPromptSubmission ? { initialPromptSubmission: compactPromptSubmission(initialPromptSubmission) } : /* c8 ignore next -- the launched result is only built after the confirmed submission evidence exists. */ {}),
-          ...(initialPromptObservation ? { initialPromptObservation } : /* c8 ignore next -- a confirmed prompt always yields its closing observation. */ {}),
-          ...(promptConfirmation ? { promptConfirmation } : /* c8 ignore next -- the launched result is only built after consumption is confirmed. */ {}),
-          timing,
-          identityProvenance: "launched",
-          ...(provenanceWarning === undefined ? {} : { provenanceWarning }),
-          sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
-          envelope: { version: "v1" as const, kind: "assignment" as const, delivery: initialPromptDelivery! },
-          ...(published ? { attachment: published } : {}),
-          handoff: { runId: handoffRun!.runId, path: handoffRun!.artifactPath },
-          recipient,
-          effectCertainty: "confirmed",
-          supervision: boundSupervision!,
-          profile: {
-            name: chosenProfile.name, requested: params.profile, selected: chosenProfile.name,
-            source: { kind: chosenProfile.source.kind, path: chosenProfile.source.path }, timeoutMinutes: chosenProfile.timeoutMinutes,
-            runtime: effective.runtime, permissions: effective.permissions, attempts,
-            fallbackProfiles: [...profileResolution!.fallbackProfiles], reachableNames: [...profileResolution!.reachableNames], sessionPersistence: chosenProfile.sessionPersistence
-          }
-        };
-        return {
-          content: [{ type: "text", text: `${formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: initialPromptDelivery })} · supervisor ${reservation!.jobId}` }],
-          details: launchDetails
-        };
-      } catch (error) {
-        if (agentStarted && selectedAttemptStartedAt !== undefined && timing.selectedStartReadinessMs === undefined) {
-          const failureReadiness = error instanceof LaunchError && record(error.details.readiness)
-            ? error.details.readiness.elapsedMs
-            : undefined;
-          timing.selectedStartReadinessMs = typeof failureReadiness === "number" && Number.isSafeInteger(failureReadiness) && failureReadiness >= 0
-            ? failureReadiness
-            : monotonicDurationMs(clock, selectedAttemptStartedAt);
-        }
-        let reconciliation: LaunchReconciliationEvidence | undefined;
-        if (topologyMutationDispatched) {
-          try {
-            reconciliation = await reconcileLaunch({
-              cli: deps.cli,
-              baseline: topologyBaseline!,
-              ...(paneId === undefined ? {} : { paneId }),
-              ...(tabId === undefined ? {} : { tabId }),
-              agentStarted,
-              promptSubmitted,
-              agentName: params.name
-            });
-          } catch (readbackError) {
-            reconciliation = {
-              effectCertainty: "unknown",
-              snapshot: "unavailable",
-              pane: "unknown",
-              agent: "unknown",
-              readFailures: [`reconciliation:${reconciliationFailureCode(readbackError)}`]
-            };
-          }
-          if (reconciliation?.tabId !== undefined && created.tabId === undefined) created.tabId = reconciliation.tabId;
-          if (reconciliation?.paneId !== undefined && created.paneId === undefined) created.paneId = reconciliation.paneId;
-          if (reconciliation?.agentId !== undefined && created.agentId === undefined) created.agentId = reconciliation.agentId;
-        }
-        // Releasing an unbound reservation settles its job; a committed exact
-        // supervisor is retained through every later launch failure.
-        if (!supervisionBound) reservation?.release(`launch_failed_${phase}`);
-        withDeliveryFailureEvidence(error, { handoffRunId: handoffRun!.runId });
-        throw partialError(error, created, phase, grant!, {
-          agentStarted,
-          promptSubmitted,
-          recipientRegistered,
-          mutationDispatched: topologyMutationDispatched,
-          ...(assignmentState === undefined ? {} : { assignmentState }),
-          ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }),
-          ...(promptDispatch === undefined ? {} : { promptDispatch }),
-          ...(readiness === undefined ? {} : { readiness }),
-          ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }),
-          timing,
-          attempts,
-        }, initialPromptDelivery, published, reconciliation);
-      } finally {
-        // The launch window is over; the directory is kept only by its own content.
-        try {
-          await grant?.release();
-        } finally {
-          await launchGate?.release();
-        }
-      }
+  let packageRoot = dirname(fileURLToPath(import.meta.url));
+  while (!existsSync(join(packageRoot, "package.json"))) packageRoot = dirname(packageRoot);
+  const loadLaunchCatalog = async (): Promise<Catalog> => {
+    if (deps.catalog !== undefined) return deps.catalog.load();
+    return loadCatalog(join(packageRoot, CATALOG_PATH));
   };
 
-  /**
-   * The auto-Batch orchestration: one authoritative catalog snapshot feeds
-   * exactly one Router call and exactly one decision-log append, both before
-   * any child mutation, then the pure expansion drives sequential children
-   * through the shared single-child lifecycle.
-   */
-  const executeBatch = async (
-    params: AutoLaunchRequest,
-    signal: AbortSignal | undefined,
-    onUpdate: AgentToolUpdateCallback<LaunchDetails | LaunchBatchDetails> | undefined,
-    ctx: ExtensionContext
-  ): Promise<AgentToolResult<LaunchBatchDetails>> => {
-    const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
-    const batchResult = (details: LaunchBatchDetails): AgentToolResult<LaunchBatchDetails> => ({
-      content: [{ type: "text", text: batchManifest(details) }],
-      details
-    });
-    const batchFailure = (router: RouterResult, code: string, message?: string): AgentToolResult<LaunchBatchDetails> =>
-      batchResult({ operation: "launch_batch", outcome: "failed", router, children: [], failure: { code, ...(message === undefined ? {} : { message }) } });
-    // The same fail-closed gate and freeze check leads, exactly like the
-    // explicit path, but the lease is released before routing so nothing is
-    // held across the Jev call and children never run under a nested lease.
+  const routeRequest = async (params: SpecLaunchRequest, signal: AbortSignal, ctx: ExtensionContext): Promise<{ catalog?: Catalog; records: SpecRouteRecord[] }> => {
+    const root = deps.cwd ?? ctx.cwd;
+    let catalog: Catalog;
+    try {
+      catalog = await loadLaunchCatalog();
+    } catch {
+      return {
+        records: params.specs.map((spec) => ({ spec, decision: { kind: "abstained", reason: "catalog_unavailable", component: "catalog" }, state: { status: "unavailable", reason: "catalog_unavailable" } }))
+      };
+    }
+
+    const records: SpecRouteRecord[] = [];
+    for (const spec of params.specs) {
+      const state = specRouterState(spec, catalog);
+      let evaluation: Awaited<ReturnType<TypeSafeSpecClient["evaluate"]>>;
+      const timeoutController = new AbortController();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        evaluation = await Promise.race([
+          specClient.evaluate({ spec, catalog }, AbortSignal.any([signal, timeoutController.signal])),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              const reason = new DOMException("Spec evaluation timed out", "TimeoutError");
+              timeoutController.abort(reason);
+              reject(reason);
+            }, SPEC_EVALUATION_TIMEOUT_MS);
+          }),
+        ]);
+      } catch {
+        evaluation = timeoutController.signal.aborted && !signal.aborted
+          ? { kind: "abstained", reason: "transport_failed", component: "evaluation" }
+          : { kind: "abstained", reason: signal.aborted ? "aborted" : "transport_failed", component: "transport" };
+      } finally {
+        clearTimeout(timeout);
+      }
+      let decision: SpecDecision;
+      if (evaluation.kind === "response") {
+        try {
+          decision = await routeSpec({ spec, catalog, response: evaluation.response, root });
+          records.push({ spec, decision, response: evaluation.response, state });
+          continue;
+        } catch {
+          decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
+        }
+      } else {
+        decision = evaluation;
+      }
+      records.push({ spec, decision, state });
+    }
+    return { catalog, records };
+  };
+
+  const executeSingle = async (
+    params: SpecLaunchRequest,
+    routed: SpecRouteRecord,
+    signal: AbortSignal,
+    onUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined,
+    ctx: ExtensionContext,
+    batch: LaunchBatchContext
+  ): Promise<AgentToolResult<LaunchDetails>> => {
+    const abortSignal = signal;
     let launchGate: LaunchGateLease | undefined;
     try {
       launchGate = await (deps.launchGate ?? (() => acquireLaunchGate()))();
       await launchGate.check();
     } catch {
       await launchGate?.release().catch(() => undefined);
-      throw new LaunchError("PROFILE_LAUNCH_FROZEN", "Profile launch is frozen");
+      throw new LaunchError("LAUNCH_FROZEN", "Launch is frozen");
+    }
+
+    const requestedDelivery: MessageDelivery = params.assignmentDelivery === "attachment" ? "attachment" : "inline";
+    const attachmentStore = deps.attachments ?? defaultAttachmentStore;
+    const handoffs = deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({}));
+    const clock = deps.clock ?? realLaunchClock;
+    const spec = routed.spec;
+    const decision = routed.decision as Extract<SpecDecision, { kind: "admitted" }>;
+    let assignmentText = specPayload(spec);
+    let promptText: string | undefined;
+    let cwd: string;
+    let launchCwd: string | undefined;
+    let placement: LaunchPlacement;
+    let label: string;
+    let recipientKey: string | undefined;
+    let grant: RecipientGrant | undefined;
+    let published: PublishedAttachment | undefined;
+    let sender: SenderIdentity | undefined;
+    let existingTarget: ResolvedTarget | undefined;
+    let workspaceId: string | undefined;
+    let contextDiagnostics: ContextResolutionDiagnostics | undefined;
+    let effectiveContext: CurrentContext | undefined;
+    let topologyBaseline: HerdrSnapshot | undefined;
+    let topologyMutationDispatched = false;
+    let reservation: SupervisionReservation | undefined;
+    let handoffRun: HandoffAllocation | undefined;
+    let phase: LaunchPhase = "validate";
+    let prepared: Awaited<ReturnType<WorktreeManager["prepare"]>> | undefined;
+    let worktreeBound = false;
+    const worktreeCount = batch.worktreeCount ?? spec.count!;
+    let chainCandidates: ResolvedCandidate[] = [];
+    const created: LaunchResourceIds = {};
+    const attempts: LaunchAttemptEvidence[] = [];
+    const contracts = new Map<string, CompiledContract>();
+    const dispatchMutation = async <T>(operation: () => Promise<T>): Promise<T> => {
+      if (abortSignal.aborted) throw new LaunchError("ABORTED", "Operation aborted");
+      topologyMutationDispatched = true;
+      return operation();
+    };
+
+    try {
+      validateParams(params);
+      assignmentText = specPayload(spec);
+      assertMessageText(assignmentText);
+      assertDeliverySize(assignmentText, requestedDelivery);
+      cwd = params.cwd ?? deps.cwd ?? ctx.cwd;
+      identifier(cwd, "cwd");
+      placement = params.placement!;
+      label = params.label ?? params.name;
+      phase = "route_spec";
+      const catalog = batch.catalog;
+      const chain = resolveChain(catalog, decision.category).chain.map((candidate, index): ResolvedCandidate => ({
+        index,
+        candidate,
+        runner: catalog.runners.get(candidate.runner)!
+      }));
+      const selectedIndex = decision.evidence!.selectedCandidate!.index;
+      chainCandidates = chain.filter((candidate) => candidate.index >= selectedIndex);
+
+      const contractFor = async (resolved: ResolvedCandidate): Promise<CompiledContract> => {
+        const key = resolvedCandidateKey(resolved);
+        const selected = decision.configuration;
+        if (candidateKey(selected.candidate) === key) {
+          contracts.set(key, selected);
+          return selected;
+        }
+        const responseCandidates = (routed.response!.candidates as readonly unknown[]).filter(record);
+        const judgment = responseCandidates.find((candidate) => candidate.index === resolved.index && candidate.runner === resolved.candidate.runner && candidate.model === resolved.candidate.model);
+        const selection = judgment!.resources as ResourceSelection;
+        const compiled = await compileCandidateContract(catalog, spec, resolved, selection);
+        contracts.set(key, compiled);
+        return compiled;
+      };
+
+      // Compile and prepare before handoff, topology, or agent start. A typed
+      // pre-spawn refusal records exactly one candidate and moves to the next.
+      phase = "compile";
+      let replicaPrepared = worktreeCount <= 1;
+      for (const candidate of chainCandidates) {
+        const identity = resolvedCandidateIdentity(candidate);
+        let contract: CompiledContract;
+        try {
+          contract = await contractFor(candidate);
+        } catch (error) {
+          attempts.push({ candidate: identity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+          continue;
+        }
+        if (!replicaPrepared) {
+          if (worktrees === undefined) {
+            contracts.delete(resolvedCandidateKey(candidate));
+            attempts.push({ candidate: identity, outcome: "agent_start_failed", errorCode: "WORKTREE_UNAVAILABLE", message: "Replica worktree manager is unavailable" });
+            continue;
+          }
+          try {
+            prepared = await worktrees.prepare({ childName: params.name, cwd, count: worktreeCount, signal: abortSignal });
+            replicaPrepared = true;
+          } catch (error) {
+            contracts.delete(resolvedCandidateKey(candidate));
+            attempts.push({ candidate: identity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+            continue;
+          }
+        }
+        contracts.set(resolvedCandidateKey(candidate), contract);
+        launchCwd = prepared?.cwd ?? cwd;
+      }
+      const initialCandidate = chainCandidates.find((candidate) => contracts.has(resolvedCandidateKey(candidate)));
+      const initialContract = initialCandidate === undefined ? undefined : contracts.get(resolvedCandidateKey(initialCandidate));
+      if (initialCandidate === undefined || initialContract === undefined) {
+        throw new LaunchError("SPEC_NO_USABLE_CANDIDATE", "No spec chain candidate could be prepared", { attempts });
+      }
+      const initialRuntime = initialContract.runtime;
+
+      const effective = await contextResolver(abortSignal);
+      contextDiagnostics = effective.diagnostics;
+      const snapshot = effective.snapshot;
+      topologyBaseline = snapshot;
+      effectiveContext = effective.context;
+      sender = resolveSender(snapshot, effective.context.paneId);
+      const nameTaken = existingNameTargets(snapshot).has(params.name) || batch.reservedNames.has(params.name);
+      if (nameTaken) throw new LaunchError("BATCH_NAME_COLLISION", `Agent name is already in use: ${params.name}`);
+      if (label !== params.name && (existingNameTargets(snapshot).has(label) || batch.reservedNames.has(label))) {
+        throw new LaunchError("BATCH_NAME_COLLISION", `Pane label is already in use: ${label}`);
+      }
+      existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, effective.context) : undefined;
+      workspaceId = placement.mode === "new_tab" ? effective.context.workspaceId : undefined;
+
+      handoffRun = await handoffs.allocate();
+      assignmentText += renderHandoffContract(handoffRun);
+      assertMessageText(assignmentText);
+      assertDeliverySize(assignmentText, requestedDelivery);
+      const managedSpec: LaunchSpec = { ...spec, instructions: `${spec.instructions}${renderHandoffContract(handoffRun)}` };
+      if (requestedDelivery === "inline") {
+        promptText = renderSpecInstructions(sender, managedSpec, requestedDelivery);
+        assertMessageText(promptText);
+      }
+
+      phase = "handoff";
+      progress(onUpdate, phase, created);
+      await handoffs.persist(handoffRun, {
+        manager: { paneId: sender.paneId, display: sender.display, source: sender.source },
+        child: {
+          agentName: params.name,
+          agentKind: initialRuntime.kind,
+          candidateName: initialContract.candidate.model,
+          specLabel: spec.label,
+          fallbackCandidates: chainCandidates.slice(1).map((candidate) => candidate.candidate.model)
+        }
+      });
+      recipientKey = mintRecipientKey();
+      grant = await attachmentStore.ensureRecipient(recipientKey);
+      if (requestedDelivery === "attachment") {
+        phase = "attachment_publish";
+        progress(onUpdate, phase, created);
+        published = await attachmentStore.publish({
+          body: assignmentText,
+          recipientKey,
+          ...(existingTarget?.paneId ? { recipientPaneId: existingTarget.paneId } : {}),
+          recipientAgentName: params.name,
+          senderPaneId: sender.paneId,
+          senderDisplay: sender.display,
+          operation: "assignment"
+        });
+        promptText = renderSpecInstructions(sender, managedSpec, "attachment", { ...published, encoding: "utf-8" });
+        assertMessageText(promptText);
+      }
+
+      // Keep this reservation allowlist and serialization unchanged from R3.
+      phase = "supervision_reserve";
+      progress(onUpdate, phase, created);
+      try {
+        const supervisionDigest = modelSafeJson({
+          doneWhen: params.supervisionDigest.doneWhen,
+          constraints: params.supervisionDigest.constraints
+        }) as { doneWhen: string[]; constraints: string[] };
+        reservation = await deps.supervision.reserve({
+          child: { agentName: params.name, agentKind: initialRuntime.kind, candidateName: initialContract.candidate.model },
+          settings: { supervisionDigest }
+        });
+      } catch (error) {
+        throw new LaunchError("SUPERVISION_UNAVAILABLE", "Automatic child supervision could not be reserved", {
+          causeCode: safeDiagnosticString(record(error) && typeof error.code === "string" ? error.code : undefined, 120) ?? "SUPERVISION_UNAVAILABLE"
+        });
+      }
+    } catch (error) {
+      const failure = withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published, handoffRunId: handoffRun?.runId });
+      try {
+        await grant?.release();
+        reservation?.release("launch_precondition_failed");
+        if (prepared !== undefined && !worktreeBound) await worktrees?.release(params.name);
+      } finally {
+        await launchGate?.release();
+      }
+      throw earlyLaunchFailure(failure, phase);
+    }
+
+    let paneId: string | undefined;
+    let tabId: string | undefined;
+    let agentStarted = false;
+    let promptSubmitted = false;
+    let promptDispatch: PromptDispatchEvidence | undefined;
+    let assignmentState: "confirmed" | "unconfirmed" | undefined;
+    let agyAcknowledgement: AgyPromptAcknowledgement | undefined;
+    let agyInitialPromptSubmission: AgyPromptSubmissionEvidence | undefined;
+    let recipientRegistered = false;
+    let supervisionBound = false;
+    let provenanceWarning: string | undefined;
+    let boundSupervision: LaunchDetails["supervision"] | undefined;
+    let readiness: LaunchReadinessEvidence | undefined;
+    let selectedAttemptStartedAt: number | undefined;
+    let chosenContract: CompiledContract | undefined;
+    const timing: LaunchTimingEvidence = {};
+
+    try {
+      phase = "placement";
+      progress(onUpdate, phase, created);
+      if (placement.mode === "existing_pane") {
+        paneId = existingTarget!.paneId!;
+        tabId = existingTarget!.tabId;
+      } else if (placement.mode === "new_tab") {
+        const result = tabRefFrom(await dispatchMutation(() => run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", launchCwd!, "--label", placement.tabLabel, ...noFocusArgs()], abortSignal, true)));
+        tabId = result.tabId;
+        paneId = result.paneId;
+        created.tabId = tabId;
+        deps.ownership?.record({ kind: "tab", id: tabId, parentId: workspaceId });
+        if (!paneId) paneId = paneRefFrom(await run(deps.cli, ["tab", "get", tabId], abortSignal)).paneId;
+        created.paneId = paneId;
+        deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
+      } else {
+        const result = paneRefFrom(await dispatchMutation(() => run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...noFocusArgs(), "--cwd", launchCwd!], abortSignal, true)));
+        paneId = result.paneId;
+        tabId = result.tabId ?? effectiveContext!.tabId;
+        created.paneId = paneId;
+        created.tabId = tabId;
+        deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
+      }
+      const resolvedPaneId = paneId!;
+      if (prepared !== undefined && worktreeCount > 1) {
+        worktrees!.bindPane(params.name, resolvedPaneId);
+        worktreeBound = true;
+      }
+      if (placement.mode !== "existing_pane") await dispatchMutation(() => run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal));
+
+      phase = "agent_start";
+      progress(onUpdate, phase, created);
+      // The pre-mutation compile loop retained each usable contract for the
+      // attempt machinery; no candidate is rebuilt or duplicated here.
+      const attemptCandidates = [...contracts.keys()];
+      let started: unknown;
+      let startedAgent: StartedAgent | undefined;
+      for (const candidate of attemptCandidates) {
+        const contract = contracts.get(candidate)!;
+        const candidateIdentityValue = candidateIdentity(contract.candidate);
+        await launchGate!.check();
+        let promptPath: string | undefined;
+        let startArgs: string[];
+        try {
+          if (contract.runtime.kind !== "agy" && contract.runtime.kind !== "devin") {
+            promptPath = (await (deps.promptSources ?? defaultPromptSourceStore).create(promptText!)).path;
+          }
+          startArgs = ["agent", "start", params.name, "--kind", contract.runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...contractArgv(contract, promptPath, grant!.path, handoffRun!.directory)];
+        } catch (error) {
+          attempts.push({ candidate: candidateIdentityValue, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+          continue;
+        }
+        const attemptStartedAt = clock.now();
+        try {
+          const shellSettleDeadline = attemptStartedAt + AGENT_PANE_SHELL_SETTLE_MS;
+          while (true) {
+            try {
+              started = await dispatchMutation(() => run(deps.cli, startArgs, abortSignal, true));
+              break;
+            } catch (startError) {
+              const envelope = cliErrorEnvelope(startError);
+              const shellPending = envelope?.id === "cli:agent:start" && envelope.error.code === "agent_pane_busy";
+              if (!shellPending || placement.mode === "existing_pane" || clock.now() >= shellSettleDeadline || abortSignal.aborted) throw startError;
+              await waitForAgentStartSettle(abortSignal, AGENT_PANE_SHELL_POLL_MS);
+            }
+          }
+          agentStarted = true;
+          attempts.push({ candidate: candidateIdentityValue, outcome: "selected" });
+          selectedAttemptStartedAt = attemptStartedAt;
+          chosenContract = contract;
+          startedAgent = agentIdentity(started, params.name, resolvedPaneId, contract.runtime.kind);
+          break;
+        } catch (error) {
+          const eligible = startFailureEvidence(error);
+          if (!eligible) {
+            attempts.push({ candidate: candidateIdentityValue, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+            throw error;
+          }
+          let failedPane: Record<string, unknown>;
+          try {
+            failedPane = paneRecord(await run(deps.cli, ["pane", "get", resolvedPaneId], abortSignal), resolvedPaneId);
+          } catch (readError) {
+            throw new LaunchError("POSTSTATE_UNAVAILABLE", "Fallback eligibility could not be proven from authoritative pane state", { causeCode: "POSTSTATE_UNAVAILABLE", startFailureCode: eligible.code, readError: readError instanceof Error ? readError.message : String(readError), attempts });
+          }
+          if (!noAgentFromPane(failedPane)) {
+            attempts.push({ candidate: candidateIdentityValue, outcome: "fallback_refused", errorCode: eligible.code, message: "authoritative pane still reports an agent", postState: compactAttemptState(failedPane) });
+            throw new LaunchError("LAUNCH_FAILED", "Automatic fallback refused because the failed pane still has an agent", { causeCode: eligible.code, attempts });
+          }
+          attempts.push({ candidate: candidateIdentityValue, outcome: "agent_start_failed", errorCode: eligible.code, message: eligible.message, postState: compactAttemptState(failedPane) });
+        }
+      }
+      if (chosenContract === undefined || startedAgent === undefined || selectedAttemptStartedAt === undefined) {
+        throw new LaunchError("LAUNCH_FAILED", "Spec fallback chain exhausted after agent start failure", { attempts });
+      }
+      const chosenRuntime = chosenContract.runtime;
+      const chosenAgent = startedAgent;
+      let agentId = chosenAgent.agentId;
+      if (agentId) created.agentId = agentId;
+      phase = "ready";
+      progress(onUpdate, phase, created);
+      await grant?.renew();
+      const ready = await waitForLaunchReadiness(deps.cli, resolvedPaneId, abortSignal, params.name, chosenRuntime.kind, chosenAgent, selectedAttemptStartedAt, true, clock, chosenRuntime.kind === "agy");
+      readiness = ready.evidence;
+      timing.selectedStartReadinessMs = readiness.elapsedMs;
+      let capturedIdentity = ready.identity;
+      agentId ??= idFrom(ready.agent, "agent_id") ?? idFrom(ready.agent, "id") ?? idFrom(ready.pane, "agent_id");
+
+      phase = "supervision_bind";
+      progress(onUpdate, phase, created);
+      try {
+        if (chosenRuntime.kind === "agy") {
+          const provisionalIdentity = capturedIdentity as ProvisionalSupervisedIdentity;
+          const provisionalBaseline = { ...ready.baseline!, state: "idle" as const };
+          await reservation!.bindProvisional({ identity: provisionalIdentity, candidateName: chosenContract.candidate.model, baseline: provisionalBaseline });
+          boundSupervision = { jobId: reservation!.jobId, state: "provisional", provisional: { ...provisionalIdentity, profileName: chosenContract.candidate.model, baseline: provisionalBaseline } };
+        } else {
+          const exactIdentity = capturedIdentity as PromptTargetIdentity;
+          await reservation!.bind({ identity: exactIdentity, candidateName: chosenContract.candidate.model, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
+          boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: exactIdentity.agentName, agentKind: exactIdentity.agentKind, paneId: resolvedPaneId, terminalId: exactIdentity.terminalId, profileName: chosenContract.candidate.model } };
+        }
+      } catch (error) {
+        if (!(error instanceof SupervisionBindError)) throw error;
+        throw new LaunchError("SUPERVISION_UNCONFIRMED", "Automatic child supervision could not be bound to the launched agent", { causeCode: "SUPERVISION_UNCONFIRMED", supervisionJobId: reservation!.jobId, supervisionEvidence: boundAgentSessionStrings(error.details) });
+      }
+      supervisionBound = true;
+      if (chosenRuntime.kind !== "agy") {
+        provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, (capturedIdentity as PromptTargetIdentity).agentSession, abortSignal, /^(?:manager|planner)(?:-|$)/u.test(spec.label) ? "orchestrator" : undefined);
+      }
+      if (params.focus === true) {
+        phase = "focus";
+        progress(onUpdate, phase, created);
+        await dispatchMutation(() => run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal));
+      }
+      if (agentId) created.agentId = agentId;
+
+      let initialPromptSubmission: PromptSubmissionEvidence | undefined;
+      let initialPromptObservation: PromptObservation | undefined;
+      let promptConfirmation: PromptConfirmationEvidence | undefined;
+      let postState: Record<string, unknown> | undefined = ready.pane;
+      assignmentState = "unconfirmed";
+      const baseline = ready.baseline!;
+      const envelope = promptText!;
+      phase = "prompt_verification";
+      progress(onUpdate, phase, created);
+      const promptSubmissionStartedAt = clock.now();
+      try {
+        let promptResponse: JsonEnvelope;
+        try {
+          promptResponse = await dispatchMutation(async () => {
+            if (capturedIdentity.agentKind !== "devin" || deps.queueFlush === undefined) return runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
+            const lease = await deps.queueFlush.writeSection(resolvedPaneId);
+            try { return await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal); } finally { await lease.release(); }
+          });
+        } catch (error) {
+          const details = record(error) && record(error.details) ? error.details : undefined;
+          const dispatch = details?.promptDispatch;
+          if (record(dispatch) && (dispatch.state === "not_written" || dispatch.state === "rejected" || dispatch.state === "acknowledged" || dispatch.state === "unknown")) {
+            const requestId = dispatch.requestId;
+            promptDispatch = { state: dispatch.state, ...(typeof requestId === "string" && requestId.length > 0 && requestId.length <= 256 && !/[\0\r\n]/u.test(requestId) ? { requestId } : {}) };
+          }
+          throw error;
+        }
+        try {
+          if (chosenRuntime.kind === "agy") {
+            agyAcknowledgement = parseAgyPromptAcknowledgement(promptResponse, capturedIdentity as ProvisionalSupervisedIdentity);
+            agyInitialPromptSubmission = agyPromptSubmissionEvidence(agyAcknowledgement);
+          } else {
+            initialPromptSubmission = parsePromptSubmission(promptResponse, capturedIdentity as PromptTargetIdentity);
+          }
+        } catch (error) {
+          promptDispatch = { state: "unknown", requestId: promptResponse.id };
+          throw error;
+        }
+        promptSubmitted = true;
+        promptDispatch = { state: "acknowledged", requestId: promptResponse.id };
+      } finally {
+        timing.promptSubmissionAckMs = monotonicDurationMs(clock, promptSubmissionStartedAt);
+      }
+
+      const confirmationStartedAt = clock.now();
+      try {
+        if (chosenRuntime.kind === "agy") {
+          const confirmed = await confirmAgyNativeSession(deps.cli, abortSignal, agyAcknowledgement!, baseline, clock, confirmationStartedAt);
+          initialPromptSubmission = confirmed.submission;
+          initialPromptObservation = confirmed.observation;
+          promptConfirmation = confirmed.confirmation;
+          timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
+          postState = confirmed.pane;
+          capturedIdentity = confirmed.identity;
+          agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+          phase = "supervision_bind";
+          progress(onUpdate, phase, created);
+          await reservation!.strengthen({ identity: confirmed.identity, candidateName: chosenContract.candidate.model, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
+          boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, profileName: chosenContract.candidate.model } };
+          provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, confirmed.identity.agentSession, abortSignal, /^(?:manager|planner)(?:-|$)/u.test(spec.label) ? "orchestrator" : undefined);
+          phase = "prompt_verification";
+        } else {
+          const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt);
+          initialPromptObservation = confirmed.observation;
+          promptConfirmation = confirmed.confirmation;
+          timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;
+          postState = confirmed.pane;
+          agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
+        }
+      } catch (error) {
+        const errorDetails = record(error) && record(error.details) ? error.details : undefined;
+        const confirmation = errorDetails?.promptConfirmation;
+        if (record(confirmation) && typeof confirmation.elapsedMs === "number") timing.postAckConfirmationMs = confirmation.elapsedMs;
+        if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") {
+          throw new LaunchError(error.code, error.message, { ...error.details, paneId: resolvedPaneId, supervisorJobId: reservation!.jobId, assignmentState: "unconfirmed", supervision: boundSupervision! });
+        }
+        throw error;
+      }
+      assignmentState = "confirmed";
+      if (agentId) created.agentId = agentId;
+      const exactIdentity = capturedIdentity as PromptTargetIdentity;
+      const capability = recipientCapability(chosenRuntime.kind);
+      const recipient = { recipientKey: recipientKey!, paneId: resolvedPaneId, agentName: exactIdentity.agentName, ...(agentId ? { agentId } : {}), profileName: chosenContract.candidate.model, kind: capability.kind, capable: capability.capable, reason: capability.reason };
+      deps.recipients?.recordFor(chosenContract.candidate.model, resolvedPaneId, recipient.recipientKey, capability, { ...exactIdentity, ...(agentId ? { agentId } : {}) }, chosenRuntime.kind === "agy" ? { agyStrengthened: true, attachmentDirectory: grant!.path } : undefined);
+      recipientRegistered = deps.recipients !== undefined;
+      const launchDetails: LaunchDetails = {
+        operation: "launch", outcome: "launched", name: exactIdentity.agentName, kind: chosenRuntime.kind, placement, tabId, paneId: resolvedPaneId,
+        ...contextRebindingDetails(contextDiagnostics!),
+        ...(agentId ? { agentId } : {}),
+        postState: boundAgentSessionStrings(modelSafeJson(postState)) as Record<string, unknown>,
+        agentStarted, initialPromptSent: true, promptSubmitted, recipientRegistered, readiness,
+        promptConsumption: "confirmed", promptDispatch: promptDispatch!, assignmentState: assignmentState!, initialPromptDelivery: requestedDelivery,
+        initialPromptSubmission: compactPromptSubmission(initialPromptSubmission!),
+        initialPromptObservation: initialPromptObservation!,
+        promptConfirmation: promptConfirmation!,
+        timing, identityProvenance: "launched", ...(provenanceWarning === undefined ? {} : { provenanceWarning }),
+        sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
+        envelope: { version: "v1" as const, kind: "assignment" as const, delivery: requestedDelivery },
+        ...(published ? { attachment: published } : {}),
+        handoff: { runId: handoffRun!.runId, path: handoffRun!.artifactPath }, recipient, effectCertainty: "confirmed",
+        supervision: boundSupervision!,
+        spec: { label: spec.label, category: (decision as Extract<SpecDecision, { kind: "admitted" }>).category, count: spec.count!, selected: candidateIdentity(chosenContract.candidate), attempts, fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedCandidateIdentity(candidate)) }
+      };
+      return { content: [{ type: "text", text: `${formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: requestedDelivery })} · supervisor ${reservation!.jobId}` }], details: launchDetails };
+    } catch (error) {
+      if (agentStarted && selectedAttemptStartedAt !== undefined && timing.selectedStartReadinessMs === undefined) {
+        const failureReadiness = error instanceof LaunchError && record(error.details.readiness) ? error.details.readiness.elapsedMs : undefined;
+        timing.selectedStartReadinessMs = typeof failureReadiness === "number" && Number.isSafeInteger(failureReadiness) && failureReadiness >= 0 ? failureReadiness : monotonicDurationMs(clock, selectedAttemptStartedAt);
+      }
+      let reconciliation: LaunchReconciliationEvidence | undefined;
+      if (topologyMutationDispatched) {
+        try {
+          reconciliation = await reconcileLaunch({ cli: deps.cli, baseline: topologyBaseline!, ...(paneId === undefined ? {} : { paneId }), ...(tabId === undefined ? {} : { tabId }), agentStarted, promptSubmitted, agentName: params.name });
+        } catch (readbackError) {
+          reconciliation = { effectCertainty: "unknown", snapshot: "unavailable", pane: "unknown", agent: "unknown", readFailures: [`reconciliation:${reconciliationFailureCode(readbackError)}`] };
+        }
+        if (reconciliation?.tabId !== undefined && created.tabId === undefined) created.tabId = reconciliation.tabId;
+        if (reconciliation?.paneId !== undefined && created.paneId === undefined) created.paneId = reconciliation.paneId;
+        if (reconciliation?.agentId !== undefined && created.agentId === undefined) created.agentId = reconciliation.agentId;
+      }
+      if (!supervisionBound) reservation?.release(`launch_failed_${phase}`);
+      if (prepared !== undefined && !worktreeBound) await worktrees?.release(params.name);
+      withDeliveryFailureEvidence(error, { handoffRunId: handoffRun!.runId });
+      throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, mutationDispatched: topologyMutationDispatched, ...(assignmentState === undefined ? {} : { assignmentState }), ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }), ...(promptDispatch === undefined ? {} : { promptDispatch }), ...(readiness === undefined ? {} : { readiness }), ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }), timing, attempts }, requestedDelivery, published, reconciliation);
+    } finally {
+      try { await grant?.release(); } finally { await launchGate?.release(); }
+    }
+  };
+
+  const executeRequest = async (
+    rawParams: unknown,
+    signal: AbortSignal | undefined,
+    onUpdate: AgentToolUpdateCallback<LaunchDetails | LaunchBatchDetails> | undefined,
+    ctx: ExtensionContext
+  ): Promise<AgentToolResult<LaunchDetails | LaunchBatchDetails>> => {
+    const params = normalizedParams(rawParams as SpecLaunchRequest);
+    const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
+    const batchResult = (details: LaunchBatchDetails): AgentToolResult<LaunchBatchDetails> => ({ content: [{ type: "text", text: batchManifest(details) }], details });
+    let gate: LaunchGateLease | undefined;
+    try {
+      gate = await (deps.launchGate ?? (() => acquireLaunchGate()))();
+      await gate.check();
+    } catch {
+      await gate?.release().catch(() => undefined);
+      throw new LaunchError("LAUNCH_FROZEN", "Launch is frozen");
     }
     try {
-      // Preserve the existing ordering: validation, freeze, assignment size,
-      // compatibility preflight — all before the Router decision.
-      validateParams(params);
-      const assignmentText = renderAssignment(params.assignment);
-      assertMessageText(assignmentText);
-      assertDeliverySize(assignmentText, params.assignmentDelivery === "attachment" ? "attachment" : "inline");
+      for (const spec of params.specs) {
+        const text = specPayload(spec);
+        assertMessageText(text);
+        assertDeliverySize(text, params.assignmentDelivery === "attachment" ? "attachment" : "inline");
+      }
       if (typeof deps.cli.prompt !== "function") throw new LaunchError("CLI_INCOMPATIBLE", "Herdr prompt transport is unavailable");
       await deps.preflight(abortSignal, "agent.prompt");
     } catch (error) {
-      await launchGate.release();
+      await gate.release();
       throw earlyLaunchFailure(error, "validate");
     }
-    await launchGate.release();
+    await gate.release();
 
-    // One catalog snapshot supplies both the Router state and the selected
-    // children. An unavailable or untrusted catalog is a typed abstain with
-    // the unavailable-state marker — never a filter, never an error.
-    let catalog: ProfileCatalog | undefined;
-    let state: RouterState | UnavailableRouterState;
-    let outcome: RouteOutcome | undefined;
-    try {
-      if (!deps.profiles) throw new Error("Profile catalog is unavailable");
-      const loaded = await deps.profiles.load();
-      if (!(loaded.effective instanceof Map) || (loaded.unreadableScopes?.length ?? 0) > 0) {
-        throw new Error("Profile catalog is unavailable");
-      }
-      catalog = loaded;
-      state = { assignment: params.assignment, catalog: projectRouterCatalog(loaded) };
-    } catch {
-      catalog = undefined;
-      state = { status: "unavailable", reason: "catalog_unavailable" };
-      outcome = { result: { kind: "abstain", reason: "catalog_unavailable", component: "catalog" }, probabilities: {} };
-    }
-    if (outcome === undefined) {
-      const router = deps.router ?? new TypeSafeRouter();
-      try {
-        outcome = await router.route(state as RouterState, abortSignal);
-      } catch {
-        outcome = {
-          result: abortSignal.aborted ? { kind: "abstain", reason: "aborted" } : { kind: "abstain", reason: "transport_failed", component: "transport" },
-          probabilities: {}
-        };
-      }
-    }
-    const decision = outcome.result;
+    const routed = await routeRequest(params, abortSignal, ctx);
+    const decisions = routed.records.map((record) => record.decision);
     const routerLog = deps.routerLog ?? appendRouterDecision;
     try {
-      await routerLog({ name: params.name, state, result: decision, probabilities: outcome.probabilities }, { root: deps.cwd ?? ctx.cwd });
+      for (const record of routed.records) await routerLog(specRouteLogEntry(params.name, record), { root: deps.cwd ?? ctx.cwd });
     } catch {
-      // The decision is retained in the failure evidence; nothing launched.
-      return batchFailure(decision, "ROUTER_LOG_UNAVAILABLE", "Router decision could not be persisted");
-    }
-    if (decision.kind === "abstain") {
-      return batchResult({ operation: "launch_batch", outcome: "abstained", router: decision, children: [] });
+      return batchResult({ operation: "launch_batch", outcome: "failed", router: decisions, children: [], failure: { code: "ROUTER_LOG_UNAVAILABLE", message: "Spec decision could not be persisted" } });
     }
 
-    // Expansion is pure: exact names, labels, and the one-child existing-pane
-    // rule are decided here, before any effect, against the caller snapshot.
+    if (routed.records.every((record) => !isAdmitted(record.decision))) {
+      return batchResult({ operation: "launch_batch", outcome: "abstained", router: decisions, children: [] });
+    }
+    const catalog = routed.catalog!;
+
     let expansion: BatchExpansion;
     try {
       const effective = await contextResolver(abortSignal);
-      expansion = expandBatchRequest(params, decision, existingNameTargets(effective.snapshot));
+      expansion = expandBatchRequest(params, decisions, existingNameTargets(effective.snapshot));
     } catch (error) {
-      return batchFailure(decision, safeLaunchCode(launchTransportCode(error)), causeMessage(error));
+      return batchResult({ operation: "launch_batch", outcome: "failed", router: decisions, children: [], failure: { code: safeLaunchCode(launchTransportCode(error)), message: causeMessage(error) } });
     }
-    if (expansion.kind === "invalid") {
-      return batchFailure(decision, expansion.code, expansion.message);
+    if (expansion.kind === "invalid") return batchResult({ operation: "launch_batch", outcome: "failed", router: decisions, children: [], failure: { code: expansion.code, message: expansion.message } });
+
+    if (params.specs.length === 1 && expansion.children.length === 1 && expansion.failures.length === 0) {
+      const child = expansion.children[0]!;
+      const record = routed.records.find((item) => item.spec.label === child.specLabel)!;
+      return executeSingle(
+        { ...params, name: child.name, specs: [{ ...child.spec, count: 1 }], ...(child.label === undefined ? {} : { label: child.label }), placement: child.placement },
+        { ...record, spec: { ...child.spec, count: 1 } },
+        abortSignal,
+        onUpdate as AgentToolUpdateCallback<LaunchDetails> | undefined,
+        ctx,
+        { catalog, reservedNames: new Set() }
+      );
     }
 
-    // Children dispatch strictly one at a time — mutating placement and start
-    // calls are never raced — and every child re-runs the existing lifecycle's
-    // freeze, abort, resource, and identity checks on a fresh snapshot.
-    const planned = expansion.children;
     const dispatched = new Map<string, LaunchBatchChild>();
     let halted = false;
-    for (const child of planned) {
-      const key = `${child.profile}:${child.ordinal}`;
+    for (const child of expansion.children) {
+      const key = `${child.specLabel}:${child.ordinal}`;
       if (halted || abortSignal.aborted) {
-        // A caller abort stops dispatch but keeps every remaining child visible.
         halted = true;
-        dispatched.set(key, { name: child.name, role: child.role, profile: child.profile, ordinal: child.ordinal, status: "not_started", code: "ABORTED" });
+        dispatched.set(key, { name: child.name, specLabel: child.specLabel, ordinal: child.ordinal, status: "not_started", code: "ABORTED" });
         continue;
       }
       const reservedNames = new Set<string>();
-      for (const sibling of planned) {
+      for (const sibling of expansion.children) {
         if (sibling === child) continue;
         reservedNames.add(sibling.name);
-        reservedNames.add(sibling.label ?? sibling.name);
+        if (sibling.label !== undefined) reservedNames.add(sibling.label);
       }
-      const request: LaunchRequest = {
-        name: child.name,
-        profile: child.profile,
-        placement: child.placement,
-        supervisionDigest: params.supervisionDigest,
-        ...(child.label === undefined ? {} : { label: child.label }),
-        ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
-        ...(params.focus === undefined ? {} : { focus: params.focus }),
-        assignment: {
-          objective: `${params.assignment.objective}\n\n${child.purpose}\nInstance ${child.ordinal} of ${child.count} for this role.`,
-          scope: params.assignment.scope,
-          verification: params.assignment.verification
-        },
-        ...(params.assignmentDelivery === undefined ? {} : { assignmentDelivery: params.assignmentDelivery })
-      };
-      const childUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined = onUpdate === undefined
-        ? undefined
-        // Progress is attributed by a leading block instead of rewriting each
-        // block, so non-text content passes through untouched.
-        : (update) => onUpdate({ ...update, content: [{ type: "text", text: `[${child.name}]` }, ...update.content] });
+      const record = routed.records[params.specs.findIndex((spec) => spec.label === child.specLabel)]!;
+      const childUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined = onUpdate === undefined ? undefined : (update) => onUpdate({ ...update, content: [{ type: "text", text: `[${child.name}]` }, ...update.content] });
       try {
-        const result = await executeSingle(request, abortSignal, childUpdate, ctx, { catalog: catalog!, reservedNames });
-        dispatched.set(key, { name: child.name, role: child.role, profile: child.profile, ordinal: child.ordinal, status: "launched", launch: result.details });
+        const result = await executeSingle({ ...params, name: child.name, specs: [{ ...child.spec, count: 1 }], ...(child.label === undefined ? {} : { label: child.label }), placement: child.placement }, { ...record, spec: { ...child.spec, count: 1 } }, abortSignal, childUpdate, ctx, { catalog, reservedNames, ...(child.count > 1 ? { worktreeCount: child.count } : {}) });
+        dispatched.set(key, { name: child.name, specLabel: child.specLabel, ordinal: child.ordinal, status: "launched", launch: result.details });
       } catch (error) {
-        // Best effort: a failed child is retained as evidence and unrelated
-        // siblings still dispatch. Successful children are never rolled back.
-        dispatched.set(key, { name: child.name, role: child.role, profile: child.profile, ordinal: child.ordinal, status: "failed", failure: batchChildFailure(error) });
+        dispatched.set(key, { name: child.name, specLabel: child.specLabel, ordinal: child.ordinal, status: "failed", failure: batchChildFailure(error) });
       }
     }
-    // Re-merge expansion failures back into the decision's own order so the
-    // manifest reads positionally and no child — including tail entries — is
-    // ever dropped from the result. Ordinals count within the Role across
-    // assignments, matching expandBatchRequest's derivation.
     const children: LaunchBatchChild[] = [];
-    const roleCursors = new Map<string, number>();
-    for (const assignment of decision.assignments) {
-      const role = roleForProfile(assignment.profile);
-      for (let index = 0; index < assignment.count; index += 1) {
-        const ordinal = (roleCursors.get(role) ?? 0) + 1;
-        roleCursors.set(role, ordinal);
-        const entry = dispatched.get(`${assignment.profile}:${ordinal}`);
-        if (entry !== undefined) {
-          children.push(entry);
-          continue;
+    for (const spec of params.specs) {
+      const decision = decisions[params.specs.indexOf(spec)];
+      if (!isAdmitted(decision)) continue;
+      const count = decision.count;
+      for (let ordinal = 1; ordinal <= count; ordinal += 1) {
+        const key = `${spec.label}:${ordinal}`;
+        const entry = dispatched.get(key);
+        if (entry !== undefined) children.push(entry);
+        else {
+          const failure = expansion.failures.find((item) => item.specLabel === spec.label && item.ordinal === ordinal)!;
+          children.push({ name: failure.name, specLabel: failure.specLabel, ordinal: failure.ordinal, status: "failed", failure: { code: failure.code, details: { code: failure.code, message: failure.message } } });
         }
-        // Expansion partitions every decision position into a planned child or
-        // a named failure, so a miss here is a defect, never a silent skip.
-        const failure = expansion.failures.find((item) => item.profile === assignment.profile && item.ordinal === ordinal)!;
-        children.push({
-          name: failure.name,
-          role: failure.role,
-          profile: failure.profile,
-          ordinal: failure.ordinal,
-          status: "failed",
-          failure: { code: failure.code, details: { code: failure.code, message: failure.message } }
-        });
       }
     }
     const launched = children.filter((child) => child.status === "launched").length;
-    const batchOutcome: LaunchBatchDetails["outcome"] = launched === 0 ? "failed" : launched === children.length ? "launched" : "partial";
-    return batchResult({
-      operation: "launch_batch",
-      outcome: batchOutcome,
-      router: decision,
-      children,
-      ...(children.length === 0 ? { failure: { code: "BATCH_ROUTE_EMPTY", message: "route decision expanded to no children" } } : {})
-    });
+    const outcome: LaunchBatchDetails["outcome"] = launched === 0 ? "failed" : launched === children.length ? "launched" : "partial";
+    return batchResult({ operation: "launch_batch", outcome, router: decisions, children });
   };
 
   return {
     name: "herdr_launch",
     label: "Herdr Launch",
-    description: "Launch a named Pi, Devin, Claude, or AGY Herdr agent from a strict profile in an explicitly selected pane placement; AGY launches run under reduced-assurance provisional supervision that strengthens after the first prompt.",
-    parameters: PublishedLaunchParamsSchema,
+    description: "Launch spec-defined Herdr agents in explicitly selected pane placements; every child carries the universal supervision baseline.",
+    parameters: SpecLaunchParamsSchema,
     async execute(_id, rawParams, signal, onUpdate, ctx) {
-      // The same discriminator as validateParams: a present `profile` field —
-      // even a malformed one — stays explicit; only an absent field is auto.
-      if (!record(rawParams) || "profile" in rawParams) {
-        return executeSingle(rawParams as unknown as LaunchRequest, signal, onUpdate, ctx);
-      }
-      return executeBatch(rawParams as unknown as AutoLaunchRequest, signal, onUpdate, ctx);
+      return executeRequest(rawParams, signal, onUpdate, ctx);
     },
     renderCall(args, theme) {
       const delivery = args.assignmentDelivery ?? "inline";
-      const profile = "profile" in args ? args.profile : "auto";
-      return textComponent(formatCall("herdr_launch", `${profile} · ${delivery}`, args.name), theme, "accent");
+      const specs = args.specs.map((spec) => spec.label).join(",");
+      return textComponent(formatCall("herdr_launch", `${specs} · ${delivery}`, args.name), theme, "accent");
     },
     renderResult(result, options, theme) {
       const details = result.details;
@@ -2871,3 +2636,98 @@ export function createLaunchTool(deps: LaunchDependencies): ToolDefinition<typeo
 }
 
 export { validateParams as validateLaunchParams, boundedReconciliationRead as boundedLaunchReconciliationRead };
+
+/** Test-only seams for the exhaustive launch lifecycle fixtures. */
+export const launchTestInternals = {
+  boundedDiagnosticText,
+  safeDiagnosticString,
+  safeDiagnosticIds,
+  diagnosticRecovery,
+  safeLaunchCode,
+  launchDiagnosticMessage,
+  record,
+  identifier,
+  normalizedParams,
+  specPayload,
+  paneRecord,
+  agentGetRecord,
+  agentIdentity,
+  idFrom,
+  paneRefFrom,
+  tabRefFrom,
+  noAgentFromPane,
+  compactAttemptState,
+  reconciliationFailureCode,
+  reconciliationTimeout,
+  boundedReconciliationRead,
+  readbackAgentName,
+  readbackAgentId,
+  malformedReadback,
+  readbackPaneRecord,
+  readbackAgentRecord,
+  launchEffectCertainty,
+  reconcileLaunch,
+  cliErrorEnvelope,
+  startFailureEvidence,
+  snapshotOf,
+  readinessScalar,
+  readinessSessionField,
+  ownReadinessSessionField,
+  compactIdentityRecord,
+  compactReadinessRecords,
+  own,
+  sameSession,
+  mergeReadinessIdentity,
+  completeReadinessIdentity,
+  completeProvisionalReadinessIdentity,
+  agyInteractiveReadiness,
+  requiredReadinessPaneId,
+  snapshotReadinessRecords,
+  readinessAgentRecord,
+  readinessPaneRecord,
+  readinessLifecycle,
+  readinessLifecycleSkew,
+  readinessBaseline,
+  createReadWindow,
+  readWithinWindow,
+  waitForReadPoll,
+  waitForAgentStartSettle,
+  monotonicDurationMs,
+  readinessEvidence,
+  compactReadinessErrorValue,
+  compactReadinessErrorMetadata,
+  readinessFailure,
+  waitForLaunchReadiness,
+  compactConfirmationObservation,
+  promptConfirmationEvidence,
+  promptUnconfirmed,
+  confirmPromptConsumption,
+  agyPromptSubmissionEvidence,
+  parseAgyPromptAcknowledgement,
+  agyPromptUnconfirmed,
+  confirmAgyNativeSession,
+  existingAgentNames,
+  existingNameTargets,
+  paneForPlacement,
+  noFocusArgs,
+  compactCliFailureEvidence,
+  cliFailureEvidence,
+  launchTransportCode,
+  causeMessage,
+  earlyLaunchFailure,
+  failureEffectCertainty,
+  partialError,
+  progress,
+  run,
+  runPrompt,
+  batchChildFailure,
+  batchManifest,
+  candidateIdentity,
+  candidateKey,
+  resolvedCandidateIdentity,
+  resolvedCandidateKey,
+  isAdmitted,
+  recipientCapability,
+  specRouterState,
+  specRouteLogEntry
+} as const;

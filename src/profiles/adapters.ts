@@ -222,11 +222,22 @@ export function buildDevinArgv(profile: Extract<Profile["runtime"], { kind: "dev
   return ["--model", effective.model, "--permission-mode", effective.permissionMode];
 }
 
-export function buildRuntimeArgv(profile: Profile, runtime: Profile["runtime"], promptFilePath?: string, attachmentDirectory?: string, handoffDirectory?: string): string[] {
-  if (runtime.kind === "pi") return buildPiArgv(runtime, profile.sessionPersistence, {}, promptFilePath);
-  if (runtime.kind === "claude") return buildClaudeArgv(runtime, profile.sessionPersistence, {}, promptFilePath, undefined, attachmentDirectory, handoffDirectory);
-  if (runtime.kind === "agy") return buildAgyArgv(runtime, profile.sessionPersistence, {}, promptFilePath, profile.source.scopeRoot, attachmentDirectory);
-  return buildDevinArgv(runtime, profile.sessionPersistence, {}, promptFilePath);
+/**
+ * What argv construction needs beyond the runtime block: session persistence
+ * and a scope root for AGY add-dir scoping. `Profile` satisfies it
+ * structurally, so the profile path and the compiled contract share the
+ * builders without either one carrying the other's identity.
+ */
+export interface RuntimeArgvContext {
+  sessionPersistence: boolean;
+  source?: { scopeRoot?: string };
+}
+
+export function buildRuntimeArgv(context: RuntimeArgvContext, runtime: Profile["runtime"], promptFilePath?: string, attachmentDirectory?: string, handoffDirectory?: string): string[] {
+  if (runtime.kind === "pi") return buildPiArgv(runtime, context.sessionPersistence, {}, promptFilePath);
+  if (runtime.kind === "claude") return buildClaudeArgv(runtime, context.sessionPersistence, {}, promptFilePath, undefined, attachmentDirectory, handoffDirectory);
+  if (runtime.kind === "agy") return buildAgyArgv(runtime, context.sessionPersistence, {}, promptFilePath, context.source?.scopeRoot, attachmentDirectory);
+  return buildDevinArgv(runtime, context.sessionPersistence, {}, promptFilePath);
 }
 
 export function buildProfileArgv(profile: Profile, overrides: RuntimeOverrides = {}, promptFilePath?: string, attachmentDirectory?: string, handoffDirectory?: string): string[] {

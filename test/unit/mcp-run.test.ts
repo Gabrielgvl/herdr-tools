@@ -103,7 +103,7 @@ const snapshot = {
   }
 };
 
-const reviewerModel = { id: "luna", name: "Luna", provider: "test", api: "openai-completions", baseUrl: "http://test", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_000, maxTokens: 1_000 } as Model<Api>;
+const reviewerModel = { id: "testmodel", name: "TestModel", provider: "test", api: "openai-completions", baseUrl: "http://test", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_000, maxTokens: 1_000 } as Model<Api>;
 
 function reviewerMessage(text: string): AssistantMessage {
   return { role: "assistant", content: [{ type: "text", text }], api: reviewerModel.api, provider: reviewerModel.provider, model: reviewerModel.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 };
@@ -180,7 +180,7 @@ async function start(overrides: Partial<Parameters<typeof runHerdrMcpServer>[0]>
     exec,
     transport: serverTransport,
     profiles: { load: async () => emptyCatalog },
-    settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "low" }),
+    settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "testmodel", reviewerThinking: "low" }),
     writeStderr: (line) => errors.push(line),
     exit: (code) => exits.push(code),
     onSignal: (signal) => signals.push(signal),
@@ -331,14 +331,16 @@ describe("MCP server startup", () => {
     expect(packageRoot("file:///a/b/c/run.js", () => false)).toBe("/a/b/c");
   });
 
-  it("serves the bundled catalog and the real settings file by default", async () => {
+  it("serves the profile collection and the real settings file by default", async () => {
     vi.useFakeTimers();
     // An unresolvable catalogue keeps this test hermetic: the real settings
     // default model would otherwise resolve and reach for the real auth.json.
     const harness = await start({ profiles: undefined, settingsLoader: undefined, models: unresolvableModels });
     const profiles = await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "profiles" } });
     expect(profiles.isError).toBeUndefined();
-    expect(textOf(profiles)).toContain("manager-pi");
+    // B10 deleted the bundled profile files: the default loader still runs
+    // and serves whatever user/project scopes contribute.
+    expect(JSON.parse(textOf(profiles).split("herdr-details\n")[0]!)).toMatchObject({ collection: "profiles", items: expect.any(Array) });
     const beyondDefaultCadence = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 600_000 } });
     expect(beyondDefaultCadence.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(beyondDefaultCadence).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
@@ -355,7 +357,7 @@ describe("MCP server startup", () => {
     const handle = await runHerdrMcpServer({
       env,
       profiles: { load: async () => emptyCatalog },
-      settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "luna", reviewerThinking: "low" }),
+      settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "testmodel", reviewerThinking: "low" }),
       exit: (code) => exits.push(code)
     });
     expect(handle).toBeDefined();
@@ -504,7 +506,7 @@ describe("MCP wait and job semantics", () => {
   it("runs the model-backed wait reviewer past the cadence instead of failing closed for being on MCP", async () => {
     vi.useFakeTimers();
     completeMock.mockResolvedValue(reviewerMessage(JSON.stringify({ classification: "progress", summary: "still progressing" })));
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }), models: authenticatedModels });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }), models: authenticatedModels });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
@@ -517,7 +519,7 @@ describe("MCP wait and job semantics", () => {
 
   it("records a reviewer failure in the detached job beyond the review cadence", async () => {
     vi.useFakeTimers();
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }), models: unresolvableModels });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }), models: unresolvableModels });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
@@ -530,7 +532,7 @@ describe("MCP wait and job semantics", () => {
   it("still maps a genuine reviewer model failure to REVIEWER_FAILED", async () => {
     vi.useFakeTimers();
     completeMock.mockRejectedValue(new Error("model down"));
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }), models: authenticatedModels });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }), models: authenticatedModels });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
@@ -541,7 +543,7 @@ describe("MCP wait and job semantics", () => {
 
   it("registers a detached wait that is polled through herdr_jobs and fails closed beyond the cadence", async () => {
     vi.useFakeTimers();
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }) });
     const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
     expect(detached.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
@@ -559,7 +561,7 @@ describe("MCP wait and job semantics", () => {
   });
 
   it("detaches a wait within the cadence without starting a reviewer", async () => {
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" }) });
+    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }) });
     const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
     expect(outcome.isError).toBeUndefined();
     const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
@@ -592,7 +594,7 @@ describe("MCP server lifecycle", () => {
       agentKind: "pi",
       agentSession: { source: "pi", agent: "pi", kind: "id", value: "worker-session" },
       recipientKey: "recipient-test-12345678",
-      profileName: "worker-pi",
+      candidateName: "worker-pi",
       kind: "pi",
       capable: true,
       reason: "test capability"

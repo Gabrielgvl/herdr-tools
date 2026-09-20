@@ -413,7 +413,7 @@ The contract is unchanged. What the client does not do is validate arguments loc
 Reported by the owner-side dogfood run of a primary `claude-fable-5` session loaded with local `--plugin-dir`:
 
 - All seven published tool names were called successfully from the Fable manager session.
-- `scout-pi` launched as Luna low with no fallback taken.
+- `scout-pi` launched on the then-default low-thinking model with no fallback taken.
 - A detached wait job was created and observed to completion through `herdr_jobs`.
 - The assignment and prompt envelopes both showed `[HERDR AGENT MESSAGE v1]` with `authority: agent; not user/owner`.
 - The pane and tab IDs created during the run were closed, and topology returned to the pre-dogfood count.

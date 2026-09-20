@@ -22,8 +22,6 @@ export const DEVIN_PERMISSION_MODES = ["normal", "accept-edits", "smart", "dange
 export type DevinPermissionMode = (typeof DEVIN_PERMISSION_MODES)[number];
 export type ProfileSourceKind = "bundled" | "user" | "project";
 
-export const RESERVED_BUNDLED_PROFILE_NAMES = new Set(["promoter-pi", "promoter-claude", "promoter-devin"]);
-
 export interface ProfileSource {
   kind: ProfileSourceKind;
   path: string;
@@ -114,12 +112,6 @@ export interface ProfileCatalog {
   unreadableScopes?: readonly ProfileSourceKind[];
 }
 
-export interface ProfileResolution {
-  profile: Profile;
-  fallbackProfiles: readonly string[];
-  reachableNames: readonly string[];
-}
-
 /**
  * Resource selection is profile-only. A launch override that could repoint
  * `extensions` or `skills` would turn the profile's exact allowlist back into
@@ -157,5 +149,4 @@ export const MAX_PROFILE_BYTES = 64 * 1024;
 export const MAX_PROFILE_BODY_BYTES = 32 * 1024;
 export const MAX_PROFILE_DIAGNOSTICS = 32;
 export const MAX_PROFILE_LIST_ITEMS = 100;
-export const MAX_PROFILE_BODY_OUTPUT = 8 * 1024;
 export const MAX_PROFILE_RESULT_BYTES = 50 * 1024;

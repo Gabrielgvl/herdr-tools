@@ -9,7 +9,7 @@ import { createJobsTool } from "../../src/tools/jobs.js";
 import { WaitJobsUi } from "../../src/wait-jobs-ui.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 5, reviewerModel: "testmodel", reviewerThinking: "low" as const };
 
 describe("the shared transcript reader", () => {
   it("reads exactly the bounded authoritative pane window and tolerates an empty one", async () => {
@@ -44,7 +44,7 @@ describe("supervision runtime defaults", () => {
       monitorOptions: { env: { HERDR_SOCKET_PATH: "" } },
     });
     // Constructing the defaults is enough; reserving proves they are reachable.
-    await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
+    await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
     await supervision.shutdown();
   });
 });
@@ -74,7 +74,7 @@ describe("supervisor-aware job surfaces", () => {
     ui.beginSession(context);
     ui.toggle(context);
     const registered = registry.register(
-      { kind: "supervisor", label: "supervise worker", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" }, settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" } },
+      { kind: "supervisor", label: "supervise worker", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" }, settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" } },
       async () => new Promise<never>(() => undefined),
     );
     registry.attachSupervision(registered.jobId, {
@@ -83,7 +83,7 @@ describe("supervisor-aware job surfaces", () => {
         monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
         reviewer: { model: "typesafe/jev-latest", thinking: "max", cadenceMinutes: 5, degraded: false, reviews: [], truncatedReviews: 0 },
         transitions: [], truncatedTransitions: 0, events: [], truncatedEvents: 0, unobservedEvents: 3,
-        child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", profileName: "worker-pi" },
+        child: { agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", candidateName: "worker-pi" },
         status: "working",
       }),
       takePendingEvents: () => [],
@@ -98,7 +98,7 @@ describe("supervisor-aware job surfaces", () => {
 
   it("settles a supervisor whose runner throws", async () => {
     const registry = new JobRegistry({ idFactory: () => "job_thrower" });
-    const request = { kind: "supervisor" as const, label: "supervise worker", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" }, settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" as const } };
+    const request = { kind: "supervisor" as const, label: "supervise worker", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" }, settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" as const } };
     const registered = registry.register(request, async () => { throw Object.assign(new Error("monitor gone"), { code: "SUPERVISION_SOCKET_CLOSED" }); });
     await registered.promise;
     expect(registry.get(registered.jobId)).toMatchObject({ supervision_result: "failed", supervision_reason: "SUPERVISION_SOCKET_CLOSED", error: { code: "SUPERVISION_SOCKET_CLOSED" } });

@@ -87,7 +87,7 @@ export const realSupervisionScheduler: SupervisionScheduler = {
 export interface SupervisionChildRequest {
   agentName: string;
   agentKind: string;
-  profileName: string;
+  candidateName: string;
 }
 
 /**
@@ -107,11 +107,11 @@ interface SupervisionReviewRecord extends SupervisionReviewView {
 export interface SupervisionBinding {
   identity: SupervisedIdentity;
   /**
-   * The profile that actually started the child. Fallback selection happens
-   * after the reservation, so the reserved profile can name a different one and
-   * the supervisor must publish the profile it is really watching.
+   * The compiled candidate that actually started the child. Fallback selection
+   * happens after the reservation, so the reserved candidate can differ and the
+   * supervisor must publish the candidate it is really watching.
    */
-  profileName: string;
+  candidateName: string;
   /** Present only where the authoritative agent record supplied one. */
   stateChangeSeq?: number;
   /**
@@ -300,7 +300,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private reviewTimer: unknown;
   private reviewing = false;
   private settlement: Settlement | undefined;
-  private selectedProfileName: string | undefined;
+  private selectedCandidateName: string | undefined;
   private bindStarted = false;
   private strengtheningStarted = false;
   /** True from the moment the anchor is prepared until a bind/strengthen task resolves. */
@@ -363,7 +363,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // anchor, but the public view stays reserved until the drain proves the
     // supervisor did not settle.
     this.identity = binding.identity;
-    this.selectedProfileName = binding.profileName;
+    this.selectedCandidateName = binding.candidateName;
     const stateChangeSeq = occupant.stateChangeSeq ?? binding.stateChangeSeq;
     this.anchor = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) };
     this.status = occupant.pane.agentStatus;
@@ -429,13 +429,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
     this.provisional = {
       identity: { ...binding.identity },
-      profileName: binding.profileName,
+      candidateName: binding.candidateName,
       baseline: { ...binding.baseline },
     };
     if (occupant.pane.agentSession !== undefined) {
       this.provisionalNativeIdentity = { ...binding.identity, agentSession: { ...occupant.pane.agentSession } };
     }
-    this.selectedProfileName = binding.profileName;
+    this.selectedCandidateName = binding.candidateName;
     this.status = "idle";
     this.provisionalLifecycle = {
       stateChangeSeq: binding.baseline.stateChangeSeq,
@@ -550,7 +550,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.strengtheningCandidate = {
       binding: {
         identity: observedIdentity,
-        profileName: binding.profileName,
+        candidateName: binding.candidateName,
         stateChangeSeq: occupant.stateChangeSeq,
       },
       stateChangeSeq: occupant.stateChangeSeq,
@@ -587,7 +587,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       status: this.status,
       anchor: this.anchor,
       lastRevision: this.lastRevision,
-      selectedProfileName: this.selectedProfileName,
+      selectedCandidateName: this.selectedCandidateName,
       bindingPublished: this.bindingPublished,
       provisionalPublished: this.provisionalPublished,
       state: this.state,
@@ -599,7 +599,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       if (this.queued.length !== 0) throw new Error("evidence_admitted_before_exact_commit");
       publication.commit();
       this.identity = { ...candidate.binding.identity, agentSession: { ...candidate.binding.identity.agentSession } };
-      this.selectedProfileName = candidate.binding.profileName;
+      this.selectedCandidateName = candidate.binding.candidateName;
       this.anchor = { revision: candidate.revision, status: candidate.status, stateChangeSeq: candidate.stateChangeSeq };
       this.status = candidate.status;
       this.lastRevision = candidate.revision;
@@ -620,7 +620,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       this.lastRevision = previous.lastRevision;
       this.lastStateChangeSeq = previous.lastStateChangeSeq;
       this.lastEndpoint = previous.lastEndpoint;
-      this.selectedProfileName = previous.selectedProfileName;
+      this.selectedCandidateName = previous.selectedCandidateName;
       this.bindingPublished = previous.bindingPublished;
       this.provisionalPublished = previous.provisionalPublished;
       this.state = previous.state;
@@ -733,7 +733,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.pendingMoveDestination = undefined;
     this.pendingMoveEndpoints.length = 0;
     this.pendingMoveInitialStateChangeSeq = undefined;
-    this.selectedProfileName = undefined;
+    this.selectedCandidateName = undefined;
     this.eventStreamDegraded = false;
     this.bindingPublished = false;
     this.provisionalPublished = false;
@@ -1884,8 +1884,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       agentKind: "agy",
       paneId: binding.identity.paneId,
       terminalId: binding.identity.terminalId,
-      profileName: binding.profileName,
-      ...(binding.profileName === this.deps.child.profileName ? {} : { requestedProfileName: this.deps.child.profileName }),
+      candidateName: binding.candidateName,
+      ...(binding.candidateName === this.deps.child.candidateName ? {} : { requestedCandidateName: this.deps.child.candidateName }),
       baseline: { ...binding.baseline },
     };
   }
@@ -1895,14 +1895,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // it alongside the identity this view already requires. The reserved profile
     // is kept beside it only when fallback selection changed it, so the two never
     // silently contradict each other.
-    const profileName = this.selectedProfileName!;
+    const candidateName = this.selectedCandidateName!;
     return {
       agentName: identity.agentName,
       agentKind: identity.agentKind,
       paneId: identity.paneId,
       terminalId: identity.terminalId,
-      profileName,
-      ...(profileName === this.deps.child.profileName ? {} : { requestedProfileName: this.deps.child.profileName }),
+      candidateName,
+      ...(candidateName === this.deps.child.candidateName ? {} : { requestedCandidateName: this.deps.child.candidateName }),
       ...(identity.agentKind === this.deps.child.agentKind ? {} : { requestedAgentKind: this.deps.child.agentKind }),
     };
   }
@@ -1966,9 +1966,9 @@ function validProvisionalBinding(binding: ProvisionalSupervisionBinding): boolea
     const identity: ProvisionalSupervisedIdentity = binding.identity;
     const baseline = binding.baseline;
     return validProvisionalIdentity(identity)
-      && typeof binding.profileName === "string"
-      && binding.profileName.length > 0
-      && !/[\0\r\n]/u.test(binding.profileName)
+      && typeof binding.candidateName === "string"
+      && binding.candidateName.length > 0
+      && !/[\0\r\n]/u.test(binding.candidateName)
       && baseline.state === "idle"
       && Number.isSafeInteger(baseline.stateChangeSeq)
       && baseline.stateChangeSeq >= 0

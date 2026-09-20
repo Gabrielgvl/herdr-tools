@@ -165,7 +165,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         reviewCadenceMinutes: settings.reviewCadenceMinutes,
         reviewerModel: SUPERVISION_REVIEWER_MODEL,
         reviewerThinking: "max",
-        ...(supervisionDigest === undefined ? {} : { supervisionDigest }),
+        supervisionDigest,
       },
     };
     const ready = deferred<Supervisor>();
@@ -211,7 +211,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       bind: async (binding) => {
         const publication = this.deps.jobs.prepareSupervisionChildBinding(registered.jobId, {
           agentKind: binding.identity.agentKind,
-          profileName: binding.profileName,
+          candidateName: binding.candidateName,
           paneId: binding.identity.paneId,
         });
         try {
@@ -237,7 +237,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       bindProvisional: async (binding) => {
         const publication = this.deps.jobs.prepareProvisionalSupervisionChildBinding(registered.jobId, {
           agentKind: binding.identity.agentKind,
-          profileName: binding.profileName,
+          candidateName: binding.candidateName,
         });
         try {
           await bound.bindProvisional(binding, publication);
@@ -249,7 +249,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       strengthen: async (binding) => {
         const publication = this.deps.jobs.prepareSupervisionStrengthening(registered.jobId, {
           agentKind: binding.identity.agentKind,
-          profileName: binding.profileName,
+          candidateName: binding.candidateName,
           paneId: binding.identity.paneId,
         });
         try {

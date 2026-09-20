@@ -1,5 +1,7 @@
 # Spec: Manager Profile and Role-Scoped Capabilities
 
+> **Superseded by the ADR-035 spec-launch migration.** Retained for historical context; profile, role, and model references below describe the retired architecture.
+
 ## Status
 
 Implemented and verified.
@@ -211,7 +213,7 @@ Profile resources remain explicit and declarative:
 ```yaml
 runtime:
   kind: pi
-  model: openai-codex/gpt-5.6-luna
+  model: openai-codex/gpt-5.6-sol
   thinking: max
   tools:
     - read

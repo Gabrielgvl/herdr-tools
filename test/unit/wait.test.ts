@@ -12,6 +12,7 @@ import { createTargetGenerationRef, historicalTargetEvidence, isTargetEvidence, 
 import { createHandoffAllocator, type HandoffAllocation, type HandoffStatus } from "../../src/handoff.js";
 import { createHandoffGate, type HandoffRun } from "../../src/handoff-gate.js";
 import { deltaLines } from "../../src/transcript-delta.js";
+import { AuthJsonCredentialStore } from "../../src/supervision/auth-json-credential-store.js";
 
 const snapshot = {
   type: "session_snapshot",
@@ -105,7 +106,7 @@ function nativeCli(options: { statuses?: Record<string, string>; currentStatuses
 
 const context = { workspaceId: "w", tabId: "w:t", paneId: "p1" };
 const extensionContext = { modelRegistry: {} } as ExtensionContext;
-const settings = { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" as const };
 
 function nativePredicateTimeout(): CliProtocolError {
   return new CliProtocolError("CLI_PROTOCOL_ERROR", "timed out waiting for agent status", {
@@ -1093,6 +1094,37 @@ describe("herdr_wait", () => {
     expect(reviewerFactory).toHaveBeenCalledTimes(1);
   });
 
+  it("resolves the Jev credential only when the configured reviewer consumes it", async () => {
+    const read = vi.spyOn(AuthJsonCredentialStore.prototype, "read").mockResolvedValue(undefined);
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    try {
+      const params = { targets: ["p1"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_001 };
+      const deps = () => ({ clock: clock(), pollIntervalMs: 60_000 });
+
+      await expect(execute(fakeCli({ p1: "working" }), params, deps())).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
+      expect(read).not.toHaveBeenCalled();
+
+      const reviewerFactory = vi.fn((): WaitReviewer => ({ review: async ({ targetId }) => ({ targetId, classification: "blocked", summary: "needs attention" }) }));
+      await expect(execute(fakeCli({ p1: "working" }), params, {
+        ...deps(),
+        settingsLoader: async () => ({ ...settings, reviewerModel: "typesafe/jev" }),
+        reviewerFactory,
+      })).resolves.toMatchObject({ wait_result: "manager_judgment_required" });
+      expect(reviewerFactory).toHaveBeenCalledTimes(1);
+      expect(read).not.toHaveBeenCalled();
+
+      await expect(execute(fakeCli({ p1: "working" }), params, {
+        ...deps(),
+        settingsLoader: async () => ({ ...settings, reviewerModel: "typesafe/jev" }),
+      })).rejects.toMatchObject({ code: "REVIEWER_FAILED" });
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(read).toHaveBeenCalledWith("typesafe");
+    } finally {
+      read.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("recomputes coverage each cadence without advancing covered transcript baselines", async () => {
     const cli = nativeCli({ statuses: { p1: "working", p2: "working" } });
     let transcriptRead = 0;
@@ -1915,7 +1947,7 @@ describe("herdr_wait managed handoff gate", () => {
     const allocation = await allocator.allocate();
     await allocator.persist(allocation, {
       manager: { paneId: "p1", display: "caller", source: "injected" },
-      child: { agentName: "one", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: [] }
+      child: { agentName: "one", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
     });
     const gate = createHandoffGate();
     const run = await gate.bind(allocation, MANAGED_IDENTITY);

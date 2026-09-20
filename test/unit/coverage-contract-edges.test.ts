@@ -18,7 +18,7 @@ const waitRequest: JobRequestSnapshot = {
   match: "any",
   condition: { kind: "state", state: "done" },
   timeoutMs: 1_000,
-  settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" },
+  settings: { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" },
 };
 
 const supervisorRequest: SupervisorJobRequestSnapshot = {
@@ -27,7 +27,7 @@ const supervisorRequest: SupervisorJobRequestSnapshot = {
   targets: ["worker"],
   targetIds: [],
   target_generation_refs: ["generation-1"],
-  child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
+  child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
   settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" },
 };
 
@@ -61,7 +61,7 @@ function installedView(request: SupervisorJobRequestSnapshot): SupervisionJobVie
     events: [],
     truncatedEvents: 0,
     unobservedEvents: 0,
-    child: { agentName: request.child.agentName, agentKind: request.child.agentKind, paneId: "p1", terminalId: "t1", profileName: request.child.profileName },
+    child: { agentName: request.child.agentName, agentKind: request.child.agentKind, paneId: "p1", terminalId: "t1", candidateName: request.child.candidateName },
     status: "working",
   };
 }
@@ -118,13 +118,13 @@ describe("coverage contract edges", () => {
   it("covers every supervised binding publication fence", async () => {
     const registry = new JobRegistry({ idFactory: (() => { let id = 0; return () => `job_coverage_${++id}`; })() });
     const malformed = await runningSupervisor(registry);
-    expect(() => registry.prepareSupervisionChildBinding(malformed, { agentKind: "pi", profileName: "worker-pi", paneId: "bad\nid" })).toThrow(/SUPERVISION_BINDING_INVALID/u);
+    expect(() => registry.prepareSupervisionChildBinding(malformed, { agentKind: "pi", candidateName: "worker-pi", paneId: "bad\nid" })).toThrow(/SUPERVISION_BINDING_INVALID/u);
 
     const misaligned = await runningSupervisor(registry, { ...supervisorRequest, targets: [], target_generation_refs: [] });
-    expect(() => registry.prepareSupervisionChildBinding(misaligned, { agentKind: "pi", profileName: "worker-pi", paneId: "p1" })).toThrow(/SUPERVISION_REQUEST_INVALID/u);
+    expect(() => registry.prepareSupervisionChildBinding(misaligned, { agentKind: "pi", candidateName: "worker-pi", paneId: "p1" })).toThrow(/SUPERVISION_REQUEST_INVALID/u);
 
     const jobId = await runningSupervisor(registry);
-    const publication = registry.prepareSupervisionChildBinding(jobId, { agentKind: "pi", profileName: "worker-pi", paneId: "p1" });
+    const publication = registry.prepareSupervisionChildBinding(jobId, { agentKind: "pi", candidateName: "worker-pi", paneId: "p1" });
     expect(() => publication.publish()).toThrow(/SUPERVISION_BINDING_UNCOMMITTED/u);
     publication.commit();
     expect(() => publication.commit()).toThrow(/SUPERVISION_ALREADY_BOUND/u);
@@ -135,7 +135,7 @@ describe("coverage contract edges", () => {
     publication.rollback();
 
     const closed = await runningSupervisor(registry);
-    const closedPublication = registry.prepareSupervisionChildBinding(closed, { agentKind: "pi", profileName: "worker-pi", paneId: "p2" });
+    const closedPublication = registry.prepareSupervisionChildBinding(closed, { agentKind: "pi", candidateName: "worker-pi", paneId: "p2" });
     registry.shutdown();
     expect(() => closedPublication.commit()).toThrow(/SUPERVISION_BINDING_CLOSED/u);
   });

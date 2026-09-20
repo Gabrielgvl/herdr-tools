@@ -1,5 +1,5 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Type, type Static } from "typebox";
+import { Type, type Static, type TUnsafe } from "typebox";
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, DEVIN_PERMISSION_MODES, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type DevinPermissionMode, type ThinkingLevel } from "./profiles/types.js";
 import { type MessageDelivery } from "./messages/limits.js";
 
@@ -94,33 +94,110 @@ export const AutoLaunchParamsSchema = Type.Object({
   ...LaunchCommonProperties
 }, { additionalProperties: false });
 
+/**
+ * The legacy N4 contract. It stays the internal shape `validateLaunchParams`
+ * in tools/launch.ts enforces — and the shape launch-batch.ts still expands —
+ * until B8 rewires the executor to the spec request below. It is no longer
+ * the published contract: `PublishedLaunchParamsSchema` now serves the spec
+ * shape.
+ */
 export const LaunchParamsSchema = Type.Union([ProfileLaunchParamsSchema, AutoLaunchParamsSchema]);
 
 /**
- * Flat publication shape: the pi harness drops every argument of a tool whose
- * parameters are a root union, so the variants' fields are published as one
- * optional-all object. `LaunchParamsSchema` stays the internal contract and
- * `validateParams` in tools/launch.ts stays the enforcement authority —
- * required fields, the profile/auto discriminator, and per-variant rejections
- * are all re-derived there. `assignment` keeps strict keys but optional fields;
- * `supervisionDigest` keeps its required fields when present.
+ * The caller-authored spec: the ADR-035 unit of launch. `label` is the Role —
+ * the caller's name for the spec that derived child names
+ * `{request.name}-{label}-{N}` are built from — so it is constrained to the
+ * kebab contract at the boundary: an out-of-pattern label is INVALID_INPUT at
+ * validation, never a BATCH_CHILD_NAME_INVALID after routing (plan R2), and it
+ * caps at 12 characters so the label's segment of the derived name is bounded;
+ * name overflow stays a structured per-child failure at expansion (audit
+ * amendment 4). `instructions` is the caller's own text, provenance-wrapped by
+ * src/spec-baseline.ts before it reaches the child; `assignment` is the typed
+ * contract reused unchanged. `category` names a catalog chain — the schema
+ * checks the kebab shape only, membership is the catalog's — and `count`
+ * defaults to 1.
  */
-export const PublishedLaunchParamsSchema = Type.Object({
-  name: Type.Optional(AgentName),
-  profile: Type.Optional(ProfileName),
-  overrides: Type.Optional(ProfileLaunchOverridesSchema),
+const SPEC_LABEL_PATTERN = "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$";
+const SpecLabel = Type.String({ minLength: 1, maxLength: 12, pattern: SPEC_LABEL_PATTERN });
+const SpecCategory = Type.String({ minLength: 1, pattern: SPEC_LABEL_PATTERN });
+export const LaunchSpecSchema = Type.Object({
+  label: SpecLabel,
+  instructions: AssignmentText("The caller's instruction text for this spec, provenance-wrapped before it reaches the child."),
+  assignment: LaunchAssignmentSchema,
+  category: Type.Optional(SpecCategory),
+  count: Type.Optional(Type.Integer({ minimum: 1, default: 1 }))
+}, { additionalProperties: false });
+
+/**
+ * The first `spec.label` occurring twice in a specs array, or undefined. The
+ * `~refine` engine invokes it only after the array's structural checks pass,
+ * so it reads `label` off a valid `LaunchSpec[]` directly.
+ */
+function duplicateSpecLabel(specs: LaunchSpec[]): string | undefined {
+  const seen = new Set<string>();
+  for (const spec of specs) {
+    if (seen.has(spec.label)) return spec.label;
+    seen.add(spec.label);
+  }
+  return undefined;
+}
+
+/**
+ * The ADR-035 launch request: the caller composes `specs` (at least one) and
+ * the compiler configures each — there is no `profile` and no `overrides`.
+ * Spec labels are unique per request: JSON Schema cannot express field-level
+ * uniqueness, so `specs` carries a `~refine` check — `Value.Check` fails and
+ * `Value.Errors` reports a `~refine` error naming the duplicate (audit
+ * amendment 4). The request-level `label` keeps its pane-label meaning and is
+ * not a spec label (CONTEXT.md). `supervisionDigest` stays a required
+ * request-level field, never per-spec (plan R3): a request without done-when
+ * conditions is unjudgeable and fails validation (ADR-035 amendment).
+ */
+export const SpecLaunchParamsSchema = Type.Object({
+  name: AgentName,
+  specs: Type.Refine(
+    Type.Array(LaunchSpecSchema, { minItems: 1 }),
+    (specs) => duplicateSpecLabel(specs) === undefined,
+    (specs) => `duplicate spec.label "${duplicateSpecLabel(specs)}"`
+  ),
   placement: Type.Optional(LaunchPlacementSchema),
   label: Type.Optional(Identifier),
   cwd: Type.Optional(Identifier),
   focus: Type.Optional(Type.Boolean()),
-  assignment: Type.Optional(Type.Object({
-    objective: Type.Optional(LaunchAssignmentSchema.properties.objective),
-    scope: Type.Optional(LaunchAssignmentSchema.properties.scope),
-    verification: Type.Optional(LaunchAssignmentSchema.properties.verification)
-  }, { additionalProperties: false })),
   assignmentDelivery: Type.Optional(StringEnum(["inline", "attachment"] as const)),
-  supervisionDigest: Type.Optional(SupervisionDigestSchema)
+  supervisionDigest: SupervisionDigestSchema
 }, { additionalProperties: false });
+
+/**
+ * The static params shape `tool.execute` keeps until B8. `Static` of the
+ * published schema is the compile-time contract of every direct execute call,
+ * and the unchanged executor still accepts the permissive flat form the
+ * deleted union mirror declared: every field optional, legacy keys present.
+ * The schema VALUE below is the strict spec contract; this type is what the
+ * wire still admits.
+ */
+type FlatLaunchParams = {
+  name?: string;
+  profile?: string;
+  overrides?: ProfileLaunchOverrides;
+  placement?: LaunchPlacement;
+  label?: string;
+  cwd?: string;
+  focus?: boolean;
+  assignment?: { objective?: string; scope?: string; verification?: string };
+  assignmentDelivery?: MessageDelivery;
+  supervisionDigest?: { doneWhen: string[]; constraints: string[] };
+};
+
+/**
+ * The published root is the spec request itself. The dual union needed an
+ * optional-all flat mirror because the pi harness drops every argument of a
+ * tool whose parameters are a root union; the spec request is a single strict
+ * object, so that workaround is gone and the published schema IS the
+ * contract. The TUnsafe cast keeps `Static` at the flat executor params above
+ * while the published value validates the spec shape.
+ */
+export const PublishedLaunchParamsSchema = SpecLaunchParamsSchema as unknown as TUnsafe<FlatLaunchParams>;
 
 export type LaunchPlacement =
   | { mode: "same_tab" }
@@ -142,6 +219,12 @@ export type LaunchParams = Static<typeof LaunchParamsSchema>;
 
 /** Batch request: the strict auto variant of the public launch schema. */
 export type AutoLaunchRequest = Static<typeof AutoLaunchParamsSchema>;
+
+/** One caller-authored spec inside an ADR-035 launch request. */
+export type LaunchSpec = Static<typeof LaunchSpecSchema>;
+
+/** The ADR-035 launch request: a named composition of caller-authored specs. */
+export type SpecLaunchRequest = Static<typeof SpecLaunchParamsSchema>;
 
 export interface LaunchAssignment {
   objective: string;

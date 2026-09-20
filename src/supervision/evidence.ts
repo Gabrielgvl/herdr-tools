@@ -41,7 +41,7 @@
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { TraceCursor, TraceEvent, TraceFailure, TraceSourceKind, TraceWindow } from "./trace-source.js";
 
@@ -512,10 +512,11 @@ export function executionDigestHash(digest: ExecutionDigest): string {
  *   it back on later cadences. A supplied base must be a full commit sha —
  *   the only pin this builder mints — so a moving ref can never silently
  *   re-anchor "what changed".
- * - Only metadata commands run: `rev-parse --verify HEAD`,
+ * - Metadata always comes from `rev-parse --verify HEAD`,
  *   `status --porcelain=v1 -z`, and `diff --name-status`/`--numstat` against
- *   the base with an explicit `--` rev/path separator. No patch text is ever
- *   produced, let alone emitted.
+ *   the base with an explicit `--` rev/path separator. Patch reads are added
+ *   only for literal repo paths named by non-error edit actions in this trace
+ *   window. Their unified hunks are bounded before they enter the view.
  * - `changedFiles` is the base→worktree delta (committed and uncommitted
  *   tracked changes) plus untracked paths, sorted and capped at
  *   `WORKSPACE_CHANGED_FILES_MAX`. `dirty` is the standard working-tree
@@ -537,8 +538,14 @@ export const WORKSPACE_VIEW_VERSION = 1;
 
 /** Cap on emitted changed-file entries; overflow is counted in `omittedFiles`. */
 export const WORKSPACE_CHANGED_FILES_MAX = 256;
+/** Cap on files whose recent hunks may be read in one cadence. */
+export const WORKSPACE_PATCH_FILES_MAX = 32;
+/** The ADR-036 V2.2 patch slot. E3 re-applies it at the outbound boundary. */
+export const EVIDENCE_PATCH_MAX_BYTES = 16 * 1024;
 /** Codepoint bound on emitted repo-relative paths; a trailing ellipsis marks the cut. */
 const WORKSPACE_PATH_MAX_CHARS = 512;
+/** Git's standard context depth for a bounded recent hunk. */
+const WORKSPACE_PATCH_CONTEXT_LINES = 3;
 /** A pinned base is the full sha this builder minted — immutable by construction. */
 const PINNED_REVISION_PATTERN = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 /** Git reads are evidence, not interactive work: bounded time and output. */
@@ -566,6 +573,20 @@ export interface WorkspaceDiffStats {
   deletions: number;
   /** Untracked paths — never inside git's own diff stats, so reported separately. */
   untrackedFiles: number;
+}
+
+/** One whole unified hunk for a file named by an edit in this cadence's trace. */
+export interface WorkspacePatchHunk {
+  path: string;
+  header: string;
+  lines: string[];
+}
+
+/** The bounded patch slot. Omission counts make every cut explicit. */
+export interface WorkspacePatch {
+  hunks: WorkspacePatchHunk[];
+  omittedHunks: number;
+  omittedFiles: number;
 }
 
 export type WorkspaceUnavailableReason =
@@ -602,6 +623,8 @@ export interface WorkspaceViewOk {
   omittedFiles: number;
   stats: WorkspaceDiffStats;
   fingerprint: string;
+  /** Base-relative hunks only for files named by edit actions since the prior review. */
+  patch?: WorkspacePatch;
 }
 
 export interface WorkspaceViewUnavailable {
@@ -618,6 +641,8 @@ export interface WorkspaceViewRequest {
   root: string;
   /** The reservation's pinned base (full sha). Absent ⇒ this build captures HEAD as the pin. */
   baseRevision?: string;
+  /** Edit-action targets from the trace window that starts at the prior review's cursor. */
+  writtenFiles?: readonly string[];
 }
 
 export interface WorkspaceCommandResult {
@@ -788,6 +813,65 @@ function parseNumstatZ(text: string): Map<string, { added?: number; deleted?: nu
   return counts;
 }
 
+function emptyWorkspacePatch(): WorkspacePatch {
+  return { hunks: [], omittedHunks: 0, omittedFiles: 0 };
+}
+
+/** Keep a deterministic prefix of whole hunks. A hunk is never sliced into invented patch text. */
+function boundWorkspacePatch(input: WorkspacePatch, capBytes: number): WorkspacePatch {
+  const kept: WorkspacePatchHunk[] = [];
+  let omittedHunks = input.omittedHunks + input.hunks.length;
+  for (const hunk of input.hunks) {
+    const candidate = { hunks: [...kept, hunk], omittedHunks: omittedHunks - 1, omittedFiles: input.omittedFiles };
+    if (utf8Length(canonicalJson(candidate)) > capBytes) break;
+    kept.push(hunk);
+    omittedHunks -= 1;
+  }
+  return { hunks: kept, omittedHunks, omittedFiles: input.omittedFiles };
+}
+
+/** A trace target becomes a git path only when it resolves lexically inside the trusted root. */
+function repoRelativePath(root: string, target: string): string | undefined {
+  if (target === "" || /[\0\r\n]/.test(target)) return undefined;
+  const path = relative(root, resolve(root, target));
+  if (path === "" || path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path)) return undefined;
+  return path.split(sep).join("/");
+}
+
+/** Associate trace writes with the authoritative changed-file enumeration; failed/no-op writes produce no patch. */
+function recentPatchFiles(root: string, writtenFiles: readonly string[], files: WorkspaceChangedFile[]): WorkspaceChangedFile[] {
+  const byPath = new Map<string, WorkspaceChangedFile>();
+  for (const file of files) {
+    byPath.set(file.path, file);
+    if (file.from !== undefined) byPath.set(file.from, file);
+  }
+  const selected = new Map<string, WorkspaceChangedFile>();
+  for (const target of writtenFiles) {
+    if (typeof target !== "string") continue;
+    const path = repoRelativePath(root, target);
+    const file = path === undefined ? undefined : byPath.get(path);
+    if (file !== undefined) selected.set(file.path, file);
+  }
+  return [...selected.values()].sort((a, b) => (a.path < b.path ? -1 : 1));
+}
+
+/** Parse only unified hunk bodies. File headers and other git metadata never enter the evidence slot. */
+function parseUnifiedHunks(path: string, text: string): WorkspacePatchHunk[] {
+  if (text === "") return [];
+  const lines = (text.endsWith("\n") ? text.slice(0, -1) : text).split("\n");
+  const hunks: WorkspacePatchHunk[] = [];
+  let current: WorkspacePatchHunk | undefined;
+  for (const line of lines) {
+    if (/^@@@? /.test(line)) {
+      current = { path: bounded(path, WORKSPACE_PATH_MAX_CHARS), header: line, lines: [] };
+      hunks.push(current);
+    } else if (current !== undefined) {
+      current.lines.push(line);
+    }
+  }
+  return hunks;
+}
+
 /**
  * Build one cadence's workspace view. Never rejects: a git/read failure is a
  * typed `available: false` value, never a fabricated clean workspace. The
@@ -804,7 +888,7 @@ export async function buildWorkspaceView(request: WorkspaceViewRequest, deps: Wo
   const pinned = request.baseRevision;
   if (pinned !== undefined && !PINNED_REVISION_PATTERN.test(pinned)) return workspaceUnavailable("base_invalid");
 
-  const step = async (args: [string, ...string[]]): Promise<{ stdout: string } | { failure: WorkspaceFailure }> => {
+  const step = async (args: [string, ...string[]], differenceExit = false): Promise<{ stdout: string } | { failure: WorkspaceFailure }> => {
     if (signal.aborted) return { failure: { reason: "aborted" } };
     let result: WorkspaceCommandResult;
     try {
@@ -818,7 +902,7 @@ export async function buildWorkspaceView(request: WorkspaceViewRequest, deps: Wo
     if (!isRecord(result) || typeof result.stdout !== "string" || !Number.isSafeInteger(result.exitCode)) {
       return { failure: { reason: "output_malformed", detail: { command: args[0] } } };
     }
-    if (result.exitCode !== 0) {
+    if (result.exitCode !== 0 && !(differenceExit && result.exitCode === 1)) {
       return { failure: { reason: "command_failed", detail: { command: args[0], exitCode: result.exitCode } } };
     }
     return { stdout: result.stdout };
@@ -875,7 +959,31 @@ export async function buildWorkspaceView(request: WorkspaceViewRequest, deps: Wo
 
   // The fingerprint covers the full-resolution view — unbounded paths and the
   // untruncated list — so a change inside the emitted tail still shifts it.
+  // Patch selection is cadence-relative and therefore deliberately excluded.
   const fingerprint = sha256Hex(canonicalJson({ baseRevision, headRevision, dirty: porcelain.dirty, changedFiles: files, stats }));
+
+  const candidates = recentPatchFiles(root, Array.isArray(request.writtenFiles) ? request.writtenFiles : [], files);
+  const selected = candidates.slice(0, WORKSPACE_PATCH_FILES_MAX);
+  let patch: WorkspacePatch = { ...emptyWorkspacePatch(), omittedFiles: candidates.length - selected.length };
+  for (let index = 0; index < selected.length; index += 1) {
+    const file = selected[index]!;
+    const args: [string, ...string[]] = file.status === "untracked"
+      ? ["diff", "--no-index", "--no-ext-diff", "--no-color", `--unified=${WORKSPACE_PATCH_CONTEXT_LINES}`, "--", "/dev/null", `./${file.path}`]
+      : ["diff", "--no-ext-diff", "--no-color", `--unified=${WORKSPACE_PATCH_CONTEXT_LINES}`, baseRevision, "--", `:(literal)${file.path}`];
+    const read = await step(args, file.status === "untracked");
+    if ("failure" in read) return workspaceUnavailable(read.failure.reason, read.failure.detail);
+    const combined: WorkspacePatch = {
+      hunks: [...patch.hunks, ...parseUnifiedHunks(file.path, read.stdout)],
+      omittedHunks: patch.omittedHunks,
+      omittedFiles: patch.omittedFiles,
+    };
+    patch = boundWorkspacePatch(combined, EVIDENCE_PATCH_MAX_BYTES);
+    if (patch.omittedHunks > combined.omittedHunks) {
+      patch = boundWorkspacePatch({ ...patch, omittedFiles: patch.omittedFiles + selected.length - index - 1 }, EVIDENCE_PATCH_MAX_BYTES);
+      break;
+    }
+  }
+
   for (const file of files) {
     file.path = bounded(file.path, WORKSPACE_PATH_MAX_CHARS);
     if (file.from !== undefined) file.from = bounded(file.from, WORKSPACE_PATH_MAX_CHARS);
@@ -891,6 +999,7 @@ export async function buildWorkspaceView(request: WorkspaceViewRequest, deps: Wo
     omittedFiles: files.length - changedFiles.length,
     stats,
     fingerprint,
+    patch,
   };
 }
 
@@ -914,12 +1023,14 @@ export async function buildWorkspaceView(request: WorkspaceViewRequest, deps: Wo
  * - trace ≤ 32 KiB — the compacted digest; over is structural overflow
  *   (a truncated digest silently drops causal events, which is the one
  *   thing compaction is forbidden to do).
+ * - patch ≤ 16 KiB — whole recent hunks only. It gives way only after the
+ *   terminal is empty; every omitted hunk/file remains counted.
  * - terminal ≤ 8 KiB — supplemental narrative, bounded to a contiguous
  *   newest suffix of whole lines (the same rule the trace source applies
  *   to a tmux window), and sacrificed first against the total.
- * - total state ≤ 64 KiB — when fixed sections plus an empty terminal
- *   already exceed it, the overflow is structural and the review is
- *   unavailable; nothing causal is ever cut to fit.
+ * - total state ≤ 64 KiB — terminal then patch give way. When the remaining
+ *   structural sections still exceed it, the review is unavailable; nothing
+ *   causal is ever cut to fit.
  *
  * Diagnostics carry counts, budget figures, and fixed-vocabulary labels
  * only — never a byte of the flagged or dropped content.
@@ -1097,6 +1208,7 @@ export interface EvidenceByteReport {
   assignment: number;
   trace: number;
   workspace: number;
+  patch: number;
   terminal: number;
 }
 
@@ -1125,6 +1237,8 @@ const COMPILER_CONFIG_HASH = sha256Hex(
       target: TARGET_MAX_CHARS,
       kind: KIND_MAX_CHARS,
       changedFiles: WORKSPACE_CHANGED_FILES_MAX,
+      patchFiles: WORKSPACE_PATCH_FILES_MAX,
+      patchContextLines: WORKSPACE_PATCH_CONTEXT_LINES,
       path: WORKSPACE_PATH_MAX_CHARS,
     },
   }),
@@ -1138,9 +1252,11 @@ const STATE_BUILDER_HASH = sha256Hex(
     budgets: {
       assignment: EVIDENCE_ASSIGNMENT_MAX_BYTES,
       trace: EVIDENCE_TRACE_MAX_BYTES,
+      patch: EVIDENCE_PATCH_MAX_BYTES,
       terminal: EVIDENCE_TERMINAL_MAX_BYTES,
       total: EVIDENCE_TOTAL_MAX_BYTES,
     },
+    truncation: ["terminal", "patch"],
   }),
 );
 
@@ -1222,6 +1338,25 @@ function boundTerminal(lines: string[], capBytes: number): EvidenceTerminal {
     kept.unshift(lines[i]!);
   }
   return { lines: kept, droppedLines: lines.length - kept.length };
+}
+
+function workspacePatch(workspace: WorkspaceView): WorkspacePatch {
+  return workspace.available ? workspace.patch ?? emptyWorkspacePatch() : emptyWorkspacePatch();
+}
+
+function withWorkspacePatch(workspace: WorkspaceView, patch: WorkspacePatch): WorkspaceView {
+  return workspace.available ? { ...workspace, patch } : workspace;
+}
+
+function withoutWorkspacePatch(workspace: WorkspaceView): WorkspaceView {
+  if (!workspace.available || workspace.patch === undefined) return workspace;
+  const structural = { ...workspace };
+  delete structural.patch;
+  return structural;
+}
+
+function omittedWorkspacePatch(patch: WorkspacePatch): WorkspacePatch {
+  return { hunks: [], omittedHunks: patch.omittedHunks + patch.hunks.length, omittedFiles: patch.omittedFiles };
 }
 
 /**
@@ -1331,29 +1466,40 @@ export function buildEvidenceState(request: EvidenceStateRequest, deps: Evidence
       return evidenceUnavailable("trace_over_budget", { bytes: traceBytes, budget: EVIDENCE_TRACE_MAX_BYTES }, identity.identity);
     }
 
-    const workspace = request.workspace;
-    const workspaceBytes = utf8Length(canonicalJson(workspace));
+    const requestedWorkspace = request.workspace;
+    const structuralWorkspace = withoutWorkspacePatch(requestedWorkspace);
+    const workspaceBytes = utf8Length(canonicalJson(structuralWorkspace));
+    const ownPatch = boundWorkspacePatch(workspacePatch(requestedWorkspace), EVIDENCE_PATCH_MAX_BYTES);
 
-    // Terminal is the elastic section: bounded to its own budget, then
-    // shrunk further — newest lines kept — until the whole state fits the
-    // total. If even an empty terminal cannot fit, the overflow is
-    // structural and the review is unavailable.
+    // Total-size truncation is explicit: terminal reaches zero before patch
+    // loses a hunk. Assignment, trace, workspace metadata, identity, and the
+    // empty omission envelopes are structural and are never cut.
     const terminalLines = stringList(request.terminal);
-    const core = {
+    const emptyTerminal: EvidenceTerminal = { lines: [], droppedLines: terminalLines.length };
+    const emptyTerminalBytes = utf8Length(canonicalJson(emptyTerminal));
+    const emptyPatch = omittedWorkspacePatch(ownPatch);
+    const minimumWorkspace = withWorkspacePatch(structuralWorkspace, emptyPatch);
+    const minimumCore = {
       version: EVIDENCE_STATE_VERSION,
       assignment,
       trace,
-      workspace,
+      workspace: minimumWorkspace,
       scan: "safe" as const,
       identity: identity.identity,
       drift,
     };
-    const emptyTerminal: EvidenceTerminal = { lines: [], droppedLines: terminalLines.length };
-    const emptyTerminalBytes = utf8Length(canonicalJson(emptyTerminal));
-    const fixedBytes = utf8Length(canonicalJson({ ...core, terminal: emptyTerminal }));
-    if (fixedBytes > EVIDENCE_TOTAL_MAX_BYTES) {
-      return evidenceUnavailable("state_over_budget", { bytes: fixedBytes, budget: EVIDENCE_TOTAL_MAX_BYTES }, identity.identity);
+    const minimumBytes = utf8Length(canonicalJson({ ...minimumCore, terminal: emptyTerminal }));
+    if (minimumBytes > EVIDENCE_TOTAL_MAX_BYTES) {
+      return evidenceUnavailable("state_over_budget", { bytes: minimumBytes, budget: EVIDENCE_TOTAL_MAX_BYTES }, identity.identity);
     }
+
+    const emptyPatchBytes = utf8Length(canonicalJson(emptyPatch));
+    const patchCap = Math.min(EVIDENCE_PATCH_MAX_BYTES, EVIDENCE_TOTAL_MAX_BYTES - minimumBytes + emptyPatchBytes);
+    const patch = boundWorkspacePatch(ownPatch, patchCap);
+    const workspace = withWorkspacePatch(structuralWorkspace, patch);
+    const patchBytes = requestedWorkspace.available ? utf8Length(canonicalJson(patch)) : 0;
+    const core = { ...minimumCore, workspace };
+    const fixedBytes = utf8Length(canonicalJson({ ...core, terminal: emptyTerminal }));
     const terminalCap = Math.min(EVIDENCE_TERMINAL_MAX_BYTES, EVIDENCE_TOTAL_MAX_BYTES - fixedBytes + emptyTerminalBytes);
     const terminal = boundTerminal(terminalLines, terminalCap);
     const terminalBytes = utf8Length(canonicalJson(terminal));
@@ -1384,6 +1530,7 @@ export function buildEvidenceState(request: EvidenceStateRequest, deps: Evidence
         assignment: assignmentBytes,
         trace: traceBytes,
         workspace: workspaceBytes,
+        patch: patchBytes,
         terminal: terminalBytes,
       },
     };

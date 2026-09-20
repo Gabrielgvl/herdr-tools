@@ -327,6 +327,33 @@ describe("herdr_launch spec cutover", () => {
     expect(harness.calls).toEqual([]);
   });
 
+  it("launches a Bash-only task after excluding hedged executor_execute and logs the exclusion", async () => {
+    const baseCatalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const pi = baseCatalog.runners.get("pi")!;
+    const runners = new Map(baseCatalog.runners);
+    runners.set("pi", { ...pi, pools: { ...pi.pools, tools: ["read", "executor_execute"] } });
+    const catalog: Catalog = { ...baseCatalog, runners };
+    const response: SpecModelDecision = {
+      ...responseFor(catalog),
+      candidates: [{ index: 0, runner: "pi", model: "pi-model", resources: { tools: { read: 0.95, executor_execute: 0.5 } } }],
+    };
+    const routerLog = vi.fn(async () => undefined) as LaunchRouterLog;
+    const result = await execute(toolFor({
+      catalog,
+      cli: makeCli().cli,
+      routerLog,
+      specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) },
+    }), request({ specs: [spec({ instructions: "Use Bash only for this task." })] }));
+
+    expect(result.details).toMatchObject({ outcome: "launched", kind: "pi" });
+    expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({
+        evidence: expect.objectContaining({ exclusions: [{ field: "tools", name: "executor_execute", noul: 0.5 }] }),
+        configuration: expect.objectContaining({ runtime: expect.objectContaining({ tools: ["read"] }) }),
+      }),
+    }), expect.anything());
+  });
+
   it("retries the next chain candidate after a proven pre-spawn start failure", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
     const harness = makeCli({

@@ -1985,6 +1985,7 @@ function specRouteLogEntry(name: string, record: SpecRouteRecord): SpecRouterLog
     result: record.decision,
     ...(record.binding === undefined ? {} : { binding: record.binding }),
     ...(record.decision.evidence === undefined ? {} : { evidence: record.decision.evidence }),
+    ...(record.response === undefined ? {} : { probabilities: record.response }),
     ...(record.state === undefined ? {} : { state: record.state })
   };
 }

@@ -10,12 +10,20 @@ A Pi extension that turns the Herdr terminal multiplexer into a supervised multi
 A caller-authored launch unit in `herdr_launch.specs`: `label`, `instructions`, a typed `assignment` (`objective`/`scope`/`verification`), optional `category`, optional replica `count`. Specs replaced profiles and roles in the ADR-035 migration; the words "profile" and "role" describe only deleted machinery.
 _Avoid_: profile, role, preset, template
 
-**Category**:
-A named catalog capability tier (`frontier`, `balanced`, `cheap`) resolving to an ordered chain of `{runner, model}` candidates in `herdr-profiles/catalog.yaml`. A spec may name its category; otherwise Jev chooses it.
-_Avoid_: tier, class, profile family
+**Quality tier**:
+A caller's requested starting quality and compute posture: `utility`, `economy`, `standard`, `strong`, `frontier`, or `max`. Omission means `standard`; workload policy may raise the effective start and bounds later recovery escalation.
+_Avoid_: category, class, profile family
+
+**Workload profile**:
+The routing description of an assignment across `intent`, `mutation`, `scope`, `horizon`, `verifiability`, `workspaceState`, and `ambiguity`. Jev derives semantic fields, while authoritative runtime evidence supplies workspace state; shape labels have no policy authority.
+_Avoid_: workload shape, role, task type
+
+**Operating point**:
+A reviewed runner, model, and native reasoning-setting combination that routing may select. The reasoning setting is runner-specific, such as Pi thinking or Claude effort, and may be encoded in the model for other runners.
+_Avoid_: model, model configuration, runner default
 
 **Candidate**:
-One `{runner, model}` entry in a category chain. Deterministic admission selects the first eligible and available candidate; the rest remain the fallback chain inside `agent_start`.
+One admissible operating point considered inside a deterministic quality-tier and recovery bucket. Jev ranks candidates within a bucket; the resulting bounded order is the pre-execution fallback chain.
 _Avoid_: profile (deleted), model pick, runner choice
 
 **candidateName**:

@@ -49,6 +49,7 @@ const QUALITY = new Set(["not_rejected", "not_evaluated", "rejected"]);
 const AVAILABILITY = new Set(["known-exhausted", "degraded", "unknown", "local-capacity-limited"]);
 const RUNNERS = new Set(["pi", "claude", "agy", "devin"]);
 const POOL_FIELDS = ["tools", "extensions", "skills", "plugins", "mcp"] as const;
+const PROBABILITY_SUM_TOLERANCE = 1e-6;
 
 export interface UnavailableRouterState {
   status: "unavailable";
@@ -108,6 +109,7 @@ export interface LoggedEvidence {
   category?: RouterEvidence["category"];
   selectedCandidate?: RouterEvidence["selectedCandidate"];
   availability?: RouterEvidence["availability"];
+  exclusions?: RouterEvidence["exclusions"];
   bypass?: RouterEvidence["bypass"];
 }
 
@@ -155,6 +157,64 @@ function number(value: unknown): value is number {
 
 function probability(value: unknown): value is number {
   return number(value) && value >= 0 && value <= 1;
+}
+
+function probabilityRecord(value: unknown): Record<string, number> {
+  if (!record(value)) throw routerLogFailure("Router decision probabilities are untrusted");
+  const out: Record<string, number> = {};
+  for (const [name, entry] of Object.entries(value)) {
+    if (!bounded(name) || !probability(entry)) throw routerLogFailure("Router decision probabilities are untrusted");
+    out[name] = entry;
+  }
+  return out;
+}
+
+function distribution(value: unknown): Record<string, number> {
+  const out = probabilityRecord(value);
+  const sum = Object.values(out).reduce((total, entry) => total + entry, 0);
+  if (Math.abs(sum - 1) > PROBABILITY_SUM_TOLERANCE) throw routerLogFailure("Router decision probabilities are untrusted");
+  return out;
+}
+
+/** Allowlist the normalized spec response. Raw model bodies never reach this boundary. */
+function projectSpecProbabilities(value: unknown): Record<string, unknown> {
+  if (value === undefined) return {};
+  if (!record(value)) throw routerLogFailure("Router decision probabilities are untrusted");
+  const out: Record<string, unknown> = {};
+  if (value.quality !== undefined) {
+    if (!record(value.quality) || !probability(value.quality.instructions_adequate) || !probability(value.quality.assignment_verifiable)) {
+      throw routerLogFailure("Router decision probabilities are untrusted");
+    }
+    out.quality = { instructions_adequate: value.quality.instructions_adequate, assignment_verifiable: value.quality.assignment_verifiable };
+  }
+  if (value.category !== undefined) {
+    if (!record(value.category) || !bounded(value.category.category) || !probability(value.category.confidence)) {
+      throw routerLogFailure("Router decision probabilities are untrusted");
+    }
+    out.category = {
+      category: value.category.category,
+      confidence: value.category.confidence,
+      ...(value.category.probabilities === undefined ? {} : { probabilities: distribution(value.category.probabilities) })
+    };
+  }
+  if (value.candidates !== undefined) {
+    if (!Array.isArray(value.candidates)) throw routerLogFailure("Router decision probabilities are untrusted");
+    out.candidates = value.candidates.map((candidate) => {
+      if (!record(candidate) || !Number.isInteger(candidate.index) || !RUNNERS.has(candidate.runner as string) || !bounded(candidate.model) || !record(candidate.resources)) {
+        throw routerLogFailure("Router decision probabilities are untrusted");
+      }
+      const resources: Record<string, Record<string, number>> = {};
+      for (const field of POOL_FIELDS) {
+        if (candidate.resources[field] !== undefined) resources[field] = probabilityRecord(candidate.resources[field]);
+      }
+      return { index: candidate.index, runner: candidate.runner, model: candidate.model, resources };
+    });
+  }
+  if (value.composition !== undefined) {
+    if (!record(value.composition) || !probability(value.composition.missing_area)) throw routerLogFailure("Router decision probabilities are untrusted");
+    out.composition = { missing_area: value.composition.missing_area };
+  }
+  return out;
 }
 
 function stateForJev(state: RouterState): unknown {
@@ -239,6 +299,15 @@ function projectEvidence(value: unknown): LoggedEvidence {
         throw routerLogFailure("Router decision evidence is untrusted");
       }
       return { index: item.index as number, status: item.status as NonNullable<RouterEvidence["availability"]>[number]["status"], retryNotBefore: item.retryNotBefore as string | null };
+    });
+  }
+  if (value.exclusions !== undefined) {
+    if (!Array.isArray(value.exclusions)) throw routerLogFailure("Router decision evidence is untrusted");
+    out.exclusions = value.exclusions.map((item) => {
+      if (!record(item) || !POOL_FIELDS.includes(item.field as (typeof POOL_FIELDS)[number]) || !bounded(item.name) || !probability(item.noul)) {
+        throw routerLogFailure("Router decision evidence is untrusted");
+      }
+      return { field: item.field as (typeof POOL_FIELDS)[number], name: item.name, noul: item.noul };
     });
   }
   if (value.bypass !== undefined) {
@@ -354,9 +423,11 @@ function buildRecord(entry: AnyRouterLogEntry, now: () => Date): RouterLogRecord
     if (isUnavailableMarker(entry.state)) stateUnavailable = { reason: "catalog_unavailable" };
     else stateDigest = routerStateDigest(entry.state);
   }
-  const result = entry.result.kind === "admitted" || entry.result.kind === "rejected" || entry.result.kind === "abstained" ? projectSpecResult(entry.result) : projectLegacyResult(entry.result as RouteDecisionOrAbstain);
-  const evidence = projectEvidence(entry.evidence ?? (entry.result.kind === "admitted" || entry.result.kind === "rejected" || entry.result.kind === "abstained" ? entry.result.evidence : undefined));
-  return { timestamp: now().toISOString(), name: caller, caller, binding, stateDigest, stateUnavailable, probabilities: {}, result, evidence };
+  const specResult = entry.result.kind === "admitted" || entry.result.kind === "rejected" || entry.result.kind === "abstained";
+  const result = specResult ? projectSpecResult(entry.result as SpecDecision) : projectLegacyResult(entry.result as RouteDecisionOrAbstain);
+  const evidence = projectEvidence(entry.evidence ?? (specResult ? (entry.result as SpecDecision).evidence : undefined));
+  const probabilities = specResult ? projectSpecProbabilities(entry.probabilities) : {};
+  return { timestamp: now().toISOString(), name: caller, caller, binding, stateDigest, stateUnavailable, probabilities, result, evidence };
 }
 
 async function ensureLogDirectory(directory: string): Promise<void> {

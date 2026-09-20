@@ -312,7 +312,7 @@ export class TypeSafeSpecClient {
       kind: "response",
       response: {
         quality: { instructions_adequate: instructions, assignment_verifiable: assignment },
-        category: { category: picked.choice, confidence: picked.confidence },
+        category: { category: picked.choice, confidence: picked.confidence, probabilities: picked.probabilities },
         candidates,
         ...(missingArea === undefined ? {} : { composition: { missing_area: missingArea, assessed: [...assessed] } }),
       },

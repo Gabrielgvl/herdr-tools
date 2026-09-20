@@ -157,6 +157,15 @@ function evidence(): RouterEvidence {
   };
 }
 
+function specProbabilities(): Record<string, unknown> {
+  return {
+    quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 },
+    category: { category: "worker", confidence: 0.9, probabilities: { worker: 1 } },
+    candidates: [{ index: 0, runner: "pi", model: "pi-model", resources: { tools: { read: 0.9, executor_execute: 0.5 } } }],
+    composition: { missing_area: 0.2, assessed: ["worker"] },
+  };
+}
+
 function admitted(overrides: Partial<Admitted> = {}): Admitted {
   return {
     kind: "admitted",
@@ -233,7 +242,7 @@ describe("appendRouterDecision records", () => {
   it("persists the fixed per-spec record shape with digest, binding, evidence, and final newline", async () => {
     const root = await tempdir();
     const paths = routerLogPaths(root);
-    await appendRouterDecision(entry(), { root, now: () => new Date("2026-09-18T10:00:00.000Z"), deadlineMs: 10_000 });
+    await appendRouterDecision(entry({ probabilities: specProbabilities() }), { root, now: () => new Date("2026-09-18T10:00:00.000Z"), deadlineMs: 10_000 });
     const content = await readFile(paths.decisions, "utf8");
     expect(content.endsWith("\n")).toBe(true);
     const records = await readRecords(paths.decisions);
@@ -246,7 +255,12 @@ describe("appendRouterDecision records", () => {
     expect(record.binding).toEqual(BINDING);
     expect(record.stateDigest).toBe(expectedDigest(state()));
     expect(record.stateUnavailable).toBeNull();
-    expect(record.probabilities).toEqual({});
+    expect(record.probabilities).toEqual({
+      quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 },
+      category: { category: "worker", confidence: 0.9, probabilities: { worker: 1 } },
+      candidates: [{ index: 0, runner: "pi", model: "pi-model", resources: { tools: { read: 0.9, executor_execute: 0.5 } } }],
+      composition: { missing_area: 0.2 },
+    });
     expect(record.result).toMatchObject({ kind: "admitted", quality: "not_rejected", category: "worker", count: 1 });
     expect(record.evidence).toEqual(evidence());
     expect((await lstat(paths.decisions)).mode & 0o777).toBe(0o600);
@@ -394,6 +408,33 @@ describe("appendRouterDecision refusal", () => {
     { name: "an unknown evidence bypass label", mutate: (input) => ({ ...input, evidence: { bypass: { label: "weird", quality: "not_rejected" } } }) },
     { name: "a non-string evidence bypass quality", mutate: (input) => ({ ...input, evidence: { bypass: { label: "abstain", quality: 5 } } }) },
     { name: "an unknown evidence bypass quality", mutate: (input) => ({ ...input, evidence: { bypass: { label: "abstain", quality: "ok" } } }) },
+    { name: "a non-record probability record", mutate: (input) => ({ ...input, probabilities: 5 }) },
+    { name: "a non-record probability quality", mutate: (input) => ({ ...input, probabilities: { quality: 5 } }) },
+    { name: "an invalid instructions probability", mutate: (input) => ({ ...input, probabilities: { quality: { instructions_adequate: 2, assignment_verifiable: 0.9 } } }) },
+    { name: "an invalid assignment probability", mutate: (input) => ({ ...input, probabilities: { quality: { instructions_adequate: 0.9, assignment_verifiable: "x" } } }) },
+    { name: "a non-record probability category", mutate: (input) => ({ ...input, probabilities: { category: 5 } }) },
+    { name: "an unbounded probability category", mutate: (input) => ({ ...input, probabilities: { category: { category: "", confidence: 0.9 } } }) },
+    { name: "an invalid category confidence", mutate: (input) => ({ ...input, probabilities: { category: { category: "worker", confidence: 2 } } }) },
+    { name: "a non-record category distribution", mutate: (input) => ({ ...input, probabilities: { category: { category: "worker", confidence: 0.9, probabilities: 5 } } }) },
+    { name: "an unbounded category distribution name", mutate: (input) => ({ ...input, probabilities: { category: { category: "worker", confidence: 0.9, probabilities: { "": 1 } } } }) },
+    { name: "an invalid category distribution probability", mutate: (input) => ({ ...input, probabilities: { category: { category: "worker", confidence: 0.9, probabilities: { worker: 2 } } } }) },
+    { name: "a category distribution that does not sum to one", mutate: (input) => ({ ...input, probabilities: { category: { category: "worker", confidence: 0.9, probabilities: { worker: 0.5 } } } }) },
+    { name: "a non-array probability candidate list", mutate: (input) => ({ ...input, probabilities: { candidates: {} } }) },
+    { name: "a non-record probability candidate", mutate: (input) => ({ ...input, probabilities: { candidates: [5] } }) },
+    { name: "a fractional probability candidate index", mutate: (input) => ({ ...input, probabilities: { candidates: [{ index: 0.5, runner: "pi", model: "m", resources: {} }] } }) },
+    { name: "an unknown probability candidate runner", mutate: (input) => ({ ...input, probabilities: { candidates: [{ index: 0, runner: "weird", model: "m", resources: {} }] } }) },
+    { name: "an unbounded probability candidate model", mutate: (input) => ({ ...input, probabilities: { candidates: [{ index: 0, runner: "pi", model: "", resources: {} }] } }) },
+    { name: "non-record probability candidate resources", mutate: (input) => ({ ...input, probabilities: { candidates: [{ index: 0, runner: "pi", model: "m", resources: 5 }] } }) },
+    { name: "a non-record resource probability map", mutate: (input) => ({ ...input, probabilities: { candidates: [{ index: 0, runner: "pi", model: "m", resources: { tools: 5 } }] } }) },
+    { name: "an unbounded resource probability name", mutate: (input) => ({ ...input, probabilities: { candidates: [{ index: 0, runner: "pi", model: "m", resources: { tools: { "": 0.9 } } }] } }) },
+    { name: "an invalid resource probability", mutate: (input) => ({ ...input, probabilities: { candidates: [{ index: 0, runner: "pi", model: "m", resources: { tools: { read: 2 } } }] } }) },
+    { name: "a non-record composition probability", mutate: (input) => ({ ...input, probabilities: { composition: 5 } }) },
+    { name: "an invalid composition probability", mutate: (input) => ({ ...input, probabilities: { composition: { missing_area: 2 } } }) },
+    { name: "a non-array exclusion list", mutate: (input) => ({ ...input, evidence: { exclusions: {} } }) },
+    { name: "a non-record exclusion", mutate: (input) => ({ ...input, evidence: { exclusions: [5] } }) },
+    { name: "an exclusion outside pool fields", mutate: (input) => ({ ...input, evidence: { exclusions: [{ field: "other", name: "x", noul: 0.5 }] } }) },
+    { name: "an exclusion with an unbounded name", mutate: (input) => ({ ...input, evidence: { exclusions: [{ field: "tools", name: "", noul: 0.5 }] } }) },
+    { name: "an exclusion with an invalid probability", mutate: (input) => ({ ...input, evidence: { exclusions: [{ field: "tools", name: "x", noul: 2 }] } }) },
     { name: "a non-record runtime", mutate: (input) => ({ ...input, result: admitted({ configuration: { ...configuration(), runtime: 5 as never } }) }) },
     { name: "an unbounded runtime kind", mutate: (input) => ({ ...input, result: admitted({ configuration: { ...configuration(), runtime: { kind: "" } as never } }) }) },
     { name: "an unknown runtime kind", mutate: (input) => ({ ...input, result: admitted({ configuration: { ...configuration(), runtime: { kind: "weird", model: "m" } as never } }) }) },
@@ -490,6 +531,23 @@ describe("appendRouterDecision projections", () => {
       bypass: { label: "transport-abstain", quality: "not_evaluated" },
       availability: [{ index: 0, status: "known-exhausted", retryNotBefore: "2026-09-19T00:00:00.000Z" }],
     });
+  });
+
+  it("persists allowlisted resource exclusions in result and entry evidence", async () => {
+    const root = await tempdir();
+    const exclusions = [{ field: "tools" as const, name: "executor_execute", noul: 0.5 }];
+    const withExclusions = { ...evidence(), exclusions };
+    await appendRouterDecision(entry({ evidence: withExclusions, result: admitted({ evidence: withExclusions }) }), { root });
+    const record = (await readRecords(routerLogPaths(root).decisions))[0]!;
+    expect(record.evidence.exclusions).toEqual(exclusions);
+    expect((record.result as Admitted).evidence.exclusions).toEqual(exclusions);
+  });
+
+  it("persists category evidence when its optional distribution is absent", async () => {
+    const root = await tempdir();
+    await appendRouterDecision(entry({ probabilities: { category: { category: "worker", confidence: 0.9 } } }), { root });
+    const record = (await readRecords(routerLogPaths(root).decisions))[0]!;
+    expect(record.probabilities).toEqual({ category: { category: "worker", confidence: 0.9 } });
   });
 
   it("persists abstained results with and without a component, and attached evidence", async () => {

@@ -162,6 +162,8 @@ export interface QualityJudgment {
 export interface CategoryJudgment {
   category: string;
   confidence: number;
+  /** The validated choice distribution, retained for decision-log evidence. */
+  probabilities?: Readonly<Record<string, number>>;
 }
 
 /** One candidate's runner-qualified resource judgments after B6 normalizes Jev output. */

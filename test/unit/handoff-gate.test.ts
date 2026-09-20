@@ -38,7 +38,7 @@ afterEach(() => {
 
 const runIdentity: HandoffRunIdentity = {
   manager: { paneId: "w1:p1", display: "caller", source: "injected" },
-  child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: [] }
+  child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
 };
 
 const launched: HandoffBoundIdentity = {

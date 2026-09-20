@@ -26,7 +26,7 @@ const agyEnabled = process.env.HERDR_TOOLS_RUN_AGY_INTEGRATION === "1";
 // a working provider/model pair for every worker-pi launch below. Unset means
 // the profile default runs unchanged.
 const piLaunchOverrides = process.env.HERDR_TOOLS_INTEGRATION_PI_MODEL === undefined ? undefined : { model: process.env.HERDR_TOOLS_INTEGRATION_PI_MODEL };
-const piEffectiveModel = process.env.HERDR_TOOLS_INTEGRATION_PI_MODEL ?? "openai-codex/gpt-5.6-luna";
+const piEffectiveModel = process.env.HERDR_TOOLS_INTEGRATION_PI_MODEL ?? "openai-codex/gpt-5.6-sol";
 const ACCEPTANCE_DEADLINE_MS = 150_000;
 
 function resultObject(value: unknown): Record<string, unknown> {

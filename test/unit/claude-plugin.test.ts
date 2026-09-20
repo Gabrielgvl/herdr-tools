@@ -204,10 +204,7 @@ describe("generated manager profile plugin", () => {
     }
   });
 
-  it("is the only plugin directory the manager profiles point at, and ships no policy surface", () => {
-    const managerClaude = readFileSync(join(repoRoot, "herdr-profiles", "manager-claude.md"), "utf8");
-    expect(managerClaude).toContain("- herdr-profiles/profile-plugins/manager\n");
-    expect(managerClaude).not.toContain("- herdr-profiles/role-plugins/manager\n");
+  it("stays out of the marketplace and ships no policy surface", () => {
     const marketplace = JSON.parse(readFileSync(join(repoRoot, ".claude-plugin/marketplace.json"), "utf8")) as { plugins: Array<{ source: string }> };
     // The globally published plugin stays the minimal package, not this one.
     expect(marketplace.plugins.map((plugin) => plugin.source)).toEqual(["./herdr-profiles/role-plugins/manager"]);

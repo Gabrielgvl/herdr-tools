@@ -76,10 +76,10 @@ function response(overrides: {
   }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
-const model = { id: "luna", provider: "test" } as Model<Api>;
+const model = { id: "testmodel", provider: "test" } as Model<Api>;
 function registry(): ModelRegistrySeam {
   return {
-    find: (provider, id) => provider === "test" && id === "luna" ? model : undefined,
+    find: (provider, id) => provider === "test" && id === "testmodel" ? model : undefined,
     getAll: () => [model],
     getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "chat-key" }),
   };
@@ -97,10 +97,10 @@ describe("TypeSafe wait reviewer", () => {
       fetch: async () => response(),
     });
     expect(selected).toBeInstanceOf(TypeSafeReviewer);
-    expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "test/luna")).toBeInstanceOf(PiModelReviewer);
-    const fallbackReviewer = new PiModelReviewer(registry(), "test/luna");
+    expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "test/testmodel")).toBeInstanceOf(PiModelReviewer);
+    const fallbackReviewer = new PiModelReviewer(registry(), "test/testmodel");
     const fallback = vi.fn(() => fallbackReviewer);
-    expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "test/luna", undefined, fallback)).toBe(fallbackReviewer);
+    expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "test/testmodel", undefined, fallback)).toBe(fallbackReviewer);
     const fetchCall = vi.fn<(input: string | URL, init?: RequestInit) => Promise<Response>>();
     expect(createConfiguredWaitReviewer({ modelRegistry: registry() }, "typesafe/jev-latest", { apiKey: "key", fetch: fetchCall }, fallback)).toBe(fallbackReviewer);
     expect(fallback).toHaveBeenCalledTimes(2);

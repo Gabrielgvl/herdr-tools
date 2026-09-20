@@ -145,7 +145,7 @@ async function socketEnv(base: string): Promise<NodeJS.ProcessEnv> {
 
 const identity: HandoffRunIdentity = {
   manager: { paneId: "w1:p1", display: "caller", source: "injected" },
-  child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: ["worker-claude"] }
+  child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: ["worker-claude"] }
 };
 
 function allocatorFor(dir: string, endpoint = "test-endpoint") {
@@ -236,9 +236,9 @@ describe("run allocation and state", () => {
       child: {
         agentName: "worker",
         agentKind: "pi",
-        profileName: "worker-pi",
-        requestedProfile: "worker-pi",
-        fallbackProfiles: ["worker-claude"],
+        candidateName: "worker-pi",
+        specLabel: "worker-pi",
+        fallbackCandidates: ["worker-claude"],
         paneId: null,
         terminalId: null,
         agentId: null

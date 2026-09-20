@@ -137,7 +137,7 @@ src/supervision/
   monitor.ts     SessionEventMonitor: one connection, bootstrap, reconnect, fan-out
   identity.ts    exact child identity, continuity, and move-continuity rules
   events.ts      transition folding, material-wake classification, opaque event IDs
-  reviewer.ts    supervisor reviewer (gpt-5.6-luna, thinking=max) + model service seam
+  reviewer.ts    supervisor reviewer (typesafe/jev-latest, SUPERVISION_REVIEWER_MODEL) + model service seam
   notify.ts      ManagerNotifier: Pi sendMessage and Claude Channel implementations
   supervisor.ts  one child's state machine, cadence, degradation, receipts
   registry.ts    SupervisionRegistry: reserve → bind → settle, job ownership
@@ -328,15 +328,34 @@ supervisor job settles immediately after the wake.
 
 - Cadence: `settings.wait.reviewCadenceMinutes` (default 5), measured from the start of a
   **continuous** `working` run. Any transition out of `working` resets the timer.
-- Model: exactly `openai-codex/gpt-5.6-luna`, `thinkingLevel: "max"`. This is a module
-  constant, not a setting: the setting `wait.reviewerModel` continues to govern the
-  explicit `herdr_wait` reviewer, which stays Luna at `low`.
+- Model: `typesafe/jev-latest` — the module constant `SUPERVISION_REVIEWER_MODEL` in
+  `src/supervision/reviewer.ts`, not a setting. Jev carries no thinking level. The setting
+  `wait.reviewerModel` continues to govern the explicit `herdr_wait` reviewer, which stays
+  at `low` thinking.
+- Contract (ADR-033/034 V2): one `systemOne` call per review carrying six independent
+  `noul` predicates — `evidence_sufficient`, `making_progress`, `stalled`, `blocked`,
+  `risk`, `appears_complete` — plus one `reason` `choice` question over the bounded reason
+  vocabulary (`repetition`, `no_output`, `oscillation`, `external_dependency`,
+  `missing_permission`, `tool_failure`, `scope_drift`, `destructive_action`,
+  `incorrect_direction`, `completion_claim`, `artifact_produced`, `verification_passed`,
+  `none`). All probabilities are logged internally.
+- Classification is deterministic code — `reduceSupervisionReview` in `src/reviewer.ts`:
+  the evidence gate runs first (`P(evidence_sufficient) < SUPERVISION_EVIDENCE_THRESHOLD`
+  = 0.60 classifies `unknown` before any signal is judged), then precedence `risk`
+  (`SUPERVISION_RISK_THRESHOLD` 0.60) → `blocked` (`SUPERVISION_BLOCKED_THRESHOLD` 0.65) →
+  `appears_complete` (`SUPERVISION_APPEARS_COMPLETE_THRESHOLD` 0.70) → `stalled`
+  (`SUPERVISION_STALLED_THRESHOLD` 0.70, raised to
+  `SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD` 0.85 on the child's first review) →
+  `progress` (`SUPERVISION_PROGRESS_THRESHOLD` 0.60), falling through to `unknown` when no
+  signal crosses. Temporal state is in-memory only.
 - Evidence: bounded compact pane metadata plus the transcript delta since the previous
   **completed** review, read through the existing `pane read --source recent-unwrapped` path.
   A pane read returns the latest window rather than what changed, so the delta is computed
   against the window the previous review consumed, using the same rule the explicit wait
   reviewer uses (`src/transcript-delta.ts`). Handing the whole window back each cadence would
-  let a stalled child keep reading as fresh progress.
+  let a stalled child keep reading as fresh progress. The call also carries the launch's
+  authorial `supervisionDigest` — `doneWhen`/`constraints` recorded at reservation — and the
+  previous review's classification and signals.
 - A review is only evidence about the run it was started for. If the child leaves `working`
   while the transcript read or the model call is in flight, the review is abandoned: nothing
   is stored, nothing is announced, and the transcript cursor does not advance over lines no
@@ -349,22 +368,24 @@ supervisor job settles immediately after the wake.
 - The reviewer never starts a Herdr agent and never creates a pane.
 - Reviews are bounded to `SUPERVISION_MAX_REVIEWS = 24` with a `truncatedReviews` count.
 
-**Model service.** The reviewer resolves its model through a narrow
-`SupervisionModelService` seam:
+**Model service.** The Jev reviewer resolves its credential through `resolveTypesafeApiKey`
+(`src/typesafe-reviewer.ts`): an explicit key wins, then the `TYPESAFE_API_KEY` environment
+variable, then the `typesafe` `api_key` entry in the Pi auth store —
+`AuthJsonCredentialStore` (`src/supervision/auth-json-credential-store.ts`), a
+`CredentialStore` backed by the Pi agent's `auth.json`
+(`$PI_CODING_AGENT_DIR/auth.json`, default `~/.pi/agent/auth.json`), the same file the Pi
+host logs into. A missing, malformed, or credential-less store resolves as "not
+authenticated" and degrades the reviewer; it never crashes the supervisor.
+
+The narrow `SupervisionModelService` seam is retained in the registry for hosts that still
+wire it, but the Jev reviewer does not consult it:
 
 - **Pi host** — adapts the host's existing `ModelRegistrySeam` (`ctx.modelRegistry`).
 - **MCP host** — `createBuiltinModelService()` builds a host-independent service from the
   installed Pi packages (`builtinModels()` from `@earendil-works/pi-ai/providers/all`,
-  `getAuth()` for credentials). Its `Models` resolves credentials through
-  `AuthJsonCredentialStore` (`src/supervision/auth-json-credential-store.ts`), a
-  `CredentialStore` backed by the Pi agent's `auth.json`
-  (`$PI_CODING_AGENT_DIR/auth.json`, default `~/.pi/agent/auth.json`) — the same file the
-  Pi host logs into — so the reviewer reuses the host's existing `openai-codex` OAuth
-  login, and OAuth refreshes persist back to that file under the shared
-  `proper-lockfile` lock. A missing, malformed, or credential-less file resolves as
-  "not authenticated" and degrades the reviewer; it never crashes the supervisor. The
-  MCP host never exposes `context.modelRegistry`, and the `hostContext` proxy keeps
-  throwing for it.
+  `getAuth()` for credentials); OAuth refreshes persist back to `auth.json` under the
+  shared `proper-lockfile` lock. The MCP host never exposes `context.modelRegistry`, and
+  the `hostContext` proxy keeps throwing for it.
 
 Unresolvable model or unavailable auth is a reviewer failure (degraded episode), never a
 supervisor failure and never a substitute model.
@@ -448,7 +469,7 @@ unobserved counts. Event history is bounded to `SUPERVISION_MAX_EVENTS = 48` wit
 follows:
 
 1. `supervision_reserve` runs **before any topology mutation**, immediately after the
-   pre-flight/profile/attachment block. It ensures the session monitor is connected,
+   pre-flight/attachment block. It ensures the session monitor is connected,
    bootstrapped, and subscribed, and registers the supervisor job in `accepted`, returning a
    stable job ID. A failure here is an ordinary early failure with `effectCertainty:
    "absent"` and code `SUPERVISION_UNAVAILABLE`.
@@ -456,7 +477,7 @@ follows:
    before optional focus or any initial-prompt dispatch. Binding validates a fresh
    `session.snapshot`, drains all queued pre-bind evidence while the public view remains
    `reserved`, and succeeds only when the exact child is still live and the supervisor is not
-   settled. Its commit publishes the selected profile, selected kind, and
+   settled. Its commit publishes the selected candidate, selected kind, and
    `request.targetIds: [exactPaneId]` before publishing bound `active` or `degraded` state.
 
 Queued closure, release, replacement, or identity-loss evidence during bind makes the bind
@@ -466,7 +487,7 @@ only the unbound reservation. A failed bind rolls any provisional request fields
 reserved snapshot with `targetIds: []`. The real child and failed binding evidence remain
 available for manual inspection.
 
-Profile fallback stays strictly inside `agent_start`, before assignment and before binding,
+Candidate fallback stays strictly inside `agent_start`, before assignment and before binding,
 so the fallback chain is unchanged. After a successful bind, no later launch failure releases,
 cancels, or shuts down the supervisor. The supervisor remains session-scoped and follows its
 own exact-child lifecycle rules.
@@ -541,25 +562,17 @@ settlements never re-notify, because their events already woke the manager. Ever
 kind resolution, context or identity proof, the prompt write, the acknowledgement — is
 swallowed: `herdr_jobs` polling stays the recovery contract on every host.
 
-`manager-claude` no longer opts in. It declares no `runtime.developmentChannels`, so no
-`--dangerously-load-development-channels` opt-in is emitted, and the session raises neither
-the organization-policy warning nor the missing-MCP-server warning at startup. Claude manager
-wakes are recovered by `herdr_jobs` polling, which returns pending events by opaque ID and
-marks exactly those observed.
+No compiled candidate contract declares `developmentChannels` — the catalog's reviewed
+resource pools expose no such pool — so no `--dangerously-load-development-channels` opt-in
+is emitted for any launch, and Claude sessions raise neither the organization-policy
+warning nor the missing-MCP-server warning at startup. Claude manager wakes are recovered
+by `herdr_jobs` polling, which returns pending events by opaque ID and marks exactly those
+observed.
 
-Generic support for the flag remains, so any profile may still opt in by declaring a tagged
-entry:
-
-```
---dangerously-load-development-channels server:herdr
-```
-
-The flag is hidden from `claude --help` in 2.1.252 but is a real root-command option, and
-`--channels` is proven to require a tagged `server:<name>` or `plugin:<name>@<marketplace>`
-entry. Entries are declared in the profile as `runtime.developmentChannels` rather than
-hard-coded in the adapter, and are validated as tagged entries at profile-parse time, so a
-different install can opt in without a code change. The field is profile-only: a launch
-override must not be able to open an inbound channel the profile did not declare. See §16.
+The flag itself is real but unused: it is hidden from `claude --help` in 2.1.252 yet parses
+as a root-command option, and `--channels` requires a tagged `server:<name>` or
+`plugin:<name>@<marketplace>` entry. Nothing in the catalog or the compiler can declare
+one, so no caller input can open an inbound channel. See §16.
 
 ## 13. Settings
 
@@ -585,15 +598,14 @@ operation. No compatibility shim preserves the old wording.
 
 ## 16. Known risks
 
-- **R1 — channel delivery (retired for `manager-claude`).** `--dangerously-load-development-channels`
+- **R1 — channel delivery (no launch opts in).** `--dangerously-load-development-channels`
   is proven to exist and to parse on Claude 2.1.252, and the entry `server:herdr` matches the
   plugin's own MCP server key, but end-to-end channel delivery was never proven here: it also
   requires the organization's `channelsEnabled` managed setting, which this repository can
   neither set nor observe, and the unproven opt-in additionally produced org-policy and
-  missing-MCP-server warnings at startup. `manager-claude` therefore declares no channels, and
-  its wakes are recovered by `herdr_jobs` polling. The risk applies only to a profile that
-  chooses to opt in; soft receipts make every event recoverable through `herdr_jobs get`, and
-  Pi delivery is unaffected.
+  missing-MCP-server warnings at startup. No compiled contract declares channels, so wakes
+  on a Claude manager are recovered by `herdr_jobs` polling. Soft receipts make every event
+  recoverable through `herdr_jobs get`, and Pi delivery is unaffected.
 - **R2 — replay volume and observer load.** A long-lived Herdr session replays a large log
   on every connect and reconnect, and `pane.updated` fires on output changes for every pane
   in the session. The monitor parses each line under a per-line bound and discards

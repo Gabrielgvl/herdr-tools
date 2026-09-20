@@ -33,25 +33,25 @@ describe("extension-owned settings", () => {
   });
 
   it("loads only the documented extension-owned shape without coercion", async () => {
-    const fake = fsWith(JSON.stringify({ wait: { reviewCadenceMinutes: 10, reviewerModel: "luna" } }));
+    const fake = fsWith(JSON.stringify({ wait: { reviewCadenceMinutes: 10, reviewerModel: "testmodel" } }));
     await expect(loadSettings({ readFile: fake.readFile })).resolves.toEqual({
       reviewCadenceMinutes: 10,
-      reviewerModel: "luna",
+      reviewerModel: "testmodel",
       reviewerThinking: "low"
     });
   });
 
   it.each([
     "{",
-    JSON.stringify({ wait: { reviewCadenceMinutes: 0, reviewerModel: "luna" } }),
-    JSON.stringify({ wait: { reviewCadenceMinutes: 31, reviewerModel: "luna" } }),
-    JSON.stringify({ wait: { reviewCadenceMinutes: 5.5, reviewerModel: "luna" } }),
+    JSON.stringify({ wait: { reviewCadenceMinutes: 0, reviewerModel: "testmodel" } }),
+    JSON.stringify({ wait: { reviewCadenceMinutes: 31, reviewerModel: "testmodel" } }),
+    JSON.stringify({ wait: { reviewCadenceMinutes: 5.5, reviewerModel: "testmodel" } }),
     JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: "" } }),
     JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: "   " } }),
     JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: 42 } }),
-    JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: "luna\nmodel" } }),
-    JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: "luna" }, extra: true }),
-    JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: "luna", thinking: "high" } })
+    JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: "testmodel\nmodel" } }),
+    JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: "testmodel" }, extra: true }),
+    JSON.stringify({ wait: { reviewCadenceMinutes: 5, reviewerModel: "testmodel", thinking: "high" } })
   ])("fails closed for malformed or invalid config: %s", async (value) => {
     const fake = fsWith(value);
     await expect(loadSettings({ readFile: fake.readFile })).rejects.toBeInstanceOf(SettingsError);
@@ -71,23 +71,23 @@ describe("extension-owned settings", () => {
   });
 
   it("does not read project or Pi settings and ignores tool override fields", async () => {
-    const fake = fsWith(JSON.stringify({ wait: { reviewCadenceMinutes: 7, reviewerModel: "luna" } }));
+    const fake = fsWith(JSON.stringify({ wait: { reviewCadenceMinutes: 7, reviewerModel: "testmodel" } }));
     await expect(loadSettings({
       readFile: fake.readFile,
       toolInput: { reviewCadenceMinutes: 1, reviewerModel: "other", reviewerThinking: "low" }
-    })).resolves.toMatchObject({ reviewCadenceMinutes: 7, reviewerModel: "luna", reviewerThinking: "low" });
+    })).resolves.toMatchObject({ reviewCadenceMinutes: 7, reviewerModel: "testmodel", reviewerThinking: "low" });
     expect(fake.paths).toEqual(["/home/gabriel/.pi/agent/extensions/herdr-tools/config.json"]);
   });
 
   it("returns a fresh immutable snapshot on each load", async () => {
-    let value: SettingsFile = { wait: { reviewCadenceMinutes: 5, reviewerModel: "luna" } };
+    let value: SettingsFile = { wait: { reviewCadenceMinutes: 5, reviewerModel: "testmodel" } };
     const paths: string[] = [];
     const readFile = async (path: string) => {
       paths.push(path);
       return JSON.stringify(value);
     };
     const first = await loadSettings({ readFile });
-    value = { wait: { reviewCadenceMinutes: 12, reviewerModel: "luna" } };
+    value = { wait: { reviewCadenceMinutes: 12, reviewerModel: "testmodel" } };
     const second = await loadSettings({ readFile });
 
     expect(first.reviewCadenceMinutes).toBe(5);

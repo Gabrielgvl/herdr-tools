@@ -44,7 +44,7 @@ function waitDetail(overrides: Partial<JobDetail> = {}): JobDetail {
       match: "any",
       condition: { kind: "state", state: "done" },
       timeoutMs: 1,
-      settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "low" },
+      settings: { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" },
     },
     result: { wait_result: "condition_met", matched: true, reason: "condition_met", matchedTargets: [{ target: "worker", targetId: "w1:p2" }] },
     ...overrides,
@@ -854,7 +854,7 @@ describe("the MCP host wake router", () => {
     expect(prompts[0]!.text).toContain("wait_result=condition_met");
 
     const before = calls.length;
-    host.notifyJobTerminal(waitDetail({ kind: "supervisor" as never, request: { kind: "supervisor", label: "sup", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" }, settings: { reviewCadenceMinutes: 1, reviewerModel: "luna", reviewerThinking: "max" } } }));
+    host.notifyJobTerminal(waitDetail({ kind: "supervisor" as never, request: { kind: "supervisor", label: "sup", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" }, settings: { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "max" } } }));
     await flush();
     expect(calls.length).toBe(before);
     expect(prompts).toHaveLength(1);

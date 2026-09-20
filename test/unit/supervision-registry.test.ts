@@ -18,7 +18,7 @@ const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s1" };
 const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session };
 const agyIdentity: ProvisionalSupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy" };
 const agySession = { source: "agy", agent: "agy", kind: "id", value: "agy-1" };
-const settings = { reviewCadenceMinutes: 5, reviewerModel: "luna", reviewerThinking: "low" as const };
+const settings = { reviewCadenceMinutes: 5, reviewerModel: "testmodel", reviewerThinking: "low" as const };
 
 const pane = { pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "working", revision: 3, agent: "pi", agent_session: session };
 
@@ -70,7 +70,7 @@ async function managedAllocation(): Promise<HandoffAllocation> {
   const allocation = await allocator.allocate();
   await allocator.persist(allocation, {
     manager: { paneId: "p0", display: "caller", source: "injected" },
-    child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi", requestedProfile: "worker-pi", fallbackProfiles: [] }
+    child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
   });
   return allocation;
 }
@@ -82,7 +82,7 @@ describe("the supervision registry", () => {
 
   it("registers a supervisor job whose request records the requested child", async () => {
     const f = fixture();
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
     const detail = f.jobs.get(reservation.jobId)!;
     expect(detail.kind).toBe("supervisor");
     expect(detail.request).toMatchObject({
@@ -91,7 +91,7 @@ describe("the supervision registry", () => {
       targets: ["worker"],
       // No pane exists at reservation time, so no target id is back-dated into the request.
       targetIds: [],
-      child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
+      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
       settings: { reviewerModel: "typesafe/jev-latest", reviewerThinking: "max", reviewCadenceMinutes: 5 },
     });
     expect(detail.request.target_generation_refs?.[0]).toMatch(/^target_generation_/u);
@@ -102,7 +102,7 @@ describe("the supervision registry", () => {
     const f = fixture();
     const digest = { doneWhen: ["tests pass"], constraints: ["read-only"] };
     const reservation = await f.supervision.reserve({
-      child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" },
+      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
       settings: { supervisionDigest: digest },
     });
     const detail = f.jobs.get(reservation.jobId)!;
@@ -117,6 +117,21 @@ describe("the supervision registry", () => {
     await f.supervision.shutdown();
   });
 
+  it("records the reservation digest on the job request as a typed field", async () => {
+    const f = fixture();
+    const register = vi.spyOn(f.jobs, "register");
+    const digest = { doneWhen: ["tests pass"], constraints: ["read-only"] };
+    await f.supervision.reserve({
+      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+      settings: { supervisionDigest: digest },
+    });
+    const jobRequest = register.mock.calls[0]![0];
+    if (jobRequest.kind !== "supervisor") throw new Error("expected a supervisor job request");
+    // Type-visible: this access compiles only because the snapshot declares the field.
+    expect(jobRequest.settings.supervisionDigest).toEqual(digest);
+    await f.supervision.shutdown();
+  });
+
   it("publishes AGY provisional supervision and atomically strengthens it to exact coverage", async () => {
     const baseline = snapshotResult([agyPane()], [agyAgent()]);
     const exact = snapshotResult(
@@ -124,21 +139,21 @@ describe("the supervision registry", () => {
       [agyAgent({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
     );
     const f = fixture({ snapshots: [baseline, baseline, exact] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
-    await reservation.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" } });
+    await reservation.bindProvisional({ identity: agyIdentity, candidateName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
     expect(f.jobs.get(reservation.jobId)).toMatchObject({
       operation_phase: "running",
-      request: { targetIds: [], child: { agentKind: "agy", profileName: "researcher-agy" } },
+      request: { targetIds: [], child: { agentKind: "agy", candidateName: "researcher-agy" } },
       supervision: { state: "provisional", provisional: { paneId: "p1", terminalId: "t1", baseline: { stateChangeSeq: 4, revision: 2 } } },
     });
     expect(f.jobs.activeSupervisorFor({ ...agySession, paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy", agentSession: agySession })).toBeUndefined();
     await expect(f.jobs.cancel(reservation.jobId)).rejects.toMatchObject({ code: "SUPERVISION_ACTIVE" });
 
     const exactIdentity: SupervisedIdentity = { ...agyIdentity, agentSession: agySession };
-    await reservation.strengthen({ identity: exactIdentity, profileName: "researcher-agy", stateChangeSeq: 5 });
+    await reservation.strengthen({ identity: exactIdentity, candidateName: "researcher-agy", stateChangeSeq: 5 });
     expect(f.jobs.get(reservation.jobId)).toMatchObject({
       operation_phase: "running",
-      request: { targetIds: ["p1"], child: { agentKind: "agy", profileName: "researcher-agy" } },
+      request: { targetIds: ["p1"], child: { agentKind: "agy", candidateName: "researcher-agy" } },
       supervision: { state: "active", child: { paneId: "p1", agentKind: "agy" }, status: "working" },
     });
     expect(f.jobs.activeSupervisorFor(exactIdentity)).toEqual({ jobId: reservation.jobId });
@@ -149,9 +164,9 @@ describe("the supervision registry", () => {
     const baseline = snapshotResult([agyPane()], [agyAgent()]);
     const replaced = snapshotResult([agyPane({ terminal_id: "t9", agent_status: "working", revision: 3, state_change_seq: 5 })], [agyAgent({ terminal_id: "t9", agent_status: "working", revision: 3, state_change_seq: 5 })]);
     const f = fixture({ snapshots: [baseline, baseline, replaced] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
-    await reservation.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
-    await expect(reservation.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, profileName: "researcher-agy" })).rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "identity_mismatch" } });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" } });
+    await reservation.bindProvisional({ identity: agyIdentity, candidateName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    await expect(reservation.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, candidateName: "researcher-agy" })).rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "identity_mismatch" } });
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running", request: { targetIds: [] }, supervision: { state: "provisional" } });
     expect(f.jobs.activeSupervisorFor({ ...agyIdentity, agentSession: agySession })).toBeUndefined();
     await expect(f.jobs.cancel(reservation.jobId)).rejects.toMatchObject({ code: "SUPERVISION_ACTIVE" });
@@ -161,18 +176,18 @@ describe("the supervision registry", () => {
   it("rolls back the request publication when AGY provisional evidence is rejected", async () => {
     const baseline = snapshotResult([agyPane()], [agyAgent()]);
     const f = fixture({ snapshots: [baseline] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
-    await expect(reservation.bindProvisional({ identity: agyIdentity, profileName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: -1, revision: 2 } }))
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" } });
+    await expect(reservation.bindProvisional({ identity: agyIdentity, candidateName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: -1, revision: 2 } }))
       .rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "provisional_baseline_invalid" } });
-    expect(f.jobs.get(reservation.jobId)).toMatchObject({ request: { targetIds: [], child: { agentKind: "agy", profileName: "researcher-agy" } } });
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ request: { targetIds: [], child: { agentKind: "agy", candidateName: "researcher-agy" } } });
     await f.supervision.shutdown();
   });
 
   it("does not expose AGY provisional state through the exact binding path", async () => {
     const baseline = snapshotResult([agyPane()], [agyAgent()]);
     const f = fixture({ snapshots: [baseline, baseline] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", profileName: "researcher-agy" } });
-    await expect(reservation.bind({ identity: { ...agyIdentity, agentSession: agySession }, profileName: "researcher-agy" })).rejects.toThrow(/STRENGTHENING_REQUIRED/u);
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" } });
+    await expect(reservation.bind({ identity: { ...agyIdentity, agentSession: agySession }, candidateName: "researcher-agy" })).rejects.toThrow(/STRENGTHENING_REQUIRED/u);
     await f.supervision.shutdown();
   });
 
@@ -180,8 +195,8 @@ describe("the supervision registry", () => {
     const gate = createHandoffGate();
     const f = fixture({ handoffs: gate });
     const allocation = await managedAllocation();
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation, agentId: "agent-1" } });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation, agentId: "agent-1" } });
     // The gate bound the run before the child publication committed: the exact
     // identity is lookup-visible and persisted in the sidecar for recovery.
     expect(gate.lookup(identity)).toMatchObject({ runId: allocation.runId, lifecycle: "awaiting_handoff", artifactPath: allocation.artifactPath });
@@ -195,8 +210,8 @@ describe("the supervision registry", () => {
   it("refuses a managed binding on a host with no handoff gate", async () => {
     const f = fixture();
     const allocation = await managedAllocation();
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await expect(reservation.bind({ identity, profileName: "worker-pi", handoff: { allocation } }))
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    await expect(reservation.bind({ identity, candidateName: "worker-pi", handoff: { allocation } }))
       .rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED" });
     // The child publication rolled back: no exact coverage was ever published.
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ request: { targetIds: [] } });
@@ -206,11 +221,11 @@ describe("the supervision registry", () => {
 
   it("binds, publishes a live view, and settles when the exact child goes away", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2 });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2 });
     expect(f.jobs.get(reservation.jobId)).toMatchObject({
       kind: "supervisor",
-      request: { targets: ["worker"], targetIds: ["p1"], child: { agentKind: "pi", profileName: "worker-pi" } },
+      request: { targets: ["worker"], targetIds: ["p1"], child: { agentKind: "pi", candidateName: "worker-pi" } },
       supervision: { state: "active", status: "working", child: { paneId: "p1" } },
     });
     expect(f.jobs.get(reservation.jobId)?.request.target_generation_refs).toHaveLength(1);
@@ -225,9 +240,9 @@ describe("the supervision registry", () => {
 
   it("finds coverage only for the complete exact live identity without observing receipts", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
     expect(f.jobs.activeSupervisorFor(identity)).toBeUndefined();
-    await reservation.bind({ identity, profileName: "worker-pi" });
+    await reservation.bind({ identity, candidateName: "worker-pi" });
     expect(f.jobs.activeSupervisorFor(identity)).toEqual({ jobId: reservation.jobId });
 
     const mismatches: SupervisedIdentity[] = [
@@ -260,14 +275,14 @@ describe("the supervision registry", () => {
 
   it("rolls request target publication back when queued evidence settles during bind", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    const binding = reservation.bind({ identity, profileName: "worker-pi" });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    const binding = reservation.bind({ identity, candidateName: "worker-pi" });
     f.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`);
     await expect(binding).rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "settled_during_bind", settledDuringBind: true } });
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.get(reservation.jobId)).toMatchObject({
       operation_phase: "settled",
-      request: { targets: ["worker"], targetIds: [], child: { agentKind: "pi", profileName: "worker-pi" } },
+      request: { targets: ["worker"], targetIds: [], child: { agentKind: "pi", candidateName: "worker-pi" } },
       supervision_result: "released",
     });
     await f.supervision.shutdown();
@@ -275,8 +290,8 @@ describe("the supervision registry", () => {
 
   it("refuses herdr_jobs cancel while the exact child is live and allows it afterwards", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity, profileName: "worker-pi" });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    await reservation.bind({ identity, candidateName: "worker-pi" });
     const tool = createJobsTool(f.jobs);
     await expect(tool.execute("id", { operation: "cancel", jobId: reservation.jobId } as never, undefined, undefined, {} as never)).rejects.toBeInstanceOf(SupervisionActiveError);
     await expect(f.jobs.cancel(reservation.jobId)).rejects.toMatchObject({ code: "SUPERVISION_ACTIVE" });
@@ -289,8 +304,8 @@ describe("the supervision registry", () => {
 
   it("returns soft receipts through herdr_jobs get and counts them in list", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane])] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity, profileName: "worker-pi" });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    await reservation.bind({ identity, candidateName: "worker-pi" });
     f.push(`${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { ...pane, agent_status: "blocked", revision: 4 } } })}\n`);
     await vi_waitFor(() => (f.jobs.get(reservation.jobId)?.unobservedEvents ?? 0) > 0);
 
@@ -308,7 +323,7 @@ describe("the supervision registry", () => {
 
   it("settles a released reservation instead of leaking its job", async () => {
     const f = fixture();
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
     reservation.release("launch_failed_placement");
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ supervision_result: "failed", supervision_reason: "launch_failed_placement" });
@@ -317,8 +332,8 @@ describe("the supervision registry", () => {
 
   it("cancels every supervisor on manager-session shutdown", async () => {
     const f = fixture({ snapshots: [snapshotResult([pane]), snapshotResult([pane])] });
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
-    await reservation.bind({ identity, profileName: "worker-pi" });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    await reservation.bind({ identity, candidateName: "worker-pi" });
     await f.supervision.shutdown();
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect(f.jobs.get(reservation.jobId)).toMatchObject({ supervision_result: "cancelled", supervision_reason: "manager_session_shutdown" });
@@ -328,7 +343,7 @@ describe("the supervision registry", () => {
   it("keeps a host with no Jev credential visibly degraded rather than silently unreviewed", async () => {
     vi.stubEnv("TYPESAFE_API_KEY", "");
     const f = fixture();
-    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } });
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
     expect(f.jobs.get(reservation.jobId)?.supervision?.reviewer).toMatchObject({ model: "typesafe/jev-latest", degraded: false });
     // The default reviewer is the shared Jev adapter; with no key anywhere it
     // fails closed through the typed authentication path.
@@ -348,7 +363,7 @@ describe("the supervision registry", () => {
       readTranscript: async () => [],
       monitorOptions: { env: {} },
     });
-    await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", profileName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
+    await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
     expect(jobs.size()).toBe(0);
     await supervision.shutdown();
   });
@@ -360,7 +375,7 @@ describe("managed handoff runtime enforcement", () => {
   const paneUpdated = (revision: number, status: string) =>
     `${JSON.stringify({ event: "pane_updated", data: { type: "pane_updated", pane: { ...pane, agent_status: status, revision } } })}\n`;
   const paneClosed = `${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p1", workspace_id: "w1" } })}\n`;
-  const child = { agentName: "worker", agentKind: "pi", profileName: "worker-pi" };
+  const child = { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" };
 
   async function waitForLifecycle(allocation: HandoffAllocation, state: string, timeoutMs = 2_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
@@ -376,7 +391,7 @@ describe("managed handoff runtime enforcement", () => {
     const f = fixture({ handoffs: gate });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
     const run = gate.lookup(identity)!;
     await writeArtifact(allocation);
     f.push(paneUpdated(4, "done"));
@@ -397,7 +412,7 @@ describe("managed handoff runtime enforcement", () => {
     const f = fixture({ handoffs: gate, repairPrompt: async (paneId, text) => { calls.push({ paneId, text }); } });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
 
     f.push(paneUpdated(4, "done"));
     await vi_waitFor(() => calls.length === 1);
@@ -435,7 +450,7 @@ describe("managed handoff runtime enforcement", () => {
     });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
 
     f.push(paneUpdated(4, "done"));
     await vi_waitFor(() => calls.length === 1);
@@ -463,7 +478,7 @@ describe("managed handoff runtime enforcement", () => {
     const f = fixture({ handoffs: gate, snapshots: [snapshotResult([idlePane])], repairPrompt: async (_paneId, text) => { calls.push(text); } });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(calls).toHaveLength(0);
     expect((await readHandoffState(allocation)).repair.attempts).toBe(0);
@@ -476,7 +491,7 @@ describe("managed handoff runtime enforcement", () => {
     const f = fixture({ handoffs: gate, snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
     // The artifact landed while the child was still working; the exit settle
     // validates it before any fallback may be authored.
     await writeArtifact(allocation);
@@ -493,7 +508,7 @@ describe("managed handoff runtime enforcement", () => {
     const f = fixture({ handoffs: gate, snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
     f.push(paneClosed);
     await vi_waitForSettled(f.jobs, reservation.jobId);
     expect((await readHandoffState(allocation)).lifecycle).toMatchObject({ state: "cancelled", detail: "event:pane_closed" });
@@ -505,7 +520,7 @@ describe("managed handoff runtime enforcement", () => {
     const f = fixture({ handoffs: gate });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
     await f.supervision.shutdown();
     await vi_waitForSettled(f.jobs, reservation.jobId);
     // The job reports the supervisor's stop, but the durable run is only ever
@@ -529,7 +544,7 @@ describe("managed handoff runtime enforcement", () => {
     const f = fixture({ handoffs: gate });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
 
     const shutdown = f.supervision.shutdown();
     await vi_waitFor(() => gateShutdownStarted);
@@ -550,7 +565,7 @@ describe("managed handoff runtime enforcement", () => {
     const f = fixture({ handoffs: gate, snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
     const allocation = await managedAllocation();
     const reservation = await f.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
 
     let detail = f.jobs.get(reservation.jobId)!;
     expect(detail.handoff).toMatchObject({ gated: true, runId: allocation.runId, path: allocation.artifactPath, state: "awaiting_handoff" });
@@ -570,13 +585,13 @@ describe("managed handoff runtime enforcement", () => {
   it("reports the explicit ungated reason on supervisor job details", async () => {
     const gated = fixture({ handoffs: createHandoffGate() });
     const unbound = await gated.supervision.reserve({ child });
-    await unbound.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2 });
+    await unbound.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2 });
     expect(gated.jobs.get(unbound.jobId)!.handoff).toEqual({ gated: false, reason: "no_managed_run" });
     await gated.supervision.shutdown();
 
     const gateless = fixture();
     const reservation = await gateless.supervision.reserve({ child });
-    await reservation.bind({ identity, profileName: "worker-pi", stateChangeSeq: 2 });
+    await reservation.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 2 });
     expect(gateless.jobs.get(reservation.jobId)!.handoff).toEqual({ gated: false, reason: "gate_unavailable" });
     await gateless.supervision.shutdown();
   });

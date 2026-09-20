@@ -37,7 +37,7 @@ export interface ProvisionalLifecycleBaseline {
 
 export interface ProvisionalSupervisionBinding {
   identity: ProvisionalSupervisedIdentity;
-  profileName: string;
+  candidateName: string;
   baseline: ProvisionalLifecycleBaseline;
 }
 

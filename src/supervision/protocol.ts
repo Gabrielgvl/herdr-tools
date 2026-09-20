@@ -127,7 +127,20 @@ export interface SupervisionSocketEvent {
   pane?: SupervisionPaneRecord;
   /** Present for `pane_moved`; validated at the boundary. */
   previousPaneId?: string;
+  /** Present for `pane_exited`; the bounded exit fact the event proves. */
+  exit?: PaneExitFact;
 }
+
+/**
+ * What a `pane_exited` event proves about the process's exit (ADR-036 W0).
+ * Herdr's transport carries no exit status or signal today, so a thin event
+ * parses to the unavailable variant — pane loss alone is never a crash fact.
+ * A transport that reports `exit_code` or `signal` yields the observed
+ * variant; a malformed field fails closed rather than degrading into a guess.
+ */
+export type PaneExitFact =
+  | { readonly available: true; readonly exitCode?: number; readonly signal?: string }
+  | { readonly available: false; readonly reason: "exit_status_not_reported" };
 
 /** A line that parsed but carries an event kind outside the accepted set. */
 export interface SupervisionSocketIgnored {
@@ -210,13 +223,44 @@ export function isPaneRecordEvent(kind: SupervisionEventKind): boolean {
   return (PANE_RECORD_EVENT_KINDS as readonly string[]).includes(kind);
 }
 
+/** The longest accepted signal name — generous for any signal spelling, bounded against stream garbage. */
+const PANE_EXIT_SIGNAL_MAX_CHARS = 64;
+
+function optionalExitCode(data: Record<string, unknown>): number | undefined {
+  const value = data.exit_code;
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new SupervisionProtocolError("Herdr pane exit status is malformed", { field: "exit_code" });
+  }
+  return value;
+}
+
+function optionalExitSignal(data: Record<string, unknown>): string | undefined {
+  const value = data.signal;
+  if (value === undefined || value === null) return undefined;
+  const signal = requiredString(value, "signal");
+  if (signal.length > PANE_EXIT_SIGNAL_MAX_CHARS) {
+    throw new SupervisionProtocolError("Herdr pane exit status is malformed", { field: "signal" });
+  }
+  return signal;
+}
+
+function paneExitFact(data: Record<string, unknown>): PaneExitFact {
+  const exitCode = optionalExitCode(data);
+  const signal = optionalExitSignal(data);
+  if (exitCode === undefined && signal === undefined) return { available: false, reason: "exit_status_not_reported" };
+  return { available: true, ...(exitCode === undefined ? {} : { exitCode }), ...(signal === undefined ? {} : { signal }) };
+}
+
 /**
  * Validate one accepted event's own fields. A `PaneInfo`-bearing kind must carry
  * a complete pane record, `pane_moved` must additionally be atomic, and a thin
- * kind must carry a usable pane id.
+ * kind must carry a usable pane id. `pane_exited` alone of the thin kinds also
+ * carries the bounded exit fact.
  */
 function validateEvent(event: SupervisionEventKind, data: Record<string, unknown>): Omit<SupervisionSocketEvent, "kind" | "event" | "data"> {
   if (data.type !== event) throw new SupervisionProtocolError("Herdr socket event type does not match its kind", { event });
+  if (event === "pane_exited") return { paneId: requiredString(data.pane_id, "pane_id"), exit: paneExitFact(data) };
   if (!isPaneRecordEvent(event)) return { paneId: requiredString(data.pane_id, "pane_id") };
   const pane = parsePaneRecord(data.pane);
   if (event !== "pane_moved") return { paneId: pane.paneId, pane };

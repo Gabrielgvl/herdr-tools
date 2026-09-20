@@ -125,6 +125,51 @@ export interface SupervisionChildBindingPublication {
   publish(): void;
 }
 
+/**
+ * The reservation's authorial digest (ADR-034) extended by ADR-036 W0 with the
+ * bounded `readOnly` claim — absent means false. Never parsed from the
+ * free-form constraint prose.
+ */
+export interface SupervisionReservationDigest extends SupervisionAssignmentDigest {
+  readOnly?: boolean;
+}
+
+/**
+ * One fact about the compiled runner's deny channel (ADR-036 W0). Only the
+ * claude runtime has a `disallowedTools` argv surface; every other runner —
+ * and any binding that cannot be matched to a reserved candidate — records
+ * the typed gap rather than an inferred list.
+ */
+export type SupervisionForbiddenTools =
+  | { readonly available: true; readonly tools: readonly string[] }
+  | { readonly available: false; readonly reason: "runner_lacks_disallowed_tools" | "candidate_not_reserved" | "candidate_ambiguous" };
+
+/**
+ * The deny-list fact of one compiled chain candidate, tagged by the identity
+ * the binding reports. The reservation carries every usable candidate's fact
+ * because fallback may start a different runner than the one reserved.
+ */
+export interface SupervisionForbiddenToolsPolicy {
+  readonly agentKind: string;
+  readonly candidateName: string;
+  readonly forbiddenTools: SupervisionForbiddenTools;
+}
+
+export type SupervisionWorkspaceRootUnavailableReason =
+  /** No usable root string exists — e.g. an existing pane whose record carries no cwd. */
+  | "root_unavailable"
+  /** The launch-resolved cwd is relative — the reservation never resolves it against the supervisor's cwd. */
+  | "root_not_absolute";
+
+/**
+ * The trusted child workspace root (ADR-036 W0): the launch-resolved `--cwd`
+ * for a new pane/tab, or the existing pane's own `cwd` record. Never inferred
+ * from the supervisor process.
+ */
+export type SupervisionWorkspaceRoot =
+  | { readonly available: true; readonly root: string }
+  | { readonly available: false; readonly reason: SupervisionWorkspaceRootUnavailableReason };
+
 /** The request half of an AGY provisional binding. */
 export interface ProvisionalSupervisionChildBinding {
   agentKind: string;
@@ -143,8 +188,12 @@ export interface SupervisorJobRequestSnapshot extends JobRequestCommon {
      * projection still emits it — removal changes the wire-visible request.
      */
     reviewerThinking: "max";
-    /** The reservation's authorial digest (ADR-034). Private to the job record; the public projection drops it. */
-    supervisionDigest?: SupervisionAssignmentDigest;
+    /** The reservation's authorial digest (ADR-034; `readOnly` added by ADR-036 W0). Private to the job record; the public projection drops it. */
+    supervisionDigest?: SupervisionReservationDigest;
+    /** Per-compiled-candidate deny-list facts (ADR-036 W0); the binding resolves the entry for the runner that started. Private to the job record. */
+    forbiddenTools?: readonly SupervisionForbiddenToolsPolicy[];
+    /** The trusted child workspace root the workspace evidence reads (ADR-036 W0). Private to the job record. */
+    workspaceRoot?: SupervisionWorkspaceRoot;
   };
 }
 

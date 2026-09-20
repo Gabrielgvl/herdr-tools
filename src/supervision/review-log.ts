@@ -9,14 +9,22 @@
  * name and kind, classification, every signal probability including the
  * non-activating ones, evidence sufficiency, the reason code, the attention
  * decision, the progress watermark, the previous classification, the new-line
- * count, and the evidence cursors the review pinned (pane, terminal, agent
+ * count, the evidence cursors the review pinned (pane, terminal, agent
  * session, pane revision, lifecycle sequence, consumed transcript window,
- * working time). An attention wake additionally appends a `wake` record whose
- * `disposition` is honestly `unknown`; a manager-observed disposition is a
- * `disposition` record appended through the same file by
- * `appendSupervisionDisposition`, superseding by `eventId` — latest wins, and
- * absent never defaults to "acted". No raw transcript, no caller prose, and
- * no reviewer summary text reaches the file.
+ * working time), and bounded ADR-036 provenance — the evidence's
+ * representation label, trace source, cursor labels, trace/workspace content
+ * hashes, byte counts, and the version-identity hash. An attention wake
+ * additionally appends a `wake` record whose `disposition` is honestly
+ * `unknown`; a manager-observed disposition is a `disposition` record
+ * appended through the same file by `appendSupervisionDisposition`,
+ * superseding by `eventId` — latest wins, and absent never defaults to
+ * "acted". A cadence whose Tier-0 checks fire appends one `violation` record
+ * per emitted wake instead — a closed violation kind, the wake's bounded
+ * detail scalars, and the cadence's provenance — carrying no classification
+ * or probability fields at all, because a deterministic code finding never
+ * passed through Jev. Its `disposition` supersedes by `eventId` exactly like
+ * a review wake's. No raw transcript, no caller prose, and no reviewer
+ * summary text reaches the file.
  *
  * Persistence is allowlisted before `modelSafeJson` ever runs: each line is
  * built from typed fields — every nested object rebuilt from its allowlisted
@@ -48,6 +56,7 @@ import { REVIEW_CLASSIFICATIONS, type ReviewClassification } from "../reviewer.j
 import { SUPERVISION_EVENT_TYPES, type SupervisionEventType } from "./events.js";
 import type { AgentSessionRecord } from "./protocol.js";
 import { SUPERVISION_REASONS, type SupervisionReason, type SupervisionSignalProbabilities } from "./reviewer.js";
+import { TRACE_SOURCE_KINDS, type TraceSourceKind } from "./trace-source.js";
 
 export class ReviewLogError extends Error {
   readonly code = "REVIEW_LOG_UNAVAILABLE";
@@ -66,9 +75,46 @@ const REVIEW_LOG_READY = "HERDR_REVIEW_LOG_LOCK_READY";
 
 const SIGNAL_KEYS = ["progress", "stalled", "blocked", "risk", "appears_complete"] as const;
 
+const PROVENANCE_LABEL_MAX_CHARS = 256;
+const PROVENANCE_LABEL_PATTERN = /^(?:pi-jsonl|devin-session|tmux-fallback)(?:@[0-9]+)?:[0-9a-f]{64}$/u;
+const VIOLATION_BATCH_MAX = 16;
+const VIOLATION_DETAIL_MAX_KEYS = 16;
+const VIOLATION_DETAIL_KEY_MAX_CHARS = 64;
+const VIOLATION_DETAIL_VALUE_MAX_CHARS = 256;
+
 /** What a human did with an attention wake, as far as was observable. */
 export const SUPERVISION_DISPOSITIONS = ["acknowledged", "acted", "overruled", "unknown"] as const;
 export type SupervisionDisposition = (typeof SUPERVISION_DISPOSITIONS)[number];
+
+/**
+ * The closed representation vocabulary the ADR-036 three-way study measures:
+ * `A-tmux-lines` is the bounded terminal fallback, `B-runner-trace` is the
+ * runner's own structured trace, and `C-vcc-supervision-view` is the future
+ * VCC representation. C is a measurement hook only — the schema admits the
+ * label so a later pipeline can be persisted and compared, but no V2.1 source
+ * maps to it and no C record is ever fabricated.
+ */
+export const SUPERVISION_REPRESENTATIONS = ["A-tmux-lines", "B-runner-trace", "C-vcc-supervision-view"] as const;
+export type SupervisionRepresentation = (typeof SUPERVISION_REPRESENTATIONS)[number];
+
+/** V2.1's representation mapping: the terminal fallback is A; every structured runner trace is B. Never C. */
+export function representationForTraceSource(source: TraceSourceKind): SupervisionRepresentation {
+  return source === "tmux-fallback" ? "A-tmux-lines" : "B-runner-trace";
+}
+
+/**
+ * The closed Tier-0 violation vocabulary (ADR-036 W1): deterministic code
+ * facts detected before any model call. A kind not in this set is not a
+ * known violation, and the append refuses rather than persists an unbounded
+ * claim.
+ */
+export const SUPERVISION_TIER0_VIOLATIONS = [
+  "read_only_dirty_workspace",
+  "forbidden_tool_observed",
+  "evidence_budget_exceeded",
+  "process_exit",
+] as const;
+export type SupervisionTier0Violation = (typeof SUPERVISION_TIER0_VIOLATIONS)[number];
 
 /**
  * The evidence cursors a review may carry; each optional field is recorded
@@ -83,6 +129,36 @@ export interface SupervisionReviewEvidence {
   stateChangeSeq?: number;
   transcriptLines?: number;
   workingForMs?: number;
+}
+
+/**
+ * Bounded trace/workspace provenance for one persisted record (ADR-036 M1):
+ * which representation the evidence took, the digest's cursor refs as
+ * `source@position:hash` labels, the trace-digest and workspace content
+ * hashes, the byte counts the assembled state carried, and the
+ * version-identity hash it was judged under. Every field is a closed label,
+ * a bounded count, or a SHA-256 hex digest — provenance, never raw evidence.
+ * Fields are `null` when the cadence honestly had none: no cursor on that
+ * side, an unavailable workspace, a refused build, a reviewer that reported
+ * no provenance.
+ */
+export interface SupervisionLogProvenance {
+  /** Which evidence source produced the trace window. */
+  traceSource: TraceSourceKind;
+  /** The closed A/B/C representation label; V2.1 supplies only A or B. */
+  representation: SupervisionRepresentation;
+  /** Digest cursor labels (`source@position:hash`); null when the window had no cursor on that side. */
+  traceFromCursor: string | null;
+  traceToCursor: string | null;
+  /** SHA-256 over the evaluated trace digest's canonical bytes. */
+  traceDigestHash: string | null;
+  /** The workspace fingerprint; null when the cadence's view was unavailable. */
+  workspaceFingerprint: string | null;
+  /** UTF-8 bytes of the assembled state and its terminal section; null when no state was built. */
+  stateBytes: number | null;
+  terminalBytes: number | null;
+  /** The version-identity hash the record was judged under. */
+  identityHash: string | null;
 }
 
 /** One completed review — plus the wake it may have raised — as the supervisor supplies it. */
@@ -101,6 +177,8 @@ export interface SupervisionReviewLogEntry {
   linesSinceLastReview?: number;
   previousClassification?: ReviewClassification;
   evidence?: SupervisionReviewEvidence;
+  /** Bounded provenance for the evidence the review ran on; absent only from callers that never assembled a state. */
+  provenance?: SupervisionLogProvenance;
   /** Present exactly when this review woke the manager; the wake record rides the same append. */
   wake?: { eventId: string; eventType: SupervisionEventType; atMs: number };
 }
@@ -131,6 +209,7 @@ export interface SupervisionReviewLogRecord {
   linesSinceLastReview: number | null;
   previousClassification: ReviewClassification | null;
   evidence: SupervisionReviewEvidence | null;
+  provenance: SupervisionLogProvenance | null;
 }
 
 /** The fixed `wake` record schema; `disposition` stays `unknown` until a `disposition` record supersedes it. */
@@ -158,7 +237,65 @@ export interface SupervisionDispositionLogRecord {
   disposition: SupervisionDisposition;
 }
 
-export type SupervisionLogRecord = SupervisionReviewLogRecord | SupervisionWakeLogRecord | SupervisionDispositionLogRecord;
+/**
+ * One Tier-0 violation as the supervisor supplies it: the emitted wake's
+ * identity plus its closed kind and bounded detail scalars, verbatim from the
+ * event the host already saw.
+ */
+export interface SupervisionViolationItem {
+  eventId: string;
+  eventType: SupervisionEventType;
+  atMs: number;
+  violation: SupervisionTier0Violation;
+  /** The emitted event's bounded detail scalars, verbatim. */
+  details?: Record<string, string | number | boolean>;
+}
+
+/**
+ * The allowlisted entry for one Tier-0 violation cadence: one `violation`
+ * record per emitted wake, all sharing the cadence's bounded provenance.
+ */
+export interface SupervisionViolationLogEntry {
+  jobId: string;
+  agentName: string;
+  agentKind: string;
+  provenance: SupervisionLogProvenance;
+  violations: SupervisionViolationItem[];
+}
+
+/**
+ * The fixed `violation` record schema: one record per Tier-0 wake. It has no
+ * classification, signals, reason, or sufficiency fields at all — a
+ * deterministic code finding can never read as Jev output. `disposition`
+ * stays `unknown` until a `disposition` record supersedes it by `eventId`,
+ * exactly like a review wake.
+ */
+export interface SupervisionViolationLogRecord {
+  type: "violation";
+  timestamp: string;
+  jobId: string;
+  agentName: string;
+  agentKind: string;
+  eventId: string;
+  eventType: SupervisionEventType;
+  atMs: number;
+  disposition: SupervisionDisposition;
+  violation: SupervisionTier0Violation;
+  details: Record<string, string | number | boolean> | null;
+  provenance: SupervisionLogProvenance;
+}
+
+export type SupervisionLogRecord =
+  | SupervisionReviewLogRecord
+  | SupervisionWakeLogRecord
+  | SupervisionDispositionLogRecord
+  | SupervisionViolationLogRecord;
+
+/**
+ * What the append seam accepts: a completed review (plus its wake), or a
+ * cadence's Tier-0 violation batch. Dispatched on the `violations` field.
+ */
+export type SupervisionLogEntry = SupervisionReviewLogEntry | SupervisionViolationLogEntry;
 
 export interface AppendReviewLogOptions {
   root: string;
@@ -168,7 +305,7 @@ export interface AppendReviewLogOptions {
 }
 
 /** The review-log append seam `SupervisorDependencies` consumes; `appendSupervisionReview` satisfies it directly. */
-export type SupervisionReviewLog = (entry: SupervisionReviewLogEntry, options: AppendReviewLogOptions) => Promise<void>;
+export type SupervisionReviewLog = (entry: SupervisionLogEntry, options: AppendReviewLogOptions) => Promise<void>;
 
 export interface SupervisionReviewLogPaths {
   directory: string;
@@ -278,6 +415,62 @@ function evidenceOrNull(value: unknown): SupervisionReviewEvidence | null {
   return value === undefined ? null : projectEvidence(value);
 }
 
+function traceSourceKind(value: unknown): TraceSourceKind {
+  if (typeof value !== "string" || !(TRACE_SOURCE_KINDS as readonly string[]).includes(value)) {
+    throw reviewLogFailure("Supervision log provenance is untrusted");
+  }
+  return value as TraceSourceKind;
+}
+
+function representationKind(value: unknown): SupervisionRepresentation {
+  if (typeof value !== "string" || !(SUPERVISION_REPRESENTATIONS as readonly string[]).includes(value)) {
+    throw reviewLogFailure("Supervision log provenance is untrusted");
+  }
+  return value as SupervisionRepresentation;
+}
+
+/** A valid provenance cursor label, or an honest null when the label is absent or malformed. */
+function provenanceLabelOrNull(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (!usableText(value) || value.length > PROVENANCE_LABEL_MAX_CHARS || !PROVENANCE_LABEL_PATTERN.test(value)) return null;
+  return value;
+}
+
+/** A SHA-256 hex digest or an honest null. */
+function provenanceHashOrNull(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) {
+    throw reviewLogFailure("Supervision log provenance is untrusted");
+  }
+  return value;
+}
+
+function provenanceCounterOrNull(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  if (!safeCounter(value)) throw reviewLogFailure("Supervision log provenance is untrusted");
+  return value;
+}
+
+/** Rebuild the bounded provenance block from its allowlisted fields; a malformed one refuses the append. */
+function projectProvenance(value: unknown): SupervisionLogProvenance {
+  if (!record(value)) throw reviewLogFailure("Supervision log provenance is untrusted");
+  return {
+    traceSource: traceSourceKind(value.traceSource),
+    representation: representationKind(value.representation),
+    traceFromCursor: provenanceLabelOrNull(value.traceFromCursor),
+    traceToCursor: provenanceLabelOrNull(value.traceToCursor),
+    traceDigestHash: provenanceHashOrNull(value.traceDigestHash),
+    workspaceFingerprint: provenanceHashOrNull(value.workspaceFingerprint),
+    stateBytes: provenanceCounterOrNull(value.stateBytes),
+    terminalBytes: provenanceCounterOrNull(value.terminalBytes),
+    identityHash: provenanceHashOrNull(value.identityHash),
+  };
+}
+
+function provenanceOrNull(value: unknown): SupervisionLogProvenance | null {
+  return value === undefined || value === null ? null : projectProvenance(value);
+}
+
 function textField(value: unknown): string {
   if (!usableText(value)) throw reviewLogFailure("Supervision review log entry is untrusted");
   return value;
@@ -365,6 +558,7 @@ function buildReviewRecord(entry: SupervisionReviewLogEntry, now: () => Date): S
     linesSinceLastReview: counterOrNull(entry.linesSinceLastReview),
     previousClassification: classificationOrNull(entry.previousClassification),
     evidence: evidenceOrNull(entry.evidence),
+    provenance: provenanceOrNull(entry.provenance),
   };
 }
 
@@ -387,6 +581,13 @@ function buildWakeRecord(entry: SupervisionReviewLogEntry, now: () => Date): Sup
   };
 }
 
+/** One review record plus its wake record when the review woke the manager. */
+function buildReviewRecords(entry: SupervisionReviewLogEntry, now: () => Date): SupervisionLogRecord[] {
+  const records: SupervisionLogRecord[] = [buildReviewRecord(entry, now)];
+  if (entry.wake !== undefined) records.push(buildWakeRecord(entry, now));
+  return records;
+}
+
 function buildDispositionRecord(entry: SupervisionDispositionLogEntry, now: () => Date): SupervisionDispositionLogRecord {
   if (!record(entry) || !usableText(entry.jobId) || !usableText(entry.eventId) || !disposition(entry.disposition)) {
     throw reviewLogFailure("Supervision disposition log entry is untrusted");
@@ -401,6 +602,84 @@ function buildDispositionRecord(entry: SupervisionDispositionLogEntry, now: () =
     eventId: entry.eventId,
     disposition: entry.disposition,
   };
+}
+
+/**
+ * Rebuild a violation's typed detail dict: bounded keys and bounded scalar
+ * values only — the same contract the emitted event's `details` already
+ * enforces. A nested object, an over-long string, or a forged key refuses the
+ * append rather than persisting unbounded evidence.
+ */
+function projectViolationDetails(value: unknown): Record<string, string | number | boolean> | null {
+  if (value === undefined || value === null) return null;
+  if (!record(value)) throw reviewLogFailure("Supervision violation log entry is untrusted");
+  const entries = Object.entries(value);
+  if (entries.length > VIOLATION_DETAIL_MAX_KEYS) throw reviewLogFailure("Supervision violation log entry is untrusted");
+  const details: Record<string, string | number | boolean> = {};
+  for (const [key, item] of entries) {
+    if (!usableText(key) || key.length > VIOLATION_DETAIL_KEY_MAX_CHARS) {
+      throw reviewLogFailure("Supervision violation log entry is untrusted");
+    }
+    if (typeof item === "boolean") {
+      details[key] = item;
+      continue;
+    }
+    if (typeof item === "number" && Number.isFinite(item)) {
+      details[key] = item;
+      continue;
+    }
+    if (typeof item === "string" && usableText(item) && item.length <= VIOLATION_DETAIL_VALUE_MAX_CHARS) {
+      details[key] = item;
+      continue;
+    }
+    throw reviewLogFailure("Supervision violation log entry is untrusted");
+  }
+  return details;
+}
+
+function violationKind(value: unknown): SupervisionTier0Violation {
+  if (typeof value !== "string" || !(SUPERVISION_TIER0_VIOLATIONS as readonly string[]).includes(value)) {
+    throw reviewLogFailure("Supervision violation log entry is untrusted");
+  }
+  return value as SupervisionTier0Violation;
+}
+
+function buildViolationRecord(
+  item: unknown,
+  subject: { jobId: string; agentName: string; agentKind: string },
+  provenance: SupervisionLogProvenance,
+  now: () => Date
+): SupervisionViolationLogRecord {
+  if (!record(item) || !usableText(item.eventId) || !eventType(item.eventType) || !finiteMs(item.atMs)) {
+    throw reviewLogFailure("Supervision violation log entry is untrusted");
+  }
+  return {
+    type: "violation",
+    timestamp: now().toISOString(),
+    ...subject,
+    eventId: item.eventId,
+    eventType: item.eventType,
+    atMs: item.atMs,
+    disposition: "unknown",
+    violation: violationKind(item.violation),
+    details: projectViolationDetails(item.details),
+    provenance,
+  };
+}
+
+/**
+ * Build one record per emitted Tier-0 wake. The batch is bounded — a cadence
+ * emits at most a handful of violations — and every record carries the same
+ * provenance block so the join needs no inference.
+ */
+function buildViolationRecords(entry: unknown, now: () => Date): SupervisionLogRecord[] {
+  const subject = reviewSubject(entry);
+  const provenance = projectProvenance((entry as SupervisionViolationLogEntry).provenance);
+  const violations: unknown = (entry as SupervisionViolationLogEntry).violations;
+  if (!Array.isArray(violations) || violations.length === 0 || violations.length > VIOLATION_BATCH_MAX) {
+    throw reviewLogFailure("Supervision violation log entry is untrusted");
+  }
+  return violations.map((item) => buildViolationRecord(item, subject, provenance, now));
 }
 
 /**
@@ -486,21 +765,22 @@ async function appendLine(path: string, payload: string): Promise<void> {
 
 /**
  * Persist one completed supervision review — and, when the review woke the
- * manager, the wake's pending disposition — to the durable log. This fails
- * OPEN by design: callers treat `REVIEW_LOG_UNAVAILABLE` like a reviewer
- * failure (report, retry next cadence), because unlike the router decision
- * log's `ROUTER_LOG_UNAVAILABLE` launch veto, review telemetry is not a launch
- * precondition and a logging failure must never blind supervision or kill the
- * child.
+ * manager, the wake's pending disposition — or a cadence's Tier-0 violation
+ * batch, to the durable log. This fails OPEN by design: callers treat
+ * `REVIEW_LOG_UNAVAILABLE` like a reviewer failure (report, retry next
+ * cadence), because unlike the router decision log's `ROUTER_LOG_UNAVAILABLE`
+ * launch veto, review telemetry is not a launch precondition and a logging
+ * failure must never blind supervision or kill the child.
  */
-export async function appendSupervisionReview(entry: SupervisionReviewLogEntry, options: AppendReviewLogOptions): Promise<void> {
+export async function appendSupervisionReview(entry: SupervisionLogEntry, options: AppendReviewLogOptions): Promise<void> {
   try {
     if (!isAbsolute(options.root)) {
       throw reviewLogFailure("Supervision review log root is untrusted");
     }
     const now = options.now ?? (() => new Date());
-    const records: SupervisionLogRecord[] = [buildReviewRecord(entry, now)];
-    if (entry.wake !== undefined) records.push(buildWakeRecord(entry, now));
+    const records: SupervisionLogRecord[] = record(entry) && "violations" in entry
+      ? buildViolationRecords(entry, now)
+      : buildReviewRecords(entry as SupervisionReviewLogEntry, now);
     await appendRecords(options.root, records, options);
   } catch (error) {
     if (error instanceof ReviewLogError) throw error;

@@ -5,9 +5,14 @@ import {
   reduceSupervisionReview,
   ReviewerFailure,
   createPiModelReviewer,
+  SUPERVISION_BLOCKED_THRESHOLD,
+  SUPERVISION_EVIDENCE_THRESHOLD,
   SUPERVISION_PROGRESS_THRESHOLD,
+  SUPERVISION_REDUCER_VERSION,
+  SUPERVISION_RISK_THRESHOLD,
   SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD,
   SUPERVISION_STALLED_THRESHOLD,
+  SUPERVISION_THRESHOLDS,
   type ModelRegistrySeam,
   type SupervisionSignalProbabilities,
 } from "../../src/reviewer.js";
@@ -102,6 +107,46 @@ describe("Pi production reviewer adapter", () => {
     const result = await reviewer.review({ targetId: "p", metadata: { label: "x".repeat(20_000) }, transcriptDelta: ["y".repeat(20_000)] }, new AbortController().signal);
     expect(prompt.length).toBe(16_000);
     expect(result.summary).toHaveLength(500);
+  });
+});
+
+describe("the ADR-036 interrupt-before-gate amendment", () => {
+  const quiet: SupervisionSignalProbabilities = { progress: 0, stalled: 0, blocked: 0, risk: 0, appears_complete: 0 };
+
+  it("evaluates risk and blocked before the evidence gate", () => {
+    // Low evidence does not mute an interrupt: a miss is costlier than a false wake.
+    expect(reduceSupervisionReview(0, { ...quiet, risk: SUPERVISION_RISK_THRESHOLD })).toBe("risk");
+    expect(reduceSupervisionReview(0, { ...quiet, blocked: SUPERVISION_BLOCKED_THRESHOLD })).toBe("blocked");
+    expect(reduceSupervisionReview(SUPERVISION_EVIDENCE_THRESHOLD - 0.01, { ...quiet, risk: 0.99 })).toBe("risk");
+    expect(reduceSupervisionReview(SUPERVISION_EVIDENCE_THRESHOLD - 0.01, { ...quiet, blocked: 0.99 })).toBe("blocked");
+  });
+
+  it("keeps the evidence gate governing every non-interrupt signal", () => {
+    for (const signal of ["appears_complete", "stalled", "progress"] as const) {
+      expect(reduceSupervisionReview(SUPERVISION_EVIDENCE_THRESHOLD - 0.01, { ...quiet, [signal]: 1 })).toBe("unknown");
+    }
+    expect(reduceSupervisionReview(0, quiet)).toBe("unknown");
+  });
+
+  it("keeps risk ahead of blocked in precedence and honours the below-threshold boundary", () => {
+    expect(reduceSupervisionReview(0, { ...quiet, risk: 1, blocked: 1 })).toBe("risk");
+    expect(reduceSupervisionReview(0, { ...quiet, risk: SUPERVISION_RISK_THRESHOLD - 0.01, blocked: SUPERVISION_BLOCKED_THRESHOLD })).toBe("blocked");
+    expect(reduceSupervisionReview(1, { ...quiet, risk: SUPERVISION_RISK_THRESHOLD - 0.01, blocked: SUPERVISION_BLOCKED_THRESHOLD - 0.01 })).toBe("unknown");
+  });
+});
+
+describe("the reviewer version identity", () => {
+  it("pins the ADR-034 threshold table verbatim under the ADR-036 reducer version", () => {
+    expect(SUPERVISION_THRESHOLDS).toEqual({
+      evidence: 0.6,
+      risk: 0.6,
+      blocked: 0.65,
+      appears_complete: 0.7,
+      stalled: 0.7,
+      stalled_first_observation: 0.85,
+      progress: 0.6,
+    });
+    expect(SUPERVISION_REDUCER_VERSION).toBe(2);
   });
 });
 

@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Value } from "typebox/value";
 import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
-import { parseCatalog, type Catalog, type ChainCandidate, type RunnerEntry } from "../../src/catalog.js";
+import { parseCatalog, type Catalog, type ChainCandidate, type RunnerEntry, type RunnerKind } from "../../src/catalog.js";
 import { PublishedLaunchParamsSchema, SpecLaunchParamsSchema, type LaunchSpec, type SpecLaunchRequest } from "../../src/launch-schema.js";
 import { SPEC_BASELINE } from "../../src/spec-baseline.js";
 import { createLaunchTool, launchTestInternals, validateLaunchParams, type LaunchCli, type LaunchDependencies, type LaunchDetails, type LaunchRouterLog } from "../../src/tools/launch.js";
@@ -41,13 +41,35 @@ function runnerEntry(models: readonly string[]): RunnerEntry {
   };
 }
 
-function catalogOf(chain: readonly ChainCandidate[]): Catalog {
+function claudeRunner(models: readonly string[]): RunnerEntry {
+  return {
+    kind: "claude",
+    models: [...models],
+    quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
+    defaults: { timeoutMinutes: 30, sessionPersistence: true, effort: "low", permissionMode: "dontAsk" },
+    plumbing: { sessionPersistence: "required", promptDelivery: "file", skillSelection: "additive", toolSelection: "allowlist" },
+    pools: { tools: ["read", "write", "bash"], extensions: [], skills: [], plugins: [], mcp: [] },
+  };
+}
+
+function devinRunner(models: readonly string[]): RunnerEntry {
+  return {
+    kind: "devin",
+    models: [...models],
+    quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
+    defaults: { timeoutMinutes: 30, sessionPersistence: true, permissionMode: "dangerous" },
+    plumbing: { sessionPersistence: "required", promptDelivery: "none", skillSelection: "ambient", toolSelection: "ambient" },
+    pools: { tools: [], extensions: [], skills: [], plugins: [], mcp: [] },
+  };
+}
+
+function catalogOf(chain: readonly ChainCandidate[], runners?: ReadonlyMap<RunnerKind, RunnerEntry>): Catalog {
   const models = chain.filter((candidate) => candidate.runner === "pi").map((candidate) => candidate.model);
   return {
     version: 1,
     maxAttempts: 4,
     categories: new Map([["worker", [...chain]]]),
-    runners: new Map([["pi", runnerEntry(models)]]),
+    runners: runners ?? new Map<RunnerKind, RunnerEntry>([["pi", runnerEntry(models)]]),
     skills: [],
     plugins: [],
     mcpServers: new Map(),
@@ -304,8 +326,81 @@ describe("herdr_launch spec cutover", () => {
     expect(harness.prompts).toHaveLength(1);
     expect(harness.prompts[0]).toContain(SPEC_BASELINE);
     expect(harness.prompts[0]).toContain("Reduce the latency without changing the public contract.");
-    expect(requests[0]).toMatchObject({ child: { agentName: "task-worker-1", agentKind: "pi", candidateName: "pi-model" }, settings: { supervisionDigest: digest() } });
-    expect(Object.keys(requests[0]!.settings!.supervisionDigest!).sort()).toEqual(["constraints", "doneWhen"]);
+    expect(requests[0]).toMatchObject({ child: { agentName: "task-worker-1", agentKind: "pi", candidateName: "pi-model" }, settings: { supervisionDigest: { ...digest(), readOnly: false } } });
+    expect(Object.keys(requests[0]!.settings!.supervisionDigest!).sort()).toEqual(["constraints", "doneWhen", "readOnly"]);
+  });
+
+  it("bounds the digest's readOnly claim — absent and false stay false, non-boolean rejects", () => {
+    const valid = request();
+    for (const flag of [true, false]) {
+      expect(Value.Check(SpecLaunchParamsSchema, { ...valid, supervisionDigest: { ...digest(), readOnly: flag } }), String(flag)).toBe(true);
+    }
+    for (const flag of ["yes", 1, null, {}, []]) {
+      expect(Value.Check(SpecLaunchParamsSchema, { ...valid, supervisionDigest: { ...digest(), readOnly: flag } }), JSON.stringify(flag)).toBe(false);
+    }
+    // The digest stays strict: an unknown field rejects rather than slipping into policy.
+    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, supervisionDigest: { ...digest(), writable: true } })).toBe(false);
+  });
+
+  it("reserves the caller readOnly claim and per-candidate deny lists with the trusted workspace root", async () => {
+    const catalog = catalogOf(
+      [{ runner: "claude", model: "opus" }, { runner: "pi", model: "pi-model" }, { runner: "devin", model: "swe-2-max" }],
+      new Map<RunnerKind, RunnerEntry>([["claude", claudeRunner(["opus"])], ["pi", runnerEntry(["pi-model"])], ["devin", devinRunner(["swe-2-max"])]]),
+    );
+    const harness = makeCli({ agentId: "agent-task-worker-1" });
+    const supervision = stubSupervision();
+    const requests: SupervisionReserveRequest[] = [];
+    const reserve = supervision.reserve;
+    supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
+    const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), request({ supervisionDigest: { ...digest(), readOnly: true } }));
+
+    expect(result.details).toMatchObject({ outcome: "launched", kind: "claude" });
+    const settings = requests[0]!.settings!;
+    // The authorial claim crosses verbatim — a caller-set true stays true.
+    expect(settings.supervisionDigest).toEqual({ ...digest(), readOnly: true });
+    // The deny list belongs to the runner that may actually start, so the
+    // reservation carries every compiled candidate's fact: claude's argv deny
+    // channel is the only authoritative source; pi and devin have none.
+    expect(settings.forbiddenTools).toEqual([
+      { agentKind: "claude", candidateName: "opus", forbiddenTools: { available: true, tools: ["write", "bash"] } },
+      { agentKind: "pi", candidateName: "pi-model", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
+      { agentKind: "devin", candidateName: "swe-2-max", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
+    ]);
+    // The launch-resolved --cwd is the trusted workspace root.
+    expect(settings.workspaceRoot).toEqual({ available: true, root: "/repo" });
+  });
+
+  it("carries the existing pane's cwd or a typed gap as the workspace root — never a guess", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const targetSnapshot = {
+      version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
+      panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "target", agent_status: "idle", cwd: "/workspace/child" }],
+      agents: []
+    } as HerdrSnapshot;
+    const resolver = async () => ({ snapshot: targetSnapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } });
+    const existingChild: Child = { paneId: "w1:p9", tabId: "w1:t1", name: "", kind: "pi", terminalId: "terminal-w1:p9", session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing" }, prompt: false };
+
+    const supervision = stubSupervision();
+    const requests: SupervisionReserveRequest[] = [];
+    const reserve = supervision.reserve;
+    supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
+    const existing = await execute(toolFor({ catalog, cli: makeCli({ existingPane: existingChild }).cli, contextResolver: resolver, supervision }), request({ placement: { mode: "existing_pane", target: "w1:p9" } }));
+    expect(existing.details).toMatchObject({ paneId: "w1:p9" });
+    // The pane's own cwd is the trusted root — not the caller's or the host's.
+    expect(requests[0]!.settings!.workspaceRoot).toEqual({ available: true, root: "/workspace/child" });
+
+    // A relative caller cwd cannot be resolved against the pane's shell and
+    // degrades to a typed gap rather than guessing a base.
+    const relative = await execute(toolFor({ catalog, cli: makeCli().cli, supervision }), request({ cwd: "relative/dir" }));
+    expect(relative.details).toMatchObject({ outcome: "launched" });
+    expect(requests[1]!.settings!.workspaceRoot).toEqual({ available: false, reason: "root_not_absolute" });
+
+    // An existing pane whose record carries no cwd yields the same typed gap.
+    const bareSnapshot = { ...targetSnapshot, panes: targetSnapshot.panes.map((pane) => ({ ...pane, cwd: undefined })) };
+    const bareResolver = async () => ({ snapshot: bareSnapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } });
+    const noCwd = await execute(toolFor({ catalog, cli: makeCli({ existingPane: { ...existingChild, prompt: false, session: { ...existingChild.session, value: "session-bare" } } }).cli, contextResolver: bareResolver, supervision }), request({ placement: { mode: "existing_pane", target: "w1:p9" } }));
+    expect(noCwd.details).toMatchObject({ paneId: "w1:p9" });
+    expect(requests[2]!.settings!.workspaceRoot).toEqual({ available: false, reason: "root_unavailable" });
   });
 
   it("rejects digest-absent and legacy profile requests before any CLI mutation", async () => {

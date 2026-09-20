@@ -7,17 +7,19 @@
  */
 
 import { createTargetGenerationRef } from "../wait-target-evidence.js";
-import type { JobGeneration, JobRegistry, SupervisorJobRequestSnapshot } from "../job-registry.js";
+import type { JobGeneration, JobRegistry, SupervisionForbiddenTools, SupervisionForbiddenToolsPolicy, SupervisionReservationDigest, SupervisionWorkspaceRoot, SupervisorJobRequestSnapshot } from "../job-registry.js";
 import type { Settings } from "../settings.js";
 import { SessionEventMonitor, type SupervisionMonitorDependencies } from "./monitor.js";
 import { inertNotifier, type ManagerNotifier } from "./notify.js";
-import { SUPERVISION_REVIEWER_MODEL, TypeSafeSupervisionReviewer, type SupervisionAssignmentDigest, type SupervisionReviewer } from "./reviewer.js";
+import { SUPERVISION_REVIEWER_MODEL, TypeSafeSupervisionReviewer, type SupervisionReviewer } from "./reviewer.js";
 import { resolveTypesafeApiKey } from "../typesafe-reviewer.js";
 import type { AuthJsonCredentialStore } from "./auth-json-credential-store.js";
+import { buildWorkspaceView, createNodeWorkspaceRunner, type WorkspaceCommandRunner, type WorkspaceView } from "./evidence.js";
 import type { SupervisionModelService } from "./model-service.js";
 import type { ProvisionalSupervisionBinding } from "./identity.js";
 import type { SelfCloseTracker } from "./self-close.js";
 import type { HandoffGate, HandoffRun } from "../handoff-gate.js";
+import { TRACE_FALLBACK_CURSOR_MAX_LINES } from "./trace-source.js";
 import {
   Supervisor,
   SupervisionBindError,
@@ -30,7 +32,7 @@ import {
 export type SupervisionTranscriptReader = (paneId: string, signal: AbortSignal) => Promise<string[]>;
 
 /** The bounded transcript window a reviewer receives. */
-export const SUPERVISION_TRANSCRIPT_LINES = 100;
+export const SUPERVISION_TRANSCRIPT_LINES = TRACE_FALLBACK_CURSOR_MAX_LINES;
 
 /**
  * The one authoritative transcript read both hosts use. It is the same
@@ -82,14 +84,42 @@ export interface SupervisionRegistryDependencies {
   repairPrompt?: (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
   clock?: { now(): number };
   scheduler?: SupervisionScheduler;
+  /** The reserve-time and cadence workspace command seam. */
+  workspaceRunner?: WorkspaceCommandRunner;
   idFactory?: () => string;
   targetGenerationRefFactory?: () => string;
 }
 
 /** Reservation-scoped settings. Callers pass the digest already bounded and redacted. */
 export interface SupervisionReservationSettings {
-  /** The launch's authorial done-when/constraints the reviewer judges against (ADR-034). */
-  supervisionDigest?: SupervisionAssignmentDigest;
+  /** The launch's authorial done-when/constraints plus the bounded `readOnly` claim (ADR-034; ADR-036 W0). */
+  supervisionDigest?: SupervisionReservationDigest;
+  /**
+   * Every compiled chain candidate's deny-list fact, tagged by the identity a
+   * binding reports (ADR-036 W0). The reservation spans the whole usable chain
+   * because fallback may start a different runner than the one reserved.
+   */
+  forbiddenTools?: readonly SupervisionForbiddenToolsPolicy[];
+  /** The trusted launch workspace root the workspace evidence reads; never the supervisor's own cwd. */
+  workspaceRoot?: SupervisionWorkspaceRoot;
+}
+
+/**
+ * Resolve the reserved deny-list fact for the runner that actually started
+ * (ADR-036 W0). A binding that matches no reserved candidate — or several
+ * candidates with different facts — degrades to a typed unavailable value
+ * rather than guessing another runner's policy.
+ */
+export function resolveForbiddenTools(
+  policies: readonly SupervisionForbiddenToolsPolicy[] | undefined,
+  bound: { agentKind: string; candidateName: string },
+): SupervisionForbiddenTools {
+  const facts = (policies ?? [])
+    .filter((policy) => policy.agentKind === bound.agentKind && policy.candidateName === bound.candidateName)
+    .map((policy) => policy.forbiddenTools);
+  if (facts.length === 0) return { available: false, reason: "candidate_not_reserved" };
+  if (facts.some((fact) => JSON.stringify(fact) !== JSON.stringify(facts[0]))) return { available: false, reason: "candidate_ambiguous" };
+  return facts[0]!;
 }
 
 export interface SupervisionReserveRequest {
@@ -122,22 +152,42 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
+export class SupervisionWorkspaceBaseError extends Error {
+  readonly code = "SUPERVISION_WORKSPACE_BASE_UNAVAILABLE" as const;
+
+  constructor(readonly details: Record<string, string | number | boolean>) {
+    super("The supervision workspace base could not be pinned");
+    this.name = "SupervisionWorkspaceBaseError";
+  }
+}
+
 export class SupervisionRegistry implements SupervisionCoordinator {
   private readonly newMonitor: () => SessionEventMonitor;
   private monitor: SessionEventMonitor;
   private readonly notifier: ManagerNotifier;
+  private readonly workspaceRunner: WorkspaceCommandRunner;
   private readonly supervisors = new Set<Supervisor>();
 
   constructor(private readonly deps: SupervisionRegistryDependencies) {
     this.newMonitor = deps.monitorFactory ?? (() => new SessionEventMonitor(deps.monitorOptions ?? {}));
     this.monitor = this.newMonitor();
     this.notifier = deps.notifier ?? inertNotifier;
+    this.workspaceRunner = deps.workspaceRunner ?? createNodeWorkspaceRunner();
   }
 
   private async reviewer(): Promise<SupervisionReviewer> {
     if (this.deps.reviewerFactory) return this.deps.reviewerFactory();
     const apiKey = await resolveTypesafeApiKey(this.deps.typesafeCredentials);
     return new TypeSafeSupervisionReviewer({ apiKey });
+  }
+
+  private async pinWorkspaceBase(root: SupervisionWorkspaceRoot | undefined): Promise<WorkspaceView | undefined> {
+    if (root?.available !== true) return undefined;
+    const view = await buildWorkspaceView({ root: root.root }, { run: this.workspaceRunner }, new AbortController().signal);
+    if (!view.available) {
+      throw new SupervisionWorkspaceBaseError({ ...(view.failure.detail ?? {}), reason: view.failure.reason });
+    }
+    return view;
   }
 
   /**
@@ -151,8 +201,12 @@ export class SupervisionRegistry implements SupervisionCoordinator {
     const monitor = this.monitor;
     await monitor.ensureStarted();
     const settings = await this.deps.settingsLoader();
-    // The reservation-scoped digest persists on the request record the job
-    // keeps; the public projection allowlists request fields and drops it.
+    // This must settle before the reservation returns. `herdr_launch` performs
+    // no child effect until then, so a failed pin cannot re-anchor after dispatch.
+    const workspaceBase = await this.pinWorkspaceBase(request.settings?.workspaceRoot);
+    // The reservation-scoped digest and Tier-0 policy facts persist on the
+    // request record the job keeps; the public projection allowlists request
+    // fields and drops every one of them.
     const supervisionDigest = request.settings?.supervisionDigest;
     const jobRequest: SupervisorJobRequestSnapshot = {
       kind: "supervisor",
@@ -166,6 +220,8 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         reviewerModel: SUPERVISION_REVIEWER_MODEL,
         reviewerThinking: "max",
         supervisionDigest,
+        forbiddenTools: request.settings?.forbiddenTools,
+        workspaceRoot: request.settings?.workspaceRoot,
       },
     };
     const ready = deferred<Supervisor>();
@@ -179,6 +235,13 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         jobId: identity.jobId,
         child: { ...request.child },
         ...(supervisionDigest === undefined ? {} : { assignmentDigest: supervisionDigest }),
+        // W0 policy facts resolve at review time against the runner identity
+        // that actually bound — fallback may have started a different reserved
+        // candidate than `request.child` names.
+        resolveForbiddenTools: resolveForbiddenTools.bind(null, request.settings?.forbiddenTools),
+        ...(request.settings?.workspaceRoot === undefined ? {} : { workspaceRoot: request.settings.workspaceRoot }),
+        ...(workspaceBase === undefined ? {} : { workspaceBase }),
+        workspaceRunner: this.workspaceRunner,
         monitor,
         notifier: this.notifier,
         reviewer: await this.reviewer(),

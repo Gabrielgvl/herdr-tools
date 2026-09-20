@@ -185,13 +185,15 @@ export function createPiModelReviewer(ctx: { modelRegistry: ModelRegistrySeam },
 }
 
 /**
- * The owner-ratified activation thresholds (ADR-034). The evidence gate runs
- * before any signal; each signal then activates independently — none requires
- * the others to be low — and the first crossing in precedence order classifies.
- * The cost of error differs per signal: `risk` wakes a human so it favours
- * recall, while `appears_complete` and `stalled` sit higher because coding
- * agents habitually claim done early and a five-minute window makes builds,
- * tests, and idle subprocesses look like stalls.
+ * The owner-ratified activation thresholds (ADR-034, ordering amended by
+ * ADR-036). `risk` and `blocked` are interrupts that run before the evidence
+ * gate; the gate then governs the remaining signals, each activating
+ * independently — none requires the others to be low — and the first
+ * crossing in precedence order classifies. The cost of error differs per
+ * signal: `risk` wakes a human so it favours recall, while
+ * `appears_complete` and `stalled` sit higher because coding agents
+ * habitually claim done early and a five-minute window makes builds, tests,
+ * and idle subprocesses look like stalls.
  */
 export const SUPERVISION_EVIDENCE_THRESHOLD = 0.60;
 export const SUPERVISION_RISK_THRESHOLD = 0.60;
@@ -200,6 +202,29 @@ export const SUPERVISION_APPEARS_COMPLETE_THRESHOLD = 0.70;
 export const SUPERVISION_STALLED_THRESHOLD = 0.70;
 export const SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD = 0.85;
 export const SUPERVISION_PROGRESS_THRESHOLD = 0.60;
+
+/**
+ * The reducer contract revision, carried into the evidence state's version
+ * identity. 1 was the ADR-034 gate-first ordering; 2 is the ADR-036
+ * amendment — `risk`/`blocked` evaluated before the evidence gate and the
+ * raised first-observation `stalled` bar.
+ */
+export const SUPERVISION_REDUCER_VERSION = 2;
+
+/**
+ * The threshold table in effect, verbatim, as the evidence state's
+ * `identity.thresholds` component — a retune is config drift. Keyed by the
+ * signal names the review record already uses.
+ */
+export const SUPERVISION_THRESHOLDS = {
+  evidence: SUPERVISION_EVIDENCE_THRESHOLD,
+  risk: SUPERVISION_RISK_THRESHOLD,
+  blocked: SUPERVISION_BLOCKED_THRESHOLD,
+  appears_complete: SUPERVISION_APPEARS_COMPLETE_THRESHOLD,
+  stalled: SUPERVISION_STALLED_THRESHOLD,
+  stalled_first_observation: SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD,
+  progress: SUPERVISION_PROGRESS_THRESHOLD,
+} as const;
 
 /** The five non-exclusive judgment signals and their probabilities. */
 export interface SupervisionSignalProbabilities {
@@ -230,10 +255,12 @@ export const SUPERVISION_REASONS = [
 export type SupervisionReason = (typeof SUPERVISION_REASONS)[number];
 
 /**
- * The deterministic precedence reducer. The evidence gate classifies
- * `unknown` before any signal is read; otherwise the first crossing signal in
- * precedence order wins, and no crossing at all falls through to `unknown`
- * rather than forcing a label from a low-resolution zone.
+ * The deterministic precedence reducer. Per the ADR-036 amendment,
+ * `risk` and `blocked` are interrupts evaluated BEFORE the evidence gate —
+ * both wake a human, so a miss costs more than a false wake. The gate still
+ * governs every non-interrupt signal: below it, `appears_complete`,
+ * `stalled`, `progress`, and the no-crossing fallthrough all classify
+ * `unknown` rather than forcing a label from a low-resolution zone.
  *
  * On a first observation (ADR-036) `stalled` must clear the raised bar: with
  * no prior review there is no trajectory to distinguish repeated activity
@@ -246,9 +273,9 @@ export function reduceSupervisionReview(
   signals: SupervisionSignalProbabilities,
   options?: { firstObservation?: boolean },
 ): ReviewClassification {
-  if (evidenceSufficiency < SUPERVISION_EVIDENCE_THRESHOLD) return "unknown";
   if (signals.risk >= SUPERVISION_RISK_THRESHOLD) return "risk";
   if (signals.blocked >= SUPERVISION_BLOCKED_THRESHOLD) return "blocked";
+  if (evidenceSufficiency < SUPERVISION_EVIDENCE_THRESHOLD) return "unknown";
   if (signals.appears_complete >= SUPERVISION_APPEARS_COMPLETE_THRESHOLD) return "appears_complete";
   const stalledThreshold = options?.firstObservation === true ? SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD : SUPERVISION_STALLED_THRESHOLD;
   if (signals.stalled >= stalledThreshold) return "stalled";

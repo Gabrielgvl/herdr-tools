@@ -1,7 +1,7 @@
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import { writeIdentityProvenance } from "../agent-identity.js";
@@ -30,6 +30,7 @@ import { TypeSafeSpecClient } from "../typesafe-spec.js";
 import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/index.js";
 import type { ProfileKind } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
+import type { SupervisionForbiddenToolsPolicy, SupervisionWorkspaceRoot } from "../job-registry.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
@@ -1647,6 +1648,33 @@ function paneForPlacement(snapshot: HerdrSnapshot, target: string, context: Curr
   return resolveTarget(snapshot, target, "pane", context);
 }
 
+/**
+ * The reservation's trusted workspace root (ADR-036 W0): the existing pane's
+ * own `cwd` for `existing_pane`, else the launch-resolved `--cwd`. A missing
+ * or relative value degrades to a typed gap — the reservation never falls
+ * back to this process's cwd.
+ */
+function supervisionWorkspaceRoot(placement: LaunchPlacement, existingTarget: ResolvedTarget | undefined, launchCwd: string | undefined): SupervisionWorkspaceRoot {
+  const root = placement.mode === "existing_pane" ? existingTarget?.record.cwd : launchCwd;
+  if (typeof root !== "string" || root.length === 0) return { available: false, reason: "root_unavailable" };
+  return isAbsolute(root) ? { available: true, root } : { available: false, reason: "root_not_absolute" };
+}
+
+/**
+ * Every compiled chain candidate's deny-list fact (ADR-036 W0). Only the
+ * claude runtime has a `disallowedTools` argv surface; other runners record
+ * the typed gap rather than a list inferred from prose.
+ */
+function supervisionForbiddenTools(contracts: ReadonlyMap<string, CompiledContract>): SupervisionForbiddenToolsPolicy[] {
+  return [...contracts.values()].map((contract) => ({
+    agentKind: contract.runtime.kind,
+    candidateName: contract.candidate.model,
+    forbiddenTools: contract.runtime.kind === "claude"
+      ? { available: true, tools: [...contract.runtime.disallowedTools] }
+      : { available: false, reason: "runner_lacks_disallowed_tools" },
+  }));
+}
+
 function noFocusArgs(): string[] {
   return ["--no-focus"];
 }
@@ -2257,17 +2285,25 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         assertMessageText(promptText);
       }
 
-      // Keep this reservation allowlist and serialization unchanged from R3.
+      // Keep this reservation allowlist and serialization unchanged from R3,
+      // extended by ADR-036 W0 with the bounded digest flag and the typed
+      // policy/workspace facts below — all derived, never prose.
       phase = "supervision_reserve";
       progress(onUpdate, phase, created);
       try {
         const supervisionDigest = modelSafeJson({
           doneWhen: params.supervisionDigest.doneWhen,
-          constraints: params.supervisionDigest.constraints
-        }) as { doneWhen: string[]; constraints: string[] };
+          constraints: params.supervisionDigest.constraints,
+          // ADR-036 W0: the bounded readOnly claim, absent means false.
+          readOnly: params.supervisionDigest.readOnly === true
+        }) as { doneWhen: string[]; constraints: string[]; readOnly: boolean };
         reservation = await deps.supervision.reserve({
           child: { agentName: params.name, agentKind: initialRuntime.kind, candidateName: initialContract.candidate.model },
-          settings: { supervisionDigest }
+          settings: {
+            supervisionDigest,
+            forbiddenTools: supervisionForbiddenTools(contracts),
+            workspaceRoot: supervisionWorkspaceRoot(placement, existingTarget, launchCwd)
+          }
         });
       } catch (error) {
         throw new LaunchError("SUPERVISION_UNAVAILABLE", "Automatic child supervision could not be reserved", {

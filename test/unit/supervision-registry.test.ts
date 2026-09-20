@@ -7,9 +7,10 @@ import { createHandoffAllocator, readHandoffState, type HandoffAllocation } from
 import { createHandoffGate, type HandoffGate } from "../../src/handoff-gate.js";
 import { ReviewerFailure } from "../../src/reviewer.js";
 import { SessionEventMonitor } from "../../src/supervision/monitor.js";
-import { SupervisionRegistry } from "../../src/supervision/registry.js";
+import { resolveForbiddenTools, SupervisionRegistry } from "../../src/supervision/registry.js";
 import { scriptedServer } from "./supervision-peer.js";
 import { TypeSafeSupervisionReviewer, type SupervisionReviewer } from "../../src/supervision/reviewer.js";
+import type { EvidenceState, WorkspaceCommandRunner } from "../../src/supervision/evidence.js";
 import type { ProvisionalSupervisedIdentity, SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { ManagerNotifier, SupervisionWake } from "../../src/supervision/notify.js";
 import { createJobsTool } from "../../src/tools/jobs.js";
@@ -19,6 +20,11 @@ const identity: SupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName
 const agyIdentity: ProvisionalSupervisedIdentity = { paneId: "p1", terminalId: "t1", agentName: "worker", agentKind: "agy" };
 const agySession = { source: "agy", agent: "agy", kind: "id", value: "agy-1" };
 const settings = { reviewCadenceMinutes: 5, reviewerModel: "testmodel", reviewerThinking: "low" as const };
+const workspaceBaseSha = "a".repeat(40);
+const cleanWorkspaceRunner: WorkspaceCommandRunner = async (argv) => ({
+  stdout: argv[1] === "rev-parse" ? `${workspaceBaseSha}\n` : "",
+  exitCode: 0,
+});
 
 const pane = { pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "working", revision: 3, agent: "pi", agent_session: session };
 
@@ -41,7 +47,7 @@ interface Fixture {
   push(line: string): void;
 }
 
-function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[]; handoffs?: HandoffGate; repairPrompt?: (paneId: string, text: string, signal: AbortSignal) => Promise<unknown> } = {}): Fixture {
+function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[]; handoffs?: HandoffGate; repairPrompt?: (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>; workspaceRunner?: WorkspaceCommandRunner } = {}): Fixture {
   const server = scriptedServer({ snapshots: options.snapshots ?? [snapshotResult([pane])] });
   const jobs = new JobRegistry();
   const wakes: SupervisionWake[] = [];
@@ -56,6 +62,7 @@ function fixture(options: { reviewer?: SupervisionReviewer; snapshots?: unknown[
     typesafeCredentials: { read: async () => undefined },
     ...(options.reviewer ? { reviewerFactory: () => options.reviewer! } : {}),
     scheduler: { setTimer: () => "timer", clearTimer: () => undefined },
+    workspaceRunner: options.workspaceRunner ?? cleanWorkspaceRunner,
     idFactory: (() => { let id = 0; return () => `fixture-${++id}`; })(),
     ...(options.handoffs ? { handoffs: options.handoffs } : {}),
     ...(options.repairPrompt ? { repairPrompt: options.repairPrompt } : {}),
@@ -130,6 +137,120 @@ describe("the supervision registry", () => {
     // Type-visible: this access compiles only because the snapshot declares the field.
     expect(jobRequest.settings.supervisionDigest).toEqual(digest);
     await f.supervision.shutdown();
+  });
+
+  it("carries the reservation's Tier-0 policy facts on the private request, never the public view", async () => {
+    const f = fixture();
+    const register = vi.spyOn(f.jobs, "register");
+    const forbiddenTools = [
+      { agentKind: "claude", candidateName: "worker-opus", forbiddenTools: { available: true as const, tools: ["Write", "Bash"] } },
+      { agentKind: "pi", candidateName: "worker-pi", forbiddenTools: { available: false as const, reason: "runner_lacks_disallowed_tools" as const } },
+    ];
+    const workspaceRoot = { available: true as const, root: "/repo" };
+    const reservation = await f.supervision.reserve({
+      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+      settings: {
+        supervisionDigest: { doneWhen: ["tests pass"], constraints: ["read-only"], readOnly: true },
+        forbiddenTools,
+        workspaceRoot,
+      },
+    });
+    const jobRequest = register.mock.calls[0]![0];
+    if (jobRequest.kind !== "supervisor") throw new Error("expected a supervisor job request");
+    // Typed private carriers: the digest keeps its authorial readOnly claim,
+    // and the policy facts cross verbatim — no constraint prose is consulted.
+    expect(jobRequest.settings.supervisionDigest).toEqual({ doneWhen: ["tests pass"], constraints: ["read-only"], readOnly: true });
+    expect(jobRequest.settings.forbiddenTools).toEqual(forbiddenTools);
+    expect(jobRequest.settings.workspaceRoot).toEqual(workspaceRoot);
+    // The public projection keeps its allowlisted settings shape.
+    const detail = f.jobs.get(reservation.jobId)!;
+    expect(detail.request.settings).toEqual({
+      reviewerModel: "typesafe/jev-latest",
+      reviewerThinking: "max",
+      reviewCadenceMinutes: 5,
+    });
+    expect(detail.request.settings).not.toHaveProperty("forbiddenTools");
+    expect(detail.request.settings).not.toHaveProperty("workspaceRoot");
+    expect(detail.request.settings).not.toHaveProperty("supervisionDigest");
+    await f.supervision.shutdown();
+  });
+
+  it("does not return a reservation until the workspace base is pinned", async () => {
+    let releasePin!: () => void;
+    const pinGate = new Promise<void>((resolve) => { releasePin = resolve; });
+    let pinStarted = false;
+    const f = fixture({
+      workspaceRunner: async (argv) => {
+        if (argv[1] === "rev-parse") {
+          pinStarted = true;
+          await pinGate;
+          return { stdout: `${workspaceBaseSha}\n`, exitCode: 0 };
+        }
+        return { stdout: "", exitCode: 0 };
+      },
+    });
+    let returned = false;
+    const reserving = f.supervision.reserve({
+      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+      settings: { workspaceRoot: { available: true, root: "/repo" } },
+    });
+    void reserving.then(() => { returned = true; });
+    await vi.waitFor(() => expect(pinStarted).toBe(true));
+    expect(returned).toBe(false);
+    releasePin();
+    await expect(reserving).resolves.toMatchObject({ jobId: expect.any(String) });
+    expect(returned).toBe(true);
+    await f.supervision.shutdown();
+  });
+
+  it("fails reservation with typed pin evidence and never re-anchors later", async () => {
+    const runner = vi.fn<WorkspaceCommandRunner>(async () => {
+      throw Object.assign(new Error("path-bearing failure must not escape"), { code: "ENOENT" });
+    });
+    const f = fixture({ workspaceRunner: runner });
+    await expect(f.supervision.reserve({
+      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+      settings: { workspaceRoot: { available: true, root: "/repo" } },
+    })).rejects.toMatchObject({
+      code: "SUPERVISION_WORKSPACE_BASE_UNAVAILABLE",
+      details: { reason: "command_failed", command: "rev-parse", code: "ENOENT" },
+    });
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(f.jobs.size()).toBe(0);
+    await f.supervision.shutdown();
+  });
+
+  it("types a pin refusal that has no command detail", async () => {
+    const f = fixture();
+    await expect(f.supervision.reserve({
+      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+      settings: { workspaceRoot: { available: true, root: "relative" } },
+    })).rejects.toMatchObject({
+      code: "SUPERVISION_WORKSPACE_BASE_UNAVAILABLE",
+      details: { reason: "root_invalid" },
+    });
+    expect(f.jobs.size()).toBe(0);
+    await f.supervision.shutdown();
+  });
+
+  it("resolves the bound candidate's deny-list fact and degrades unmatched or ambiguous bindings", () => {
+    const policies = [
+      { agentKind: "claude", candidateName: "opus", forbiddenTools: { available: true as const, tools: ["Write"] } },
+      { agentKind: "pi", candidateName: "pi-1", forbiddenTools: { available: false as const, reason: "runner_lacks_disallowed_tools" as const } },
+      { agentKind: "claude", candidateName: "dup", forbiddenTools: { available: true as const, tools: ["Write"] } },
+      { agentKind: "claude", candidateName: "dup", forbiddenTools: { available: true as const, tools: ["Bash"] } },
+      { agentKind: "pi", candidateName: "same", forbiddenTools: { available: false as const, reason: "runner_lacks_disallowed_tools" as const } },
+      { agentKind: "pi", candidateName: "same", forbiddenTools: { available: false as const, reason: "runner_lacks_disallowed_tools" as const } },
+    ];
+    expect(resolveForbiddenTools(policies, { agentKind: "claude", candidateName: "opus" })).toEqual({ available: true, tools: ["Write"] });
+    expect(resolveForbiddenTools(policies, { agentKind: "pi", candidateName: "pi-1" })).toEqual({ available: false, reason: "runner_lacks_disallowed_tools" });
+    // Identical duplicate chain entries resolve to their shared fact.
+    expect(resolveForbiddenTools(policies, { agentKind: "pi", candidateName: "same" })).toEqual({ available: false, reason: "runner_lacks_disallowed_tools" });
+    // A binding the reservation never compiled — or one that matches reserved
+    // candidates with different facts — degrades rather than guessing.
+    expect(resolveForbiddenTools(policies, { agentKind: "devin", candidateName: "swe" })).toEqual({ available: false, reason: "candidate_not_reserved" });
+    expect(resolveForbiddenTools(policies, { agentKind: "claude", candidateName: "dup" })).toEqual({ available: false, reason: "candidate_ambiguous" });
+    expect(resolveForbiddenTools(undefined, { agentKind: "pi", candidateName: "pi-1" })).toEqual({ available: false, reason: "candidate_not_reserved" });
   });
 
   it("publishes AGY provisional supervision and atomically strengthens it to exact coverage", async () => {
@@ -350,7 +471,9 @@ describe("the supervision registry", () => {
     const registry = f.supervision as unknown as { reviewer(): Promise<SupervisionReviewer> };
     const reviewer = await registry.reviewer();
     expect(reviewer).toBeInstanceOf(TypeSafeSupervisionReviewer);
-    await expect(reviewer.review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: {}, transcriptDelta: [] }, new AbortController().signal))
+    // The mandatory evidence stub's contents are never read: the credential
+    // check fails closed before the envelope is touched (ADR-036 V2-02).
+    await expect(reviewer.review({ paneId: "p1", agentName: "worker", workingForMs: 0, metadata: { agentKind: "pi", status: "working", revision: 0 }, evidence: {} as EvidenceState }, new AbortController().signal))
       .rejects.toThrowError(ReviewerFailure);
     await f.supervision.shutdown();
   });

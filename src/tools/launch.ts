@@ -1,4 +1,5 @@
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,8 +24,8 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 import { expandBatchRequest, type BatchExpansion } from "../launch-batch.js";
 import { renderAssignment, SpecLaunchParamsSchema, type LaunchPlacement, type LaunchSpec, type SpecLaunchRequest } from "../launch-schema.js";
 import { renderSpecInstructions } from "../spec-baseline.js";
-import { routeSpec, type RouterState, type SpecDecision, type SpecModelDecision } from "../router.js";
-import { appendRouterDecision, type AppendRouterLogOptions, type SpecRouterLogEntry } from "../router-log.js";
+import { createBypassReceipt, routeSpec, type BypassReceipt, type RouterBinding, type RouterEvidence, type RouterState, type SpecDecision, type SpecModelDecision } from "../router.js";
+import { appendRouterDecision, routerStateDigest, type AppendRouterLogOptions, type SpecRouterLogEntry } from "../router-log.js";
 import { TypeSafeSpecClient } from "../typesafe-spec.js";
 import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/index.js";
 import type { ProfileKind } from "../profiles/types.js";
@@ -119,6 +120,8 @@ export interface LaunchSpecEvidence {
   label: string;
   category: string;
   count: number;
+  quality: Exclude<AdmittedSpecDecision["quality"], "rejected">;
+  bypass?: NonNullable<RouterEvidence["bypass"]>;
   selected: { index: number; runner: string; model: string };
   attempts: LaunchAttemptEvidence[];
   fallbackCandidates: Array<{ index: number; runner: string; model: string }>;
@@ -250,6 +253,7 @@ const AGENT_PANE_SHELL_SETTLE_MS = 10_000;
 const AGENT_PANE_SHELL_POLL_MS = 150;
 const LAUNCH_RECONCILIATION_TIMEOUT_MS = 5_000;
 const SPEC_EVALUATION_TIMEOUT_MS = 20_000;
+const BYPASS_POLICY_REVISION = "adr-035";
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
 /**
@@ -1895,6 +1899,8 @@ type SpecRouteRecord = {
   decision: SpecDecision;
   response?: SpecModelDecision;
   state?: SpecRouterLogEntry["state"];
+  binding?: RouterBinding;
+  bypassConfiguration?: CompiledContract;
 };
 
 function candidateIdentity(candidate: { index: number; runner: string; model: string }): { index: number; runner: string; model: string } {
@@ -1915,6 +1921,43 @@ function resolvedCandidateKey(candidate: ResolvedCandidate): string {
 
 function isAdmitted(decision: SpecDecision): decision is AdmittedSpecDecision {
   return decision.kind === "admitted";
+}
+
+function launchBinding(name: string, spec: LaunchSpec, state: RouterState): RouterBinding {
+  return {
+    caller: name,
+    specRevision: routerStateDigest(state),
+    policyRevision: BYPASS_POLICY_REVISION,
+    launchIdentity: createHash("sha256").update(JSON.stringify({ name, spec })).digest("hex")
+  };
+}
+
+function parseBypassToken(value: string): BypassReceipt | undefined {
+  try {
+    return JSON.parse(value) as BypassReceipt;
+  } catch {
+    return undefined;
+  }
+}
+
+function allReviewedResources(candidate: ResolvedCandidate): ResourceSelection {
+  const pools = candidate.runner.pools;
+  return candidate.runner.kind === "pi"
+    ? { tools: pools.tools, extensions: pools.extensions, skills: pools.skills, mcp: pools.mcp }
+    : candidate.runner.kind === "claude"
+      ? { tools: pools.tools, plugins: pools.plugins, mcp: pools.mcp }
+      : {};
+}
+
+async function transportBypassConfiguration(spec: LaunchSpec, catalog: Catalog): Promise<CompiledContract | undefined> {
+  const category = spec.category ?? catalog.categories.keys().next().value;
+  if (typeof category !== "string") return undefined;
+  try {
+    const selected = resolveChain(catalog, category).selected!;
+    return await compileCandidateContract(catalog, spec, selected, allReviewedResources(selected));
+  } catch {
+    return undefined;
+  }
 }
 
 function recipientCapability(kind: RunnerKind): AttachmentCapability & { kind: ProfileKind } {
@@ -1940,6 +1983,7 @@ function specRouteLogEntry(name: string, record: SpecRouteRecord): SpecRouterLog
     caller: name,
     name,
     result: record.decision,
+    ...(record.binding === undefined ? {} : { binding: record.binding }),
     ...(record.decision.evidence === undefined ? {} : { evidence: record.decision.evidence }),
     ...(record.state === undefined ? {} : { state: record.state })
   };
@@ -1972,8 +2016,27 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     }
 
     const records: SpecRouteRecord[] = [];
+    const bypassRequested = params.transportBypass !== undefined;
+    const bypass = bypassRequested ? parseBypassToken(params.transportBypass!) : undefined;
+    const retain = async (spec: LaunchSpec, state: RouterState, binding: RouterBinding, decision: SpecDecision, response?: SpecModelDecision): Promise<void> => {
+      const record: SpecRouteRecord = { spec, decision, ...(response === undefined ? {} : { response }), state, binding };
+      if (decision.kind === "abstained" && decision.reason === "transport_failed") {
+        record.bypassConfiguration = await transportBypassConfiguration(spec, catalog);
+      }
+      records.push(record);
+    };
+
     for (const spec of params.specs) {
       const state = specRouterState(spec, catalog);
+      const binding = launchBinding(params.name, spec, state);
+      if (bypassRequested) {
+        const decision = bypass === undefined
+          ? { kind: "abstained" as const, reason: "invalid_response" as const, component: "bypass" }
+          : await routeSpec({ spec, catalog, response: undefined, root, binding, bypass });
+        await retain(spec, state, binding, decision);
+        continue;
+      }
+
       let evaluation: Awaited<ReturnType<TypeSafeSpecClient["evaluate"]>>;
       const timeoutController = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -1998,16 +2061,15 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       let decision: SpecDecision;
       if (evaluation.kind === "response") {
         try {
-          decision = await routeSpec({ spec, catalog, response: evaluation.response, root });
-          records.push({ spec, decision, response: evaluation.response, state });
-          continue;
+          decision = await routeSpec({ spec, catalog, response: evaluation.response, root, binding });
         } catch {
           decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
         }
-      } else {
-        decision = evaluation;
+        await retain(spec, state, binding, decision, evaluation.response);
+        continue;
       }
-      records.push({ spec, decision, state });
+      decision = evaluation;
+      await retain(spec, state, binding, decision);
     }
     return { catalog, records };
   };
@@ -2094,10 +2156,10 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           contracts.set(key, selected);
           return selected;
         }
-        const responseCandidates = (routed.response!.candidates as readonly unknown[]).filter(record);
-        const judgment = responseCandidates.find((candidate) => candidate.index === resolved.index && candidate.runner === resolved.candidate.runner && candidate.model === resolved.candidate.model);
-        const selection = judgment!.resources as ResourceSelection;
-        const compiled = await compileCandidateContract(catalog, spec, resolved, selection);
+        const responseCandidates = routed.response === undefined ? undefined : (routed.response.candidates as readonly unknown[]).filter(record);
+        const judgment = responseCandidates?.find((candidate) => candidate.index === resolved.index && candidate.runner === resolved.candidate.runner && candidate.model === resolved.candidate.model);
+        const selection = judgment?.resources as ResourceSelection | undefined;
+        const compiled = await compileCandidateContract(catalog, spec, resolved, selection ?? allReviewedResources(resolved));
         contracts.set(key, compiled);
         return compiled;
       };
@@ -2476,7 +2538,16 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         ...(published ? { attachment: published } : {}),
         handoff: { runId: handoffRun!.runId, path: handoffRun!.artifactPath }, recipient, effectCertainty: "confirmed",
         supervision: boundSupervision!,
-        spec: { label: spec.label, category: (decision as Extract<SpecDecision, { kind: "admitted" }>).category, count: spec.count!, selected: candidateIdentity(chosenContract.candidate), attempts, fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedCandidateIdentity(candidate)) }
+        spec: {
+          label: spec.label,
+          category: decision.category,
+          count: spec.count!,
+          quality: decision.quality,
+          ...(decision.evidence.bypass === undefined ? {} : { bypass: decision.evidence.bypass }),
+          selected: candidateIdentity(chosenContract.candidate),
+          attempts,
+          fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedCandidateIdentity(candidate))
+        }
       };
       return { content: [{ type: "text", text: `${formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: requestedDelivery })} · supervisor ${reservation!.jobId}` }], details: launchDetails };
     } catch (error) {
@@ -2539,7 +2610,21 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     const decisions = routed.records.map((record) => record.decision);
     const routerLog = deps.routerLog ?? appendRouterDecision;
     try {
-      for (const record of routed.records) await routerLog(specRouteLogEntry(params.name, record), { root: deps.cwd ?? ctx.cwd });
+      for (const record of routed.records) {
+        await routerLog(specRouteLogEntry(params.name, record), { root: deps.cwd ?? ctx.cwd });
+        if (record.decision.kind === "abstained" && record.decision.reason === "transport_failed" && record.binding !== undefined && record.bypassConfiguration !== undefined) {
+          const receipt = createBypassReceipt({
+            binding: record.binding,
+            abstention: record.decision,
+            configuration: record.bypassConfiguration,
+            category: record.spec.category,
+            count: record.spec.count,
+            recorded: true
+          });
+          record.decision = { ...record.decision, receipt: JSON.stringify(receipt) };
+          decisions[routed.records.indexOf(record)] = record.decision;
+        }
+      }
     } catch {
       return batchResult({ operation: "launch_batch", outcome: "failed", router: decisions, children: [], failure: { code: "ROUTER_LOG_UNAVAILABLE", message: "Spec decision could not be persisted" } });
     }
@@ -2724,6 +2809,10 @@ export const launchTestInternals = {
   batchManifest,
   candidateIdentity,
   candidateKey,
+  launchBinding,
+  parseBypassToken,
+  allReviewedResources,
+  transportBypassConfiguration,
   resolvedCandidateIdentity,
   resolvedCandidateKey,
   isAdmitted,

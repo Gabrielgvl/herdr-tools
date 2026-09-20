@@ -155,6 +155,7 @@ function duplicateSpecLabel(specs: LaunchSpec[]): string | undefined {
  */
 export const SpecLaunchParamsSchema = Type.Object({
   name: AgentName,
+  transportBypass: Type.Optional(Identifier),
   specs: Type.Refine(
     Type.Array(LaunchSpecSchema, { minItems: 1 }),
     (specs) => duplicateSpecLabel(specs) === undefined,
@@ -178,6 +179,7 @@ export const SpecLaunchParamsSchema = Type.Object({
  */
 type FlatLaunchParams = {
   name?: string;
+  transportBypass?: string;
   profile?: string;
   overrides?: ProfileLaunchOverrides;
   placement?: LaunchPlacement;

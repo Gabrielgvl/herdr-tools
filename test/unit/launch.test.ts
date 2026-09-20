@@ -277,6 +277,8 @@ describe("herdr_launch spec cutover", () => {
   it("publishes and validates only the strict spec request", () => {
     const valid = request();
     expect(Value.Check(SpecLaunchParamsSchema, valid)).toBe(true);
+    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, transportBypass: "receipt-token" })).toBe(true);
+    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, transportBypass: "" })).toBe(false);
     expect(Value.Check(PublishedLaunchParamsSchema, valid)).toBe(true);
     expect(() => validateLaunchParams(valid)).not.toThrow();
     expect(Value.Check(SpecLaunchParamsSchema, { ...valid, profile: "worker" })).toBe(false);
@@ -612,7 +614,35 @@ quotaSources:
     const abstained = await toolFor({ catalog, cli: makeCli().cli, catalogLoad: async () => { throw new Error("catalog unavailable"); } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
     expect(abstained.details).toMatchObject({ operation: "launch_batch", outcome: "abstained", router: [{ kind: "abstained", reason: "catalog_unavailable" }] });
     const transportFailure = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(transportFailure.details).toMatchObject({ outcome: "abstained", router: [{ reason: "transport_failed" }] });
+    expect(transportFailure.details).toMatchObject({ outcome: "abstained", router: [{ reason: "transport_failed", receipt: expect.any(String) }] });
+    const token = (transportFailure.details as { router: Array<{ receipt?: string }> }).router[0]!.receipt!;
+    const uncategorized = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", request({ specs: [spec({ category: undefined })] }), new AbortController().signal, undefined, extensionContext);
+    expect(uncategorized.details).toMatchObject({ outcome: "abstained", router: [{ reason: "transport_failed", receipt: expect.any(String) }] });
+    const noCategories = await toolFor({ catalog: { ...catalog, categories: new Map() }, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", request({ specs: [spec({ category: undefined })] }), new AbortController().signal, undefined, extensionContext);
+    expect(noCategories.details).toMatchObject({ outcome: "abstained", router: [{ reason: "transport_failed" }] });
+    expect((noCategories.details as { router: Array<{ receipt?: string }> }).router[0]!.receipt).toBeUndefined();
+    const replayEvaluate = vi.fn(async () => { throw new Error("replay must not evaluate"); });
+    const replayLog = vi.fn(async () => undefined) as LaunchRouterLog;
+    const replay = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: replayEvaluate }, routerLog: replayLog }), request({ transportBypass: token }));
+    expect(replayEvaluate).not.toHaveBeenCalled();
+    expect(replay.details).toMatchObject({ outcome: "launched", spec: { quality: "not_evaluated", bypass: { label: "transport-abstain", quality: "not_evaluated" } } });
+    expect(replayLog).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ kind: "admitted", quality: "not_evaluated", evidence: expect.objectContaining({ bypass: { label: "transport-abstain", quality: "not_evaluated" } }) }) }), expect.anything());
+    const fallbackCatalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+    const fallbackSource = await toolFor({ catalog: fallbackCatalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
+    const fallbackToken = (fallbackSource.details as { router: Array<{ receipt?: string }> }).router[0]!.receipt!;
+    const fallbackHarness = makeCli({
+      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+      start: (_argv, attempt) => {
+        if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
+        return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+      },
+    });
+    const fallbackReplay = await execute(toolFor({ catalog: fallbackCatalog, cli: fallbackHarness.cli, specClient: { evaluate: replayEvaluate } }), request({ transportBypass: fallbackToken }));
+    expect(fallbackReplay.details.spec).toMatchObject({ selected: { model: "fallback" }, attempts: [{ outcome: "agent_start_failed" }, { outcome: "selected" }] });
+    const foreign = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: replayEvaluate } }).execute("call", request({ name: "other", transportBypass: token }), new AbortController().signal, undefined, extensionContext);
+    expect(foreign.details).toMatchObject({ outcome: "abstained", router: [{ kind: "abstained", reason: "invalid_response", component: "bypass" }], children: [] });
+    const malformed = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: replayEvaluate } }).execute("call", request({ transportBypass: "not-json" }), new AbortController().signal, undefined, extensionContext);
+    expect(malformed.details).toMatchObject({ outcome: "abstained", router: [{ kind: "abstained", reason: "invalid_response", component: "bypass" }], children: [] });
     const invalidResponse = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: undefined as never })) } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
     expect(invalidResponse.details).toMatchObject({ outcome: "abstained", router: [{ reason: "invalid_response" }] });
     const logFailure = await toolFor({ catalog, cli: makeCli().cli, routerLog: vi.fn(async () => { throw new Error("log"); }) as LaunchRouterLog }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
@@ -767,6 +797,13 @@ quotaSources:
 
   it("covers remaining defensive identity and reconciliation projections", async () => {
     const i = launchTestInternals as unknown as UnsafeLaunchInternals;
+    const bypassCatalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const piResolved = { index: 0, candidate: { runner: "pi" as const, model: "pi-model" }, runner: bypassCatalog.runners.get("pi")! };
+    expect(i.allReviewedResources(piResolved)).toMatchObject({ tools: ["read"], extensions: [], skills: [], mcp: [] });
+    expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "claude" } })).toMatchObject({ tools: ["read"], plugins: [], mcp: [] });
+    expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "agy" } })).toEqual({});
+    await expect(i.transportBypassConfiguration(spec({ category: undefined }), { ...bypassCatalog, categories: new Map() })).resolves.toBeUndefined();
+    await expect(i.transportBypassConfiguration(spec(), { ...bypassCatalog, categories: new Map() })).resolves.toBeUndefined();
     const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s" };
     expect(i.launchDiagnosticMessage({ code: "OK", phase: "ready", created: {}, assignmentState: "unconfirmed", paneId: "p", agentStarted: true, promptSubmitted: true, recipientRegistered: false, effectCertainty: "unknown", recoveryGuidance: "Inspect" })).toContain("HERDR_LAUNCH_DIAGNOSTIC");
     expect(() => i.agentIdentity(null, "worker", "p", "pi")).toThrow();

@@ -114,6 +114,8 @@ export interface Abstained {
   reason: AbstainReason;
   component?: string;
   evidence?: RouterEvidence;
+  /** Opaque launch-surface token issued only after a transport abstention is logged. */
+  receipt?: string;
 }
 
 export type SpecDecision = Admitted | Rejected | Abstained;
@@ -483,21 +485,23 @@ function assertBinding(binding: unknown): asserts binding is RouterBinding {
   }
 }
 
-/** Create a replayable bypass only from an abstention that was already recorded. */
+/** Create a replayable bypass only from a recorded transport abstention. */
 export function createBypassReceipt(input: CreateBypassReceiptInput): BypassReceipt {
-  if (input.abstention.kind !== "abstained" || (input.recorded !== true && input.recordedAbstention !== true)) {
-    throw new Error("bypass receipts require a recorded abstention");
+  if (input.abstention.kind !== "abstained" || input.abstention.reason !== "transport_failed" || (input.recorded !== true && input.recordedAbstention !== true)) {
+    throw new Error("bypass receipts require a recorded transport abstention");
   }
   assertBinding(input.binding);
-  const transport = input.abstention.reason === "transport_failed";
+  const category = input.category ?? input.configuration.specLabel;
   const evidence: RouterEvidence = {
-    bypass: { label: transport ? "transport-abstain" : "abstain", quality: transport ? "not_evaluated" : "not_rejected" },
-    quality: { outcome: transport ? "not_evaluated" : "not_rejected" }
+    quality: { outcome: "not_evaluated" },
+    category: { name: category, confidence: 1 },
+    selectedCandidate: { index: input.configuration.candidate.index, runner: input.configuration.candidate.runner, model: input.configuration.candidate.model },
+    bypass: { label: "transport-abstain", quality: "not_evaluated" }
   };
   const result: Admitted = {
     kind: "admitted",
-    quality: transport ? "not_evaluated" : "not_rejected",
-    category: input.category ?? input.configuration.specLabel,
+    quality: "not_evaluated",
+    category,
     count: input.count ?? 1,
     configuration: clone(input.configuration),
     evidence
@@ -509,7 +513,7 @@ export function createBypassReceipt(input: CreateBypassReceiptInput): BypassRece
     recorded: true as const,
     abstention: {
       kind: "abstained" as const,
-      reason: input.abstention.reason,
+      reason: "transport_failed" as const,
       ...(input.abstention.component === undefined ? {} : { component: input.abstention.component })
     },
     result
@@ -531,7 +535,23 @@ export function replayBypassReceipt(receipt: BypassReceipt, binding: RouterBindi
     abstention: receipt.abstention,
     result: receipt.result
   } as Omit<BypassReceipt, "digest">;
-  if (receipt.digest !== receiptDigest(unsigned) || receipt.abstention.kind !== "abstained" || receipt.result.kind !== "admitted") throw new Error("invalid bypass receipt");
+  const evidence = record(receipt.result) && record(receipt.result.evidence) ? receipt.result.evidence : undefined;
+  const quality = record(evidence) && record(evidence.quality) ? evidence.quality : undefined;
+  const bypass = record(evidence) && record(evidence.bypass) ? evidence.bypass : undefined;
+  if (
+    receipt.digest !== receiptDigest(unsigned) ||
+    !record(receipt.abstention) ||
+    receipt.abstention.kind !== "abstained" ||
+    receipt.abstention.reason !== "transport_failed" ||
+    !record(receipt.result) ||
+    receipt.result.kind !== "admitted" ||
+    receipt.result.quality !== "not_evaluated" ||
+    !record(quality) ||
+    quality.outcome !== "not_evaluated" ||
+    !record(bypass) ||
+    bypass.label !== "transport-abstain" ||
+    bypass.quality !== "not_evaluated"
+  ) throw new Error("invalid bypass receipt");
   return clone(receipt.result);
 }
 

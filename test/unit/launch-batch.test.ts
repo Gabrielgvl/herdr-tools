@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { CliProtocolError } from "../../src/cli.js";
 import type { CompiledContract } from "../../src/compile.js";
 import { expandBatchRequest } from "../../src/launch-batch.js";
 import type { LaunchSpec, SpecLaunchRequest } from "../../src/launch-schema.js";
 import type { SpecDecision } from "../../src/router.js";
+import { launchTestInternals } from "../../src/tools/launch.js";
 
 const assignment = { objective: "Do the work.", scope: "Only this replica.", verification: "Run the focused check." };
 const digest = { doneWhen: ["done"], constraints: ["none"] };
@@ -53,6 +55,18 @@ function expanded(result: ReturnType<typeof expandBatchRequest>) {
 }
 
 describe("spec batch expansion", () => {
+  it("treats a typed quota failure from agent start as fallback-eligible", () => {
+    const failure = new CliProtocolError("CLI_PROTOCOL_ERROR", "Individual quota reached", {
+      exitCode: 1,
+      killed: false,
+      errorStream: "stderr",
+      stderrTruncated: false,
+      errorEnvelope: { id: "cli:agent:start", error: { code: "quota_exceeded", message: "Individual quota reached" } },
+    });
+
+    expect(launchTestInternals.startFailureEvidence(failure)).toEqual({ code: "quota_exceeded", message: "Individual quota reached" });
+  });
+
   it("derives exact names and one count-one spec per replica", () => {
     const result = expanded(expandBatchRequest(request([spec("worker", 2), spec("review")]), [admitted(2), admitted(1)], new Set()));
     expect(result.children.map((child) => ({ name: child.name, label: child.specLabel, ordinal: child.ordinal, count: child.count, specCount: child.spec.count }))).toEqual([

@@ -52,6 +52,17 @@ function claudeRunner(models: readonly string[]): RunnerEntry {
   };
 }
 
+function agyRunner(models: readonly string[]): RunnerEntry {
+  return {
+    kind: "agy",
+    models: [...models],
+    quota: { provider: "google", billingProduct: "antigravity", account: "primary", scope: "account" },
+    defaults: { timeoutMinutes: 30, sessionPersistence: true, mode: "plan" },
+    plumbing: { sessionPersistence: "required", promptDelivery: "bootstrap", skillSelection: "ambient", toolSelection: "ambient" },
+    pools: { tools: [], extensions: [], skills: [], plugins: [], mcp: [] },
+  };
+}
+
 function devinRunner(models: readonly string[]): RunnerEntry {
   return {
     kind: "devin",
@@ -524,6 +535,42 @@ describe("herdr_launch spec cutover", () => {
       const persisted = toolFor({ catalog, cli: persistedHarness.cli, cwd: null, useDefaultFailureRecorder: true });
       await persisted.execute("call", request(), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
       expect(readFileSync(join(root, ".herdr", "availability", "cooldowns.jsonl"), "utf8")).toContain('"code":"CLI_PROTOCOL_ERROR"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls through an AGY quota-class pre-spawn failure and reports the launched PI child", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-launch-quota-fallback-"));
+    try {
+      const catalog = catalogOf(
+        [{ runner: "agy", model: "flash-low" }, { runner: "pi", model: "luna" }],
+        new Map<RunnerKind, RunnerEntry>([["agy", agyRunner(["flash-low"])], ["pi", runnerEntry(["luna"])]]),
+      );
+      const harness = makeCli({
+        failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+        start: (_argv, attempt) => {
+          if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Individual quota reached", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "quota_exceeded", message: "Individual quota reached" } } });
+          return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+        },
+      });
+      const result = await toolFor({
+        catalog,
+        cli: harness.cli,
+        cwd: null,
+        useDefaultFailureRecorder: true,
+        specClient: { evaluate: vi.fn(async ({ spec: routedSpec }: { spec: LaunchSpec }) => ({ kind: "response" as const, response: responseFor(catalog, routedSpec.label === "ignored" ? { instructions_adequate: 0.1, assignment_verifiable: 0.1 } : undefined) })) },
+      }).execute("call", request({ specs: [spec(), spec({ label: "ignored" })] }), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
+
+      expect(result.details).toMatchObject({
+        operation: "launch_batch",
+        outcome: "launched",
+        children: [{ status: "launched", launch: { kind: "pi", spec: { selected: { runner: "pi", model: "luna" }, attempts: [{ candidate: { runner: "agy", model: "flash-low" }, outcome: "agent_start_failed", errorCode: "quota_exceeded" }, { candidate: { runner: "pi", model: "luna" }, outcome: "selected" }] } } }],
+      });
+      expect((result.details as { children: unknown[] }).children).toHaveLength(1);
+      expect(harness.starts).toBe(2);
+      expect(harness.children).toHaveLength(1);
+      expect(readFileSync(join(root, ".herdr", "availability", "cooldowns.jsonl"), "utf8")).toContain('"failureClass":"quota"');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

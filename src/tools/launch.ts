@@ -40,7 +40,7 @@ import type { SelfCloseTracker } from "../supervision/self-close.js";
 import { CATALOG_PATH, loadCatalog, resolveChain, type Catalog, type ResolvedCandidate, type RunnerKind } from "../catalog.js";
 import { createWorktreeManager, type WorktreeManager } from "../worktree.js";
 import { compileCandidateContract, contractArgv, type CompiledContract, type ResourceSelection } from "../compile.js";
-import { recordLaunchFailure, type LaunchFailureSignal, type RecordLaunchFailureOptions } from "../availability.js";
+import { classifyLaunchFailure, recordLaunchFailure, type LaunchFailureSignal, type RecordLaunchFailureOptions } from "../availability.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -737,7 +737,9 @@ function startFailureEvidence(error: unknown): { code: string; message: string }
   if (error.code !== "CLI_PROTOCOL_ERROR" || exitCode !== 1 || killed !== false || errorStream !== "stderr" || stderrTruncated !== false) return undefined;
   const envelope = cliErrorEnvelope(error);
   if (!envelope || envelope.id !== "cli:agent:start") return undefined;
-  if (envelope.error.code !== "agent_start_failed" || envelope.error.message !== "agent process exited before becoming interactive") return undefined;
+  const provenPreSpawn = envelope.error.code === "agent_start_failed" && envelope.error.message === "agent process exited before becoming interactive";
+  const quotaFailure = classifyLaunchFailure({ code: error.code, causeCode: envelope.error.code }) === "quota";
+  if (!provenPreSpawn && !quotaFailure) return undefined;
   return { ...envelope.error };
 }
 

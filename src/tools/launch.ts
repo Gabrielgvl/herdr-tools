@@ -24,7 +24,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 import { expandBatchRequest, type BatchExpansion } from "../launch-batch.js";
 import { renderAssignment, SpecLaunchParamsSchema, type LaunchPlacement, type LaunchSpec, type SpecLaunchRequest } from "../launch-schema.js";
 import { renderSpecInstructions } from "../spec-baseline.js";
-import { createBypassReceipt, routeSpec, type BypassReceipt, type RouterBinding, type RouterEvidence, type RouterState, type SpecDecision, type SpecModelDecision } from "../router.js";
+import { candidateResourceSelection, createBypassReceipt, routeSpec, type AvailabilityGate, type BypassReceipt, type RouterBinding, type RouterEvidence, type RouterState, type SpecDecision, type SpecModelDecision } from "../router.js";
 import { appendRouterDecision, routerStateDigest, type AppendRouterLogOptions, type SpecRouterLogEntry } from "../router-log.js";
 import { TypeSafeSpecClient } from "../typesafe-spec.js";
 import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/index.js";
@@ -40,6 +40,7 @@ import type { SelfCloseTracker } from "../supervision/self-close.js";
 import { CATALOG_PATH, loadCatalog, resolveChain, type Catalog, type ResolvedCandidate, type RunnerKind } from "../catalog.js";
 import { createWorktreeManager, type WorktreeManager } from "../worktree.js";
 import { compileCandidateContract, contractArgv, type CompiledContract, type ResourceSelection } from "../compile.js";
+import { recordLaunchFailure, type LaunchFailureSignal, type RecordLaunchFailureOptions } from "../availability.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -92,7 +93,10 @@ export interface LaunchDependencies {
   /** B8's immutable catalog and spec evaluator seams. */
   catalog?: { load: () => Promise<Catalog> };
   specClient?: Pick<TypeSafeSpecClient, "evaluate">;
+  availability?: AvailabilityGate;
   worktrees?: WorktreeManager;
+  /** B2 failure recorder seam; production uses the durable cooldown log. */
+  availabilityFailureRecorder?: (candidate: ResolvedCandidate["candidate"], runner: ResolvedCandidate["runner"], failure: LaunchFailureSignal, options: RecordLaunchFailureOptions) => Promise<unknown>;
   /**
    * The one-shot decision-log append sink, run once per spec decision before
    * any child mutation. Defaults to the local JSONL record rooted at the
@@ -127,6 +131,8 @@ export interface LaunchSpecEvidence {
   selected: { index: number; runner: string; model: string };
   attempts: LaunchAttemptEvidence[];
   fallbackCandidates: Array<{ index: number; runner: string; model: string }>;
+  /** The effective contract that produced the selected child's argv. */
+  configuration: CompiledContract;
 }
 
 export interface LaunchReadinessEvidence {
@@ -2062,7 +2068,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
         evaluation = await Promise.race([
-          specClient.evaluate({ spec, catalog }, AbortSignal.any([signal, timeoutController.signal])),
+          specClient.evaluate({ spec, catalog, team: params.specs }, AbortSignal.any([signal, timeoutController.signal])),
           new Promise<never>((_, reject) => {
             timeout = setTimeout(() => {
               const reason = new DOMException("Spec evaluation timed out", "TimeoutError");
@@ -2081,7 +2087,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       let decision: SpecDecision;
       if (evaluation.kind === "response") {
         try {
-          decision = await routeSpec({ spec, catalog, response: evaluation.response, root, binding });
+          decision = await routeSpec({ spec, catalog, response: evaluation.response, root, binding, launched: params.specs.map((member) => member.label), ...(deps.availability === undefined ? {} : { availability: deps.availability }) });
         } catch {
           decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
         }
@@ -2090,6 +2096,11 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       }
       decision = evaluation;
       await retain(spec, state, binding, decision);
+    }
+    const launched = records.filter((record) => isAdmitted(record.decision)).map((record) => record.spec.label).sort().join("\0");
+    for (const record of records) {
+      if (!isAdmitted(record.decision) || record.decision.advisory === undefined) continue;
+      record.decision = { ...record.decision, advisory: { ...record.decision.advisory, diverged: [...record.decision.advisory.assessed].sort().join("\0") !== launched } };
     }
     return { catalog, records };
   };
@@ -2167,7 +2178,12 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         runner: catalog.runners.get(candidate.runner)!
       }));
       const selectedIndex = decision.evidence!.selectedCandidate!.index;
-      chainCandidates = chain.filter((candidate) => candidate.index >= selectedIndex);
+      const availability = new Map(decision.evidence.availability?.map((entry) => [entry.index, entry.status]));
+      chainCandidates = chain.filter((candidate) => {
+        if (candidate.index < selectedIndex) return false;
+        const status = availability.get(candidate.index);
+        return candidate.index === selectedIndex || (status !== "known-exhausted" && status !== "local-capacity-limited");
+      });
 
       const contractFor = async (resolved: ResolvedCandidate): Promise<CompiledContract> => {
         const key = resolvedCandidateKey(resolved);
@@ -2176,10 +2192,10 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           contracts.set(key, selected);
           return selected;
         }
-        const responseCandidates = routed.response === undefined ? undefined : (routed.response.candidates as readonly unknown[]).filter(record);
-        const judgment = responseCandidates?.find((candidate) => candidate.index === resolved.index && candidate.runner === resolved.candidate.runner && candidate.model === resolved.candidate.model);
-        const selection = judgment?.resources as ResourceSelection | undefined;
-        const compiled = await compileCandidateContract(catalog, spec, resolved, selection ?? allReviewedResources(resolved));
+        const selection = routed.response === undefined
+          ? allReviewedResources(resolved)
+          : candidateResourceSelection(routed.response, chain.map((candidate) => candidate.candidate), resolved.index);
+        const compiled = await compileCandidateContract(catalog, spec, resolved, selection);
         contracts.set(key, compiled);
         return compiled;
       };
@@ -2403,6 +2419,11 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           startedAgent = agentIdentity(started, params.name, resolvedPaneId, contract.runtime.kind);
           break;
         } catch (error) {
+          const envelope = cliErrorEnvelope(error);
+          await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(contract.candidate, chainCandidates.find((resolved) => resolvedCandidateKey(resolved) === candidate)!.runner, {
+            code: launchTransportCode(error),
+            ...(envelope === undefined ? {} : { causeCode: envelope.error.code })
+          }, { root: deps.cwd ?? ctx.cwd });
           const eligible = startFailureEvidence(error);
           if (!eligible) {
             attempts.push({ candidate: candidateIdentityValue, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
@@ -2425,6 +2446,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         throw new LaunchError("LAUNCH_FAILED", "Spec fallback chain exhausted after agent start failure", { attempts });
       }
       const chosenRuntime = chosenContract.runtime;
+      await handoffs.selectCandidate(handoffRun!, chosenContract.candidate.model, chosenRuntime.kind);
       const chosenAgent = startedAgent;
       let agentId = chosenAgent.agentId;
       if (agentId) created.agentId = agentId;
@@ -2574,7 +2596,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           ...(decision.evidence.bypass === undefined ? {} : { bypass: decision.evidence.bypass }),
           selected: candidateIdentity(chosenContract.candidate),
           attempts,
-          fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedCandidateIdentity(candidate))
+          fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedCandidateIdentity(candidate)),
+          configuration: chosenContract
         }
       };
       return { content: [{ type: "text", text: `${formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: requestedDelivery })} · supervisor ${reservation!.jobId}` }], details: launchDetails };

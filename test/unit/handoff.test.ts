@@ -248,7 +248,9 @@ describe("run allocation and state", () => {
       artifact: { path: run.artifactPath, sha256: null, bytes: null, version: 0 },
       repair: { attempts: 0, fence: null }
     });
-    // No staging files survive the atomic commit.
+    await allocator.selectCandidate(run, "worker-claude", "claude");
+    expect((JSON.parse(await readFile(run.statePath, "utf8")) as HandoffState).child).toMatchObject({ candidateName: "worker-claude", agentKind: "claude" });
+    // No staging files survive the atomic commits.
     expect((await readdir(run.toolsDir)).sort()).toEqual(["lock", "state.json"]);
   });
 

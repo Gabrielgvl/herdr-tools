@@ -182,12 +182,8 @@ export interface SupervisorJobRequestSnapshot extends JobRequestCommon {
   settings: {
     reviewCadenceMinutes: number;
     reviewerModel: string;
-    /**
-     * Vestige of the retired supervisor thinking pin (ADR-033); Jev has no thinking
-     * level and nothing consults the value. Retained only because the public
-     * projection still emits it — removal changes the wire-visible request.
-     */
-    reviewerThinking: "max";
+    /** Legacy snapshot compatibility only. Public projections omit it because Jev has no thinking level. */
+    reviewerThinking?: "max";
     /** The reservation's authorial digest (ADR-034; `readOnly` added by ADR-036 W0). Private to the job record; the public projection drops it. */
     supervisionDigest?: SupervisionReservationDigest;
     /** Per-compiled-candidate deny-list facts (ADR-036 W0); the binding resolves the entry for the runner that started. Private to the job record. */
@@ -647,8 +643,7 @@ function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): Jo
       },
       settings: {
         reviewCadenceMinutes: request.settings.reviewCadenceMinutes,
-        reviewerModel,
-        reviewerThinking: request.settings.reviewerThinking
+        reviewerModel
       }
     };
   }
@@ -748,7 +743,6 @@ function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation)
     monitor: { ...view.monitor },
     reviewer: {
       model: boundedText(view.reviewer.model, PUBLIC_FIELD_BYTES),
-      thinking: view.reviewer.thinking,
       cadenceMinutes: view.reviewer.cadenceMinutes,
       degraded: view.reviewer.degraded,
       reviews,

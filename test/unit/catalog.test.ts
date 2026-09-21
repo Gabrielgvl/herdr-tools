@@ -285,7 +285,10 @@ describe("catalog", () => {
       VALID.replace("  - {name: pi-quotas, kind: proactive, runner: pi}", "  - {name: other-floor, kind: floor}"),
       VALID.replace("  - {name: pi-quotas, kind: proactive, runner: pi}", "  - {name: pi-quotas, kind: proactive, runner: pi}\n  - {name: pi-quotas, kind: proactive, runner: pi}"),
       VALID.replace("kind: proactive, runner: pi}", "kind: proactive, runner: nomad}"),
+      VALID.replace("kind: proactive, runner: pi}", "kind: proactive}"),
+      VALID.replace("kind: proactive, runner: pi}", "kind: coarse}"),
       VALID.replace("kind: proactive, runner: pi}", "kind: bogus, runner: pi}"),
+      VALID.replace("kind: floor}", "kind: floor, runner: pi}"),
       VALID.replace("  - {name: reactive-cooldowns, kind: floor}", "  - 5"),
       VALID.replace("  - {name: reactive-cooldowns, kind: floor}", "  - {name: reactive-cooldowns, kind: floor, zone: x}"),
       // Anchors, aliases, and tags are refused outright.

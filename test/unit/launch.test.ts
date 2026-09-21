@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
@@ -124,6 +124,7 @@ function fakeHandoffs(): HandoffAllocator {
       return { runId, namespaceDir: tmpdir(), directory, artifactPath: join(directory, "handoff.md"), toolsDir: join(directory, ".tools"), statePath: join(directory, ".tools", "state.json"), lockPath: join(directory, ".tools", "lock"), marker: `herdr-run:${runId}` };
     }),
     persist: vi.fn(async () => undefined),
+    selectCandidate: vi.fn(async () => undefined),
   };
 }
 
@@ -261,19 +262,26 @@ function toolFor(options: {
   promptSources?: LaunchDependencies["promptSources"];
   queueFlush?: LaunchDependencies["queueFlush"];
   clock?: LaunchDependencies["clock"];
+  handoffs?: HandoffAllocator;
+  availability?: LaunchDependencies["availability"];
+  availabilityFailureRecorder?: LaunchDependencies["availabilityFailureRecorder"];
+  cwd?: string | null;
+  useDefaultFailureRecorder?: boolean;
 }): ReturnType<typeof createLaunchTool> {
   const supervision = options.supervision ?? stubSupervision();
   const specClient = options.specClient ?? { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(options.catalog) })) };
   return createLaunchTool({
     cli: options.cli,
     context,
-    cwd: "/repo",
+    ...(options.cwd === null ? {} : { cwd: options.cwd ?? "/repo" }),
     preflight: options.preflight ?? (async () => undefined),
     supervision,
     specClient,
     catalog: { load: options.catalogLoad ?? (async () => options.catalog) },
     attachments: options.attachments ?? fakeAttachments(),
-    handoffs: fakeHandoffs(),
+    handoffs: options.handoffs ?? fakeHandoffs(),
+    ...(options.useDefaultFailureRecorder ? {} : { availabilityFailureRecorder: options.availabilityFailureRecorder ?? vi.fn(async () => undefined) }),
+    ...(options.availability === undefined ? {} : { availability: options.availability }),
     ...(options.ownership === undefined ? {} : { ownership: options.ownership }),
     recipients: new RecipientRegistry(),
     routerLog: options.routerLog ?? (vi.fn(async () => undefined) as LaunchRouterLog),
@@ -311,6 +319,8 @@ describe("herdr_launch spec cutover", () => {
     expect(() => validateLaunchParams(duplicate)).toThrow();
     expect([...Value.Errors(SpecLaunchParamsSchema, duplicate)]).toEqual(expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining("duplicate spec.label") })]));
     expect(Value.Check(SpecLaunchParamsSchema, { ...valid, specs: [spec({ label: "worker-overlong" })] })).toBe(false);
+    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, specs: [spec({ count: 8 })] })).toBe(true);
+    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, specs: [spec({ count: 9 })] })).toBe(false);
   });
 
   it("derives the child name, carries the universal baseline, and reserves the caller digest", async () => {
@@ -322,7 +332,7 @@ describe("herdr_launch spec cutover", () => {
     supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
     const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), request());
 
-    expect(result.details).toMatchObject({ outcome: "launched", name: "task-worker-1", kind: "pi", spec: { label: "worker", count: 1, selected: { model: "pi-model" } }, supervision: { state: "active" } });
+    expect(result.details).toMatchObject({ outcome: "launched", name: "task-worker-1", kind: "pi", spec: { label: "worker", count: 1, selected: { model: "pi-model" }, configuration: { runtime: { kind: "pi", model: "pi-model", thinking: "low", tools: ["read"] }, timeoutMinutes: 30, resources: { tools: { permitted: ["read"] } } } }, supervision: { state: "active" } });
     expect(harness.prompts).toHaveLength(1);
     expect(harness.prompts[0]).toContain(SPEC_BASELINE);
     expect(harness.prompts[0]).toContain("Reduce the latency without changing the public contract.");
@@ -422,6 +432,37 @@ describe("herdr_launch spec cutover", () => {
     expect(harness.calls).toEqual([]);
   });
 
+  it("assesses every spec against the complete planned team", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const evaluate = vi.fn(async ({ spec: routedSpec, team }: { spec: LaunchSpec; team?: readonly LaunchSpec[] }) => ({
+      kind: "response" as const,
+      response: { ...responseFor(catalog), composition: { missing_area: 0.9, assessed: team?.map((member) => member.label) ?? [routedSpec.label] } },
+    }));
+    const result = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate } }).execute(
+      "call",
+      request({ specs: [spec(), spec({ label: "critic" })] }),
+      new AbortController().signal,
+      undefined,
+      extensionContext,
+    );
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    expect(evaluate.mock.calls.every(([input]) => input.team?.map((member) => member.label).join(",") === "worker,critic")).toBe(true);
+    expect(result.details).toMatchObject({ router: [{ advisory: { assessed: ["worker", "critic"], diverged: false } }, { advisory: { assessed: ["worker", "critic"], diverged: false } }] });
+
+    const partial = await toolFor({
+      catalog,
+      cli: makeCli().cli,
+      specClient: { evaluate: vi.fn(async ({ spec: routedSpec, team }: { spec: LaunchSpec; team?: readonly LaunchSpec[] }) => ({
+        kind: "response" as const,
+        response: {
+          ...responseFor(catalog, routedSpec.label === "critic" ? { instructions_adequate: 0.1, assignment_verifiable: 0.1 } : undefined),
+          composition: { missing_area: 0.9, assessed: team!.map((member) => member.label) },
+        },
+      })) },
+    }).execute("call", request({ specs: [spec(), spec({ label: "critic" })] }), new AbortController().signal, undefined, extensionContext);
+    expect(partial.details).toMatchObject({ router: [{ advisory: { assessed: ["worker", "critic"], diverged: true } }, { kind: "rejected" }] });
+  });
+
   it("launches a Bash-only task after excluding every hedged alternative execution tool", async () => {
     const baseCatalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const pi = baseCatalog.runners.get("pi")!;
@@ -463,9 +504,66 @@ describe("herdr_launch spec cutover", () => {
         return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
       },
     });
-    const result = await execute(toolFor({ catalog, cli: harness.cli }), request());
+    const handoffs = fakeHandoffs();
+    const availabilityFailureRecorder = vi.fn(async () => undefined);
+    const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs, availabilityFailureRecorder }), request());
     expect(result.details).toMatchObject({ spec: { selected: { model: "fallback" }, attempts: [{ outcome: "agent_start_failed" }, { outcome: "selected" }] } });
+    expect(availabilityFailureRecorder).toHaveBeenCalledWith(expect.objectContaining({ model: "primary" }), expect.anything(), { code: "CLI_PROTOCOL_ERROR", causeCode: "agent_start_failed" }, { root: "/repo" });
+    expect(handoffs.selectCandidate).toHaveBeenCalledWith(expect.anything(), "fallback", "pi");
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
+
+    const root = mkdtempSync(join(tmpdir(), "herdr-launch-availability-"));
+    try {
+      const persistedHarness = makeCli({
+        failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+        start: (_argv, attempt) => {
+          if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
+          return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+        },
+      });
+      const persisted = toolFor({ catalog, cli: persistedHarness.cli, cwd: null, useDefaultFailureRecorder: true });
+      await persisted.execute("call", request(), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
+      expect(readFileSync(join(root, ".herdr", "availability", "cooldowns.jsonl"), "utf8")).toContain('"code":"CLI_PROTOCOL_ERROR"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("compiles fallback probability maps with the router parser", async () => {
+    const catalog = catalogOf(
+      [{ runner: "pi", model: "primary" }, { runner: "claude", model: "fallback" }],
+      new Map<RunnerKind, RunnerEntry>([["pi", runnerEntry(["primary"])], ["claude", claudeRunner(["fallback"])]]),
+    );
+    const response = responseFor(catalog);
+    for (const candidate of response.candidates as unknown as Array<{ resources: unknown }>) candidate.resources = { tools: { read: 0.95 } };
+    const harness = makeCli({
+      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+      start: (_argv, attempt) => {
+        if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
+        return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:claude", agent: "claude", kind: "id", value: "session-1" } } });
+      },
+    });
+    const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) } }), request());
+    expect(result.details.spec).toMatchObject({ selected: { runner: "claude", model: "fallback" }, configuration: { runtime: { kind: "claude", allowedTools: ["read"] } } });
+  });
+
+  it("does not re-admit unavailable candidates into the fallback chain", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "exhausted" }, { runner: "pi", model: "primary" }, { runner: "pi", model: "cooled" }, { runner: "pi", model: "fallback" }]);
+    const availability = vi.fn(async (candidate: ChainCandidate) => ({
+      status: candidate.model === "exhausted" ? "known-exhausted" as const : candidate.model === "cooled" ? "local-capacity-limited" as const : "unknown" as const,
+      retryNotBefore: null,
+      evidence: { records: 0 },
+    }));
+    const harness = makeCli({
+      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+      start: (_argv, attempt) => {
+        if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
+        return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+      },
+    });
+    const result = await execute(toolFor({ catalog, cli: harness.cli, availability }), request());
+    expect(result.details.spec).toMatchObject({ selected: { model: "fallback" }, fallbackCandidates: [{ model: "fallback" }] });
+    expect(harness.starts).toBe(2);
   });
 
   it("preserves fallback_refused when authoritative pane state still has an agent", async () => {

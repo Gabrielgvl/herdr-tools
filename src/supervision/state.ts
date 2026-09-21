@@ -79,7 +79,8 @@ export interface SupervisionReviewView {
 
 export interface SupervisionReviewerView {
   model: string;
-  thinking: "max";
+  /** Legacy input compatibility only. Public projections omit this because Jev has no thinking level. */
+  thinking?: "max";
   cadenceMinutes: number;
   degraded: boolean;
   reviews: SupervisionReviewView[];

@@ -2349,7 +2349,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       },
       reviewer: {
         model: SUPERVISION_REVIEWER_MODEL,
-        thinking: "max" as const,
         cadenceMinutes: Math.round(this.deps.cadenceMs / 60_000),
         degraded: this.reviewerDegraded,
         reviews: this.reviews.entries(),

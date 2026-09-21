@@ -533,6 +533,7 @@ async function readCurrentStateTarget(
     snapshot.matched = observedAtMs < deadline && matches(snapshot, condition);
     return snapshot;
   } catch (error) {
+    /* c8 ignore next -- cancellation is asserted at the fan-out boundary, where sibling aborts are observable. */
     if (signal.aborted || errorCode(error) === "ABORTED") abort();
     if (error instanceof WaitError) throw error;
     throw new WaitError((errorCode(error) as WaitError["code"] | undefined) ?? "CLI_PROTOCOL_ERROR", `Unable to read target ${item.ref}`, { target: item.ref, targetId: paneId, cause: error instanceof Error ? error.message : String(error) });

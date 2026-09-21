@@ -30,6 +30,7 @@ import { TypeSafeSpecClient } from "../typesafe-spec.js";
 import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/index.js";
 import type { ProfileKind } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
+import { boundedDiagnosticMessage } from "../telemetry.js";
 import type { SupervisionForbiddenToolsPolicy, SupervisionWorkspaceRoot } from "../job-registry.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
@@ -363,28 +364,18 @@ function launchDiagnosticMessage(diagnostic: LaunchModelDiagnostic): string {
     effectCertainty: diagnostic.effectCertainty,
     recoveryGuidance: diagnostic.recoveryGuidance
   };
-  const suffix = `\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`;
-  const suffixBytes = Buffer.byteLength(suffix, "utf8");
-  /* c8 ignore next -- the fixed-shape payload is bounded below this defensive fallback. */
-  if (suffixBytes > LAUNCH_DIAGNOSTIC_MAX_BYTES) {
-    // The normal fixed-shape payload is comfortably below the bound. Keep a
-    // valid, smaller payload if that invariant ever changes instead of slicing
-    // JSON in the middle of a multibyte character or escaped field.
-    const minimal = {
-      code: payload.code,
-      phase: payload.phase,
-      created: {},
-      ...(payload.assignmentState === "unconfirmed" ? { paneId: payload.paneId, supervisorJobId: payload.supervisorJobId, assignmentState: payload.assignmentState } : {}),
-      agentStarted: payload.agentStarted,
-      promptSubmitted: payload.promptSubmitted,
-      recipientRegistered: payload.recipientRegistered,
-      effectCertainty: payload.effectCertainty,
-      recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.unknownEffect
-    } satisfies LaunchModelDiagnostic;
-    return `${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(minimal)}`;
-  }
-  const available = LAUNCH_DIAGNOSTIC_MAX_BYTES - suffixBytes;
-  return `${boundedDiagnosticText(LAUNCH_DIAGNOSTIC_SUMMARY, available)}${suffix}`;
+  const minimal = {
+    code: payload.code,
+    phase: payload.phase,
+    created: {},
+    ...(payload.assignmentState === "unconfirmed" ? { paneId: payload.paneId, supervisorJobId: payload.supervisorJobId, assignmentState: payload.assignmentState } : {}),
+    agentStarted: payload.agentStarted,
+    promptSubmitted: payload.promptSubmitted,
+    recipientRegistered: payload.recipientRegistered,
+    effectCertainty: payload.effectCertainty,
+    recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.unknownEffect
+  } satisfies LaunchModelDiagnostic;
+  return boundedDiagnosticMessage(LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_DIAGNOSTIC_MARKER, payload, LAUNCH_DIAGNOSTIC_MAX_BYTES, minimal);
 }
 
 class LaunchError extends Error {

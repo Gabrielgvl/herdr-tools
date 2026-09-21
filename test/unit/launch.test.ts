@@ -576,6 +576,42 @@ describe("herdr_launch spec cutover", () => {
     }
   });
 
+  it("falls through an AGY spawn deadline after authoritative no-agent proof", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-launch-timeout-fallback-"));
+    try {
+      const catalog = catalogOf(
+        [{ runner: "agy", model: "flash-low" }, { runner: "pi", model: "luna" }],
+        new Map<RunnerKind, RunnerEntry>([["agy", agyRunner(["flash-low"])], ["pi", runnerEntry(["luna"])]]),
+      );
+      const harness = makeCli({
+        failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+        start: (_argv, attempt) => {
+          if (attempt === 0) throw new CliProtocolError("CLI_TIMEOUT", "start surfaced timeout", { exitCode: null, killed: true, errorEnvelope: { id: "cli:agent:start", error: { code: "quota_exceeded", message: "AGY individual quota reached" } } });
+          return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+        },
+      });
+      const result = await toolFor({
+        catalog,
+        cli: harness.cli,
+        cwd: null,
+        useDefaultFailureRecorder: true,
+        specClient: { evaluate: vi.fn(async ({ spec: routedSpec }: { spec: LaunchSpec }) => ({ kind: "response" as const, response: responseFor(catalog, routedSpec.label === "ignored" ? { instructions_adequate: 0.1, assignment_verifiable: 0.1 } : undefined) })) },
+      }).execute("call", request({ specs: [spec(), spec({ label: "ignored" })] }), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
+
+      expect(result.details).toMatchObject({
+        operation: "launch_batch",
+        outcome: "launched",
+        children: [{ status: "launched", launch: { kind: "pi", spec: { selected: { runner: "pi", model: "luna" }, attempts: [{ candidate: { runner: "agy", model: "flash-low" }, outcome: "agent_start_failed", errorCode: "CLI_TIMEOUT", message: "AGY individual quota reached" }, { candidate: { runner: "pi", model: "luna" }, outcome: "selected" }] } } }],
+      });
+      expect((result.details as { children: unknown[] }).children).toHaveLength(1);
+      expect(harness.starts).toBe(2);
+      expect(harness.children).toHaveLength(1);
+      expect(readFileSync(join(root, ".herdr", "availability", "cooldowns.jsonl"), "utf8")).toContain('"failureClass":"quota"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("compiles fallback probability maps with the router parser", async () => {
     const catalog = catalogOf(
       [{ runner: "pi", model: "primary" }, { runner: "claude", model: "fallback" }],

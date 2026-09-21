@@ -67,6 +67,17 @@ describe("spec batch expansion", () => {
     expect(launchTestInternals.startFailureEvidence(failure)).toEqual({ code: "quota_exceeded", message: "Individual quota reached" });
   });
 
+  it("treats an agent-start deadline with no confirmed child as fallback-eligible", () => {
+    const failure = new CliProtocolError("CLI_TIMEOUT", "start surfaced timeout", {
+      exitCode: null,
+      killed: true,
+      errorEnvelope: { id: "cli:agent:start", error: { code: "quota_exceeded", message: "AGY individual quota reached" } },
+    });
+
+    expect(launchTestInternals.startFailureEvidence(failure)).toEqual({ code: "CLI_TIMEOUT", message: "AGY individual quota reached" });
+    expect(launchTestInternals.startFailureEvidence(new CliProtocolError("CLI_TIMEOUT", "start surfaced timeout", { killed: true }))).toEqual({ code: "CLI_TIMEOUT", message: "start surfaced timeout" });
+  });
+
   it("derives exact names and one count-one spec per replica", () => {
     const result = expanded(expandBatchRequest(request([spec("worker", 2), spec("review")]), [admitted(2), admitted(1)], new Set()));
     expect(result.children.map((child) => ({ name: child.name, label: child.specLabel, ordinal: child.ordinal, count: child.count, specCount: child.spec.count }))).toEqual([

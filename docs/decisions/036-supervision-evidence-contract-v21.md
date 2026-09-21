@@ -4,6 +4,8 @@
 
 Accepted (owner-authored contract, 2026-09-19). Implementation sequenced after the C1 reducer move (file-collision avoidance) and the router promotion (landed). V2.2 elements are explicitly conditional on observed unknown-rates.
 
+Implementation accuracy note: the current launch carrier supplies only `doneWhen` and `constraints` to reviewer assignment evidence. It does not copy `spec.assignment.objective`, and the public schema has no `progressMarkers`, so those fields are absent and empty respectively. The current porcelain parser can reject a valid worktree-column rename as `output_malformed`. A status-bearing `pane_exited` latches a non-clean exit before identity reconciliation. These are current behavior, not completed parts of the intended contract below.
+
 ## Date
 
 2026-09-19
@@ -25,7 +27,7 @@ Owner-authored replacement contract, informed by scout reports: VCC (lllyasviel/
 - Workspace view per cadence: `baseRevision`, `headRevision`, `dirty`, `changedFiles` (path/status/added/deleted), diff stats, `fingerprint` — no full diff. Bounded recent hunks and files-written-since-last-review are V2.2.
 - Deterministic `executionDigest`: actions compacted by class (read/search/edit/command with exit code and duration), never LLM-summarized. The evidence chain `edit → failing test → edit → passing test` must survive compaction (non-zero exits, errors, writes, first/last occurrences are never compacted away).
 - Byte budgets with truncation priority: assignment 8KB (never truncated), trace 32KB, patch 16KB (V2.2), terminal 8KB (sacrificed first), total state 64KB. Over-budget structural evidence → `reviewer_unavailable`, never silent truncation of causal events.
-- Outbound safety: build → deterministic compaction → byte bounding → local sensitive-context scan → only `safe` sends. `sensitive|indeterminate` → no request, `reviewer_unavailable`. No semantic redaction (it silently alters evidence).
+- Outbound safety: build → deterministic compaction → byte bounding → local sensitive-context scan → only `safe` sends. `sensitive|indeterminate` → no request, `reviewer_unavailable`. No semantic redaction (it silently alters evidence). The implementation uses configured shaped patterns, so `safe` means no detector matched. It is not a general proof that arbitrary credential text is absent.
 - **Attention policy separated from classification** (code, not Jev): `risk`/`blocked`/`appears_complete`/`stalled` → wake; `progress` → silent; `unknown` → silent during **baseline grace** (first review of a reservation with `workingForMs ≤ 2×cadence`), wake otherwise. Baseline acquisitions are expected states, not findings.
 - **Reducer amendment (supersedes ADR-034's gate-first ordering for interrupts):** `risk` and `blocked` are interrupt signals evaluated BEFORE the evidence gate — they wake a human, so a miss is more expensive than a false wake; the evidence gate still governs `appears_complete`/`stalled`/`progress`/fallthrough. `stalled` on a first observation requires ≥ 0.85 (no trajectory exists to ground a lower bar).
 - **Deterministic summary:** Jev never generates prose. The summary is code-composed (`classification: signals; trace=cursor; workspace=fingerprint`) — auditable, aggregatable, and the judgment-of-judgment anti-pattern stays dead.
@@ -85,7 +87,7 @@ Evidence hierarchy: Tier 0 deterministic violations (code) → Tier 1 structured
 
 ## Assignment digest fields
 
-`assignment: { objective, doneWhen (terminal criteria only), progressMarkers (intermediate observable states — never count as completion criteria), constraints }`. `progressMarkers` give the first review verifiable advancement targets (the grounding the N8 first-cadence 0.58 lacked).
+The intended shape is `assignment: { objective, doneWhen (terminal criteria only), progressMarkers (intermediate observable states that never count as completion criteria), constraints }`. The evidence builder supports that shape, but the production launch-to-supervisor carrier currently supplies only `doneWhen` and `constraints`. `objective` is omitted and `progressMarkers` is empty in production reviews.
 
 ## V2 result shape
 

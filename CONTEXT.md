@@ -11,8 +11,8 @@ A caller-authored launch unit in `herdr_launch.specs`: `label`, `instructions`, 
 _Avoid_: profile, role, preset, template
 
 **Category**:
-A named catalog capability tier (`frontier`, `balanced`, `cheap`) resolving to an ordered chain of `{runner, model}` candidates in `herdr-profiles/catalog.yaml`. A spec may name its category; otherwise Jev chooses it.
-_Avoid_: tier, class, profile family
+The public `specs[].category` field names a catalog capability group (`frontier`, `balanced`, `cheap`) that resolves to an ordered chain of `{runner, model}` candidates in `herdr-profiles/catalog.yaml`. A spec may name its category; otherwise Jev chooses it. The current schema has no `qualityTier` field and no `standard` default.
+_Avoid_: quality tier, tier, class, profile family
 
 **Candidate**:
 One `{runner, model}` entry in a category chain. Deterministic admission selects the first eligible and available candidate; the rest remain the fallback chain inside `agent_start`.

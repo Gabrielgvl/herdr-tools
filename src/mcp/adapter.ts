@@ -1,9 +1,9 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
-import { Value } from "typebox/value";
 import { modelSafeJson } from "../redaction.js";
 import type { HerdrToolDefinition, HerdrToolSurface } from "../tool-surface.js";
 import { hostContext, type HerdrToolHost } from "./host.js";
 import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE } from "../tools/launch.js";
+import { appendToolTelemetry, invalidInputError, monotonicDurationMs, telemetryOperation, type ToolInputError } from "../telemetry.js";
 import type { QueueRefusal, SequentialToolQueue } from "./queue.js";
 
 /** Total response bound for one MCP tool result. */
@@ -21,7 +21,6 @@ const DETAILS_FIELD_BYTES = Buffer.byteLength(",\"details\":", "utf8");
 const MAX_ERROR_MESSAGE_CHARS = 2_000;
 const MAX_CODE_CHARS = 120;
 const MAX_TOOL_NAME_CHARS = 120;
-const MAX_VALIDATION_ERRORS = 3;
 const LAUNCH_DIAGNOSTIC_PHASES = new Set(["validate", "resolve_profile", "attachment_publish", "supervision_reserve", "placement", "agent_start", "ready", "focus", "prompt_verification", "supervision_bind"]);
 const LAUNCH_EFFECT_CERTAINTIES = new Set(["absent", "partial", "unknown", "confirmed"]);
 const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
@@ -375,15 +374,12 @@ export function errorOutcome(code: string, message: string, details?: unknown, t
   return { content: [{ type: "text", text: JSON.stringify(payload) }], isError: true };
 }
 
-function validationOutcome(definition: HerdrToolDefinition, args: unknown): McpCallOutcome | undefined {
-  if (Value.Check(definition.parameters, args)) return undefined;
-  const errors = [...Value.Errors(definition.parameters, args)].slice(0, MAX_VALIDATION_ERRORS).map((error) => ({
-    keyword: singleLine(String(error.keyword), MAX_CODE_CHARS),
-    instancePath: singleLine(String(error.instancePath), MAX_CODE_CHARS),
-    schemaPath: singleLine(String(error.schemaPath), MAX_CODE_CHARS),
-    message: singleLine(String(error.message), MAX_ERROR_MESSAGE_CHARS)
-  }));
-  return errorOutcome("INVALID_INPUT", `INVALID_INPUT: arguments do not match the ${definition.name} schema`, { errors });
+function toolInputOutcome(error: ToolInputError): McpCallOutcome {
+  return { content: [{ type: "text", text: JSON.stringify({ code: error.code, message: error.message, details: error.diagnostic }) }], isError: true };
+}
+
+function validationError(definition: HerdrToolDefinition, args: unknown): ToolInputError | undefined {
+  return invalidInputError(definition.name, definition.validationSchema ?? definition.parameters, args);
 }
 
 const QUEUE_REFUSAL_MESSAGE: Record<QueueRefusal, string> = {
@@ -402,13 +398,23 @@ const QUEUE_REFUSAL_MESSAGE: Record<QueueRefusal, string> = {
  * state and must not wait behind an unrelated mutation.
  */
 export async function callTool(request: McpCallRequest): Promise<McpCallOutcome> {
+  const startedAt = performance.now();
   const definition = request.surface.definitions.find((candidate) => candidate.name === request.name);
   if (!definition) {
     throw new McpError(ErrorCode.MethodNotFound, `unknown Herdr tool ${singleLine(request.name, MAX_TOOL_NAME_CHARS)}`);
   }
   const args = request.args === undefined || request.args === null ? {} : request.args;
-  const invalid = validationOutcome(definition, args);
-  if (invalid) return invalid;
+  const invalid = validationError(definition, args);
+  if (invalid !== undefined) {
+    await appendToolTelemetry({
+      tool: definition.name,
+      operation: telemetryOperation(definition.name, args, false),
+      phases: { validate: "failure", execute: "skipped", persist: "success" },
+      durationMs: monotonicDurationMs(startedAt),
+      effectCertainty: "absent",
+    }, { root: request.host.cwd });
+    return toolInputOutcome(invalid);
+  }
   const invoke = async (): Promise<McpCallOutcome> => {
     try {
       const result = await definition.execute(request.callId, args, request.host.signal, undefined, hostContext(request.host));

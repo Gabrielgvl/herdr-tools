@@ -22,6 +22,12 @@ import { createLaunchTool } from "./tools/launch.js";
 import { createPaneTool } from "./tools/pane.js";
 import { createTabTool } from "./tools/tab.js";
 import { createWaitTool } from "./tools/wait.js";
+import { CommunicateParamsSchema, InspectParamsSchema } from "./schemas.js";
+import { JobsParamsSchema } from "./jobs-schema.js";
+import { SpecLaunchParamsSchema } from "./launch-schema.js";
+import { PaneParamsSchema, TabParamsSchema } from "./topology-schema.js";
+import { WaitParamsSchema } from "./wait-schema.js";
+import { appendToolTelemetry, invalidInputError, monotonicDurationMs, telemetryEffectCertainty, telemetryOperation, type ToolTelemetryEntry } from "./telemetry.js";
 
 export const CORE_TOOL_NAMES = [
   "herdr_inspect",
@@ -86,6 +92,8 @@ export interface HerdrToolDefinition {
   readonly label: string;
   readonly description: string;
   readonly parameters: TSchema;
+  /** The strict runtime schema when `parameters` is the host-compatible flat projection. */
+  readonly validationSchema?: TSchema;
   /**
    * The Pi scheduling contract the mutating tools declare. Both hosts must
    * honor it, so it is part of the host-agnostic projection rather than a
@@ -156,11 +164,47 @@ export interface HerdrToolSurface {
   readonly definitions: readonly HerdrToolDefinition[];
 }
 
+function telemetryEntry(
+  tool: string,
+  operation: string,
+  validate: ToolTelemetryEntry["phases"]["validate"],
+  execute: ToolTelemetryEntry["phases"]["execute"],
+  startedAt: number,
+  effectCertainty: ToolTelemetryEntry["effectCertainty"],
+): ToolTelemetryEntry {
+  return { tool, operation, phases: { validate, execute, persist: "success" }, durationMs: monotonicDurationMs(startedAt), effectCertainty };
+}
+
+function instrumentTool<T extends HerdrToolDefinition>(tool: T, validationSchema: TSchema, root: string): T {
+  const execute = tool.execute.bind(tool);
+  return {
+    ...tool,
+    validationSchema,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const startedAt = performance.now();
+      const invalid = invalidInputError(tool.name, validationSchema, params);
+      if (invalid !== undefined) {
+        await appendToolTelemetry(telemetryEntry(tool.name, telemetryOperation(tool.name, params, false), "failure", "skipped", startedAt, "absent"), { root });
+        throw invalid;
+      }
+      const operation = telemetryOperation(tool.name, params, true);
+      try {
+        const result = await execute(toolCallId, params, signal, onUpdate, ctx);
+        await appendToolTelemetry(telemetryEntry(tool.name, operation, "success", "success", startedAt, telemetryEffectCertainty(result, "confirmed")), { root });
+        return result;
+      } catch (error) {
+        await appendToolTelemetry(telemetryEntry(tool.name, operation, "success", "failure", startedAt, telemetryEffectCertainty(error, "unknown")), { root });
+        throw error;
+      }
+    },
+  } as T;
+}
+
 /** Construct the seven Herdr tools once for every host. */
 export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrToolSurface {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
-  const inspect = createInspectTool({ cli: deps.cli, context: deps.context, contextResolver, environment: deps.environment, profiles: deps.profiles, ...(deps.handoffs ? { handoffs: deps.handoffs } : {}) });
-  const communicate = createCommunicateTool({
+  const inspect = instrumentTool(createInspectTool({ cli: deps.cli, context: deps.context, contextResolver, environment: deps.environment, profiles: deps.profiles, ...(deps.handoffs ? { handoffs: deps.handoffs } : {}) }), InspectParamsSchema, deps.cwd);
+  const communicate = instrumentTool(createCommunicateTool({
     cli: deps.cli,
     context: deps.context,
     contextResolver,
@@ -168,8 +212,8 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     queueFlush: deps.queueFlush,
     ...(deps.attachments ? { attachments: deps.attachments } : {}),
     ...(deps.recipients ? { recipients: deps.recipients } : {}),
-  });
-  const wait = createWaitTool({
+  }), CommunicateParamsSchema, deps.cwd);
+  const wait = instrumentTool(createWaitTool({
     cli: deps.cli,
     context: deps.context,
     contextResolver,
@@ -177,9 +221,9 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     jobRegistry: deps.jobs,
     ...(deps.reviewerFactory ? { reviewerFactory: deps.reviewerFactory } : {}),
     ...(deps.handoffs ? { handoffs: deps.handoffs } : {}),
-  });
-  const jobs = createJobsTool(deps.jobs);
-  const launch = createLaunchTool({
+  }), WaitParamsSchema, deps.cwd);
+  const jobs = instrumentTool(createJobsTool(deps.jobs), JobsParamsSchema, deps.cwd);
+  const launch = instrumentTool(createLaunchTool({
     cli: deps.cli,
     context: deps.context,
     contextResolver,
@@ -191,8 +235,8 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     queueFlush: deps.queueFlush,
     ...(deps.attachments ? { attachments: deps.attachments } : {}),
     ...(deps.recipients ? { recipients: deps.recipients } : {}),
-  });
-  const pane = createPaneTool({
+  }), SpecLaunchParamsSchema, deps.cwd);
+  const pane = instrumentTool(createPaneTool({
     cli: deps.cli,
     context: deps.context,
     contextResolver,
@@ -200,15 +244,15 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     ownership: deps.ownership,
     preflight: deps.preflight,
     ...(deps.selfClose ? { selfClose: deps.selfClose } : {}),
-  });
-  const tab = createTabTool({
+  }), PaneParamsSchema, deps.cwd);
+  const tab = instrumentTool(createTabTool({
     cli: deps.cli,
     context: deps.context,
     contextResolver,
     cwd: deps.cwd,
     ownership: deps.ownership,
     preflight: deps.preflight,
-  });
+  }), TabParamsSchema, deps.cwd);
   return {
     inspect,
     communicate,

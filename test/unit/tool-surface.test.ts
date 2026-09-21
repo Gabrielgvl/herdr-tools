@@ -16,6 +16,7 @@ import { createLaunchTool } from "../../src/tools/launch.js";
 import { createPaneTool } from "../../src/tools/pane.js";
 import { createTabTool } from "../../src/tools/tab.js";
 import { createWaitTool } from "../../src/tools/wait.js";
+import { TOOL_DIAGNOSTIC_MARKER } from "../../src/telemetry.js";
 import { stubSupervision } from "./supervision-fixtures.js";
 
 const snapshot = {
@@ -124,6 +125,23 @@ describe("shared tool surface", () => {
     expect(surface.definitions.map((definition) => ({ name: definition.name, label: definition.label, description: definition.description })))
       .toEqual(direct.map((definition) => ({ name: definition.name, label: definition.label, description: definition.description })));
     expect(surface.definitions.filter((definition) => "executionMode" in definition).map((definition) => definition.name)).toEqual(["herdr_communicate", "herdr_pane", "herdr_tab"]);
+  });
+
+  it("validates strict per-operation schemas before executing a shared tool", async () => {
+    const { surface, calls } = surfaceFor();
+    const failure = await surface.tab.execute("id", { operation: "create" } as never, new AbortController().signal, undefined, extensionContext).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "INVALID_INPUT",
+      diagnostic: {
+        tool: "herdr_tab",
+        schema: "herdr_tab",
+        phase: "validate",
+        errors: expect.arrayContaining([{ path: "/label", expected: "required property", received: "missing" }]) as unknown[],
+        effectCertainty: "absent",
+      },
+    });
+    expect((failure as Error).message).toContain(TOOL_DIAGNOSTIC_MARKER);
+    expect(calls).toEqual([]);
   });
 
   it("threads the host working directory into topology mutations", async () => {

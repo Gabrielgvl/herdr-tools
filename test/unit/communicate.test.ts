@@ -119,6 +119,13 @@ function makeClaudeCli(options: { omitSession?: boolean } = {}) {
 }
 
 describe("herdr_communicate", () => {
+  it("retains direct factory validation behind the shared diagnostic wrapper", async () => {
+    const harness = makeCli();
+    await expect(execute(harness.cli, { operation: "cancel", text: "invalid" })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(execute(harness.cli, { operation: "prompt", target: "w1:p2", text: "valid", extra: true })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(harness.calls).toEqual([]);
+  });
+
   it.each(["idle", "done", "blocked"] as const)("steers %s directly without Escape", async (state) => {
     const harness = makeCli(state);
     const result = await execute(harness.cli, { target: "reviewer", operation: "steer", text: "new direction" });

@@ -1,4 +1,5 @@
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,12 +24,13 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 import { expandBatchRequest, type BatchExpansion } from "../launch-batch.js";
 import { renderAssignment, SpecLaunchParamsSchema, type LaunchPlacement, type LaunchSpec, type SpecLaunchRequest } from "../launch-schema.js";
 import { renderSpecInstructions } from "../spec-baseline.js";
-import { routeSpec, type RouterState, type SpecDecision, type SpecModelDecision } from "../router.js";
-import { appendRouterDecision, type AppendRouterLogOptions, type SpecRouterLogEntry } from "../router-log.js";
+import { candidateResourceSelection, createBypassReceipt, routeSpec, type AvailabilityGate, type BypassReceipt, type RouterBinding, type RouterEvidence, type RouterState, type SpecDecision, type SpecModelDecision } from "../router.js";
+import { appendRouterDecision, routerStateDigest, type AppendRouterLogOptions, type SpecRouterLogEntry } from "../router-log.js";
 import { TypeSafeSpecClient } from "../typesafe-spec.js";
 import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/index.js";
 import type { ProfileKind } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
+import { boundedDiagnosticMessage } from "../telemetry.js";
 import type { SupervisionForbiddenToolsPolicy, SupervisionWorkspaceRoot } from "../job-registry.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
@@ -38,6 +40,7 @@ import type { SelfCloseTracker } from "../supervision/self-close.js";
 import { CATALOG_PATH, loadCatalog, resolveChain, type Catalog, type ResolvedCandidate, type RunnerKind } from "../catalog.js";
 import { createWorktreeManager, type WorktreeManager } from "../worktree.js";
 import { compileCandidateContract, contractArgv, type CompiledContract, type ResourceSelection } from "../compile.js";
+import { recordLaunchFailure, type LaunchFailureSignal, type RecordLaunchFailureOptions } from "../availability.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -90,7 +93,10 @@ export interface LaunchDependencies {
   /** B8's immutable catalog and spec evaluator seams. */
   catalog?: { load: () => Promise<Catalog> };
   specClient?: Pick<TypeSafeSpecClient, "evaluate">;
+  availability?: AvailabilityGate;
   worktrees?: WorktreeManager;
+  /** B2 failure recorder seam; production uses the durable cooldown log. */
+  availabilityFailureRecorder?: (candidate: ResolvedCandidate["candidate"], runner: ResolvedCandidate["runner"], failure: LaunchFailureSignal, options: RecordLaunchFailureOptions) => Promise<unknown>;
   /**
    * The one-shot decision-log append sink, run once per spec decision before
    * any child mutation. Defaults to the local JSONL record rooted at the
@@ -120,9 +126,13 @@ export interface LaunchSpecEvidence {
   label: string;
   category: string;
   count: number;
+  quality: Exclude<AdmittedSpecDecision["quality"], "rejected">;
+  bypass?: NonNullable<RouterEvidence["bypass"]>;
   selected: { index: number; runner: string; model: string };
   attempts: LaunchAttemptEvidence[];
   fallbackCandidates: Array<{ index: number; runner: string; model: string }>;
+  /** The effective contract that produced the selected child's argv. */
+  configuration: CompiledContract;
 }
 
 export interface LaunchReadinessEvidence {
@@ -251,6 +261,7 @@ const AGENT_PANE_SHELL_SETTLE_MS = 10_000;
 const AGENT_PANE_SHELL_POLL_MS = 150;
 const LAUNCH_RECONCILIATION_TIMEOUT_MS = 5_000;
 const SPEC_EVALUATION_TIMEOUT_MS = 20_000;
+const BYPASS_POLICY_REVISION = "adr-035";
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
 /**
@@ -359,28 +370,18 @@ function launchDiagnosticMessage(diagnostic: LaunchModelDiagnostic): string {
     effectCertainty: diagnostic.effectCertainty,
     recoveryGuidance: diagnostic.recoveryGuidance
   };
-  const suffix = `\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(payload)}`;
-  const suffixBytes = Buffer.byteLength(suffix, "utf8");
-  /* c8 ignore next -- the fixed-shape payload is bounded below this defensive fallback. */
-  if (suffixBytes > LAUNCH_DIAGNOSTIC_MAX_BYTES) {
-    // The normal fixed-shape payload is comfortably below the bound. Keep a
-    // valid, smaller payload if that invariant ever changes instead of slicing
-    // JSON in the middle of a multibyte character or escaped field.
-    const minimal = {
-      code: payload.code,
-      phase: payload.phase,
-      created: {},
-      ...(payload.assignmentState === "unconfirmed" ? { paneId: payload.paneId, supervisorJobId: payload.supervisorJobId, assignmentState: payload.assignmentState } : {}),
-      agentStarted: payload.agentStarted,
-      promptSubmitted: payload.promptSubmitted,
-      recipientRegistered: payload.recipientRegistered,
-      effectCertainty: payload.effectCertainty,
-      recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.unknownEffect
-    } satisfies LaunchModelDiagnostic;
-    return `${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(minimal)}`;
-  }
-  const available = LAUNCH_DIAGNOSTIC_MAX_BYTES - suffixBytes;
-  return `${boundedDiagnosticText(LAUNCH_DIAGNOSTIC_SUMMARY, available)}${suffix}`;
+  const minimal = {
+    code: payload.code,
+    phase: payload.phase,
+    created: {},
+    ...(payload.assignmentState === "unconfirmed" ? { paneId: payload.paneId, supervisorJobId: payload.supervisorJobId, assignmentState: payload.assignmentState } : {}),
+    agentStarted: payload.agentStarted,
+    promptSubmitted: payload.promptSubmitted,
+    recipientRegistered: payload.recipientRegistered,
+    effectCertainty: payload.effectCertainty,
+    recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.unknownEffect
+  } satisfies LaunchModelDiagnostic;
+  return boundedDiagnosticMessage(LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_DIAGNOSTIC_MARKER, payload, LAUNCH_DIAGNOSTIC_MAX_BYTES, minimal);
 }
 
 class LaunchError extends Error {
@@ -1923,6 +1924,8 @@ type SpecRouteRecord = {
   decision: SpecDecision;
   response?: SpecModelDecision;
   state?: SpecRouterLogEntry["state"];
+  binding?: RouterBinding;
+  bypassConfiguration?: CompiledContract;
 };
 
 function candidateIdentity(candidate: { index: number; runner: string; model: string }): { index: number; runner: string; model: string } {
@@ -1943,6 +1946,43 @@ function resolvedCandidateKey(candidate: ResolvedCandidate): string {
 
 function isAdmitted(decision: SpecDecision): decision is AdmittedSpecDecision {
   return decision.kind === "admitted";
+}
+
+function launchBinding(name: string, spec: LaunchSpec, state: RouterState): RouterBinding {
+  return {
+    caller: name,
+    specRevision: routerStateDigest(state),
+    policyRevision: BYPASS_POLICY_REVISION,
+    launchIdentity: createHash("sha256").update(JSON.stringify({ name, spec })).digest("hex")
+  };
+}
+
+function parseBypassToken(value: string): BypassReceipt | undefined {
+  try {
+    return JSON.parse(value) as BypassReceipt;
+  } catch {
+    return undefined;
+  }
+}
+
+function allReviewedResources(candidate: ResolvedCandidate): ResourceSelection {
+  const pools = candidate.runner.pools;
+  return candidate.runner.kind === "pi"
+    ? { tools: pools.tools, extensions: pools.extensions, skills: pools.skills, mcp: pools.mcp }
+    : candidate.runner.kind === "claude"
+      ? { tools: pools.tools, plugins: pools.plugins, mcp: pools.mcp }
+      : {};
+}
+
+async function transportBypassConfiguration(spec: LaunchSpec, catalog: Catalog): Promise<CompiledContract | undefined> {
+  const category = spec.category ?? catalog.categories.keys().next().value;
+  if (typeof category !== "string") return undefined;
+  try {
+    const selected = resolveChain(catalog, category).selected!;
+    return await compileCandidateContract(catalog, spec, selected, allReviewedResources(selected));
+  } catch {
+    return undefined;
+  }
 }
 
 function recipientCapability(kind: RunnerKind): AttachmentCapability & { kind: ProfileKind } {
@@ -1968,7 +2008,9 @@ function specRouteLogEntry(name: string, record: SpecRouteRecord): SpecRouterLog
     caller: name,
     name,
     result: record.decision,
+    ...(record.binding === undefined ? {} : { binding: record.binding }),
     ...(record.decision.evidence === undefined ? {} : { evidence: record.decision.evidence }),
+    ...(record.response === undefined ? {} : { probabilities: record.response }),
     ...(record.state === undefined ? {} : { state: record.state })
   };
 }
@@ -2000,14 +2042,33 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     }
 
     const records: SpecRouteRecord[] = [];
+    const bypassRequested = params.transportBypass !== undefined;
+    const bypass = bypassRequested ? parseBypassToken(params.transportBypass!) : undefined;
+    const retain = async (spec: LaunchSpec, state: RouterState, binding: RouterBinding, decision: SpecDecision, response?: SpecModelDecision): Promise<void> => {
+      const record: SpecRouteRecord = { spec, decision, ...(response === undefined ? {} : { response }), state, binding };
+      if (decision.kind === "abstained" && decision.reason === "transport_failed") {
+        record.bypassConfiguration = await transportBypassConfiguration(spec, catalog);
+      }
+      records.push(record);
+    };
+
     for (const spec of params.specs) {
       const state = specRouterState(spec, catalog);
+      const binding = launchBinding(params.name, spec, state);
+      if (bypassRequested) {
+        const decision = bypass === undefined
+          ? { kind: "abstained" as const, reason: "invalid_response" as const, component: "bypass" }
+          : await routeSpec({ spec, catalog, response: undefined, root, binding, bypass });
+        await retain(spec, state, binding, decision);
+        continue;
+      }
+
       let evaluation: Awaited<ReturnType<TypeSafeSpecClient["evaluate"]>>;
       const timeoutController = new AbortController();
       let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
         evaluation = await Promise.race([
-          specClient.evaluate({ spec, catalog }, AbortSignal.any([signal, timeoutController.signal])),
+          specClient.evaluate({ spec, catalog, team: params.specs }, AbortSignal.any([signal, timeoutController.signal])),
           new Promise<never>((_, reject) => {
             timeout = setTimeout(() => {
               const reason = new DOMException("Spec evaluation timed out", "TimeoutError");
@@ -2026,16 +2087,20 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       let decision: SpecDecision;
       if (evaluation.kind === "response") {
         try {
-          decision = await routeSpec({ spec, catalog, response: evaluation.response, root });
-          records.push({ spec, decision, response: evaluation.response, state });
-          continue;
+          decision = await routeSpec({ spec, catalog, response: evaluation.response, root, binding, launched: params.specs.map((member) => member.label), ...(deps.availability === undefined ? {} : { availability: deps.availability }) });
         } catch {
           decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
         }
-      } else {
-        decision = evaluation;
+        await retain(spec, state, binding, decision, evaluation.response);
+        continue;
       }
-      records.push({ spec, decision, state });
+      decision = evaluation;
+      await retain(spec, state, binding, decision);
+    }
+    const launched = records.filter((record) => isAdmitted(record.decision)).map((record) => record.spec.label).sort().join("\0");
+    for (const record of records) {
+      if (!isAdmitted(record.decision) || record.decision.advisory === undefined) continue;
+      record.decision = { ...record.decision, advisory: { ...record.decision.advisory, diverged: [...record.decision.advisory.assessed].sort().join("\0") !== launched } };
     }
     return { catalog, records };
   };
@@ -2113,7 +2178,12 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         runner: catalog.runners.get(candidate.runner)!
       }));
       const selectedIndex = decision.evidence!.selectedCandidate!.index;
-      chainCandidates = chain.filter((candidate) => candidate.index >= selectedIndex);
+      const availability = new Map(decision.evidence.availability?.map((entry) => [entry.index, entry.status]));
+      chainCandidates = chain.filter((candidate) => {
+        if (candidate.index < selectedIndex) return false;
+        const status = availability.get(candidate.index);
+        return candidate.index === selectedIndex || (status !== "known-exhausted" && status !== "local-capacity-limited");
+      });
 
       const contractFor = async (resolved: ResolvedCandidate): Promise<CompiledContract> => {
         const key = resolvedCandidateKey(resolved);
@@ -2122,9 +2192,9 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           contracts.set(key, selected);
           return selected;
         }
-        const responseCandidates = (routed.response!.candidates as readonly unknown[]).filter(record);
-        const judgment = responseCandidates.find((candidate) => candidate.index === resolved.index && candidate.runner === resolved.candidate.runner && candidate.model === resolved.candidate.model);
-        const selection = judgment!.resources as ResourceSelection;
+        const selection = routed.response === undefined
+          ? allReviewedResources(resolved)
+          : candidateResourceSelection(routed.response, chain.map((candidate) => candidate.candidate), resolved.index);
         const compiled = await compileCandidateContract(catalog, spec, resolved, selection);
         contracts.set(key, compiled);
         return compiled;
@@ -2349,6 +2419,11 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           startedAgent = agentIdentity(started, params.name, resolvedPaneId, contract.runtime.kind);
           break;
         } catch (error) {
+          const envelope = cliErrorEnvelope(error);
+          await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(contract.candidate, chainCandidates.find((resolved) => resolvedCandidateKey(resolved) === candidate)!.runner, {
+            code: launchTransportCode(error),
+            ...(envelope === undefined ? {} : { causeCode: envelope.error.code })
+          }, { root: deps.cwd ?? ctx.cwd });
           const eligible = startFailureEvidence(error);
           if (!eligible) {
             attempts.push({ candidate: candidateIdentityValue, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
@@ -2371,6 +2446,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         throw new LaunchError("LAUNCH_FAILED", "Spec fallback chain exhausted after agent start failure", { attempts });
       }
       const chosenRuntime = chosenContract.runtime;
+      await handoffs.selectCandidate(handoffRun!, chosenContract.candidate.model, chosenRuntime.kind);
       const chosenAgent = startedAgent;
       let agentId = chosenAgent.agentId;
       if (agentId) created.agentId = agentId;
@@ -2512,7 +2588,17 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         ...(published ? { attachment: published } : {}),
         handoff: { runId: handoffRun!.runId, path: handoffRun!.artifactPath }, recipient, effectCertainty: "confirmed",
         supervision: boundSupervision!,
-        spec: { label: spec.label, category: (decision as Extract<SpecDecision, { kind: "admitted" }>).category, count: spec.count!, selected: candidateIdentity(chosenContract.candidate), attempts, fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedCandidateIdentity(candidate)) }
+        spec: {
+          label: spec.label,
+          category: decision.category,
+          count: spec.count!,
+          quality: decision.quality,
+          ...(decision.evidence.bypass === undefined ? {} : { bypass: decision.evidence.bypass }),
+          selected: candidateIdentity(chosenContract.candidate),
+          attempts,
+          fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedCandidateIdentity(candidate)),
+          configuration: chosenContract
+        }
       };
       return { content: [{ type: "text", text: `${formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: requestedDelivery })} · supervisor ${reservation!.jobId}` }], details: launchDetails };
     } catch (error) {
@@ -2575,7 +2661,21 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     const decisions = routed.records.map((record) => record.decision);
     const routerLog = deps.routerLog ?? appendRouterDecision;
     try {
-      for (const record of routed.records) await routerLog(specRouteLogEntry(params.name, record), { root: deps.cwd ?? ctx.cwd });
+      for (const record of routed.records) {
+        await routerLog(specRouteLogEntry(params.name, record), { root: deps.cwd ?? ctx.cwd });
+        if (record.decision.kind === "abstained" && record.decision.reason === "transport_failed" && record.binding !== undefined && record.bypassConfiguration !== undefined) {
+          const receipt = createBypassReceipt({
+            binding: record.binding,
+            abstention: record.decision,
+            configuration: record.bypassConfiguration,
+            category: record.spec.category,
+            count: record.spec.count,
+            recorded: true
+          });
+          record.decision = { ...record.decision, receipt: JSON.stringify(receipt) };
+          decisions[routed.records.indexOf(record)] = record.decision;
+        }
+      }
     } catch {
       return batchResult({ operation: "launch_batch", outcome: "failed", router: decisions, children: [], failure: { code: "ROUTER_LOG_UNAVAILABLE", message: "Spec decision could not be persisted" } });
     }
@@ -2760,6 +2860,10 @@ export const launchTestInternals = {
   batchManifest,
   candidateIdentity,
   candidateKey,
+  launchBinding,
+  parseBypassToken,
+  allReviewedResources,
+  transportBypassConfiguration,
   resolvedCandidateIdentity,
   resolvedCandidateKey,
   isAdmitted,

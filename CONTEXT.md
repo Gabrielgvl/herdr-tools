@@ -14,8 +14,16 @@ _Avoid_: profile, role, preset, template
 The public `specs[].category` field names a catalog capability group (`frontier`, `balanced`, `cheap`) that resolves to an ordered chain of `{runner, model}` candidates in `herdr-profiles/catalog.yaml`. A spec may name its category; otherwise Jev chooses it. The current schema has no `qualityTier` field and no `standard` default.
 _Avoid_: quality tier, tier, class, profile family
 
+**Workload profile**:
+Jev's routing description of an assignment across `intent`, `mutation`, `scope`, `horizon`, `verifiability`, `workspaceState`, and `ambiguity`, derived during evaluation to inform the category and resource judgments. Shape labels have no policy authority; the caller's `category` (or its absence) decides the chain.
+_Avoid_: workload shape, role, task type
+
+**Operating point**:
+A reviewed runner, model, and native reasoning-setting combination that routing may select. The reasoning setting is runner-specific, such as Pi thinking or Claude effort, and may be encoded in the model for other runners.
+_Avoid_: model, model configuration, runner default
+
 **Candidate**:
-One `{runner, model}` entry in a category chain. Deterministic admission selects the first eligible and available candidate; the rest remain the fallback chain inside `agent_start`.
+One admissible operating point considered inside a deterministic quality-tier and recovery bucket. Jev ranks candidates within a bucket; the resulting bounded order is the pre-execution fallback chain.
 _Avoid_: profile (deleted), model pick, runner choice
 
 **candidateName**:

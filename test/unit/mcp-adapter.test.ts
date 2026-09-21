@@ -12,6 +12,7 @@ import { HostCapabilityError } from "../../src/mcp/host.js";
 import { SequentialToolQueue } from "../../src/mcp/queue.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
 import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE } from "../../src/tools/launch.js";
+import { TOOL_DIAGNOSTIC_MARKER, TOOL_DIAGNOSTIC_RECOVERY } from "../../src/telemetry.js";
 import { stubSupervision } from "./supervision-fixtures.js";
 
 const health = { client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } };
@@ -316,7 +317,7 @@ describe("MCP published schema parity", () => {
 });
 
 describe("MCP argument validation", () => {
-  it("accepts the no-argument form and rejects unknown fields with bounded schema errors", async () => {
+  it("accepts the no-argument form and returns bounded structured schema diagnostics", async () => {
     const surface = realSurface();
     const definitions = { definitions: [...surface.definitions] };
     const absent = await callTool({ surface: definitions, name: "herdr_inspect", args: undefined, host, callId: "c", queue: new SequentialToolQueue() });
@@ -324,13 +325,34 @@ describe("MCP argument validation", () => {
     expect(absent.isError).toBeUndefined();
     expect(nulled.isError).toBeUndefined();
     expect(absent.content[0]!.text).toContain("inspect");
+
     const invalid = await callTool({ surface: definitions, name: "herdr_inspect", args: { mode: "health", extra: true }, host, callId: "c", queue: new SequentialToolQueue() });
     expect(invalid.isError).toBe(true);
     const body = payload(invalid);
-    expect(body.code).toBe("INVALID_INPUT");
-    expect(body.message).toContain("herdr_inspect");
-    expect((body.details as { errors: unknown[] }).errors).toHaveLength(1);
-    expect((body.details as { errors: Array<Record<string, string>> }).errors[0]).toMatchObject({ keyword: expect.any(String) as unknown as string, message: expect.any(String) as unknown as string });
+    expect(body.message).toContain(TOOL_DIAGNOSTIC_MARKER);
+    expect(body.details).toMatchObject({
+      tool: "herdr_inspect",
+      schema: "herdr_inspect",
+      code: "INVALID_INPUT",
+      phase: "validate",
+      errors: expect.arrayContaining([{ path: "/extra", expected: "property not allowed", received: "boolean" }]) as unknown[],
+      effectCertainty: "absent",
+      recoveryGuidance: TOOL_DIAGNOSTIC_RECOVERY,
+    });
+
+    const invalidTab = await callTool({ surface: definitions, name: "herdr_tab", args: { operation: "create" }, host, callId: "tab", queue: new SequentialToolQueue() });
+    const tabBody = payload(invalidTab);
+    expect(invalidTab.isError).toBe(true);
+    expect(tabBody.message).toContain(TOOL_DIAGNOSTIC_MARKER);
+    expect(tabBody.details).toMatchObject({
+      tool: "herdr_tab",
+      schema: "herdr_tab",
+      code: "INVALID_INPUT",
+      phase: "validate",
+      errors: expect.arrayContaining([{ path: "/label", expected: "required property", received: "missing" }]) as unknown[],
+      effectCertainty: "absent",
+      recoveryGuidance: TOOL_DIAGNOSTIC_RECOVERY,
+    });
   });
 
   /**

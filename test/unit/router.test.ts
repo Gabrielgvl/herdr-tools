@@ -261,9 +261,10 @@ describe("per-spec router policy", () => {
     await expect(routeSpec(input)).resolves.toMatchObject({ kind: "rejected", quality: "rejected", reason: "instructions_inadequate" });
   });
 
-  it("requires a recorded abstention and replays a receipt deterministically", async () => {
-    const abstention = recordedAbstention("no_assignments");
-    expect(() => createBypassReceipt({ binding: BINDING, abstention, configuration: configuration() })).toThrow(/recorded abstention/);
+  it("requires a recorded transport abstention and replays a receipt deterministically", async () => {
+    const abstention = recordedAbstention();
+    expect(() => createBypassReceipt({ binding: BINDING, abstention, configuration: configuration() })).toThrow(/recorded transport abstention/);
+    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention("no_assignments"), configuration: configuration(), recorded: true })).toThrow(/recorded transport abstention/);
 
     const receipt = createBypassReceipt({ binding: BINDING, abstention, configuration: configuration(), category: "worker", count: 2, recordedAbstention: true });
     const first = replayBypassReceipt(receipt, BINDING);
@@ -461,6 +462,7 @@ describe("response boundary parsing", () => {
     { name: "array record with no operand", entry: candidateEntry({ selection: { tools: [{ name: "read" }] } }), expected: invalid("candidates") },
     { name: "array with non-record items", entry: candidateEntry({ selection: { tools: [5] } }), expected: invalid("candidates") },
     { name: "non-array non-map pool value", entry: candidateEntry({ selection: { tools: 5 } }), expected: invalid("candidates") },
+    { name: "map with unbounded resource name", entry: candidateEntry({ selection: { tools: { "": 0.9 } } }), expected: invalid("candidates") },
     { name: "unparseable pool operand", entry: candidateEntry({ selection: { tools: { read: "x" } } }), expected: invalid("candidates") },
     { name: "record operand with no tolerated key", entry: candidateEntry({ selection: { tools: { read: { weird: 1 } } } }), expected: invalid("candidates") },
     { name: "explicit confidence override on a record operand", entry: candidateEntry({ selection: { tools: { read: { selected: 0.9, confidence: 0.85 } } } }), expected: admitted },
@@ -474,11 +476,22 @@ describe("response boundary parsing", () => {
     });
   }
 
-  it("abstains low_confidence on the named resource from maps and arrays, before later candidates", async () => {
+  it("excludes indecisive resources, records the noul, and keeps later candidates parseable", async () => {
     for (const tools of [{ read: 0.7 }, [{ name: "read", selected: 0.7 }]]) {
-      const result = await routeSpec(withEntry(candidateEntry({ selection: { tools } })));
-      expect(result).toMatchObject({ kind: "abstained", reason: "low_confidence", component: "tools:read" });
+      const seen: ResourceSelection[] = [];
+      const input = withEntry(candidateEntry({ selection: { tools } }));
+      input.compile = async (_catalog, _spec, resolved, selection) => {
+        seen.push(selection);
+        return configuration(resolved.index, resolved.candidate.model);
+      };
+      const result = await routeSpec(input);
+      expect(result).toMatchObject({
+        kind: "admitted",
+        evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] },
+      });
+      expect(seen).toEqual([{}]);
     }
+
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }, { runner: "claude", model: "claude-model" }]);
     const input = baseInput(catalog);
     input.response = {
@@ -489,8 +502,46 @@ describe("response boundary parsing", () => {
       ],
     };
     const result = await routeSpec(input);
-    expect(result).toMatchObject({ kind: "abstained", reason: "low_confidence", component: "tools:read" });
-    expect(result).not.toMatchObject({ component: "claude-model" });
+    expect(result).toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] } });
+  });
+
+  it("keeps confident YES resources and excludes confident NO resources", async () => {
+    const yesSeen: ResourceSelection[] = [];
+    const yes = withEntry(candidateEntry({ selection: { tools: { read: 0.95 } } }));
+    yes.compile = async (_catalog, _spec, resolved, selection) => {
+      yesSeen.push(selection);
+      return configuration(resolved.index, resolved.candidate.model);
+    };
+    await expect(routeSpec(yes)).resolves.toMatchObject({ kind: "admitted" });
+    expect(yesSeen).toEqual([{ tools: ["read"] }]);
+
+    const noSeen: ResourceSelection[] = [];
+    const no = withEntry(candidateEntry({ selection: { tools: { read: 0.1 } } }));
+    no.compile = async (_catalog, _spec, resolved, selection) => {
+      noSeen.push(selection);
+      return configuration(resolved.index, resolved.candidate.model);
+    };
+    await expect(routeSpec(no)).resolves.toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.1 }] } });
+    expect(noSeen).toEqual([{}]);
+  });
+
+  it("abstains when an excluded resource is explicitly required by the instructions", async () => {
+    const input = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
+    input.spec = { ...SPEC, instructions: "You must use read to complete this assignment." };
+    await expect(routeSpec(input)).resolves.toMatchObject({
+      kind: "abstained",
+      reason: "low_confidence",
+      component: "tools:read",
+      evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] },
+    });
+
+    const imperative = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
+    imperative.spec = { ...SPEC, instructions: "Use read to complete this assignment." };
+    await expect(routeSpec(imperative)).resolves.toMatchObject({ kind: "abstained", reason: "low_confidence" });
+
+    const forbidden = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
+    forbidden.spec = { ...SPEC, instructions: "Do not use read for this assignment." };
+    await expect(routeSpec(forbidden)).resolves.toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] } });
   });
 
   it("assembles the bypass binding only from a complete bounded field set", async () => {
@@ -533,15 +584,16 @@ describe("bypass receipt integrity", () => {
     return { ...unsigned, digest: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex") } as BypassReceipt;
   };
 
-  it("refuses to sign a receipt for anything but a recorded abstention", async () => {
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: { kind: "admitted" } as never, configuration: configuration(), recorded: true })).toThrow(/recorded abstention/);
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration() })).toThrow(/recorded abstention/);
+  it("refuses to sign a receipt for anything but a recorded transport abstention", async () => {
+    expect(() => createBypassReceipt({ binding: BINDING, abstention: { kind: "admitted" } as never, configuration: configuration(), recorded: true })).toThrow(/recorded transport abstention/);
+    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration() })).toThrow(/recorded transport abstention/);
     expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recorded: true })).not.toThrow();
     expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recordedAbstention: true })).not.toThrow();
+    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention("no_assignments"), configuration: configuration(), recorded: true })).toThrow(/recorded transport abstention/);
   });
 
-  it("stamps provenance defaults: contract spec label for the category, count one, no component key", async () => {
-    const receipt = createBypassReceipt({ binding: BINDING, abstention: recordedAbstention("aborted"), configuration: configuration(), recorded: true });
+  it("stamps transport provenance defaults: contract spec label for the category, count one, no component key", async () => {
+    const receipt = createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recorded: true });
     expect(receipt.version).toBe(1);
     expect(receipt.kind).toBe("bypass_receipt");
     expect(receipt.result.category).toBe("worker");
@@ -554,8 +606,9 @@ describe("bypass receipt integrity", () => {
     expect(transport.result.quality).toBe("not_evaluated");
     expect(transport.abstention.component).toBe("fixture");
     expect(transport.result.evidence?.bypass).toMatchObject({ label: "transport-abstain", quality: "not_evaluated" });
-    const bare = createBypassReceipt({ binding: BINDING, abstention: { kind: "abstained", reason: "no_assignments" }, configuration: configuration(), recorded: true });
-    expect(bare.abstention).toEqual({ kind: "abstained", reason: "no_assignments" });
+    const withoutComponent = createBypassReceipt({ binding: BINDING, abstention: { kind: "abstained", reason: "transport_failed" }, configuration: configuration(), recorded: true });
+    expect(withoutComponent.abstention).toEqual({ kind: "abstained", reason: "transport_failed" });
+    expect(() => createBypassReceipt({ binding: BINDING, abstention: { kind: "abstained", reason: "no_assignments" }, configuration: configuration(), recorded: true })).toThrow(/recorded transport abstention/);
   });
 
   it("refuses malformed bindings, foreign receipts, tampering, and kind confusion at replay", async () => {
@@ -575,6 +628,9 @@ describe("bypass receipt integrity", () => {
     expect(() => replayBypassReceipt(receipt, { ...BINDING, launchIdentity: "other" })).toThrow(/binding mismatch/);
     expect(() => replayBypassReceipt(redigest(receipt, { abstention: { ...receipt.abstention, kind: "weird" } }), BINDING)).toThrow(/invalid bypass receipt/);
     expect(() => replayBypassReceipt(redigest(receipt, { result: { ...receipt.result, kind: "abstained" } }), BINDING)).toThrow(/invalid bypass receipt/);
+    expect(() => replayBypassReceipt(redigest(receipt, { result: { ...receipt.result, evidence: undefined } }), BINDING)).toThrow(/invalid bypass receipt/);
+    expect(() => replayBypassReceipt(redigest(receipt, { result: { ...receipt.result, evidence: {} } }), BINDING)).toThrow(/invalid bypass receipt/);
+    expect(() => replayBypassReceipt(redigest(receipt, { result: { ...receipt.result, evidence: { quality: { outcome: "not_evaluated" } } } }), BINDING)).toThrow(/invalid bypass receipt/);
     expect(replayBypassReceipt(receipt, BINDING)).toEqual(receipt.result);
   });
 });

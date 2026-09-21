@@ -106,7 +106,8 @@ describe("compile", () => {
     expect(claude.quota).toEqual({ provider: "anthropic", billingProduct: "claude", account: "primary", scope: "account" });
     expect(pi.plumbing.toolSelection).toBe("allowlist");
     expect(agy.plumbing.promptDelivery).toBe("bootstrap");
-    expect(pi.resources.tools!.permitted).toEqual(["read", "bash", "mcp"]);
+    expect(pi.resources.tools!.permitted).toEqual(["read", "bash"]);
+    expect(pi.resources.mcp!.permitted).toEqual([]);
     expect(pi.resources.skills!.installed).toHaveLength(3);
   });
 
@@ -126,7 +127,7 @@ describe("compile", () => {
     await expect(compileCandidateContract(catalog, SPEC, pi, { tools: ["read", "root_shell"] })).rejects.toBeInstanceOf(CompileError);
   });
 
-  it("adds the declared MCP provider plugin on claude and the mcp client tool on pi", async () => {
+  it("adds the declared MCP provider plugin on claude and removes unscopable ambient MCP on pi", async () => {
     const catalog = catalogAt(scope());
     const root = catalog.source.scopeRoot;
     const claude = await compileCandidateContract(catalog, SPEC, candidate(catalog, "claude"), { tools: ["Read"], mcp: ["executor"] });
@@ -146,13 +147,15 @@ describe("compile", () => {
     expect(withSkill.resources.tools!.permitted).toEqual(["Read", "Skill"]);
     const pi = await compileCandidateContract(catalog, SPEC, candidate(catalog, "pi"), { tools: ["read"], mcp: ["herdr"] });
     expect(pi.resources.tools!.selected).toEqual(["read"]);
-    expect(pi.resources.tools!.permitted).toEqual(["read", "mcp"]);
-    expect(pi.derivations).toContainEqual({ action: "dependency", field: "tools", name: "mcp", reason: "MCP server selection requires the mcp client tool" });
-    expect(pi.gaps).toContainEqual(expect.objectContaining({ kind: "ambient-exposure" }));
-    // Selecting the mcp tool outright needs no derivation.
+    expect(pi.resources.tools!.permitted).toEqual(["read"]);
+    expect(pi.resources.mcp!.selected).toEqual(["herdr"]);
+    expect(pi.resources.mcp!.exposed).toEqual([]);
+    expect(pi.resources.mcp!.permitted).toEqual([]);
+    expect(pi.derivations).toContainEqual({ action: "incompatible", field: "mcp", name: "herdr", reason: "Pi cannot scope ambient MCP servers to the reviewed selection" });
     const piDirect = await compileCandidateContract(catalog, SPEC, candidate(catalog, "pi"), { tools: ["read", "mcp"], mcp: ["herdr"] });
-    expect(piDirect.derivations.some((derivation) => derivation.action === "dependency")).toBe(false);
-    expect(piDirect.resources.tools!.permitted).toEqual(["read", "mcp"]);
+    expect(piDirect.resources.tools!.selected).toEqual(["read", "mcp"]);
+    expect(piDirect.resources.tools!.permitted).toEqual(["read"]);
+    expect(piDirect.derivations).toContainEqual({ action: "incompatible", field: "tools", name: "mcp", reason: "Pi cannot scope ambient MCP servers to the reviewed selection" });
   });
 
   it("removes incompatible pairs deterministically and records them", async () => {

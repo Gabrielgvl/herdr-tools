@@ -117,7 +117,8 @@ export const LaunchParamsSchema = Type.Union([ProfileLaunchParamsSchema, AutoLau
  * src/spec-baseline.ts before it reaches the child; `assignment` is the typed
  * contract reused unchanged. `category` names a catalog chain — the schema
  * checks the kebab shape only, membership is the catalog's — and `count`
- * defaults to 1.
+ * defaults to 1 and is capped at 8 so expansion cannot allocate an unbounded
+ * number of children synchronously.
  */
 const SPEC_LABEL_PATTERN = "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$";
 const SpecLabel = Type.String({ minLength: 1, maxLength: 12, pattern: SPEC_LABEL_PATTERN });
@@ -127,7 +128,7 @@ export const LaunchSpecSchema = Type.Object({
   instructions: AssignmentText("The caller's instruction text for this spec, provenance-wrapped before it reaches the child."),
   assignment: LaunchAssignmentSchema,
   category: Type.Optional(SpecCategory),
-  count: Type.Optional(Type.Integer({ minimum: 1, default: 1 }))
+  count: Type.Optional(Type.Integer({ minimum: 1, maximum: 8, default: 1 }))
 }, { additionalProperties: false });
 
 /**

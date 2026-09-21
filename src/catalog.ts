@@ -351,8 +351,11 @@ function quotaSources(value: unknown, runners: ReadonlyMap<RunnerKind, RunnerEnt
     seen.add(name);
     const kind = stringField(entry.kind, `${field}.kind`);
     if (kind !== "floor" && kind !== "proactive" && kind !== "coarse") fail(`${field}.kind must be floor, proactive, or coarse`, { field });
-    if (kind === "floor") floor += 1;
-    if (entry.runner === undefined) return { name, kind: kind as QuotaSourceKind };
+    if (kind === "floor") {
+      floor += 1;
+      if (entry.runner !== undefined) fail(`${field}.runner must be omitted for the global floor source`, { field });
+      return { name, kind: kind as QuotaSourceKind };
+    }
     const runner = stringField(entry.runner, `${field}.runner`) as RunnerKind;
     if (!runners.has(runner)) fail(`${field}.runner names a runner the catalog does not declare`, { field, runner });
     return { name, kind: kind as QuotaSourceKind, runner };

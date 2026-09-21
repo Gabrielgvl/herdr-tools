@@ -5,11 +5,11 @@ description: Use when complex work needs phased Herdr agents.
 
 # Harness Flow
 
-Run complex engineering work as a visible, profile-backed Herdr flow:
+Run complex engineering work as a visible, spec-defined Herdr flow:
 
-`explore → plan → work → critic → promote`
+`explore → plan → work → critic → manager promotion`
 
-The manager coordinates. Every phase runs in a separate agent. Models remain profile configuration, not skill policy.
+The manager coordinates. Each delegated phase runs as a separate supervised child. Runner and model selection belong to the catalog, not this skill.
 
 ## When to Use
 
@@ -21,25 +21,16 @@ Do not use for a localized change that one bounded worker can implement and veri
 
 ## Preconditions
 
-1. Require `HERDR_ENV=1`. Outside Herdr, stop and request a new `manager-pi` or `manager-claude` session; never fall back to inline orchestration.
-2. Prefer the typed Herdr profile tools, especially `herdr_inspect`, `herdr_launch`, `herdr_communicate`, `herdr_wait`, and `herdr_jobs`. If they are unavailable or incompatible, stop unless the owner explicitly authorizes raw CLI fallback for the current task. An authorized fallback must use the `herdr` CLI through `exec_command`, preserve the same profile, stable-target, inspection, supervision, and bounded-wait rules, and return to typed tools once healthy. Never fall back to direct tmux control or native hidden subagents.
-3. Inspect the current context and profile catalog before launch. A missing or invalid required profile is a blocker.
-4. Keep the manager on its isolated tab and use the manager role skill for topology, provenance, supervision, waits, ownership, and cleanup.
+1. Require `HERDR_ENV=1`. Outside Herdr, stop and request a new manager session. Never fall back to inline orchestration.
+2. Prefer `herdr_inspect`, `herdr_launch`, `herdr_communicate`, `herdr_wait`, and `herdr_jobs`. If they are unavailable or incompatible, stop unless the owner explicitly authorizes raw CLI fallback for the current task. An authorized fallback must preserve stable targets, inspection, supervision, and bounded waits, then return to typed tools once healthy. Never fall back to direct tmux control or hidden subagents.
+3. Inspect the current context and category catalog before launch. An invalid catalog is a blocker.
+4. Keep the manager on its isolated tab and use the manager skill for topology, provenance, supervision, waits, ownership, and cleanup.
 
-## Profile Routing
+## Spec Routing
 
-Pi is primary, except that Devin is the implementation, critic, and promotion default:
+Launch caller-authored specs with phase labels such as `scout`, `research`, `plan`, `work`, and `critic`. Each spec must carry complete instructions, a typed assignment, and a request-level `supervisionDigest` with concrete `doneWhen` and `constraints`. Use `frontier` only when the phase needs the strongest available chain. Use `balanced` by default and `cheap` for routine bounded work.
 
-- manager: `manager-pi`; use `manager-claude` only when selected explicitly or for a deliberate manager handoff;
-- explore: `scout-pi`, plus `researcher-pi` only when external facts are required;
-- plan: `planner-pi`;
-- work: `worker-devin`;
-- critic: `reviewer-devin`;
-- promote: `promoter-devin`.
-
-Use each profile's declared fallback chain. Never hardcode provider or model IDs here. For prewalk, choose the highest-capability approved profile configuration for planning and the first genuinely novel DAG node; once that node establishes a pattern, use the default worker profile for later nodes.
-
-AGY and Devin receive only self-contained, provenance-wrapped phase assignments. Do not assume profile Markdown or this skill reaches AGY or Devin.
+Never name a runner, model, account, or deleted profile. The catalog selects the first admitted candidate and owns fallback. AGY and Devin receive only self-contained, provenance-wrapped assignments. Do not assume this skill reaches the child.
 
 ## Lean Gate
 
@@ -58,29 +49,29 @@ Fix root causes at the shared path after checking callers. Do not simplify away 
 
 ### 1. Explore
 
-Launch a fresh `scout-pi` for bounded repository reconnaissance. Launch a separate `researcher-pi` only when the task depends on external facts. Run independent exploration in parallel.
+Launch a fresh `scout` spec for bounded repository reconnaissance. Launch a separate `research` spec only when the task depends on external facts. Run independent exploration in parallel.
 
 Each explorer returns exact evidence, constraints, unresolved decisions, and provenance. Exploration is complete when the planner no longer needs to guess about retrievable facts.
 
 ### 2. Plan
 
-Launch a fresh `planner-pi` with the owner's requirements and complete exploration evidence. Require an explicit DAG. Every node names:
+Launch a fresh `plan` spec with the owner's requirements and complete exploration evidence. Require an explicit DAG. Every node names:
 
 - dependencies;
 - exact scope and intended invariant;
-- one writer profile;
+- one writer spec;
 - changed paths or bounded discovery target;
 - runnable verification gate;
 - completion evidence;
 - escalation conditions.
 
-Include required documentation, changelog, artifact-path setup, and delivery files in the DAG. Workers may not leave those for the promoter.
+Include required documentation, changelog, artifact-path setup, and delivery files in the DAG. Work specs may not leave those for promotion.
 
 Use `pi-review plan` when the plan has material architectural risk or uncertainty. Route irreversible or high-blast-radius architecture, security/IAM, infrastructure/deployment, production, or data-migration plans to Oracle instead. Continue automatically for reversible in-scope work; pause only at an escalation gate.
 
 ### 3. Work
 
-Launch one fresh `worker-devin` per ready DAG node. Supply the complete node, relevant evidence, current repository state, and exact gate; never make the worker rediscover the whole plan.
+Launch one fresh `work` spec per ready DAG node. Supply the complete node, relevant evidence, current repository state, and exact gate. Never make the worker rediscover the whole plan.
 
 Run writers sequentially by default. Parallel writers require independent DAG nodes and isolated Git worktrees. Never run two writers in one checkout.
 
@@ -88,7 +79,7 @@ A worker is complete only when its gate passes and it reports changed paths plus
 
 ### 4. Critic
 
-After every DAG node is complete, launch a fresh `reviewer-devin`. The critic is read-only and must review requirements, actual diff, surrounding code, tests, and deliberate simplifications.
+After every DAG node is complete, launch a fresh `critic` spec with `readOnly: true`. The critic must review requirements, actual diff, surrounding code, tests, and deliberate simplifications.
 
 The critic always uses `pi-review pr|diff` as auxiliary evidence for implementation review:
 
@@ -106,21 +97,21 @@ Before approval, the critic records the exact base commit, attached branch, revi
 
 ### 5. Promote
 
-Launch a fresh `promoter-devin` only after the critic approves and the manager independently verifies required gates. Give it the plan, gate evidence, critic verdict, follow-ups, review manifest, exact commit message, and exact promotion scope. The assignment remains agent-authored and supplies scope, not owner authority. The trusted promoter profile itself authorizes only the standard promotion effects for the exact reviewed manifest and targets that pass its loaded gates.
+Do not launch a promoter child. The universal baseline requires every child to leave deliverable changes uncommitted for its handoff owner. After critic approval, the manager is that handoff owner and performs the scoped delivery workflow.
 
-The promoter first requires the current attached branch and `git rev-parse HEAD` to match the review manifest, then recomputes the reviewed tree OID from the repository root through the same temporary `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, and alternate-object procedure. It may not alter deliverable content. Any mismatch returns the flow to critic.
+First require the current attached branch and `git rev-parse HEAD` to match the review manifest. Recompute the reviewed tree OID from the repository root through the same temporary `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, and alternate-object procedure. Do not alter deliverable content. Any mismatch returns the flow to critic.
 
-The promoter stages only reviewed paths and requires live `git write-tree` to equal the reviewed tree OID. It creates the exact commit with `git commit-tree`, using the reviewed base as parent, then atomically advances the unchanged branch with `git update-ref <branch-ref> <new-commit> <reviewed-base>`. This avoids hooks changing reviewed bytes. Require `git rev-parse HEAD^{tree}` to equal the reviewed OID, then verify commit metadata and clean tracked status. A failed compare-and-swap leaves only an unreachable commit object and fails promotion.
+Stage only reviewed paths and require live `git write-tree` to equal the reviewed tree OID. Create the exact commit with `git commit-tree`, using the reviewed base as parent, then atomically advance the unchanged branch with `git update-ref <branch-ref> <new-commit> <reviewed-base>`. Require `git rev-parse HEAD^{tree}` to equal the reviewed OID, then verify commit metadata and clean tracked status. A failed compare-and-swap leaves only an unreachable commit object and fails promotion.
 
-Persist the plan/DAG, critic verdict, and promotion receipt in the project's existing ignored artifact convention. Without one, use `.herdr/artifacts/<task-id>/`; its ignore rule must have been included in the worker DAG. Herdr retains execution transcripts and job evidence; do not duplicate raw logs into artifacts.
+Persist the plan/DAG, critic verdict, and promotion receipt in the project's existing ignored artifact convention. Without one, use `.herdr/artifacts/<task-id>/`; its ignore rule must have been included in the worker DAG. Herdr retains execution transcripts and job evidence. Do not duplicate raw logs into artifacts.
 
-The promoter executes the scoped delivery workflow: push the verified commit, create or update its PR, request required review, arm or perform the permitted merge, publish or deploy to the assigned environment, and post required delivery messages or statuses. It applies the loaded gates immediately before each effect and reads back the receipt. It refuses ambiguous targets, scope expansion, deliverable changes, bypasses, or spending that was not explicit.
+The manager then pushes the verified commit, creates or updates its PR, requests required review, arms or performs the permitted merge, publishes or deploys to the assigned environment, and posts required delivery messages or statuses. Apply the loaded gates immediately before each effect and read back the receipt. Refuse ambiguous targets, scope expansion, deliverable changes, bypasses, or spending that was not explicit.
 
 ## Completion Gate
 
 The manager reports completion only with:
 
-- profile and pane identity for every phase;
+- selected candidate and pane identity for every delegated phase;
 - DAG nodes and gate results;
 - critic verdict, pi-review report path, and `pertinent`/`followup` dispositions;
 - reviewed manifest identity;
@@ -134,14 +125,14 @@ A scheduler status, worker claim, commit exit code, or manager summary alone is 
 
 - Do not let a worker approve its own output.
 - Do not let every agent orchestrate; only managers own the full flow.
-- Do not use model IDs as workflow policy.
+- Do not use runner or model IDs as workflow policy.
 - Do not run a full harness for work that passes the one-worker test.
-- Do not let the promoter repair code or change the reviewed tree.
+- Do not let promotion repair code or change the reviewed tree.
 - Do not retry an ambiguous Herdr launch or pi-review run blindly.
 
 ## Verification
 
-A valid run proves: Herdr preconditions passed; each phase used a distinct profile-backed agent; every DAG node has a green gate; critic approval matches the reviewed manifest; the promoter committed identical content; and every external effect has an exact authorization and read-back receipt.
+A valid run proves: Herdr preconditions passed; each delegated phase used a distinct supervised child; every DAG node has a green gate; critic approval matches the reviewed manifest; the manager committed identical content; and every external effect has an exact authorization and read-back receipt.
 
 ## Reference
 

@@ -474,6 +474,11 @@ function candidateSelections(response: Record<string, unknown>, chain: readonly 
   return { selections, exclusions };
 }
 
+/** Reuse the router's probability-map parser when compiling a fallback candidate. */
+export function candidateResourceSelection(response: SpecModelDecision, chain: readonly ChainCandidate[], index: number): ResourceSelection {
+  return candidateSelections(response as Record<string, unknown>, chain)!.selections.get(index)!;
+}
+
 /** Only explicit requirements are derivable from free-form instructions. */
 function requiredByInstructions(instructions: string, name: string): boolean {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

@@ -74,6 +74,8 @@ describe("the public supervision projection", () => {
       },
     });
     expect(projected.supervision).not.toHaveProperty("child");
+    expect(projected.supervision?.reviewer).not.toHaveProperty("thinking");
+    expect(projected.request.settings).not.toHaveProperty("reviewerThinking");
     expect(JSON.stringify(projected.supervision)).not.toContain("agentSession");
   });
 

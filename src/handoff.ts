@@ -265,6 +265,8 @@ export interface HandoffAllocator {
   allocate(): Promise<HandoffAllocation>;
   /** Create the run directory and `.tools`, then write `state.json` under the short flock. */
   persist(run: HandoffAllocation, identity: HandoffRunIdentity): Promise<void>;
+  /** Replace the requested candidate with the candidate that actually started. */
+  selectCandidate(run: HandoffAllocation, candidateName: string, agentKind: string): Promise<void>;
 }
 
 export function createHandoffAllocator(options: {
@@ -341,6 +343,12 @@ export function createHandoffAllocator(options: {
       } finally {
         await holder.release().catch(() => undefined);
       }
+    },
+    async selectCandidate(run, candidateName, agentKind) {
+      await updateHandoffState(run, (state) => {
+        state.child.candidateName = candidateName;
+        state.child.agentKind = agentKind;
+      });
     }
   };
 }

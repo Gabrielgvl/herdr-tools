@@ -218,7 +218,6 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       settings: {
         reviewCadenceMinutes: settings.reviewCadenceMinutes,
         reviewerModel: SUPERVISION_REVIEWER_MODEL,
-        reviewerThinking: "max",
         supervisionDigest,
         forbiddenTools: request.settings?.forbiddenTools,
         workspaceRoot: request.settings?.workspaceRoot,

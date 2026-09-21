@@ -196,19 +196,16 @@ async function compilePi(candidate: ResolvedCandidate["candidate"], runner: Reso
     fields[field]!.selected = new Set(selected[field]);
     fields[field]!.granted = new Set(selected[field]);
   }
-  // Declared dependency: an MCP server selection requires the `mcp` client
-  // tool. Without it in the pool the servers are unreachable — an incompatible
-  // pair removed, never widened into a grant.
-  if (fields.mcp!.selected.size > 0) {
-    if (pools.tools.includes("mcp")) {
-      if (!fields.tools!.granted.has("mcp")) work.derivations.push({ action: "dependency", field: "tools", name: "mcp", reason: "MCP server selection requires the mcp client tool" });
-      fields.tools!.granted.add("mcp");
-    } else {
-      for (const server of pools.mcp.filter((name) => fields.mcp!.selected.has(name))) {
-        fields.mcp!.granted.delete(server);
-        work.derivations.push({ action: "incompatible", field: "mcp", name: server, reason: "the reviewed tool pool has no mcp client tool to reach it" });
-      }
-    }
+  // Pi's MCP tool binds every server from ambient host configuration and has
+  // no server-scoped allow or deny channel. Remove both direct tool grants and
+  // selected servers rather than claiming the reviewed subset is enforceable.
+  const ambientMcpReason = "Pi cannot scope ambient MCP servers to the reviewed selection";
+  for (const server of pools.mcp.filter((name) => fields.mcp!.selected.has(name))) {
+    fields.mcp!.granted.delete(server);
+    work.derivations.push({ action: "incompatible", field: "mcp", name: server, reason: ambientMcpReason });
+  }
+  if (fields.tools!.granted.delete("mcp")) {
+    work.derivations.push({ action: "incompatible", field: "tools", name: "mcp", reason: ambientMcpReason });
   }
   for (const field of ["tools", "extensions", "skills"] as const) {
     for (const name of pools[field]) if (fields[field]!.granted.has(name)) fields[field]!.exposed.add(name);
@@ -216,11 +213,6 @@ async function compilePi(candidate: ResolvedCandidate["candidate"], runner: Reso
   }
   // Pi has no deny channel: the `--tools` allowlist and `--no-skills` make the
   // complement unreachable, so `denied` stays empty by mechanism, not omission.
-  // MCP binding is ambient (Pi's own host config) — permitted by contract,
-  // exposed only if the environment provides it.
-  for (const name of pools.mcp) if (fields.mcp!.granted.has(name)) fields.mcp!.permitted.add(name);
-  fields.mcp!.exposed = new Set(fields.mcp!.permitted);
-  if (fields.mcp!.permitted.size > 0) work.gaps.push({ kind: "ambient-exposure", message: "Pi MCP servers bind through ambient host configuration, not argv; the contract permits the selection but cannot enforce presence" });
   for (const field of CONSUMABLE_FIELDS.pi) work.resources[field] = record(pools[field], fields[field]!);
   return {
     kind: "pi",

@@ -753,7 +753,8 @@ describe("JobRegistry", () => {
     if (detail.request.kind !== "supervisor") throw new Error("expected a supervisor request");
     // The declared field is accepted on the private snapshot; the projection's
     // settings allowlist still drops it.
-    expect(detail.request.settings).toEqual({ reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" });
+    expect(detail.request.settings).toEqual({ reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest" });
+    expect(detail.request.settings).not.toHaveProperty("reviewerThinking");
     expect(detail.request.settings).not.toHaveProperty("supervisionDigest");
   });
 

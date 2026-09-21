@@ -99,7 +99,7 @@ describe("the supervision registry", () => {
       // No pane exists at reservation time, so no target id is back-dated into the request.
       targetIds: [],
       child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
-      settings: { reviewerModel: "typesafe/jev-latest", reviewerThinking: "max", reviewCadenceMinutes: 5 },
+      settings: { reviewerModel: "typesafe/jev-latest", reviewCadenceMinutes: 5 },
     });
     expect(detail.request.target_generation_refs?.[0]).toMatch(/^target_generation_/u);
     await f.supervision.shutdown();
@@ -117,7 +117,6 @@ describe("the supervision registry", () => {
     // keeps its allowlisted settings shape and never exposes it.
     expect(detail.request.settings).toEqual({
       reviewerModel: "typesafe/jev-latest",
-      reviewerThinking: "max",
       reviewCadenceMinutes: 5,
     });
     expect(detail.request.settings).not.toHaveProperty("supervisionDigest");
@@ -166,7 +165,6 @@ describe("the supervision registry", () => {
     const detail = f.jobs.get(reservation.jobId)!;
     expect(detail.request.settings).toEqual({
       reviewerModel: "typesafe/jev-latest",
-      reviewerThinking: "max",
       reviewCadenceMinutes: 5,
     });
     expect(detail.request.settings).not.toHaveProperty("forbiddenTools");

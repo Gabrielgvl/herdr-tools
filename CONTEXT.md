@@ -10,12 +10,12 @@ A Pi extension that turns the Herdr terminal multiplexer into a supervised multi
 A caller-authored launch unit in `herdr_launch.specs`: `label`, `instructions`, a typed `assignment` (`objective`/`scope`/`verification`), optional `category`, optional replica `count`. Specs replaced profiles and roles in the ADR-035 migration; the words "profile" and "role" describe only deleted machinery.
 _Avoid_: profile, role, preset, template
 
-**Quality tier**:
-A caller's requested starting quality and compute posture: `utility`, `economy`, `standard`, `strong`, `frontier`, or `max`. Omission means `standard`; workload policy may raise the effective start and bounds later recovery escalation.
-_Avoid_: category, class, profile family
+**Category**:
+The public `specs[].category` field names a catalog capability group (`frontier`, `balanced`, `cheap`) that resolves to an ordered chain of `{runner, model}` candidates in `herdr-profiles/catalog.yaml`. A spec may name its category; otherwise Jev chooses it. The current schema has no `qualityTier` field and no `standard` default.
+_Avoid_: quality tier, tier, class, profile family
 
 **Workload profile**:
-The routing description of an assignment across `intent`, `mutation`, `scope`, `horizon`, `verifiability`, `workspaceState`, and `ambiguity`. Jev derives semantic fields, while authoritative runtime evidence supplies workspace state; shape labels have no policy authority.
+Jev's routing description of an assignment across `intent`, `mutation`, `scope`, `horizon`, `verifiability`, `workspaceState`, and `ambiguity`, derived during evaluation to inform the category and resource judgments. Shape labels have no policy authority; the caller's `category` (or its absence) decides the chain.
 _Avoid_: workload shape, role, task type
 
 **Operating point**:

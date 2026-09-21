@@ -92,9 +92,12 @@ status agree.
   proves. This is the `evidence_gap` condition in requirement 7, and it is correct whether or
   not the outage is still in the log.
 - **C4.** Thin events (`pane_closed`, `pane_exited`, `pane_agent_detected`) carry only a
-  pane ID, and **F6** makes a pane ID untrustworthy. They are treated as *reconciliation
-  triggers*, never as conclusions: the monitor takes a fresh `session.snapshot` and the
-  supervisor decides from authoritative state.
+  pane ID, and **F6** makes a pane ID untrustworthy. They normally trigger a fresh
+  `session.snapshot`, and lifecycle settlement still comes from authoritative state. The
+  implemented `pane_exited` path has one exception: a reported non-clean exit for the
+  currently bound pane ID is latched as `process_exit` before reconciliation. Because the
+  event has no occupant identity, a delayed exit from a prior occupant of a reused pane ID
+  can be attributed to the replacement child.
 - **C5.** Every accepted event is validated on its own fields at the protocol boundary, not
   merely proven to be an object. A known kind that is malformed is refused — dropping the
   connection, which the monitor reports and reconnects from — rather than accepted and
@@ -322,7 +325,10 @@ Material wakes, each with an opaque `eventId`:
 | `evidence_gap` | event or snapshot revision evidence is incomplete | high |
 
 `identity_replaced`, `identity_lost`, `released`, and `pane_closed` are **settling**: the
-supervisor job settles immediately after the wake.
+supervisor job settles immediately after the wake. A status-bearing non-clean `pane_exited`
+may also produce a high-priority `reviewer_attention` event with violation `process_exit`.
+That violation is latched before reconciliation and is flushed before a settling lifecycle
+event. It is not lifecycle-correlated beyond the matching pane ID.
 
 ## 9. Supervisor reviewer (requirement 8)
 
@@ -348,14 +354,22 @@ supervisor job settles immediately after the wake.
   `SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD` 0.85 on the child's first review) →
   `progress` (`SUPERVISION_PROGRESS_THRESHOLD` 0.60), falling through to `unknown` when no
   signal crosses. Temporal state is in-memory only.
-- Evidence: bounded compact pane metadata plus the transcript delta since the previous
-  **completed** review, read through the existing `pane read --source recent-unwrapped` path.
-  A pane read returns the latest window rather than what changed, so the delta is computed
-  against the window the previous review consumed, using the same rule the explicit wait
-  reviewer uses (`src/transcript-delta.ts`). Handing the whole window back each cadence would
-  let a stalled child keep reading as fresh progress. The call also carries the launch's
-  authorial `supervisionDigest` — `doneWhen`/`constraints` recorded at reservation — and the
-  previous review's classification and signals.
+- Evidence: one bounded V2.1 state assembled in fixed order from assignment, structured
+  trace, Git workspace state, supplemental terminal lines, and version identity. Pi and Devin
+  use their structured trace readers. Other runners use a labelled `tmux-fallback` trace.
+  The production assignment carrier supplies `supervisionDigest.doneWhen` and `constraints`.
+  It does not copy `spec.assignment.objective`, and the strict public schema has no
+  `progressMarkers`, so reviewer evidence omits `objective` and carries an empty
+  `progressMarkers` list. `supervisionDigest.readOnly` remains a code-owned Tier-0 claim.
+  The previous review's classification and signals are carried separately.
+- Workspace evidence pins the Git base during reservation. A failed pin refuses launch before
+  child effects. At cadence, unavailable workspace evidence skips the read-only dirty-workspace
+  violation. The porcelain v1 parser consumes an extra rename/copy source record only when the
+  index status column is `R` or `C`; a valid worktree-column rename/copy can therefore return
+  `output_malformed` and make the workspace view unavailable for that cadence.
+- Outbound safety is a local configured-pattern scan over each bounded canonical section and
+  its decoded string leaves. Only a state labelled `safe` is sent, but `safe` means no current
+  detector matched. It is not a general proof that arbitrary credential text is absent.
 - A review is only evidence about the run it was started for. If the child leaves `working`
   while the transcript read or the model call is in flight, the review is abandoned: nothing
   is stored, nothing is announced, and the transcript cursor does not advance over lines no
@@ -363,8 +377,10 @@ supervisor job settles immediately after the wake.
 - The prompt is bounded in UTF-8 bytes, never split mid-code-point.
 - Result storage is silent (job progress). Only `stalled`, `blocked`, `risk`,
   `appears_complete`, and `unknown` wake the manager, and the supervisor stays active.
-- A reviewer failure enters a degraded episode: one `reviewer_degraded` wake, then retry at
-  the next cadence. The first success afterwards emits one `reviewer_recovered` wake.
+- Reviewer infrastructure failure, including transport, authentication, HTTP, or malformed
+  response, is silent and retries at the next cadence. Evidence-read and review-sink failures
+  enter one visible `reviewer_degraded` episode; the first later successful cadence emits one
+  `reviewer_recovered` wake.
 - The reviewer never starts a Herdr agent and never creates a pane.
 - Reviews are bounded to `SUPERVISION_MAX_REVIEWS = 24` with a `truncatedReviews` count.
 

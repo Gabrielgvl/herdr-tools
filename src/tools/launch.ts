@@ -733,9 +733,10 @@ function cliErrorEnvelope(error: unknown): HerdrErrorEnvelope | undefined {
 
 function startFailureEvidence(error: unknown): { code: string; message: string } | undefined {
   if (!(error instanceof CliProtocolError)) return undefined;
-  const { exitCode, killed, errorStream, stderrTruncated } = error.details;
-  if (error.code !== "CLI_PROTOCOL_ERROR" || exitCode !== 1 || killed !== false || errorStream !== "stderr" || stderrTruncated !== false) return undefined;
   const envelope = cliErrorEnvelope(error);
+  const { exitCode, killed, errorStream, stderrTruncated } = error.details;
+  if (error.code === "CLI_TIMEOUT" && killed === true) return { code: error.code, message: envelope?.error.message ?? error.message };
+  if (error.code !== "CLI_PROTOCOL_ERROR" || exitCode !== 1 || killed !== false || errorStream !== "stderr" || stderrTruncated !== false) return undefined;
   if (!envelope || envelope.id !== "cli:agent:start") return undefined;
   const provenPreSpawn = envelope.error.code === "agent_start_failed" && envelope.error.message === "agent process exited before becoming interactive";
   const quotaFailure = classifyLaunchFailure({ code: error.code, causeCode: envelope.error.code }) === "quota";

@@ -449,6 +449,17 @@ describe("TypeSafeSpecClient typed outcomes", () => {
     expect(fetchCall).not.toHaveBeenCalled();
   });
 
+  it("preserves a bounded provider error type for actionable HTTP 400 diagnostics", async () => {
+    const outcome = await client(async () => new Response(JSON.stringify({ detail: { error_type: "max_tokens_exceeded", secret: "do-not-leak" } }), { status: 400 })).evaluate({ task: TASK, catalog: CATALOG }, signal());
+    expect(outcome).toEqual({
+      kind: "abstained",
+      reason: "transport_failed",
+      component: "http_400_max_tokens_exceeded",
+      requestSize: { questions: 36, bytes: expect.any(Number) },
+    });
+    expect(JSON.stringify(outcome)).not.toContain("do-not-leak");
+  });
+
   for (const status of [401, 429, 503]) {
     it(`maps HTTP ${status} to transport_failed with only the bounded status and the request-size diagnostic`, async () => {
       const fetchCall = vi.fn(async () => new Response(JSON.stringify({ detail: `server-secret-${status}` }), { status }));

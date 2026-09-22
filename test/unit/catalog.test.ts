@@ -86,6 +86,14 @@ quotaSources:
 const PI_POOLS = "    pools:\n      tools: [read, bash]\n      extensions: [ext/host.ts]\n      skills: [skills/adr, skills/tdd]\n      mcp: [herdr, executor]\n";
 const MCP_BLOCK = "mcp:\n  herdr: {plugin: herdr-tools}\n  executor: {plugin: herdr-executor}\n";
 const QUOTA_BLOCK = "quotaSources:\n  - {name: reactive-cooldowns, kind: floor}\n  - {name: pi-quotas, kind: proactive, runner: pi}\n";
+const TIER_CHAINS = `tierChains:
+  utility: [pi:openai/pi-pro:off]
+  economy: [pi:openai/pi-lite:off]
+  standard: [claude:claude-opus-5:low]
+  strong: [agy:gemini-high]
+  frontier: [devin:swe-2-max]
+  max: [pi:zai/test-glm:low]
+`;
 
 const parse = (text: string = VALID): Catalog => parseCatalog(text, SOURCE);
 
@@ -94,6 +102,14 @@ describe("catalog", () => {
     const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
     expect(catalog.version).toBe(2);
     expect(catalog.points).toHaveLength(54);
+    expect(catalog.tierChains).toEqual({
+      utility: ["pi:openai-codex/gpt-5.6-luna:low", "devin:swe-1-7-lightning-medium"],
+      economy: ["devin:swe-2-medium", "pi:openai-codex/gpt-5.6-luna:max", "pi:zai/glm-5.3-flash:low", "claude:sonnet:low"],
+      standard: ["devin:swe-2-high", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-5.6-terra:max", "agy:gemini-3.8-flash-low"],
+      strong: ["devin:swe-2-max", "pi:openai-codex/gpt-5.6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "claude:opus:low", "agy:gemini-3.8-flash-high"],
+      frontier: ["claude:fable:low", "pi:openai-codex/gpt-6-astra:high", "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium"],
+      max: ["claude:fable:max", "pi:openai-codex/gpt-6-astra:max", "devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium"],
+    });
     expect(catalog.quotaSources.some((source) => source.kind === "floor")).toBe(true);
     // Every declared resource pool path must exist inside the package root.
     for (const path of [...catalog.skills, ...catalog.plugins]) await access(path);
@@ -465,6 +481,21 @@ describe("catalog", () => {
     expect(points.find((point) => point.id === "pi:openai/pi-pro:high")).toMatchObject({ runner: "pi", model: "openai/pi-pro", reasoning: "high", provider: "openai", quota: { provider: "openai", billingProduct: "codex", account: "primary", scope: "account" }, costClass: "low", latencyClass: "low" });
     expect(points.find((point) => point.id === "pi:zai/test-glm:high")).toMatchObject({ provider: "zai", quota: { provider: "zai", billingProduct: "zai-api", account: "primary", scope: "account" } });
     expect(catalog.pointPolicy?.get("devin:swe-2-max")).toEqual({ costClass: "low", latencyClass: "low" });
+  });
+
+  it("validates authoritative tier chains without length caps, point reuse, or same-tier provider reuse", () => {
+    const withChains = VALID.replace("quotaSources:", `${TIER_CHAINS}quotaSources:`);
+    expect(parse(withChains).tierChains?.strong).toEqual(["agy:gemini-high"]);
+    const cases = [
+      VALID.replace("quotaSources:", "tierChains: 5\nquotaSources:"),
+      withChains.replace("  utility: [pi:openai/pi-pro:off]", "  utility: []"),
+      withChains.replace("  utility: [pi:openai/pi-pro:off]", "  utility: [pi:missing:low]"),
+      withChains.replace("  economy: [pi:openai/pi-lite:off]", "  economy: [pi:openai/pi-pro:off]"),
+      withChains.replace("  utility: [pi:openai/pi-pro:off]", "  utility: [pi:openai/pi-pro:off, pi:openai/pi-lite:low]"),
+      withChains.replace("  max: [pi:zai/test-glm:low]\n", ""),
+      withChains.replace("tierChains:", "tierChains:\n  ghost: [pi:openai/pi-pro:low]"),
+    ];
+    for (const [index, text] of cases.entries()) expect(() => parse(text), `case ${index}`).toThrow(CatalogError);
   });
 
   it("requires a declared pointPolicy to match the generated point set exactly", () => {

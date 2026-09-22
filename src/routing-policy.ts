@@ -6,7 +6,7 @@
  */
 
 /** Policy revision recorded in decision evidence. */
-export const POLICY_REVISION = "adr-037-p1";
+export const POLICY_REVISION = "adr-037-p2";
 
 /**
  * The caller's requested starting quality and compute posture, in ascending
@@ -69,7 +69,7 @@ export const TIER_ENVELOPES: Readonly<Record<QualityTier, TierEnvelope>> = {
   max: { maxCostClass: "unbounded", maxLatencyClass: "unbounded" }
 };
 
-export type WorkloadIntent = "explore" | "reason" | "implement" | "debug" | "verify" | "review" | "coordinate";
+export type WorkloadIntent = "explore" | "reason" | "implement" | "debug" | "verify" | "review" | "coordinate" | "unknown";
 export type WorkloadMutation = "none" | "bounded" | "broad";
 export type WorkloadScope = "local" | "multi_file" | "repo_wide";
 export type WorkloadHorizon = "short" | "medium" | "long";
@@ -96,7 +96,8 @@ export const INTENT_TIER_INTERVALS: Readonly<Record<WorkloadIntent, { readonly f
   debug: { floor: "standard", ceiling: "max" },
   verify: { floor: "utility", ceiling: "standard" },
   review: { floor: "standard", ceiling: "frontier" },
-  coordinate: { floor: "standard", ceiling: "frontier" }
+  coordinate: { floor: "standard", ceiling: "frontier" },
+  unknown: { floor: "standard", ceiling: "max" }
 };
 
 /**

@@ -156,6 +156,8 @@ export interface Catalog {
   points?: readonly OperatingPoint[];
   /** The validated pointPolicy map, keyed by exact point id. Empty when the file declares none. */
   pointPolicy?: ReadonlyMap<string, PointPolicy>;
+  /** Authoritative per-tier fallback order. Jev never sees this operating-point policy. */
+  tierChains?: Readonly<Record<QualityTier, readonly string[]>>;
   /** sha256 hex over the raw catalog bytes — the catalog revision recorded in decision evidence. */
   catalogRevision?: string;
   source: CatalogSource;
@@ -487,6 +489,30 @@ function pointPolicy(value: unknown, generated: readonly GeneratedPoint[]): Map<
   return map;
 }
 
+function tierChains(value: unknown, generated: readonly GeneratedPoint[]): Readonly<Record<QualityTier, readonly string[]>> | undefined {
+  if (value === undefined) return undefined;
+  if (!record(value)) fail("tierChains must be a mapping keyed by quality tier");
+  exactKeys(value, Object.keys(TIER_ENVELOPES), "tierChains");
+  const pointById = new Map(generated.map((point) => [point.id, point]));
+  const used = new Set<string>();
+  const chains = {} as Record<QualityTier, readonly string[]>;
+  for (const tier of Object.keys(TIER_ENVELOPES) as QualityTier[]) {
+    const ids = uniqueStrings(value[tier], `tierChains.${tier}`);
+    if (ids.length === 0) fail(`tierChains.${tier} must not be empty`, { tier });
+    const providers = new Set<string>();
+    for (const id of ids) {
+      const point = pointById.get(id);
+      if (point === undefined) fail(`tierChains.${tier} names a point the catalog does not generate`, { tier, point: id });
+      if (used.has(id)) fail("tierChains must not reuse an operating point", { tier, point: id });
+      if (providers.has(point.provider)) fail(`tierChains.${tier} must use distinct providers`, { tier, provider: point.provider });
+      used.add(id);
+      providers.add(point.provider);
+    }
+    chains[tier] = ids;
+  }
+  return chains;
+}
+
 function withinBound(value: CostClass, bound: ClassBound): boolean {
   return bound === "unbounded" || CLASS_ORDER.indexOf(value) <= CLASS_ORDER.indexOf(bound);
 }
@@ -537,7 +563,7 @@ export function parseCatalog(text: string, source: CatalogSource, revision: stri
   if (document.contents === null || !isMap(document.contents)) fail("catalog must be a YAML mapping");
   validateNode(document.contents);
   const values = document.contents.toJSON() as Record<string, unknown>;
-  exactKeys(values, ["version", "runners", "skills", "plugins", "mcp", "quotaSources", "pointPolicy"], "catalog");
+  exactKeys(values, ["version", "runners", "skills", "plugins", "mcp", "quotaSources", "pointPolicy", "tierChains"], "catalog");
   if (values.version !== 2) fail("catalog version must be 2");
   const scopeRoot = resolve(source.scopeRoot);
   const skills = scopedPaths(values.skills ?? [], "skills", scopeRoot);
@@ -546,6 +572,7 @@ export function parseCatalog(text: string, source: CatalogSource, revision: stri
   const runners = runnerEntries(values.runners, scopeRoot, skills, plugins, mcp);
   const generated = generatePoints(runners);
   const policy = pointPolicy(values.pointPolicy, generated);
+  const chains = tierChains(values.tierChains, generated);
   const points: OperatingPoint[] = [];
   for (const point of generated) {
     const classes = policy.get(point.id);
@@ -556,6 +583,7 @@ export function parseCatalog(text: string, source: CatalogSource, revision: stri
     runners,
     points,
     pointPolicy: policy,
+    ...(chains === undefined ? {} : { tierChains: chains }),
     catalogRevision: revision,
     skills,
     plugins,

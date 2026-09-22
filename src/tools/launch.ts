@@ -2402,7 +2402,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         /* c8 ignore next -- admitted decisions always carry the evaluation response; the fallback exists so a foreign record cannot crash compile. */
         const selection = routed.response === undefined
           ? allReviewedResources(resolved)
-          : runnerResourceSelection(routed.response, resolved.point.runner);
+          : runnerResourceSelection(routed.response, resolved.point.runner, resolved.runner);
         const compiled = await compileCandidateContract(catalog, { label: shared.specLabel }, resolved, selection);
         contracts.set(key, compiled);
         return compiled;
@@ -2955,7 +2955,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       return emit({ kind: "launch", launchId, outcome: "abstained", requestedTier: params.tier, children: [], ...(abstention === undefined ? {} : { abstention }) });
     }
     const catalog = routed.catalog!;
-    const intent = decision.evidence.workload?.intent;
+    const intent = decision.evidence.intent?.value;
     /* c8 ignore next 4 -- admitted decisions always carry the workload classification; the guard keeps a malformed decision from launching blind. */
     if (intent === undefined) {
       return emit({ kind: "launch", launchId, outcome: "failed", requestedTier: params.tier, effectiveTier: decision.effectiveStartTier, children: [], error: { code: "ROUTER_EVIDENCE_INCOMPLETE", message: "Admitted decision lacks the workload classification" } });

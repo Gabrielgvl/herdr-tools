@@ -487,7 +487,7 @@ function nullableString(value: unknown): value is string | null {
 
 /** The closed-union members of each WorkloadProfile field, mirrored for record validation. */
 const WORKLOAD_MEMBERS: Readonly<Record<keyof WorkloadProfile, ReadonlySet<string>>> = {
-  intent: new Set(["explore", "reason", "implement", "debug", "verify", "review", "coordinate"]),
+  intent: new Set(["explore", "reason", "implement", "debug", "verify", "review", "coordinate", "unknown"]),
   mutation: new Set(["none", "bounded", "broad"]),
   scope: new Set(["local", "multi_file", "repo_wide"]),
   horizon: new Set(["short", "medium", "long"]),

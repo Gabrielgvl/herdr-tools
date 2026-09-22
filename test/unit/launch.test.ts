@@ -45,7 +45,7 @@ function runnerEntry(modelIds: readonly string[]): RunnerEntry {
     quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
     defaults: { timeoutMinutes: 30, sessionPersistence: false, thinking: "low" },
     plumbing: { sessionPersistence: "optional", promptDelivery: "file", skillSelection: "exact", toolSelection: "allowlist" },
-    pools: { tools: ["read"], extensions: [], skills: [], plugins: [], mcp: [] },
+    pools: { tools: ["read", "bash", "write"], extensions: [], skills: [], plugins: [], mcp: [] },
   };
 }
 
@@ -56,7 +56,7 @@ function claudeRunner(modelIds: readonly string[]): RunnerEntry {
     quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
     defaults: { timeoutMinutes: 30, sessionPersistence: true, effort: "low", permissionMode: "dontAsk" },
     plumbing: { sessionPersistence: "required", promptDelivery: "file", skillSelection: "additive", toolSelection: "allowlist" },
-    pools: { tools: ["read", "write", "bash"], extensions: [], skills: [], plugins: [], mcp: [] },
+    pools: { tools: ["Read", "Write", "Bash"], extensions: [], skills: [], plugins: [], mcp: [] },
   };
 }
 
@@ -96,8 +96,8 @@ function catalogOf(subjects: readonly AvailabilitySubject[], runners?: ReadonlyM
       runner: subject.runner,
       model: subject.model,
       ...(reasoning === undefined ? {} : { reasoning }),
-      provider: runner.quota.provider,
-      quota: { ...runner.quota },
+      provider: `${runner.quota.provider}-${subject.model}`,
+      quota: { ...runner.quota, provider: `${runner.quota.provider}-${subject.model}` },
       costClass: "low",
       latencyClass: "low",
     };
@@ -111,6 +111,14 @@ function catalogOf(subjects: readonly AvailabilitySubject[], runners?: ReadonlyM
     quotaSources: [{ name: "reactive-cooldowns", kind: "floor" }],
     points,
     pointPolicy: new Map(points.map((point) => [point.id, { costClass: point.costClass, latencyClass: point.latencyClass }])),
+    tierChains: {
+      utility: points.map((point) => point.id),
+      economy: points.map((point) => point.id),
+      standard: points.map((point) => point.id),
+      strong: points.map((point) => point.id),
+      frontier: points.map((point) => point.id),
+      max: points.map((point) => point.id),
+    },
     source: { path: "/tmp/catalog.yaml", scopeRoot: "/tmp" },
   };
 }
@@ -139,6 +147,7 @@ function responseFor(catalog: Catalog, quality: { done_when_verifiable?: number 
   return {
     quality: { done_when_verifiable: quality.done_when_verifiable ?? 0.95 },
     intent: { value: "implement", confidence: 0.95 },
+    tier: { value: "standard", confidence: 0.95 },
     resources,
     fitness,
     uncertainDimensions: [],
@@ -465,7 +474,7 @@ describe("herdr_launch task cutover", () => {
     // operating-point id: claude's argv deny channel is the only authoritative
     // source; pi and devin have none.
     expect(settings.forbiddenTools).toEqual([
-      { agentKind: "claude", operatingPointId: "claude:opus:low", forbiddenTools: { available: true, tools: ["write", "bash"] } },
+      { agentKind: "claude", operatingPointId: "claude:opus:low", forbiddenTools: { available: true, tools: [] } },
       { agentKind: "pi", operatingPointId: "pi:pi-model:low", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
       { agentKind: "devin", operatingPointId: "devin:swe-2-max", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
     ]);
@@ -682,11 +691,11 @@ describe("herdr_launch task cutover", () => {
       const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
 
       expect(result.details).toMatchObject({ outcome: "launched" });
-      // claude:b:low is excluded; claude:c:low shares its provider, so the
-      // test-provider point pi:a:low starts first despite lower fitness order.
+      // The failed provider is excluded; the authoritative chain's first
+      // remaining provider starts.
       const firstStart = harness.calls.find((argv) => argv[0] === "agent" && argv[1] === "start")!;
-      expect(firstStart[4]).toBe("pi");
-      expect(result.details!.children[0]!.operatingPointId).toBe("pi:a:low");
+      expect(firstStart[4]).toBe("claude");
+      expect(result.details!.children[0]!.operatingPointId).toBe("claude:c:low");
     });
 
     it("keeps fitness order when the head already carries a different provider, and when the failed point is gone from the catalog", async () => {
@@ -700,11 +709,12 @@ describe("herdr_launch task cutover", () => {
       const result = await execute(toolFor({ catalog, cli: makeCli().cli, handoffs: first.allocator }), task({ recoveryOf: first.run.runId }));
       expect(result.details!.children[0]!.operatingPointId).toBe("pi:a:low");
 
-      // A failed point no longer in the catalog is simply absent — no reorder.
+      // A failed point no longer in the catalog cannot resolve its provider,
+      // so recovery fails closed instead of guessing.
       const single = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
       const second = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "pi:gone:low" });
       const again = await execute(toolFor({ catalog: single, cli: makeCli().cli, handoffs: second.allocator }), task({ recoveryOf: second.run.runId }));
-      expect(again.details!.children[0]!.operatingPointId).toBe("pi:primary:low");
+      expect(again.details).toMatchObject({ outcome: "abstained", children: [] });
     });
 
     it("abstains closed when the exclusion empties the usable chain", async () => {
@@ -854,20 +864,16 @@ describe("herdr_launch task cutover", () => {
     expect(result.details).toMatchObject({ outcome: "launched" });
   });
 
-  it("launches a Bash-only task after excluding every hedged alternative execution tool", async () => {
+  it("launches with the fixed read/bash/write tool surface", async () => {
     const baseCatalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const pi = baseCatalog.runners.get("pi")!;
     const runners = new Map(baseCatalog.runners);
-    runners.set("pi", { ...pi, pools: { ...pi.pools, tools: ["read", "bash", "executor_execute", "exec_command"] } });
+    runners.set("pi", { ...pi, pools: { ...pi.pools, tools: ["read", "bash", "write", "executor_execute", "exec_command"] } });
     const catalog: Catalog = { ...baseCatalog, runners };
     const response: TaskModelDecision = {
       ...responseFor(catalog),
       resources: { pi: { tools: { read: 0.95, bash: 0.95, executor_execute: 0.5, exec_command: 0.5 } } },
     };
-    const exclusions = [
-      { field: "tools", name: "executor_execute", noul: 0.5 },
-      { field: "tools", name: "exec_command", noul: 0.5 },
-    ];
     const routerLog = vi.fn(async () => undefined) as LaunchRouterLog;
     const result = await execute(toolFor({
       catalog,
@@ -880,8 +886,7 @@ describe("herdr_launch task cutover", () => {
     expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({
       probabilities: response,
       result: expect.objectContaining({
-        evidence: expect.objectContaining({ exclusions }),
-        configuration: expect.objectContaining({ runtime: expect.objectContaining({ tools: ["read", "bash"] }) }),
+        configuration: expect.objectContaining({ runtime: expect.objectContaining({ tools: ["read", "bash", "write"] }) }),
       }),
     }), expect.anything());
   });
@@ -1000,7 +1005,10 @@ describe("herdr_launch task cutover", () => {
   });
 
   it("does not re-admit unavailable candidates into the fallback chain", async () => {
-    const catalog = catalogOf([{ runner: "pi", model: "exhausted" }, { runner: "pi", model: "primary" }, { runner: "pi", model: "cooled" }, { runner: "pi", model: "fallback" }]);
+    const catalog = catalogOf(
+      [{ runner: "pi", model: "exhausted" }, { runner: "pi", model: "primary" }, { runner: "pi", model: "cooled" }, { runner: "claude", model: "fallback" }],
+      new Map<RunnerKind, RunnerEntry>([["pi", runnerEntry(["exhausted", "primary", "cooled"])], ["claude", claudeRunner(["fallback"])]]),
+    );
     const availability = vi.fn(async (candidate: AvailabilitySubject) => ({
       status: candidate.model === "exhausted" ? "known-exhausted" as const : candidate.model === "cooled" ? "local-capacity-limited" as const : "unknown" as const,
       retryNotBefore: null,
@@ -1010,11 +1018,11 @@ describe("herdr_launch task cutover", () => {
       failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
       start: (argv, attempt) => {
         if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
-        return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+        return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:claude", agent: "claude", kind: "id", value: "session-1" } } });
       },
     });
     const result = await execute(toolFor({ catalog, cli: harness.cli, availability }), task());
-    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }] });
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:fallback:low" }] });
     expect(harness.starts).toBe(2);
   });
 
@@ -1384,7 +1392,7 @@ describe("herdr_launch task cutover", () => {
     const agyCatalog = parseCatalog(`version: 2
 runners:
   agy:
-    models: [{model: agy-model}]
+    models: [{model: agy-utility}, {model: agy-economy}, {model: agy-model}, {model: agy-strong}, {model: agy-frontier}, {model: agy-max}]
     quota: {provider: google, billingProduct: antigravity, account: primary, scope: account}
     defaults: {mode: plan, timeoutMinutes: 30, sessionPersistence: true}
     plumbing: {sessionPersistence: required, promptDelivery: bootstrap, skillSelection: ambient, toolSelection: ambient}
@@ -1394,7 +1402,19 @@ mcp: {}
 quotaSources:
   - {name: reactive-cooldowns, kind: floor}
 pointPolicy:
+  agy:agy-utility: {costClass: medium, latencyClass: medium}
+  agy:agy-economy: {costClass: medium, latencyClass: medium}
   agy:agy-model: {costClass: medium, latencyClass: medium}
+  agy:agy-strong: {costClass: medium, latencyClass: medium}
+  agy:agy-frontier: {costClass: medium, latencyClass: medium}
+  agy:agy-max: {costClass: medium, latencyClass: medium}
+tierChains:
+  utility: [agy:agy-utility]
+  economy: [agy:agy-economy]
+  standard: [agy:agy-model]
+  strong: [agy:agy-strong]
+  frontier: [agy:agy-frontier]
+  max: [agy:agy-max]
 `, { path: "/tmp/agy-catalog.yaml", scopeRoot: "/tmp" });
     const agyHarness = makeCli({ agentId: "agy-agent", prompt: () => ok("prompt", { type: "agent_prompted", agent: agentRecord(agyHarness.children[0]!) }) });
     const agySupervision = stubSupervision();
@@ -1413,7 +1433,7 @@ pointPolicy:
     const devinCatalog = parseCatalog(`version: 2
 runners:
   devin:
-    models: [{model: devin-model}]
+    models: [{model: devin-utility}, {model: devin-economy}, {model: devin-model}, {model: devin-strong}, {model: devin-frontier}, {model: devin-max}]
     quota: {provider: cognition, billingProduct: devin, account: primary, scope: account}
     defaults: {permissionMode: dangerous, timeoutMinutes: 30, sessionPersistence: true}
     plumbing: {sessionPersistence: required, promptDelivery: none, skillSelection: ambient, toolSelection: ambient}
@@ -1423,7 +1443,19 @@ mcp: {}
 quotaSources:
   - {name: reactive-cooldowns, kind: floor}
 pointPolicy:
+  devin:devin-utility: {costClass: medium, latencyClass: medium}
+  devin:devin-economy: {costClass: medium, latencyClass: medium}
   devin:devin-model: {costClass: medium, latencyClass: medium}
+  devin:devin-strong: {costClass: medium, latencyClass: medium}
+  devin:devin-frontier: {costClass: medium, latencyClass: medium}
+  devin:devin-max: {costClass: medium, latencyClass: medium}
+tierChains:
+  utility: [devin:devin-utility]
+  economy: [devin:devin-economy]
+  standard: [devin:devin-model]
+  strong: [devin:devin-strong]
+  frontier: [devin:devin-frontier]
+  max: [devin:devin-max]
 `, { path: "/tmp/devin-catalog.yaml", scopeRoot: "/tmp" });
     const lease = { release: vi.fn(async () => undefined) };
     const queueFlush = { writeSection: vi.fn(async () => lease) };
@@ -1617,8 +1649,8 @@ pointPolicy:
     const i = launchTestInternals as unknown as UnsafeLaunchInternals;
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const piResolved = { index: 0, point: catalog.points![0]!, runner: catalog.runners.get("pi")! };
-    expect(i.allReviewedResources(piResolved)).toMatchObject({ tools: ["read"], extensions: [], skills: [], mcp: [] });
-    expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "claude" } })).toMatchObject({ tools: ["read"], plugins: [], mcp: [] });
+    expect(i.allReviewedResources(piResolved)).toMatchObject({ tools: ["read", "bash", "write"], extensions: [], skills: [], mcp: [] });
+    expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "claude" } })).toMatchObject({ tools: ["read", "bash", "write"], plugins: [], mcp: [] });
     expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "agy" } })).toEqual({});
     const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s" };
     expect(i.launchDiagnosticMessage({ code: "OK", phase: "ready", created: {}, assignmentState: "unconfirmed", paneId: "p", agentStarted: true, promptSubmitted: true, recipientRegistered: false, effectCertainty: "unknown", recoveryGuidance: "Inspect" })).toContain("HERDR_LAUNCH_DIAGNOSTIC");

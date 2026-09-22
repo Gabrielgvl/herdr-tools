@@ -304,6 +304,38 @@ runners:
       skillSelection: ambient
       toolSelection: ambient
 
+# Authoritative fallback chains. Jev selects only the weakest sufficient tier;
+# the runtime walks that tier and then stronger tiers on pre-start availability
+# failures. Chain membership deliberately overrides the historical envelopes.
+tierChains:
+  utility:
+    - pi:openai-codex/gpt-5.6-luna:low
+    - devin:swe-1-7-lightning-medium
+  economy:
+    - devin:swe-2-medium
+    - pi:openai-codex/gpt-5.6-luna:max
+    - pi:zai/glm-5.3-flash:low
+    - claude:sonnet:low
+  standard:
+    - devin:swe-2-high
+    - pi:zai/glm-5.3-flash:high
+    - pi:openai-codex/gpt-5.6-terra:max
+    - agy:gemini-3.8-flash-low
+  strong:
+    - devin:swe-2-max
+    - pi:openai-codex/gpt-5.6-sol:xhigh
+    - pi:zai/glm-5.3-flash:max
+    - claude:opus:low
+    - agy:gemini-3.8-flash-high
+  frontier:
+    - claude:fable:low
+    - pi:openai-codex/gpt-6-astra:high
+    - devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium
+  max:
+    - claude:fable:max
+    - pi:openai-codex/gpt-6-astra:max
+    - devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium
+
 # Reviewed operating-point policy (ADR-037) — the FROZEN audited table from
 # plan-delta-model-audit v3.1 Appendix A, transcribed verbatim. One entry per
 # generated point — each model crossed with its own declared reasoning set —

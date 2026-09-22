@@ -108,7 +108,7 @@ describe("compile", () => {
     expect(claude.quota).toEqual({ provider: "anthropic", billingProduct: "claude", account: "primary", scope: "account" });
     expect(pi.plumbing.toolSelection).toBe("allowlist");
     expect(agy.plumbing.promptDelivery).toBe("bootstrap");
-    expect(pi.resources.tools!.permitted).toEqual(["read", "bash"]);
+    expect(pi.resources.tools!.permitted).toEqual(["read", "bash", "write"]);
     expect(pi.resources.mcp!.permitted).toEqual([]);
     expect(pi.resources.skills!.installed).toHaveLength(3);
   });
@@ -139,24 +139,24 @@ describe("compile", () => {
     expect(claude.derivations).toContainEqual({ action: "dependency", field: "plugins", name: `${root}/plugins/executor`, reason: "provides selected MCP server executor" });
     if (claude.runtime.kind === "claude") {
       expect(claude.runtime.pluginDirs).toEqual([`${root}/plugins/executor`]);
-      expect(claude.runtime.allowedTools).toEqual(["Read", "mcp__plugin_herdr-executor_executor"]);
+      expect(claude.runtime.allowedTools).toEqual(["Read", "Bash", "Write", "mcp__plugin_herdr-executor_executor"]);
     }
     // A dependency already granted by the selection records no derivation.
     const already = await compileCandidateContract(catalog, SPEC, point(catalog, "claude", "high"), { tools: ["Read"], plugins: ["plugins/executor"], mcp: ["executor"] });
     expect(already.derivations.some((derivation) => derivation.action === "dependency")).toBe(false);
     // The `Skill` tool stays permitted when plugin dirs expose reviewed skills.
     const withSkill = await compileCandidateContract(catalog, SPEC, point(catalog, "claude", "high"), { tools: ["Read", "Skill"], plugins: ["plugins/worker"] });
-    expect(withSkill.resources.tools!.permitted).toEqual(["Read", "Skill"]);
+    expect(withSkill.resources.tools!.permitted).toEqual(["Read", "Bash", "Write", "Skill"]);
     const pi = await compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), { tools: ["read"], mcp: ["herdr"] });
     expect(pi.resources.tools!.selected).toEqual(["read"]);
-    expect(pi.resources.tools!.permitted).toEqual(["read"]);
+    expect(pi.resources.tools!.permitted).toEqual(["read", "bash", "write"]);
     expect(pi.resources.mcp!.selected).toEqual(["herdr"]);
     expect(pi.resources.mcp!.exposed).toEqual([]);
     expect(pi.resources.mcp!.permitted).toEqual([]);
     expect(pi.derivations).toContainEqual({ action: "incompatible", field: "mcp", name: "herdr", reason: "Pi cannot scope ambient MCP servers to the reviewed selection" });
     const piDirect = await compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), { tools: ["read", "mcp"], mcp: ["herdr"] });
     expect(piDirect.resources.tools!.selected).toEqual(["read", "mcp"]);
-    expect(piDirect.resources.tools!.permitted).toEqual(["read"]);
+    expect(piDirect.resources.tools!.permitted).toEqual(["read", "bash", "write"]);
     expect(piDirect.derivations).toContainEqual({ action: "incompatible", field: "tools", name: "mcp", reason: "Pi cannot scope ambient MCP servers to the reviewed selection" });
   });
 
@@ -165,10 +165,10 @@ describe("compile", () => {
     // claude `Skill` with no plugin dirs can only reach unreviewed ambient skills.
     const claude = await compileCandidateContract(catalog, SPEC, point(catalog, "claude", "high"), { tools: ["Read", "Skill"] });
     expect(claude.resources.tools!.selected).toEqual(["Read", "Skill"]);
-    expect(claude.resources.tools!.permitted).toEqual(["Read"]);
+    expect(claude.resources.tools!.permitted).toEqual(["Read", "Bash", "Write"]);
     expect(claude.derivations).toContainEqual(expect.objectContaining({ action: "incompatible", field: "tools", name: "Skill" }));
     if (claude.runtime.kind === "claude") {
-      expect(claude.runtime.allowedTools).toEqual(["Read"]);
+      expect(claude.runtime.allowedTools).toEqual(["Read", "Bash", "Write"]);
       expect(claude.runtime.disallowedTools).toContain("Skill");
     }
     // A selected MCP server whose provider plugin has no directory in the pool is an incompatible pair, removed and recorded.
@@ -178,7 +178,7 @@ describe("compile", () => {
     expect(removed.resources.mcp!.selected).toEqual(["executor"]);
     expect(removed.resources.mcp!.permitted).toEqual([]);
     expect(removed.derivations).toContainEqual(expect.objectContaining({ action: "incompatible", field: "mcp", name: "executor", reason: "provider plugin herdr-executor has no directory in the reviewed plugin pool" }));
-    if (removed.runtime.kind === "claude") expect(removed.runtime.allowedTools).toEqual(["Read"]);
+    if (removed.runtime.kind === "claude") expect(removed.runtime.allowedTools).toEqual(["Read", "Bash", "Write"]);
     // A pool member the catalog never declares a provider for is the same failure.
     const undeclared = catalogAt(scope());
     (undeclared.mcpServers as Map<string, McpServer>).delete("herdr");
@@ -186,7 +186,7 @@ describe("compile", () => {
     expect(dropped.derivations).toContainEqual(expect.objectContaining({ action: "incompatible", field: "mcp", name: "herdr", reason: "provider plugin is undeclared in the catalog" }));
     // Same fate on pi when the mcp client tool is not in the pool.
     const piPools = catalogAt(scope());
-    (piPools.runners.get("pi")!.pools as { -readonly [K in keyof RunnerPools]: RunnerPools[K] }).tools = ["read", "bash"];
+    (piPools.runners.get("pi")!.pools as { -readonly [K in keyof RunnerPools]: RunnerPools[K] }).tools = ["read", "bash", "write"];
     const piRemoved = await compileCandidateContract(piPools, SPEC, point(piPools, "pi", "high"), { tools: ["read"], mcp: ["herdr"] });
     expect(piRemoved.resources.mcp!.permitted).toEqual([]);
     expect(piRemoved.derivations).toContainEqual(expect.objectContaining({ action: "incompatible", field: "mcp", name: "herdr" }));
@@ -207,13 +207,13 @@ describe("compile", () => {
     expect(claude.derivations).toContainEqual(expect.objectContaining({ action: "deny", field: "mcp", name: "herdr" }));
     expect(claude.resources.plugins!.permitted).toEqual([`${catalog.source.scopeRoot}/plugins/manager`]);
     if (claude.runtime.kind === "claude") {
-      expect(claude.runtime.allowedTools).toEqual(["Read", "Bash"]);
+      expect(claude.runtime.allowedTools).toEqual(["Read", "Bash", "Write"]);
       expect(claude.runtime.disallowedTools).toContain("mcp__plugin_herdr-tools_herdr");
     }
     const tools = claude.resources.tools!;
     expect(tools.installed).toEqual(["Read", "Bash", "Write", "Skill", "NotebookEdit"]);
-    expect(tools.permitted).toEqual(["Read", "Bash"]);
-    expect(tools.denied).toEqual(["Write", "Skill", "NotebookEdit"]);
+    expect(tools.permitted).toEqual(["Read", "Bash", "Write"]);
+    expect(tools.denied).toEqual(["Skill", "NotebookEdit"]);
     expect(claude.gaps).toContainEqual(expect.objectContaining({ kind: "deny-coverage" }));
     expect(claude.gaps).toContainEqual(expect.objectContaining({ kind: "ambient-exposure" }));
   });
@@ -233,14 +233,14 @@ describe("compile", () => {
     const catalog = catalogAt(scope());
     const root = catalog.source.scopeRoot;
     const pi = await compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), { tools: ["read", "bash"], skills: [`${root}/skills/adr`, "skills/tdd"], extensions: ["ext/host.ts"] });
-    expect(contractArgv(pi, "/tmp/prompt.md")).toEqual(["--model", "openai/pi-pro", "--thinking", "high", "--tools", "read,bash", "--extension", `${root}/ext/host.ts`, "--no-skills", "--skill", `${root}/skills/adr`, "--skill", `${root}/skills/tdd`, "--append-system-prompt", "/tmp/prompt.md"]);
+    expect(contractArgv(pi, "/tmp/prompt.md")).toEqual(["--model", "openai/pi-pro", "--thinking", "high", "--tools", "read,bash,write", "--extension", `${root}/ext/host.ts`, "--no-skills", "--skill", `${root}/skills/adr`, "--skill", `${root}/skills/tdd`, "--append-system-prompt", "/tmp/prompt.md"]);
     // Reasoning comes from the point, never the runner default: `low` wins
     // over the runner's declared `effort: high`.
     const low = await compileCandidateContract(catalog, SPEC, point(catalog, "claude", "low"), { tools: ["Read"] });
     const lowArgv = contractArgv(low, "/tmp/prompt.md");
     expect(lowArgv.slice(lowArgv.indexOf("--effort"), lowArgv.indexOf("--effort") + 2)).toEqual(["--effort", "low"]);
     const claude = await compileCandidateContract(catalog, SPEC, point(catalog, "claude", "high"), { tools: ["Read"], plugins: ["plugins/worker"] });
-    expect(contractArgv(claude, "/tmp/prompt.md", "/tmp/att", "/tmp/handoff")).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "dontAsk", "--allowed-tools", "Read", ...["Bash", "Write", "Skill", "NotebookEdit"].flatMap((tool) => ["--disallowed-tools", tool]), "--plugin-dir", `${root}/plugins/worker`, "--add-dir", "/tmp/att", "--add-dir", "/tmp/handoff", "--append-system-prompt-file", "/tmp/prompt.md"]);
+    expect(contractArgv(claude, "/tmp/prompt.md", "/tmp/att", "/tmp/handoff")).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "dontAsk", ...["Read", "Bash", "Write"].flatMap((tool) => ["--allowed-tools", tool]), ...["Skill", "NotebookEdit"].flatMap((tool) => ["--disallowed-tools", tool]), "--plugin-dir", `${root}/plugins/worker`, "--add-dir", "/tmp/att", "--add-dir", "/tmp/handoff", "--append-system-prompt-file", "/tmp/prompt.md"]);
     const agy = await compileCandidateContract(catalog, SPEC, point(catalog, "agy"), {});
     expect(contractArgv(agy, undefined, "/tmp/att")).toEqual(["--model", "gemini-low", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", "/tmp/att", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     const devin = await compileCandidateContract(catalog, SPEC, point(catalog, "devin"), {});
@@ -278,16 +278,22 @@ describe("compile", () => {
     await expect(compileCandidateContract(axisless, SPEC, point(axisless, "pi", "high"), { tools: ["read"] })).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED" });
   });
 
-  it("fails closed when the permit set argv cannot express would grant ambient defaults", async () => {
+  it("keeps the unconditional base permit set when Jev selects no tools", async () => {
     const catalog = catalogAt(scope());
-    await expect(compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), {})).rejects.toMatchObject({ code: "EMPTY_PERMIT_SET", details: { runner: "pi" } });
-    await expect(compileCandidateContract(catalog, SPEC, point(catalog, "claude", "high"), {})).rejects.toMatchObject({ code: "EMPTY_PERMIT_SET", details: { runner: "claude" } });
+    await expect(compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), {})).resolves.toMatchObject({ runtime: { tools: ["read", "bash", "write"] } });
+    await expect(compileCandidateContract(catalog, SPEC, point(catalog, "claude", "high"), {})).resolves.toMatchObject({ runtime: { allowedTools: ["Read", "Bash", "Write"] } });
     // Ambient runners carry no permit set at all, so the rule does not apply...
     await expect(compileCandidateContract(catalog, SPEC, point(catalog, "agy"), {})).resolves.toMatchObject({ runtime: { kind: "agy" } });
     // ...and a hypothetical ambient runner with allowlist plumbing fails the same way.
     const mutated = catalogAt(scope());
     mutated.runners.get("agy")!.plumbing.toolSelection = "allowlist";
     await expect(compileCandidateContract(mutated, SPEC, point(mutated, "agy"), {})).rejects.toMatchObject({ code: "EMPTY_PERMIT_SET", details: { runner: "agy" } });
+    const missingPiBase = catalogAt(scope());
+    (missingPiBase.runners.get("pi")!.pools as { -readonly [K in keyof RunnerPools]: RunnerPools[K] }).tools = ["read", "bash"];
+    await expect(compileCandidateContract(missingPiBase, SPEC, point(missingPiBase, "pi", "high"), {})).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED", details: { runner: "pi", names: ["write"] } });
+    const missingClaudeBase = catalogAt(scope());
+    (missingClaudeBase.runners.get("claude")!.pools as { -readonly [K in keyof RunnerPools]: RunnerPools[K] }).tools = ["Read", "Bash"];
+    await expect(compileCandidateContract(missingClaudeBase, SPEC, point(missingClaudeBase, "claude", "high"), {})).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED", details: { runner: "claude", names: ["Write"] } });
   });
 
   it("rejects malformed selections before any membership check", async () => {

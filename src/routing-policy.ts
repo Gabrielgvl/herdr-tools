@@ -165,13 +165,10 @@ export function resolveTierPolicy(profile: WorkloadProfile, requestedTier?: Qual
 }
 
 /**
- * Recovery start tier: the maximum of the requested-or-default tier, the
- * adjusted workload floor, and the next tier after the prior route's tier.
- * A prior `max` route keeps `max`.
+ * Recovery start tier: folded into the router's Task admission (the lifted
+ * RoutingTask carries the prior route tier; `maxTier(effectiveStart,
+ * nextTier(prior))` applies there).
  */
-export function resolveRecoveryStart(profile: WorkloadProfile, priorRouteTier: QualityTier, requestedTier?: QualityTier): QualityTier {
-  return maxTier(resolveTierPolicy(profile, requestedTier).effectiveStart, nextTier(priorRouteTier));
-}
 
 export type RoutingPolicyErrorCode = "RECOVERY_SOURCE_UNRESOLVABLE";
 

@@ -335,11 +335,16 @@ describe("the Jev API key resolver", () => {
     await expect(resolveTypesafeApiKey(storeWith({ type: "api_key", key: "store-key" }))).resolves.toBe("store-key");
   });
 
-  it("prefers the environment over the credential store", async () => {
+  it("prefers the auth store over a stale environment value", async () => {
     vi.stubEnv("TYPESAFE_API_KEY", "env-key");
     const store = vi.fn(async () => ({ type: "api_key" as const, key: "store-key" }));
-    await expect(resolveTypesafeApiKey({ read: store })).resolves.toBe("env-key");
-    expect(store).not.toHaveBeenCalled();
+    await expect(resolveTypesafeApiKey({ read: store })).resolves.toBe("store-key");
+    expect(store).toHaveBeenCalledWith("typesafe");
+  });
+
+  it("falls back to the environment when the auth store has no usable key", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "env-key");
+    await expect(resolveTypesafeApiKey(storeWith(undefined))).resolves.toBe("env-key");
   });
 
   it("refuses non-api-key entries and degrades on store or missing-key failures", async () => {

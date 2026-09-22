@@ -399,17 +399,21 @@ describe("TypeSafeSpecClient typed outcomes", () => {
     expect(fetchCall).not.toHaveBeenCalled();
   });
 
-  it("resolves the key env-first, then the Pi auth store, preferring an explicit option over both", async () => {
+  it("resolves the key store-first (a rotated auth-store key beats a stale env var), with env as the bootstrap fallback and an explicit option over both", async () => {
     const store = { read: async () => ({ type: "api_key", key: "store-key" }) as never };
-    vi.stubEnv("TYPESAFE_API_KEY", "");
     const calls: Array<{ init?: RequestInit }> = [];
     const fetchCall: FetchCall = async (_input, init) => (calls.push({ init }), response());
+    // Store wins over a present env var: a rotated key in auth.json must beat
+    // whatever stale value a long-running session's environment still carries.
+    vi.stubEnv("TYPESAFE_API_KEY", "stale-env-key");
     await new TypeSafeSpecClient({ fetch: fetchCall, credentials: store }).evaluate({ task: TASK, catalog: CATALOG }, signal());
     expect((calls[0]!.init!.headers as Record<string, string>).Authorization).toBe("Bearer store-key");
 
-    vi.stubEnv("TYPESAFE_API_KEY", "env-key");
+    // Env is the bootstrap fallback when the store has no usable key.
+    const emptyStore = { read: async () => ({ type: "api_key", key: "" }) as never };
     calls.length = 0;
-    await new TypeSafeSpecClient({ fetch: fetchCall, credentials: store }).evaluate({ task: TASK, catalog: CATALOG }, signal());
+    vi.stubEnv("TYPESAFE_API_KEY", "env-key");
+    await new TypeSafeSpecClient({ fetch: fetchCall, credentials: emptyStore }).evaluate({ task: TASK, catalog: CATALOG }, signal());
     expect((calls[0]!.init!.headers as Record<string, string>).Authorization).toBe("Bearer env-key");
 
     calls.length = 0;
@@ -446,10 +450,15 @@ describe("TypeSafeSpecClient typed outcomes", () => {
   });
 
   for (const status of [401, 429, 503]) {
-    it(`maps HTTP ${status} to transport_failed with only the bounded status`, async () => {
+    it(`maps HTTP ${status} to transport_failed with only the bounded status and the request-size diagnostic`, async () => {
       const fetchCall = vi.fn(async () => new Response(JSON.stringify({ detail: `server-secret-${status}` }), { status }));
       const outcome = await client(fetchCall).evaluate({ task: TASK, catalog: CATALOG }, signal());
-      expect(outcome).toEqual({ kind: "abstained", reason: "transport_failed", component: `http_${status}` });
+      expect(outcome).toEqual({
+        kind: "abstained",
+        reason: "transport_failed",
+        component: `http_${status}`,
+        requestSize: { questions: 36, bytes: expect.any(Number) },
+      });
       expect(fetchCall).toHaveBeenCalledTimes(1);
       const exposed = JSON.stringify(outcome);
       expect(exposed).not.toContain(`server-secret-${status}`);
@@ -463,7 +472,7 @@ describe("TypeSafeSpecClient typed outcomes", () => {
       const outcome = await client(async () => {
         throw thrown;
       }).evaluate({ task: TASK, catalog: CATALOG }, signal());
-      expect(outcome).toEqual({ kind: "abstained", reason: "transport_failed", component: "transport" });
+      expect(outcome).toEqual({ kind: "abstained", reason: "transport_failed", component: "transport", requestSize: expect.any(Object) });
       expect(JSON.stringify(outcome)).not.toContain("offline-secret");
     }
   });
@@ -476,7 +485,7 @@ describe("TypeSafeSpecClient typed outcomes", () => {
       });
     const pending = client(hanging).evaluate({ task: TASK, catalog: CATALOG }, signal());
     await vi.advanceTimersByTimeAsync(10_001);
-    await expect(pending).resolves.toEqual({ kind: "abstained", reason: "transport_failed", component: "transport" });
+    await expect(pending).resolves.toEqual({ kind: "abstained", reason: "transport_failed", component: "transport", requestSize: { questions: 36, bytes: expect.any(Number) } });
   });
 
   it("aborts before, during, and after the request", async () => {

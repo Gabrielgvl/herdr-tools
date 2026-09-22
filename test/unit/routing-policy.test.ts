@@ -11,7 +11,6 @@ import {
   maxTier,
   nextTier,
   rankFallbackCandidates,
-  resolveRecoveryStart,
   resolveTierPolicy,
   tierRank,
   type CostClass,
@@ -146,19 +145,6 @@ describe("resolveTierPolicy", () => {
   it("lifts the effective ceiling to the effective start when the requested tier exceeds it", () => {
     const policy = resolveTierPolicy(profile({ intent: "verify" }), "frontier");
     expect(policy).toMatchObject({ requestedTier: "frontier", adjustedFloor: "utility", adjustedCeiling: "standard", effectiveStart: "frontier", effectiveCeiling: "frontier" });
-  });
-});
-
-describe("resolveRecoveryStart", () => {
-  it("takes the maximum of requested-or-standard, adjusted floor, and the next tier after the prior route", () => {
-    expect(resolveRecoveryStart(profile(), "standard")).toBe("strong");
-    expect(resolveRecoveryStart(profile(), "economy", "utility")).toBe("standard");
-    expect(resolveRecoveryStart(profile({ intent: "implement", mutation: "broad", scope: "repo_wide" }), "economy")).toBe("frontier");
-    expect(resolveRecoveryStart(profile(), "economy", "frontier")).toBe("frontier");
-  });
-
-  it("keeps max as the next tier after a max prior route", () => {
-    expect(resolveRecoveryStart(profile({ intent: "verify" }), "max")).toBe("max");
   });
 });
 

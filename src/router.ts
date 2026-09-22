@@ -20,7 +20,6 @@ import {
 /** The old reason vocabulary is retained for every fail-closed abstention. */
 export type AbstainReason =
   | "low_confidence"
-  | "no_assignments"
   | "no_candidates_at_tier"
   | "catalog_unavailable"
   | "invalid_response"
@@ -152,6 +151,8 @@ export interface Abstained {
   reason: AbstainReason;
   component?: string;
   evidence?: RouterEvidence;
+  /** Bounded diagnostics for transport rejections: the measured outbound request size, so a provider-side limit is visible without the API body. */
+  requestSize?: { questions: number; bytes: number };
 }
 
 export type SpecDecision = Admitted | Rejected | Abstained;

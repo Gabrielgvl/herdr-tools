@@ -312,7 +312,6 @@ describe("appendRouterDecision records", () => {
     const root = await tempdir();
     const reasons: readonly Abstained["reason"][] = [
       "low_confidence",
-      "no_assignments",
       "no_candidates_at_tier",
       "catalog_unavailable",
       "invalid_response",
@@ -324,6 +323,22 @@ describe("appendRouterDecision records", () => {
     const records = await readRecords(routerLogPaths(root).decisions);
     expect(records.map((record) => (record.result as { reason: string }).reason)).toEqual(reasons);
     expect(records.every((record) => record.result.kind === "abstained")).toBe(true);
+  });
+
+  it("persists a bounded requestSize diagnostic on transport abstentions and refuses malformed sizes", async () => {
+    const root = await tempdir();
+    const paths = routerLogPaths(root);
+    const ok = await appendRouterDecision(entry({ result: { ...abstained("transport_failed"), requestSize: { questions: 445, bytes: 240254 } } }), { root, now: () => new Date("2026-09-22T10:00:00.000Z"), deadlineMs: 10_000 });
+    expect(ok).toBeUndefined();
+    const [record] = await readRecords(paths.decisions);
+    expect(record.result).toMatchObject({ requestSize: { questions: 445, bytes: 240254 } });
+
+    const bad = await tempdir();
+    const badPaths = routerLogPaths(bad);
+    await expect(
+      appendRouterDecision(entry({ result: { ...abstained("transport_failed"), requestSize: { questions: -1, bytes: 240254 } } }), { root: bad, deadlineMs: 10_000 }),
+    ).rejects.toMatchObject({ code: "ROUTER_LOG_UNAVAILABLE" });
+    await expect(readFile(badPaths.decisions, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("persists rejected quality as rejected and discards the legacy probabilities bag", async () => {

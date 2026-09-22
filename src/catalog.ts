@@ -351,6 +351,13 @@ function modelEntry(kind: RunnerKind, value: unknown, field: string): ModelEntry
   if (quota !== undefined) entry.quota = quota;
   const reasoning = reasoningSet(kind, value.supportedReasoning, `${field}.supportedReasoning`);
   if (reasoning !== undefined) entry.supportedReasoning = reasoning;
+  // The pi runtime always launches with a thinking setting: an undeclared
+  // axis would mint a bare point the compiler rejects at start time. Fail at
+  // parse instead. Claude effort is optional (haiku is unreasoned); AGY/Devin
+  // encode reasoning in the model id.
+  if (kind === "pi" && (reasoning === undefined || reasoning.length === 0)) {
+    fail(`${field} must declare a supportedReasoning axis for the pi runtime`, { field });
+  }
   return entry;
 }
 

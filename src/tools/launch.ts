@@ -293,6 +293,8 @@ export interface LaunchResult {
   effectiveTier?: QualityTier;
   children: LaunchResultChild[];
   error?: { code: string; message?: string };
+  /** Bounded routing abstention fact — the caller-facing reason the request did not launch. Full evidence lives in the decision log. */
+  abstention?: { reason: string; component?: string; requestSize?: { questions: number; bytes: number } };
 }
 
 const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
@@ -2944,7 +2946,13 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
 
     const decision = routedRecord.decision;
     if (!isAdmitted(decision)) {
-      return emit({ kind: "launch", launchId, outcome: "abstained", requestedTier: params.tier, children: [] });
+      /* Bounded caller-facing abstention fact: the full probabilities and
+       * evidence stay in the decision log; this is the minimum a caller needs
+       * to self-correct (e.g. clarify the Task after a low-confidence intent). */
+      const abstention = decision.kind === "abstained"
+        ? { reason: decision.reason, ...(decision.component === undefined ? {} : { component: decision.component }) }
+        : undefined;
+      return emit({ kind: "launch", launchId, outcome: "abstained", requestedTier: params.tier, children: [], ...(abstention === undefined ? {} : { abstention }) });
     }
     const catalog = routed.catalog!;
     const intent = decision.evidence.workload?.intent;

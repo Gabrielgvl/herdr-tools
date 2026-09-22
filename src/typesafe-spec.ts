@@ -146,6 +146,14 @@ function refuse(reason: AbstainReason, component?: string, requestSize?: { quest
   return { kind: "abstained", reason, ...(component === undefined ? {} : { component }), ...(requestSize === undefined ? {} : { requestSize }) };
 }
 
+function transportComponent(error: APIError): string {
+  const detail = record(error.body) && record(error.body.detail) ? error.body.detail : undefined;
+  const errorType = detail?.error_type;
+  return typeof errorType === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(errorType)
+    ? `http_${error.status}_${errorType}`
+    : `http_${error.status}`;
+}
+
 /** Exact-key probability map: every sent key present once, each in [0,1], summing to one. */
 function distribution(value: unknown, keys: readonly string[]): Record<string, number> | undefined {
   if (!record(value) || Object.keys(value).length !== keys.length) return undefined;
@@ -332,7 +340,7 @@ export class TypeSafeSpecClient {
       response = await client.systemOne({ state: built.state as EntryType, questions: built.questions }, { signal });
     } catch (error) {
       if (signal.aborted) return refuse("aborted");
-      return refuse("transport_failed", error instanceof APIError ? `http_${error.status}` : "transport", specRequestSize(built));
+      return refuse("transport_failed", error instanceof APIError ? transportComponent(error) : "transport", specRequestSize(built));
     }
     const evaluated = this.normalize(response, built.resourceQuestions, built.fitnessQuestions);
     if (evaluated.kind === "response" && signal.aborted) return refuse("aborted");

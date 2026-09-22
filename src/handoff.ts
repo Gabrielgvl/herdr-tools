@@ -19,6 +19,7 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { acquireFlockHolder, assertOwnerOnlyDirectory } from "./pane-write-lock.js";
+import { QUALITY_TIERS, type QualityTier, type WorkloadProfile } from "./routing-policy.js";
 import { resolveSocketPath } from "./supervision/socket.js";
 
 export type HandoffErrorCode =
@@ -53,7 +54,7 @@ export const HANDOFF_STATE_NAME = "state.json";
 export const HANDOFF_LOCK_NAME = "lock";
 export const HANDOFF_MAX_BYTES = 64 * 1024;
 const HANDOFF_LOCK_READY = "HERDR_HANDOFF_LOCK_READY";
-const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
@@ -115,6 +116,8 @@ export interface HandoffAllocation {
   runId: string;
   /** The endpoint-private namespace directory this run lives under. */
   namespaceDir: string;
+  /** The endpoint identity this run's namespace derives from. */
+  endpoint: string;
   /** The run's private directory; the agent writes `handoff.md` inside it. */
   directory: string;
   /** The exact artifact path injected into the assignment. */
@@ -137,12 +140,46 @@ export interface HandoffAllocation {
 export type HandoffLifecycleState = "awaiting_handoff" | "handed_off" | "recovery_pending" | "cancelled" | "failed";
 
 /**
+ * The runtime-resolved concrete model record (ADR-037 N4 amendment): the exact
+ * model the started child runs, or the bounded unavailable fact when no
+ * trustworthy post-start readback seam exists. Persisted beside the recorded
+ * `operatingPointId` so a later rolling-alias refresh stays observable.
+ */
+export type HandoffResolvedModel =
+  | { available: true; model: string }
+  | { available: false; reason: string; catalogRevision?: string };
+
+/**
+ * The launch route evidence a v2 run record carries for recovery lineage
+ * (ADR-037): the tier the fallback chain was built at, the operating point
+ * selected first, the policy revision, and the derived workload profile.
+ */
+export interface HandoffRouteRecord {
+  tier: QualityTier;
+  operatingPointId: string;
+  policyRevision: string;
+  workload: WorkloadProfile;
+}
+
+/**
+ * The managed workspace a run's child worked in (ADR-037): the canonical
+ * resolved cwd, plus the provable replica worktree root when the child ran
+ * inside one. A recovery resumes the worktree when present, else resolvedCwd.
+ */
+export interface HandoffWorkspaceRecord {
+  resolvedCwd: string;
+  worktree?: string;
+}
+
+/**
  * The versioned sidecar. Identity fields that only exist after agent start are
  * reserved as null at allocation and bound by the gate once the launched
- * identity is proven; the deferred recovery node reads them.
+ * identity is proven. v2 records add the endpoint pin and child route/workspace
+ * lineage a later recovery resolves against; v1 records predate recovery and
+ * are never reinterpreted — they fail closed at parse.
  */
 export interface HandoffState {
-  v: 1;
+  v: 2;
   runId: string;
   endpoint: string;
   createdAt: string;
@@ -150,12 +187,17 @@ export interface HandoffState {
   child: {
     agentName: string;
     agentKind: string;
-    candidateName: string;
+    operatingPointId: string;
     specLabel: string;
     fallbackCandidates: string[];
     paneId: string | null;
     terminalId: string | null;
     agentId: string | null;
+    resolvedModel?: HandoffResolvedModel;
+    /** Route evidence — the lineage a later recovery resolves (ADR-037). */
+    route?: HandoffRouteRecord;
+    /** The managed workspace the child worked in — what a recovery resumes. */
+    workspace?: HandoffWorkspaceRecord;
   };
   nativeSession: { source: string; agent: string; kind: string; value: string } | null;
   lifecycle: { state: HandoffLifecycleState; watermark: { stateChangeSeq: number; revision: number } | null; detail?: string };
@@ -165,18 +207,27 @@ export interface HandoffState {
 
 export interface HandoffRunIdentity {
   manager: { paneId: string; display: string; source: string };
-  child: { agentName: string; agentKind: string; candidateName: string; specLabel: string; fallbackCandidates: string[] };
+  child: {
+    agentName: string;
+    agentKind: string;
+    operatingPointId: string;
+    specLabel: string;
+    fallbackCandidates: string[];
+    /** Route evidence the launch path supplies for recovery lineage. */
+    route?: HandoffRouteRecord;
+    /** The managed workspace the launch path resolved for this child. */
+    workspace?: HandoffWorkspaceRecord;
+  };
 }
 
-function allocateIn(namespace: HandoffNamespace): HandoffAllocation {
-  const runId = randomUUID();
-  /* c8 ignore next -- randomUUID always matches this shape; the guard exists so a swapped id source cannot silently widen the run layout. */
-  if (!RUN_ID_PATTERN.test(runId)) throw new HandoffError("HANDOFF_UNAVAILABLE", "Handoff run id is malformed");
+/** The exact run-directory layout a run id derives under one namespace. */
+function deriveRun(namespace: HandoffNamespace, runId: string): HandoffAllocation {
   const directory = join(namespace.dir, runId);
   const toolsDir = join(directory, HANDOFF_TOOLS_DIR_NAME);
   return {
     runId,
     namespaceDir: namespace.dir,
+    endpoint: namespace.endpoint,
     directory,
     artifactPath: join(directory, HANDOFF_ARTIFACT_NAME),
     toolsDir,
@@ -184,6 +235,24 @@ function allocateIn(namespace: HandoffNamespace): HandoffAllocation {
     lockPath: join(toolsDir, HANDOFF_LOCK_NAME),
     marker: `herdr-run:${runId}`
   };
+}
+
+function allocateIn(namespace: HandoffNamespace): HandoffAllocation {
+  const runId = randomUUID();
+  /* c8 ignore next -- randomUUID always matches this shape; the guard exists so a swapped id source cannot silently widen the run layout. */
+  if (!RUN_ID_PATTERN.test(runId)) throw new HandoffError("HANDOFF_UNAVAILABLE", "Handoff run id is malformed");
+  return deriveRun(namespace, runId);
+}
+
+/**
+ * The derivation shared by `allocate` and `open`: an id that does not match
+ * the UUID layout is refused before any path is derived.
+ */
+function openIn(namespace: HandoffNamespace, runId: string): HandoffAllocation {
+  if (!RUN_ID_PATTERN.test(runId)) throw new HandoffError("HANDOFF_UNAVAILABLE", "Handoff run id is malformed");
+  const run = deriveRun(namespace, runId);
+  assertRunPaths(run, "HANDOFF_STORE_FAILED");
+  return run;
 }
 
 /** Paths must be exactly the UUID-derived layout; anything else is refused. */
@@ -263,10 +332,17 @@ export interface HandoffAllocator {
    * manager identity is known, still before any launch effect.
    */
   allocate(): Promise<HandoffAllocation>;
+  /**
+   * Open an existing run by id inside this endpoint's namespace — the same
+   * derivation and path-consistency assertion as `allocate`, without the
+   * must-not-exist check. Used to resolve `recoveryOf` lineage; the caller
+   * reads the sidecar next, where a missing or malformed record fails closed.
+   */
+  open(runId: string): Promise<HandoffAllocation>;
   /** Create the run directory and `.tools`, then write `state.json` under the short flock. */
   persist(run: HandoffAllocation, identity: HandoffRunIdentity): Promise<void>;
   /** Replace the requested candidate with the candidate that actually started. */
-  selectCandidate(run: HandoffAllocation, candidateName: string, agentKind: string): Promise<void>;
+  selectCandidate(run: HandoffAllocation, operatingPointId: string, agentKind: string, resolvedModel?: HandoffResolvedModel): Promise<void>;
 }
 
 export function createHandoffAllocator(options: {
@@ -288,6 +364,9 @@ export function createHandoffAllocator(options: {
   return {
     async allocate() {
       return allocateIn(await namespace());
+    },
+    async open(runId) {
+      return openIn(await namespace(), runId);
     },
     async persist(run, identity) {
       const ns = await namespace();
@@ -311,7 +390,7 @@ export function createHandoffAllocator(options: {
         throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff run directory could not be created", { path: safePath(run.directory), causeCode: (error as { code?: unknown}).code });
       }
       const state: HandoffState = {
-        v: 1,
+        v: 2,
         runId: run.runId,
         endpoint: ns.endpoint,
         createdAt: now().toISOString(),
@@ -319,12 +398,26 @@ export function createHandoffAllocator(options: {
         child: {
           agentName: identity.child.agentName,
           agentKind: identity.child.agentKind,
-          candidateName: identity.child.candidateName,
+          operatingPointId: identity.child.operatingPointId,
           specLabel: identity.child.specLabel,
           fallbackCandidates: [...identity.child.fallbackCandidates],
           paneId: null,
           terminalId: null,
-          agentId: null
+          agentId: null,
+          ...(identity.child.route === undefined ? {} : {
+            route: {
+              tier: identity.child.route.tier,
+              operatingPointId: identity.child.route.operatingPointId,
+              policyRevision: identity.child.route.policyRevision,
+              workload: { ...identity.child.route.workload }
+            }
+          }),
+          ...(identity.child.workspace === undefined ? {} : {
+            workspace: {
+              resolvedCwd: identity.child.workspace.resolvedCwd,
+              ...(identity.child.workspace.worktree === undefined ? {} : { worktree: identity.child.workspace.worktree })
+            }
+          })
         },
         nativeSession: null,
         lifecycle: { state: "awaiting_handoff", watermark: null },
@@ -344,13 +437,36 @@ export function createHandoffAllocator(options: {
         await holder.release().catch(() => undefined);
       }
     },
-    async selectCandidate(run, candidateName, agentKind) {
+    async selectCandidate(run, operatingPointId, agentKind, resolvedModel) {
       await updateHandoffState(run, (state) => {
-        state.child.candidateName = candidateName;
+        state.child.operatingPointId = operatingPointId;
         state.child.agentKind = agentKind;
+        // The recorded route's selected point tracks the actual start so a
+        // recovery excludes the point that really ran.
+        if (state.child.route !== undefined) state.child.route.operatingPointId = operatingPointId;
+        if (resolvedModel !== undefined) state.child.resolvedModel = resolvedModel;
       });
     }
   };
+}
+
+/**
+ * Open an existing run by id inside this endpoint's namespace — the same
+ * derivation and path-consistency assertion as allocation, without the
+ * must-not-exist check. Reading the run's sidecar is the caller's next step;
+ * a missing or malformed record fails closed there.
+ */
+export async function openHandoffRun(
+  runId: string,
+  options: { env?: NodeJS.ProcessEnv; namespace?: HandoffNamespace | (() => Promise<HandoffNamespace>) } = {}
+): Promise<HandoffAllocation> {
+  let namespace: HandoffNamespace;
+  try {
+    namespace = typeof options.namespace === "function" ? await options.namespace() : options.namespace ?? (await resolveHandoffNamespace(options.env ?? process.env));
+  } catch (error) {
+    throw error instanceof HandoffError ? error : new HandoffError("HANDOFF_UNAVAILABLE", "Handoff namespace is unavailable");
+  }
+  return openIn(namespace, runId);
 }
 
 /** Bound on flock's own contention wait for one sidecar section. */
@@ -361,6 +477,76 @@ function stateRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function nonempty(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function nullableString(value: unknown): value is string | null {
+  return value === null || nonempty(value);
+}
+
+/** The closed-union members of each WorkloadProfile field, mirrored for record validation. */
+const WORKLOAD_MEMBERS: Readonly<Record<keyof WorkloadProfile, ReadonlySet<string>>> = {
+  intent: new Set(["explore", "reason", "implement", "debug", "verify", "review", "coordinate"]),
+  mutation: new Set(["none", "bounded", "broad"]),
+  scope: new Set(["local", "multi_file", "repo_wide"]),
+  horizon: new Set(["short", "medium", "long"]),
+  verifiability: new Set(["strong", "partial", "weak"]),
+  workspaceState: new Set(["clean", "partial", "failed"]),
+  ambiguity: new Set(["low", "medium", "high"])
+};
+
+const CHILD_KEYS = new Set(["agentName", "agentKind", "operatingPointId", "specLabel", "fallbackCandidates", "paneId", "terminalId", "agentId", "resolvedModel", "route", "workspace"]);
+const ROUTE_KEYS = new Set(["tier", "operatingPointId", "policyRevision", "workload"]);
+const WORKSPACE_KEYS = new Set(["resolvedCwd", "worktree"]);
+const RESOLVED_MODEL_KEYS = new Set(["available", "model", "reason", "catalogRevision"]);
+
+function validWorkload(value: unknown): value is WorkloadProfile {
+  if (!stateRecord(value)) return false;
+  const fields = Object.keys(WORKLOAD_MEMBERS) as (keyof WorkloadProfile)[];
+  return Object.keys(value).length === fields.length
+    && fields.every((field) => typeof value[field] === "string" && WORKLOAD_MEMBERS[field].has(value[field] as string));
+}
+
+function validRoute(value: unknown): value is HandoffRouteRecord {
+  return stateRecord(value)
+    && Object.keys(value).every((key) => ROUTE_KEYS.has(key))
+    && typeof value.tier === "string" && (QUALITY_TIERS as readonly string[]).includes(value.tier)
+    && nonempty(value.operatingPointId)
+    && nonempty(value.policyRevision)
+    && validWorkload(value.workload);
+}
+
+function validWorkspace(value: unknown): value is HandoffWorkspaceRecord {
+  return stateRecord(value)
+    && Object.keys(value).every((key) => WORKSPACE_KEYS.has(key))
+    && nonempty(value.resolvedCwd)
+    && (value.worktree === undefined || nonempty(value.worktree));
+}
+
+function validResolvedModel(value: unknown): boolean {
+  if (!stateRecord(value) || !Object.keys(value).every((key) => RESOLVED_MODEL_KEYS.has(key))) return false;
+  return value.available === true
+    ? nonempty(value.model)
+    : value.available === false && nonempty(value.reason) && (value.catalogRevision === undefined || nonempty(value.catalogRevision));
+}
+
+/**
+ * The child record is the identity a later recovery resolves; every persisted
+ * field is validated against its shape so a tampered or version-skewed record
+ * fails closed instead of being reinterpreted.
+ */
+function validChild(value: unknown): value is HandoffState["child"] {
+  return stateRecord(value)
+    && Object.keys(value).every((key) => CHILD_KEYS.has(key))
+    && nonempty(value.agentName) && nonempty(value.agentKind) && nonempty(value.operatingPointId) && nonempty(value.specLabel)
+    && Array.isArray(value.fallbackCandidates) && value.fallbackCandidates.every((entry) => typeof entry === "string")
+    && nullableString(value.paneId) && nullableString(value.terminalId) && nullableString(value.agentId)
+    && (value.resolvedModel === undefined || validResolvedModel(value.resolvedModel))
+    && (value.route === undefined || validRoute(value.route))
+    && (value.workspace === undefined || validWorkspace(value.workspace));
+}
+
 function parseHandoffState(content: string, run: HandoffAllocation): HandoffState {
   let value: unknown;
   try {
@@ -369,8 +555,11 @@ function parseHandoffState(content: string, run: HandoffAllocation): HandoffStat
     throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff state is malformed", { path: safePath(run.statePath) });
   }
   const state = value as HandoffState;
-  if (!stateRecord(state) || state.v !== 1 || state.runId !== run.runId
-    || !stateRecord(state.lifecycle) || !stateRecord(state.artifact) || !stateRecord(state.repair)) {
+  // v2 records only: a v1 sidecar predates recovery lineage and is never
+  // reinterpreted. The endpoint pin binds the record to this run's namespace.
+  if (!stateRecord(state) || state.v !== 2 || state.runId !== run.runId || state.endpoint !== run.endpoint
+    || !stateRecord(state.manager) || !stateRecord(state.lifecycle) || !stateRecord(state.artifact) || !stateRecord(state.repair)
+    || !validChild(state.child)) {
     throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff state is malformed", { path: safePath(run.statePath) });
   }
   return state;

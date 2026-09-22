@@ -7,25 +7,29 @@ import {
   type Questions,
 } from "@typesafe-ai/sdk";
 import { isAbsolute, relative } from "node:path";
-import type { Catalog, ChainCandidate, RunnerEntry, RunnerKind, RunnerPools } from "./catalog.js";
-import type { LaunchSpec } from "./launch-schema.js";
-import type {
-  AbstainReason,
-  Abstained,
-  CandidateJudgment,
-  SpecModelDecision,
+import type { Catalog, RunnerEntry, RunnerKind, RunnerPools } from "./catalog.js";
+import {
+  MODIFIER_THRESHOLD,
+  ROUTER_CONFIDENCE_THRESHOLD,
+  SEMANTIC_MODIFIERS,
+  WORKLOAD_INTENTS,
+  type AbstainReason,
+  type Abstained,
+  type RoutingTask,
+  type SemanticModifier,
+  type TaskModelDecision,
 } from "./router.js";
+import { QUALITY_TIERS, type WorkloadIntent, type WorkspaceState } from "./routing-policy.js";
 import type { AuthJsonCredentialStore } from "./supervision/auth-json-credential-store.js";
 import { createTypeSafeClient, resolveTypesafeApiKey } from "./typesafe-reviewer.js";
 
 const SPEC_MODEL = "jev-latest";
 const PROBABILITY_SUM_TOLERANCE = 1e-6;
 
-const QUALITY_INSTRUCTIONS = "instructions_adequate";
-const QUALITY_ASSIGNMENT = "assignment_verifiable";
-const CATEGORY_QUESTION = "category";
-const COMPOSITION_QUESTION = "missing_area";
+const QUALITY_DONE_WHEN = "done_when_verifiable";
+const INTENT_QUESTION = "intent";
 const RESOURCE_PREFIX = "resource_";
+const FITNESS_PREFIX = "fitness:";
 
 const POOL_FIELDS: readonly (keyof RunnerPools)[] = ["tools", "extensions", "skills", "plugins", "mcp"];
 type PoolField = (typeof POOL_FIELDS)[number];
@@ -38,12 +42,54 @@ const RESOURCE_NOUN: Record<PoolField, string> = {
   mcp: "MCP server",
 };
 
+const INTENT_DESCRIPTIONS: Record<string, string> = {
+  explore: "Understand, navigate, or answer questions about code or data without changing it.",
+  reason: "Analyze, design, plan, or evaluate options; judgment-heavy work that may not touch files.",
+  implement: "Write, modify, or refactor code or artifacts to achieve the objective.",
+  debug: "Diagnose and fix a concrete failure, defect, or unexpected behavior.",
+  verify: "Check that existing work meets its contract: run checks, review outputs, validate evidence.",
+  review: "Critique completed or in-flight work for correctness, quality, or adherence — not to implement it.",
+  coordinate: "Organize, delegate, or synchronize work across agents, tasks, or components.",
+};
+
+const MODIFIER_INSTRUCTIONS: Record<SemanticModifier, { question: string; yes: string; no: string }> = {
+  mutation_broad: {
+    question: "Does this Task require broad mutation — writes spanning many files or subsystems? Writes the Task delegates to child workers count as part of the Task.",
+    yes: "The Task's writes span many files or subsystems, including writes made through delegated children.",
+    no: "The Task's writes are bounded or absent.",
+  },
+  scope_repo_wide: {
+    question: "Does this Task span repo-wide semantic breadth — changes across independent subsystems or a global contract? Raw file count alone does not make scope repo-wide.",
+    yes: "The Task crosses independent subsystems or a global contract.",
+    no: "The Task stays within one subsystem or a local area.",
+  },
+  horizon_long: {
+    question: "Does this Task have a long horizon — for example four or more sequential delegated workers with gated handoffs, or multi-stage work whose later steps depend on earlier results — even within one subsystem?",
+    yes: "The Task is multi-stage or long-running in the sense described.",
+    no: "The Task completes in a short single stage.",
+  },
+  ambiguity_high: {
+    question: "Is this Task highly ambiguous — are the objective, the approach, or the done-when open to materially different reasonable interpretations?",
+    yes: "A competent agent could reasonably interpret the Task in materially different ways.",
+    no: "The Task pins down what to do and how to prove it.",
+  },
+};
+
+const TIER_DESCRIPTIONS: Record<string, string> = {
+  utility: "minimize cost and latency, accepting later recovery escalation",
+  economy: "optimize cost per successful completion",
+  standard: "optimize expected total cost per accepted result",
+  strong: "bias toward first-pass completion",
+  frontier: "strongly bias toward completion reliability",
+  max: "maximize success probability within reviewed limits",
+};
+
 /**
- * The client's outcome: either the normalized model response that `routeSpec`
- * consumes as `SpecRouteInput.response`, or a typed fail-closed abstention the
+ * The client's outcome: either the normalized model response that `routeTask`
+ * consumes as `TaskRouteInput.response`, or a typed fail-closed abstention the
  * caller may return verbatim — it is already a `SpecDecision` member.
  */
-export type SpecEvaluation = { kind: "response"; response: SpecModelDecision } | Abstained;
+export type TaskEvaluation = { kind: "response"; response: TaskModelDecision } | Abstained;
 
 export interface TypeSafeSpecOptions {
   /** Explicit key wins; otherwise `resolveTypesafeApiKey` (env → Pi auth store). */
@@ -53,11 +99,34 @@ export interface TypeSafeSpecOptions {
   credentials?: Pick<AuthJsonCredentialStore, "read">;
 }
 
-export interface SpecEvaluationInput {
-  spec: LaunchSpec;
+export interface TaskEvaluationInput {
+  task: RoutingTask;
   catalog: Catalog;
-  /** The caller's planned team — every spec in the request. Defaults to this spec alone. */
-  team?: readonly LaunchSpec[];
+  /** Runtime-owned workspace state; absent means clean. */
+  workspaceState?: WorkspaceState;
+}
+
+export interface ResourceQuestion {
+  id: string;
+  runner: RunnerKind;
+  field: keyof RunnerPools;
+  /** The exact pool entry; this is the key the normalized `resources` map carries. */
+  name: string;
+}
+
+export interface FitnessQuestion {
+  id: string;
+  /** The point's position in `catalog.points` — the key the normalized `fitness` map carries. */
+  index: number;
+  tier: (typeof QUALITY_TIERS)[number];
+}
+
+/** The outbound request projection, retained so the size measurer and the tests see exactly what ships. */
+export interface EvaluationRequest {
+  questions: Questions;
+  state: Record<string, unknown>;
+  resourceQuestions: readonly ResourceQuestion[];
+  fitnessQuestions: readonly FitnessQuestion[];
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -73,7 +142,7 @@ function isReadonlyMap<K, V>(value: unknown): value is ReadonlyMap<K, V> {
   return value instanceof Map;
 }
 
-function refuse(reason: AbstainReason, component?: string): SpecEvaluation {
+function refuse(reason: AbstainReason, component?: string): TaskEvaluation {
   return { kind: "abstained", reason, ...(component === undefined ? {} : { component }) };
 }
 
@@ -105,29 +174,16 @@ function parseChoiceAnswer(answer: unknown, candidates: readonly string[]): { ch
   return { choice: answer.choice, confidence: answer.confidence, probabilities };
 }
 
-/** The spec fields are schema-validated upstream; this guards the boundary against non-spec input. */
-function validSpec(spec: unknown): spec is LaunchSpec {
-  return record(spec)
-    && typeof spec.label === "string"
-    && typeof spec.instructions === "string"
-    && record(spec.assignment)
-    && typeof spec.assignment.objective === "string"
-    && typeof spec.assignment.scope === "string"
-    && typeof spec.assignment.verification === "string";
-}
-
-/** The spec's allowlisted semantic fields — shared by `state.spec` and each `state.team` member. */
-function specState(spec: LaunchSpec): Record<string, unknown> {
-  return {
-    label: spec.label,
-    instructions: spec.instructions,
-    assignment: {
-      objective: spec.assignment.objective,
-      scope: spec.assignment.scope,
-      verification: spec.assignment.verification,
-    },
-    ...(spec.category === undefined ? {} : { category: spec.category }),
-  };
+/** The Task fields are schema-validated upstream; this guards the boundary against non-Task input. */
+function validTask(task: unknown): task is RoutingTask {
+  return record(task)
+    && typeof task.objective === "string"
+    && typeof task.scope === "string"
+    && Array.isArray(task.doneWhen)
+    && task.doneWhen.every((entry) => typeof entry === "string")
+    && Array.isArray(task.constraints)
+    && task.constraints.every((entry) => typeof entry === "string")
+    && (task.tier === undefined || (typeof task.tier === "string" && (QUALITY_TIERS as readonly string[]).includes(task.tier)));
 }
 
 /** Pool entries are scope-resolved paths; the question text shows the scope-relative name. */
@@ -137,23 +193,119 @@ function displayResource(name: string, scopeRoot: string): string {
   return rel === "" || rel.startsWith("..") || isAbsolute(rel) ? name : rel;
 }
 
-interface ResourceQuestion {
-  id: string;
-  runner: RunnerKind;
-  field: PoolField;
-  /** The exact pool entry; this is the key the normalized `resources` map carries. */
-  name: string;
+/**
+ * The one `systemOne` request per Task (ADR-037): the done_when_verifiable
+ * quality gate, the intent Choice — the only confidence gate — the four
+ * one-sided positive modifier Nouls, runner-qualified resource Nouls deduped
+ * over the operating points' runners, and six speculative tier-fitness Nouls
+ * for every reviewed point. Fitness keys are index-qualified
+ * (`fitness:t{tier}:{index}`) because point ids contain colons; the ordered
+ * id list rides in `state.points`.
+ */
+export function buildEvaluationRequest(input: TaskEvaluationInput): EvaluationRequest | undefined {
+  const catalog = input.catalog;
+  if (!record(catalog) || !isReadonlyMap<RunnerKind, RunnerEntry>(catalog.runners)) return undefined;
+  const points = Array.isArray(catalog.points) ? catalog.points : [];
+
+  const questions: Questions = {
+    [QUALITY_DONE_WHEN]: noul(
+      "Does task.doneWhen contain concrete, falsifiable completion evidence relevant to the task's objective and scope — evidence a supervisor could check without re-doing the work?",
+      {
+        true: "doneWhen names concrete, falsifiable evidence (tests, outputs, diffs, artifacts) relevant to this objective and scope.",
+        false: "doneWhen is vague ('it works'), absent, irrelevant to the objective or scope, or requires re-doing the work to check.",
+      }
+    ),
+    [INTENT_QUESTION]: choice(
+      "Which workload intent best describes this Task? Judge the whole Task, including work it delegates to child workers.",
+      { ...INTENT_DESCRIPTIONS }
+    ),
+  };
+  for (const name of SEMANTIC_MODIFIERS) {
+    const modifier = MODIFIER_INSTRUCTIONS[name];
+    questions[name] = noul(modifier.question, { true: modifier.yes, false: modifier.no });
+  }
+
+  const scopeRoot = record(catalog.source) && typeof catalog.source.scopeRoot === "string" ? catalog.source.scopeRoot : "";
+
+  // Runner-qualified resource Nouls dedupe across points: the pools belong to
+  // the runner, so every point on one runner asks each resource once.
+  const resourceQuestions: ResourceQuestion[] = [];
+  const resources: Record<string, Record<string, string[]>> = {};
+  const pointRunners = new Set<RunnerKind>(points.map((point) => point.runner));
+  for (const runner of pointRunners) {
+    const entry = catalog.runners.get(runner);
+    if (entry === undefined) return undefined;
+    const fields: Record<string, string[]> = {};
+    for (const field of POOL_FIELDS) {
+      fields[field] = [];
+      entry.pools[field].forEach((name, index) => {
+        const id = `${RESOURCE_PREFIX}${runner}_${field}_${index}`;
+        const display = displayResource(name, scopeRoot);
+        const noun = RESOURCE_NOUN[field];
+        questions[id] = noul(
+          `Would an agent executing this Task on the ${runner} runner plausibly need the ${noun} "${display}" to complete the task within scope?`,
+          {
+            true: `The ${noun} "${display}" is necessary or materially useful for this Task on the ${runner} runner.`,
+            false: `The ${noun} "${display}" is unnecessary or out of scope for this Task on the ${runner} runner.`,
+          }
+        );
+        fields[field].push(display);
+        resourceQuestions.push({ id, runner, field, name });
+      });
+    }
+    resources[runner] = fields;
+  }
+
+  const fitnessQuestions: FitnessQuestion[] = [];
+  const pointStates = points.map((point, index) => ({
+    index,
+    id: point.id,
+    runner: point.runner,
+    model: point.model,
+    ...(point.reasoning === undefined ? {} : { reasoning: point.reasoning }),
+    provider: point.provider,
+    costClass: point.costClass,
+    latencyClass: point.latencyClass,
+  }));
+  for (const [index, point] of points.entries()) {
+    for (const [tierIndex, tier] of QUALITY_TIERS.entries()) {
+      const id = `${FITNESS_PREFIX}t${tierIndex}:${index}`;
+      questions[id] = noul(
+        `Rate the fitness of operating point "${point.id}" for this Task under the "${tier}" quality tier (${TIER_DESCRIPTIONS[tier]}). Fitness is the point's expected success on this exact Task within that tier's reviewed cost and latency envelope.`,
+        {
+          true: `"${point.id}" is a strong fit for this Task at the ${tier} tier.`,
+          false: `"${point.id}" is a poor fit for this Task at the ${tier} tier.`,
+        }
+      );
+      fitnessQuestions.push({ id, index, tier });
+    }
+  }
+
+  const state = {
+    task: {
+      objective: input.task.objective,
+      scope: input.task.scope,
+      doneWhen: [...input.task.doneWhen],
+      constraints: [...input.task.constraints],
+      ...(input.task.tier === undefined ? {} : { tier: input.task.tier }),
+    },
+    workspaceState: input.workspaceState ?? "clean",
+    points: pointStates,
+    resources,
+  };
+  return { questions, state, resourceQuestions, fitnessQuestions };
+}
+
+/** The outbound request's size: the question count plus the serialized `{state, questions}` byte length. */
+export function specRequestSize(request: Pick<EvaluationRequest, "questions" | "state">): { questions: number; bytes: number } {
+  return { questions: Object.keys(request.questions).length, bytes: Buffer.byteLength(JSON.stringify({ state: request.state, questions: request.questions }), "utf8") };
 }
 
 /**
- * The Jev spec client (ADR-035): exactly one `systemOne` request per spec
- * carrying the probe-2b quality gate, the category confirm/override choice, the
- * B13 `missing_area` composition advisory over the planned team, and
- * runner-qualified per-resource nouls covering every chain candidate — the
- * pools are per-runner, so one answer serves every candidate on that runner and
- * a category override or chain fallback never needs a second call. No retries,
- * logging, repair calls, or model listing. Outcomes carry reason codes and a
- * bounded HTTP status only — never API messages, bodies, or credentials.
+ * The Jev spec client (ADR-037): exactly one `systemOne` request per Task. No
+ * retries, logging, repair calls, or model listing. Outcomes carry reason
+ * codes and a bounded HTTP status only — never API messages, bodies, or
+ * credentials.
  */
 export class TypeSafeSpecClient {
   private readonly options: TypeSafeSpecOptions;
@@ -162,96 +314,13 @@ export class TypeSafeSpecClient {
     this.options = options;
   }
 
-  async evaluate(input: SpecEvaluationInput, signal: AbortSignal): Promise<SpecEvaluation> {
+  async evaluate(input: TaskEvaluationInput, signal: AbortSignal): Promise<TaskEvaluation> {
     if (signal.aborted) return refuse("aborted");
-    if (!validSpec(input.spec)) return refuse("invalid_response", "spec");
-    const team: readonly LaunchSpec[] = input.team === undefined ? [input.spec] : input.team;
-    if (!Array.isArray(team) || team.length === 0 || !team.every(validSpec)) return refuse("invalid_response", "team");
-    const categories: unknown = record(input.catalog) ? input.catalog.categories : undefined;
-    const runners: unknown = record(input.catalog) ? input.catalog.runners : undefined;
-    if (!isReadonlyMap<string, readonly ChainCandidate[]>(categories) || categories.size === 0 || !isReadonlyMap<RunnerKind, RunnerEntry>(runners)) {
-      return refuse("catalog_unavailable", "catalog");
-    }
-    const catalog = input.catalog;
+    if (!validTask(input.task)) return refuse("invalid_response", "task");
+    const built = buildEvaluationRequest(input);
+    if (built === undefined) return refuse("catalog_unavailable", "catalog");
     const apiKey = this.options.apiKey ?? await resolveTypesafeApiKey(this.options.credentials);
     if (apiKey === undefined || apiKey.length === 0) return refuse("authentication_unavailable", "api_key");
-
-    const questions: Questions = {
-      [QUALITY_INSTRUCTIONS]: noul(
-        "Are these instructions sufficient for a competent agent to begin this work correctly? Detailed methodology may arrive via separately selected skills — judge only whether the instructions state the agent's job and conduct clearly enough to start.",
-        {
-          true: "The instructions state the job and expected conduct clearly enough to begin correctly.",
-          false: "The instructions are too vague or missing for the agent to know what job it has or how to behave.",
-        }
-      ),
-      [QUALITY_ASSIGNMENT]: noul(
-        "Does assignment.verification name concrete, checkable evidence a supervisor could verify without re-doing the work?",
-        {
-          true: "Verification specifies concrete, falsifiable evidence (tests, outputs, diffs, artifacts).",
-          false: "Verification is vague ('it works'), absent, or requires re-doing the work to check.",
-        }
-      ),
-      [CATEGORY_QUESTION]: choice(
-        input.spec.category === undefined
-          ? "Which catalog category best fits this spec's label, instructions, and assignment? Each option lists that category's ordered chain of runner/model candidates; the first eligible candidate is used."
-          : `The caller proposed the "${input.spec.category}" category. Which catalog category best fits this spec's label, instructions, and assignment? Confirm the proposed category, or override it only when another category is a clearly better fit. Each option lists that category's ordered chain of runner/model candidates; the first eligible candidate is used.`,
-        Object.fromEntries(
-          [...categories.entries()].map(([name, chain]) => [
-            name,
-            {
-              chain: chain.map((candidate) => {
-                const entry: Record<string, string> = { runner: candidate.runner, model: candidate.model };
-                if (candidate.account !== undefined) entry.account = candidate.account;
-                return entry;
-              }),
-            },
-          ])
-        )
-      ),
-      // B13 composition advisory — never a gate: the answer feeds an advisory
-      // field on the decision, so a missing or malformed answer degrades to
-      // "no advisory" instead of an abstention.
-      [COMPOSITION_QUESTION]: noul(
-        "Is the planned team in `team` missing a distinct contribution — work the specs' assignments call for but no listed spec provides?",
-        {
-          true: "A distinct contribution is missing — e.g., independent verification of a member's own work, research before implementation, or coordination across members.",
-          false: "The listed specs cover their assignments; another member would duplicate, not complement.",
-        }
-      ),
-    };
-
-    // Runner-qualified nouls dedupe across candidates: the pools belong to the
-    // runner, so a chain listing the same runner twice (or two categories
-    // sharing one) asks each resource once.
-    const resourceQuestions: ResourceQuestion[] = [];
-    const chainRunners = new Set<RunnerKind>();
-    for (const chain of categories.values()) for (const candidate of chain) chainRunners.add(candidate.runner);
-    const scopeRoot = record(catalog.source) && typeof catalog.source.scopeRoot === "string" ? catalog.source.scopeRoot : "";
-    for (const runner of chainRunners) {
-      const entry = runners.get(runner);
-      if (entry === undefined) return refuse("catalog_unavailable", "catalog");
-      for (const field of POOL_FIELDS) {
-        entry.pools[field].forEach((name, index) => {
-          const id = `${RESOURCE_PREFIX}${runner}_${field}_${index}`;
-          const display = displayResource(name, scopeRoot);
-          const noun = RESOURCE_NOUN[field];
-          questions[id] = noul(
-            `Would an agent executing this spec on the ${runner} runner plausibly need the ${noun} "${display}" to complete the assignment within scope?`,
-            {
-              true: `The ${noun} "${display}" is necessary or materially useful for this spec on the ${runner} runner.`,
-              false: `The ${noun} "${display}" is unnecessary or out of scope for this spec on the ${runner} runner.`,
-            }
-          );
-          resourceQuestions.push({ id, runner, field, name });
-        });
-      }
-    }
-
-    const spec = input.spec;
-    const outbound = {
-      spec: specState(spec),
-      team: team.map(specState),
-    };
 
     let response: unknown;
     try {
@@ -260,12 +329,12 @@ export class TypeSafeSpecClient {
         defaultModel: SPEC_MODEL,
         ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
       });
-      response = await client.systemOne({ state: outbound as EntryType, questions }, { signal });
+      response = await client.systemOne({ state: built.state as EntryType, questions: built.questions }, { signal });
     } catch (error) {
       if (signal.aborted) return refuse("aborted");
       return refuse("transport_failed", error instanceof APIError ? `http_${error.status}` : "transport");
     }
-    const evaluated = this.normalize(response, categories, resourceQuestions, team.map((member) => member.label));
+    const evaluated = this.normalize(response, built.resourceQuestions, built.fitnessQuestions);
     if (evaluated.kind === "response" && signal.aborted) return refuse("aborted");
     return evaluated;
   }
@@ -274,47 +343,49 @@ export class TypeSafeSpecClient {
    * Boundary validation of the wire response: the SDK's generic answer types
    * are not trusted. Every sent question must answer with its own type; an
    * answer that fails validation abstains `invalid_response` naming the
-   * question id, never silently accepted. The `missing_area` advisory is the
-   * deliberate exception — it is not a gate, so its answer degrades to no
-   * advisory rather than an abstention.
+   * question id, never silently accepted.
    */
-  private normalize(body: unknown, categories: ReadonlyMap<string, readonly ChainCandidate[]>, resourceQuestions: readonly ResourceQuestion[], assessed: readonly string[]): SpecEvaluation {
+  private normalize(body: unknown, resourceQuestions: readonly ResourceQuestion[], fitnessQuestions: readonly FitnessQuestion[]): TaskEvaluation {
     if (!record(body) || !record(body.answers)) return refuse("invalid_response", "response");
     const answers = body.answers;
-    const instructions = parseNoulAnswer(answers[QUALITY_INSTRUCTIONS]);
-    if (instructions === undefined) return refuse("invalid_response", QUALITY_INSTRUCTIONS);
-    const assignment = parseNoulAnswer(answers[QUALITY_ASSIGNMENT]);
-    if (assignment === undefined) return refuse("invalid_response", QUALITY_ASSIGNMENT);
-    const categoryNames = [...categories.keys()];
-    const picked = parseChoiceAnswer(answers[CATEGORY_QUESTION], categoryNames);
-    if (picked === undefined) return refuse("invalid_response", CATEGORY_QUESTION);
+    const doneWhen = parseNoulAnswer(answers[QUALITY_DONE_WHEN]);
+    if (doneWhen === undefined) return refuse("invalid_response", QUALITY_DONE_WHEN);
+    const picked = parseChoiceAnswer(answers[INTENT_QUESTION], WORKLOAD_INTENTS);
+    if (picked === undefined) return refuse("invalid_response", INTENT_QUESTION);
 
-    const resourcesByRunner = new Map<RunnerKind, Record<string, Record<string, number>>>();
+    const modifiers: TaskModelDecision["modifiers"] = {};
+    for (const name of SEMANTIC_MODIFIERS) {
+      const value = parseNoulAnswer(answers[name]);
+      if (value === undefined) return refuse("invalid_response", name);
+      modifiers[name] = { probability: value, applied: value >= MODIFIER_THRESHOLD, confidence: Math.max(value, 1 - value) };
+    }
+
+    const resourcesByRunner: Record<string, Record<string, Record<string, number>>> = {};
     for (const question of resourceQuestions) {
       const value = parseNoulAnswer(answers[question.id]);
       if (value === undefined) return refuse("invalid_response", question.id);
-      let fields = resourcesByRunner.get(question.runner);
-      if (fields === undefined) resourcesByRunner.set(question.runner, fields = {});
-      (fields[question.field] ??= {})[question.name] = value;
+      const fields = (resourcesByRunner[question.runner] ??= {});
+      ((fields[question.field] ??= {}))[question.name] = value;
     }
 
-    const chain = categories.get(picked.choice)!;
-    const candidates: CandidateJudgment[] = chain.map((candidate, index) => ({
-      index,
-      runner: candidate.runner,
-      model: candidate.model,
-      resources: resourcesByRunner.get(candidate.runner) ?? {},
-    }));
-    // Advisory only: an unparseable `missing_area` omits `composition` — the
-    // evaluation never abstains on it, so it can never gate a launch.
-    const missingArea = parseNoulAnswer(answers[COMPOSITION_QUESTION]);
+    const fitness: Record<string, Record<string, number>> = {};
+    for (const question of fitnessQuestions) {
+      const value = parseNoulAnswer(answers[question.id]);
+      if (value === undefined) return refuse("invalid_response", question.id);
+      ((fitness[String(question.index)] ??= {}))[question.tier] = value;
+    }
+
     return {
       kind: "response",
       response: {
-        quality: { instructions_adequate: instructions, assignment_verifiable: assignment },
-        category: { category: picked.choice, confidence: picked.confidence, probabilities: picked.probabilities },
-        candidates,
-        ...(missingArea === undefined ? {} : { composition: { missing_area: missingArea, assessed: [...assessed] } }),
+        quality: { done_when_verifiable: doneWhen },
+        intent: { value: picked.choice as WorkloadIntent, confidence: picked.confidence, probabilities: picked.probabilities },
+        modifiers,
+        resources: resourcesByRunner,
+        fitness,
+        // Intent is the only confidence gate; modifiers never abstain, so the
+        // only possible uncertain dimension is the intent itself.
+        uncertainDimensions: picked.confidence < ROUTER_CONFIDENCE_THRESHOLD ? ["intent"] : [],
       },
     };
   }

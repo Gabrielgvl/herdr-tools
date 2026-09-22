@@ -1,6 +1,6 @@
 /**
  * The ADR-035 decision log. Inputs are reduced to a fixed, typed record before
- * modelSafeJson runs: caller/bypass identity, the decision kind, quality,
+ * modelSafeJson runs: caller/binding identity, the decision kind, quality,
  * bounded evidence, and the compiled contract's reviewed fields only.
  */
 
@@ -9,19 +9,20 @@ import { constants } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { acquireFlockHolder, assertOwnerOnlyDirectory } from "./pane-write-lock.js";
+import { CLAUDE_EFFORTS, THINKING_LEVELS, type ClaudeEffort, type ThinkingLevel } from "./profiles/types.js";
 import { modelSafeJson } from "./redaction.js";
 import type {
-  Abstain,
   Abstained,
   Admitted,
   RouterBinding,
   RouterEvidence,
-  RouterResult,
-  RouterState,
-  RouteDecision,
   Rejected,
-  SpecDecision
+  SelectedPoint,
+  SpecDecision,
+  TaskRouterState
 } from "./router.js";
+import { SEMANTIC_MODIFIERS, WORKLOAD_INTENTS } from "./router.js";
+import { QUALITY_TIERS } from "./routing-policy.js";
 
 export class RouterLogError extends Error {
   readonly code = "ROUTER_LOG_UNAVAILABLE";
@@ -39,6 +40,7 @@ const ROUTER_LOG_READY = "HERDR_ROUTER_LOG_LOCK_READY";
 const REASONS = new Set([
   "low_confidence",
   "no_assignments",
+  "no_candidates_at_tier",
   "catalog_unavailable",
   "invalid_response",
   "authentication_unavailable",
@@ -48,6 +50,20 @@ const REASONS = new Set([
 const QUALITY = new Set(["not_rejected", "not_evaluated", "rejected"]);
 const AVAILABILITY = new Set(["known-exhausted", "degraded", "unknown", "local-capacity-limited"]);
 const RUNNERS = new Set(["pi", "claude", "agy", "devin"]);
+const TIERS = new Set<string>(QUALITY_TIERS);
+const INTENTS = new Set<string>(WORKLOAD_INTENTS);
+const MODIFIERS = new Set<string>(SEMANTIC_MODIFIERS);
+const REASONING = new Set<string>([...THINKING_LEVELS, ...CLAUDE_EFFORTS]);
+const WORKLOAD_FIELDS = {
+  intent: INTENTS,
+  mutation: new Set(["none", "bounded", "broad"]),
+  scope: new Set(["local", "multi_file", "repo_wide"]),
+  horizon: new Set(["short", "medium", "long"]),
+  verifiability: new Set(["strong", "partial", "weak"]),
+  workspaceState: new Set(["clean", "partial", "failed"]),
+  ambiguity: new Set(["low", "medium", "high"])
+} as const;
+const CHAIN_EXCLUSION_REASONS = new Set(["cost_class_exceeded", "latency_class_exceeded", "attempt_bound", "unavailable", "required_resource", "recovery_excluded"]);
 const POOL_FIELDS = ["tools", "extensions", "skills", "plugins", "mcp"] as const;
 const PROBABILITY_SUM_TOLERANCE = 1e-6;
 
@@ -56,40 +72,35 @@ export interface UnavailableRouterState {
   reason: "catalog_unavailable";
 }
 
-/** The pre-cutover shape stays assignable to B8 while the new overload is added below. */
-export interface RouterLogEntry {
-  name: string;
-  state: RouterState | UnavailableRouterState;
-  probabilities: unknown;
-  result: RouterResult;
-  caller?: string;
-  binding?: RouterBinding;
-  specRevision?: string;
-  policyRevision?: string;
-  launchIdentity?: string;
-  evidence?: RouterEvidence;
-}
-
 /** ADR-035 record input; no model text or raw response is accepted. */
 export interface SpecRouterLogEntry {
   caller: string;
   result: SpecDecision;
   binding?: RouterBinding;
   evidence?: RouterEvidence;
-  name?: string;
   specRevision?: string;
   policyRevision?: string;
   launchIdentity?: string;
-  state?: RouterState | UnavailableRouterState;
+  /** The catalog content digest the decision was routed against. */
+  catalogRevision?: string;
+  /** Recovery lineage: the managed handoff run this route recovers. */
+  recoveryOf?: string;
+  /** Recovery lineage: the failed operating point the chain excludes. */
+  priorOperatingPointId?: string;
+  state?: TaskRouterState | UnavailableRouterState;
   probabilities?: unknown;
 }
 
 export interface RouterLogRecord {
   timestamp: string;
-  /** Caller alias retained for the B8 reader; it equals `caller`. */
+  /** Caller alias; it equals `caller`. */
   name: string;
   caller: string;
   binding: RouterBinding | null;
+  catalogRevision: string | null;
+  /** Recovery lineage pair — both null on ordinary routes, both set on recovery. */
+  recoveryOf: string | null;
+  priorOperatingPointId: string | null;
   stateDigest: string | null;
   stateUnavailable: { reason: "catalog_unavailable" } | null;
   probabilities: Record<string, unknown>;
@@ -98,19 +109,21 @@ export interface RouterLogRecord {
 }
 
 export type LoggedRouterResult =
-  | Pick<Admitted, "kind" | "quality" | "category" | "count" | "configuration" | "evidence">
+  | Pick<Admitted, "kind" | "quality" | "count" | "requestedTier" | "workloadFloor" | "effectiveStartTier" | "effectiveCeiling" | "chain" | "selectedPoint" | "configuration" | "evidence">
   | Pick<Rejected, "kind" | "quality" | "reason" | "evidence">
-  | Pick<Abstained, "kind" | "reason" | "component" | "evidence">
-  | RouteDecision
-  | Abstain;
+  | Pick<Abstained, "kind" | "reason" | "component" | "evidence">;
 
 export interface LoggedEvidence {
   quality?: RouterEvidence["quality"];
-  category?: RouterEvidence["category"];
-  selectedCandidate?: RouterEvidence["selectedCandidate"];
+  policyRevision?: string;
+  intent?: RouterEvidence["intent"];
+  modifiers?: RouterEvidence["modifiers"];
+  workload?: RouterEvidence["workload"];
+  fitness?: RouterEvidence["fitness"];
+  chainExclusions?: RouterEvidence["chainExclusions"];
+  selectedPoint?: RouterEvidence["selectedPoint"];
   availability?: RouterEvidence["availability"];
   exclusions?: RouterEvidence["exclusions"];
-  bypass?: RouterEvidence["bypass"];
 }
 
 export interface AppendRouterLogOptions {
@@ -182,69 +195,104 @@ function projectSpecProbabilities(value: unknown): Record<string, unknown> {
   if (!record(value)) throw routerLogFailure("Router decision probabilities are untrusted");
   const out: Record<string, unknown> = {};
   if (value.quality !== undefined) {
-    if (!record(value.quality) || !probability(value.quality.instructions_adequate) || !probability(value.quality.assignment_verifiable)) {
+    if (!record(value.quality) || !probability(value.quality.done_when_verifiable)) {
       throw routerLogFailure("Router decision probabilities are untrusted");
     }
-    out.quality = { instructions_adequate: value.quality.instructions_adequate, assignment_verifiable: value.quality.assignment_verifiable };
+    out.quality = { done_when_verifiable: value.quality.done_when_verifiable };
   }
-  if (value.category !== undefined) {
-    if (!record(value.category) || !bounded(value.category.category) || !probability(value.category.confidence)) {
+  if (value.intent !== undefined) {
+    if (!record(value.intent) || !INTENTS.has(value.intent.value as string) || !probability(value.intent.confidence)) {
       throw routerLogFailure("Router decision probabilities are untrusted");
     }
-    out.category = {
-      category: value.category.category,
-      confidence: value.category.confidence,
-      ...(value.category.probabilities === undefined ? {} : { probabilities: distribution(value.category.probabilities) })
+    out.intent = {
+      value: value.intent.value,
+      confidence: value.intent.confidence,
+      ...(value.intent.probabilities === undefined ? {} : { probabilities: distribution(value.intent.probabilities) })
     };
   }
-  if (value.candidates !== undefined) {
-    if (!Array.isArray(value.candidates)) throw routerLogFailure("Router decision probabilities are untrusted");
-    out.candidates = value.candidates.map((candidate) => {
-      if (!record(candidate) || !Number.isInteger(candidate.index) || !RUNNERS.has(candidate.runner as string) || !bounded(candidate.model) || !record(candidate.resources)) {
+  if (value.modifiers !== undefined) {
+    if (!record(value.modifiers)) throw routerLogFailure("Router decision probabilities are untrusted");
+    const modifiers: Record<string, unknown> = {};
+    for (const [name, entry] of Object.entries(value.modifiers)) {
+      if (!MODIFIERS.has(name) || !record(entry) || !probability(entry.probability) || typeof entry.applied !== "boolean" || !probability(entry.confidence)) {
         throw routerLogFailure("Router decision probabilities are untrusted");
       }
-      const resources: Record<string, Record<string, number>> = {};
-      for (const field of POOL_FIELDS) {
-        if (candidate.resources[field] !== undefined) resources[field] = probabilityRecord(candidate.resources[field]);
-      }
-      return { index: candidate.index, runner: candidate.runner, model: candidate.model, resources };
-    });
+      modifiers[name] = { probability: entry.probability, applied: entry.applied, confidence: entry.confidence };
+    }
+    out.modifiers = modifiers;
   }
-  if (value.composition !== undefined) {
-    if (!record(value.composition) || !probability(value.composition.missing_area)) throw routerLogFailure("Router decision probabilities are untrusted");
-    out.composition = { missing_area: value.composition.missing_area };
+  if (value.resources !== undefined) {
+    if (!record(value.resources)) throw routerLogFailure("Router decision probabilities are untrusted");
+    const resources: Record<string, Record<string, Record<string, number>>> = {};
+    for (const [runner, fields] of Object.entries(value.resources)) {
+      if (!RUNNERS.has(runner) || !record(fields)) throw routerLogFailure("Router decision probabilities are untrusted");
+      const projected: Record<string, Record<string, number>> = {};
+      for (const [field, names] of Object.entries(fields)) {
+        if (!(POOL_FIELDS as readonly string[]).includes(field)) throw routerLogFailure("Router decision probabilities are untrusted");
+        projected[field] = probabilityRecord(names);
+      }
+      resources[runner] = projected;
+    }
+    out.resources = resources;
+  }
+  if (value.fitness !== undefined) {
+    if (!record(value.fitness)) throw routerLogFailure("Router decision probabilities are untrusted");
+    const fitness: Record<string, Record<string, number>> = {};
+    for (const [index, tiers] of Object.entries(value.fitness)) {
+      if (!bounded(index) || !/^\d+$/.test(index) || !record(tiers)) throw routerLogFailure("Router decision probabilities are untrusted");
+      const byTier: Record<string, number> = {};
+      for (const [tier, entry] of Object.entries(tiers)) {
+        if (!TIERS.has(tier) || !probability(entry)) throw routerLogFailure("Router decision probabilities are untrusted");
+        byTier[tier] = entry;
+      }
+      fitness[index] = byTier;
+    }
+    out.fitness = fitness;
+  }
+  if (value.uncertainDimensions !== undefined) {
+    if (!Array.isArray(value.uncertainDimensions) || !value.uncertainDimensions.every((entry) => bounded(entry))) {
+      throw routerLogFailure("Router decision probabilities are untrusted");
+    }
+    out.uncertainDimensions = [...value.uncertainDimensions];
   }
   return out;
 }
 
-function stateForJev(state: RouterState): unknown {
+function stateForTask(state: TaskRouterState): unknown {
   return {
-    assignment: {
-      objective: state.assignment.objective,
-      scope: state.assignment.scope,
-      verification: state.assignment.verification
+    task: {
+      objective: state.task.objective,
+      scope: state.task.scope,
+      doneWhen: [...state.task.doneWhen],
+      constraints: [...state.task.constraints],
+      ...(state.task.tier === undefined ? {} : { tier: state.task.tier })
     },
-    catalog: state.catalog.map(({ name, description, runner, model, timeout }) => ({ name, description, runner, model, timeout }))
+    points: state.points.map((point) => ({
+      id: point.id,
+      runner: point.runner,
+      model: point.model,
+      ...(point.reasoning === undefined ? {} : { reasoning: point.reasoning }),
+      provider: point.provider,
+      timeout: point.timeout
+    }))
   };
 }
 
-export function routerStateDigest(state: RouterState): string {
-  return createHash("sha256").update(JSON.stringify(stateForJev(state))).digest("hex");
+export function routerStateDigest(state: TaskRouterState): string {
+  return createHash("sha256").update(JSON.stringify(stateForTask(state))).digest("hex");
 }
 
-function isUnavailableMarker(state: RouterState | UnavailableRouterState): state is UnavailableRouterState {
-  return record(state) && state.status === "unavailable" && state.reason === "catalog_unavailable" && !("assignment" in state) && !("catalog" in state);
+function isUnavailableMarker(state: TaskRouterState | UnavailableRouterState): state is UnavailableRouterState {
+  return record(state) && state.status === "unavailable" && state.reason === "catalog_unavailable" && !("assignment" in state) && !("catalog" in state) && !("task" in state);
 }
 
-function validateState(state: RouterState | UnavailableRouterState): void {
+function validateState(state: TaskRouterState | UnavailableRouterState): void {
   if (isUnavailableMarker(state)) return;
-  if (!record(state) || !record(state.assignment) || !Array.isArray(state.catalog)) throw routerLogFailure("Router decision state is malformed");
-  for (const entry of state.catalog) if (!record(entry) || !bounded(entry.name)) throw routerLogFailure("Router decision state is malformed");
+  if (!record(state) || !record(state.task) || !Array.isArray(state.points)) throw routerLogFailure("Router decision state is malformed");
+  for (const entry of state.points) if (!record(entry) || !bounded(entry.id)) throw routerLogFailure("Router decision state is malformed");
 }
 
-type AnyRouterLogEntry = RouterLogEntry | SpecRouterLogEntry;
-
-function bindingFromEntry(entry: AnyRouterLogEntry, caller: string): RouterBinding | null {
+function bindingFromEntry(entry: SpecRouterLogEntry, caller: string): RouterBinding | null {
   if (entry.binding !== undefined) {
     if (!record(entry.binding) || !bounded(entry.binding.caller) || !bounded(entry.binding.specRevision) || !bounded(entry.binding.policyRevision) || !bounded(entry.binding.launchIdentity)) {
       throw routerLogFailure("Router decision binding is untrusted");
@@ -267,6 +315,20 @@ function stringArray(value: unknown): string[] {
   return [...value];
 }
 
+function projectSelectedPoint(value: unknown): SelectedPoint {
+  if (!record(value) || !Number.isInteger(value.index) || !bounded(value.id) || !RUNNERS.has(value.runner as string) || !bounded(value.model)) {
+    throw routerLogFailure("Router decision evidence is untrusted");
+  }
+  if (value.reasoning !== undefined && !REASONING.has(value.reasoning as string)) throw routerLogFailure("Router decision evidence is untrusted");
+  return {
+    index: value.index as number,
+    id: value.id as string,
+    runner: value.runner as SelectedPoint["runner"],
+    model: value.model as string,
+    ...(value.reasoning === undefined ? {} : { reasoning: value.reasoning as SelectedPoint["reasoning"] })
+  };
+}
+
 function projectEvidence(value: unknown): LoggedEvidence {
   if (value === undefined) return {};
   if (!record(value)) throw routerLogFailure("Router decision evidence is untrusted");
@@ -274,31 +336,67 @@ function projectEvidence(value: unknown): LoggedEvidence {
   if (value.quality !== undefined) {
     if (!record(value.quality) || typeof value.quality.outcome !== "string" || !QUALITY.has(value.quality.outcome)) throw routerLogFailure("Router decision evidence is untrusted");
     const quality: NonNullable<LoggedEvidence["quality"]> = { outcome: value.quality.outcome as "not_rejected" | "not_evaluated" | "rejected" };
-    if (value.quality.instructions_adequate !== undefined) {
-      if (!probability(value.quality.instructions_adequate)) throw routerLogFailure("Router decision evidence is untrusted");
-      quality.instructions_adequate = value.quality.instructions_adequate;
-    }
-    if (value.quality.assignment_verifiable !== undefined) {
-      if (!probability(value.quality.assignment_verifiable)) throw routerLogFailure("Router decision evidence is untrusted");
-      quality.assignment_verifiable = value.quality.assignment_verifiable;
+    if (value.quality.done_when_verifiable !== undefined) {
+      if (!probability(value.quality.done_when_verifiable)) throw routerLogFailure("Router decision evidence is untrusted");
+      quality.done_when_verifiable = value.quality.done_when_verifiable;
     }
     out.quality = quality;
   }
-  if (value.category !== undefined) {
-    if (!record(value.category) || !bounded(value.category.name) || !probability(value.category.confidence)) throw routerLogFailure("Router decision evidence is untrusted");
-    out.category = { name: value.category.name, confidence: value.category.confidence };
+  if (value.policyRevision !== undefined) {
+    if (!bounded(value.policyRevision)) throw routerLogFailure("Router decision evidence is untrusted");
+    out.policyRevision = value.policyRevision;
   }
-  if (value.selectedCandidate !== undefined) {
-    if (!record(value.selectedCandidate) || !Number.isInteger(value.selectedCandidate.index) || !RUNNERS.has(value.selectedCandidate.runner as string) || !bounded(value.selectedCandidate.model)) throw routerLogFailure("Router decision evidence is untrusted");
-    out.selectedCandidate = { index: value.selectedCandidate.index as number, runner: value.selectedCandidate.runner as "pi" | "claude" | "agy" | "devin", model: value.selectedCandidate.model as string };
+  if (value.intent !== undefined) {
+    if (!record(value.intent) || !INTENTS.has(value.intent.value as string) || !probability(value.intent.confidence)) throw routerLogFailure("Router decision evidence is untrusted");
+    out.intent = {
+      value: value.intent.value as NonNullable<RouterEvidence["intent"]>["value"],
+      confidence: value.intent.confidence,
+      ...(value.intent.probabilities === undefined ? {} : { probabilities: distribution(value.intent.probabilities) })
+    };
+  }
+  if (value.modifiers !== undefined) {
+    if (!record(value.modifiers)) throw routerLogFailure("Router decision evidence is untrusted");
+    const modifiers: NonNullable<LoggedEvidence["modifiers"]> = {};
+    for (const [name, entry] of Object.entries(value.modifiers)) {
+      if (!MODIFIERS.has(name) || !record(entry) || !probability(entry.probability) || typeof entry.applied !== "boolean" || !probability(entry.confidence)) {
+        throw routerLogFailure("Router decision evidence is untrusted");
+      }
+      modifiers[name as keyof typeof modifiers] = { probability: entry.probability, applied: entry.applied, confidence: entry.confidence };
+    }
+    out.modifiers = modifiers;
+  }
+  if (value.workload !== undefined) {
+    if (!record(value.workload)) throw routerLogFailure("Router decision evidence is untrusted");
+    const workload: Record<string, string> = {};
+    for (const [field, members] of Object.entries(WORKLOAD_FIELDS)) {
+      const entry = value.workload[field];
+      if (typeof entry !== "string" || !members.has(entry)) throw routerLogFailure("Router decision evidence is untrusted");
+      workload[field] = entry;
+    }
+    out.workload = workload as unknown as NonNullable<RouterEvidence["workload"]>;
+  }
+  if (value.fitness !== undefined) {
+    out.fitness = probabilityRecord(value.fitness);
+  }
+  if (value.chainExclusions !== undefined) {
+    if (!Array.isArray(value.chainExclusions)) throw routerLogFailure("Router decision evidence is untrusted");
+    out.chainExclusions = value.chainExclusions.map((item) => {
+      if (!record(item) || !bounded(item.id) || !bounded(item.provider) || !Array.isArray(item.reasons) || item.reasons.length === 0 || !item.reasons.every((reason: unknown) => typeof reason === "string" && CHAIN_EXCLUSION_REASONS.has(reason))) {
+        throw routerLogFailure("Router decision evidence is untrusted");
+      }
+      return { id: item.id, provider: item.provider, reasons: [...item.reasons] as NonNullable<RouterEvidence["chainExclusions"]>[number]["reasons"] };
+    });
+  }
+  if (value.selectedPoint !== undefined) {
+    out.selectedPoint = projectSelectedPoint(value.selectedPoint);
   }
   if (value.availability !== undefined) {
     if (!Array.isArray(value.availability)) throw routerLogFailure("Router decision evidence is untrusted");
     out.availability = value.availability.map((item) => {
-      if (!record(item) || !Number.isInteger(item.index) || typeof item.status !== "string" || !AVAILABILITY.has(item.status) || (item.retryNotBefore !== null && !bounded(item.retryNotBefore))) {
+      if (!record(item) || !bounded(item.id) || typeof item.status !== "string" || !AVAILABILITY.has(item.status) || (item.retryNotBefore !== null && !bounded(item.retryNotBefore))) {
         throw routerLogFailure("Router decision evidence is untrusted");
       }
-      return { index: item.index as number, status: item.status as NonNullable<RouterEvidence["availability"]>[number]["status"], retryNotBefore: item.retryNotBefore as string | null };
+      return { id: item.id as string, status: item.status as NonNullable<RouterEvidence["availability"]>[number]["status"], retryNotBefore: item.retryNotBefore as string | null };
     });
   }
   if (value.exclusions !== undefined) {
@@ -309,10 +407,6 @@ function projectEvidence(value: unknown): LoggedEvidence {
       }
       return { field: item.field as (typeof POOL_FIELDS)[number], name: item.name, noul: item.noul };
     });
-  }
-  if (value.bypass !== undefined) {
-    if (!record(value.bypass) || (value.bypass.label !== "transport-abstain" && value.bypass.label !== "abstain") || typeof value.bypass.quality !== "string" || !QUALITY.has(value.bypass.quality)) throw routerLogFailure("Router decision evidence is untrusted");
-    out.bypass = { label: value.bypass.label, quality: value.bypass.quality as "not_rejected" | "not_evaluated" | "rejected" };
   }
   return out;
 }
@@ -344,16 +438,17 @@ function projectResources(value: unknown): unknown {
 }
 
 function projectConfiguration(value: unknown): Admitted["configuration"] {
-  if (!record(value) || !bounded(value.specLabel) || !record(value.candidate) || !Number.isInteger(value.candidate.index) || !RUNNERS.has(value.candidate.runner as string) || !bounded(value.candidate.model) || !record(value.quota) || !bounded(value.quota.provider) || !bounded(value.quota.billingProduct) || !bounded(value.quota.account) || !bounded(value.quota.scope) || !bounded(value.scopeRoot) || typeof value.sessionPersistence !== "boolean" || !Number.isInteger(value.timeoutMinutes) || !record(value.plumbing) || !record(value.runtime) || !Array.isArray(value.derivations) || !Array.isArray(value.gaps)) {
+  if (!record(value) || !bounded(value.specLabel) || !record(value.candidate) || !Number.isInteger(value.candidate.index) || !bounded(value.candidate.id) || !RUNNERS.has(value.candidate.runner as string) || !bounded(value.candidate.model) || (value.candidate.reasoning !== undefined && !REASONING.has(value.candidate.reasoning as string)) || !record(value.quota) || !bounded(value.quota.provider) || !bounded(value.quota.billingProduct) || !bounded(value.quota.account) || !bounded(value.quota.scope) || !bounded(value.scopeRoot) || typeof value.sessionPersistence !== "boolean" || !Number.isInteger(value.timeoutMinutes) || !record(value.plumbing) || !record(value.runtime) || !Array.isArray(value.derivations) || !Array.isArray(value.gaps)) {
     throw routerLogFailure("Router compiled configuration is untrusted");
   }
   const candidateValue = value.candidate;
   const quotaValue = value.quota;
   const candidate = {
     index: candidateValue.index as number,
+    id: candidateValue.id as string,
     runner: candidateValue.runner as "pi" | "claude" | "agy" | "devin",
     model: candidateValue.model as string,
-    ...(candidateValue.account === undefined ? {} : { account: candidateValue.account as string })
+    ...(candidateValue.reasoning === undefined ? {} : { reasoning: candidateValue.reasoning as ThinkingLevel | ClaudeEffort })
   };
   const derivations = value.derivations.map((item) => {
     if (!record(item) || (item.action !== "dependency" && item.action !== "incompatible" && item.action !== "deny") || !POOL_FIELDS.includes(item.field as (typeof POOL_FIELDS)[number]) || !bounded(item.name) || !bounded(item.reason)) throw routerLogFailure("Router compiled configuration is untrusted");
@@ -387,33 +482,35 @@ function projectConfiguration(value: unknown): Admitted["configuration"] {
 
 function projectSpecResult(result: SpecDecision): LoggedRouterResult {
   if (result.kind === "admitted") {
-    if (!QUALITY.has(result.quality) || !bounded(result.category) || !Number.isInteger(result.count) || result.count < 1) throw routerLogFailure("Router decision result is malformed");
-    return { kind: "admitted", quality: result.quality, category: result.category, count: result.count, configuration: projectConfiguration(result.configuration), evidence: projectEvidence(result.evidence) };
+    if (!QUALITY.has(result.quality) || !Number.isInteger(result.count) || result.count < 1) throw routerLogFailure("Router decision result is malformed");
+    for (const tier of [result.requestedTier, result.workloadFloor, result.effectiveStartTier, result.effectiveCeiling]) {
+      if (tier !== undefined && !TIERS.has(tier)) throw routerLogFailure("Router decision result is malformed");
+    }
+    if (!Array.isArray(result.chain) || result.chain.length === 0 || !result.chain.every(bounded)) throw routerLogFailure("Router decision result is malformed");
+    return {
+      kind: "admitted",
+      quality: result.quality,
+      count: result.count,
+      ...(result.requestedTier === undefined ? {} : { requestedTier: result.requestedTier }),
+      ...(result.workloadFloor === undefined ? {} : { workloadFloor: result.workloadFloor }),
+      ...(result.effectiveStartTier === undefined ? {} : { effectiveStartTier: result.effectiveStartTier }),
+      ...(result.effectiveCeiling === undefined ? {} : { effectiveCeiling: result.effectiveCeiling }),
+      chain: [...result.chain],
+      selectedPoint: projectSelectedPoint(result.selectedPoint),
+      configuration: projectConfiguration(result.configuration),
+      evidence: projectEvidence(result.evidence)
+    };
   }
   if (result.kind === "rejected") {
-    if (result.quality !== "rejected" || (result.reason !== "instructions_inadequate" && result.reason !== "assignment_unverifiable")) throw routerLogFailure("Router decision result is malformed");
+    if (result.quality !== "rejected" || result.reason !== "done_when_unverifiable") throw routerLogFailure("Router decision result is malformed");
     return { kind: "rejected", quality: "rejected", reason: result.reason, evidence: projectEvidence(result.evidence) };
   }
   if (result.kind !== "abstained" || !REASONS.has(result.reason) || (result.component !== undefined && !bounded(result.component))) throw routerLogFailure("Router decision result is malformed");
   return { kind: "abstained", reason: result.reason, ...(result.component === undefined ? {} : { component: result.component }), ...(result.evidence === undefined ? {} : { evidence: projectEvidence(result.evidence) }) };
 }
 
-function projectLegacyResult(result: RouteDecisionOrAbstain): LoggedRouterResult {
-  if (result.kind === "abstain") {
-    if (!REASONS.has(result.reason) || (result.component !== undefined && !bounded(result.component))) throw routerLogFailure("Router decision result is malformed");
-    return result.component === undefined ? { kind: "abstain", reason: result.reason } : { kind: "abstain", reason: result.reason, component: result.component };
-  }
-  if (!Array.isArray(result.assignments)) throw routerLogFailure("Router decision result is malformed");
-  return { kind: "route", assignments: result.assignments.map((item) => {
-    if (!record(item) || !bounded(item.profile) || !Number.isInteger(item.count) || item.count < 1 || !bounded(item.purpose)) throw routerLogFailure("Router decision result is malformed");
-    return { profile: item.profile, count: item.count, purpose: item.purpose };
-  }) };
-}
-
-type RouteDecisionOrAbstain = Extract<RouterResult, { kind: "route" | "abstain" }>;
-
-function buildRecord(entry: AnyRouterLogEntry, now: () => Date): RouterLogRecord {
-  const caller = entry.caller ?? entry.name;
+function buildRecord(entry: SpecRouterLogEntry, now: () => Date): RouterLogRecord {
+  const caller = entry.caller;
   if (!bounded(caller)) throw routerLogFailure("Router decision caller is untrusted");
   const binding = bindingFromEntry(entry, caller);
   let stateDigest: string | null = null;
@@ -423,15 +520,22 @@ function buildRecord(entry: AnyRouterLogEntry, now: () => Date): RouterLogRecord
     if (isUnavailableMarker(entry.state)) stateUnavailable = { reason: "catalog_unavailable" };
     else stateDigest = routerStateDigest(entry.state);
   }
-  const specResult = entry.result.kind === "admitted" || entry.result.kind === "rejected" || entry.result.kind === "abstained";
-  const result = specResult ? projectSpecResult(entry.result as SpecDecision) : projectLegacyResult(entry.result as RouteDecisionOrAbstain);
-  const evidence = projectEvidence(entry.evidence ?? (specResult ? (entry.result as SpecDecision).evidence : undefined));
-  const probabilities = specResult ? projectSpecProbabilities(entry.probabilities) : {};
-  return { timestamp: now().toISOString(), name: caller, caller, binding, stateDigest, stateUnavailable, probabilities, result, evidence };
+  const catalogRevision = entry.catalogRevision === undefined ? null : entry.catalogRevision;
+  if (catalogRevision !== null && !bounded(catalogRevision)) throw routerLogFailure("Router decision catalog revision is untrusted");
+  const recoveryOf = entry.recoveryOf === undefined ? null : entry.recoveryOf;
+  const priorOperatingPointId = entry.priorOperatingPointId === undefined ? null : entry.priorOperatingPointId;
+  if ((recoveryOf === null) !== (priorOperatingPointId === null) || (recoveryOf !== null && !bounded(recoveryOf)) || (priorOperatingPointId !== null && !bounded(priorOperatingPointId))) {
+    throw routerLogFailure("Router decision recovery lineage is untrusted");
+  }
+  const result = projectSpecResult(entry.result);
+  const evidence = projectEvidence(entry.evidence ?? entry.result.evidence);
+  const probabilities = projectSpecProbabilities(entry.probabilities);
+  return { timestamp: now().toISOString(), name: caller, caller, binding, catalogRevision, recoveryOf, priorOperatingPointId, stateDigest, stateUnavailable, probabilities, result, evidence };
 }
 
 async function ensureLogDirectory(directory: string): Promise<void> {
-  for (const path of [dirname(directory), directory]) {
+  const parent = dirname(directory);
+  for (const [path, ownerOnly] of [[parent, false], [directory, true]] as const) {
     try {
       await mkdir(path, { mode: 0o700 });
     } catch (error) {
@@ -442,6 +546,15 @@ async function ensureLogDirectory(directory: string): Promise<void> {
       value = await lstat(path);
     } catch {
       throw routerLogFailure("Router decision log directory is unavailable");
+    }
+    if (!ownerOnly) {
+      // The `.herdr` parent is a shared coordination directory that herdr itself
+      // and other tooling may create with a default umask; requiring owner-only
+      // here failed every launch in projects whose `.herdr` predated the router
+      // log (ROUTER_LOG_UNAVAILABLE). The trust boundary is the router leaf and
+      // the 0600 no-follow decisions file below, not the shared parent.
+      if (!value.isDirectory() || value.isSymbolicLink() || value.uid !== uid()) throw routerLogFailure("Router decision log directory is unavailable");
+      continue;
     }
     assertOwnerOnlyDirectory(path, value, routerLogFailure, "Router decision log");
   }
@@ -472,9 +585,7 @@ async function appendLine(path: string, line: string): Promise<void> {
 }
 
 /** Validate the typed projection before redaction and append one whole line. */
-export function appendRouterDecision(entry: RouterLogEntry, options: AppendRouterLogOptions): Promise<void>;
-export function appendRouterDecision(entry: SpecRouterLogEntry, options: AppendRouterLogOptions): Promise<void>;
-export async function appendRouterDecision(entry: AnyRouterLogEntry, options: AppendRouterLogOptions): Promise<void> {
+export async function appendRouterDecision(entry: SpecRouterLogEntry, options: AppendRouterLogOptions): Promise<void> {
   try {
     if (!isAbsolute(options.root)) throw routerLogFailure("Router decision log root is untrusted");
     const line = `${JSON.stringify(modelSafeJson(buildRecord(entry, options.now ?? (() => new Date()))))}\n`;

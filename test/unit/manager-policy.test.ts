@@ -23,7 +23,7 @@ describe("manager raw CLI fallback policy", () => {
     expect(canonical).toContain("Never delegate Herdr work to a native subagent or the `Task` tool");
     expect(canonical).toContain("Do not retry, add escalation keys");
     expect(canonical).toContain("PROMPT_UNCONFIRMED");
-    expect(canonical).toContain("Do not relaunch, resend the assignment, auto-send Enter");
+    expect(canonical).toContain("Do not relaunch, resend the Task, auto-send Enter");
     expect(canonical).not.toContain("--stdin");
 
     const registry = JSON.parse(await readFile(join(packageRoot, "herdr-skill-bundles.json"), "utf8")) as {

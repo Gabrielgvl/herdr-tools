@@ -111,9 +111,9 @@ export interface WaitJobRequestSnapshot extends JobRequestCommon {
 export interface SupervisedJobChild {
   agentName: string;
   agentKind: string;
-  candidateName: string;
+  operatingPointId: string;
   requestedAgentKind?: string;
-  requestedCandidateName?: string;
+  requestedOperatingPointId?: string;
 }
 
 export interface SupervisionChildBindingPublication {
@@ -151,7 +151,7 @@ export type SupervisionForbiddenTools =
  */
 export interface SupervisionForbiddenToolsPolicy {
   readonly agentKind: string;
-  readonly candidateName: string;
+  readonly operatingPointId: string;
   readonly forbiddenTools: SupervisionForbiddenTools;
 }
 
@@ -173,7 +173,7 @@ export type SupervisionWorkspaceRoot =
 /** The request half of an AGY provisional binding. */
 export interface ProvisionalSupervisionChildBinding {
   agentKind: string;
-  candidateName: string;
+  operatingPointId: string;
 }
 
 export interface SupervisorJobRequestSnapshot extends JobRequestCommon {
@@ -469,12 +469,12 @@ function verifyInstalledSupervisor(record: JobRecord, stage: "provisional" | "ex
     throw new Error("SUPERVISION_PUBLICATION_UNCONFIRMED: installed supervisor state is unavailable");
   }
   if (stage === "provisional") {
-    if (view.state !== "provisional" || view.provisional.agentName !== child.agentName || view.provisional.agentKind !== child.agentKind || view.provisional.candidateName !== child.candidateName || !sameOptional(view.provisional.requestedCandidateName, child.requestedCandidateName)) {
+    if (view.state !== "provisional" || view.provisional.agentName !== child.agentName || view.provisional.agentKind !== child.agentKind || view.provisional.operatingPointId !== child.operatingPointId || !sameOptional(view.provisional.requestedOperatingPointId, child.requestedOperatingPointId)) {
       throw new Error("SUPERVISION_PUBLICATION_MISMATCH: installed provisional supervisor state does not match the binding");
     }
     return;
   }
-  if ((view.state !== "active" && view.state !== "degraded") || view.child.agentName !== child.agentName || view.child.agentKind !== child.agentKind || view.child.candidateName !== child.candidateName || view.child.paneId !== paneId || !sameOptional(view.child.requestedAgentKind, child.requestedAgentKind) || !sameOptional(view.child.requestedCandidateName, child.requestedCandidateName)) {
+  if ((view.state !== "active" && view.state !== "degraded") || view.child.agentName !== child.agentName || view.child.agentKind !== child.agentKind || view.child.operatingPointId !== child.operatingPointId || view.child.paneId !== paneId || !sameOptional(view.child.requestedAgentKind, child.requestedAgentKind) || !sameOptional(view.child.requestedOperatingPointId, child.requestedOperatingPointId)) {
     throw new Error("SUPERVISION_PUBLICATION_MISMATCH: installed exact supervisor state does not match the binding");
   }
 }
@@ -637,9 +637,9 @@ function copyRequest(request: JobRequestSnapshot, truncation: JobTruncation): Jo
       child: {
         agentName: boundedText(request.child.agentName, PUBLIC_FIELD_BYTES),
         agentKind: boundedText(request.child.agentKind, PUBLIC_FIELD_BYTES),
-        candidateName: boundedText(request.child.candidateName, PUBLIC_FIELD_BYTES),
+        operatingPointId: boundedText(request.child.operatingPointId, PUBLIC_FIELD_BYTES),
         ...(request.child.requestedAgentKind === undefined ? {} : { requestedAgentKind: boundedText(request.child.requestedAgentKind, PUBLIC_FIELD_BYTES) }),
-        ...(request.child.requestedCandidateName === undefined ? {} : { requestedCandidateName: boundedText(request.child.requestedCandidateName, PUBLIC_FIELD_BYTES) })
+        ...(request.child.requestedOperatingPointId === undefined ? {} : { requestedOperatingPointId: boundedText(request.child.requestedOperatingPointId, PUBLIC_FIELD_BYTES) })
       },
       settings: {
         reviewCadenceMinutes: request.settings.reviewCadenceMinutes,
@@ -672,14 +672,14 @@ function boundedProvisional(view: SupervisionProvisionalView, truncation: JobTru
   const agentName = boundedText(view.agentName, PUBLIC_FIELD_BYTES);
   const paneId = boundedText(view.paneId, PUBLIC_FIELD_BYTES);
   const terminalId = boundedText(view.terminalId, PUBLIC_FIELD_BYTES);
-  const candidateName = boundedText(view.candidateName, PUBLIC_FIELD_BYTES);
-  const requestedCandidateName = view.requestedCandidateName === undefined ? undefined : boundedText(view.requestedCandidateName, PUBLIC_FIELD_BYTES);
+  const operatingPointId = boundedText(view.operatingPointId, PUBLIC_FIELD_BYTES);
+  const requestedOperatingPointId = view.requestedOperatingPointId === undefined ? undefined : boundedText(view.requestedOperatingPointId, PUBLIC_FIELD_BYTES);
   const clipped = [
     agentName !== view.agentName,
     paneId !== view.paneId,
     terminalId !== view.terminalId,
-    candidateName !== view.candidateName,
-    requestedCandidateName !== view.requestedCandidateName,
+    operatingPointId !== view.operatingPointId,
+    requestedOperatingPointId !== view.requestedOperatingPointId,
   ].some(Boolean);
   if (clipped) truncation.supervisionFieldsClipped = (truncation.supervisionFieldsClipped ?? 0) + 1;
   return {
@@ -687,8 +687,8 @@ function boundedProvisional(view: SupervisionProvisionalView, truncation: JobTru
     agentKind: "agy",
     paneId,
     terminalId,
-    candidateName,
-    ...(requestedCandidateName === undefined ? {} : { requestedCandidateName }),
+    operatingPointId,
+    ...(requestedOperatingPointId === undefined ? {} : { requestedOperatingPointId }),
     baseline: { ...view.baseline }
   };
 }
@@ -698,16 +698,16 @@ function boundedChild(view: SupervisionChildView, truncation: JobTruncation): Su
   const agentKind = boundedText(view.agentKind, PUBLIC_FIELD_BYTES);
   const paneId = boundedText(view.paneId, PUBLIC_FIELD_BYTES);
   const terminalId = boundedText(view.terminalId, PUBLIC_FIELD_BYTES);
-  const candidateName = boundedText(view.candidateName, PUBLIC_FIELD_BYTES);
-  const requestedCandidateName = view.requestedCandidateName === undefined ? undefined : boundedText(view.requestedCandidateName, PUBLIC_FIELD_BYTES);
+  const operatingPointId = boundedText(view.operatingPointId, PUBLIC_FIELD_BYTES);
+  const requestedOperatingPointId = view.requestedOperatingPointId === undefined ? undefined : boundedText(view.requestedOperatingPointId, PUBLIC_FIELD_BYTES);
   const requestedAgentKind = view.requestedAgentKind === undefined ? undefined : boundedText(view.requestedAgentKind, PUBLIC_FIELD_BYTES);
   if ([
     agentName !== view.agentName,
     agentKind !== view.agentKind,
     paneId !== view.paneId,
     terminalId !== view.terminalId,
-    candidateName !== view.candidateName,
-    requestedCandidateName !== view.requestedCandidateName,
+    operatingPointId !== view.operatingPointId,
+    requestedOperatingPointId !== view.requestedOperatingPointId,
     requestedAgentKind !== view.requestedAgentKind,
   ].some(Boolean)) truncation.supervisionFieldsClipped = (truncation.supervisionFieldsClipped ?? 0) + 1;
   return {
@@ -715,8 +715,8 @@ function boundedChild(view: SupervisionChildView, truncation: JobTruncation): Su
     agentKind,
     paneId,
     terminalId,
-    candidateName,
-    ...(requestedCandidateName === undefined ? {} : { requestedCandidateName }),
+    operatingPointId,
+    ...(requestedOperatingPointId === undefined ? {} : { requestedOperatingPointId }),
     ...(requestedAgentKind === undefined ? {} : { requestedAgentKind }),
   };
 }
@@ -1486,7 +1486,7 @@ export class JobRegistry {
     if (!record) throw new Error("JOB_NOT_FOUND: unknown Herdr job");
     if (record.detail.request.kind !== "supervisor") throw new Error("JOB_KIND_MISMATCH: only a supervisor job has a supervised child");
     if (bound.agentKind !== "agy") throw new Error("SUPERVISION_PROVISIONAL_INVALID: provisional supervision is AGY-only");
-    if (typeof bound.candidateName !== "string" || bound.candidateName.length === 0 || /[\0\r\n]/u.test(bound.candidateName)) throw new Error("SUPERVISION_BINDING_INVALID: provisional profile name is malformed");
+    if (typeof bound.operatingPointId !== "string" || bound.operatingPointId.length === 0 || /[\0\r\n]/u.test(bound.operatingPointId)) throw new Error("SUPERVISION_BINDING_INVALID: provisional profile name is malformed");
     const request = record.detail.request;
     if (record.supervisionBindingStage !== "reserved" || request.targetIds.length !== 0) throw new Error("SUPERVISION_ALREADY_BOUND: supervisor request already has a provisional or exact binding");
     if (request.targets.length !== 1 || request.target_generation_refs?.length !== 1) throw new Error("SUPERVISION_REQUEST_INVALID: supervisor target arrays are not aligned");
@@ -1496,9 +1496,9 @@ export class JobRegistry {
     const selectedChild: SupervisedJobChild = {
       agentName: reservedChild.agentName,
       agentKind: "agy",
-      candidateName: bound.candidateName,
+      operatingPointId: bound.operatingPointId,
       ...(requestedAgentKind === undefined ? {} : { requestedAgentKind }),
-      ...(bound.candidateName === reservedChild.candidateName ? {} : { requestedCandidateName: reservedChild.candidateName })
+      ...(bound.operatingPointId === reservedChild.operatingPointId ? {} : { requestedOperatingPointId: reservedChild.operatingPointId })
     };
     let committed = false;
     let published = false;
@@ -1536,18 +1536,18 @@ export class JobRegistry {
    * changes until `commit`, and no observer is notified until `publish`, after
    * the supervisor has installed its matching bound state.
    */
-  prepareSupervisionChildBinding(jobId: string, bound: { agentKind: string; candidateName: string; paneId: string }): SupervisionChildBindingPublication {
+  prepareSupervisionChildBinding(jobId: string, bound: { agentKind: string; operatingPointId: string; paneId: string }): SupervisionChildBindingPublication {
     return this.prepareExactSupervisionChildBinding(jobId, bound, false);
   }
 
   /** Prepare the exact request half of an already-published AGY provisional binding. */
-  prepareSupervisionStrengthening(jobId: string, bound: { agentKind: string; candidateName: string; paneId: string }): SupervisionChildBindingPublication {
+  prepareSupervisionStrengthening(jobId: string, bound: { agentKind: string; operatingPointId: string; paneId: string }): SupervisionChildBindingPublication {
     return this.prepareExactSupervisionChildBinding(jobId, bound, true);
   }
 
   private prepareExactSupervisionChildBinding(
     jobId: string,
-    bound: { agentKind: string; candidateName: string; paneId: string },
+    bound: { agentKind: string; operatingPointId: string; paneId: string },
     strengthening: boolean,
   ): SupervisionChildBindingPublication {
     const record = this.jobs.get(jobId);
@@ -1571,13 +1571,13 @@ export class JobRegistry {
     const reservedChild = clone(request.child);
     const reservedTargetIds = [...request.targetIds];
     const requestedAgentKind = reservedChild.requestedAgentKind ?? (bound.agentKind === reservedChild.agentKind ? undefined : reservedChild.agentKind);
-    const requestedCandidateName = reservedChild.requestedCandidateName ?? (bound.candidateName === reservedChild.candidateName ? undefined : reservedChild.candidateName);
+    const requestedOperatingPointId = reservedChild.requestedOperatingPointId ?? (bound.operatingPointId === reservedChild.operatingPointId ? undefined : reservedChild.operatingPointId);
     const selectedChild: SupervisedJobChild = {
       agentName: reservedChild.agentName,
       agentKind: bound.agentKind,
-      candidateName: bound.candidateName,
+      operatingPointId: bound.operatingPointId,
       ...(requestedAgentKind === undefined ? {} : { requestedAgentKind }),
-      ...(requestedCandidateName === undefined ? {} : { requestedCandidateName }),
+      ...(requestedOperatingPointId === undefined ? {} : { requestedOperatingPointId }),
     };
     let committed = false;
     let published = false;

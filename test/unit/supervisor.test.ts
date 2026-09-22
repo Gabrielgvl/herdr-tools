@@ -26,7 +26,7 @@ const agyIdentity: ProvisionalSupervisedIdentity = { paneId: "p1", terminalId: "
 const agySession = { source: "agy", agent: "agy", kind: "id", value: "agy-1" };
 const provisionalBinding: ProvisionalSupervisionBinding = {
   identity: agyIdentity,
-  candidateName: "researcher-agy",
+  operatingPointId: "researcher-agy",
   baseline: { state: "idle", stateChangeSeq: 4, revision: 2 },
 };
 const exactAgyIdentity: SupervisedIdentity = { ...agyIdentity, agentSession: agySession };
@@ -168,7 +168,7 @@ function harness(options: HarnessOptions = {}): Harness {
   };
   const deps: SupervisorDependencies = {
     jobId: "job_supervisor",
-    child: options.child ?? { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+    child: options.child ?? { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
     monitor: {
       addObserver: () => { observers += 1; },
       removeObserver: () => { observers -= 1; },
@@ -255,11 +255,11 @@ describe("target-local snapshot evidence", () => {
 describe("supervisor binding", () => {
   it("binds to the proven occupant and anchors on its revision", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 9 })])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 4 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 4 });
     const view = h.supervisor.view();
     expect(view.state).toBe("active");
     expect(view.status).toBe("working");
-    expect(view.child).toEqual({ agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", candidateName: "worker-pi" });
+    expect(view.child).toEqual({ agentName: "worker", agentKind: "pi", paneId: "p1", terminalId: "t1", operatingPointId: "worker-pi" });
     expect(view.reviewer).toMatchObject({ model: "typesafe/jev-latest", cadenceMinutes: 5, degraded: false });
     expect(h.supervisor.childLive()).toBe(true);
     // A working child arms the review cadence immediately.
@@ -272,8 +272,8 @@ describe("supervisor binding", () => {
       [agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
       [agyAgentRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
     );
-    const h = harness({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" }, snapshots: [baseline, exact] });
-    const provisional: ProvisionalSupervisionBinding = { identity: agyIdentity, candidateName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } };
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" }, snapshots: [baseline, exact] });
+    const provisional: ProvisionalSupervisionBinding = { identity: agyIdentity, operatingPointId: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } };
     const events: string[] = [];
     await h.supervisor.bindProvisional(provisional, { commit: () => { events.push(`provisional-commit:${h.supervisor.view().state}`); }, rollback: vi.fn(), publish: () => { events.push(`provisional-publish:${h.supervisor.view().state}`); } });
     expect(h.supervisor.view()).toMatchObject({ state: "provisional", provisional: { paneId: "p1", terminalId: "t1", agentKind: "agy", baseline: { stateChangeSeq: 4, revision: 2 } }, status: "idle" });
@@ -283,9 +283,9 @@ describe("supervisor binding", () => {
     expect(h.supervisor.coversIdentity({ ...agyIdentity, agentSession: agySession })).toBe(false);
 
     const exactIdentity: SupervisedIdentity = { ...agyIdentity, agentSession: agySession };
-    await h.supervisor.strengthen({ identity: exactIdentity, candidateName: "researcher-agy" }, { commit: () => { events.push(`exact-commit:${h.supervisor.view().state}`); }, rollback: vi.fn(), publish: () => { events.push(`exact-publish:${h.supervisor.view().state}`); } });
+    await h.supervisor.strengthen({ identity: exactIdentity, operatingPointId: "researcher-agy" }, { commit: () => { events.push(`exact-commit:${h.supervisor.view().state}`); }, rollback: vi.fn(), publish: () => { events.push(`exact-publish:${h.supervisor.view().state}`); } });
     expect(events).toEqual(["provisional-commit:reserved", "provisional-publish:provisional", "exact-commit:provisional", "exact-publish:active"]);
-    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p1", terminalId: "t1", agentKind: "agy", candidateName: "researcher-agy" }, status: "working" });
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { paneId: "p1", terminalId: "t1", agentKind: "agy", operatingPointId: "researcher-agy" }, status: "working" });
     expect(h.supervisor.coversIdentity(exactIdentity)).toBe(true);
     expect(h.observers).toBe(1);
     h.supervisor.shutdown();
@@ -296,7 +296,7 @@ describe("supervisor binding", () => {
       [agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 6, state_change_seq: 8 })],
       [agyAgentRecord({ agent_session: agySession, agent_status: "idle", revision: 6, state_change_seq: 8 })],
     );
-    const h = harness({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" }, snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), exact] });
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" }, snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), exact] });
     await h.supervisor.bindProvisional(provisionalBinding);
     await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })));
     await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 4, state_change_seq: 6 })));
@@ -305,7 +305,7 @@ describe("supervisor binding", () => {
     expect(h.wakes).toEqual([]);
 
     let published: ReturnType<Supervisor["view"]> | undefined;
-    await h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }, {
+    await h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }, {
       commit: vi.fn(),
       rollback: vi.fn(),
       publish: () => { published = h.supervisor.view(); },
@@ -328,11 +328,11 @@ describe("supervisor binding", () => {
     [agyExactSnapshot({ revision: 5, state_change_seq: 5, agent_status: "blocked" }), "lifecycle_regressed"],
     [agyExactSnapshot({ revision: 4, state_change_seq: 6, agent_status: "idle" }), "lifecycle_contradiction"],
   ] as const)("rejects a strengthening snapshot behind retained event evidence (%s)", async (exact, cause) => {
-    const h = harness({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" }, snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), exact] });
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" }, snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), exact] });
     await h.supervisor.bindProvisional(provisionalBinding);
     await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 4, state_change_seq: 6 })));
     const publication = { commit: vi.fn(), rollback: vi.fn(), publish: vi.fn() };
-    await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }, publication))
+    await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }, publication))
       .rejects.toMatchObject({ details: { cause } });
     expect(publication.commit).not.toHaveBeenCalled();
     h.supervisor.shutdown();
@@ -346,11 +346,11 @@ describe("supervisor binding", () => {
       [agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
       [agyAgentRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
     );
-    const h = harness({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" }, snapshots: [baseline, fresh] });
-    await h.supervisor.bindProvisional({ identity: agyIdentity, candidateName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" }, snapshots: [baseline, fresh] });
+    await h.supervisor.bindProvisional({ identity: agyIdentity, operatingPointId: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
     const commit = vi.fn();
     let published: ReturnType<Supervisor["view"]> | undefined;
-    const strengthening = h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, candidateName: "researcher-agy" }, { commit, rollback: vi.fn(), publish: () => { published = h.supervisor.view(); } });
+    const strengthening = h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, operatingPointId: "researcher-agy" }, { commit, rollback: vi.fn(), publish: () => { published = h.supervisor.view(); } });
     await Promise.resolve();
     const admitted = h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 4, state_change_seq: 6 })));
     resolveFresh(exact);
@@ -368,8 +368,8 @@ describe("supervisor binding", () => {
       [agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
       [agyAgentRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })],
     );
-    const h = harness({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" }, snapshots: [baseline, exact] });
-    await h.supervisor.bindProvisional({ identity: agyIdentity, candidateName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" }, snapshots: [baseline, exact] });
+    await h.supervisor.bindProvisional({ identity: agyIdentity, operatingPointId: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
     const internals = h.supervisor as unknown as { drainAdmitted(): Promise<void> };
     const drainAdmitted = internals.drainAdmitted.bind(h.supervisor);
     let injectMove = true;
@@ -380,7 +380,7 @@ describe("supervisor binding", () => {
       void h.supervisor.onEvent(paneEvent("pane_moved", agyPaneRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 }), { previous_pane_id: "p1" }));
     };
     const publication = { commit: vi.fn(), rollback: vi.fn(), publish: vi.fn() };
-    const failure = await h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, candidateName: "researcher-agy" }, publication)
+    const failure = await h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: agySession }, operatingPointId: "researcher-agy" }, publication)
       .catch((error: SupervisionBindError) => error);
     expect(failure).toBeInstanceOf(SupervisionBindError);
     expect((failure as SupervisionBindError).details).toMatchObject({ cause: "move_before_strengthening" });
@@ -395,10 +395,10 @@ describe("supervisor binding", () => {
       [agyPaneRecord({ agent_session: otherSession, agent_status: "working", revision: 4, state_change_seq: 6 })],
       [agyAgentRecord({ agent_session: otherSession, agent_status: "working", revision: 4, state_change_seq: 6 })],
     );
-    const h = harness({ child: { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" }, snapshots: [baseline, exact] });
-    await h.supervisor.bindProvisional({ identity: agyIdentity, candidateName: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" }, snapshots: [baseline, exact] });
+    await h.supervisor.bindProvisional({ identity: agyIdentity, operatingPointId: "researcher-agy", baseline: { state: "idle", stateChangeSeq: 4, revision: 2 } });
     await h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 3, state_change_seq: 5 })));
-    const failure = await h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: otherSession }, candidateName: "researcher-agy" })
+    const failure = await h.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: otherSession }, operatingPointId: "researcher-agy" })
       .catch((error: SupervisionBindError) => error);
     expect(failure).toBeInstanceOf(SupervisionBindError);
     expect((failure as SupervisionBindError).details).toMatchObject({ cause: "native_identity_mismatch" });
@@ -407,34 +407,34 @@ describe("supervisor binding", () => {
 
   it("binds without a state_change_seq rather than defaulting one", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord()])] });
-    await expect(h.supervisor.bind({ identity, candidateName: "worker-pi" })).resolves.toBeUndefined();
+    await expect(h.supervisor.bind({ identity, operatingPointId: "worker-pi" })).resolves.toBeUndefined();
     expect(h.timerArmed()).toBe(false);
 
     const regressed = harness({ snapshots: [snapshot([paneRecord({ stateChangeSeq: 3 })])] });
-    await expect(regressed.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 4 }))
+    await expect(regressed.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 4 }))
       .rejects.toMatchObject({ details: { cause: "lifecycle_regressed" } });
 
     const stopped = harness();
     stopped.supervisor.shutdown();
-    await expect(stopped.supervisor.bind({ identity, candidateName: "worker-pi" })).rejects.toMatchObject({ details: { cause: "bind_already_attempted" } });
+    await expect(stopped.supervisor.bind({ identity, operatingPointId: "worker-pi" })).rejects.toMatchObject({ details: { cause: "bind_already_attempted" } });
   });
 
   it("refuses to bind when authoritative state is unreadable, absent, or a different agent", async () => {
     const unreadable = harness({ snapshots: [Object.assign(new Error("closed"), { code: "SUPERVISION_SOCKET_CLOSED" })] });
-    await expect(unreadable.supervisor.bind({ identity, candidateName: "worker-pi" })).rejects.toBeInstanceOf(SupervisionBindError);
+    await expect(unreadable.supervisor.bind({ identity, operatingPointId: "worker-pi" })).rejects.toBeInstanceOf(SupervisionBindError);
     expect(unreadable.observers).toBe(0);
 
     const missing = harness({ snapshots: [snapshot([], [])] });
-    await expect(missing.supervisor.bind({ identity, candidateName: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
+    await expect(missing.supervisor.bind({ identity, operatingPointId: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
 
     const invalid = harness({ snapshots: [snapshot([paneRecord(), paneRecord()])] });
-    await expect(invalid.supervisor.bind({ identity, candidateName: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
+    await expect(invalid.supervisor.bind({ identity, operatingPointId: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
 
     const agentFree = harness({ snapshots: [snapshot([paneRecord()], [])] });
-    await expect(agentFree.supervisor.bind({ identity, candidateName: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
+    await expect(agentFree.supervisor.bind({ identity, operatingPointId: "worker-pi" })).rejects.toThrow(/no valid unique authoritative occupant/u);
 
     const replaced = harness({ snapshots: [snapshot([paneRecord({ agentSession: { ...session, value: "other" } })])] });
-    const failure = await replaced.supervisor.bind({ identity, candidateName: "worker-pi" }).catch((error: SupervisionBindError) => error);
+    const failure = await replaced.supervisor.bind({ identity, operatingPointId: "worker-pi" }).catch((error: SupervisionBindError) => error);
     expect(failure).toBeInstanceOf(SupervisionBindError);
     expect((failure as SupervisionBindError).message).toMatch(/could not prove the launched identity/u);
     expect((failure as SupervisionBindError).code).toBe("SUPERVISION_UNCONFIRMED");
@@ -448,7 +448,7 @@ describe("supervisor binding", () => {
       rollback: () => { order.push("rollback"); },
       publish: () => { order.push(`publish:${h.supervisor.view().state}:${h.supervisor.view().child?.paneId}`); },
     };
-    const binding = h.supervisor.bind({ identity, candidateName: "worker-pi" }, publication);
+    const binding = h.supervisor.bind({ identity, operatingPointId: "worker-pi" }, publication);
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
     expect(h.supervisor.view()).toMatchObject({ state: "reserved" });
     expect(h.supervisor.view().child).toBeUndefined();
@@ -466,7 +466,7 @@ describe("supervisor binding", () => {
     };
     const rollback = vi.fn();
     const publication: SupervisionChildBindingPublication = { commit: vi.fn(), rollback, publish: vi.fn() };
-    const binding = h.supervisor.bind({ identity, candidateName: "worker-pi" }, publication);
+    const binding = h.supervisor.bind({ identity, operatingPointId: "worker-pi" }, publication);
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
     const failure = await binding.catch((error: SupervisionBindError) => error);
     expect(failure).toBeInstanceOf(SupervisionBindError);
@@ -484,7 +484,7 @@ describe("supervisor binding", () => {
     };
     const rollback = vi.fn();
     const publication: SupervisionChildBindingPublication = { commit: vi.fn(), rollback, publish: vi.fn() };
-    const binding = h.supervisor.bind({ identity, candidateName: "worker-pi" }, publication);
+    const binding = h.supervisor.bind({ identity, operatingPointId: "worker-pi" }, publication);
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
     const failure = await binding.catch((error: SupervisionBindError) => error);
     expect(failure).toBeInstanceOf(SupervisionBindError);
@@ -516,7 +516,7 @@ describe("supervisor binding", () => {
       const commit = vi.fn();
       const rollback = vi.fn();
       const publication: SupervisionChildBindingPublication = { commit, rollback, publish: vi.fn() };
-      const binding = scenario.h.supervisor.bind({ identity, candidateName: "worker-pi" }, publication);
+      const binding = scenario.h.supervisor.bind({ identity, operatingPointId: "worker-pi" }, publication);
       await scenario.h.supervisor.onEvent(scenario.event);
       const failure = await binding.catch((error: SupervisionBindError) => error);
       expect(failure, scenario.label).toBeInstanceOf(SupervisionBindError);
@@ -550,7 +550,7 @@ describe("supervisor binding", () => {
       rollback: vi.fn(),
       publish: vi.fn(),
     };
-    const binding = h.supervisor.bind({ identity, candidateName: "worker-pi" }, publication);
+    const binding = h.supervisor.bind({ identity, operatingPointId: "worker-pi" }, publication);
     const first = h.supervisor.onEvent(thinEvent("pane_exited"));
     const second = h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7 })));
     await binding;
@@ -586,7 +586,7 @@ describe("supervisor binding", () => {
     };
     const commit = vi.fn();
     const rollback = vi.fn();
-    const binding = h.supervisor.bind({ identity, candidateName: "worker-pi" }, { commit, rollback, publish: vi.fn() });
+    const binding = h.supervisor.bind({ identity, operatingPointId: "worker-pi" }, { commit, rollback, publish: vi.fn() });
     const move = h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", status: "working", revision: 3 }), { previous_pane_id: "p1" }));
     const settled = binding.catch((error: SupervisionBindError) => error);
     await new Promise<void>((resolve) => { setImmediate(resolve); });
@@ -611,7 +611,7 @@ describe("supervisor binding", () => {
       h.supervisor.shutdown();
       throw new Error("snapshot closed");
     };
-    await expect(h.supervisor.bind({ identity, candidateName: "worker-pi" })).rejects.toBeInstanceOf(SupervisionBindError);
+    await expect(h.supervisor.bind({ identity, operatingPointId: "worker-pi" })).rejects.toBeInstanceOf(SupervisionBindError);
     expect(await h.supervisor.run()).toEqual({ outcome: "cancelled", reason: "manager_session_shutdown" });
     expect(h.supervisor.view().state).toBe("settled");
   });
@@ -621,7 +621,7 @@ describe("supervisor binding", () => {
     (h.supervisor as unknown as { deps: { scheduler: SupervisionScheduler } }).deps.scheduler.setTimer = () => {
       throw new Error("timer failed");
     };
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     expect(h.supervisor.view()).toMatchObject({ state: "active", reviewer: { degraded: true } });
     expect(h.timerArmed()).toBe(false);
     expect(h.progress).toContain("supervision reviewer cadence could not be armed");
@@ -634,7 +634,7 @@ describe("supervisor binding", () => {
       rollback: vi.fn(),
       publish: vi.fn(),
     };
-    const failure = await h.supervisor.bind({ identity, candidateName: "worker-pi" }, publication).catch((error: SupervisionBindError) => error);
+    const failure = await h.supervisor.bind({ identity, operatingPointId: "worker-pi" }, publication).catch((error: SupervisionBindError) => error);
     expect(failure).toBeInstanceOf(SupervisionBindError);
     expect((failure as SupervisionBindError).message).toMatch(/could not publish its exact child/u);
     expect((failure as SupervisionBindError).message).not.toContain("private-publication-secret");
@@ -644,13 +644,13 @@ describe("supervisor binding", () => {
     expect(h.supervisor.view().child).toBeUndefined();
     expect(h.supervisor.childLive()).toBe(false);
     expect(h.observers).toBe(0);
-    await expect(h.supervisor.bind({ identity, candidateName: "worker-pi" })).rejects.toThrow(/single-use/u);
+    await expect(h.supervisor.bind({ identity, operatingPointId: "worker-pi" })).rejects.toThrow(/single-use/u);
     h.supervisor.release("bind_publication_failed");
   });
 });
 
 describe("AGY provisional supervision failures", () => {
-  const agyChild = { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" };
+  const agyChild = { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" };
   const agyHarness = (snapshots: Array<HerdrSnapshot | Error | Promise<HerdrSnapshot>> = []): Harness => harness({ child: agyChild, snapshots });
 
   it("validates every provisional binding field and remains single-use", async () => {
@@ -661,7 +661,7 @@ describe("AGY provisional supervision failures", () => {
       ...([1, "", "bad\n"] as unknown[]).map((paneId) => ({ ...provisionalBinding, identity: { ...agyIdentity, paneId } } as ProvisionalSupervisionBinding)),
       ...([1, "", "bad\r"] as unknown[]).map((terminalId) => ({ ...provisionalBinding, identity: { ...agyIdentity, terminalId } } as ProvisionalSupervisionBinding)),
       ...([1, "", "bad\0"] as unknown[]).map((agentName) => ({ ...provisionalBinding, identity: { ...agyIdentity, agentName } } as ProvisionalSupervisionBinding)),
-      ...([1, "", "bad\n"] as unknown[]).map((candidateName) => ({ ...provisionalBinding, candidateName } as ProvisionalSupervisionBinding)),
+      ...([1, "", "bad\n"] as unknown[]).map((operatingPointId) => ({ ...provisionalBinding, operatingPointId } as ProvisionalSupervisionBinding)),
       { ...provisionalBinding, baseline: { ...provisionalBinding.baseline, state: "working" } } as unknown as ProvisionalSupervisionBinding,
       ...([-1, 1.5, Number.MAX_SAFE_INTEGER + 1] as number[]).map((stateChangeSeq) => ({ ...provisionalBinding, baseline: { ...provisionalBinding.baseline, stateChangeSeq } })),
       ...([-1, 1.5, Number.MAX_SAFE_INTEGER + 1] as number[]).map((revision) => ({ ...provisionalBinding, baseline: { ...provisionalBinding.baseline, revision } })),
@@ -853,26 +853,26 @@ describe("AGY provisional supervision failures", () => {
 
   it.each(["pi", "claude"] as const)("allows a %s reservation to bind and strengthen an AGY fallback", async (agentKind) => {
     const h = harness({
-      child: { agentName: "worker", agentKind, candidateName: `researcher-${agentKind}` },
+      child: { agentName: "worker", agentKind, operatingPointId: `researcher-${agentKind}` },
       snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), agyExactSnapshot()],
     });
-    await h.supervisor.bindProvisional({ ...provisionalBinding, candidateName: "fallback-agy" });
-    expect(h.supervisor.view()).toMatchObject({ state: "provisional", provisional: { agentKind: "agy", candidateName: "fallback-agy", requestedCandidateName: `researcher-${agentKind}` } });
-    await h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "fallback-agy" });
-    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { agentKind: "agy", candidateName: "fallback-agy", requestedAgentKind: agentKind, requestedCandidateName: `researcher-${agentKind}` } });
+    await h.supervisor.bindProvisional({ ...provisionalBinding, operatingPointId: "fallback-agy" });
+    expect(h.supervisor.view()).toMatchObject({ state: "provisional", provisional: { agentKind: "agy", operatingPointId: "fallback-agy", requestedOperatingPointId: `researcher-${agentKind}` } });
+    await h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "fallback-agy" });
+    expect(h.supervisor.view()).toMatchObject({ state: "active", child: { agentKind: "agy", operatingPointId: "fallback-agy", requestedAgentKind: agentKind, requestedOperatingPointId: `researcher-${agentKind}` } });
     h.supervisor.shutdown();
   });
 
   it("projects the requested profile beside a provisional fallback", async () => {
     const h = agyHarness([snapshot([agyPaneRecord()], [agyAgentRecord()])]);
-    await bindAgy(h, { ...provisionalBinding, candidateName: "fallback-agy" });
-    expect(h.supervisor.view()).toMatchObject({ provisional: { candidateName: "fallback-agy", requestedCandidateName: "researcher-agy" } });
+    await bindAgy(h, { ...provisionalBinding, operatingPointId: "fallback-agy" });
+    expect(h.supervisor.view()).toMatchObject({ provisional: { operatingPointId: "fallback-agy", requestedOperatingPointId: "researcher-agy" } });
     h.supervisor.shutdown();
   });
 });
 
 describe("AGY supervision strengthening failures", () => {
-  const agyChild = { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" };
+  const agyChild = { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" };
   const agyHarness = (after: Array<HerdrSnapshot | Error | Promise<HerdrSnapshot>> = []): Harness => harness({
     child: agyChild,
     snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), ...after],
@@ -885,12 +885,12 @@ describe("AGY supervision strengthening failures", () => {
   }
 
   it("rejects repeated and mismatched strengthening requests", async () => {
-    await expect(agyHarness().supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }))
+    await expect(agyHarness().supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }))
       .rejects.toMatchObject({ details: { cause: "strengthen_already_attempted" } });
 
     for (const binding of [
-      { identity: { ...exactAgyIdentity, agentKind: "pi" }, candidateName: "researcher-agy" },
-      { identity: { ...exactAgyIdentity, paneId: "p2" }, candidateName: "researcher-agy" },
+      { identity: { ...exactAgyIdentity, agentKind: "pi" }, operatingPointId: "researcher-agy" },
+      { identity: { ...exactAgyIdentity, paneId: "p2" }, operatingPointId: "researcher-agy" },
     ] as SupervisionBinding[]) {
       const h = await provisional();
       await expect(h.supervisor.strengthen(binding)).rejects.toMatchObject({ details: { cause: "strengthening_identity_invalid" } });
@@ -899,12 +899,12 @@ describe("AGY supervision strengthening failures", () => {
 
     const stopped = await provisional();
     stopped.supervisor.shutdown();
-    await expect(stopped.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }))
+    await expect(stopped.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }))
       .rejects.toMatchObject({ details: { cause: "strengthen_already_attempted" } });
 
     const strengthened = await provisional([agyExactSnapshot()]);
-    await strengthened.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" });
-    await expect(strengthened.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }))
+    await strengthened.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" });
+    await expect(strengthened.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }))
       .rejects.toMatchObject({ details: { cause: "strengthen_already_attempted" } });
     strengthened.supervisor.shutdown();
   });
@@ -925,7 +925,7 @@ describe("AGY supervision strengthening failures", () => {
     for (const [evidence, requestedIdentity, cause] of cases) {
       const h = await provisional([evidence]);
       const rollback = vi.fn();
-      await expect(h.supervisor.strengthen({ identity: requestedIdentity, candidateName: "researcher-agy" }, { commit: vi.fn(), rollback, publish: vi.fn() }))
+      await expect(h.supervisor.strengthen({ identity: requestedIdentity, operatingPointId: "researcher-agy" }, { commit: vi.fn(), rollback, publish: vi.fn() }))
         .rejects.toMatchObject({ details: { cause } });
       expect(rollback).toHaveBeenCalled();
       expect(h.supervisor.view().state).toBe("provisional");
@@ -938,7 +938,7 @@ describe("AGY supervision strengthening failures", () => {
     );
     const pinned = harness({ child: agyChild, snapshots: [pinnedBaseline, agyExactSnapshot({ agent_session: otherSession })] });
     await bindAgy(pinned);
-    await expect(pinned.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: otherSession }, candidateName: "researcher-agy" }))
+    await expect(pinned.supervisor.strengthen({ identity: { ...agyIdentity, agentSession: otherSession }, operatingPointId: "researcher-agy" }))
       .rejects.toMatchObject({ details: { cause: "native_identity_mismatch" } });
     pinned.supervisor.shutdown();
   });
@@ -948,7 +948,7 @@ describe("AGY supervision strengthening failures", () => {
     h.supervisor.onReconciliationFailure("request_failed");
     expect(provisionalCause(h)).toBe("reconciliation_request_failed");
     const rollback = vi.fn(() => { throw new Error("rollback unavailable"); });
-    await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }, { commit: vi.fn(), rollback, publish: vi.fn() }))
+    await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }, { commit: vi.fn(), rollback, publish: vi.fn() }))
       .rejects.toMatchObject({ details: { cause: "reconciliation_request_failed" } });
     h.supervisor.release("launch_failed");
     expect(h.supervisor.childLive()).toBe(true);
@@ -969,7 +969,7 @@ describe("AGY supervision strengthening failures", () => {
       let resolveFresh!: (value: HerdrSnapshot) => void;
       const fresh = new Promise<HerdrSnapshot>((resolve) => { resolveFresh = resolve; });
       const h = await provisional([fresh]);
-      const strengthening = h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" });
+      const strengthening = h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" });
       await Promise.resolve();
       const admitted = h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord(overrides)));
       resolveFresh(agyExactSnapshot());
@@ -983,7 +983,7 @@ describe("AGY supervision strengthening failures", () => {
     let resolveFresh!: (value: HerdrSnapshot) => void;
     const fresh = new Promise<HerdrSnapshot>((resolve) => { resolveFresh = resolve; });
     const h = await provisional([fresh]);
-    const strengthening = h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" });
+    const strengthening = h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" });
     await Promise.resolve();
     const admitted = h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "working", revision: 4, state_change_seq: 6 })));
     resolveFresh(agyExactSnapshot());
@@ -996,7 +996,7 @@ describe("AGY supervision strengthening failures", () => {
     let resolveFresh!: (value: HerdrSnapshot) => void;
     const fresh = new Promise<HerdrSnapshot>((resolve) => { resolveFresh = resolve; });
     const h = await provisional([fresh]);
-    const strengthening = h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "fallback-agy" });
+    const strengthening = h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "fallback-agy" });
     await Promise.resolve();
     const sameRevision = h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "blocked", revision: 3, state_change_seq: 6 })));
     const jumped = h.supervisor.onEvent(paneEvent("pane_updated", agyPaneRecord({ agent_session: agySession, agent_status: "idle", revision: 6, state_change_seq: 7 })));
@@ -1007,7 +1007,7 @@ describe("AGY supervision strengthening failures", () => {
     expect(h.supervisor.view()).toMatchObject({
       state: "active",
       status: "working",
-      child: { candidateName: "fallback-agy", requestedCandidateName: "researcher-agy" },
+      child: { operatingPointId: "fallback-agy", requestedOperatingPointId: "researcher-agy" },
       reviewer: { degraded: false },
     });
     h.supervisor.shutdown();
@@ -1016,7 +1016,7 @@ describe("AGY supervision strengthening failures", () => {
   it("keeps exact supervision active when its first cadence cannot be armed", async () => {
     const h = await provisional([agyExactSnapshot()]);
     (h.supervisor as unknown as { scheduler: SupervisionScheduler }).scheduler.setTimer = () => { throw new Error("timer failed"); };
-    await h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" });
+    await h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" });
     expect(h.supervisor.view()).toMatchObject({ state: "active", status: "working", reviewer: { degraded: true } });
     expect(h.progress).toContain("supervision reviewer cadence could not be armed");
     h.supervisor.shutdown();
@@ -1030,7 +1030,7 @@ describe("AGY supervision strengthening failures", () => {
         rollback: vi.fn(() => { throw new Error("rollback failed"); }),
         publish: vi.fn(() => { if (fail === "publish") throw new Error("failed"); }),
       };
-      await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }, publication))
+      await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }, publication))
         .rejects.toMatchObject({ details: { cause: "publication_failed" } });
       expect(h.supervisor.view()).toMatchObject({ state: "provisional", status: "idle" });
       expect(h.supervisor.childLive()).toBe(true);
@@ -1047,7 +1047,7 @@ describe("AGY supervision strengthening failures", () => {
       const internals = h.supervisor as unknown as { drainAdmitted(): Promise<void>; strengtheningCandidate?: unknown; state?: string };
       const drain = internals.drainAdmitted.bind(h.supervisor);
       internals.drainAdmitted = async () => { await drain(); mutation(internals); };
-      await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }))
+      await expect(h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }))
         .rejects.toMatchObject({ details: { cause } });
       h.supervisor.shutdown();
     }
@@ -1059,14 +1059,14 @@ describe("AGY supervision strengthening failures", () => {
     const queuedInternals = queued.supervisor as unknown as { drainAdmitted(): Promise<void>; queued: { readonly length: number } };
     queuedInternals.drainAdmitted = async () => undefined;
     queuedInternals.queued = { get length() { return ++lengthReads === 1 ? 0 : 1; } };
-    await expect(queued.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }))
+    await expect(queued.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }))
       .rejects.toMatchObject({ details: { cause: "publication_failed" } });
     queued.supervisor.shutdown();
 
     const drain = await provisional([agyExactSnapshot()]);
     const drainInternals = drain.supervisor as unknown as { drainAdmitted(): Promise<void> };
     drainInternals.drainAdmitted = async () => { throw Object.assign(new Error("drain failed"), { code: "DRAIN_FAILED" }); };
-    await expect(drain.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" }))
+    await expect(drain.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" }))
       .rejects.toMatchObject({ details: { cause: "DRAIN_FAILED" } });
     drain.supervisor.shutdown();
   });
@@ -1124,15 +1124,15 @@ describe("AGY supervision strengthening failures", () => {
 describe("supervisor folding", () => {
   async function bound(options: HarnessOptions = {}): Promise<Harness> {
     const h = harness({ ...options, snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), ...(options.snapshots ?? [])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     return h;
   }
 
   async function exactAgyBound(after: HerdrSnapshot[] = []): Promise<Harness> {
-    const child = { agentName: "worker", agentKind: "agy", candidateName: "researcher-agy" };
+    const child = { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" };
     const h = harness({ child, snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), agyExactSnapshot(), ...after] });
     await h.supervisor.bindProvisional(provisionalBinding);
-    await h.supervisor.strengthen({ identity: exactAgyIdentity, candidateName: "researcher-agy" });
+    await h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy" });
     h.wakes.length = 0;
     return h;
   }
@@ -1262,14 +1262,14 @@ describe("supervisor folding", () => {
 
   it("accepts a Pi same-revision transition when its authoritative lifecycle sequence advances", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 4 })])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 4 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 4 });
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 5, stateChangeSeq: 5 })));
     expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
     expect(h.supervisor.view().monitor.evidenceGaps).toBe(0);
     h.supervisor.shutdown();
 
     const unanchored = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
-    await unanchored.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await unanchored.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await unanchored.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 6, stateChangeSeq: 1 })));
     expect(unanchored.supervisor.view().monitor.evidenceGaps).toBe(0);
     unanchored.supervisor.shutdown();
@@ -1279,11 +1279,11 @@ describe("supervisor folding", () => {
     const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
     for (const [agentKind, agentSession] of [["pi", session], ["claude", claudeSession]] as const) {
       const h = harness({
-        child: { agentName: "worker", agentKind, candidateName: `worker-${agentKind}` },
+        child: { agentName: "worker", agentKind, operatingPointId: `worker-${agentKind}` },
         snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind, agentSession })])],
       });
       const boundIdentity = { ...identity, agentKind, agentSession };
-      await h.supervisor.bind({ identity: boundIdentity, candidateName: `worker-${agentKind}` });
+      await h.supervisor.bind({ identity: boundIdentity, operatingPointId: `worker-${agentKind}` });
       await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 5, agentKind, agentSession })));
       expect(types(h.wakes)).toEqual(["evidence_gap", "work_cycle_completed"]);
       expect(h.supervisor.view().monitor.evidenceGaps).toBe(1);
@@ -1400,7 +1400,7 @@ describe("supervisor folding", () => {
 describe("supervisor pane moves", () => {
   async function bound(after: Array<HerdrSnapshot | Error> = []): Promise<Harness> {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), ...after] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     return h;
   }
 
@@ -1419,7 +1419,7 @@ describe("supervisor pane moves", () => {
     const destination = paneRecord({ paneId: "p2", status: "idle", revision: 1 });
     delete destination.state_change_seq;
     const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     expect(types(h.wakes)).toEqual(["work_cycle_completed"]);
     expect(h.supervisor.view()).toMatchObject({ child: { paneId: "p2" }, status: "idle", monitor: { evidenceGaps: 0 } });
@@ -1438,7 +1438,7 @@ describe("supervisor pane moves", () => {
     const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
     const lower = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 7 });
     const h = harness({ snapshots: [snapshot([origin]), snapshot([lower], [{ pane_id: "p2", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
     expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
@@ -1464,7 +1464,7 @@ describe("supervisor pane moves", () => {
     const moved = paneRecord({ paneId: "p2", status: "idle", revision: 2, stateChangeSeq: 8 });
     const lower = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
     const h = harness({ snapshots: [snapshot([origin]), snapshot([lower], [{ pane_id: "p2", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
 
@@ -1479,7 +1479,7 @@ describe("supervisor pane moves", () => {
     const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
     const destination = paneRecord({ paneId: "p2", status: "working", revision: 2, stateChangeSeq: 9 });
     const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
 
@@ -1499,7 +1499,7 @@ describe("supervisor pane moves", () => {
     const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
     const destination = paneRecord({ paneId: "p2", status: "working", revision: 1, stateChangeSeq: 8 });
     const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
 
@@ -1520,7 +1520,7 @@ describe("supervisor pane moves", () => {
     const moved = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 8 });
     const destination = paneRecord({ paneId: "p2", status: "idle", revision: 2, stateChangeSeq: 8 });
     const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
 
@@ -1539,7 +1539,7 @@ describe("supervisor pane moves", () => {
     const incoherent = paneRecord({ paneId: "p2", status: "working", revision: 2 });
     delete incoherent.state_change_seq;
     const h = harness({ snapshots: [snapshot([origin]), snapshot([incoherent], [{ pane_id: "p2", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1", }, monitor: { reconciliation: { lastFailureReason: "target_identity_contradiction" } } });
     expect((h.supervisor as unknown as { lastStateChangeSeq?: number }).lastStateChangeSeq).toBe(8);
@@ -1668,7 +1668,7 @@ describe("supervisor pane moves", () => {
     const regressed = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 7 });
     const destination = paneRecord({ paneId: "p3", status: "idle", revision: 2, stateChangeSeq: 9 });
     const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([destination], [{ pane_id: "p3", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
     await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
     await h.supervisor.onEvent(paneEvent("pane_moved", regressed, { previous_pane_id: "p2" }));
@@ -1689,7 +1689,7 @@ describe("supervisor pane moves", () => {
     const regressed = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 7 });
     const contradictory = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 8 });
     const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([contradictory], [{ pane_id: "p3", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
     await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
     await h.supervisor.onEvent(paneEvent("pane_moved", regressed, { previous_pane_id: "p2" }));
@@ -1712,7 +1712,7 @@ describe("supervisor pane moves", () => {
     const contradictory = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 8 });
     const destination = paneRecord({ paneId: "p3", status: "blocked", revision: 2, stateChangeSeq: 9 });
     const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([destination], [{ pane_id: "p3", name: "worker" }])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
     await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
     await h.supervisor.onEvent(paneEvent("pane_moved", contradictory, { previous_pane_id: "p2" }));
@@ -1735,7 +1735,7 @@ describe("supervisor pane moves", () => {
     const second = paneRecord({ paneId: "p3", status: "idle", revision: 2, stateChangeSeq: 8 });
     const destination = paneRecord({ paneId: "p3", status: "idle", revision: 2 });
     const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), invalidDestination("p3")] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
     await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
     await h.supervisor.onEvent(paneEvent("pane_moved", second, { previous_pane_id: "p2" }));
@@ -1778,7 +1778,7 @@ describe("supervisor pane moves", () => {
 describe("supervisor reconnect and monitor health", () => {
   async function bound(after: Array<HerdrSnapshot | Error> = []): Promise<Harness> {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), ...after] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     return h;
   }
 
@@ -1860,7 +1860,7 @@ describe("supervisor reconnect and monitor health", () => {
 
   it("reconciles a missed status transition and snapshot revision gaps", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "idle", revision: 5 })])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await h.supervisor.onReconciliationSnapshot(snapshot([paneRecord({ status: "working", revision: 8 })]));
     expect(types(h.wakes)).toEqual(["evidence_gap"]);
     expect(h.wakes[0]!.event.details).toMatchObject({ source: "snapshot", reason: "revision_jump", previousRevision: 5, observedRevision: 8 });
@@ -1968,7 +1968,7 @@ describe("supervisor reconnect and monitor health", () => {
   async function boundDuringOutage(): Promise<Harness> {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
     h.degradeMonitor();
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     expect(h.supervisor.view()).toMatchObject({ state: "degraded", monitor: { connected: false, degraded: true } });
     expect(h.supervisor.childLive()).toBe(true);
     // The outage was already visible when the child bound, so it is not news.
@@ -2005,7 +2005,7 @@ describe("supervisor reconnect and monitor health", () => {
 describe("supervisor review cadence", () => {
   async function working(options: HarnessOptions = {}): Promise<Harness> {
     const h = harness({ ...options, snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), ...(options.snapshots ?? [])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     return h;
   }
 
@@ -2079,7 +2079,7 @@ describe("supervisor review cadence", () => {
     const review = (h: Harness): Promise<void> => (h.supervisor as unknown as { review(): Promise<void> }).review();
 
     const stopped = harness({ snapshots: [snapshot([paneRecord({ status: "idle", revision: 5 })])] });
-    await stopped.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await stopped.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await review(stopped);
     expect(stopped.reviews).toBe(0);
     expect(stopped.timerArmed()).toBe(false);
@@ -2285,7 +2285,7 @@ describe("supervisor review cadence", () => {
 
   it("clears the cadence when the child leaves the working state", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     expect(h.timerArmed()).toBe(true);
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 6 })));
     expect(h.timerArmed()).toBe(false);
@@ -2474,7 +2474,7 @@ describe("supervisor review cadence", () => {
         snapshots: [snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 9 })])],
         review: async () => ({ classification: "stalled", summary: "no output" }),
       });
-      await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 9 });
+      await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 9 });
       h.fireTimer();
       await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
       const paths = reviewLogPaths(root);
@@ -2516,7 +2516,7 @@ describe("the ADR-036 evidence cadence", () => {
         : undefined
     );
     const h = harness({ ...options, workspaceBase, snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), ...(options.snapshots ?? [])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     return h;
   }
 
@@ -2618,11 +2618,11 @@ describe("the ADR-036 evidence cadence", () => {
     const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
     const reads: string[] = [];
     const h = harness({
-      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
       snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
       transcript: async (paneId) => { reads.push(paneId); return ["a", "b"]; },
     });
-    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    await h.supervisor.bind({ identity: claudeIdentity, operatingPointId: "worker-claude" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     // One pane read — the fallback window IS the terminal evidence, so there is
@@ -2637,14 +2637,14 @@ describe("the ADR-036 evidence cadence", () => {
     const devinSession = { source: "devin", agent: "devin", kind: "id", value: "devin-1" };
     const devinIdentity: SupervisedIdentity = { ...identity, agentKind: "devin", agentSession: devinSession };
     const h = harness({
-      child: { agentName: "worker", agentKind: "devin", candidateName: "worker-devin" },
+      child: { agentName: "worker", agentKind: "devin", operatingPointId: "worker-devin" },
       snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })])],
       devinSession: async () => ({
         position: { steps: 1 },
         events: [{ kind: "agent", offset: 0, bytes: 12, record: { tool_calls: [{ function_name: "shell", arguments: "ls", tool_call_id: "t1" }] } }],
       }),
     });
-    await h.supervisor.bind({ identity: devinIdentity, candidateName: "worker-devin" });
+    await h.supervisor.bind({ identity: devinIdentity, operatingPointId: "worker-devin" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     expect(h.reviewRequests[0]!.evidence!.trace.source).toBe("devin-session");
@@ -2655,10 +2655,10 @@ describe("the ADR-036 evidence cadence", () => {
     const devinSession = { source: "devin", agent: "devin", kind: "id", value: "devin-1" };
     const devinIdentity: SupervisedIdentity = { ...identity, agentKind: "devin", agentSession: devinSession };
     const h = harness({
-      child: { agentName: "worker", agentKind: "devin", candidateName: "worker-devin" },
+      child: { agentName: "worker", agentKind: "devin", operatingPointId: "worker-devin" },
       snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })])],
     });
-    await h.supervisor.bind({ identity: devinIdentity, candidateName: "worker-devin" });
+    await h.supervisor.bind({ identity: devinIdentity, operatingPointId: "worker-devin" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     expect(h.reviewRequests[0]!.evidence!.trace.source).toBe("devin-session");
@@ -2667,7 +2667,7 @@ describe("the ADR-036 evidence cadence", () => {
   it("keeps a typed trace failure silent as reviewer_unavailable and retries next cadence", async () => {
     const badSession = { ...session, kind: "id" };
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentSession: badSession })])] });
-    await h.supervisor.bind({ identity: { ...identity, agentSession: badSession }, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity: { ...identity, agentSession: badSession }, operatingPointId: "worker-pi" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.progress.some((line) => line.includes("review unavailable"))).toBe(true));
     // The window is a typed gap — no Jev call, no wake, nothing stored.
@@ -2746,7 +2746,7 @@ describe("the ADR-036 evidence cadence", () => {
   });
 
   it("reports a deny-listed tool observed in the trace, resolved against the bound identity", async () => {
-    const boundArgs: Array<{ agentKind: string; candidateName: string }> = [];
+    const boundArgs: Array<{ agentKind: string; operatingPointId: string }> = [];
     const h = await working({
       traceFile: piJsonl([piToolCall("Deploy")]),
       resolveForbiddenTools: (bound) => { boundArgs.push(bound); return { available: true, tools: ["deploy"] }; },
@@ -2754,7 +2754,7 @@ describe("the ADR-036 evidence cadence", () => {
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
     // The resolver saw the runner identity that actually bound — pi/worker-pi.
-    expect(boundArgs).toEqual([{ agentKind: "pi", candidateName: "worker-pi" }]);
+    expect(boundArgs).toEqual([{ agentKind: "pi", operatingPointId: "worker-pi" }]);
     expect(h.wakes[0]!.event.details).toMatchObject({ violation: "forbidden_tool_observed", tools: "deploy" });
     expect(h.wakes[0]!.event.details).not.toHaveProperty("classification");
     expect(h.reviews).toBe(0);
@@ -2814,11 +2814,11 @@ describe("the ADR-036 evidence cadence", () => {
     const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
     const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
     const h = harness({
-      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
       snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
       resolveForbiddenTools: () => ({ available: true, tools: ["Bash"] }),
     });
-    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    await h.supervisor.bind({ identity: claudeIdentity, operatingPointId: "worker-claude" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     expect(types(h.wakes)).toEqual(["evidence_gap"]);
@@ -2832,11 +2832,11 @@ describe("the ADR-036 evidence cadence", () => {
     const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
     const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
     const h = harness({
-      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
       snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
       resolveForbiddenTools: () => ({ available: true, tools: [] }),
     });
-    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    await h.supervisor.bind({ identity: claudeIdentity, operatingPointId: "worker-claude" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     expect(h.wakes).toEqual([]);
@@ -2975,7 +2975,7 @@ describe("the ADR-036 evidence cadence", () => {
       workspaceRunner: runner,
       snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])],
     });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     expect(h.reviewRequests[0]!.evidence!.workspace).toEqual({
@@ -3035,7 +3035,7 @@ describe("the ADR-036 evidence cadence", () => {
         reviewLogRoot: root,
         snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), snapshot([], [])],
       });
-      await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+      await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
       await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
       await h.supervisor.onEvent(thinEvent("pane_closed"));
       await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
@@ -3210,11 +3210,11 @@ describe("the ADR-036 evidence cadence", () => {
     const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
     const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
     const h = harness({
-      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
       snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
       transcript: async () => { throw new Error("pane gone"); },
     });
-    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    await h.supervisor.bind({ identity: claudeIdentity, operatingPointId: "worker-claude" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.progress.some((line) => line.includes("review unavailable"))).toBe(true));
     expect(h.reviews).toBe(0);
@@ -3340,11 +3340,11 @@ describe("the ADR-036 evidence cadence", () => {
     const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
     const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
     const h = harness({
-      child: { agentName: "worker", agentKind: "claude", candidateName: "worker-claude" },
+      child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
       snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
       transcript: async () => ["a", "b"],
     });
-    await h.supervisor.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    await h.supervisor.bind({ identity: claudeIdentity, operatingPointId: "worker-claude" });
     h.fireTimer();
     await vi.waitFor(() => expect(h.logged).toHaveLength(1));
     const logged = h.logged[0] as SupervisionReviewLogEntry;
@@ -3356,14 +3356,14 @@ describe("the ADR-036 evidence cadence", () => {
     const devinSession = { source: "devin", agent: "devin", kind: "id", value: "devin-1" };
     const devinIdentity: SupervisedIdentity = { ...identity, agentKind: "devin", agentSession: devinSession };
     const h = harness({
-      child: { agentName: "worker", agentKind: "devin", candidateName: "worker-devin" },
+      child: { agentName: "worker", agentKind: "devin", operatingPointId: "worker-devin" },
       snapshots: [
         snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })]),
         snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })]),
       ],
       devinSession: async () => ({ position: "opaque-token", events: [] }),
     });
-    await h.supervisor.bind({ identity: devinIdentity, candidateName: "worker-devin" });
+    await h.supervisor.bind({ identity: devinIdentity, operatingPointId: "worker-devin" });
     await h.supervisor.onEvent(exitEvent("p1", { exit_code: 9 }));
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
@@ -3384,7 +3384,7 @@ describe("the ADR-036 evidence cadence", () => {
         traceFile: piJsonl([piToolCall("Deploy")]),
         resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
       });
-      await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+      await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
       h.fireTimer();
       await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
       const paths = reviewLogPaths(root);
@@ -3452,7 +3452,7 @@ describe("the ADR-036 evidence cadence", () => {
         traceFile: piJsonl([{ type: "message", timestamp: 1, message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "Bash", arguments: { command: canary } }] } }]),
         transcript: async () => ["ordinary line", canary],
       });
-      await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+      await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
       h.fireTimer();
       await vi.waitFor(() => expect(h.reviews).toBe(1));
       const paths = reviewLogPaths(root);
@@ -3473,7 +3473,7 @@ describe("the ADR-036 evidence cadence", () => {
 describe("the supervisor job port", () => {
   it("returns pending events once and marks exactly those observed", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     expect(h.supervisor.coversIdentity(identity)).toBe(true);
     expect(h.supervisor.coversIdentity({ ...identity, paneId: "p2" })).toBe(false);
     expect(h.supervisor.coversIdentity({ ...identity, agentSession: undefined } as unknown as SupervisedIdentity)).toBe(false);
@@ -3488,7 +3488,7 @@ describe("the supervisor job port", () => {
 
   it("settles on shutdown and on a released reservation, and refuses to re-settle", async () => {
     const shutdown = harness({ snapshots: [snapshot([paneRecord()])] });
-    await shutdown.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await shutdown.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     shutdown.supervisor.shutdown();
     shutdown.supervisor.shutdown();
     expect(await shutdown.supervisor.run()).toEqual({ outcome: "cancelled", reason: "manager_session_shutdown" });
@@ -3501,14 +3501,14 @@ describe("the supervisor job port", () => {
     expect(released.supervisor.view().settledReason).toBe("launch_failed_placement");
 
     const settledThenStopped = harness({ snapshots: [snapshot([paneRecord()]), snapshot([], [])] });
-    await settledThenStopped.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await settledThenStopped.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await settledThenStopped.supervisor.onEvent(thinEvent("pane_closed"));
     settledThenStopped.supervisor.shutdown();
     await (settledThenStopped.supervisor as unknown as { settle(outcome: "cancelled", reason: string): Promise<void> }).settle("cancelled", "ignored");
     expect(await settledThenStopped.supervisor.run()).toMatchObject({ outcome: "released" });
 
     const releasedAfterSettle = harness({ snapshots: [snapshot([paneRecord()]), snapshot([], [])] });
-    await releasedAfterSettle.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await releasedAfterSettle.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await releasedAfterSettle.supervisor.onEvent(thinEvent("pane_closed"));
     releasedAfterSettle.supervisor.release("too late");
     expect(await releasedAfterSettle.supervisor.run()).toMatchObject({ outcome: "released" });
@@ -3516,7 +3516,7 @@ describe("the supervisor job port", () => {
 
   it("survives a job-progress publisher that throws", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord()])] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     // Replace the update seam with one that throws; supervision must not notice.
     (h.supervisor as unknown as { deps: { update: () => void } }).deps.update = () => { throw new Error("ui gone"); };
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 6 })));
@@ -3525,12 +3525,12 @@ describe("the supervisor job port", () => {
 
   it("projects fallback child identity fields and settled omissions", async () => {
     const fallback = harness({
-      child: { agentName: "worker", agentKind: "claude", candidateName: "requested-claude" },
+      child: { agentName: "worker", agentKind: "claude", operatingPointId: "requested-claude" },
       snapshots: [snapshot([paneRecord()])],
     });
-    await fallback.supervisor.bind({ identity, candidateName: "fallback-pi" });
+    await fallback.supervisor.bind({ identity, operatingPointId: "fallback-pi" });
     expect(fallback.supervisor.view()).toMatchObject({
-      child: { candidateName: "fallback-pi", requestedCandidateName: "requested-claude", requestedAgentKind: "claude" },
+      child: { operatingPointId: "fallback-pi", requestedOperatingPointId: "requested-claude", requestedAgentKind: "claude" },
     });
 
     const internals = fallback.supervisor as unknown as { state: string; identity?: SupervisedIdentity; status?: string };
@@ -3558,7 +3558,7 @@ describe("self-close wake suppression", () => {
   it("records no event or wake after a proven self-close", async () => {
     const tracker = createSelfCloseTracker();
     const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     tracker.begin("p1")(true);
     await h.supervisor.onEvent(thinEvent("pane_closed"));
     expect(h.wakes).toEqual([]);
@@ -3572,7 +3572,7 @@ describe("self-close wake suppression", () => {
   it("suppresses the event when absence is observed before the close finishes", async () => {
     const tracker = createSelfCloseTracker();
     const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     const finish = tracker.begin("p1");
     const observed = h.supervisor.onEvent(thinEvent("pane_closed"));
     finish(true);
@@ -3586,7 +3586,7 @@ describe("self-close wake suppression", () => {
   it("wakes exactly once when a still-pending close resolves unproven", async () => {
     const tracker = createSelfCloseTracker();
     const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     const finish = tracker.begin("p1");
     const observed = h.supervisor.onEvent(thinEvent("pane_closed"));
     expect(h.wakes).toEqual([]);
@@ -3599,7 +3599,7 @@ describe("self-close wake suppression", () => {
   it("wakes pane_closed normally when the tracked close failed", async () => {
     const tracker = createSelfCloseTracker();
     const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     tracker.begin("p1")(false);
     await h.supervisor.onEvent(thinEvent("pane_closed"));
     expect(types(h.wakes)).toEqual(["pane_closed"]);
@@ -3611,7 +3611,7 @@ describe("self-close wake suppression", () => {
     tracker.begin("p1")(true);
     expect(tracker.consume("p1")).toBe(true);
     const h = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), absent()] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await h.supervisor.onEvent(thinEvent("pane_closed"));
     expect(types(h.wakes)).toEqual(["pane_closed"]);
     tracker.clear();
@@ -3628,7 +3628,7 @@ describe("self-close wake suppression", () => {
         snapshot([paneRecord({ agentSession: null, agentKind: null })], []),
       ],
     });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     tracker.begin("p1")(true);
     await h.supervisor.onEvent(thinEvent("pane_exited"));
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
@@ -3645,13 +3645,13 @@ describe("self-close wake suppression", () => {
     const consumeSpy = vi.spyOn(tracker, "consume");
 
     const replaced = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()]), snapshot([paneRecord({ terminalId: "t9" })])] });
-    await replaced.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await replaced.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     tracker.begin("p1")(true);
     await replaced.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ terminalId: "t9", revision: 6 })));
     expect(types(replaced.wakes)).toEqual(["identity_replaced"]);
 
     const lost = harness({ selfClose: tracker, snapshots: [snapshot([paneRecord()])] });
-    await lost.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await lost.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await lost.supervisor.onBootstrap(snapshot([], []), 2, true);
     expect(types(lost.wakes)).toEqual(["identity_lost"]);
 
@@ -3667,7 +3667,7 @@ describe("self-close wake suppression", () => {
 
     // A marker on the origin pane must not suppress the destination's closure.
     const stray = harness({ selfClose: tracker, snapshots: [snapshot([origin]), invalidDestination()] });
-    await stray.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await stray.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await stray.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     tracker.begin("p1")(true);
     await stray.supervisor.onReconciliationSnapshot(absent());
@@ -3676,7 +3676,7 @@ describe("self-close wake suppression", () => {
 
     // The marker on the destination itself does suppress it.
     const held = harness({ selfClose: tracker, snapshots: [snapshot([origin]), invalidDestination()] });
-    await held.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await held.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await held.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     tracker.begin("p2")(true);
     await held.supervisor.onReconciliationSnapshot(absent());
@@ -3696,7 +3696,7 @@ describe("self-close wake suppression", () => {
       clear: () => undefined,
     };
     const h = harness({ selfClose: throwing, snapshots: [snapshot([paneRecord()]), absent()] });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await h.supervisor.onEvent(thinEvent("pane_closed"));
     expect(types(h.wakes)).toEqual(["pane_closed"]);
 
@@ -3707,7 +3707,7 @@ describe("self-close wake suppression", () => {
       clear: () => undefined,
     };
     const deferred = harness({ selfClose: rejecting, snapshots: [snapshot([paneRecord()]), absent()] });
-    await deferred.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await deferred.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await deferred.supervisor.onEvent(thinEvent("pane_closed"));
     await vi.waitFor(() => expect(deferred.wakes).toHaveLength(1));
     expect(types(deferred.wakes)).toEqual(["pane_closed"]);
@@ -3722,7 +3722,7 @@ describe("managed handoff evaluation", () => {
     const allocation = await allocator.allocate();
     await allocator.persist(allocation, {
       manager: { paneId: "p0", display: "caller", source: "injected" },
-      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] },
+      child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] },
     });
     return allocation;
   }
@@ -3752,7 +3752,7 @@ describe("managed handoff evaluation", () => {
       handoffs: gate,
       ...(options.repairPrompt ? { repairPrompt: options.repairPrompt } : {}),
     });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
     const allocation = await managedAllocation();
     const run = await gate.bind(allocation, identity);
     return { gate, h, allocation, run };
@@ -3927,7 +3927,7 @@ describe("managed handoff evaluation", () => {
   it("reports an unbound identity as the reason a gated host is still ungated", async () => {
     const h = harness({ snapshots: [workingOrigin()], handoffs: createHandoffGate() });
     expect(h.supervisor.handoffEvidence()).toEqual({ gated: false, reason: "identity_unavailable" });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi", stateChangeSeq: 5 });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
     expect(h.supervisor.handoffEvidence()).toEqual({ gated: false, reason: "no_managed_run" });
     h.supervisor.shutdown();
   });

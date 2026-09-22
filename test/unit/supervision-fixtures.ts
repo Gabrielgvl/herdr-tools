@@ -3,7 +3,7 @@ import type { ProvisionalSupervisionBinding } from "../../src/supervision/identi
 import type { SupervisionBinding } from "../../src/supervision/supervisor.js";
 
 export interface StubSupervision extends SupervisionCoordinator {
-  readonly reserved: Array<{ agentName: string; agentKind: string; candidateName: string }>;
+  readonly reserved: Array<{ agentName: string; agentKind: string; operatingPointId: string }>;
   readonly bindAttempts: SupervisionBinding[];
   readonly bound: SupervisionBinding[];
   readonly provisionalBindAttempts: ProvisionalSupervisionBinding[];

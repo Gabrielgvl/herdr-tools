@@ -227,11 +227,9 @@ export async function writeIdentityProvenance(
   provenance: "adopted" | "launched",
   actorPaneId: string | undefined,
   session: AgentSessionIdentity,
-  signal: AbortSignal,
-  scope?: "orchestrator"
+  signal: AbortSignal
 ): Promise<string | undefined> {
   const tokens = [`identity_provenance=${provenance}`];
-  if (scope !== undefined) tokens.push(`identity_scope=${scope}`);
   const actor = actorPaneId === undefined ? undefined : tokenValue(actorPaneId);
   if (actor !== undefined) tokens.push(`identity_actor=${actor}`);
   const sessionValue = tokenValue(session.value);

@@ -1,10 +1,10 @@
 import { promises as fs } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { quotaKeyFor, type Catalog, type QuotaKey, type ResolvedCandidate, type RunnerKind, type RunnerPlumbing, type RunnerPools } from "./catalog.js";
+import { type Catalog, type OperatingPoint, type QuotaKey, type RunnerEntry, type RunnerKind, type RunnerPlumbing, type RunnerPools } from "./catalog.js";
 import { buildRuntimeArgv } from "./profiles/adapters.js";
 import { normalizeScopedResourcePath } from "./profiles/parser.js";
 import { assertPhysicalContainment } from "./profiles/skill-bundles.js";
-import type { ClaudePermissionMode, DevinPermissionMode, RuntimeProfile } from "./profiles/types.js";
+import { CLAUDE_EFFORTS, THINKING_LEVELS, type ClaudeEffort, type ClaudePermissionMode, type DevinPermissionMode, type RuntimeProfile, type ThinkingLevel } from "./profiles/types.js";
 
 export type CompileErrorCode = "INVALID_SELECTION" | "SELECTION_OUTSIDE_POOL" | "CANDIDATE_NOT_REVIEWED" | "EMPTY_PERMIT_SET";
 
@@ -26,7 +26,15 @@ export interface CompileSpec {
   label: string;
 }
 
-/** Jev's resource picks for one chain candidate, keyed by pool field. */
+/** One generated operating point resolved to its runner entry — the ADR-037 unit the compiler binds to. */
+export interface ResolvedPoint {
+  /** The point's position in `catalog.points` — the index the fitness nouls and decision evidence key on. */
+  index: number;
+  point: OperatingPoint;
+  runner: RunnerEntry;
+}
+
+/** Jev's resource picks for one operating point, keyed by pool field. */
 export type ResourceSelection = Partial<Record<keyof RunnerPools, readonly string[]>>;
 
 /**
@@ -67,7 +75,8 @@ export interface CompiledResourceSet {
 /** A launchable execution contract: the effective per-runner configuration plus the evidence of how it was derived. */
 export interface CompiledContract {
   specLabel: string;
-  candidate: { index: number; runner: RunnerKind; model: string; account?: string };
+  /** The operating-point identity the contract was compiled for. */
+  candidate: { index: number; id: string; runner: RunnerKind; model: string; reasoning?: ThinkingLevel | ClaudeEffort };
   /** The availability tuple this candidate is admitted under. */
   quota: QuotaKey;
   scopeRoot: string;
@@ -188,7 +197,7 @@ interface Work {
   gaps: CompileGap[];
 }
 
-async function compilePi(candidate: ResolvedCandidate["candidate"], runner: ResolvedCandidate["runner"], selected: Record<keyof RunnerPools, string[]>, work: Work): Promise<RuntimeProfile> {
+async function compilePi(point: OperatingPoint, runner: RunnerEntry, selected: Record<keyof RunnerPools, string[]>, work: Work): Promise<RuntimeProfile> {
   const pools = runner.pools;
   const fields: Record<string, FieldWork> = {};
   for (const field of CONSUMABLE_FIELDS.pi) {
@@ -216,15 +225,17 @@ async function compilePi(candidate: ResolvedCandidate["candidate"], runner: Reso
   for (const field of CONSUMABLE_FIELDS.pi) work.resources[field] = record(pools[field], fields[field]!);
   return {
     kind: "pi",
-    model: candidate.model,
-    thinking: runner.defaults.thinking!,
+    model: point.model,
+    // Reasoning comes from the selected point, never a runner default: the
+    // membership check above proves a pi point carries a ThinkingLevel.
+    thinking: point.reasoning as ThinkingLevel,
     tools: [...fields.tools!.permitted],
     extensions: [...fields.extensions!.exposed],
     skills: [...fields.skills!.exposed],
   };
 }
 
-async function compileClaude(candidate: ResolvedCandidate["candidate"], runner: ResolvedCandidate["runner"], catalog: Catalog, selected: Record<keyof RunnerPools, string[]>, work: Work): Promise<RuntimeProfile> {
+async function compileClaude(point: OperatingPoint, runner: RunnerEntry, catalog: Catalog, selected: Record<keyof RunnerPools, string[]>, work: Work): Promise<RuntimeProfile> {
   const pools = runner.pools;
   const fields: Record<string, FieldWork> = {};
   for (const field of CONSUMABLE_FIELDS.claude) {
@@ -299,8 +310,10 @@ async function compileClaude(candidate: ResolvedCandidate["candidate"], runner: 
   work.gaps.push({ kind: "ambient-exposure", message: "Claude plugin dirs load additively on ambient plugin and skill configuration; the contract controls what is added, not what the environment already provides" });
   return {
     kind: "claude",
-    model: candidate.model,
-    effort: runner.defaults.effort!,
+    model: point.model,
+    // Reasoning comes from the selected point, never a runner default: an
+    // unreasoned point (e.g. a Haiku-class model) emits no `effort` at all.
+    ...(point.reasoning === undefined ? {} : { effort: point.reasoning as ClaudeEffort }),
     permissionMode: runner.defaults.permissionMode as ClaudePermissionMode,
     allowedTools: [...fields.tools!.permitted, ...[...fields.mcp!.permitted].map((server) => mcpToolRule(providerOf(server)!.plugin, server))],
     disallowedTools: [...fields.tools!.denied, ...[...fields.mcp!.denied].map((server) => mcpToolRule(providerOf(server)!.plugin, server))],
@@ -310,13 +323,13 @@ async function compileClaude(candidate: ResolvedCandidate["candidate"], runner: 
   };
 }
 
-async function compileAmbient(candidate: ResolvedCandidate["candidate"], runner: ResolvedCandidate["runner"], work: Work): Promise<RuntimeProfile> {
+async function compileAmbient(point: OperatingPoint, runner: RunnerEntry, work: Work): Promise<RuntimeProfile> {
   // Ambient pools are empty by construction, so any named selection already
   // failed membership above — the same boundary, not a special case.
   work.gaps.push({ kind: "ambient-exposure", message: `${runner.kind} consumes no pool fields; all resources are ambient and outside catalog review` });
   return runner.kind === "agy"
-    ? { kind: "agy", model: candidate.model, mode: runner.defaults.mode!, addDirs: [] }
-    : { kind: "devin", model: candidate.model, permissionMode: runner.defaults.permissionMode as DevinPermissionMode };
+    ? { kind: "agy", model: point.model, mode: runner.defaults.mode!, addDirs: [] }
+    : { kind: "devin", model: point.model, permissionMode: runner.defaults.permissionMode as DevinPermissionMode };
 }
 
 /**
@@ -327,9 +340,16 @@ async function compileAmbient(candidate: ResolvedCandidate["candidate"], runner:
  * physical containment of the exposed path-typed resources and plugin manifest
  * reads for declared MCP dependencies.
  */
-export async function compileCandidateContract(catalog: Catalog, spec: CompileSpec, resolved: ResolvedCandidate, selection: ResourceSelection = {}): Promise<CompiledContract> {
-  const { candidate, runner } = resolved;
-  if (candidate.runner !== runner.kind || !runner.models.includes(candidate.model)) fail("CANDIDATE_NOT_REVIEWED", `candidate ${candidate.runner}/${candidate.model} is not in the runner's reviewed model set`, { runner: candidate.runner, model: candidate.model });
+export async function compileCandidateContract(catalog: Catalog, spec: CompileSpec, resolved: ResolvedPoint, selection: ResourceSelection = {}): Promise<CompiledContract> {
+  const { point, runner } = resolved;
+  const entry = runner.models.find((item) => item.model === point.model);
+  if (point.runner !== runner.kind || entry === undefined) fail("CANDIDATE_NOT_REVIEWED", `point ${point.runner}/${point.model} is not in the runner's reviewed model set`, { runner: point.runner, model: point.model });
+  // Reviewed membership covers the point's reasoning too: it must be a member
+  // of the model's own declared axis (empty on ambient runners), and Pi argv
+  // cannot express an unreasoned point at all.
+  if (point.reasoning !== undefined && !(entry.supportedReasoning ?? []).includes(point.reasoning)) fail("CANDIDATE_NOT_REVIEWED", `point reasoning ${point.reasoning} is outside the model's declared axis`, { runner: point.runner, model: point.model, reasoning: point.reasoning });
+  if (runner.kind === "pi" && (point.reasoning === undefined || !THINKING_LEVELS.includes(point.reasoning as ThinkingLevel))) fail("CANDIDATE_NOT_REVIEWED", `pi point ${point.id} carries no reasoning setting`, { runner: point.runner, model: point.model });
+  if (runner.kind === "claude" && point.reasoning !== undefined && !CLAUDE_EFFORTS.includes(point.reasoning as ClaudeEffort)) fail("CANDIDATE_NOT_REVIEWED", `claude point ${point.id} carries a non-effort reasoning setting`, { runner: point.runner, model: point.model });
   for (const field of Object.keys(selection)) if (!POOL_FIELDS.includes(field as keyof RunnerPools)) fail("INVALID_SELECTION", `selection.${field} is not a pool field`, { field });
   const scopeRoot = catalog.source.scopeRoot;
   // Membership is checked for every pool field, consumable or not: a selection
@@ -338,7 +358,7 @@ export async function compileCandidateContract(catalog: Catalog, spec: CompileSp
   const selected: Record<keyof RunnerPools, string[]> = { tools: [], extensions: [], skills: [], plugins: [], mcp: [] };
   for (const field of POOL_FIELDS) selected[field] = selectWithinPool(runner.pools[field], selectionValues(selection[field], field), field, scopeRoot);
   const work: Work = { resources: {}, derivations: [], gaps: [] };
-  const runtime = runner.kind === "pi" ? await compilePi(candidate, runner, selected, work) : runner.kind === "claude" ? await compileClaude(candidate, runner, catalog, selected, work) : await compileAmbient(candidate, runner, work);
+  const runtime = runner.kind === "pi" ? await compilePi(point, runner, selected, work) : runner.kind === "claude" ? await compileClaude(point, runner, catalog, selected, work) : await compileAmbient(point, runner, work);
   // On allowlist-tooling runners an empty permit set emits no allowlist flag
   // at all — argv cannot express "no tools", and omitting the flag would grant
   // the ambient default set, silently widening past the pool. Fail instead.
@@ -350,8 +370,9 @@ export async function compileCandidateContract(catalog: Catalog, spec: CompileSp
   for (const path of exposedPaths) await assertPhysicalContainment(path, scopeRoot, "compiled selection");
   return {
     specLabel: spec.label,
-    candidate: candidate.account === undefined ? { index: resolved.index, runner: candidate.runner, model: candidate.model } : { index: resolved.index, runner: candidate.runner, model: candidate.model, account: candidate.account },
-    quota: quotaKeyFor(candidate, runner),
+    candidate: { index: resolved.index, id: point.id, runner: point.runner, model: point.model, ...(point.reasoning === undefined ? {} : { reasoning: point.reasoning }) },
+    // The point's quota tuple is part of the reviewed operating point.
+    quota: point.quota,
     scopeRoot,
     sessionPersistence: runner.defaults.sessionPersistence,
     timeoutMinutes: runner.defaults.timeoutMinutes,

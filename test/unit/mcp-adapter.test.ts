@@ -102,24 +102,22 @@ describe("MCP input schema publication", () => {
     expect(published.anyOf.every((variant) => variant.additionalProperties === false)).toBe(true);
   });
 
-  it("publishes herdr_launch as the strict spec request root (ADR-035)", () => {
+  it("publishes herdr_launch as the strict flat Task root (ADR-037)", () => {
     const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
     const published = publishedInputSchema(definition.parameters) as { type: string; properties: Record<string, unknown>; required?: unknown; anyOf?: unknown; additionalProperties?: unknown };
     expect(published.type).toBe("object");
     expect(published.anyOf).toBeUndefined();
-    // The spec request is a single object, so the published root carries the
+    // The Task is a single strict object, so the published root carries the
     // real requireds — the optional-all flattening existed only for the union.
-    expect(published.required).toEqual(expect.arrayContaining(["name", "specs", "supervisionDigest"]));
+    expect(published.required).toEqual(expect.arrayContaining(["objective", "scope", "doneWhen"]));
     expect(published.additionalProperties).toBe(false);
-    for (const field of ["name", "specs", "placement", "label", "cwd", "focus", "assignmentDelivery", "supervisionDigest"]) {
+    for (const field of ["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd"]) {
       expect(published.properties).toHaveProperty(field);
     }
-    for (const field of ["profile", "overrides", "assignment", "instructions"]) {
+    // The deleted caller-authority fields have no alias at the boundary.
+    for (const field of ["name", "specs", "tasks", "instructions", "assignment", "supervisionDigest", "category", "count", "placement", "focus", "assignmentDelivery", "profile", "overrides", "transportBypass"]) {
       expect(published.properties).not.toHaveProperty(field);
     }
-    const specItem = (published.properties.specs as { items: unknown }).items;
-    expect(specItem).toMatchObject({ type: "object", additionalProperties: false, required: expect.arrayContaining(["label", "instructions", "assignment"]) });
-    expect((specItem as { properties: Record<string, unknown> }).properties.label).toMatchObject({ pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" });
   });
 
   // Regression coverage for the incident where the pi harness dropped every
@@ -174,9 +172,9 @@ describe("MCP published schema parity", () => {
     // The flat publication deliberately accepts missing required fields and
     // cross-variant fields — the tools' runtime validation owns the union
     // contract now — but it still rejects undeclared keys and mistyped values.
-    // Exception: herdr_launch's spec request is a single strict object, so its
+    // Exception: herdr_launch's Task request is a single strict object, so its
     // published root carries the real requireds (ADR-035).
-    const specReq = (overrides: Record<string, unknown> = {}, specs: unknown[] = [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }]) => ({ name: "task", specs, supervisionDigest: { doneWhen: ["d"], constraints: ["none"] }, ...overrides });
+    const taskReq = (overrides: Record<string, unknown> = {}) => ({ objective: "o", scope: "s", doneWhen: ["d"], constraints: ["none"], ...overrides });
     const cases: Array<[string, unknown, boolean]> = [
       ["herdr_inspect", {}, true],
       ["herdr_inspect", { mode: "context" }, true],
@@ -216,36 +214,47 @@ describe("MCP published schema parity", () => {
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: true }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }, false],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }, false],
-      // The spec request (ADR-035): caller-authored specs, no profile, no overrides.
-      ["herdr_launch", specReq(), true],
-      ["herdr_launch", specReq({}, [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }, { label: "scout", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" }, category: "cheap", count: 2 }]), true],
-      ["herdr_launch", specReq({ label: "free pane label", cwd: "/repo", focus: true, assignmentDelivery: "inline", placement: { mode: "existing_pane", target: "w:p" } }), true],
-      ["herdr_launch", specReq({ extra: true }), false],
-      // The digest is a required request field: a digest-absent request fails at the schema.
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }] }, false],
-      ["herdr_launch", specReq({ supervisionDigest: { doneWhen: [], constraints: ["none"] } }), false],
-      ["herdr_launch", specReq({ supervisionDigest: { doneWhen: ["d"], constraints: [] } }), false],
-      ["herdr_launch", specReq({ supervisionDigest: { doneWhen: ["d"] } }), false],
-      // specs is required and non-empty; spec keys are strict.
-      ["herdr_launch", { name: "task", supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }, false],
-      ["herdr_launch", specReq({}, []), false],
-      ["herdr_launch", specReq({}, [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" }, extra: true }]), false],
-      ["herdr_launch", specReq({}, [{ label: "worker", instructions: "i" }]), false],
-      // spec.label is the kebab Role contract, not a free label.
-      ["herdr_launch", specReq({}, [{ label: "Worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }]), false],
-      ["herdr_launch", specReq({}, [{ label: "bad name", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }]), false],
-      ["herdr_launch", specReq({}, [{ label: "worker", instructions: "", assignment: { objective: "o", scope: "s", verification: "v" } }]), false],
-      ["herdr_launch", specReq({}, [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" }, count: 0 }]), false],
-      ["herdr_launch", specReq({}, [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" }, category: "Not Kebab" }]), false],
-      // A per-spec digest is an unknown field — the digest stays request-level.
-      ["herdr_launch", specReq({}, [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }]), false],
-      // The profile-era request is now unknown keys at the boundary.
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }, false],
-      ["herdr_launch", { name: "worker", profile: "worker-pi" }, false],
-      ["herdr_launch", specReq({ profile: "worker-pi" }), false],
-      ["herdr_launch", specReq({ overrides: { model: "m" } }), false],
-      ["herdr_launch", specReq({ assignment: { objective: "o", scope: "s", verification: "v" } }), false],
-      ["herdr_launch", specReq({ initialPrompt: "o" }), false]
+      // The flat Task (ADR-037): caller-authored objective/scope/doneWhen, no
+      // identity, routing, placement, or supervision authority.
+      ["herdr_launch", taskReq(), true],
+      ["herdr_launch", taskReq({ tier: "strong", replicas: 2, label: "docs sprint", cwd: "/repo", recoveryOf: "run-1" }), true],
+      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"] }, true],
+      ["herdr_launch", taskReq({ extra: true }), false],
+      // The required semantic fields fail at the schema when absent or empty.
+      ["herdr_launch", { objective: "o", scope: "s" }, false],
+      ["herdr_launch", taskReq({ objective: "" }), false],
+      ["herdr_launch", taskReq({ scope: "" }), false],
+      ["herdr_launch", taskReq({ doneWhen: [] }), false],
+      ["herdr_launch", taskReq({ doneWhen: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] }), false],
+      ["herdr_launch", taskReq({ constraints: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] }), false],
+      ["herdr_launch", taskReq({ constraints: [] }), true],
+      ["herdr_launch", taskReq({ objective: "a\0b" }), false],
+      ["herdr_launch", taskReq({ label: "a\nb" }), false],
+      // Tier is the reviewed enum; replicas is a bounded integer.
+      ["herdr_launch", taskReq({ tier: "bogus" }), false],
+      ["herdr_launch", taskReq({ tier: "standard" }), true],
+      ["herdr_launch", taskReq({ replicas: 0 }), false],
+      ["herdr_launch", taskReq({ replicas: 9 }), false],
+      ["herdr_launch", taskReq({ replicas: 1.5 }), false],
+      ["herdr_launch", taskReq({ replicas: "2" }), false],
+      ["herdr_launch", taskReq({ replicas: 8 }), true],
+      // The deleted caller-authority fields are unknown keys — no alias survives.
+      ["herdr_launch", taskReq({ name: "worker" }), false],
+      ["herdr_launch", taskReq({ specs: [{ label: "worker" }] }), false],
+      ["herdr_launch", taskReq({ tasks: [] }), false],
+      ["herdr_launch", taskReq({ instructions: "i" }), false],
+      ["herdr_launch", taskReq({ assignment: { objective: "o" } }), false],
+      ["herdr_launch", taskReq({ supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }), false],
+      ["herdr_launch", taskReq({ category: "cheap" }), false],
+      ["herdr_launch", taskReq({ count: 2 }), false],
+      ["herdr_launch", taskReq({ placement: { mode: "existing_pane" } }), false],
+      ["herdr_launch", taskReq({ focus: true }), false],
+      ["herdr_launch", taskReq({ assignmentDelivery: "inline" }), false],
+      ["herdr_launch", taskReq({ transportBypass: true }), false],
+      // The profile-era request is unknown keys at the boundary.
+      ["herdr_launch", taskReq({ profile: "worker-pi" }), false],
+      ["herdr_launch", taskReq({ overrides: { model: "m" } }), false],
+      ["herdr_launch", taskReq({ initialPrompt: "o" }), false]
     ];
     for (const [name, args, accepted] of cases) {
       const definition = surface.definitions.find((candidate) => candidate.name === name)!;
@@ -256,10 +265,10 @@ describe("MCP published schema parity", () => {
     }
   });
 
-  it("keeps the single spec contract at runtime: every contract-invalid call is INVALID_INPUT", async () => {
+  it("keeps the single Task contract at runtime: every contract-invalid call is INVALID_INPUT", async () => {
     const surface = realSurface();
     // Missing required fields, removed profile-era fields, strict-key
-    // violations, and bad value domains fail at the single spec boundary.
+    // violations, and bad value domains fail at the single Task boundary.
     const rejected: Array<[string, unknown]> = [
       ["herdr_inspect", { mode: "context", collection: "panes" }],
       ["herdr_inspect", { mode: "context", profile: "worker-pi" }],
@@ -288,24 +297,20 @@ describe("MCP published schema parity", () => {
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }],
       ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }],
       ["herdr_launch", { name: "task" }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }] }],
-      ["herdr_launch", { name: "task", specs: [], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
-      ["herdr_launch", { name: "task", specs: [{ label: "Worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" }, count: 0 }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: [], constraints: ["none"] } }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: [] } }],
-      // A valid spec request is not a contract-invalid case; it belongs to the
-      // cutover execution tests, not this schema-error table.
-      // The profile-era request is rejected outright: profile, overrides, and a
-      // request-level assignment are unknown fields under the spec contract.
+      ["herdr_launch", { objective: "o", scope: "s" }],
+      ["herdr_launch", { objective: "o", scope: "s", doneWhen: [] }],
+      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], replicas: 0 }],
+      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], tier: "bogus" }],
+      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], label: "a\nb" }],
+      // A valid Task is not a contract-invalid case; it belongs to the cutover
+      // execution tests, not this schema-error table.
+      // The deleted request shapes are rejected outright: specs, digests,
+      // profile, overrides, and request-level assignment are unknown fields.
+      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
       ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }],
-      ["herdr_launch", { name: "worker", profile: "worker-pi" }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] }, profile: "worker-pi" }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] }, overrides: { model: "m" } }],
-      ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] }, initialPrompt: "o" }]
+      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], profile: "worker-pi" }],
+      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], overrides: { model: "m" } }],
+      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], initialPrompt: "o" }]
     ];
     for (const [name, args] of rejected) {
       const outcome = await callTool({ surface, name, args, host, callId: "c", queue: new SequentialToolQueue() });
@@ -363,30 +368,25 @@ describe("MCP argument validation", () => {
    */
   it("splits schema label bounds from rendered payload bounds", async () => {
     const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
-    const overlongLabel = {
-      name: "worker",
-      specs: [{ label: "worker-overlong", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }],
-      supervisionDigest: { doneWhen: ["d"], constraints: ["none"] }
-    };
-    expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, overlongLabel)).toBe(false);
-    expect(Value.Check(definition.parameters, overlongLabel)).toBe(false);
-    const labelOutcome = await callTool({ surface: realSurface(), name: "herdr_launch", args: overlongLabel, host, callId: "c", queue: new SequentialToolQueue() });
+    const multiLineLabel = { objective: "o", scope: "s", doneWhen: ["d"], label: "a\nb" };
+    expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, multiLineLabel)).toBe(false);
+    expect(Value.Check(definition.parameters, multiLineLabel)).toBe(false);
+    const labelOutcome = await callTool({ surface: realSurface(), name: "herdr_launch", args: multiLineLabel, host, callId: "c", queue: new SequentialToolQueue() });
     expect(labelOutcome.isError).toBe(true);
     expect(payload(labelOutcome).code).toBe("INVALID_INPUT");
 
-    const oversizedInstructions = {
-      name: "worker",
-      specs: [{ label: "worker", instructions: "x".repeat(1024 * 1024 + 1), assignment: { objective: "o", scope: "s", verification: "v" } }],
-      assignmentDelivery: "attachment",
-      supervisionDigest: { doneWhen: ["The oversized instructions are delivered."], constraints: ["none"] }
+    const oversizedTask = {
+      objective: "x".repeat(1024 * 1024 + 1),
+      scope: "s",
+      doneWhen: ["The oversized task body is rejected."]
     };
-    // Instructions remain intentionally unbounded at the schema layer; the
-    // rendered assignment size limit owns this later rejection.
-    expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, oversizedInstructions)).toBe(true);
-    expect(Value.Check(definition.parameters, oversizedInstructions)).toBe(true);
-    const outcome = await callTool({ surface: realSurface(), name: "herdr_launch", args: oversizedInstructions, host, callId: "c", queue: new SequentialToolQueue() });
+    // Task text remains intentionally unbounded at the schema layer; the
+    // rendered-payload size limit owns this later rejection.
+    expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, oversizedTask)).toBe(true);
+    expect(Value.Check(definition.parameters, oversizedTask)).toBe(true);
+    const outcome = await callTool({ surface: realSurface(), name: "herdr_launch", args: oversizedTask, host, callId: "c", queue: new SequentialToolQueue() });
     expect(outcome.isError).toBe(true);
-    expect(payload(outcome).code).toBe("PAYLOAD_TOO_LARGE");
+    expect(payload(outcome).code).toBe("MESSAGE_TOO_LARGE");
   });
 
   it("rejects invalid arguments for every tool before mutation", async () => {
@@ -395,7 +395,7 @@ describe("MCP argument validation", () => {
       ["herdr_communicate", { target: "w:p2", operation: "prompt" }],
       ["herdr_wait", { targets: [], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }],
       ["herdr_jobs", { operation: "get" }],
-      ["herdr_launch", { name: "Worker", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
+      ["herdr_launch", { name: "worker", specs: [{ label: "worker" }], objective: "o", scope: "s", doneWhen: ["d"] }],
       ["herdr_pane", { operation: "split" }],
       ["herdr_tab", { operation: "create" }]
     ];
@@ -483,25 +483,26 @@ describe("MCP result mapping", () => {
     expect(outcomeBytes(multibyte)).toBeLessThanOrEqual(MCP_RESULT_MAX_BYTES);
   });
 
-  it("keeps a complete all-child batch manifest when verbose details exceed the bound", async () => {
-    // The batch result contract: the compact manifest leads the content so a
-    // bounded response can never masquerade as a smaller fan-out.
-    const names = Array.from({ length: 20 }, (_, index) => `task-worker-${index + 1}`);
+  it("keeps a complete all-child launch manifest when verbose details exceed the bound", async () => {
+    // The uniform launch result contract: the compact manifest leads the
+    // content so a bounded response can never masquerade as a smaller fan-out.
+    const names = Array.from({ length: 20 }, (_, index) => `task-abcd1234-${index + 1}`);
     const manifest = [
-      `herdr_launch batch outcome=launched router=route assignments=1 children=${names.length}`,
-      ...names.map((name, index) => `- ${name} requested=worker outcome=launched pane=w1:p${index + 10} supervisor=job-${index + 1}`)
+      `herdr_launch outcome=launched launch=abcd1234-0000-0000-0000-000000000000 tier=standard children=${names.length}`,
+      ...names.map((name, index) => `- ${name} state=launched point=pi:pi-model:low supervisor=job-${index + 1}`)
     ].join("\n");
     const details = {
-      operation: "launch_batch",
+      kind: "launch",
       outcome: "launched",
-      router: { kind: "route", assignments: [{ profile: "worker", count: names.length, purpose: "Perform the worker role." }] },
+      launchId: "abcd1234-0000-0000-0000-000000000000",
+      requestedTier: "standard",
+      effectiveTier: "standard",
       children: names.map((name, index) => ({
-        name,
-        role: "worker",
-        profile: "worker",
-        ordinal: index + 1,
-        status: "launched",
-        launch: { operation: "launch", outcome: "launched", paneId: `w1:p${index + 10}`, supervision: { jobId: `job-${index + 1}` }, postState: { blob: "x".repeat(4_000) } }
+        target: name,
+        state: "launched",
+        operatingPointId: "pi:pi-model:low",
+        supervisorJobId: `job-${index + 1}`,
+        details: { operation: "launch", outcome: "launched", paneId: `w1:p${index + 10}`, supervision: { jobId: `job-${index + 1}` }, postState: { blob: "x".repeat(4_000) } }
       }))
     };
     const outcome = await call(stub({ execute: async () => ({ content: [{ type: "text", text: manifest }], details }) }));

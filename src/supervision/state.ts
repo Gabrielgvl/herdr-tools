@@ -21,9 +21,9 @@ export interface SupervisionChildView {
   paneId: string;
   terminalId: string;
   /** The compiled candidate that actually started this child. */
-  candidateName: string;
+  operatingPointId: string;
   /** Present only when fallback selection changed the candidate after reservation. */
-  requestedCandidateName?: string;
+  requestedOperatingPointId?: string;
   /** Present only when fallback selection changed the kind after reservation. */
   requestedAgentKind?: string;
 }
@@ -40,9 +40,9 @@ export interface SupervisionProvisionalView {
   paneId: string;
   terminalId: string;
   /** The compiled candidate that actually started this child. */
-  candidateName: string;
+  operatingPointId: string;
   /** Present only when fallback selection changed the candidate after reservation. */
-  requestedCandidateName?: string;
+  requestedOperatingPointId?: string;
   baseline: {
     state: "idle";
     stateChangeSeq: number;
@@ -159,13 +159,13 @@ function status(value: unknown): value is SupervisionAgentStatus {
 }
 
 function child(value: unknown): value is SupervisionChildView {
-  if (!record(value) || !text(value.agentName) || !text(value.agentKind) || !text(value.paneId) || !text(value.terminalId) || !text(value.candidateName)) return false;
-  return (value.requestedCandidateName === undefined || text(value.requestedCandidateName)) && (value.requestedAgentKind === undefined || text(value.requestedAgentKind));
+  if (!record(value) || !text(value.agentName) || !text(value.agentKind) || !text(value.paneId) || !text(value.terminalId) || !text(value.operatingPointId)) return false;
+  return (value.requestedOperatingPointId === undefined || text(value.requestedOperatingPointId)) && (value.requestedAgentKind === undefined || text(value.requestedAgentKind));
 }
 
 function provisional(value: unknown): value is SupervisionProvisionalView {
-  if (!record(value) || value.agentKind !== "agy" || !text(value.agentName) || !text(value.paneId) || !text(value.terminalId) || !text(value.candidateName)) return false;
-  if (value.requestedCandidateName !== undefined && !text(value.requestedCandidateName)) return false;
+  if (!record(value) || value.agentKind !== "agy" || !text(value.agentName) || !text(value.paneId) || !text(value.terminalId) || !text(value.operatingPointId)) return false;
+  if (value.requestedOperatingPointId !== undefined && !text(value.requestedOperatingPointId)) return false;
   return record(value.baseline) && value.baseline.state === "idle" && safeCounter(value.baseline.stateChangeSeq) && safeCounter(value.baseline.revision);
 }
 

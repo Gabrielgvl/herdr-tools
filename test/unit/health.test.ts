@@ -373,6 +373,20 @@ describe("agent.prompt compatibility preflight", () => {
     expect(cli.pingPromptEndpoint).not.toHaveBeenCalled();
   });
 
+  it("accepts a matching client/server version pair newer than the reference pin (same protocol + generation)", async () => {
+    const base = JSON.parse(promptHealthy) as { client: Record<string, unknown>; server: Record<string, unknown> };
+    base.client.version = "0.9.1";
+    base.server.version = "0.9.1";
+    const cli = {
+      runText: vi.fn(async () => JSON.stringify(base)),
+      readApiSchema: vi.fn(async () => installedPromptSchema),
+      pingPromptEndpoint: vi.fn(async () => undefined)
+    };
+    await expect(preflightPromptCompatibility(cli, new AbortController().signal)).resolves.toMatchObject({ client: { version: "0.9.1" } });
+    expect(cli.readApiSchema).toHaveBeenCalledOnce();
+    expect(cli.pingPromptEndpoint).toHaveBeenCalledOnce();
+  });
+
   it("fails closed for an incompatible schema or ping without retaining backend text", async () => {
     const badSchema = {
       runText: vi.fn(async () => promptHealthy),

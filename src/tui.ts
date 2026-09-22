@@ -137,6 +137,10 @@ export function resultForRender(
     return { text: `settled · ${waitResult}${targetId ? ` · ${targetId}` : ""}`, tone };
   }
   if (details?.outcome === "partial") return { text: `partial${targetId ? ` · ${targetId}` : ""}`, tone: "warning" };
+  // The uniform launch result reports abstained and failed without throwing;
+  // they must not fall through to the success row.
+  if (details?.outcome === "abstained") return { text: `abstained${targetId ? ` · ${targetId}` : ""}`, tone: "warning" };
+  if (details?.outcome === "failed") return { text: `failed${targetId ? ` · ${targetId}` : ""}`, tone: "error" };
   if (result.isError && operation === "launch") {
     const row = assignmentUnconfirmedRow(details);
     if (row !== undefined) return { text: row, tone: "error" };

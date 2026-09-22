@@ -299,7 +299,7 @@ describe("herdr_inspect", () => {
     const allocation = await allocator.allocate();
     await allocator.persist(allocation, {
       manager: { paneId: "w1:p0", display: "caller", source: "injected" },
-      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
+      child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
     });
     const gate = createHandoffGate();
     await gate.bind(allocation, { paneId: "w1:p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session });
@@ -366,7 +366,7 @@ describe("herdr_inspect", () => {
     const allocation = await allocator.allocate();
     await allocator.persist(allocation, {
       manager: { paneId: "w1:p0", display: "caller", source: "injected" },
-      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
+      child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
     });
     const gate = createHandoffGate();
     await gate.bind(allocation, { paneId: "w1:p1", terminalId: "t1", agentName: "worker", agentKind: "pi", agentSession: session });

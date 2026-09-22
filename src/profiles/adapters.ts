@@ -22,10 +22,10 @@ function thinking(value: unknown, fallback: ThinkingLevel): ThinkingLevel {
   return result as ThinkingLevel;
 }
 
-function effort(value: unknown, fallback: ClaudeEffort): ClaudeEffort {
-  const result = value ?? fallback;
-  if (!CLAUDE_EFFORTS.includes(result as ClaudeEffort)) throw new ProfileAdapterError("effort override is invalid");
-  return result as ClaudeEffort;
+function effort(value: unknown, fallback: ClaudeEffort | undefined): ClaudeEffort | undefined {
+  const result = (value ?? fallback) as ClaudeEffort | undefined;
+  if (result !== undefined && !CLAUDE_EFFORTS.includes(result)) throw new ProfileAdapterError("effort override is invalid");
+  return result;
 }
 
 function permissionMode(value: unknown, fallback: ClaudePermissionMode): ClaudePermissionMode {
@@ -190,8 +190,8 @@ export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "cl
   const effective = resolveClaudeRuntime(profile, overrides, scopeRoot);
   // The run handoff directory is granted like the recipient attachment
   // directory: without it the exact artifact path sits outside every working
-  // directory the session may write.
-  const args = ["--model", effective.model, "--effort", effective.effort, ...permissionArgs(effective.permissionMode), ...repeated("--allowed-tools", effective.allowedTools), ...repeated("--disallowed-tools", effective.disallowedTools), ...repeated("--add-dir", effective.addDirs), ...repeated("--plugin-dir", effective.pluginDirs), ...channelArgs(effective.developmentChannels), ...grantedDirectoryArg(attachmentDirectory, "attachment directory"), ...grantedDirectoryArg(handoffDirectory, "handoff directory")];
+  // directory the session may write. An unreasoned point emits no `--effort`.
+  const args = ["--model", effective.model, ...(effective.effort === undefined ? [] : ["--effort", effective.effort]), ...permissionArgs(effective.permissionMode), ...repeated("--allowed-tools", effective.allowedTools), ...repeated("--disallowed-tools", effective.disallowedTools), ...repeated("--add-dir", effective.addDirs), ...repeated("--plugin-dir", effective.pluginDirs), ...channelArgs(effective.developmentChannels), ...grantedDirectoryArg(attachmentDirectory, "attachment directory"), ...grantedDirectoryArg(handoffDirectory, "handoff directory")];
   return [...args, ...promptFileArg("--append-system-prompt-file", promptFilePath)];
 }
 

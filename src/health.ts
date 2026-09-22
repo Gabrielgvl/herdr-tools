@@ -201,8 +201,12 @@ export function validateAgentPromptSchema(text: string): void {
 
 async function preflightPromptEndpoint(cli: HealthCli, signal: AbortSignal, health: HealthDetails): Promise<HealthDetails> {
   if (health.server.endpointCompatible !== true
-    || health.client.version !== REQUIRED_HERDR_VERSION
-    || health.server.version !== REQUIRED_HERDR_VERSION
+    // Client and server must agree with each other; the protocol, endpoint
+    // generation, installed-schema validation, and live ping below are the
+    // real compatibility gates. An exact pin on REQUIRED_HERDR_VERSION broke
+    // every launch when a same-protocol patch release (0.9.0 -> 0.9.1) was
+    // installed by the stable channel.
+    || health.client.version !== health.server.version
     || health.client.endpointProtocolGeneration !== REQUIRED_ENDPOINT_PROTOCOL_GENERATION
     || health.server.endpointProtocolGeneration !== REQUIRED_ENDPOINT_PROTOCOL_GENERATION
     || !cli.readApiSchema

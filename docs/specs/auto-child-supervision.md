@@ -8,8 +8,8 @@
 
 Every successful `herdr_launch` now produces a live, first-class **supervisor** that watches
 the exact child agent it launched for the whole life of that child, binding as soon as the
-exact launch identity is proven, before optional focus or assignment. Assignment
-confirmation remains a separate launch-success gate. If assignment consumption is not
+exact launch identity is proven, before prompt dispatch. Prompt
+confirmation remains a separate launch-success gate. If prompt consumption is not
 proven, launch fails while retaining the active supervisor so the child remains observable.
 Supervision remains an internal service, not an eighth public tool. It observes the raw
 child lifecycle and, for Tools-managed handoff runs, may withhold completion acceptance
@@ -354,13 +354,13 @@ event. It is not lifecycle-correlated beyond the matching pane ID.
   `SUPERVISION_STALLED_FIRST_OBSERVATION_THRESHOLD` 0.85 on the child's first review) →
   `progress` (`SUPERVISION_PROGRESS_THRESHOLD` 0.60), falling through to `unknown` when no
   signal crosses. Temporal state is in-memory only.
-- Evidence: one bounded V2.1 state assembled in fixed order from assignment, structured
+- Evidence: one bounded V2.1 state assembled in fixed order from the Task digest, structured
   trace, Git workspace state, supplemental terminal lines, and version identity. Pi and Devin
   use their structured trace readers. Other runners use a labelled `tmux-fallback` trace.
-  The production assignment carrier supplies `supervisionDigest.doneWhen` and `constraints`.
-  It does not copy `spec.assignment.objective`, and the strict public schema has no
+  The production carrier builds the internal `supervisionDigest` from the Task's `doneWhen` and `constraints`.
+  It does not copy the Task's `objective`, and the strict public schema has no
   `progressMarkers`, so reviewer evidence omits `objective` and carries an empty
-  `progressMarkers` list. `supervisionDigest.readOnly` remains a code-owned Tier-0 claim.
+  `progressMarkers` list. the digest's `readOnly` remains a code-owned Tier-0 claim.
   The previous review's classification and signals are carried separately.
 - Workspace evidence pins the Git base during reservation. A failed pin refuses launch before
   child effects. At cadence, unavailable workspace evidence skips the read-only dirty-workspace
@@ -503,7 +503,7 @@ only the unbound reservation. A failed bind rolls any provisional request fields
 reserved snapshot with `targetIds: []`. The real child and failed binding evidence remain
 available for manual inspection.
 
-Candidate fallback stays strictly inside `agent_start`, before assignment and before binding,
+Candidate fallback stays strictly inside `agent_start`, before prompt delivery and before binding,
 so the fallback chain is unchanged. After a successful bind, no later launch failure releases,
 cancels, or shuts down the supervisor. The supervisor remains session-scoped and follows its
 own exact-child lifecycle rules.
@@ -512,7 +512,7 @@ Initial-prompt confirmation remains a separate launch-success gate. The prompt i
 most once. An acknowledged prompt whose semantic consumption is not proven throws
 `LAUNCH_FAILED` with `causeCode: "PROMPT_UNCONFIRMED"`, `assignmentState: "unconfirmed"`,
 `promptSubmitted: true`, the exact pane ID, the retained active supervisor job ID, and bounded
-recovery evidence. The confirmation path never auto-sends Enter, retries assignment or start,
+recovery evidence. The confirmation path never auto-sends Enter, retries prompt or start,
 focuses again, closes or reuses the pane, registers a recipient, or authorizes dependent work.
 The fixed recovery instruction tells the manager to inspect the existing child with
 `herdr_inspect` and the supervisor with `herdr_jobs get`.

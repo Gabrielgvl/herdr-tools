@@ -1947,7 +1947,7 @@ describe("herdr_wait managed handoff gate", () => {
     const allocation = await allocator.allocate();
     await allocator.persist(allocation, {
       manager: { paneId: "p1", display: "caller", source: "injected" },
-      child: { agentName: "one", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
+      child: { agentName: "one", agentKind: "pi", operatingPointId: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
     });
     const gate = createHandoffGate();
     const run = await gate.bind(allocation, MANAGED_IDENTITY);

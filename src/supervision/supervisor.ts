@@ -123,7 +123,7 @@ export const realSupervisionScheduler: SupervisionScheduler = {
 export interface SupervisionChildRequest {
   agentName: string;
   agentKind: string;
-  candidateName: string;
+  operatingPointId: string;
 }
 
 /**
@@ -153,7 +153,7 @@ export interface SupervisionBinding {
    * happens after the reservation, so the reserved candidate can differ and the
    * supervisor must publish the candidate it is really watching.
    */
-  candidateName: string;
+  operatingPointId: string;
   /** Present only where the authoritative agent record supplied one. */
   stateChangeSeq?: number;
   /**
@@ -183,7 +183,7 @@ export interface SupervisorDependencies {
    * means the armed rule is unenforceable and reports its coverage gap once
    * as `evidence_gap` (ADR-036 V2-07).
    */
-  resolveForbiddenTools?: (bound: { agentKind: string; candidateName: string }) => SupervisionForbiddenTools;
+  resolveForbiddenTools?: (bound: { agentKind: string; operatingPointId: string }) => SupervisionForbiddenTools;
   /**
    * The trusted launch workspace root the per-cadence workspace evidence reads
    * (ADR-036 W0). Absent or a typed gap ⇒ the view reports the gap verbatim;
@@ -421,7 +421,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   /** Whether the armed-but-unenforceable forbidden-tool rule already reported its typed gap (ADR-036 V2-07). */
   private forbiddenToolGapReported = false;
   private settlement: Settlement | undefined;
-  private selectedCandidateName: string | undefined;
+  private selectedOperatingPointId: string | undefined;
   private bindStarted = false;
   private strengtheningStarted = false;
   /** True from the moment the anchor is prepared until a bind/strengthen task resolves. */
@@ -490,7 +490,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // anchor, but the public view stays reserved until the drain proves the
     // supervisor did not settle.
     this.identity = binding.identity;
-    this.selectedCandidateName = binding.candidateName;
+    this.selectedOperatingPointId = binding.operatingPointId;
     const stateChangeSeq = occupant.stateChangeSeq ?? binding.stateChangeSeq;
     this.anchor = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) };
     this.status = occupant.pane.agentStatus;
@@ -556,13 +556,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
     this.provisional = {
       identity: { ...binding.identity },
-      candidateName: binding.candidateName,
+      operatingPointId: binding.operatingPointId,
       baseline: { ...binding.baseline },
     };
     if (occupant.pane.agentSession !== undefined) {
       this.provisionalNativeIdentity = { ...binding.identity, agentSession: { ...occupant.pane.agentSession } };
     }
-    this.selectedCandidateName = binding.candidateName;
+    this.selectedOperatingPointId = binding.operatingPointId;
     this.status = "idle";
     this.provisionalLifecycle = {
       stateChangeSeq: binding.baseline.stateChangeSeq,
@@ -677,7 +677,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.strengtheningCandidate = {
       binding: {
         identity: observedIdentity,
-        candidateName: binding.candidateName,
+        operatingPointId: binding.operatingPointId,
         stateChangeSeq: occupant.stateChangeSeq,
       },
       stateChangeSeq: occupant.stateChangeSeq,
@@ -714,7 +714,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       status: this.status,
       anchor: this.anchor,
       lastRevision: this.lastRevision,
-      selectedCandidateName: this.selectedCandidateName,
+      selectedOperatingPointId: this.selectedOperatingPointId,
       bindingPublished: this.bindingPublished,
       provisionalPublished: this.provisionalPublished,
       state: this.state,
@@ -726,7 +726,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       if (this.queued.length !== 0) throw new Error("evidence_admitted_before_exact_commit");
       publication.commit();
       this.identity = { ...candidate.binding.identity, agentSession: { ...candidate.binding.identity.agentSession } };
-      this.selectedCandidateName = candidate.binding.candidateName;
+      this.selectedOperatingPointId = candidate.binding.operatingPointId;
       this.anchor = { revision: candidate.revision, status: candidate.status, stateChangeSeq: candidate.stateChangeSeq };
       this.status = candidate.status;
       this.lastRevision = candidate.revision;
@@ -747,7 +747,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       this.lastRevision = previous.lastRevision;
       this.lastStateChangeSeq = previous.lastStateChangeSeq;
       this.lastEndpoint = previous.lastEndpoint;
-      this.selectedCandidateName = previous.selectedCandidateName;
+      this.selectedOperatingPointId = previous.selectedOperatingPointId;
       this.bindingPublished = previous.bindingPublished;
       this.provisionalPublished = previous.provisionalPublished;
       this.state = previous.state;
@@ -860,7 +860,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.pendingMoveDestination = undefined;
     this.pendingMoveEndpoints.length = 0;
     this.pendingMoveInitialStateChangeSeq = undefined;
-    this.selectedCandidateName = undefined;
+    this.selectedOperatingPointId = undefined;
     // An unreported exit belongs to the identity that folded it; a failed
     // binding drops both together so the latch can never outlive its pane.
     this.unreportedExit = undefined;
@@ -1986,7 +1986,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     const forbidden = this.deps.resolveForbiddenTools?.({
       agentKind: reviewed.agentKind,
-      candidateName: this.selectedCandidateName!,
+      operatingPointId: this.selectedOperatingPointId!,
     });
     if (forbidden !== undefined) {
       // ADR-036 V2-07: the matcher enforces only where a real deny-list fact
@@ -2390,8 +2390,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       agentKind: "agy",
       paneId: binding.identity.paneId,
       terminalId: binding.identity.terminalId,
-      candidateName: binding.candidateName,
-      ...(binding.candidateName === this.deps.child.candidateName ? {} : { requestedCandidateName: this.deps.child.candidateName }),
+      operatingPointId: binding.operatingPointId,
+      ...(binding.operatingPointId === this.deps.child.operatingPointId ? {} : { requestedOperatingPointId: this.deps.child.operatingPointId }),
       baseline: { ...binding.baseline },
     };
   }
@@ -2401,14 +2401,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // it alongside the identity this view already requires. The reserved profile
     // is kept beside it only when fallback selection changed it, so the two never
     // silently contradict each other.
-    const candidateName = this.selectedCandidateName!;
+    const operatingPointId = this.selectedOperatingPointId!;
     return {
       agentName: identity.agentName,
       agentKind: identity.agentKind,
       paneId: identity.paneId,
       terminalId: identity.terminalId,
-      candidateName,
-      ...(candidateName === this.deps.child.candidateName ? {} : { requestedCandidateName: this.deps.child.candidateName }),
+      operatingPointId,
+      ...(operatingPointId === this.deps.child.operatingPointId ? {} : { requestedOperatingPointId: this.deps.child.operatingPointId }),
       ...(identity.agentKind === this.deps.child.agentKind ? {} : { requestedAgentKind: this.deps.child.agentKind }),
     };
   }
@@ -2472,9 +2472,9 @@ function validProvisionalBinding(binding: ProvisionalSupervisionBinding): boolea
     const identity: ProvisionalSupervisedIdentity = binding.identity;
     const baseline = binding.baseline;
     return validProvisionalIdentity(identity)
-      && typeof binding.candidateName === "string"
-      && binding.candidateName.length > 0
-      && !/[\0\r\n]/u.test(binding.candidateName)
+      && typeof binding.operatingPointId === "string"
+      && binding.operatingPointId.length > 0
+      && !/[\0\r\n]/u.test(binding.operatingPointId)
       && baseline.state === "idle"
       && Number.isSafeInteger(baseline.stateChangeSeq)
       && baseline.stateChangeSeq >= 0

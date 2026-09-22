@@ -23,7 +23,7 @@ const request: SupervisorJobRequestSnapshot = {
   label: "supervise worker",
   targets: ["worker"],
   targetIds: [],
-  child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+  child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
   settings: { reviewCadenceMinutes: 5, reviewerModel: "typesafe/jev-latest", reviewerThinking: "max" },
 };
 
@@ -71,7 +71,7 @@ function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: EdgeOp
   const readTranscript: SupervisorDependencies["readTranscript"] = options.transcript ?? (async () => []);
   const deps: SupervisorDependencies = {
     jobId: "job_edge",
-    child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+    child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
     monitor: {
       addObserver: () => undefined,
       removeObserver: () => undefined,
@@ -110,7 +110,7 @@ function edgeSupervisor(snapshots: Array<HerdrSnapshot | Error>, options: EdgeOp
 describe("supervisor guards after settlement", () => {
   it("ignores every stream path once the supervisor has settled", async () => {
     const h = edgeSupervisor([snapshot([paneRecord()]), snapshot([], [])]);
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await h.supervisor.onEvent(thinEvent("pane_closed", "p1"));
     expect(await h.supervisor.run()).toMatchObject({ outcome: "released" });
 
@@ -125,7 +125,7 @@ describe("supervisor guards after settlement", () => {
     const stopper = { current: (): void => undefined };
     const deps: SupervisorDependencies = {
       jobId: "job_stop_mid_drain",
-      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+      child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
       monitor: { addObserver: () => undefined, removeObserver: () => undefined, snapshot: async () => snapshot([paneRecord("working")]), generation: 1, isDegraded: () => false },
       // The first material wake stops the supervisor, so the second queued event
       // must not be folded.
@@ -139,7 +139,7 @@ describe("supervisor guards after settlement", () => {
     };
     const supervisor = new Supervisor(deps);
     stopper.current = () => supervisor.shutdown();
-    const binding = supervisor.bind({ identity, candidateName: "worker-pi" });
+    const binding = supervisor.bind({ identity, operatingPointId: "worker-pi" });
     // Both events are queued synchronously, before binding can set the anchor.
     const queued = [supervisor.onEvent(paneEvent("pane_updated", paneRecord("blocked", 6))), supervisor.onEvent(paneEvent("pane_updated", paneRecord("idle", 7)))];
     await expect(binding).rejects.toMatchObject({ code: "SUPERVISION_UNCONFIRMED", details: { cause: "settled_during_bind", settledDuringBind: true, supervisionOutcome: "cancelled" } });
@@ -151,7 +151,7 @@ describe("supervisor guards after settlement", () => {
     const stopper = { current: (): void => undefined };
     const supervisor = new Supervisor({
       jobId: "job_double_settle",
-      child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" },
+      child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
       monitor: { addObserver: () => undefined, removeObserver: () => undefined, snapshot: async () => snapshot([]), generation: 1, isDegraded: () => false },
       notifier: { wake: () => stopper.current() },
       reviewer: { review: async () => ({ classification: "progress", summary: "s" }) },
@@ -175,14 +175,14 @@ describe("supervisor guards after settlement", () => {
 
   it("settles identity_lost when a move names a pane no snapshot can show", async () => {
     const h = edgeSupervisor([snapshot([paneRecord()]), snapshot([])]);
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord("working", 6, "p2"), { previous_pane_id: "p1" }));
     expect(await h.supervisor.run()).toMatchObject({ reason: "move_continuity_unproven" });
   });
 
   it("discards a review whose work cycle ended while the model call was in flight", async () => {
     const h = edgeSupervisor([snapshot([paneRecord("working")]), snapshot([paneRecord("idle", 6)])], { scheduler: false });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     const review = (h.supervisor as unknown as { review(): Promise<void> }).review();
     // The child leaves the working state while the review is still in flight.
     await h.supervisor.onEvent(thinEvent("pane_exited", "p1"));
@@ -199,7 +199,7 @@ describe("supervisor guards after settlement", () => {
 
   it("never runs two reviews at once", async () => {
     const h = edgeSupervisor([snapshot([paneRecord("working")])], { scheduler: false });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     const first = (h.supervisor as unknown as { review(): Promise<void> }).review();
     const second = (h.supervisor as unknown as { review(): Promise<void> }).review();
     h.releaseReview();
@@ -309,7 +309,7 @@ describe("monitor and registry seams", () => {
     const previous = process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_SOCKET_PATH;
     try {
-      await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
+      await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_UNAVAILABLE" });
     } finally {
       if (previous !== undefined) process.env.HERDR_SOCKET_PATH = previous;
     }
@@ -334,14 +334,14 @@ describe("review-round remediations", () => {
         return monitor;
       },
     });
-    const first = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    const first = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
     expect(first.jobId).toBeDefined();
 
     await supervision.shutdown();
-    await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
+    await expect(supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } })).rejects.toMatchObject({ code: "SUPERVISION_SOCKET_CLOSED" });
 
     await supervision.beginSession();
-    const second = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
+    const second = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
     expect(second.jobId).not.toBe(first.jobId);
     expect(monitors).toHaveLength(2);
     // The replaced monitor stays stopped; it never serves the new session.
@@ -360,7 +360,7 @@ describe("review-round remediations", () => {
       snapshot([moved], [{ pane_id: "p2", name: "worker" }]),
       snapshot([paneRecord("working", 9, "p2")], [{ pane_id: "p2", name: "worker" }]),
     ]);
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
 
     // Two old-pane events at the anchor revision, then the move above it.
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord("working", 5)));
@@ -389,7 +389,7 @@ describe("review-round remediations", () => {
       snapshot([moved], [{ pane_id: "p2", name: "worker" }]),
       snapshot([paneRecord("working", 6, "p2")], [{ pane_id: "p2", name: "worker" }]),
     ]);
-    const binding = h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    const binding = h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     const queued = h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     await binding;
     await queued;
@@ -409,7 +409,7 @@ describe("review-round remediations", () => {
       transcript: async () => windows[Math.min(read++, windows.length - 1)]!,
       onReview: (request) => { deltas.push(request.evidence.terminal.lines); },
     });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     const first = (h.supervisor as unknown as { review(): Promise<void> }).review();
     h.releaseReview();
     await first;
@@ -427,7 +427,7 @@ describe("review-round remediations", () => {
         return ["line"];
       },
     });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     await (h.supervisor as unknown as { review(): Promise<void> }).review();
     expect(h.reviews).toBe(0);
     expect(h.supervisor.view().reviewer.reviews).toEqual([]);
@@ -441,7 +441,7 @@ describe("review-round remediations", () => {
       transcript: async () => ["line"],
       reviewFails: true,
     });
-    await h.supervisor.bind({ identity, candidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     const review = (h.supervisor as unknown as { review(): Promise<void> }).review();
     // The child finishes its cycle while the failing model call is in flight.
     await h.supervisor.onEvent(thinEvent("pane_exited", "p1"));
@@ -456,12 +456,12 @@ describe("review-round remediations", () => {
 
   it("publishes the profile that actually started the child", async () => {
     const h = edgeSupervisor([snapshot([paneRecord()])]);
-    await h.supervisor.bind({ identity, candidateName: "worker-claude" });
-    expect(h.supervisor.view().child).toMatchObject({ candidateName: "worker-claude", requestedCandidateName: "worker-pi" });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-claude" });
+    expect(h.supervisor.view().child).toMatchObject({ operatingPointId: "worker-claude", requestedOperatingPointId: "worker-pi" });
 
     const same = edgeSupervisor([snapshot([paneRecord()])]);
-    await same.supervisor.bind({ identity, candidateName: "worker-pi" });
-    expect(same.supervisor.view().child).not.toHaveProperty("requestedCandidateName");
+    await same.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    expect(same.supervisor.view().child).not.toHaveProperty("requestedOperatingPointId");
   });
 
   it("updates the job request and the supervision view to the bound profile together", async () => {
@@ -489,11 +489,11 @@ describe("review-round remediations", () => {
       readTranscript: async () => [],
       monitorFactory: () => new SessionEventMonitor({ connect: () => peer.connect(), env: { HERDR_SOCKET_PATH: "/tmp/s.sock" }, clock: { now: () => 0, sleep: async () => undefined } }),
     });
-    const reservation = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
-    await reservation.bind({ identity: claudeIdentity, candidateName: "worker-claude" });
+    const reservation = await supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
+    await reservation.bind({ identity: claudeIdentity, operatingPointId: "worker-claude" });
     const detail = jobs.get(reservation.jobId)!;
-    expect(detail.request).toMatchObject({ child: { agentKind: "claude", candidateName: "worker-claude", requestedAgentKind: "pi", requestedCandidateName: "worker-pi" } });
-    expect(detail.supervision?.child).toMatchObject({ agentKind: "claude", candidateName: "worker-claude", requestedAgentKind: "pi", requestedCandidateName: "worker-pi" });
+    expect(detail.request).toMatchObject({ child: { agentKind: "claude", operatingPointId: "worker-claude", requestedAgentKind: "pi", requestedOperatingPointId: "worker-pi" } });
+    expect(detail.supervision?.child).toMatchObject({ agentKind: "claude", operatingPointId: "worker-claude", requestedAgentKind: "pi", requestedOperatingPointId: "worker-pi" });
     await supervision.shutdown();
   });
 });

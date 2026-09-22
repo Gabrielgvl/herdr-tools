@@ -232,7 +232,7 @@ A wait whose timeout is longer than the configured review cadence is a long wait
 
 Long waits use mandatory in-process, tool-less reviewer calls only for targets without active exact-child supervision:
 
-- The reviewer model is the extension-owned setting from `config.json`, default `openai-codex/gpt-5.6-sol`; the tool cannot select or override it.
+- The reviewer model is the extension-owned setting from `config.json`, default `openai-codex/gpt-6-sol`; the tool cannot select or override it.
 - Reviewer thinking is fixed at `low`; the tool cannot select or override it.
 - After each latest authoritative target observation and immediately before dispatch, the wait partitions targets between active bound supervisors and the explicit reviewer. A covered target receives no wait-reviewer request. Uncovered targets receive one independent reviewer call each, concurrently, with no target-count cap.
 - Reviewer construction is lazy. An all-covered long wait does not resolve or authenticate the wait reviewer. Native lifecycle waits are still bounded into review windows so authoritative waiting is not bypassed.
@@ -499,13 +499,13 @@ The optional extension-owned `config.json` uses this JSON shape:
 {
   "wait": {
     "reviewCadenceMinutes": 5,
-    "reviewerModel": "openai-codex/gpt-5.6-sol"
+    "reviewerModel": "openai-codex/gpt-6-sol"
   }
 }
 ```
 
 - `wait.reviewCadenceMinutes`: integer, default `5`, inclusive range `1..30`.
-- `wait.reviewerModel`: model identifier, default `openai-codex/gpt-5.6-sol`.
+- `wait.reviewerModel`: model identifier, default `openai-codex/gpt-6-sol`.
 - Reviewer thinking level is fixed to `low` and is not configurable by a tool call.
 - `wait.reviewCadenceMinutes` is shared with the supervision reviewer. `wait.reviewerModel` is wait-only: the supervisor reviewer's model is the code constant `SUPERVISION_REVIEWER_MODEL` (`typesafe/jev-latest`), not a setting, and Jev carries no thinking level.
 
@@ -771,7 +771,7 @@ The feature is complete only when all of the following are true:
 - Inspection has the specified current, single-target, collection, and health behavior.
 - Communication distinguishes normal prompt, explicit steer, named keys, cancel, and interrupt; a normal prompt submits through the same direct path an explicit steer uses on every sendable state; steer never synthesizes an interrupt; turn control binds one key to one stable working identity and independently verifies the outcome.
 - Wait supports the specified raw/semantic states, literal/regex output, any/all, explicit one-hour maximum, structured timeout snapshots, and long-wait reviewer ownership partitioning.
-- Reviewer calls are in-process, tool-less, concurrent per unsupervised target, bounded, non-mutating, fixed at low thinking, use the extension-owned reviewer model (default `openai-codex/gpt-5.6-sol`), and fail immediately without fallback when unavailable. Active exact supervisors own review for their covered children, and reviewer `unknown` requires a fresh exact working-state proof to be suppressed.
+- Reviewer calls are in-process, tool-less, concurrent per unsupervised target, bounded, non-mutating, fixed at low thinking, use the extension-owned reviewer model (default `openai-codex/gpt-6-sol`), and fail immediately without fallback when unavailable. Active exact supervisors own review for their covered children, and reviewer `unknown` requires a fresh exact working-state proof to be suppressed.
 - Every launch is one caller-authored Task; the runtime mints child names and derives the workload profile, and Jev evaluation plus deterministic admission ensure every executed child runs a contract compiled for a reviewed operating point. Pi and Claude bind exact supervision before prompt delivery. AGY requires a self-contained initial prompt, publishes provisional supervision before its single submission, and strengthens to exact native-session supervision before success, recipient registration, or attachment access. Failed launches are never automatically cleaned.
 - Pane and tab topology operations implement the specified defaults, labels, environment behavior, autonomous exact close, protected ancestors, bounded reconciliation, and authoritative post-state.
 - Results are structured and concise, custom rows are compact, and waits/launches stream progress.

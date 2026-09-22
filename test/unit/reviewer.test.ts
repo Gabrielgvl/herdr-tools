@@ -39,6 +39,17 @@ describe("Pi production reviewer adapter", () => {
     expect((calls[0] as { context: { messages: [{ content: string }] } }).context.messages[0].content).not.toContain("tools");
   });
 
+  it("omits null-valued auth headers before the provider call", async () => {
+    const calls: unknown[] = [];
+    const seam: ModelRegistrySeam = { ...registry(), getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "key", headers: { "x-keep": "1", "x-drop": null } }) };
+    const reviewer = new PiModelReviewer(seam, "testmodel", async (_selected, _context, options) => {
+      calls.push(options);
+      return message(JSON.stringify({ classification: "progress", summary: "ok" }));
+    });
+    await reviewer.review({ targetId: "p1", metadata: {}, transcriptDelta: [] }, new AbortController().signal);
+    expect((calls[0] as { headers: Record<string, string> }).headers).toEqual({ "x-keep": "1" });
+  });
+
   it("fails closed for authentication, malformed JSON, and extra response keys", async () => {
     await expect(new PiModelReviewer(registry(false), "testmodel").review({ targetId: "p", metadata: {}, transcriptDelta: [] }, new AbortController().signal)).rejects.toBeInstanceOf(ReviewerFailure);
     const bad = new PiModelReviewer(registry(), "testmodel", async () => message("not json"));

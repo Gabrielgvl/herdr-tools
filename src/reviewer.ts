@@ -1,5 +1,5 @@
 import { complete } from "@earendil-works/pi-ai/compat";
-import type { Api, AssistantMessage, Context, Model, ProviderStreamOptions, TextContent } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Context, Model, ProviderHeaders, ProviderStreamOptions, TextContent } from "@earendil-works/pi-ai";
 
 export const REVIEW_CLASSIFICATIONS = ["progress", "stalled", "blocked", "risk", "appears_complete", "unknown"] as const;
 export type ReviewClassification = (typeof REVIEW_CLASSIFICATIONS)[number];
@@ -23,10 +23,15 @@ export interface WaitReviewer {
 export interface ModelRegistrySeam {
   find(provider: string, modelId: string): Model<Api> | undefined;
   getAll(): Model<Api>[];
-  getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
+  getApiKeyAndHeaders(model: Model<Api>): Promise<{ ok: true; apiKey?: string; headers?: ProviderHeaders } | { ok: false; error: string }>;
 }
 
 export type CompleteSeam = (model: Model<Api>, context: Context, options: ProviderStreamOptions) => Promise<AssistantMessage>;
+
+/** pi-ai auth headers may carry null-valued entries; reviewer/service consumers forward string headers only, so nulls are omitted at the boundary. */
+export function dropNullHeaders(headers: ProviderHeaders): Record<string, string> {
+  return Object.fromEntries(Object.entries(headers).filter((entry): entry is [string, string] => entry[1] !== null));
+}
 
 export class ReviewerFailure extends Error {
   readonly code = "REVIEWER_FAILED" as const;
@@ -158,7 +163,7 @@ export class PiModelReviewer implements WaitReviewer {
     try {
       const message = await this.completeCall(this.model, { messages: [{ role: "user", content: promptFor(request), timestamp: Date.now() }] }, {
         apiKey: auth.apiKey,
-        headers: auth.headers,
+        headers: auth.headers === undefined ? undefined : dropNullHeaders(auth.headers),
         signal,
         maxTokens: 256,
         // The option name the transports read; one named for the thinking level

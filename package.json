@@ -22,9 +22,9 @@
     "validate:plugin": "claude plugin validate ./herdr-profiles/role-plugins/manager && claude plugin validate ./herdr-profiles/profile-plugins/manager && claude plugin validate ./herdr-profiles/profile-plugins/executor"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.83.0",
-    "@earendil-works/pi-coding-agent": "^0.83.0",
-    "@earendil-works/pi-tui": "^0.83.0",
+    "@earendil-works/pi-ai": "^0.87.1",
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@earendil-works/pi-tui": "^0.87.1",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@typesafe-ai/sdk": "^0.6.0",
     "pi-mcp-adapter": "2.20.1",
@@ -34,9 +34,9 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.83.0",
-    "@earendil-works/pi-coding-agent": "^0.83.0",
-    "@earendil-works/pi-tui": "^0.83.0",
+    "@earendil-works/pi-ai": "^0.87.1",
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@earendil-works/pi-tui": "^0.87.1",
     "@types/node": "^24.12.4",
     "@types/proper-lockfile": "^4.1.4",
     "@typescript-eslint/eslint-plugin": "^8.46.0",

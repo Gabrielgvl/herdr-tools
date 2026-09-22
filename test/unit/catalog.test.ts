@@ -101,12 +101,12 @@ describe("catalog", () => {
   it("parses the shipped catalog config and its generated point set", async () => {
     const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
     expect(catalog.version).toBe(2);
-    expect(catalog.points).toHaveLength(54);
+    expect(catalog.points).toHaveLength(48);
     expect(catalog.tierChains).toEqual({
-      utility: ["pi:openai-codex/gpt-5.6-luna:low", "devin:swe-1-7-lightning-medium"],
-      economy: ["devin:swe-2-medium", "pi:openai-codex/gpt-5.6-luna:max", "pi:zai/glm-5.3-flash:low", "claude:sonnet:low"],
-      standard: ["devin:swe-2-high", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-5.6-terra:max", "agy:gemini-3.8-flash-low"],
-      strong: ["devin:swe-2-max", "pi:openai-codex/gpt-5.6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "claude:opus:low", "agy:gemini-3.8-flash-high"],
+      utility: ["pi:openai-codex/gpt-6-luna:low", "devin:swe-1-7-lightning-medium"],
+      economy: ["devin:swe-2-medium", "pi:openai-codex/gpt-6-luna:max", "pi:zai/glm-5.3-flash:low", "claude:sonnet:low"],
+      standard: ["devin:swe-2-high", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6-sol:high", "agy:gemini-3.8-flash-low"],
+      strong: ["devin:swe-2-max", "pi:openai-codex/gpt-6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "claude:opus:low", "agy:gemini-3.8-flash-high"],
       frontier: ["claude:fable:low", "pi:openai-codex/gpt-6-astra:high", "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium"],
       max: ["claude:fable:max", "pi:openai-codex/gpt-6-astra:max", "devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium"],
     });
@@ -293,33 +293,29 @@ describe("catalog", () => {
     await expect(loadCatalog(join(root, "missing.yaml"))).rejects.toThrow();
   });
 
-  it("ships exactly the audited 54 operating points with the frozen policy table", async () => {
+  it("ships exactly the reviewed 48 operating points with the migrated policy table", async () => {
     const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
     const points = catalog.points ?? [];
-    expect(points).toHaveLength(54);
-    expect(catalog.pointPolicy?.size).toBe(54);
+    expect(points).toHaveLength(48);
+    expect(catalog.pointPolicy?.size).toBe(48);
     for (const point of points) expect(catalog.pointPolicy?.get(point.id)).toEqual({ costClass: point.costClass, latencyClass: point.latencyClass });
-    // The FROZEN Appendix A table (plan-delta-model-audit v3.1), verbatim —
-    // every declared class is compared, key for key.
+    // The audited Appendix A table (plan-delta-model-audit v3.1) with the GPT-6
+    // migration applied: Luna/Sol rows carry the audited classes verbatim by
+    // reasoning setting — provisional pending fresh calibration. Every declared
+    // class is compared, key for key.
     expect(Object.fromEntries(catalog.pointPolicy ?? new Map())).toEqual({
-      "pi:openai-codex/gpt-5.6-luna:off": { costClass: "low", latencyClass: "low" },
-      "pi:openai-codex/gpt-5.6-luna:low": { costClass: "low", latencyClass: "low" },
-      "pi:openai-codex/gpt-5.6-luna:medium": { costClass: "low", latencyClass: "low" },
-      "pi:openai-codex/gpt-5.6-luna:high": { costClass: "low", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-luna:xhigh": { costClass: "low", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-luna:max": { costClass: "low", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-terra:off": { costClass: "medium", latencyClass: "low" },
-      "pi:openai-codex/gpt-5.6-terra:low": { costClass: "medium", latencyClass: "low" },
-      "pi:openai-codex/gpt-5.6-terra:medium": { costClass: "medium", latencyClass: "low" },
-      "pi:openai-codex/gpt-5.6-terra:high": { costClass: "medium", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-terra:xhigh": { costClass: "medium", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-terra:max": { costClass: "medium", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-sol:off": { costClass: "high", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-sol:low": { costClass: "high", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-sol:medium": { costClass: "high", latencyClass: "medium" },
-      "pi:openai-codex/gpt-5.6-sol:high": { costClass: "high", latencyClass: "high" },
-      "pi:openai-codex/gpt-5.6-sol:xhigh": { costClass: "high", latencyClass: "high" },
-      "pi:openai-codex/gpt-5.6-sol:max": { costClass: "high", latencyClass: "high" },
+      "pi:openai-codex/gpt-6-luna:off": { costClass: "low", latencyClass: "low" },
+      "pi:openai-codex/gpt-6-luna:low": { costClass: "low", latencyClass: "low" },
+      "pi:openai-codex/gpt-6-luna:medium": { costClass: "low", latencyClass: "low" },
+      "pi:openai-codex/gpt-6-luna:high": { costClass: "low", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6-luna:xhigh": { costClass: "low", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6-luna:max": { costClass: "low", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6-sol:off": { costClass: "high", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6-sol:low": { costClass: "high", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6-sol:medium": { costClass: "high", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6-sol:high": { costClass: "high", latencyClass: "high" },
+      "pi:openai-codex/gpt-6-sol:xhigh": { costClass: "high", latencyClass: "high" },
+      "pi:openai-codex/gpt-6-sol:max": { costClass: "high", latencyClass: "high" },
       "pi:openai-codex/gpt-6-astra:low": { costClass: "extreme", latencyClass: "high" },
       "pi:openai-codex/gpt-6-astra:medium": { costClass: "extreme", latencyClass: "high" },
       "pi:openai-codex/gpt-6-astra:high": { costClass: "extreme", latencyClass: "extreme" },
@@ -357,7 +353,7 @@ describe("catalog", () => {
       "devin:fusion-gpt-6-astra-medium-sidekick-swe-2-medium": { costClass: "extreme", latencyClass: "high" },
       "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium": { costClass: "extreme", latencyClass: "extreme" },
     });
-    expect(points.filter((point) => point.runner === "pi")).toHaveLength(29);
+    expect(points.filter((point) => point.runner === "pi")).toHaveLength(23);
     expect(points.filter((point) => point.runner === "claude")).toHaveLength(13);
     expect(points.filter((point) => point.runner === "agy")).toHaveLength(3);
     expect(points.filter((point) => point.runner === "devin")).toHaveLength(9);
@@ -369,20 +365,20 @@ describe("catalog", () => {
     expect(points.find((point) => point.id === "pi:zai/glm-5.3-flash:low")).toMatchObject({ provider: "zai", quota: { provider: "zai", billingProduct: "zai-api", account: "primary", scope: "account" } });
     expect(points.find((point) => point.id === "pi:opencode-go/glm-5.3-flash:low")).toMatchObject({ provider: "opencode-go", quota: { billingProduct: "opencode-go-subscription" } });
     expect(catalog.catalogRevision).toMatch(/^[0-9a-f]{64}$/);
-    // Per-tier exact eligible-id sets, derived from the frozen table.
+    // Per-tier exact eligible-id sets, derived from the reviewed table.
     const ids = (tier: QualityTier) => pointsWithinTier(points, tier).map((point) => point.id).sort();
     expect(ids("utility")).toEqual([
-      "pi:openai-codex/gpt-5.6-luna:low",
-      "pi:openai-codex/gpt-5.6-luna:medium",
-      "pi:openai-codex/gpt-5.6-luna:off",
+      "pi:openai-codex/gpt-6-luna:low",
+      "pi:openai-codex/gpt-6-luna:medium",
+      "pi:openai-codex/gpt-6-luna:off",
     ]);
     expect(ids("economy")).toEqual([
-      "pi:openai-codex/gpt-5.6-luna:high",
-      "pi:openai-codex/gpt-5.6-luna:low",
-      "pi:openai-codex/gpt-5.6-luna:max",
-      "pi:openai-codex/gpt-5.6-luna:medium",
-      "pi:openai-codex/gpt-5.6-luna:off",
-      "pi:openai-codex/gpt-5.6-luna:xhigh",
+      "pi:openai-codex/gpt-6-luna:high",
+      "pi:openai-codex/gpt-6-luna:low",
+      "pi:openai-codex/gpt-6-luna:max",
+      "pi:openai-codex/gpt-6-luna:medium",
+      "pi:openai-codex/gpt-6-luna:off",
+      "pi:openai-codex/gpt-6-luna:xhigh",
       "pi:zai/glm-5.3-flash:low",
     ]);
     expect(ids("standard")).toEqual([
@@ -396,18 +392,12 @@ describe("catalog", () => {
       "devin:swe-1-7-lightning",
       "devin:swe-1-7-lightning-medium",
       "devin:swe-2-medium",
-      "pi:openai-codex/gpt-5.6-luna:high",
-      "pi:openai-codex/gpt-5.6-luna:low",
-      "pi:openai-codex/gpt-5.6-luna:max",
-      "pi:openai-codex/gpt-5.6-luna:medium",
-      "pi:openai-codex/gpt-5.6-luna:off",
-      "pi:openai-codex/gpt-5.6-luna:xhigh",
-      "pi:openai-codex/gpt-5.6-terra:high",
-      "pi:openai-codex/gpt-5.6-terra:low",
-      "pi:openai-codex/gpt-5.6-terra:max",
-      "pi:openai-codex/gpt-5.6-terra:medium",
-      "pi:openai-codex/gpt-5.6-terra:off",
-      "pi:openai-codex/gpt-5.6-terra:xhigh",
+      "pi:openai-codex/gpt-6-luna:high",
+      "pi:openai-codex/gpt-6-luna:low",
+      "pi:openai-codex/gpt-6-luna:max",
+      "pi:openai-codex/gpt-6-luna:medium",
+      "pi:openai-codex/gpt-6-luna:off",
+      "pi:openai-codex/gpt-6-luna:xhigh",
       "pi:zai/glm-5.3-flash:low",
     ]);
     expect(ids("strong")).toEqual([
@@ -428,24 +418,18 @@ describe("catalog", () => {
       "devin:swe-2-high",
       "devin:swe-2-max",
       "devin:swe-2-medium",
-      "pi:openai-codex/gpt-5.6-luna:high",
-      "pi:openai-codex/gpt-5.6-luna:low",
-      "pi:openai-codex/gpt-5.6-luna:max",
-      "pi:openai-codex/gpt-5.6-luna:medium",
-      "pi:openai-codex/gpt-5.6-luna:off",
-      "pi:openai-codex/gpt-5.6-luna:xhigh",
-      "pi:openai-codex/gpt-5.6-sol:high",
-      "pi:openai-codex/gpt-5.6-sol:low",
-      "pi:openai-codex/gpt-5.6-sol:max",
-      "pi:openai-codex/gpt-5.6-sol:medium",
-      "pi:openai-codex/gpt-5.6-sol:off",
-      "pi:openai-codex/gpt-5.6-sol:xhigh",
-      "pi:openai-codex/gpt-5.6-terra:high",
-      "pi:openai-codex/gpt-5.6-terra:low",
-      "pi:openai-codex/gpt-5.6-terra:max",
-      "pi:openai-codex/gpt-5.6-terra:medium",
-      "pi:openai-codex/gpt-5.6-terra:off",
-      "pi:openai-codex/gpt-5.6-terra:xhigh",
+      "pi:openai-codex/gpt-6-luna:high",
+      "pi:openai-codex/gpt-6-luna:low",
+      "pi:openai-codex/gpt-6-luna:max",
+      "pi:openai-codex/gpt-6-luna:medium",
+      "pi:openai-codex/gpt-6-luna:off",
+      "pi:openai-codex/gpt-6-luna:xhigh",
+      "pi:openai-codex/gpt-6-sol:high",
+      "pi:openai-codex/gpt-6-sol:low",
+      "pi:openai-codex/gpt-6-sol:max",
+      "pi:openai-codex/gpt-6-sol:medium",
+      "pi:openai-codex/gpt-6-sol:off",
+      "pi:openai-codex/gpt-6-sol:xhigh",
       "pi:opencode-go/glm-5.3-flash:high",
       "pi:opencode-go/glm-5.3-flash:low",
       "pi:opencode-go/glm-5.3-flash:max",

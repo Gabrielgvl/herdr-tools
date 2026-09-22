@@ -174,22 +174,22 @@ describe("the builtin supervision model service", () => {
     const { dir, authPath } = fixture();
     writeAuth(authPath, { "openai-codex": oauthEntry });
     vi.stubEnv("PI_CODING_AGENT_DIR", dir);
-    const resolved = await createBuiltinModelService().resolve("openai-codex/gpt-5.6-sol");
+    const resolved = await createBuiltinModelService().resolve("openai-codex/gpt-6-sol");
     expect(resolved.model.provider).toBe("openai-codex");
-    expect(resolved.model.id).toBe("gpt-5.6-sol");
+    expect(resolved.model.id).toBe("gpt-6-sol");
     expect(resolved.apiKey).toBe("fake-access-token");
   });
 
   it("fails as not-authenticated — never crashes — when the file is missing or malformed", async () => {
     const { dir, authPath } = fixture();
     vi.stubEnv("PI_CODING_AGENT_DIR", dir);
-    await expect(createBuiltinModelService().resolve("openai-codex/gpt-5.6-sol")).rejects.toThrow(/not authenticated/u);
+    await expect(createBuiltinModelService().resolve("openai-codex/gpt-6-sol")).rejects.toThrow(/not authenticated/u);
     expect(existsSync(authPath)).toBe(false);
 
     writeAuth(authPath, "{not json");
-    await expect(createBuiltinModelService().resolve("openai-codex/gpt-5.6-sol")).rejects.toThrow(/not authenticated/u);
+    await expect(createBuiltinModelService().resolve("openai-codex/gpt-6-sol")).rejects.toThrow(/not authenticated/u);
 
     writeAuth(authPath, { "openai-codex": { type: "api_key", key: "fake" } });
-    await expect(createBuiltinModelService().resolve("openai-codex/gpt-5.6-sol")).rejects.toThrow(/not authenticated/u);
+    await expect(createBuiltinModelService().resolve("openai-codex/gpt-6-sol")).rejects.toThrow(/not authenticated/u);
   });
 });

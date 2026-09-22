@@ -77,13 +77,13 @@ mcp:
 
 runners:
   pi:
-    # Per-model declared reasoning axes (ADR-037 audit). GPT-5.6 supports six
-    # settings; Pi `minimal` is a runner-level alias of provider `low` and is
-    # never a canonical point. GPT-6 Astra has no `off` operating point.
+    # Per-model declared reasoning axes (ADR-037 audit). GPT-6 Luna and Sol
+    # support six settings; Pi `minimal` is a runner-level alias of provider
+    # `low` and is never a canonical point. GPT-6 Astra has no `off`
+    # operating point.
     models:
-      - {model: openai-codex/gpt-5.6-luna, supportedReasoning: [off, low, medium, high, xhigh, max]}
-      - {model: openai-codex/gpt-5.6-terra, supportedReasoning: [off, low, medium, high, xhigh, max]}
-      - {model: openai-codex/gpt-5.6-sol, supportedReasoning: [off, low, medium, high, xhigh, max]}
+      - {model: openai-codex/gpt-6-luna, supportedReasoning: [off, low, medium, high, xhigh, max]}
+      - {model: openai-codex/gpt-6-sol, supportedReasoning: [off, low, medium, high, xhigh, max]}
       - {model: openai-codex/gpt-6-astra, supportedReasoning: [low, medium, high, xhigh, max]}
       # GLM-5.3-Flash routes are billed outside the runner's codex domain:
       # provider + billingProduct keep their availability tuples distinct.
@@ -309,21 +309,21 @@ runners:
 # failures. Chain membership deliberately overrides the historical envelopes.
 tierChains:
   utility:
-    - pi:openai-codex/gpt-5.6-luna:low
+    - pi:openai-codex/gpt-6-luna:low
     - devin:swe-1-7-lightning-medium
   economy:
     - devin:swe-2-medium
-    - pi:openai-codex/gpt-5.6-luna:max
+    - pi:openai-codex/gpt-6-luna:max
     - pi:zai/glm-5.3-flash:low
     - claude:sonnet:low
   standard:
     - devin:swe-2-high
     - pi:zai/glm-5.3-flash:high
-    - pi:openai-codex/gpt-5.6-terra:max
+    - pi:openai-codex/gpt-6-sol:high
     - agy:gemini-3.8-flash-low
   strong:
     - devin:swe-2-max
-    - pi:openai-codex/gpt-5.6-sol:xhigh
+    - pi:openai-codex/gpt-6-sol:xhigh
     - pi:zai/glm-5.3-flash:max
     - claude:opus:low
     - agy:gemini-3.8-flash-high
@@ -336,37 +336,34 @@ tierChains:
     - pi:openai-codex/gpt-6-astra:max
     - devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium
 
-# Reviewed operating-point policy (ADR-037) — the FROZEN audited table from
-# plan-delta-model-audit v3.1 Appendix A, transcribed verbatim. One entry per
-# generated point — each model crossed with its own declared reasoning set —
-# keyed by the exact opaque point id; the parser requires this key set to
-# equal the generated set, so a missing or unknown id invalidates the
-# catalog. Classes derive from the audit's deterministic thresholds: cost on
+# Reviewed operating-point policy (ADR-037) — audited classes from
+# plan-delta-model-audit v3.1 Appendix A. One entry per generated point —
+# each model crossed with its own declared reasoning set — keyed by the
+# exact opaque point id; the parser requires this key set to equal the
+# generated set, so a missing or unknown id invalidates the catalog.
+# Classes derive from the audit's deterministic thresholds: cost on
 # list-equivalent output price (≤1.5 low, ≤15 medium, ≤25 high, >25 extreme;
 # subscription-included routes keep list-equivalent classes), latency on
 # end-to-end or decode evidence with a +1 step above medium reasoning.
+# GPT-6 migration (2026-09-22): GPT-6 Luna and Sol inherit their audited classes
+# by reasoning setting. Those inherited classes are PROVISIONAL pending fresh
+# calibration, not newly benchmarked.
 # Evidence limitation, recorded per the audit: the OpenCode Go GLM route has
 # no independent latency measurement and is classed conservatively high;
 # Devin classes rest on published task economics, not wall-clock latency.
 pointPolicy:
-  pi:openai-codex/gpt-5.6-luna:off: {costClass: low, latencyClass: low}
-  pi:openai-codex/gpt-5.6-luna:low: {costClass: low, latencyClass: low}
-  pi:openai-codex/gpt-5.6-luna:medium: {costClass: low, latencyClass: low}
-  pi:openai-codex/gpt-5.6-luna:high: {costClass: low, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-luna:xhigh: {costClass: low, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-luna:max: {costClass: low, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-terra:off: {costClass: medium, latencyClass: low}
-  pi:openai-codex/gpt-5.6-terra:low: {costClass: medium, latencyClass: low}
-  pi:openai-codex/gpt-5.6-terra:medium: {costClass: medium, latencyClass: low}
-  pi:openai-codex/gpt-5.6-terra:high: {costClass: medium, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-terra:xhigh: {costClass: medium, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-terra:max: {costClass: medium, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-sol:off: {costClass: high, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-sol:low: {costClass: high, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-sol:medium: {costClass: high, latencyClass: medium}
-  pi:openai-codex/gpt-5.6-sol:high: {costClass: high, latencyClass: high}
-  pi:openai-codex/gpt-5.6-sol:xhigh: {costClass: high, latencyClass: high}
-  pi:openai-codex/gpt-5.6-sol:max: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-6-luna:off: {costClass: low, latencyClass: low}
+  pi:openai-codex/gpt-6-luna:low: {costClass: low, latencyClass: low}
+  pi:openai-codex/gpt-6-luna:medium: {costClass: low, latencyClass: low}
+  pi:openai-codex/gpt-6-luna:high: {costClass: low, latencyClass: medium}
+  pi:openai-codex/gpt-6-luna:xhigh: {costClass: low, latencyClass: medium}
+  pi:openai-codex/gpt-6-luna:max: {costClass: low, latencyClass: medium}
+  pi:openai-codex/gpt-6-sol:off: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-6-sol:low: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-6-sol:medium: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-6-sol:high: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-6-sol:xhigh: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-6-sol:max: {costClass: high, latencyClass: high}
   pi:openai-codex/gpt-6-astra:low: {costClass: extreme, latencyClass: high}
   pi:openai-codex/gpt-6-astra:medium: {costClass: extreme, latencyClass: high}
   pi:openai-codex/gpt-6-astra:high: {costClass: extreme, latencyClass: extreme}

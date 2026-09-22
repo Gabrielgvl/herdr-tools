@@ -119,7 +119,7 @@ This is a Tools-owned orchestration gate, not a Herdr core lifecycle veto. For m
 {
   "wait": {
     "reviewCadenceMinutes": 5,
-    "reviewerModel": "openai-codex/gpt-5.6-sol"
+    "reviewerModel": "openai-codex/gpt-6-sol"
   }
 }
 ```

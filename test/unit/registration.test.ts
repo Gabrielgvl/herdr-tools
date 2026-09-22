@@ -133,7 +133,7 @@ describe("global extension registration", () => {
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
     expect(runtime.settings.load).toBeTypeOf("function");
     readFileMock.mockRejectedValueOnce(Object.assign(new Error("missing"), { code: "ENOENT" }));
-    await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-5.6-sol", reviewerThinking: "low" });
+    await expect(runtime.settings.load()).resolves.toMatchObject({ reviewCadenceMinutes: 5, reviewerModel: "openai-codex/gpt-6-sol", reviewerThinking: "low" });
   });
 
   it("creates a compatibility preflight for the registered CLI", async () => {

@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { lstat, mkdir, open } from "node:fs/promises";
 import type { TSchema } from "typebox";
+import { Settings } from "typebox/system";
 import { Value } from "typebox/value";
 import { acquireFlockHolder, assertOwnerOnlyDirectory } from "./pane-write-lock.js";
 import { modelSafeJson } from "./redaction.js";
@@ -16,6 +17,9 @@ const TOOL_TELEMETRY_READY = "HERDR_TOOL_TELEMETRY_LOCK_READY";
 const MAX_DIAGNOSTIC_ERRORS = 8;
 const MAX_PATH_BYTES = 256;
 const MAX_EXPECTED_BYTES = 160;
+// ponytail: finite TypeBox error buffer; inputs with ~256+ simultaneous schema
+// violations can still crowd out later errors — raise if that becomes plausible.
+const TYPEBOX_ERROR_BUFFER_MAX = 256;
 const EFFECT_CERTAINTIES = new Set(["absent", "partial", "unknown", "confirmed"]);
 const PHASE_OUTCOMES = new Set(["success", "failure", "skipped"]);
 const TOOL_OPERATIONS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
@@ -167,10 +171,23 @@ function receivedType(value: unknown, path: string): ToolValidationError["receiv
   return typeof found.value as ToolValidationError["received"];
 }
 
+function rawErrors(schema: TSchema, value: unknown): ReturnType<typeof Value.Errors> {
+  const maxErrors = Settings.Get().maxErrors;
+  Settings.Set({ maxErrors: TYPEBOX_ERROR_BUFFER_MAX });
+  try {
+    return Value.Errors(schema, value);
+  } finally {
+    Settings.Set({ maxErrors });
+  }
+}
+
 function diagnosticErrors(schema: TSchema, value: unknown): ToolValidationError[] {
   const errors: ToolValidationError[] = [];
   const seen = new Set<string>();
-  for (const error of Value.Errors(schema, value)) {
+  for (const error of rawErrors(schema, value)) {
+    // TypeBox 1.3.27+ also reports the `additionalProperties: false` boolean
+    // sub-schema per offending property; the keyword error already names them.
+    if (error.keyword === "boolean" && error.schemaPath.endsWith("/additionalProperties")) continue;
     for (const rawPath of propertyPaths(error)) {
       const path = boundedText(rawPath || "/", MAX_PATH_BYTES);
       const item = { path, expected: boundedText(expected(error), MAX_EXPECTED_BYTES), received: receivedType(value, rawPath) };

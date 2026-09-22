@@ -98,6 +98,16 @@ describe("tool schema diagnostics", () => {
     expect(JSON.stringify(refined)).not.toContain(secret);
   });
 
+  it("keeps real constraint errors visible when additionalProperties companions overflow the raw buffer", () => {
+    const schema = Type.Object({ even: Type.Number({ multipleOf: 2 }) }, { additionalProperties: false });
+    const raw = { even: 3, e1: 1, e2: 1, e3: 1, e4: 1, e5: 1, e6: 1, e7: 1 };
+    const diagnostic = invalidInputDiagnostic("herdr_tab", schema, raw)!;
+    expect(diagnostic.errors).toHaveLength(8);
+    expect(diagnostic.errors).toContainEqual({ path: "/e7", expected: "property not allowed", received: "number" });
+    expect(diagnostic.errors).toContainEqual({ path: "/even", expected: "schema constraint multipleOf", received: "number" });
+    expect(diagnostic.errors.some((error) => error.expected === "schema constraint boolean")).toBe(false);
+  });
+
   it("caps error count and falls back to marker-only valid JSON when a payload cannot fit", () => {
     const schema = Type.Object({}, { additionalProperties: false });
     const diagnostic = invalidInputDiagnostic("bad tool name", schema, Object.fromEntries(Array.from({ length: 20 }, (_, index) => [`field-${index}-${"x".repeat(300)}`, index])))!;

@@ -10,8 +10,8 @@
  */
 
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import type { Api, Model } from "@earendil-works/pi-ai";
-import { modelFor, ReviewerFailure, type ModelRegistrySeam } from "../reviewer.js";
+import type { Api, Model, ProviderHeaders } from "@earendil-works/pi-ai";
+import { dropNullHeaders, modelFor, ReviewerFailure, type ModelRegistrySeam } from "../reviewer.js";
 import { AuthJsonCredentialStore } from "./auth-json-credential-store.js";
 
 /** The builtin catalogue plus `auth.json` credential store both model seams share. */
@@ -47,7 +47,7 @@ export function createRegistryModelService(registry: ModelRegistrySeam): Supervi
       return {
         model,
         ...(auth.apiKey === undefined ? {} : { apiKey: auth.apiKey }),
-        ...(auth.headers === undefined ? {} : { headers: auth.headers }),
+        ...(auth.headers === undefined ? {} : { headers: dropNullHeaders(auth.headers) }),
       };
     },
   };
@@ -57,7 +57,7 @@ export function createRegistryModelService(registry: ModelRegistrySeam): Supervi
 export interface BuiltinModelsSeam {
   getModel(provider: string, id: string): Model<Api> | undefined;
   getModels(provider?: string): readonly Model<Api>[];
-  getAuth(model: Model<Api>): Promise<{ auth: { apiKey?: string; headers?: Record<string, string> } } | undefined>;
+  getAuth(model: Model<Api>): Promise<{ auth: { apiKey?: string; headers?: ProviderHeaders } } | undefined>;
 }
 
 /**
@@ -84,7 +84,7 @@ export function createBuiltinModelService(models: BuiltinModelsSeam = createBuil
       return {
         model,
         ...(auth.auth.apiKey === undefined ? {} : { apiKey: auth.auth.apiKey }),
-        ...(auth.auth.headers === undefined ? {} : { headers: auth.auth.headers }),
+        ...(auth.auth.headers === undefined ? {} : { headers: dropNullHeaders(auth.auth.headers) }),
       };
     },
   };

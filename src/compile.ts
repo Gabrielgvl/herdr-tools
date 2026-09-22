@@ -103,6 +103,10 @@ const CONSUMABLE_FIELDS: Record<RunnerKind, readonly (keyof RunnerPools)[]> = {
 
 /** Pool fields whose members are scope-rooted paths; the rest are bare names. */
 const PATH_FIELDS: ReadonlySet<keyof RunnerPools> = new Set(["extensions", "skills", "plugins"]);
+const BASE_TOOLS: Record<"pi" | "claude", readonly string[]> = {
+  pi: ["read", "bash", "write"],
+  claude: ["Read", "Bash", "Write"],
+};
 
 function fail(code: CompileErrorCode, message: string, details: Record<string, unknown> = {}): never {
   throw new CompileError(code, message, details);
@@ -205,6 +209,9 @@ async function compilePi(point: OperatingPoint, runner: RunnerEntry, selected: R
     fields[field]!.selected = new Set(selected[field]);
     fields[field]!.granted = new Set(selected[field]);
   }
+  // These tools are unconditional runtime capabilities, after the compiler
+  // verifies they are all present in the reviewed pool.
+  for (const name of BASE_TOOLS.pi) fields.tools!.granted.add(name);
   // Pi's MCP tool binds every server from ambient host configuration and has
   // no server-scoped allow or deny channel. Remove both direct tool grants and
   // selected servers rather than claiming the reviewed subset is enforceable.
@@ -243,6 +250,9 @@ async function compileClaude(point: OperatingPoint, runner: RunnerEntry, catalog
     fields[field]!.selected = new Set(selected[field]);
     fields[field]!.granted = new Set(selected[field]);
   }
+  // These tools are unconditional runtime capabilities, after the compiler
+  // verifies they are all present in the reviewed pool.
+  for (const name of BASE_TOOLS.claude) fields.tools!.granted.add(name);
   const pluginNames = fields.mcp!.selected.size > 0 || fields.plugins!.selected.size > 0 ? await pluginDirsByName(pools.plugins) : new Map<string, string>();
   const providerOf = (server: string): { plugin: string; dir: string | undefined } | undefined => {
     const plugin = catalog.mcpServers.get(server)?.plugin;
@@ -350,6 +360,10 @@ export async function compileCandidateContract(catalog: Catalog, spec: CompileSp
   if (point.reasoning !== undefined && !(entry.supportedReasoning ?? []).includes(point.reasoning)) fail("CANDIDATE_NOT_REVIEWED", `point reasoning ${point.reasoning} is outside the model's declared axis`, { runner: point.runner, model: point.model, reasoning: point.reasoning });
   if (runner.kind === "pi" && (point.reasoning === undefined || !THINKING_LEVELS.includes(point.reasoning as ThinkingLevel))) fail("CANDIDATE_NOT_REVIEWED", `pi point ${point.id} carries no reasoning setting`, { runner: point.runner, model: point.model });
   if (runner.kind === "claude" && point.reasoning !== undefined && !CLAUDE_EFFORTS.includes(point.reasoning as ClaudeEffort)) fail("CANDIDATE_NOT_REVIEWED", `claude point ${point.id} carries a non-effort reasoning setting`, { runner: point.runner, model: point.model });
+  if (runner.kind === "pi" || runner.kind === "claude") {
+    const missingBaseTools = BASE_TOOLS[runner.kind].filter((name) => !runner.pools.tools.includes(name));
+    if (missingBaseTools.length > 0) fail("CANDIDATE_NOT_REVIEWED", `${runner.kind} reviewed pool is missing required base tools`, { runner: runner.kind, names: missingBaseTools });
+  }
   for (const field of Object.keys(selection)) if (!POOL_FIELDS.includes(field as keyof RunnerPools)) fail("INVALID_SELECTION", `selection.${field} is not a pool field`, { field });
   const scopeRoot = catalog.source.scopeRoot;
   // Membership is checked for every pool field, consumable or not: a selection

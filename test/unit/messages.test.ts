@@ -656,7 +656,14 @@ describe("attachment store", () => {
           .then(() => process.stdout.write("PUBLISHED"))
           .catch((error) => process.stdout.write(String(error.code)));
       `;
-      const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+      // A hermetic child env keeps harness-injected output out of the outcome
+      // readback: NODE_OPTIONS preloads (the context-mode FS tracer writes
+      // `__CM_FS__:<n>` lines to the child's stdio under load) and coverage
+      // directories would otherwise corrupt the exact stdout/stderr contract.
+      const childEnv = { ...process.env };
+      delete childEnv.NODE_OPTIONS;
+      delete childEnv.NODE_V8_COVERAGE;
+      const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
       let childOutput = "";
       let childError = "";
       child.stdout.on("data", (chunk: Buffer) => { childOutput += chunk.toString(); });
@@ -665,9 +672,15 @@ describe("attachment store", () => {
       const localOutcome = await local.publish({ ...input, body: "local" }).then(() => "PUBLISHED").catch((error: { code?: string }) => String(error.code));
       await new Promise<void>((resolve) => child.on("close", () => resolve()));
 
-      expect(childError, `child publish failed: ${childError}`).toBe("");
-      expect([localOutcome, childOutput].filter((value) => value === "PUBLISHED")).toHaveLength(1);
-      expect([localOutcome, childOutput].filter((value) => value === "ATTACHMENT_QUOTA_EXCEEDED")).toHaveLength(1);
+      // Tolerate a leaked `__CM_FS__` marker only: the publication outcome is
+      // still read as the one remaining token, and any other stderr is a
+      // failure. The exactly-one-publication assertion is unchanged.
+      const stripMarkers = (output: string) => output.replace(/__CM_FS__:\d+/g, "").trim();
+      const childOutcome = stripMarkers(childOutput);
+      const childDiagnostics = stripMarkers(childError);
+      expect(childDiagnostics, `child publish failed: ${childError}`).toBe("");
+      expect([localOutcome, childOutcome].filter((value) => value === "PUBLISHED")).toHaveLength(1);
+      expect([localOutcome, childOutcome].filter((value) => value === "ATTACHMENT_QUOTA_EXCEEDED")).toHaveLength(1);
       const records = await fs.readdir(join(storeRoot, KEY));
       expect(records.filter((name) => !name.startsWith(".tmp-") && name !== ATTACHMENT_LOCK_NAME)).toHaveLength(ATTACHMENT_STORE_MAX_RECORDS);
     } finally {

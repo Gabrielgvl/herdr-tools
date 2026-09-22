@@ -5,17 +5,21 @@ import type { FileHandle } from "node:fs/promises";
 import type * as FsPromises from "node:fs/promises";
 import type * as PaneWriteLockModule from "../../src/pane-write-lock.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
 import {
   createHandoffAllocator,
   HANDOFF_ARTIFACT_NAME,
   HANDOFF_HEADINGS,
   HANDOFF_MAX_BYTES,
   HANDOFF_STATE_DIR_NAME,
+  HandoffError,
+  openHandoffRun,
   parseHandoffArtifact,
   readHandoffArtifact,
   readHandoffState,
   renderHandoffContract,
   resolveHandoffNamespace,
+  RUN_ID_PATTERN,
   updateHandoffState,
   type HandoffAllocation,
   type HandoffRunIdentity,
@@ -145,7 +149,22 @@ async function socketEnv(base: string): Promise<NodeJS.ProcessEnv> {
 
 const identity: HandoffRunIdentity = {
   manager: { paneId: "w1:p1", display: "caller", source: "injected" },
-  child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: ["worker-claude"] }
+  child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi", specLabel: "worker-pi", fallbackCandidates: ["worker-claude"] }
+};
+
+/** The recovery lineage a v2 record carries — route evidence and the managed workspace. */
+const identityWithLineage: HandoffRunIdentity = {
+  ...identity,
+  child: {
+    ...identity.child,
+    route: {
+      tier: "standard",
+      operatingPointId: "worker-pi",
+      policyRevision: "adr-037-p1",
+      workload: { intent: "implement", mutation: "bounded", scope: "local", horizon: "short", verifiability: "strong", workspaceState: "clean", ambiguity: "low" }
+    },
+    workspace: { resolvedCwd: "/repo", worktree: "/repo/.herdr/worktrees/worker" }
+  }
 };
 
 function allocatorFor(dir: string, endpoint = "test-endpoint") {
@@ -228,7 +247,7 @@ describe("run allocation and state", () => {
 
     const state = JSON.parse(await readFile(run.statePath, "utf8")) as HandoffState;
     expect(state).toEqual({
-      v: 1,
+      v: 2,
       runId: run.runId,
       endpoint: "endpoint-A",
       createdAt: expect.any(String),
@@ -236,7 +255,7 @@ describe("run allocation and state", () => {
       child: {
         agentName: "worker",
         agentKind: "pi",
-        candidateName: "worker-pi",
+        operatingPointId: "worker-pi",
         specLabel: "worker-pi",
         fallbackCandidates: ["worker-claude"],
         paneId: null,
@@ -248,8 +267,11 @@ describe("run allocation and state", () => {
       artifact: { path: run.artifactPath, sha256: null, bytes: null, version: 0 },
       repair: { attempts: 0, fence: null }
     });
+    await allocator.selectCandidate(run, "worker-claude", "claude", { available: false, reason: "no-readback-seam", catalogRevision: "rev-1" });
+    expect((JSON.parse(await readFile(run.statePath, "utf8")) as HandoffState).child).toMatchObject({ operatingPointId: "worker-claude", agentKind: "claude", resolvedModel: { available: false, reason: "no-readback-seam", catalogRevision: "rev-1" } });
+    // A later correction without a resolved-model record leaves the recorded one untouched.
     await allocator.selectCandidate(run, "worker-claude", "claude");
-    expect((JSON.parse(await readFile(run.statePath, "utf8")) as HandoffState).child).toMatchObject({ candidateName: "worker-claude", agentKind: "claude" });
+    expect((JSON.parse(await readFile(run.statePath, "utf8")) as HandoffState).child).toMatchObject({ resolvedModel: { available: false, reason: "no-readback-seam", catalogRevision: "rev-1" } });
     // No staging files survive the atomic commits.
     expect((await readdir(run.toolsDir)).sort()).toEqual(["lock", "state.json"]);
   });
@@ -265,6 +287,196 @@ describe("run allocation and state", () => {
     await expect(allocator.persist(foreign, identity)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED" });
     const escaped = { ...(await allocator.allocate()), directory: join(dir, "..", "escape") };
     await expect(allocator.persist(escaped, identity)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED" });
+  });
+});
+
+describe("run opener", () => {
+  it("opens the exact allocation a run id derives under this endpoint's namespace", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, identityWithLineage);
+
+    const opened = await openHandoffRun(run.runId, { namespace: { dir, endpoint: "test-endpoint" } });
+    expect(opened).toEqual({
+      runId: run.runId,
+      namespaceDir: dir,
+      endpoint: "test-endpoint",
+      directory: run.directory,
+      artifactPath: run.artifactPath,
+      toolsDir: run.toolsDir,
+      statePath: run.statePath,
+      lockPath: run.lockPath,
+      marker: run.marker
+    });
+    // The opened allocation reads the trusted record back — no must-not-exist.
+    expect((await readHandoffState(opened)).child.route?.operatingPointId).toBe("worker-pi");
+    // The allocator's open delegates the same derivation under its namespace.
+    expect(await allocator.open(run.runId)).toEqual(opened);
+  });
+
+  it("opens a run whose state was never persisted — reading it then fails closed", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const runId = randomUUID();
+    const opened = await allocator.open(runId);
+    expect(opened.directory).toBe(join(dir, runId));
+    await expect(readHandoffState(opened)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", message: "Handoff state is missing" });
+  });
+
+  it("rejects run ids outside the managed UUID shape", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    for (const runId of ["not-a-run", "../escape", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeez", "", "A".repeat(36)]) {
+      await expect(openHandoffRun(runId, { namespace: { dir, endpoint: "test-endpoint" } })).rejects.toMatchObject({ code: "HANDOFF_UNAVAILABLE", message: "Handoff run id is malformed" });
+      await expect(allocator.open(runId)).rejects.toMatchObject({ code: "HANDOFF_UNAVAILABLE" });
+    }
+    expect(RUN_ID_PATTERN.test(randomUUID())).toBe(true);
+  });
+
+  it("wraps namespace failures and resolves the ambient env when none is injected", async () => {
+    await expect(openHandoffRun(randomUUID(), { namespace: async () => { throw new Error("boom"); } })).rejects.toMatchObject({ code: "HANDOFF_UNAVAILABLE", message: "Handoff namespace is unavailable" });
+    await expect(openHandoffRun(randomUUID(), { namespace: async () => { throw new HandoffError("HANDOFF_UNAVAILABLE", "Handoff namespace is unavailable"); } })).rejects.toMatchObject({ code: "HANDOFF_UNAVAILABLE", message: "Handoff namespace is unavailable" });
+
+    const base = await root();
+    const env = await socketEnv(base);
+    const runId = randomUUID();
+    const opened = await openHandoffRun(runId, { env });
+    expect(opened.directory).toBe(join(base, HANDOFF_STATE_DIR_NAME, runId));
+    expect(opened.endpoint).toBe(join(base, "herdr.sock"));
+    // With no env injected the ambient process env resolves the namespace.
+    vi.stubEnv("HERDR_SOCKET_PATH", env.HERDR_SOCKET_PATH!);
+    expect((await openHandoffRun(runId)).directory).toBe(opened.directory);
+  });
+});
+
+describe("recovery lineage records", () => {
+  it("persists route and workspace evidence and keeps the recorded point in step with the actual start", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, identityWithLineage);
+
+    const state = await readHandoffState(run);
+    expect(state.child.route).toEqual(identityWithLineage.child.route);
+    expect(state.child.workspace).toEqual(identityWithLineage.child.workspace);
+
+    // selectCandidate keeps the recorded route's selected point in step with
+    // the actual start so a recovery excludes the point that really ran.
+    await allocator.selectCandidate(run, "worker-claude", "claude");
+    const updated = await readHandoffState(run);
+    expect(updated.child.operatingPointId).toBe("worker-claude");
+    expect(updated.child.route).toMatchObject({ tier: "standard", operatingPointId: "worker-claude", policyRevision: "adr-037-p1" });
+  });
+
+  it("leaves a lineage-less record's route absent when the selected candidate lands", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, identity);
+    await allocator.selectCandidate(run, "worker-claude", "claude");
+    const state = await readHandoffState(run);
+    expect(state.child.operatingPointId).toBe("worker-claude");
+    expect("route" in state.child).toBe(false);
+    expect("workspace" in state.child).toBe(false);
+  });
+
+  it("fails closed on v1 records — they are never reinterpreted", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, identity);
+    const original = JSON.parse(await readFile(run.statePath, "utf8")) as Record<string, unknown>;
+    for (const v of [1, 3, "2"]) {
+      await writeFile(run.statePath, JSON.stringify({ ...original, v }), { mode: 0o600 });
+      await expect(readHandoffState(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", message: "Handoff state is malformed" });
+    }
+  });
+
+  it("fails closed on a record pinned to a foreign endpoint or missing top-level records", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, identity);
+    const original = JSON.parse(await readFile(run.statePath, "utf8")) as Record<string, unknown>;
+    const mutations: Record<string, unknown>[] = [
+      { endpoint: "other-endpoint" },
+      { manager: null },
+      { lifecycle: null },
+      { artifact: "x" },
+      { repair: 7 },
+      { child: null },
+    ];
+    for (const [index, mutation] of mutations.entries()) {
+      await writeFile(run.statePath, JSON.stringify({ ...original, ...mutation }), { mode: 0o600 });
+      await expect(readHandoffState(run), `mutation ${index}`).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", message: "Handoff state is malformed" });
+    }
+  });
+
+  it("fails closed on any malformed child record field", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, identityWithLineage);
+    const original = JSON.parse(await readFile(run.statePath, "utf8")) as Record<string, unknown>;
+    const originalChild = JSON.parse(JSON.stringify(original.child)) as Record<string, unknown>;
+    const mutations: Array<(child: Record<string, unknown>) => void> = [
+      (child) => { child.agentName = 7; },
+      (child) => { delete child.agentKind; },
+      (child) => { child.operatingPointId = ""; },
+      (child) => { child.specLabel = 3; },
+      (child) => { child.fallbackCandidates = "x"; },
+      (child) => { child.fallbackCandidates = [7]; },
+      (child) => { child.paneId = 5; },
+      (child) => { child.terminalId = ""; },
+      (child) => { child.agentId = {}; },
+      (child) => { child.resolvedModel = { available: "yes" }; },
+      (child) => { child.resolvedModel = { available: true }; },
+      (child) => { child.resolvedModel = { available: false }; },
+      (child) => { child.resolvedModel = { available: false, reason: "x", catalogRevision: 4 }; },
+      (child) => { child.resolvedModel = { available: true, model: "m", extra: 1 }; },
+      (child) => { child.route = { ...(child.route as Record<string, unknown>), tier: "bogus" }; },
+      (child) => { child.route = { ...(child.route as Record<string, unknown>), operatingPointId: "" }; },
+      (child) => { child.route = { ...(child.route as Record<string, unknown>), policyRevision: "" }; },
+      (child) => { child.route = { ...(child.route as Record<string, unknown>), workload: { intent: "bogus" } }; },
+      (child) => { child.route = { ...(child.route as Record<string, unknown>), workload: "x" }; },
+      (child) => { child.route = "x"; },
+      (child) => { child.workspace = {}; },
+      (child) => { child.workspace = { resolvedCwd: "/x", worktree: 5 }; },
+      (child) => { child.workspace = { resolvedCwd: "/x", foreign: true }; },
+      (child) => { child.unknownField = true; },
+    ];
+    for (const [index, mutate] of mutations.entries()) {
+      const child = JSON.parse(JSON.stringify(originalChild)) as Record<string, unknown>;
+      mutate(child);
+      await writeFile(run.statePath, JSON.stringify({ ...original, child }), { mode: 0o600 });
+      await expect(readHandoffState(run), `mutation ${index}`).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", message: "Handoff state is malformed" });
+    }
+    // The unmutated record still parses — the matrix proved field-level strictness.
+    await writeFile(run.statePath, JSON.stringify(original), { mode: 0o600 });
+    expect((await readHandoffState(run)).child.route?.tier).toBe("standard");
+  });
+
+  it("fails closed on any malformed workload field inside the recorded route", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, identityWithLineage);
+    const original = JSON.parse(await readFile(run.statePath, "utf8")) as { child: { route: { workload: Record<string, unknown> } } } & Record<string, unknown>;
+    const workload = original.child.route.workload;
+    for (const field of Object.keys(workload)) {
+      const state = JSON.parse(JSON.stringify(original)) as typeof original;
+      state.child.route.workload[field] = "bogus";
+      await writeFile(run.statePath, JSON.stringify(state), { mode: 0o600 });
+      await expect(readHandoffState(run), field).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", message: "Handoff state is malformed" });
+    }
+    // An extra workload key and a missing one are equally malformed.
+    for (const mutate of [(w: Record<string, unknown>) => { w.extra = "clean"; }, (w: Record<string, unknown>) => { delete w.intent; }]) {
+      const state = JSON.parse(JSON.stringify(original)) as typeof original;
+      mutate(state.child.route.workload);
+      await writeFile(run.statePath, JSON.stringify(state), { mode: 0o600 });
+      await expect(readHandoffState(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", message: "Handoff state is malformed" });
+    }
   });
 });
 

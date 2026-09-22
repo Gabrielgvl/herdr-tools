@@ -1,25 +1,22 @@
-import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { availability, recordLaunchFailure, type CandidateAvailability } from "../../src/availability.js";
-import type { Catalog, ChainCandidate, RunnerEntry, RunnerKind } from "../../src/catalog.js";
+import type { Catalog, OperatingPoint, RunnerEntry, RunnerKind } from "../../src/catalog.js";
 import { CompileError, type CompiledContract, type ResourceSelection } from "../../src/compile.js";
-import type { LaunchSpec } from "../../src/launch-schema.js";
 import {
-  COMPOSITION_ADVISORY_THRESHOLD,
+  MODIFIER_THRESHOLD,
   ROUTER_CONFIDENCE_THRESHOLD,
-  assembleSpecDecision,
-  createBypassReceipt,
-  replayBypassReceipt,
-  routeSpec,
-  type AbstainReason,
-  type Abstained,
-  type BypassReceipt,
-  type RouterBinding,
-  type SpecRouteInput,
+  SEMANTIC_MODIFIERS,
+  WORKLOAD_INTENTS,
+  routeTask,
+  runnerResourceSelection,
+  type RoutingTask,
+  type TaskRouteInput,
 } from "../../src/router.js";
+import { MAX_ATTEMPTS, POLICY_REVISION, QUALITY_TIERS, type CostClass, type LatencyClass, type QualityTier } from "../../src/routing-policy.js";
+import type { ClaudeEffort, ThinkingLevel } from "../../src/profiles/types.js";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -28,21 +25,16 @@ afterEach(async () => {
 
 const SHARED_QUOTA = { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" };
 
-const SPEC: LaunchSpec = {
-  label: "worker",
-  instructions: "Reduce the latency.",
-  assignment: { objective: "Reduce the latency.", scope: "Only the test fixture.", verification: "Run the focused tests." },
-  count: 2,
+const TASK: RoutingTask = {
+  objective: "Reduce the latency.",
+  scope: "Only the test fixture.",
+  doneWhen: ["p95 latency below 200ms in the bench output"],
+  constraints: ["Do not change the wire protocol"],
 };
 
-const BINDING: RouterBinding = {
-  caller: "oom-hunt",
-  specRevision: "spec-1",
-  policyRevision: "adr-035-b6",
-  launchIdentity: "launch-1",
-};
+const SPEC = { label: "worker", count: 2 };
 
-function runner(kind: RunnerKind, model: string, quota = SHARED_QUOTA): RunnerEntry {
+function runnerEntry(kind: RunnerKind, models: string[]): RunnerEntry {
   const defaults: RunnerEntry["defaults"] = kind === "pi"
     ? { timeoutMinutes: 30, sessionPersistence: false, thinking: "low" }
     : kind === "claude"
@@ -59,8 +51,8 @@ function runner(kind: RunnerKind, model: string, quota = SHARED_QUOTA): RunnerEn
         : { sessionPersistence: "required", promptDelivery: "none", skillSelection: "ambient", toolSelection: "ambient" };
   return {
     kind,
-    models: [model],
-    quota,
+    models: models.map((model) => ({ model })),
+    quota: SHARED_QUOTA,
     defaults,
     plumbing,
     pools: {
@@ -73,36 +65,57 @@ function runner(kind: RunnerKind, model: string, quota = SHARED_QUOTA): RunnerEn
   };
 }
 
-function catalogOf(chain: readonly ChainCandidate[]): Catalog {
+function makePoint(
+  runner: RunnerKind,
+  model: string,
+  options: { reasoning?: ThinkingLevel | ClaudeEffort; costClass?: CostClass; latencyClass?: LatencyClass; provider?: string } = {},
+): OperatingPoint {
+  const provider = options.provider ?? `${runner}-provider`;
+  return {
+    id: `${runner}:${model}${options.reasoning === undefined ? "" : `:${options.reasoning}`}`,
+    runner,
+    model,
+    ...(options.reasoning === undefined ? {} : { reasoning: options.reasoning }),
+    provider,
+    quota: { ...SHARED_QUOTA, provider },
+    costClass: options.costClass ?? "medium",
+    latencyClass: options.latencyClass ?? "medium",
+  };
+}
+
+function catalogOf(points: readonly OperatingPoint[]): Catalog {
   const runners = new Map<RunnerKind, RunnerEntry>();
-  for (const candidate of chain) {
-    if (!runners.has(candidate.runner)) runners.set(candidate.runner, runner(candidate.runner, candidate.model));
+  for (const point of points) {
+    if (!runners.has(point.runner)) {
+      runners.set(point.runner, runnerEntry(point.runner, [...new Set(points.filter((entry) => entry.runner === point.runner).map((entry) => entry.model))]));
+    }
   }
   return {
-    version: 1,
-    maxAttempts: 4,
-    categories: new Map([["worker", [...chain]]]),
+    version: 2,
     runners,
     skills: [],
     plugins: [],
     mcpServers: new Map(),
     quotaSources: [{ name: "reactive-cooldowns", kind: "floor" }],
+    points,
     source: { path: "/tmp/catalog.yaml", scopeRoot: "/tmp" },
   };
 }
 
-const SINGLE_CATALOG = catalogOf([{ runner: "pi", model: "pi-model" }]);
+const SINGLE_POINT = makePoint("pi", "pi-model", { reasoning: "low" });
+const SINGLE_CATALOG = catalogOf([SINGLE_POINT]);
 
-function configuration(index = 0, model = "pi-model", specLabel = SPEC.label): CompiledContract {
+function configuration(resolved: { index: number; point: OperatingPoint }, specLabel = SPEC.label): CompiledContract {
+  const { point } = resolved;
   return {
     specLabel,
-    candidate: { index, runner: "pi", model },
-    quota: SHARED_QUOTA,
+    candidate: { index: resolved.index, id: point.id, runner: point.runner, model: point.model, ...(point.reasoning === undefined ? {} : { reasoning: point.reasoning }) },
+    quota: point.quota,
     scopeRoot: "/tmp",
     sessionPersistence: false,
     timeoutMinutes: 30,
     plumbing: { sessionPersistence: "optional", promptDelivery: "file", skillSelection: "exact", toolSelection: "allowlist" },
-    runtime: { kind: "pi", model, thinking: "low", tools: ["read"], extensions: [], skills: [] },
+    runtime: { kind: "pi", model: point.model, thinking: "low", tools: ["read"], extensions: [], skills: [] },
     resources: {
       tools: { installed: ["read"], selected: ["read"], exposed: ["read"], permitted: ["read"], denied: [] },
     },
@@ -111,16 +124,36 @@ function configuration(index = 0, model = "pi-model", specLabel = SPEC.label): C
   };
 }
 
-function responseFor(catalog: Catalog, category = "worker", confidence = 0.9): Record<string, unknown> {
+function fitnessFor(catalog: Catalog, probability: number | ((point: OperatingPoint, tier: QualityTier) => number) = 0.9): Record<string, Record<string, number>> {
+  const out: Record<string, Record<string, number>> = {};
+  for (const [index, point] of (catalog.points ?? []).entries()) {
+    const byTier = {} as Record<string, number>;
+    for (const tier of QUALITY_TIERS) byTier[tier] = typeof probability === "function" ? probability(point, tier) : probability;
+    out[String(index)] = byTier;
+  }
+  return out;
+}
+
+function resourcesFor(catalog: Catalog, probability = 0.95): Record<string, Record<string, Record<string, number>>> {
+  const out: Record<string, Record<string, Record<string, number>>> = {};
+  for (const [kind, entry] of catalog.runners) {
+    const fields: Record<string, Record<string, number>> = {};
+    for (const field of ["tools", "extensions", "skills", "plugins", "mcp"] as const) {
+      for (const name of entry.pools[field]) (fields[field] ??= {})[name] = probability;
+    }
+    out[kind] = fields;
+  }
+  return out;
+}
+
+function responseFor(catalog: Catalog, patch: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 },
-    category: { category, confidence },
-    candidates: (catalog.categories.get(category) ?? []).map((candidate, index) => ({
-      index,
-      runner: candidate.runner,
-      model: candidate.model,
-      selection: candidate.runner === "pi" ? { tools: ["read"] } : {},
-    })),
+    quality: { done_when_verifiable: 0.9 },
+    intent: { value: "implement", confidence: 0.9 },
+    modifiers: {},
+    resources: resourcesFor(catalog),
+    fitness: fitnessFor(catalog),
+    ...patch,
   };
 }
 
@@ -128,715 +161,737 @@ function availabilityStatus(status: CandidateAvailability["status"]): CandidateA
   return { status, retryNotBefore: null, evidence: { records: status === "unknown" ? 0 : 1 } };
 }
 
-function baseInput(catalog: Catalog = SINGLE_CATALOG): SpecRouteInput {
+function baseInput(catalog: Catalog = SINGLE_CATALOG): TaskRouteInput {
   return {
+    task: TASK,
     spec: SPEC,
     catalog,
     response: responseFor(catalog),
     root: "/tmp/router-test-root",
     availability: async () => availabilityStatus("unknown"),
-    compile: async (_catalog, _spec, resolved) => configuration(resolved.index, resolved.candidate.model),
+    compile: async (_catalog, _spec, resolved) => configuration(resolved),
   };
 }
 
-const GOOD_QUALITY = { instructions_adequate: 0.9, assignment_verifiable: 0.9 };
-
-function recordedAbstention(reason: AbstainReason = "transport_failed"): Abstained {
-  return { kind: "abstained", reason, component: "fixture" };
-}
-
-describe("per-spec router policy", () => {
-  it("keeps the policy confidence threshold at 0.8 and admits with not_rejected evidence", async () => {
+describe("task routing policy", () => {
+  it("keeps the intent confidence threshold at 0.8, the modifier threshold at 0.7, and admits with not_rejected evidence", async () => {
     expect(ROUTER_CONFIDENCE_THRESHOLD).toBe(0.8);
+    expect(MODIFIER_THRESHOLD).toBe(0.7);
     const seen: ResourceSelection[] = [];
     const input = baseInput();
     input.compile = async (_catalog, _spec, resolved, selection) => {
       seen.push(selection);
-      return configuration(resolved.index, resolved.candidate.model);
+      return configuration(resolved);
     };
 
-    const result = await routeSpec(input);
+    const result = await routeTask(input);
 
-    expect(result).toMatchObject({ kind: "admitted", quality: "not_rejected", category: "worker", count: 2 });
+    expect(result).toMatchObject({
+      kind: "admitted",
+      quality: "not_rejected",
+      count: 2,
+      requestedTier: "standard",
+      workloadFloor: "standard",
+      effectiveStartTier: "standard",
+      effectiveCeiling: "frontier",
+      chain: [SINGLE_POINT.id],
+      selectedPoint: { index: 0, id: SINGLE_POINT.id, runner: "pi", model: "pi-model", reasoning: "low" },
+    });
     expect(result.evidence).toMatchObject({
-      quality: { outcome: "not_rejected", instructions_adequate: 0.9, assignment_verifiable: 0.9 },
-      category: { name: "worker", confidence: 0.9 },
-      selectedCandidate: { index: 0, runner: "pi", model: "pi-model" },
-      availability: [{ index: 0, status: "unknown", retryNotBefore: null }],
+      quality: { outcome: "not_rejected", done_when_verifiable: 0.9 },
+      policyRevision: POLICY_REVISION,
+      intent: { value: "implement", confidence: 0.9 },
+      workload: { intent: "implement", mutation: "none", scope: "local", horizon: "short", workspaceState: "clean", ambiguity: "low" },
+      selectedPoint: { index: 0, id: SINGLE_POINT.id },
+      availability: [{ id: "pi:pi-model:low", status: "unknown", retryNotBefore: null }],
+      fitness: { [SINGLE_POINT.id]: 0.9 },
     });
     expect(seen).toEqual([{ tools: ["read"] }]);
     expect(JSON.stringify(result)).not.toContain("certified");
   });
 
-  it("rejects a confident quality failure before assembling an admission", () => {
-    const result = assembleSpecDecision({
-      spec: SPEC,
-      quality: { instructions_adequate: { probability: 0.1, confidence: 0.9 }, assignment_verifiable: { probability: 0.9, confidence: 0.9 } },
-      category: "worker",
-      configuration: configuration(),
-    });
+  it("rejects a confident done_when failure before assembling an admission", async () => {
+    const input = baseInput();
+    input.response = { quality: { done_when_verifiable: 0.1 } };
+    await expect(routeTask(input)).resolves.toMatchObject({ kind: "rejected", quality: "rejected", reason: "done_when_unverifiable" });
 
-    expect(result).toEqual({
+    const rejected = await routeTask(baseInput());
+    expect(rejected.kind).toBe("admitted");
+    const failing = baseInput();
+    failing.response = { ...responseFor(SINGLE_CATALOG), quality: { done_when_verifiable: { probability: 0.05, confidence: 0.9 } } };
+    await expect(routeTask(failing)).resolves.toEqual({
       kind: "rejected",
       quality: "rejected",
-      reason: "instructions_inadequate",
-      evidence: { quality: { outcome: "rejected", instructions_adequate: 0.1, assignment_verifiable: 0.9 } },
+      reason: "done_when_unverifiable",
+      evidence: { quality: { outcome: "rejected", done_when_verifiable: 0.05 } },
     });
   });
 
-  it("preserves the complete abstention reason taxonomy without partial output", () => {
-    const reasons: readonly AbstainReason[] = [
-      "low_confidence",
-      "no_assignments",
-      "catalog_unavailable",
-      "invalid_response",
-      "authentication_unavailable",
-      "transport_failed",
-      "aborted",
-    ];
+  it("abstains invalid_response/quality on missing or malformed quality evidence", async () => {
+    for (const quality of [undefined, "junk", { done_when_verifiable: "junk" }, { done_when_verifiable: { probabilities: { yes: 0.5, no: 0.6 } } }]) {
+      const input = baseInput();
+      input.response = quality === undefined ? { ...responseFor(SINGLE_CATALOG), quality: undefined } : { ...responseFor(SINGLE_CATALOG), quality };
+      await expect(routeTask(input), JSON.stringify(quality)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "quality" });
+    }
+    for (const response of ["junk", null]) {
+      const input = baseInput();
+      input.response = response;
+      await expect(routeTask(input)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "quality" });
+    }
+  });
 
-    for (const reason of reasons) {
-      const result = assembleSpecDecision({
-        spec: SPEC,
-        quality: GOOD_QUALITY,
-        category: "worker",
-        configuration: configuration(),
-        abstention: recordedAbstention(reason),
+  it("abstains low_confidence naming intent when the intent judgment is under 0.8 — the only abstaining classification", async () => {
+    for (const confidence of [0.799, 0.5, 0]) {
+      const input = baseInput();
+      input.response = responseFor(SINGLE_CATALOG, { intent: { value: "implement", confidence } });
+      await expect(routeTask(input), `confidence ${confidence}`).resolves.toMatchObject({
+        kind: "abstained",
+        reason: "low_confidence",
+        component: "intent",
+        evidence: { quality: { outcome: "not_rejected" }, policyRevision: POLICY_REVISION, intent: { value: "implement", confidence } },
       });
-      expect(result).toEqual(recordedAbstention(reason));
-      expect(JSON.stringify(result)).not.toContain("pi-model");
+    }
+    const boundary = baseInput();
+    boundary.response = responseFor(SINGLE_CATALOG, { intent: { value: "implement", confidence: 0.8 } });
+    await expect(routeTask(boundary)).resolves.toMatchObject({ kind: "admitted" });
+  });
+
+  it("abstains invalid_response/intent on a malformed or foreign intent judgment", async () => {
+    for (const intent of [undefined, 5, "ghost", { value: "implement" }, { value: "ghost", confidence: 0.9 }, { value: "implement", confidence: 2 }, { value: "implement", confidence: 0.9, probabilities: { implement: 0.9 } }]) {
+      const input = baseInput();
+      input.response = responseFor(SINGLE_CATALOG, { intent });
+      await expect(routeTask(input), JSON.stringify(intent)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "intent" });
     }
   });
 
-  it("fails closed for missing quality, low category confidence, and malformed candidates", async () => {
-    const missingQuality = baseInput();
-    missingQuality.response = responseFor(SINGLE_CATALOG);
-    delete (missingQuality.response as Record<string, unknown>).quality;
-    await expect(routeSpec(missingQuality)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "quality" });
-
-    const lowCategory = baseInput();
-    lowCategory.response = responseFor(SINGLE_CATALOG, "worker", 0.799);
-    await expect(routeSpec(lowCategory)).resolves.toMatchObject({ kind: "abstained", reason: "low_confidence", component: "category" });
-
-    const malformedCandidates = baseInput();
-    malformedCandidates.response = { ...responseFor(SINGLE_CATALOG), candidates: [] };
-    await expect(routeSpec(malformedCandidates)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "candidates" });
-  });
-
-  it("reports no_assignments for exhausted candidates and transport_failed for local capacity", async () => {
-    const exhausted = baseInput();
-    exhausted.availability = async () => availabilityStatus("known-exhausted");
-    await expect(routeSpec(exhausted)).resolves.toMatchObject({ kind: "abstained", reason: "no_assignments" });
-
-    const local = baseInput();
-    local.availability = async () => availabilityStatus("local-capacity-limited");
-    await expect(routeSpec(local)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
-  });
-
-  it("returns transport_failed when availability or transport evidence cannot be trusted", async () => {
-    const unavailable = baseInput();
-    unavailable.availability = async () => { throw new Error("availability read failed"); };
-    await expect(routeSpec(unavailable)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
-
-    const transport = baseInput();
-    transport.response = { ...responseFor(SINGLE_CATALOG), transport: { failed: true, component: "router-http" } };
-    await expect(routeSpec(transport)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "router-http" });
-  });
-
-  it("rejects a spec even when a valid bypass receipt is presented", async () => {
-    const receipt = createBypassReceipt({
-      binding: BINDING,
-      abstention: recordedAbstention(),
-      configuration: configuration(),
-      recorded: true,
-    });
-    const input = baseInput();
-    input.binding = BINDING;
-    input.bypass = receipt;
-    input.response = {
-      quality: { instructions_adequate: 0.1, assignment_verifiable: 0.9 },
-      category: { category: "worker", confidence: 0.9 },
-    };
-
-    await expect(routeSpec(input)).resolves.toMatchObject({ kind: "rejected", quality: "rejected", reason: "instructions_inadequate" });
-  });
-
-  it("requires a recorded transport abstention and replays a receipt deterministically", async () => {
-    const abstention = recordedAbstention();
-    expect(() => createBypassReceipt({ binding: BINDING, abstention, configuration: configuration() })).toThrow(/recorded transport abstention/);
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention("no_assignments"), configuration: configuration(), recorded: true })).toThrow(/recorded transport abstention/);
-
-    const receipt = createBypassReceipt({ binding: BINDING, abstention, configuration: configuration(), category: "worker", count: 2, recordedAbstention: true });
-    const first = replayBypassReceipt(receipt, BINDING);
-    const second = replayBypassReceipt(receipt, BINDING);
-    expect(first).toEqual(second);
-    first.category = "mutated-after-replay";
-    expect(replayBypassReceipt(receipt, BINDING)).toEqual(receipt.result);
-
-    const input = baseInput();
-    input.binding = BINDING;
-    input.bypass = receipt;
-    input.response = null;
-    input.availability = async () => { throw new Error("bypass must not re-read availability"); };
-    input.compile = async () => { throw new Error("bypass must not recompile"); };
-    await expect(routeSpec(input)).resolves.toEqual(receipt.result);
-  });
-
-  it("labels a transport-abstain bypass as quality not_evaluated", () => {
-    const receipt = createBypassReceipt({ binding: BINDING, abstention: recordedAbstention("transport_failed"), configuration: configuration(), recorded: true });
-    expect(receipt.result).toMatchObject({
-      kind: "admitted",
-      quality: "not_evaluated",
-      evidence: { quality: { outcome: "not_evaluated" }, bypass: { label: "transport-abstain", quality: "not_evaluated" } },
-    });
-    expect(replayBypassReceipt(receipt, BINDING)).toEqual(receipt.result);
-  });
-
-  it("consumes availability without runner-name bias", async () => {
-    const chain: readonly ChainCandidate[] = [
-      { runner: "pi", model: "shared-model" },
-      { runner: "claude", model: "shared-model" },
-    ];
-    const catalog = catalogOf(chain);
-    const root = await mkdtemp(join(tmpdir(), "herdr-router-availability-"));
-    dirs.push(root);
-    const first = chain[0]!;
-    const second = chain[1]!;
-    const pi = catalog.runners.get("pi")!;
-    const claude = catalog.runners.get("claude")!;
-    const now = () => new Date("2026-09-18T10:00:00.000Z");
-
-    await recordLaunchFailure(first, pi, "quota_exceeded", { root, now });
-    await expect(availability(first, pi, { root, now })).resolves.toMatchObject({ status: "known-exhausted", retryNotBefore: null });
-    await expect(availability(second, claude, { root, now })).resolves.toMatchObject({ status: "known-exhausted", retryNotBefore: null });
-
-    const seen: CandidateAvailability[] = [];
-    const result = await routeSpec({
-      spec: SPEC,
-      catalog,
-      response: responseFor(catalog),
-      root,
-      now,
-      availability: async (candidate, runnerEntry, options) => {
-        const value = await availability(candidate, runnerEntry, options);
-        seen.push(value);
-        return value;
-      },
-      compile: async () => { throw new Error("an exhausted chain must not compile"); },
-    });
-
-    expect(result).toMatchObject({ kind: "abstained", reason: "no_assignments" });
-    expect(seen.map((value) => value.status)).toEqual(["known-exhausted", "known-exhausted"]);
-    if (result.kind === "abstained") expect(result.evidence?.availability?.map((value) => value.status)).toEqual(["known-exhausted", "known-exhausted"]);
-  });
-});
-
-describe("response boundary parsing", () => {
-  const respond = (patch: Record<string, unknown>): SpecRouteInput => {
-    const input = baseInput();
-    input.response = { ...responseFor(SINGLE_CATALOG), ...patch };
-    return input;
-  };
-  const respondedWith = (response: unknown): SpecRouteInput => {
-    const input = baseInput();
-    input.response = response;
-    return input;
-  };
-  const invalid = (component: string): Record<string, unknown> => ({ kind: "abstained", reason: "invalid_response", component });
-  const admitted = { kind: "admitted" };
-  const candidateEntry = (selection: Record<string, unknown>): Record<string, unknown> => ({ index: 0, runner: "pi", model: "pi-model", ...selection });
-  const withEntry = (entry: Record<string, unknown>): SpecRouteInput => respondedWith({ ...responseFor(SINGLE_CATALOG), candidates: [entry] });
-
-  for (const { name, value, expected } of [
-    { name: "bare true", value: true, expected: admitted },
-    { name: "bare false", value: false, expected: { kind: "rejected", reason: "instructions_inadequate" } },
-    { name: "noul key", value: { noul: 0.9 }, expected: admitted },
-    { name: "yes key", value: { yes: 0.9 }, expected: admitted },
-    { name: "numeric value key", value: { value: 0.9 }, expected: admitted },
-    { name: "boolean value key", value: { value: true }, expected: admitted },
-    { name: "boolean value key false", value: { value: false }, expected: { kind: "rejected", reason: "instructions_inadequate" } },
-    { name: "choice yes", value: { choice: "yes" }, expected: admitted },
-    { name: "choice no", value: { choice: "no" }, expected: { kind: "rejected", reason: "instructions_inadequate" } },
-    { name: "foreign choice", value: { choice: "maybe" }, expected: invalid("quality") },
-    { name: "yes/no probability map", value: { probabilities: { yes: 0.9, no: 0.1 } }, expected: admitted },
-    { name: "true/false probability map", value: { probabilities: { true: 0.9, false: 0.1 } }, expected: admitted },
-    { name: "adequate/inadequate probability map", value: { probabilities: { adequate: 0.9, inadequate: 0.1 } }, expected: admitted },
-    { name: "probability map that does not sum", value: { probabilities: { yes: 0.5, no: 0.6 } }, expected: invalid("quality") },
-    { name: "probability map with a non-probability value", value: { probabilities: { yes: "x", no: 0.1 } }, expected: invalid("quality") },
-    { name: "probability map with a non-probability complement", value: { probabilities: { yes: 0.9, no: "x" } }, expected: invalid("quality") },
-    { name: "explicit confidence override", value: { probability: 0.9, confidence: 0.7 }, expected: admitted },
-    { name: "out-of-range confidence", value: { probability: 0.9, confidence: 2 }, expected: invalid("quality") },
-    { name: "free text", value: "text", expected: invalid("quality") },
-  ]) {
-    it(`parses quality operand shape: ${name}`, async () => {
-      const result = await routeSpec(respond({ quality: { instructions_adequate: value, assignment_verifiable: 0.9 } }));
-      expect(result).toMatchObject(expected);
-    });
-  }
-
-  it("reads the quality object, camelCase aliases, and keeps only parseable rejection evidence", async () => {
-    await expect(routeSpec(respond({ quality: 5 }))).resolves.toMatchObject(invalid("quality"));
-    await expect(routeSpec(respond({ quality: { instructionsAdequate: 0.9, assignmentVerifiable: 0.9 } }))).resolves.toMatchObject(admitted);
-    await expect(routeSpec(respond({ quality: { instructions_adequate: 0.9, assignment_verifiable: 0.05 } }))).resolves.toMatchObject({ kind: "rejected", reason: "assignment_unverifiable" });
-    const partial = await routeSpec(respond({ quality: { instructions_adequate: { probability: 0.05, confidence: 0.9 }, assignment_verifiable: "junk" } }));
-    expect(partial).toMatchObject({ kind: "rejected", reason: "instructions_inadequate", evidence: { quality: { outcome: "rejected", instructions_adequate: 0.05 } } });
-    const reversed = await routeSpec(respond({ quality: { instructions_adequate: "junk", assignment_verifiable: 0.05 } }));
-    expect(reversed).toMatchObject({ kind: "rejected", reason: "assignment_unverifiable", evidence: { quality: { outcome: "rejected", assignment_verifiable: 0.05 } } });
-  });
-
-  for (const { name, category, expected } of [
-    { name: "bare string", category: "worker", expected: admitted },
-    { name: "choice key", category: { choice: "worker", confidence: 0.9 }, expected: admitted },
-    { name: "name key", category: { name: "worker", confidence: 0.9 }, expected: admitted },
-    { name: "value key", category: { value: "worker", confidence: 0.9 }, expected: admitted },
-    { name: "probability key", category: { category: "worker", probability: 0.9 }, expected: admitted },
-    { name: "non-record", category: 5, expected: invalid("category") },
-    { name: "unbounded name", category: { category: "", confidence: 0.9 }, expected: invalid("category") },
-    { name: "missing confidence", category: { category: "worker" }, expected: invalid("category") },
-    { name: "category outside the catalog", category: { category: "ghost", confidence: 0.9 }, expected: invalid("category") },
-  ]) {
-    it(`parses category judgment shape: ${name}`, async () => {
-      await expect(routeSpec(respond({ category }))).resolves.toMatchObject(expected);
-    });
-  }
-
-  it("reads the category from alternates or defaults to the spec's own category", async () => {
-    const withoutCategory = responseFor(SINGLE_CATALOG);
-    delete withoutCategory.category;
-    await expect(routeSpec(respondedWith({ ...withoutCategory, categoryChoice: { category: "worker", confidence: 0.9 } }))).resolves.toMatchObject(admitted);
-    await expect(routeSpec(respondedWith({ ...withoutCategory, routing: { category: { category: "worker", confidence: 0.9 } } }))).resolves.toMatchObject(admitted);
-    const viaSpec = respondedWith(withoutCategory);
-    viaSpec.spec = { ...SPEC, category: "worker" };
-    await expect(routeSpec(viaSpec)).resolves.toMatchObject({ kind: "admitted", category: "worker" });
-    await expect(routeSpec(respondedWith(withoutCategory))).resolves.toMatchObject(invalid("category"));
-  });
-
-  for (const { name, patch, component } of [
-    { name: "transport true", patch: { transport: true }, component: "transport" },
-    { name: "transport_failed kind", patch: { kind: "transport_failed" }, component: "transport" },
-    { name: "transport kind with component", patch: { kind: "transport", component: "http_503" }, component: "http_503" },
-    { name: "failed transport object", patch: { transport: { failed: true } }, component: "transport" },
-  ]) {
-    it(`maps transport marker to a bounded component: ${name}`, async () => {
-      await expect(routeSpec(respond(patch))).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component });
-    });
-  }
-
-  it("ignores transport markers that do not report a failure", async () => {
-    await expect(routeSpec(respond({ transport: { failed: false } }))).resolves.toMatchObject(admitted);
-    await expect(routeSpec(respond({ transport: "junk" }))).resolves.toMatchObject(admitted);
-  });
-
-  it("reads candidate judgments from every tolerated key and container", async () => {
-    const entry = candidateEntry({ selection: { tools: ["read"] } });
-    for (const key of ["candidateSelections", "selections"]) {
-      const response = responseFor(SINGLE_CATALOG);
-      delete response.candidates;
-      response[key] = [entry];
-      await expect(routeSpec(respondedWith(response))).resolves.toMatchObject(admitted);
-    }
-    const recordForm = responseFor(SINGLE_CATALOG);
-    recordForm.candidates = { "0": { runner: "pi", model: "pi-model", selection: { tools: ["read"] } } };
-    await expect(routeSpec(respondedWith(recordForm))).resolves.toMatchObject(admitted);
-    const missing = responseFor(SINGLE_CATALOG);
-    delete missing.candidates;
-    await expect(routeSpec(respondedWith(missing))).resolves.toMatchObject(invalid("candidates"));
-    for (const candidates of [
-      [{ index: 5, runner: "pi", model: "pi-model" }],
-      [{ index: 0, runner: "claude", model: "pi-model" }],
-      [{ index: 0, runner: "pi", model: "other" }],
-    ]) {
-      await expect(routeSpec(respondedWith({ ...responseFor(SINGLE_CATALOG), candidates })), JSON.stringify(candidates)).resolves.toMatchObject(invalid("candidates"));
-    }
-  });
-
-  for (const { name, entry, expected } of [
-    { name: "resources container", entry: candidateEntry({ resources: { tools: { read: 0.9 } } }), expected: admitted },
-    { name: "bare pool fields", entry: candidateEntry({ tools: { read: 0.9 } }), expected: admitted },
-    { name: "boolean pool operand", entry: candidateEntry({ selection: { tools: { read: true } } }), expected: admitted },
-    { name: "boolean pool operand unselected", entry: candidateEntry({ selection: { tools: { read: false } } }), expected: admitted },
-    { name: "array with name records", entry: candidateEntry({ selection: { tools: [{ name: "read", selected: true }] } }), expected: admitted },
-    { name: "array record unselected", entry: candidateEntry({ selection: { tools: [{ name: "read", selected: false }] } }), expected: admitted },
-    { name: "array with resource-keyed records", entry: candidateEntry({ selection: { tools: [{ resource: "read", selected: 0.9 }] } }), expected: admitted },
-    { name: "array record with unbounded name", entry: candidateEntry({ selection: { tools: [{ name: "", selected: true }] } }), expected: invalid("candidates") },
-    { name: "array record with no operand", entry: candidateEntry({ selection: { tools: [{ name: "read" }] } }), expected: invalid("candidates") },
-    { name: "array with non-record items", entry: candidateEntry({ selection: { tools: [5] } }), expected: invalid("candidates") },
-    { name: "non-array non-map pool value", entry: candidateEntry({ selection: { tools: 5 } }), expected: invalid("candidates") },
-    { name: "map with unbounded resource name", entry: candidateEntry({ selection: { tools: { "": 0.9 } } }), expected: invalid("candidates") },
-    { name: "unparseable pool operand", entry: candidateEntry({ selection: { tools: { read: "x" } } }), expected: invalid("candidates") },
-    { name: "record operand with no tolerated key", entry: candidateEntry({ selection: { tools: { read: { weird: 1 } } } }), expected: invalid("candidates") },
-    { name: "explicit confidence override on a record operand", entry: candidateEntry({ selection: { tools: { read: { selected: 0.9, confidence: 0.85 } } } }), expected: admitted },
-    { name: "out-of-range record confidence", entry: candidateEntry({ selection: { tools: { read: { selected: 0.9, confidence: 2 } } } }), expected: invalid("candidates") },
-    { name: "low-probability pool operand is not selected", entry: candidateEntry({ selection: { tools: { read: 0.1 } } }), expected: admitted },
-    { name: "every tolerated operand key", entry: candidateEntry({ selection: { tools: { read: { selected: true }, write: { permitted: 0.9 }, exec: { noul: 0.9 }, pi: { probability: 0.9 }, scan: { value: true }, grep: { choice: true } } } }), expected: admitted },
-    { name: "bare string choice operand is not tolerated", entry: candidateEntry({ selection: { tools: { read: { choice: "yes" } } } }), expected: invalid("candidates") },
-  ]) {
-    it(`parses candidate selection shape: ${name}`, async () => {
-      await expect(routeSpec(withEntry(entry))).resolves.toMatchObject(expected);
-    });
-  }
-
-  it("excludes indecisive resources, records the noul, and keeps later candidates parseable", async () => {
-    for (const tools of [{ read: 0.7 }, [{ name: "read", selected: 0.7 }]]) {
-      const seen: ResourceSelection[] = [];
-      const input = withEntry(candidateEntry({ selection: { tools } }));
-      input.compile = async (_catalog, _spec, resolved, selection) => {
-        seen.push(selection);
-        return configuration(resolved.index, resolved.candidate.model);
-      };
-      const result = await routeSpec(input);
-      expect(result).toMatchObject({
-        kind: "admitted",
-        evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] },
+  it("applies each difficult modifier only at P >= 0.70, adding exactly one tier, and never abstains on modifier uncertainty", async () => {
+    // implement has the standard base floor, so one applied modifier lifts it to strong.
+    for (const name of SEMANTIC_MODIFIERS) {
+      const applied = baseInput();
+      applied.response = responseFor(SINGLE_CATALOG, {
+        intent: { value: "implement", confidence: 0.9 },
+        modifiers: { [name]: MODIFIER_THRESHOLD },
       });
-      expect(seen).toEqual([{}]);
-    }
+      const result = await routeTask(applied);
+      expect(result, name).toMatchObject({ kind: "admitted", workloadFloor: "strong", effectiveStartTier: "strong" });
+      expect(result.evidence?.modifiers?.[name]).toMatchObject({ probability: MODIFIER_THRESHOLD, applied: true });
 
-    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }, { runner: "claude", model: "claude-model" }]);
+      const skipped = baseInput();
+      skipped.response = responseFor(SINGLE_CATALOG, {
+        intent: { value: "implement", confidence: 0.9 },
+        modifiers: { [name]: MODIFIER_THRESHOLD - 0.001 },
+      });
+      const skippedResult = await routeTask(skipped);
+      expect(skippedResult, `${name} below threshold`).toMatchObject({ kind: "admitted", workloadFloor: "standard", effectiveStartTier: "standard" });
+      expect(skippedResult.evidence?.modifiers?.[name]).toMatchObject({ applied: false });
+    }
+    // Malformed and low-probability modifiers are one-sided: never an abstention.
+    const malformed = baseInput();
+    malformed.response = responseFor(SINGLE_CATALOG, { modifiers: { mutation_broad: "junk", horizon_long: 0.2 } });
+    await expect(routeTask(malformed)).resolves.toMatchObject({ kind: "admitted", workloadFloor: "standard" });
+  });
+
+  it("lifts the floor once per applied modifier and the ceiling past the effective start", async () => {
+    const input = baseInput();
+    input.response = responseFor(SINGLE_CATALOG, {
+      intent: { value: "implement", confidence: 0.9 },
+      modifiers: { mutation_broad: 0.9, scope_repo_wide: 0.9 },
+    });
+    // implement floor standard + two modifiers = frontier; the frontier base ceiling lifted twice clamps at max.
+    await expect(routeTask(input)).resolves.toMatchObject({ kind: "admitted", workloadFloor: "frontier", effectiveStartTier: "frontier", effectiveCeiling: "max" });
+    // A requested tier above the lifted floor wins the start; the ceiling follows it.
+    const requested = baseInput();
+    requested.task = { ...TASK, tier: "max" };
+    requested.response = responseFor(SINGLE_CATALOG, { intent: { value: "verify", confidence: 0.9 } });
+    await expect(routeTask(requested)).resolves.toMatchObject({ kind: "admitted", requestedTier: "max", workloadFloor: "utility", effectiveStartTier: "max", effectiveCeiling: "max" });
+    // A requested tier below the floor loses to the floor.
+    const floored = baseInput();
+    floored.task = { ...TASK, tier: "utility" };
+    floored.response = responseFor(SINGLE_CATALOG, { intent: { value: "implement", confidence: 0.9 } });
+    await expect(routeTask(floored)).resolves.toMatchObject({ kind: "admitted", requestedTier: "utility", effectiveStartTier: "standard" });
+  });
+
+  it("maps runtime workspace state into the profile — partial lifts once, failed opens the ceiling to max", async () => {
+    const partial = baseInput();
+    partial.workspaceState = "partial";
+    partial.response = responseFor(SINGLE_CATALOG, { intent: { value: "verify", confidence: 0.9 } });
+    await expect(routeTask(partial)).resolves.toMatchObject({ kind: "admitted", workloadFloor: "economy", evidence: { workload: { workspaceState: "partial" } } });
+    const failed = baseInput();
+    failed.workspaceState = "failed";
+    failed.response = responseFor(SINGLE_CATALOG, { intent: { value: "verify", confidence: 0.9 } });
+    await expect(routeTask(failed)).resolves.toMatchObject({ kind: "admitted", workloadFloor: "economy", effectiveCeiling: "max", evidence: { workload: { workspaceState: "failed" } } });
+  });
+
+  it("ranks the chain by effective-tier fitness, prefers distinct providers, tie-breaks on id, and bounds at MAX_ATTEMPTS", async () => {
+    const points = [
+      makePoint("pi", "a-model", { reasoning: "low", provider: "shared" }),
+      makePoint("pi", "b-model", { reasoning: "low", provider: "shared" }),
+      makePoint("claude", "c-model", { reasoning: "high", provider: "other" }),
+      makePoint("agy", "d-model", { provider: "third" }),
+      makePoint("devin", "e-model", { provider: "fourth" }),
+    ];
+    const catalog = catalogOf(points);
     const input = baseInput(catalog);
-    input.response = {
-      ...responseFor(catalog),
-      candidates: [
-        { index: 0, runner: "pi", model: "pi-model", selection: { tools: { read: 0.7 } } },
-        { index: 1, runner: "claude", model: "claude-model", selection: {} },
-      ],
+    // Fitness at standard: agy strongest, then claude, then the two shared-provider
+    // points (a before b on id), devin weakest — but devin still chains ahead of
+    // the second shared-provider point on provider diversity.
+    input.response = responseFor(catalog, {
+      fitness: fitnessFor(catalog, (point) => ({ "agy:d-model": 0.95, "claude:c-model:high": 0.9, "pi:a-model:low": 0.8, "pi:b-model:low": 0.7, "devin:e-model": 0.1 })[point.id] ?? 0),
+    });
+    const result = await routeTask(input);
+    expect(result).toMatchObject({ kind: "admitted" });
+    if (result.kind !== "admitted") return;
+    expect(result.chain).toEqual(["agy:d-model", "claude:c-model:high", "pi:a-model:low", "devin:e-model"]);
+    expect(result.selectedPoint).toMatchObject({ index: 0, id: "agy:d-model", runner: "agy", model: "d-model" });
+    expect(result.evidence?.chainExclusions).toEqual([{ id: "pi:b-model:low", provider: "shared", reasons: ["attempt_bound"] }]);
+    expect(result.evidence?.fitness).toMatchObject({ "agy:d-model": 0.95, "devin:e-model": 0.1 });
+    expect(result.chain.length).toBeLessThanOrEqual(MAX_ATTEMPTS);
+  });
+
+  it("excludes points outside the tier envelope with typed reasons and abstains no_candidates_at_tier when the envelope is empty", async () => {
+    const catalog = catalogOf([
+      makePoint("pi", "cheap-model", { reasoning: "low", costClass: "low", latencyClass: "low" }),
+      makePoint("claude", "dear-model", { reasoning: "high", costClass: "extreme", latencyClass: "low" }),
+      makePoint("agy", "slow-model", { costClass: "low", latencyClass: "extreme" }),
+      makePoint("devin", "both-model", { costClass: "extreme", latencyClass: "extreme" }),
+    ]);
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog);
+    const result = await routeTask(input);
+    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "standard" });
+    if (result.kind === "admitted") {
+      // standard admits at most medium/medium: only the cheap pi point survives.
+      expect(result.chain).toEqual(["pi:cheap-model:low"]);
+      expect(result.evidence?.chainExclusions).toEqual([
+        { id: "agy:slow-model", provider: "agy-provider", reasons: ["latency_class_exceeded"] },
+        { id: "claude:dear-model:high", provider: "claude-provider", reasons: ["cost_class_exceeded"] },
+        { id: "devin:both-model", provider: "devin-provider", reasons: ["cost_class_exceeded", "latency_class_exceeded"] },
+      ]);
+    }
+
+    const empty = catalogOf([makePoint("pi", "dear-model", { reasoning: "low", costClass: "extreme" })]);
+    const nothing = baseInput(empty);
+    nothing.response = responseFor(empty);
+    await expect(routeTask(nothing)).resolves.toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+    // A catalog with no reviewed points at all abstains the same way.
+    const bare = catalogOf([]);
+    const noPoints = baseInput(bare);
+    noPoints.response = responseFor(bare);
+    await expect(routeTask(noPoints)).resolves.toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+  });
+
+  it("probes every chain point after scoring, then abstains no_candidates_at_tier when all are exhausted and transport_failed when all are local-limited", async () => {
+    const catalog = catalogOf([SINGLE_POINT, makePoint("claude", "claude-model", { reasoning: "high" })]);
+    const seen: CandidateAvailability[] = [];
+    const exhausted = baseInput(catalog);
+    exhausted.response = responseFor(catalog);
+    exhausted.availability = async () => {
+      const value = availabilityStatus("known-exhausted");
+      seen.push(value);
+      return value;
     };
-    const result = await routeSpec(input);
+    const result = await routeTask(exhausted);
+    expect(result).toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+    expect(seen).toHaveLength(2);
+    if (result.kind === "abstained") expect(result.evidence?.availability?.map((entry) => entry.status)).toEqual(["known-exhausted", "known-exhausted"]);
+
+    const local = baseInput(catalog);
+    local.response = responseFor(catalog);
+    local.availability = async () => availabilityStatus("local-capacity-limited");
+    await expect(routeTask(local)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
+
+    // Equal fitness ranks by id: claude:claude-model:high is probed first and
+    // its exhaustion excludes it before the bound, so the pi point chains at 0.
+    const mixed = baseInput(catalog);
+    mixed.response = responseFor(catalog);
+    let calls = 0;
+    mixed.availability = async () => availabilityStatus(calls++ === 0 ? "known-exhausted" : "unknown");
+    const mixedResult = await routeTask(mixed);
+    expect(mixedResult).toMatchObject({ kind: "admitted", selectedPoint: { index: 0, id: "pi:pi-model:low" }, chain: ["pi:pi-model:low"] });
+    if (mixedResult.kind === "admitted") {
+      expect(mixedResult.evidence?.chainExclusions).toEqual([{ id: "claude:claude-model:high", provider: "claude-provider", reasons: ["unavailable"] }]);
+      expect(mixedResult.evidence?.availability?.map((entry) => [entry.id, entry.status])).toEqual([["claude:claude-model:high", "known-exhausted"], ["pi:pi-model:low", "unknown"]]);
+    }
+  });
+
+  it("returns transport_failed when the availability read fails or no root and no gate exist", async () => {
+    const throwing = baseInput();
+    throwing.availability = async () => { throw new Error("availability read failed"); };
+    await expect(routeTask(throwing)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
+
+    const bare = baseInput();
+    delete bare.root;
+    delete bare.availability;
+    await expect(routeTask(bare)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
+  });
+
+  it("abstains invalid_response/fitness when any point's tier judgments are missing or malformed", async () => {
+    const missing = baseInput();
+    missing.response = responseFor(SINGLE_CATALOG, { fitness: {} });
+    await expect(routeTask(missing)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "fitness" });
+    const partial = baseInput();
+    partial.response = responseFor(SINGLE_CATALOG, { fitness: { "0": { standard: 0.9 } } });
+    await expect(routeTask(partial)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "fitness" });
+    const malformed = baseInput();
+    malformed.response = responseFor(SINGLE_CATALOG, { fitness: "junk" });
+    await expect(routeTask(malformed)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "fitness" });
+  });
+
+  it("abstains invalid_response/candidates when a pool-owning chain runner has no resource map or a malformed one", async () => {
+    const missing = baseInput();
+    const response = responseFor(SINGLE_CATALOG);
+    delete (response.resources as Record<string, unknown>).pi;
+    missing.response = response;
+    await expect(routeTask(missing)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "candidates" });
+    const malformed = baseInput();
+    malformed.response = responseFor(SINGLE_CATALOG, { resources: { pi: { tools: "junk" } } });
+    await expect(routeTask(malformed)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "candidates" });
+  });
+
+  it("excludes indecisive resources, records the noul, and abstains low_confidence only when the task text explicitly requires one", async () => {
+    const input = baseInput();
+    input.response = responseFor(SINGLE_CATALOG, { resources: { pi: { tools: { read: 0.7 } } } });
+    const seen: ResourceSelection[] = [];
+    input.compile = async (_catalog, _spec, resolved, selection) => {
+      seen.push(selection);
+      return configuration(resolved);
+    };
+    const result = await routeTask(input);
     expect(result).toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] } });
-  });
+    expect(seen).toEqual([{}]);
 
-  it("keeps confident YES resources and excludes confident NO resources", async () => {
-    const yesSeen: ResourceSelection[] = [];
-    const yes = withEntry(candidateEntry({ selection: { tools: { read: 0.95 } } }));
-    yes.compile = async (_catalog, _spec, resolved, selection) => {
-      yesSeen.push(selection);
-      return configuration(resolved.index, resolved.candidate.model);
-    };
-    await expect(routeSpec(yes)).resolves.toMatchObject({ kind: "admitted" });
-    expect(yesSeen).toEqual([{ tools: ["read"] }]);
-
-    const noSeen: ResourceSelection[] = [];
-    const no = withEntry(candidateEntry({ selection: { tools: { read: 0.1 } } }));
-    no.compile = async (_catalog, _spec, resolved, selection) => {
-      noSeen.push(selection);
-      return configuration(resolved.index, resolved.candidate.model);
-    };
-    await expect(routeSpec(no)).resolves.toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.1 }] } });
-    expect(noSeen).toEqual([{}]);
-  });
-
-  it("abstains when an excluded resource is explicitly required by the instructions", async () => {
-    const input = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
-    input.spec = { ...SPEC, instructions: "You must use read to complete this assignment." };
-    await expect(routeSpec(input)).resolves.toMatchObject({
+    const required = baseInput();
+    required.task = { ...TASK, constraints: ["You must use read to complete this assignment."] };
+    required.response = responseFor(SINGLE_CATALOG, { resources: { pi: { tools: { read: 0.7 } } } });
+    await expect(routeTask(required)).resolves.toMatchObject({
       kind: "abstained",
       reason: "low_confidence",
       component: "tools:read",
       evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] },
     });
 
-    const imperative = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
-    imperative.spec = { ...SPEC, instructions: "Use read to complete this assignment." };
-    await expect(routeSpec(imperative)).resolves.toMatchObject({ kind: "abstained", reason: "low_confidence" });
+    const forbidden = baseInput();
+    forbidden.task = { ...TASK, constraints: ["Do not use read for this assignment."] };
+    forbidden.response = responseFor(SINGLE_CATALOG, { resources: { pi: { tools: { read: 0.7 } } } });
+    await expect(routeTask(forbidden)).resolves.toMatchObject({ kind: "admitted" });
 
-    const forbidden = withEntry(candidateEntry({ selection: { tools: { read: 0.7 } } }));
-    forbidden.spec = { ...SPEC, instructions: "Do not use read for this assignment." };
-    await expect(routeSpec(forbidden)).resolves.toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0.7 }] } });
+    const imperative = baseInput();
+    imperative.task = { ...TASK, constraints: ["Use read for this assignment."] };
+    imperative.response = responseFor(SINGLE_CATALOG, { resources: { pi: { tools: { read: 0.7 } } } });
+    await expect(routeTask(imperative)).resolves.toMatchObject({ kind: "abstained", reason: "low_confidence", component: "tools:read" });
   });
 
-  it("assembles the bypass binding only from a complete bounded field set", async () => {
-    const receipt = createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recorded: true });
-    const withFields = (fields: Record<string, unknown>): SpecRouteInput => {
-      const input = baseInput();
-      input.bypass = receipt;
-      Object.assign(input, fields);
-      return input;
-    };
-    const replayed = await routeSpec(withFields({ caller: BINDING.caller, specRevision: BINDING.specRevision, policyRevision: BINDING.policyRevision, launchIdentity: BINDING.launchIdentity }));
-    expect(replayed).toEqual(receipt.result);
-    for (const fields of [
-      { caller: "" },
-      { caller: "x", specRevision: "" },
-      { caller: "x", specRevision: "s", policyRevision: "" },
-      { caller: "x", specRevision: "s", policyRevision: "p", launchIdentity: "" },
-    ]) {
-      await expect(routeSpec(withFields(fields)), JSON.stringify(fields)).resolves.toMatchObject(invalid("bypass"));
-    }
-    await expect(routeSpec(withFields({}))).resolves.toMatchObject(invalid("bypass"));
-    const tampered = baseInput();
-    tampered.binding = BINDING;
-    tampered.bypass = { ...receipt, digest: "forged" };
-    await expect(routeSpec(tampered)).resolves.toMatchObject(invalid("bypass"));
-  });
-});
-
-describe("bypass receipt integrity", () => {
-  const redigest = (receipt: BypassReceipt, patch: Record<string, unknown>): BypassReceipt => {
-    const unsigned = {
-      version: receipt.version,
-      kind: receipt.kind,
-      binding: receipt.binding,
-      recorded: receipt.recorded,
-      abstention: receipt.abstention,
-      result: receipt.result,
-      ...patch,
-    };
-    return { ...unsigned, digest: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex") } as BypassReceipt;
-  };
-
-  it("refuses to sign a receipt for anything but a recorded transport abstention", async () => {
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: { kind: "admitted" } as never, configuration: configuration(), recorded: true })).toThrow(/recorded transport abstention/);
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration() })).toThrow(/recorded transport abstention/);
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recorded: true })).not.toThrow();
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recordedAbstention: true })).not.toThrow();
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: recordedAbstention("no_assignments"), configuration: configuration(), recorded: true })).toThrow(/recorded transport abstention/);
-  });
-
-  it("stamps transport provenance defaults: contract spec label for the category, count one, no component key", async () => {
-    const receipt = createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recorded: true });
-    expect(receipt.version).toBe(1);
-    expect(receipt.kind).toBe("bypass_receipt");
-    expect(receipt.result.category).toBe("worker");
-    expect(receipt.result.count).toBe(1);
-    expect(receipt.result).not.toHaveProperty("component");
-    expect(receipt.digest).toMatch(/^[0-9a-f]{64}$/);
-    const transport = createBypassReceipt({ binding: BINDING, abstention: recordedAbstention("transport_failed"), configuration: configuration(), category: "ops", count: 3, recorded: true });
-    expect(transport.result.category).toBe("ops");
-    expect(transport.result.count).toBe(3);
-    expect(transport.result.quality).toBe("not_evaluated");
-    expect(transport.abstention.component).toBe("fixture");
-    expect(transport.result.evidence?.bypass).toMatchObject({ label: "transport-abstain", quality: "not_evaluated" });
-    const withoutComponent = createBypassReceipt({ binding: BINDING, abstention: { kind: "abstained", reason: "transport_failed" }, configuration: configuration(), recorded: true });
-    expect(withoutComponent.abstention).toEqual({ kind: "abstained", reason: "transport_failed" });
-    expect(() => createBypassReceipt({ binding: BINDING, abstention: { kind: "abstained", reason: "no_assignments" }, configuration: configuration(), recorded: true })).toThrow(/recorded transport abstention/);
-  });
-
-  it("refuses malformed bindings, foreign receipts, tampering, and kind confusion at replay", async () => {
-    const receipt = createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recorded: true });
-    expect(() => replayBypassReceipt(receipt, { ...BINDING, caller: "" })).toThrow(/invalid bypass binding/);
-    expect(() => replayBypassReceipt({ ...receipt, binding: { ...BINDING, caller: "" } }, BINDING)).toThrow(/invalid bypass binding/);
-    for (const foreign of [
-      undefined,
-      "x",
-      { ...receipt, version: 2 },
-      { ...receipt, kind: "admitted" },
-      { ...receipt, recorded: false },
-      { ...receipt, digest: "forged" },
-    ]) {
-      expect(() => replayBypassReceipt(foreign as BypassReceipt, BINDING)).toThrow(/invalid bypass receipt/);
-    }
-    expect(() => replayBypassReceipt(receipt, { ...BINDING, launchIdentity: "other" })).toThrow(/binding mismatch/);
-    expect(() => replayBypassReceipt(redigest(receipt, { abstention: { ...receipt.abstention, kind: "weird" } }), BINDING)).toThrow(/invalid bypass receipt/);
-    expect(() => replayBypassReceipt(redigest(receipt, { result: { ...receipt.result, kind: "abstained" } }), BINDING)).toThrow(/invalid bypass receipt/);
-    expect(() => replayBypassReceipt(redigest(receipt, { result: { ...receipt.result, evidence: undefined } }), BINDING)).toThrow(/invalid bypass receipt/);
-    expect(() => replayBypassReceipt(redigest(receipt, { result: { ...receipt.result, evidence: {} } }), BINDING)).toThrow(/invalid bypass receipt/);
-    expect(() => replayBypassReceipt(redigest(receipt, { result: { ...receipt.result, evidence: { quality: { outcome: "not_evaluated" } } } }), BINDING)).toThrow(/invalid bypass receipt/);
-    expect(replayBypassReceipt(receipt, BINDING)).toEqual(receipt.result);
-  });
-});
-
-describe("availability, catalog, and compile edges", () => {
-  it("abstains invalid_response when the response is not a record at all", async () => {
-    for (const response of ["junk", null]) {
-      const input = baseInput();
-      input.response = response;
-      await expect(routeSpec(input)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "quality" });
-    }
-  });
-
-  it("abstains transport_failed when neither a root nor an availability gate is provided", async () => {
-    const input = baseInput();
-    delete input.root;
-    delete input.availability;
-    await expect(routeSpec(input)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
-  });
-
-  it("passes an empty root to an injected gate and reaches the real availability reader by default", async () => {
-    const rootless = baseInput();
-    delete rootless.root;
-    const seen: string[] = [];
-    rootless.availability = async (_candidate, _runner, options) => {
-      seen.push(options.root);
-      return availabilityStatus("unknown");
-    };
-    await expect(routeSpec(rootless)).resolves.toMatchObject({ kind: "admitted" });
-    expect(seen).toEqual([""]);
-
-    const root = await mkdtemp(join(tmpdir(), "herdr-router-root-"));
-    dirs.push(root);
-    const real = baseInput();
-    real.root = root;
-    delete real.availability;
-    real.now = () => new Date("2026-09-18T10:00:00.000Z");
-    await expect(routeSpec(real)).resolves.toMatchObject({ kind: "admitted" });
-  });
-
-  it("abstains catalog_unavailable when a chain runner is absent or the catalog read throws", async () => {
-    const missingRunner = baseInput({ ...SINGLE_CATALOG, runners: new Map() });
-    await expect(routeSpec(missingRunner)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "catalog" });
-    const throwing = baseInput();
-    throwing.catalog = { ...SINGLE_CATALOG, categories: { get: () => { throw new Error("down"); } } as unknown as Catalog["categories"] };
-    await expect(routeSpec(throwing)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "catalog" });
-    const gateDown = baseInput();
-    gateDown.eligibility = () => { throw new Error("gate down"); };
-    await expect(routeSpec(gateDown)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "catalog" });
+  it("abstains catalog_unavailable when a chain point's runner is absent from the catalog", async () => {
+    const catalog = catalogOf([SINGLE_POINT]);
+    catalog.runners = new Map();
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog, { resources: {} });
+    await expect(routeTask(input)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "catalog" });
   });
 
   it("maps compile failures to typed abstains and reaches the real compiler by default", async () => {
     const invalidSelection = baseInput();
     invalidSelection.compile = async () => { throw new CompileError("INVALID_SELECTION", "bad selection"); };
-    await expect(routeSpec(invalidSelection)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "candidates" });
+    await expect(routeTask(invalidSelection)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "candidates" });
+    const outsidePool = baseInput();
+    outsidePool.compile = async () => { throw new CompileError("SELECTION_OUTSIDE_POOL", "outside"); };
+    await expect(routeTask(outsidePool)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "candidates" });
     const otherCode = baseInput();
     otherCode.compile = async () => { throw new CompileError("CANDIDATE_NOT_REVIEWED", "unreviewed"); };
-    await expect(routeSpec(otherCode)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "configuration" });
+    await expect(routeTask(otherCode)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "configuration" });
     const generic = baseInput();
     generic.compile = async () => { throw new Error("compile down"); };
-    await expect(routeSpec(generic)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "configuration" });
-
-    const realCompile = baseInput();
-    delete realCompile.compile;
-    await expect(routeSpec(realCompile)).resolves.toMatchObject({ kind: "admitted" });
-  });
-});
-
-describe("assembleSpecDecision edges", () => {
-  it("replays a bypass before reading the remaining fields", async () => {
-    const receipt = createBypassReceipt({ binding: BINDING, abstention: recordedAbstention(), configuration: configuration(), recorded: true });
-    const replayed = assembleSpecDecision({ spec: SPEC, quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 }, bypass: receipt, binding: BINDING });
-    expect(replayed).toEqual(receipt.result);
-    expect(assembleSpecDecision({ spec: SPEC, quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 }, bypass: receipt })).toMatchObject({ kind: "abstained", reason: "invalid_response", component: "bypass" });
-    expect(assembleSpecDecision({ spec: SPEC, quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 }, bypass: { ...receipt, digest: "forged" }, binding: BINDING })).toMatchObject({ kind: "abstained", reason: "invalid_response", component: "bypass" });
+    await expect(routeTask(generic)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "configuration" });
   });
 
-  it("abstains invalid_response when the configuration is absent", async () => {
-    const result = assembleSpecDecision({ spec: SPEC, quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 }, category: { category: "worker", confidence: 0.9 } });
-    expect(result).toMatchObject({ kind: "abstained", reason: "invalid_response", component: "configuration" });
-  });
-
-  it("abstains invalid_response on an unparseable quality gate and low_confidence on a low-confidence category", async () => {
-    expect(assembleSpecDecision({ spec: SPEC, quality: { instructions_adequate: "junk", assignment_verifiable: 0.9 } })).toMatchObject({ kind: "abstained", reason: "invalid_response", component: "quality" });
-    const low = assembleSpecDecision({ spec: SPEC, quality: GOOD_QUALITY, category: { category: "worker", confidence: 0.5 }, configuration: configuration() });
-    expect(low).toMatchObject({ kind: "abstained", reason: "low_confidence", component: "category" });
-  });
-
-  it("admits with not_rejected quality evidence and defaults when no caller evidence is supplied", async () => {
-    const result = assembleSpecDecision({ spec: { label: "worker" }, quality: GOOD_QUALITY, category: { category: "worker", confidence: 0.9 }, configuration: configuration() });
-    expect(result).toMatchObject({
-      kind: "admitted",
-      quality: "not_rejected",
-      category: "worker",
-      count: 1,
-      evidence: {
-        quality: { outcome: "not_rejected", instructions_adequate: 0.9, assignment_verifiable: 0.9 },
-        category: { name: "worker", confidence: 0.9 },
-      },
-    });
-  });
-
-  it("admits an unevaluated quality gate and merges caller evidence", async () => {
-    const result = assembleSpecDecision({
-      spec: { label: "worker" },
-      category: { category: "worker", confidence: 0.9 },
-      configuration: configuration(),
-      evidence: { availability: [{ index: 0, status: "known-exhausted", retryNotBefore: null }] },
-    });
-    expect(result).toMatchObject({
-      kind: "admitted",
-      quality: "not_evaluated",
-      evidence: {
-        quality: { outcome: "not_evaluated" },
-        availability: [{ index: 0, status: "known-exhausted", retryNotBefore: null }],
-      },
-    });
-  });
-
-  it("fails closed on a malformed category judgment at this seam too", async () => {
-    const result = assembleSpecDecision({ spec: SPEC, quality: { instructions_adequate: 0.9, assignment_verifiable: 0.9 }, configuration: configuration(), category: {} as never });
-    expect(result).toMatchObject({ kind: "abstained", reason: "invalid_response", component: "category" });
-  });
-});
-
-describe("composition advisory (B13)", () => {
-  const withComposition = (composition: unknown, launched?: readonly string[]): SpecRouteInput => {
-    const input = baseInput();
-    input.response = { ...responseFor(SINGLE_CATALOG), composition };
-    if (launched !== undefined) input.launched = launched;
-    return input;
-  };
-
-  it("surfaces the flag at 0.80 but not at 0.79", async () => {
-    expect(COMPOSITION_ADVISORY_THRESHOLD).toBe(0.8);
-    const flagged = await routeSpec(withComposition({ missing_area: 0.8, assessed: ["worker"] }));
-    expect(flagged).toMatchObject({
-      kind: "admitted",
-      quality: "not_rejected",
-      category: "worker",
-      count: 2,
-      advisory: { missing_area: 0.8, assessed: ["worker"], diverged: false },
-    });
-    const below = await routeSpec(withComposition({ missing_area: 0.79, assessed: ["worker"] }));
-    expect(below).toMatchObject({ kind: "admitted", quality: "not_rejected", category: "worker", count: 2 });
-    expect(below).not.toHaveProperty("advisory");
-  });
-
-  it("never changes the launch outcome — the flag rides an identical admission", async () => {
-    const bare = await routeSpec(baseInput());
-    const flagged = await routeSpec(withComposition({ missing_area: 0.94, assessed: ["worker"] }));
-    if (flagged.kind !== "admitted") throw new Error("expected admitted");
-    const { advisory, ...rest } = flagged;
-    expect(advisory).toEqual({ missing_area: 0.94, assessed: ["worker"], diverged: false });
-    expect(rest).toEqual(bare);
-
-    const rejected = baseInput();
-    rejected.response = {
-      quality: { instructions_adequate: 0.05, assignment_verifiable: 0.9 },
-      category: { category: "worker", confidence: 0.9 },
-      composition: { missing_area: 0.95, assessed: ["worker"] },
-    };
-    const rejection = await routeSpec(rejected);
-    expect(rejection).toMatchObject({ kind: "rejected", reason: "instructions_inadequate" });
-    expect(rejection).not.toHaveProperty("advisory");
-
-    const abstaining = baseInput();
-    abstaining.response = { ...responseFor(SINGLE_CATALOG), category: { category: "worker", confidence: 0.5 }, composition: { missing_area: 0.95, assessed: ["worker"] } };
-    const abstention = await routeSpec(abstaining);
-    expect(abstention).toMatchObject({ kind: "abstained", reason: "low_confidence" });
-    expect(abstention).not.toHaveProperty("advisory");
-  });
-
-  it("tags the advisory when the launched team differs from the assessed team", async () => {
-    // Per-record default: the decision launches its own spec, so an assessed
-    // team with other members is tagged diverged.
-    const diverged = await routeSpec(withComposition({ missing_area: 0.9, assessed: ["worker", "reviewer"] }));
-    expect(diverged).toMatchObject({ kind: "admitted", advisory: { missing_area: 0.9, assessed: ["worker", "reviewer"], diverged: true } });
-    // A caller that knows the launched team supplies it; equal multisets are untagged regardless of order.
-    const same = await routeSpec(withComposition({ missing_area: 0.9, assessed: ["reviewer", "worker"] }, ["worker", "reviewer"]));
-    expect(same).toMatchObject({ kind: "admitted", advisory: { diverged: false } });
-    const missing = await routeSpec(withComposition({ missing_area: 0.9, assessed: ["worker", "reviewer"] }, ["worker"]));
-    expect(missing).toMatchObject({ kind: "admitted", advisory: { diverged: true } });
-  });
-
-  it("surfaces nothing for malformed composition judgments and records an unusable assessed team as empty", async () => {
-    for (const composition of ["junk", 5, null, {}, { missing_area: "yes" }, { missing_area: 1.5 }]) {
-      const result = await routeSpec(withComposition(composition));
-      expect(result).toMatchObject({ kind: "admitted" });
-      expect(result).not.toHaveProperty("advisory");
+  it("maps transport markers to a bounded component before any classification", async () => {
+    for (const { patch, component } of [
+      { patch: { transport: true }, component: "transport" },
+      { patch: { kind: "transport_failed" }, component: "transport" },
+      { patch: { kind: "transport", component: "http_503" }, component: "http_503" },
+      { patch: { transport: { failed: true } }, component: "transport" },
+      { patch: { transport: { failed: true, component: "quota_429" } }, component: "quota_429" },
+    ]) {
+      const input = baseInput();
+      input.response = responseFor(SINGLE_CATALOG, patch);
+      await expect(routeTask(input), JSON.stringify(patch)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component });
     }
-    const unlabeled = await routeSpec(withComposition({ missing_area: 0.9, assessed: "worker" }));
-    expect(unlabeled).toMatchObject({ kind: "admitted", advisory: { missing_area: 0.9, assessed: [], diverged: true } });
-    const partial = await routeSpec(withComposition({ missing_area: 0.9, assessed: ["worker", 7] }));
-    expect(partial).toMatchObject({ kind: "admitted", advisory: { assessed: ["worker"], diverged: false } });
   });
 
-  it("attaches the advisory through the assembly seam too", () => {
-    const result = assembleSpecDecision({
+  it("parses every recorded binary-answer form Jev may emit on the quality gate", async () => {
+    const route = async (answer: unknown) => {
+      const input = baseInput();
+      input.response = responseFor(SINGLE_CATALOG, { quality: { done_when_verifiable: answer } });
+      return routeTask(input);
+    };
+    // Scalar booleans and the record aliases all normalize to the same judgment.
+    await expect(route(true)).resolves.toMatchObject({ kind: "admitted" });
+    await expect(route(false)).resolves.toMatchObject({ kind: "rejected" });
+    for (const answer of [{ noul: 0.9 }, { yes: 0.9 }, { value: 0.9 }, { value: true }, { choice: "pass" }, { choice: "verifiable" }, { probabilities: { yes: 0.9, no: 0.1 } }, { probabilities: { true: 0.8, false: 0.2 } }, { probabilities: { adequate: 0.7, inadequate: 0.3 } }, { probability: 0.9, confidence: 0.8 }]) {
+      await expect(route(answer), JSON.stringify(answer)).resolves.toMatchObject({ kind: "admitted" });
+    }
+    for (const answer of [{ choice: "no" }, { choice: "unverifiable" }, { choice: "fail" }, { value: false }]) {
+      await expect(route(answer), JSON.stringify(answer)).resolves.toMatchObject({ kind: "rejected" });
+    }
+    // An explicit confidence outside [0,1] or an unrecognized choice invalidates the answer; a set probability never consults the map.
+    for (const answer of [{ choice: "maybe" }, { probability: 0.9, confidence: 1.5 }, { value: "junk" }]) {
+      await expect(route(answer), JSON.stringify(answer)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "quality" });
+    }
+    await expect(route({ probability: 0.9, probabilities: { yes: 0.1, no: 0.9 } })).resolves.toMatchObject({ kind: "admitted" });
+    // A bare done_when answer without the quality wrapper is the same judgment.
+    const bare = baseInput();
+    const rest = responseFor(SINGLE_CATALOG) as Record<string, unknown>;
+    delete rest.quality;
+    bare.response = { ...rest, done_when_verifiable: 0.9 };
+    await expect(routeTask(bare)).resolves.toMatchObject({ kind: "admitted" });
+  });
+
+  it("labels done_when verifiability strong, partial, or weak — a bounded evidence label, never a gate", async () => {
+    for (const [probability, label] of [[0.9, "strong"], [0.6, "partial"], [0.3, "weak"]] as const) {
+      const input = baseInput();
+      input.response = responseFor(SINGLE_CATALOG, { quality: { done_when_verifiable: probability } });
+      await expect(routeTask(input), `p=${probability}`).resolves.toMatchObject({ kind: "admitted", evidence: { workload: { verifiability: label } } });
+    }
+  });
+
+  it("parses the intent judgment's alternate keys and carries its validated distribution into evidence", async () => {
+    for (const intent of ["implement", { choice: "implement", confidence: 0.9 }, { intent: "implement", confidence: 0.9 }, { value: "implement", probability: 0.9 }]) {
+      const input = baseInput();
+      input.response = responseFor(SINGLE_CATALOG, { intent });
+      await expect(routeTask(input), JSON.stringify(intent)).resolves.toMatchObject({ kind: "admitted" });
+    }
+    const distribution = { explore: 0.01, reason: 0.01, implement: 0.94, debug: 0.01, verify: 0.01, review: 0.01, coordinate: 0.01 };
+    const input = baseInput();
+    input.response = responseFor(SINGLE_CATALOG, { intent: { value: "implement", confidence: 0.9, probabilities: distribution } });
+    await expect(routeTask(input)).resolves.toMatchObject({ kind: "admitted", evidence: { intent: { probabilities: { implement: 0.94 } } } });
+    // The map must be a record over exactly the seven intents whose probabilities sum to one.
+    const foreign: Record<string, number> = { ...distribution, ghost: 0.01 };
+    delete foreign.explore;
+    for (const probabilities of ["junk", foreign, { ...distribution, implement: "junk" }, Object.fromEntries(WORKLOAD_INTENTS.map((name) => [name, 0.9]))]) {
+      const malformed = baseInput();
+      malformed.response = responseFor(SINGLE_CATALOG, { intent: { value: "implement", confidence: 0.9, probabilities } });
+      await expect(routeTask(malformed), JSON.stringify(probabilities)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "intent" });
+    }
+    const nonString = baseInput();
+    nonString.response = responseFor(SINGLE_CATALOG, { intent: { value: 5, confidence: 0.9 } });
+    await expect(routeTask(nonString)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "intent" });
+  });
+
+  it("parses resource judgments in every recorded form and fails closed on malformed entries", async () => {
+    for (const [judgment, selected] of [
+      [true, true],
+      [false, false],
+      [{ selected: true, confidence: 0.9 }, true],
+      [{ selected: false, confidence: 0.9 }, false],
+      [{ permitted: true, confidence: 0.9 }, true],
+      [{ noul: 0.9 }, true],
+      [{ probability: 0.9 }, true],
+      [{ value: true }, true],
+    ] as const) {
+      const seen: ResourceSelection[] = [];
+      const input = baseInput();
+      input.response = responseFor(SINGLE_CATALOG, { resources: { pi: { tools: { read: judgment } } } });
+      input.compile = async (_c, _s, resolved, selection) => {
+        seen.push(selection);
+        return configuration(resolved);
+      };
+      await expect(routeTask(input), JSON.stringify(judgment)).resolves.toMatchObject({ kind: "admitted" });
+      expect(seen[0]?.tools ?? [], JSON.stringify(judgment)).toEqual(selected ? ["read"] : []);
+    }
+    // Array-of-record selections: bare strings select, `{name, judgment}` and the `{resource}` alias carry the same judgment.
+    const seenArray: ResourceSelection[] = [];
+    const arrayForm = baseInput();
+    arrayForm.response = responseFor(SINGLE_CATALOG, { resources: { pi: { tools: ["read", { name: "read", selected: false, confidence: 0.9 }] } } });
+    arrayForm.compile = async (_c, _s, resolved, selection) => {
+      seenArray.push(selection);
+      return configuration(resolved);
+    };
+    await expect(routeTask(arrayForm)).resolves.toMatchObject({ kind: "admitted", evidence: { exclusions: [{ field: "tools", name: "read", noul: 0 }] } });
+    expect(seenArray).toEqual([{ tools: ["read"] }]);
+    const seenAlias: ResourceSelection[] = [];
+    const aliasForm = baseInput();
+    aliasForm.response = responseFor(SINGLE_CATALOG, { resources: { pi: { tools: [{ resource: "read", noul: 0.9 }] } } });
+    aliasForm.compile = async (_c, _s, resolved, selection) => {
+      seenAlias.push(selection);
+      return configuration(resolved);
+    };
+    await expect(routeTask(aliasForm)).resolves.toMatchObject({ kind: "admitted" });
+    expect(seenAlias).toEqual([{ tools: ["read"] }]);
+    // Every malformed judgment abstains closed — never a silent default.
+    for (const resources of [
+      { pi: { tools: { read: "junk" } } },
+      { pi: { tools: { read: { selected: "junk" } } } },
+      { pi: { tools: { read: { choice: "yes" } } } },
+      { pi: { tools: { read: { selected: true, confidence: "junk" } } } },
+      { pi: { tools: { read: { name: "read" } } } },
+      { pi: { tools: { "": 0.9 } } },
+      { pi: { tools: [5] } },
+      { pi: { tools: [{ name: "read" }] } },
+      { pi: { tools: [{ name: "" }] } },
+      { pi: { tools: [{ name: "bad\nname", noul: 0.9 }] } },
+      { pi: "junk" },
+      "junk",
+    ]) {
+      const input = baseInput();
+      input.response = responseFor(SINGLE_CATALOG, { resources });
+      await expect(routeTask(input), JSON.stringify(resources)).resolves.toMatchObject({ kind: "abstained", reason: "invalid_response", component: "candidates" });
+    }
+  });
+
+  it("admits an ambient-only chain whose runner owns no pools — an absent map is an empty selection", async () => {
+    const catalog = catalogOf([makePoint("agy", "agy-model")]);
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog, { resources: {} });
+    await expect(routeTask(input)).resolves.toMatchObject({ kind: "admitted", selectedPoint: { id: "agy:agy-model", runner: "agy" } });
+  });
+
+  it("abstains catalog_unavailable when a later candidate's runner disappears mid-admission", async () => {
+    const catalog = catalogOf([SINGLE_POINT, makePoint("claude", "claude-model", { reasoning: "high" })]);
+    const real = catalog.runners;
+    let calls = 0;
+    catalog.runners = new Proxy(real, {
+      get(target, property) {
+        if (property === "get") return (key: RunnerKind) => (++calls <= 1 ? target.get(key) : undefined);
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as ReadonlyMap<RunnerKind, RunnerEntry>;
+    const input = baseInput(catalog);
+    await expect(routeTask(input)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "catalog" });
+  });
+
+  it("reduces malformed resource maps to an empty selection through the export seam", () => {
+    expect(runnerResourceSelection("junk" as never, "pi")).toEqual({});
+    expect(runnerResourceSelection({ resources: "junk" } as never, "pi")).toEqual({});
+    expect(runnerResourceSelection({ resources: {} } as never, "pi")).toEqual({});
+    expect(runnerResourceSelection({ resources: { pi: "junk" } } as never, "pi")).toEqual({});
+    expect(runnerResourceSelection({ resources: { pi: { tools: "junk" } } } as never, "pi")).toEqual({});
+    expect(runnerResourceSelection({ resources: { pi: { tools: { read: 0.9 } } } } as never, "pi")).toEqual({ tools: ["read"] });
+  });
+
+  it("abstains no_candidates_at_tier on a catalog whose points were never generated", async () => {
+    const bare: Catalog = { ...SINGLE_CATALOG };
+    delete bare.points;
+    const input = baseInput(bare);
+    input.response = responseFor(bare);
+    await expect(routeTask(input)).resolves.toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+  });
+
+  it("defaults the replica count to one when the spec omits it", async () => {
+    const input = baseInput();
+    input.spec = { label: "worker" };
+    await expect(routeTask(input)).resolves.toMatchObject({ kind: "admitted", count: 1 });
+  });
+
+  it("consumes availability without runner-name bias: a shared quota exhausts every point on the tuple", async () => {
+    const points = [
+      makePoint("pi", "shared-model", { reasoning: "low", provider: "test-provider" }),
+      makePoint("claude", "shared-model", { reasoning: "high", provider: "test-provider" }),
+    ];
+    const catalog = catalogOf(points);
+    const root = await mkdtemp(join(tmpdir(), "herdr-router-availability-"));
+    dirs.push(root);
+    const now = () => new Date("2026-09-18T10:00:00.000Z");
+    const pi = catalog.runners.get("pi")!;
+    const claude = catalog.runners.get("claude")!;
+
+    await recordLaunchFailure({ runner: "pi", model: "shared-model" }, pi, "quota_exceeded", { root, now });
+    await expect(availability({ runner: "pi", model: "shared-model" }, pi, { root, now })).resolves.toMatchObject({ status: "known-exhausted" });
+    await expect(availability({ runner: "claude", model: "shared-model" }, claude, { root, now })).resolves.toMatchObject({ status: "known-exhausted" });
+
+    const seen: CandidateAvailability[] = [];
+    const result = await routeTask({
+      task: TASK,
       spec: SPEC,
-      quality: GOOD_QUALITY,
-      category: { category: "worker", confidence: 0.9 },
-      configuration: configuration(),
-      composition: { missing_area: 0.9, assessed: ["worker", "reviewer"] },
-      launched: ["worker"],
+      catalog,
+      response: responseFor(catalog),
+      root,
+      now,
+      availability: async (candidate, runner, options) => {
+        const value = await availability(candidate, runner, options);
+        seen.push(value);
+        return value;
+      },
+      compile: async () => { throw new Error("an exhausted chain must not compile"); },
     });
-    expect(result).toMatchObject({ kind: "admitted", advisory: { missing_area: 0.9, assessed: ["worker", "reviewer"], diverged: true } });
+
+    expect(result).toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+    expect(seen.map((value) => value.status)).toEqual(["known-exhausted", "known-exhausted"]);
+  });
+
+  it("applies the attempt bound after availability admission — four exhausted points cannot hide a fifth admissible one", async () => {
+    const points = [1, 2, 3, 4, 5].map((n) => makePoint("pi", `p${n}`, { reasoning: "low", provider: `provider-${n}` }));
+    const catalog = catalogOf(points);
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog, {
+      fitness: fitnessFor(catalog, (point) => ({ "pi:p1:low": 0.9, "pi:p2:low": 0.8, "pi:p3:low": 0.7, "pi:p4:low": 0.6, "pi:p5:low": 0.5 })[point.id] ?? 0),
+    });
+    const seen: string[] = [];
+    input.availability = async (candidate) => {
+      seen.push(candidate.model);
+      return availabilityStatus(candidate.model === "p5" ? "unknown" : "known-exhausted");
+    };
+    const result = await routeTask(input);
+    expect(result).toMatchObject({ kind: "admitted", chain: ["pi:p5:low"], selectedPoint: { index: 0, id: "pi:p5:low" } });
+    // All five ranked candidates were probed in order; the four exhausted ones
+    // are excluded evidence, not bound slots.
+    expect(seen).toEqual(["p1", "p2", "p3", "p4", "p5"]);
+    if (result.kind === "admitted") {
+      expect(result.evidence?.chainExclusions?.filter((entry) => entry.reasons.includes("unavailable"))).toHaveLength(4);
+      expect(result.evidence?.availability?.map((entry) => entry.id)).toEqual(["pi:p1:low", "pi:p2:low", "pi:p3:low", "pi:p4:low", "pi:p5:low"]);
+    }
+  });
+
+  it("excludes the failed prior point before the attempt bound so the chain holds four other admissible points", async () => {
+    const points = [1, 2, 3, 4, 5, 6].map((n) => makePoint("pi", `p${n}`, { reasoning: "low", provider: `provider-${n}` }));
+    const catalog = catalogOf(points);
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog, {
+      fitness: fitnessFor(catalog, (point) => ({ "pi:p1:low": 0.95, "pi:p2:low": 0.9, "pi:p3:low": 0.8, "pi:p4:low": 0.7, "pi:p5:low": 0.6, "pi:p6:low": 0.5 })[point.id] ?? 0),
+    });
+    input.recovery = { priorOperatingPointId: "pi:p1:low" };
+    const result = await routeTask(input);
+    expect(result).toMatchObject({ kind: "admitted" });
+    if (result.kind !== "admitted") return;
+    // The failed point never consumes a slot: four admissible points chain.
+    expect(result.chain).toEqual(["pi:p2:low", "pi:p3:low", "pi:p4:low", "pi:p5:low"]);
+    expect(result.evidence?.chainExclusions).toEqual([
+      { id: "pi:p1:low", provider: "provider-1", reasons: ["recovery_excluded"] },
+      { id: "pi:p6:low", provider: "provider-6", reasons: ["attempt_bound"] },
+    ]);
+  });
+
+  it("prefers a different provider first when the failed provider's next point would head the recovery chain", async () => {
+    const points = [
+      makePoint("pi", "p0", { reasoning: "low", provider: "shared" }),
+      makePoint("pi", "failed", { reasoning: "low", provider: "shared" }),
+      makePoint("pi", "p2", { reasoning: "low", provider: "other" }),
+      makePoint("pi", "p3", { reasoning: "low", provider: "third" }),
+    ];
+    const catalog = catalogOf(points);
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog, {
+      fitness: fitnessFor(catalog, (point) => ({ "pi:p0:low": 0.95, "pi:failed:low": 0.9, "pi:p2:low": 0.8, "pi:p3:low": 0.7 })[point.id] ?? 0),
+    });
+    input.recovery = { priorOperatingPointId: "pi:failed:low" };
+    const result = await routeTask(input);
+    expect(result).toMatchObject({ kind: "admitted" });
+    if (result.kind !== "admitted") return;
+    // Ranked order puts p0 (same provider as the failed point) first; the
+    // different-provider preference moves p2 ahead before the bound.
+    expect(result.chain).toEqual(["pi:p2:low", "pi:p0:low", "pi:p3:low"]);
+    expect(result.selectedPoint).toMatchObject({ id: "pi:p2:low" });
+    expect(result.evidence?.chainExclusions).toEqual([{ id: "pi:failed:low", provider: "shared", reasons: ["recovery_excluded"] }]);
+  });
+
+  it("keeps ranked order when no different provider remains after the recovery exclusion", async () => {
+    const points = [
+      makePoint("pi", "p1", { reasoning: "low", provider: "shared" }),
+      makePoint("pi", "p2", { reasoning: "low", provider: "shared" }),
+    ];
+    const catalog = catalogOf(points);
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog, {
+      fitness: fitnessFor(catalog, (point) => (point.id === "pi:p1:low" ? 0.9 : 0.8)),
+    });
+    input.recovery = { priorOperatingPointId: "pi:p1:low" };
+    // The failed point's provider is the only provider left, so the surviving
+    // same-provider point heads the chain — the preference is a no-op.
+    const result = await routeTask(input);
+    expect(result).toMatchObject({ kind: "admitted", chain: ["pi:p2:low"], selectedPoint: { index: 0, id: "pi:p2:low" } });
+    if (result.kind === "admitted") {
+      expect(result.evidence?.chainExclusions).toEqual([{ id: "pi:p1:low", provider: "shared", reasons: ["recovery_excluded"] }]);
+    }
+  });
+
+  it("abstains low_confidence carrying probe evidence when required-resource and exhausted exclusions empty the chain", async () => {
+    const catalog = catalogOf([makePoint("pi", "pi-model", { reasoning: "low" }), makePoint("claude", "claude-model", { reasoning: "high" })]);
+    const input = baseInput(catalog);
+    input.task = { ...TASK, constraints: ["You must use read to complete this assignment."] };
+    input.response = responseFor(catalog, {
+      fitness: fitnessFor(catalog, (point) => (point.id === "pi:pi-model:low" ? 0.9 : 0.8)),
+      resources: { pi: { tools: { read: 0.7 } }, claude: { tools: { Read: 0.95 } } },
+    });
+    input.availability = async () => availabilityStatus("known-exhausted");
+    const result = await routeTask(input);
+    // pi drops the required read tool; claude selects it but probes exhausted —
+    // the abstain names the resource component and still reports the probe.
+    expect(result).toMatchObject({ kind: "abstained", reason: "low_confidence", component: "tools:read" });
+    if (result.kind === "abstained") {
+      expect(result.evidence?.availability).toEqual([{ id: "claude:claude-model:high", status: "known-exhausted", retryNotBefore: null }]);
+      expect(result.evidence?.chainExclusions).toEqual([
+        { id: "claude:claude-model:high", provider: "claude-provider", reasons: ["unavailable"] },
+        { id: "pi:pi-model:low", provider: "pi-provider", reasons: ["required_resource"] },
+      ]);
+    }
+  });
+
+  it("dedupes one runner's resource exclusions across every candidate on it", async () => {
+    const catalog = catalogOf([makePoint("pi", "m1", { reasoning: "low" }), makePoint("pi", "m2", { reasoning: "low" })]);
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog, { resources: { pi: { tools: { read: 0.95, exec_command: 0.5 } } } });
+    const result = await routeTask(input);
+    expect(result).toMatchObject({ kind: "admitted", chain: ["pi:m1:low", "pi:m2:low"] });
+    // Both pi candidates iterate the same cached selection — the shared
+    // exclusion lands in evidence exactly once.
+    if (result.kind === "admitted") {
+      expect(result.evidence?.exclusions).toEqual([{ field: "tools", name: "exec_command", noul: 0.5 }]);
+    }
+  });
+
+  it("emits exclusion evidence in stable id order even for duplicate point ids", async () => {
+    const points = [
+      makePoint("pi", "z1", { reasoning: "low", provider: "a" }),
+      makePoint("pi", "a1", { reasoning: "low", provider: "b" }),
+      makePoint("pi", "m1", { reasoning: "low", provider: "c" }),
+      makePoint("pi", "m1", { reasoning: "low", provider: "d" }),
+    ];
+    const catalog = catalogOf(points);
+    const input = baseInput(catalog);
+    input.response = responseFor(catalog);
+    input.availability = async () => availabilityStatus("known-exhausted");
+    const result = await routeTask(input);
+    expect(result).toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+    if (result.kind === "abstained") {
+      expect(result.evidence?.chainExclusions?.map((entry) => entry.id)).toEqual(["pi:a1:low", "pi:m1:low", "pi:m1:low", "pi:z1:low"]);
+    }
+  });
+
+  it("excludes every candidate whose selection drops a task-required resource and abstains when none remain", async () => {
+    const piPoint = makePoint("pi", "pi-model", { reasoning: "low" });
+    const claudePoint = makePoint("claude", "claude-model", { reasoning: "high" });
+    const catalog = catalogOf([piPoint, claudePoint]);
+    const requiredTask = { ...TASK, constraints: ["You must use read to complete this assignment."] };
+
+    // The higher-fitness fallback drops the required resource — it is excluded
+    // before the bound and the lower-fitness capable point is selected instead.
+    const fallback = baseInput(catalog);
+    fallback.task = requiredTask;
+    fallback.response = responseFor(catalog, {
+      fitness: fitnessFor(catalog, (point) => (point.id === "claude:claude-model:high" ? 0.9 : 0.6)),
+      resources: { pi: { tools: { read: 0.95 } }, claude: { tools: { Read: 0.7 } } },
+    });
+    const result = await routeTask(fallback);
+    expect(result).toMatchObject({ kind: "admitted", chain: ["pi:pi-model:low"], selectedPoint: { index: 0, id: "pi:pi-model:low" } });
+    if (result.kind === "admitted") {
+      expect(result.evidence?.chainExclusions).toEqual([{ id: "claude:claude-model:high", provider: "claude-provider", reasons: ["required_resource"] }]);
+    }
+
+    // Every candidate dropping the required resource abstains rather than
+    // launching under-capable.
+    const all = baseInput(catalog);
+    all.task = requiredTask;
+    all.response = responseFor(catalog, {
+      fitness: fitnessFor(catalog, (point) => (point.id === "pi:pi-model:low" ? 0.9 : 0.8)),
+      resources: { pi: { tools: { read: 0.7 } }, claude: { tools: { Read: 0.7 } } },
+    });
+    const abstained = await routeTask(all);
+    expect(abstained).toMatchObject({ kind: "abstained", reason: "low_confidence", component: "tools:read" });
+    if (abstained.kind === "abstained") {
+      expect(abstained.evidence?.chainExclusions).toEqual([
+        { id: "claude:claude-model:high", provider: "claude-provider", reasons: ["required_resource"] },
+        { id: "pi:pi-model:low", provider: "pi-provider", reasons: ["required_resource"] },
+      ]);
+    }
   });
 });

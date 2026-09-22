@@ -854,7 +854,7 @@ describe("the MCP host wake router", () => {
     expect(prompts[0]!.text).toContain("wait_result=condition_met");
 
     const before = calls.length;
-    host.notifyJobTerminal(waitDetail({ kind: "supervisor" as never, request: { kind: "supervisor", label: "sup", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" }, settings: { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "max" } } }));
+    host.notifyJobTerminal(waitDetail({ kind: "supervisor" as never, request: { kind: "supervisor", label: "sup", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" }, settings: { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "max" } } }));
     await flush();
     expect(calls.length).toBe(before);
     expect(prompts).toHaveLength(1);

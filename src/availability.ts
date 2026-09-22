@@ -42,7 +42,7 @@
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
-import { quotaKeyFor, type ChainCandidate, type QuotaKey, type RunnerEntry } from "./catalog.js";
+import { quotaKeyFor, type AvailabilitySubject, type QuotaKey, type RunnerEntry } from "./catalog.js";
 import { acquireFlockHolder, assertOwnerOnlyDirectory } from "./pane-write-lock.js";
 import { modelSafeJson } from "./redaction.js";
 
@@ -346,12 +346,12 @@ function keyField(value: unknown, field: string): string {
 }
 
 /**
- * The candidate's availability tuple via the B1 derivation — the runner's
- * quota tuple with any per-candidate account override. The runner name never
- * enters the key, so candidates sharing provider/billingProduct/account/scope
- * share the cooldown regardless of which runner they launch on.
+ * The subject's availability tuple via the B1 derivation — the model entry's
+ * below-runner attribution merged over the runner's quota tuple. The runner
+ * name never enters the key, so points sharing provider/billingProduct/
+ * account/scope share the cooldown regardless of which runner they launch on.
  */
-function availabilityKeyFor(candidate: ChainCandidate, runner: RunnerEntry): QuotaKey {
+function availabilityKeyFor(candidate: AvailabilitySubject, runner: RunnerEntry): QuotaKey {
   const key = quotaKeyFor(candidate, runner);
   return {
     provider: keyField(key.provider, "provider"),
@@ -556,7 +556,7 @@ async function readRecords(path: string): Promise<ReadResult> {
  * the failure was recorded under.
  */
 export async function recordLaunchFailure(
-  candidate: ChainCandidate,
+  candidate: AvailabilitySubject,
   runner: RunnerEntry,
   failure: string | LaunchFailureSignal,
   options: RecordLaunchFailureOptions
@@ -601,7 +601,7 @@ export async function recordLaunchFailure(
  * never treated as exhausted.
  */
 export async function availability(
-  candidate: ChainCandidate,
+  candidate: AvailabilitySubject,
   runner: RunnerEntry,
   options: AvailabilityOptions
 ): Promise<CandidateAvailability> {

@@ -1,7 +1,8 @@
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, existsSync, type Stats } from "node:fs";
+import { access, realpath, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import { writeIdentityProvenance } from "../agent-identity.js";
@@ -11,20 +12,19 @@ import type { CompatibilityPreflight } from "../health.js";
 import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
-import { createHandoffAllocator, renderHandoffContract, type HandoffAllocation, type HandoffAllocator } from "../handoff.js";
-import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
+import { createHandoffAllocator, readHandoffState, renderHandoffContract, RUN_ID_PATTERN, type HandoffAllocation, type HandoffAllocator, type HandoffState } from "../handoff.js";
+import { assertDeliverySize, assertMessageText, utf8Bytes, ATTACHMENT_MAX_BYTES, MESSAGE_INLINE_MAX_BYTES, type MessageDelivery } from "../messages/limits.js";
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type AgentSessionIdentity, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
 import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
 import type { AttachmentCapability } from "../profiles/capability.js";
 import { resolveSender, type SenderIdentity } from "../provenance.js";
-import type { CurrentContext, HerdrSnapshot, ResolvedTarget } from "../targets.js";
-import { parseSnapshotResult, resolveTarget } from "../targets.js";
-import { formatCall, formatResult, renderResultComponent, textComponent } from "../tui.js";
-import { expandBatchRequest, type BatchExpansion } from "../launch-batch.js";
-import { renderAssignment, SpecLaunchParamsSchema, type LaunchPlacement, type LaunchSpec, type SpecLaunchRequest } from "../launch-schema.js";
-import { renderSpecInstructions } from "../spec-baseline.js";
-import { candidateResourceSelection, createBypassReceipt, routeSpec, type AvailabilityGate, type BypassReceipt, type RouterBinding, type RouterEvidence, type RouterState, type SpecDecision, type SpecModelDecision } from "../router.js";
+import type { CurrentContext, HerdrSnapshot } from "../targets.js";
+import { parseSnapshotResult } from "../targets.js";
+import { formatCall, renderResultComponent, textComponent } from "../tui.js";
+import { LaunchTaskSchema, renderTask, type LaunchTask } from "../launch-schema.js";
+import { renderTaskInstructions } from "../spec-baseline.js";
+import { routeTask, runnerResourceSelection, type AvailabilityGate, type RouterBinding, type RoutingTask, type SpecDecision, type TaskModelDecision, type TaskRouterState } from "../router.js";
 import { appendRouterDecision, routerStateDigest, type AppendRouterLogOptions, type SpecRouterLogEntry } from "../router-log.js";
 import { TypeSafeSpecClient } from "../typesafe-spec.js";
 import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/index.js";
@@ -37,10 +37,11 @@ import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
 import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
 import type { SelfCloseTracker } from "../supervision/self-close.js";
-import { CATALOG_PATH, loadCatalog, resolveChain, type Catalog, type ResolvedCandidate, type RunnerKind } from "../catalog.js";
+import { CATALOG_PATH, loadCatalog, type AvailabilitySubject, type Catalog, type RunnerEntry, type RunnerKind } from "../catalog.js";
 import { createWorktreeManager, type WorktreeManager } from "../worktree.js";
-import { compileCandidateContract, contractArgv, type CompiledContract, type ResourceSelection } from "../compile.js";
-import { classifyLaunchFailure, recordLaunchFailure, type LaunchFailureSignal, type RecordLaunchFailureOptions } from "../availability.js";
+import { compileCandidateContract, contractArgv, type CompiledContract, type ResolvedPoint, type ResourceSelection } from "../compile.js";
+import { deriveWorkspaceState, maxTier, nextTier, POLICY_REVISION, type QualityTier, type WorkloadIntent, type WorkloadProfile, type WorkspaceState } from "../routing-policy.js";
+import { availability as defaultAvailability, classifyLaunchFailure, recordLaunchFailure, type LaunchFailureSignal, type RecordLaunchFailureOptions } from "../availability.js";
 
 export interface LaunchCli {
   runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
@@ -96,7 +97,7 @@ export interface LaunchDependencies {
   availability?: AvailabilityGate;
   worktrees?: WorktreeManager;
   /** B2 failure recorder seam; production uses the durable cooldown log. */
-  availabilityFailureRecorder?: (candidate: ResolvedCandidate["candidate"], runner: ResolvedCandidate["runner"], failure: LaunchFailureSignal, options: RecordLaunchFailureOptions) => Promise<unknown>;
+  availabilityFailureRecorder?: (candidate: AvailabilitySubject, runner: RunnerEntry, failure: LaunchFailureSignal, options: RecordLaunchFailureOptions) => Promise<unknown>;
   /**
    * The one-shot decision-log append sink, run once per spec decision before
    * any child mutation. Defaults to the local JSONL record rooted at the
@@ -105,7 +106,7 @@ export interface LaunchDependencies {
   routerLog?: LaunchRouterLog;
 }
 
-/** The ADR-035 decision-log append seam; `appendRouterDecision` satisfies it. */
+/** The ADR-037 decision-log append seam; `appendRouterDecision` satisfies it. */
 export type LaunchRouterLog = (entry: SpecRouterLogEntry, options: AppendRouterLogOptions) => Promise<void>;
 
 export interface LaunchResourceIds {
@@ -114,25 +115,53 @@ export interface LaunchResourceIds {
   agentId?: string;
 }
 
+/**
+ * One operating-point attempt in a child's start loop. `skipped_unavailable`
+ * records the mandatory availability re-probe refusing the point without a
+ * start dispatch; no Jev request is re-issued on that verdict.
+ */
 export interface LaunchAttemptEvidence {
-  candidate: { index: number; runner: string; model: string };
-  outcome: "selected" | "agent_start_failed" | "fallback_refused";
+  point: { index: number; id: string; runner: string; model: string };
+  outcome: "selected" | "agent_start_failed" | "fallback_refused" | "skipped_unavailable";
   errorCode?: string;
   message?: string;
   postState?: Record<string, unknown>;
 }
 
-export interface LaunchSpecEvidence {
-  label: string;
-  category: string;
-  count: number;
+/**
+ * The runtime-resolved-model evidence seam (N4 amendment): no post-start
+ * readback carries a model field, so the record is a bounded unavailable fact
+ * pinned to the catalog revision — never a fabricated concrete id.
+ */
+export type LaunchResolvedModel =
+  | { available: true; model: string }
+  | { available: false; reason: "no-readback-seam"; catalogRevision?: string };
+
+export interface LaunchTaskEvidence {
+  /** The caller's display-only label, when supplied. */
+  label?: string;
+  replicas: number;
+  /** The caller's requested tier after defaulting; omission resolved to `standard`. */
+  requestedTier?: QualityTier;
+  workloadFloor?: QualityTier;
+  effectiveStartTier?: QualityTier;
+  effectiveCeiling?: QualityTier;
   quality: Exclude<AdmittedSpecDecision["quality"], "rejected">;
-  bypass?: NonNullable<RouterEvidence["bypass"]>;
-  selected: { index: number; runner: string; model: string };
+  /** The operating point that actually started this child — the exact point id. */
+  selected: { index: number; id: string; runner: string; model: string };
   attempts: LaunchAttemptEvidence[];
-  fallbackCandidates: Array<{ index: number; runner: string; model: string }>;
+  fallbackCandidates: Array<{ index: number; id: string; runner: string; model: string }>;
+  resolvedModel: LaunchResolvedModel;
   /** The effective contract that produced the selected child's argv. */
   configuration: CompiledContract;
+  /** The prior-run lineage this child was launched under; absent on fresh launches. */
+  recovery?: {
+    recoveryOf: string;
+    workspaceState: WorkspaceState;
+    priorRouteTier: QualityTier;
+    priorOperatingPointId: string;
+    priorPolicyRevision: string;
+  };
 }
 
 export interface LaunchReadinessEvidence {
@@ -177,15 +206,31 @@ export interface LaunchReconciliationEvidence {
   readFailures?: string[];
 }
 
+/** The runtime-owned workload-tab fact recorded on a launched child (D12). */
+export interface LaunchTopologyEvidence {
+  /** The classified workload intent the tab grammar is keyed on. */
+  intent: WorkloadIntent;
+  tabId: string;
+  tabLabel: string;
+  /** True when an existing matching tab was reused rather than created. */
+  reused: boolean;
+  /** A reused tab's internal layout was not created by this launch and is never asserted. */
+  layoutUnverified?: true;
+}
+
 export interface LaunchDetails extends LaunchResourceIds {
   operation: "launch";
   outcome: "launched" | "partial";
+  launchId?: string;
   effectCertainty?: LaunchEffectCertainty;
   reconciliation?: LaunchReconciliationEvidence;
   contextRebinding?: ContextResolutionDiagnostics;
+  /** The runtime-minted child identity — also the pane/agent target. */
   name?: string;
   kind?: string;
-  placement?: LaunchPlacement;
+  topology?: LaunchTopologyEvidence;
+  /** The provable replica worktree this child runs in, when replicas > 1. */
+  worktree?: string;
   postState?: Record<string, unknown>;
   agentStarted?: boolean;
   initialPromptSent?: boolean;
@@ -203,10 +248,10 @@ export interface LaunchDetails extends LaunchResourceIds {
   /** Advisory identity provenance tokens were written; `provenanceWarning` is set when that write failed. */
   identityProvenance?: "launched";
   provenanceWarning?: string;
-  phase?: "validate" | "route_spec" | "compile" | "handoff" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "focus" | "prompt_verification" | "supervision_bind";
+  phase?: "validate" | "route" | "compile" | "handoff" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "prompt_verification" | "supervision_bind";
   supervision?:
-    | { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; profileName: string } }
-    | { jobId: string; state: "provisional"; provisional: { agentName: string; agentKind: "agy"; paneId: string; terminalId: string; profileName: string; baseline: PromptObservationBaseline } };
+    | { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; operatingPointId: string } }
+    | { jobId: string; state: "provisional"; provisional: { agentName: string; agentKind: "agy"; paneId: string; terminalId: string; operatingPointId: string; baseline: PromptObservationBaseline } };
   created?: LaunchResourceIds;
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
@@ -214,44 +259,40 @@ export interface LaunchDetails extends LaunchResourceIds {
   attachment?: PublishedAttachment;
   /** The generated Tools-owned run and its agent-writable artifact path. */
   handoff?: { runId: string; path: string };
-  recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; profileName: string; kind: ProfileKind; capable: boolean; reason: string };
-  spec?: LaunchSpecEvidence;
+  recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; operatingPointId: string; kind: ProfileKind; capable: boolean; reason: string };
+  task?: LaunchTaskEvidence;
 }
 
 /**
- * Internal Batch wiring handed to the shared single-child executor. Explicit
- * calls pass neither field: the catalog is loaded inside the child lifecycle
- * and the name check stays the existing agent-name-only test.
+ * The uniform launch result (ADR-037 D15): one Task in, one result out. A
+ * launch that cannot start any child reports `failed`; an admitted decision
+ * that started some but not all children reports `partial`.
  */
-interface LaunchBatchContext {
-  /** The single catalog snapshot that fed every spec decision and child. */
-  catalog: Catalog;
-  /** Names and pane labels sibling children will claim. */
-  reservedNames: ReadonlySet<string>;
-  /** Original replica count; each expanded child still gets its own worktree. */
-  worktreeCount?: number;
+export interface LaunchResultChild {
+  /** The runtime-minted child name — the pane/agent target. */
+  target: string;
+  state: "launched" | "failed" | "not_started";
+  /** The exact operating-point id that started this child, when one did. */
+  operatingPointId?: string;
+  supervisorJobId?: string;
+  worktree?: string;
+  /**
+   * Bounded, redacted failure fact — never cause prose. `causeCode`,
+   * `paneId`, and `supervisorJobId` carry the recovery handles when the
+   * child's work may already have been consumed (PROMPT_UNCONFIRMED), so the
+   * caller inspects the live child instead of relaunching a duplicate.
+   */
+  error?: { code: string; message?: string; causeCode?: string; paneId?: string; supervisorJobId?: string };
 }
 
-export type LaunchBatchChildStatus = "launched" | "failed" | "not_started";
-
-/** One expanded spec replica's retained outcome inside a Batch result. */
-export interface LaunchBatchChild {
-  /** The exact derived `{name}-{spec.label}-{N}` target. */
-  name: string;
-  specLabel: string;
-  ordinal: number;
-  status: LaunchBatchChildStatus;
-  launch?: LaunchDetails;
-  failure?: { code: string; details: Record<string, unknown> };
-  code?: string;
-}
-
-export interface LaunchBatchDetails {
-  operation: "launch_batch";
-  outcome: "abstained" | "launched" | "partial" | "failed";
-  router: SpecDecision[];
-  children: LaunchBatchChild[];
-  failure?: { code: string; message?: string };
+export interface LaunchResult {
+  kind: "launch";
+  launchId: string;
+  outcome: "launched" | "abstained" | "partial" | "failed";
+  requestedTier: QualityTier;
+  effectiveTier?: QualityTier;
+  children: LaunchResultChild[];
+  error?: { code: string; message?: string };
 }
 
 const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
@@ -261,7 +302,6 @@ const AGENT_PANE_SHELL_SETTLE_MS = 10_000;
 const AGENT_PANE_SHELL_POLL_MS = 150;
 const LAUNCH_RECONCILIATION_TIMEOUT_MS = 5_000;
 const SPEC_EVALUATION_TIMEOUT_MS = 20_000;
-const BYPASS_POLICY_REVISION = "adr-035";
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
 /**
@@ -404,22 +444,159 @@ function identifier(value: unknown, field: string): asserts value is string {
   }
 }
 
-function validateParams(params: SpecLaunchRequest): void {
-  if (!record(params) || !Value.Check(SpecLaunchParamsSchema, params)) {
-    throw new LaunchError("INVALID_INPUT", "launch parameters must be a valid spec request");
+function validateParams(params: unknown): asserts params is LaunchTask {
+  if (!record(params) || !Value.Check(LaunchTaskSchema, params)) {
+    throw new LaunchError("INVALID_INPUT", "launch parameters must be a valid task");
+  }
+  // The label is display-only metadata bounded at 256 UTF-8 bytes so it can
+  // never push a bounded routing-evidence record over its cap.
+  if (params.label !== undefined && Buffer.byteLength(params.label, "utf8") > 256) {
+    throw new LaunchError("INVALID_INPUT", "label exceeds the 256-byte bound");
+  }
+  // ADR-037 recovery contract: exactly one replica and no caller cwd — the
+  // runtime resumes the prior run's managed workspace itself.
+  if (params.recoveryOf !== undefined && (params.cwd !== undefined || (params.replicas ?? 1) !== 1)) {
+    throw new LaunchError("INVALID_INPUT", "a recovery launch forbids cwd and requires exactly one replica");
   }
 }
 
-function normalizedParams(params: SpecLaunchRequest): SpecLaunchRequest {
-  validateParams(params);
-  return {
-    ...params,
-    specs: params.specs.map((spec) => ({ ...spec, count: spec.count ?? 1 }))
-  };
+/** The caller's Task with every schema default made concrete. */
+interface NormalizedLaunchTask extends LaunchTask {
+  constraints: string[];
+  replicas: number;
+  tier: QualityTier;
 }
 
-function specPayload(spec: LaunchSpec): string {
-  return `${spec.instructions}\n\n${renderAssignment(spec.assignment)}`;
+function normalizedParams(params: unknown): NormalizedLaunchTask {
+  validateParams(params);
+  return { ...params, constraints: params.constraints ?? [], replicas: params.replicas ?? 1, tier: params.tier ?? "standard" };
+}
+
+/**
+ * Grammar-valid runtime child identity (D11): a launchId segment plus the
+ * replica ordinal. Callers never name children; no `{name}-{label}-{N}`
+ * derivation or collision reservation exists anymore.
+ */
+function mintChildName(launchId: string, ordinal: number): string {
+  return `task-${launchId.slice(0, 8)}-${ordinal}`;
+}
+
+/**
+ * Canonical working directory (D13): the caller's `cwd` (or the host root by
+ * default) resolved through realpath before any effect. It must exist, be a
+ * directory, and be readable/searchable; anything else fails closed.
+ */
+async function resolveLaunchCwd(rawCwd: string | undefined, root: string): Promise<string> {
+  identifier(root, "cwd");
+  const candidate = rawCwd === undefined ? root : isAbsolute(rawCwd) ? rawCwd : resolve(root, rawCwd);
+  let resolved: string;
+  let stats: Stats;
+  try {
+    resolved = await realpath(candidate);
+    stats = await stat(resolved);
+  } catch {
+    throw new LaunchError("CWD_UNAVAILABLE", "Launch cwd is not an accessible directory");
+  }
+  if (!stats.isDirectory()) {
+    throw new LaunchError("CWD_UNAVAILABLE", "Launch cwd is not an accessible directory");
+  }
+  try {
+    await access(resolved, constants.R_OK | constants.X_OK);
+  } catch {
+    throw new LaunchError("CWD_UNAVAILABLE", "Launch cwd is not an accessible directory");
+  }
+  return resolved;
+}
+
+/**
+ * Prior-run lineage resolved from the managed handoff record `recoveryOf`
+ * names (ADR-037): the derived workspace state, the resumed managed workspace,
+ * and the route evidence the recovery's routing policy consumes.
+ */
+interface RecoveryContext {
+  runId: string;
+  workspaceState: WorkspaceState;
+  /** The prior run's managed workspace, re-canonicalized and proven accessible. */
+  resumedWorkspace: string;
+  /** The persisted worktree root when the prior child ran inside one. */
+  resumedWorktree?: string;
+  priorRouteTier: QualityTier;
+  priorOperatingPointId: string;
+  priorPolicyRevision: string;
+  priorWorkload: WorkloadProfile;
+}
+
+/**
+ * Resolve `recoveryOf` to verified prior-run lineage: the run id opens a
+ * managed allocation inside this endpoint's namespace, the sidecar must be a
+ * trusted v2 record carrying route and workspace evidence, and the recorded
+ * workspace must still resolve to itself. Every gap fails closed — a recovery
+ * never falls back to the caller or ambient cwd.
+ */
+async function resolveRecoveryOf(params: NormalizedLaunchTask, handoffs: HandoffAllocator, root: string): Promise<RecoveryContext> {
+  const recoveryOf = params.recoveryOf;
+  const unresolvable = (reason: string): LaunchError =>
+    new LaunchError("RECOVERY_UNRESOLVABLE", "recoveryOf cannot be resolved by this runtime", { recoveryOf, reason });
+  /* c8 ignore next 3 -- validateParams already enforces the recovery contract; the re-assertion keeps a validation bypass fail-closed. */
+  if (recoveryOf === undefined || params.replicas !== 1 || params.cwd !== undefined) {
+    throw new LaunchError("INVALID_INPUT", "a recovery launch forbids cwd and requires exactly one replica");
+  }
+  if (!RUN_ID_PATTERN.test(recoveryOf)) throw unresolvable("run_id_malformed");
+  let allocation: HandoffAllocation;
+  try {
+    allocation = await handoffs.open(recoveryOf);
+  } catch {
+    throw unresolvable("run_unavailable");
+  }
+  let prior: HandoffState;
+  try {
+    prior = await readHandoffState(allocation);
+  } catch {
+    throw unresolvable("state_unreadable");
+  }
+  const route = prior.child.route;
+  const workspace = prior.child.workspace;
+  if (route === undefined || workspace === undefined) throw unresolvable("lineage_incomplete");
+  // Reuse requires terminal evidence: the durable lifecycle record is what
+  // proves the prior child can no longer write to the workspace being
+  // resumed. awaiting_handoff — and a handed_off mark with no terminal
+  // artifact — may still have a live writer; recovery rejects before any
+  // effect rather than risk a second writer over partial state.
+  const lifecycle = prior.lifecycle.state;
+  const terminal =
+    lifecycle === "failed" ||
+    lifecycle === "cancelled" ||
+    lifecycle === "recovery_pending" ||
+    (lifecycle === "handed_off" && prior.artifact.status !== undefined);
+  if (!terminal && (lifecycle === "awaiting_handoff" || lifecycle === "handed_off")) {
+    throw unresolvable("lifecycle_non_terminal");
+  }
+  let workspaceState: WorkspaceState;
+  try {
+    workspaceState = deriveWorkspaceState({ lifecycle: prior.lifecycle.state, artifactStatus: prior.artifact.status });
+  } catch {
+    throw unresolvable("evidence_unresolvable");
+  }
+  const recorded = workspace.worktree ?? workspace.resolvedCwd;
+  let resumedWorkspace: string;
+  try {
+    resumedWorkspace = await resolveLaunchCwd(recorded, root);
+  } catch {
+    throw unresolvable("workspace_unavailable");
+  }
+  // The recorded path was canonical when written; a path that now resolves
+  // elsewhere is not the prior workspace.
+  if (resumedWorkspace !== recorded) throw unresolvable("workspace_moved");
+  return {
+    runId: recoveryOf,
+    workspaceState,
+    resumedWorkspace,
+    ...(workspace.worktree === undefined ? {} : { resumedWorktree: workspace.worktree }),
+    priorRouteTier: route.tier,
+    priorOperatingPointId: route.operatingPointId,
+    priorPolicyRevision: route.policyRevision,
+    priorWorkload: route.workload
+  };
 }
 
 function paneRecord(value: unknown, expectedPaneId: string): Record<string, unknown> {
@@ -1621,54 +1798,72 @@ async function confirmAgyNativeSession(
   }
 }
 
-function existingAgentNames(snapshot: HerdrSnapshot): string[] {
-  const names = snapshot.agents.flatMap((agent) => typeof agent.name === "string" ? [agent.name] : []);
-  for (const pane of snapshot.panes) {
-    const name = typeof pane.agent_name === "string" ? pane.agent_name : typeof pane.agent === "string" ? pane.agent : undefined;
-    if (name && !names.includes(name)) names.push(name);
-  }
-  return names;
+/**
+ * The runtime-minted name must not already resolve to a live pane/agent or
+ * pane label — a collision means the identity grammar was violated, so the
+ * launch fails closed rather than targeting an existing surface.
+ */
+function mintedNameTaken(snapshot: HerdrSnapshot, name: string): boolean {
+  return snapshot.agents.some((agent) => agent.name === name)
+    || snapshot.panes.some((pane) => pane.agent_name === name || pane.agent === name || pane.label === name);
 }
 
 /**
- * Every name an exact pane/agent target resolution could already match:
- * existing agent names plus pane labels, which shadow a name in the shared
- * resolvers, so name-only uniqueness is not sufficient. Batch child
- * expansion checks this set rather than parsing identity a second way.
+ * The workload-tab grammar (D12): `workload:<intent>` is the first tab of an
+ * intent, `workload:<intent>:<n>` its numbered spillovers. Matching is exact —
+ * a caller-labeled tab that only resembles the grammar is never reused.
  */
-export function existingNameTargets(snapshot: HerdrSnapshot): Set<string> {
-  const names = new Set(existingAgentNames(snapshot));
-  for (const pane of snapshot.panes) {
-    if (typeof pane.label === "string" && pane.label.length > 0) names.add(pane.label);
-  }
-  return names;
+function workloadTabOrdinal(intent: string, label: string | undefined): number | undefined {
+  if (label === `workload:${intent}`) return 1;
+  const prefix = `workload:${intent}:`;
+  if (label === undefined || !label.startsWith(prefix)) return undefined;
+  const suffix = label.slice(prefix.length);
+  return /^[0-9]+$/u.test(suffix) ? Number(suffix) : undefined;
 }
 
-function paneForPlacement(snapshot: HerdrSnapshot, target: string, context: CurrentContext): ResolvedTarget {
-  return resolveTarget(snapshot, target, "pane", context);
+const WORKLOAD_TAB_MAX_PANES = 4;
+
+/**
+ * The runtime topology decision for one child: reuse the lowest-ordinal tab of
+ * this intent that still holds fewer than four panes (counting every pane in
+ * the snapshot), else create the next label in the grammar — `workload:<intent>`
+ * when no matching tab exists yet, `workload:<intent>:{n+1}` past the highest
+ * existing ordinal.
+ */
+function selectWorkloadTab(snapshot: HerdrSnapshot, workspaceId: string, intent: WorkloadIntent): { reuse?: { tabId: string; tabLabel: string; anchorPaneId: string }; create?: { tabLabel: string } } {
+  const matching = snapshot.tabs
+    .filter((tab) => tab.workspace_id === workspaceId)
+    .flatMap((tab) => {
+      const ordinal = workloadTabOrdinal(intent, tab.label);
+      return ordinal === undefined ? [] : [{ tab, ordinal, panes: snapshot.panes.filter((pane) => pane.tab_id === tab.tab_id) }];
+    })
+    .sort((left, right) => left.ordinal - right.ordinal);
+  const reusable = matching.find((entry) => entry.panes.length > 0 && entry.panes.length < WORKLOAD_TAB_MAX_PANES);
+  if (reusable !== undefined) return { reuse: { tabId: reusable.tab.tab_id, tabLabel: reusable.tab.label, anchorPaneId: reusable.panes.at(-1)!.pane_id } };
+  const nextOrdinal = matching.length === 0 ? 1 : Math.max(...matching.map((entry) => entry.ordinal)) + 1;
+  return { create: { tabLabel: nextOrdinal === 1 ? `workload:${intent}` : `workload:${intent}:${nextOrdinal}` } };
 }
 
 /**
- * The reservation's trusted workspace root (ADR-036 W0): the existing pane's
- * own `cwd` for `existing_pane`, else the launch-resolved `--cwd`. A missing
- * or relative value degrades to a typed gap — the reservation never falls
- * back to this process's cwd.
+ * The reservation's trusted workspace root (ADR-036 W0): the canonical launch
+ * `cwd` resolved before effects. A missing or relative value degrades to a
+ * typed gap — the reservation never falls back to this process's cwd.
  */
-function supervisionWorkspaceRoot(placement: LaunchPlacement, existingTarget: ResolvedTarget | undefined, launchCwd: string | undefined): SupervisionWorkspaceRoot {
-  const root = placement.mode === "existing_pane" ? existingTarget?.record.cwd : launchCwd;
-  if (typeof root !== "string" || root.length === 0) return { available: false, reason: "root_unavailable" };
-  return isAbsolute(root) ? { available: true, root } : { available: false, reason: "root_not_absolute" };
+function supervisionWorkspaceRoot(launchCwd: string | undefined): SupervisionWorkspaceRoot {
+  if (typeof launchCwd !== "string" || launchCwd.length === 0) return { available: false, reason: "root_unavailable" };
+  return isAbsolute(launchCwd) ? { available: true, root: launchCwd } : { available: false, reason: "root_not_absolute" };
 }
 
 /**
  * Every compiled chain candidate's deny-list fact (ADR-036 W0). Only the
  * claude runtime has a `disallowedTools` argv surface; other runners record
- * the typed gap rather than a list inferred from prose.
+ * the typed gap rather than a list inferred from prose. The tag is the exact
+ * operating-point id the binding reports (ADR-037).
  */
 function supervisionForbiddenTools(contracts: ReadonlyMap<string, CompiledContract>): SupervisionForbiddenToolsPolicy[] {
   return [...contracts.values()].map((contract) => ({
     agentKind: contract.runtime.kind,
-    candidateName: contract.candidate.model,
+    operatingPointId: contract.candidate.id,
     forbiddenTools: contract.runtime.kind === "claude"
       ? { available: true, tools: [...contract.runtime.disallowedTools] }
       : { available: false, reason: "runner_lacks_disallowed_tools" },
@@ -1808,7 +2003,11 @@ function partialError(
       ? "ABORTED"
       : error instanceof LaunchError && error.code === "READY_TIMEOUT"
         ? "READY_TIMEOUT"
-        : "LAUNCH_FAILED";
+        // PROMPT_UNCONFIRMED stays distinguishable: the work may already be
+        // consumed, so a relaunch must never look like an ordinary failure.
+        : error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED"
+          ? "PROMPT_UNCONFIRMED"
+          : "LAUNCH_FAILED";
   const errorDetails = error instanceof LaunchError ? error.details : {};
   const cliFailure = error instanceof LaunchError
     ? compactCliFailureEvidence(errorDetails.cliFailure)
@@ -1866,10 +2065,10 @@ function partialError(
   });
 }
 
-function progress(onUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined, phase: LaunchDetails["phase"], created: LaunchResourceIds): void {
+function progress(onUpdate: AgentToolUpdateCallback<LaunchResult> | undefined, launchId: string, childTarget: string, phase: LaunchPhase, requestedTier: QualityTier): void {
   onUpdate?.({
     content: [{ type: "text", text: `Launch ${phase}` }],
-    details: { operation: "launch", outcome: "partial", phase, created: { ...created } }
+    details: { kind: "launch", launchId, outcome: "partial", requestedTier, children: [{ target: childTarget, state: "not_started" }] }
   });
 }
 
@@ -1889,142 +2088,137 @@ async function runPrompt(cli: LaunchCli, paneId: string, envelope: string, signa
   return cli.prompt(paneId, envelope, signal);
 }
 
-/** The complete redacted structured evidence one failed child retains. */
-function batchChildFailure(error: unknown): { code: string; details: Record<string, unknown> } {
-  const source = error instanceof LaunchError ? error.details : record(error) && record(error.details) ? error.details : {};
-  const projected = modelSafeJson(source) as Record<string, unknown>;
-  const details = { ...projected };
-  const message = causeMessage(error);
-  if (details.causeMessage === undefined && message !== undefined) details.causeMessage = message;
-  return { code: safeLaunchCode(launchTransportCode(error)), details };
+/**
+ * The bounded, redacted failure fact one failed child retains in the result.
+ * Only this module's own fixed prose may be published: a foreign cause can
+ * quote a command line or credential, and the diagnostic blob belongs to the
+ * thrown-error channel, not the uniform result. Recovery handles — the cause
+ * code, the pane, and the retained supervisor job — are bounded identifiers
+ * the caller needs to inspect a possibly-consumed child instead of relaunching.
+ */
+function launchChildError(error: unknown): LaunchResultChild["error"] {
+  const message = error instanceof LaunchError
+    ? safeDiagnosticString(error.message.split(`\n${LAUNCH_DIAGNOSTIC_MARKER}`)[0], 256)
+    : undefined;
+  const details = error instanceof LaunchError ? error.details : undefined;
+  const causeCode = safeDiagnosticString(details?.causeCode, 64);
+  const paneId = safeDiagnosticString(details?.paneId, 128);
+  const supervisorJobId = safeDiagnosticString(details?.supervisorJobId, 128);
+  return {
+    code: safeLaunchCode(launchTransportCode(error)),
+    ...(message === undefined ? {} : { message }),
+    ...(causeCode === undefined ? {} : { causeCode }),
+    ...(paneId === undefined ? {} : { paneId }),
+    ...(supervisorJobId === undefined ? {} : { supervisorJobId })
+  };
 }
 
 /**
- * The all-child manifest rendered ahead of verbose details. Every expanded
- * child gets exactly one line, so a bounded response can never masquerade as
- * a smaller Batch.
+ * The all-child manifest rendered ahead of verbose details. Every minted child
+ * gets exactly one line, so a bounded response can never masquerade as a
+ * smaller launch.
  */
-function batchManifest(details: LaunchBatchDetails): string {
-  const router = details.router.map((decision) => decision.kind).join(",") || "none";
-  const head = `herdr_launch batch outcome=${details.outcome} router=${router} children=${details.children.length}${details.failure === undefined ? "" : ` failure=${details.failure.code}`}`;
-  const lines = details.children.map((child) => {
-    const selected = child.launch?.spec?.selected.model;
-    const failureDetails = child.failure?.details;
-    const createdValue = failureDetails?.created;
-    const created = record(createdValue) ? createdValue : undefined;
-    const paneId = child.launch?.paneId ?? safeDiagnosticString(failureDetails?.paneId) ?? safeDiagnosticString(created?.paneId);
-    const supervisorJobId = child.launch?.supervision?.jobId ?? safeDiagnosticString(failureDetails?.supervisorJobId);
-    const code = child.failure?.code ?? child.code;
-    return `- ${child.name} spec=${child.specLabel}${selected === undefined ? "" : ` selected=${selected}`} outcome=${child.status}${code === undefined ? "" : ` code=${code}`}${paneId === undefined ? "" : ` pane=${paneId}`}${supervisorJobId === undefined ? "" : ` supervisor=${supervisorJobId}`}`;
-  });
+function launchManifest(result: LaunchResult): string {
+  const head = `herdr_launch outcome=${result.outcome} launch=${result.launchId} tier=${result.requestedTier}${result.effectiveTier === undefined ? "" : ` effective=${result.effectiveTier}`} children=${result.children.length}${result.error === undefined ? "" : ` error=${result.error.code}`}`;
+  const lines = result.children.map((child) =>
+    `- ${child.target} state=${child.state}${child.operatingPointId === undefined ? "" : ` point=${child.operatingPointId}`}${child.supervisorJobId === undefined ? "" : ` supervisor=${child.supervisorJobId}`}${child.worktree === undefined ? "" : ` worktree=${child.worktree}`}${child.error === undefined ? "" : ` error=${child.error.code}`}`
+  );
   return [head, ...lines].join("\n");
 }
 
 type AdmittedSpecDecision = Extract<SpecDecision, { kind: "admitted" }>;
 
-type SpecRouteRecord = {
-  spec: LaunchSpec;
+type TaskRouteRecord = {
+  /** The canonical Task the decision and its evidence were produced from. */
+  task: RoutingTask;
   decision: SpecDecision;
-  response?: SpecModelDecision;
+  response?: TaskModelDecision;
   state?: SpecRouterLogEntry["state"];
   binding?: RouterBinding;
-  bypassConfiguration?: CompiledContract;
+  /** The catalog content digest the decision was routed against. */
+  catalogRevision?: string;
+  /** Recovery lineage for the decision log: the run being recovered. */
+  recoveryOf?: string;
+  /** Recovery lineage for the decision log: the failed prior operating point. */
+  priorOperatingPointId?: string;
 };
 
-function candidateIdentity(candidate: { index: number; runner: string; model: string }): { index: number; runner: string; model: string } {
-  return { index: candidate.index, runner: candidate.runner, model: candidate.model };
+/** The attempt-evidence identity of one chain point: exact id included. */
+function pointIdentity(point: { index: number; id: string; runner: string; model: string }): LaunchAttemptEvidence["point"] {
+  return { index: point.index, id: point.id, runner: point.runner, model: point.model };
 }
 
-function candidateKey(candidate: { index: number; runner: string; model: string }): string {
-  return `${candidate.index}:${candidate.runner}:${candidate.model}`;
+function resolvedPointIdentity(resolved: ResolvedPoint): LaunchAttemptEvidence["point"] {
+  return { index: resolved.index, id: resolved.point.id, runner: resolved.point.runner, model: resolved.point.model };
 }
 
-function resolvedCandidateIdentity(candidate: ResolvedCandidate): { index: number; runner: string; model: string } {
-  return { index: candidate.index, runner: candidate.candidate.runner, model: candidate.candidate.model };
-}
-
-function resolvedCandidateKey(candidate: ResolvedCandidate): string {
-  return candidateKey(resolvedCandidateIdentity(candidate));
+/** A chain position keyed by point id — immutable for the whole decision. */
+function resolvedPointKey(resolved: ResolvedPoint): string {
+  return resolved.point.id;
 }
 
 function isAdmitted(decision: SpecDecision): decision is AdmittedSpecDecision {
   return decision.kind === "admitted";
 }
 
-function launchBinding(name: string, spec: LaunchSpec, state: RouterState): RouterBinding {
+function launchBinding(launchId: string, state: TaskRouterState): RouterBinding {
   return {
-    caller: name,
+    caller: launchId,
     specRevision: routerStateDigest(state),
-    policyRevision: BYPASS_POLICY_REVISION,
-    launchIdentity: createHash("sha256").update(JSON.stringify({ name, spec })).digest("hex")
+    policyRevision: POLICY_REVISION,
+    launchIdentity: createHash("sha256").update(JSON.stringify({ launchId, task: state.task })).digest("hex")
   };
 }
 
-function parseBypassToken(value: string): BypassReceipt | undefined {
-  try {
-    return JSON.parse(value) as BypassReceipt;
-  } catch {
-    return undefined;
-  }
-}
-
-function allReviewedResources(candidate: ResolvedCandidate): ResourceSelection {
-  const pools = candidate.runner.pools;
-  return candidate.runner.kind === "pi"
+function allReviewedResources(resolved: ResolvedPoint): ResourceSelection {
+  const pools = resolved.runner.pools;
+  return resolved.runner.kind === "pi"
     ? { tools: pools.tools, extensions: pools.extensions, skills: pools.skills, mcp: pools.mcp }
-    : candidate.runner.kind === "claude"
+    : resolved.runner.kind === "claude"
       ? { tools: pools.tools, plugins: pools.plugins, mcp: pools.mcp }
       : {};
 }
 
-async function transportBypassConfiguration(spec: LaunchSpec, catalog: Catalog): Promise<CompiledContract | undefined> {
-  const category = spec.category ?? catalog.categories.keys().next().value;
-  if (typeof category !== "string") return undefined;
-  try {
-    const selected = resolveChain(catalog, category).selected!;
-    return await compileCandidateContract(catalog, spec, selected, allReviewedResources(selected));
-  } catch {
-    return undefined;
-  }
-}
-
 function recipientCapability(kind: RunnerKind): AttachmentCapability & { kind: ProfileKind } {
-  return { kind: kind as ProfileKind, capable: true, reason: "compiled spec contract grants the launch runtime" };
+  return { kind: kind as ProfileKind, capable: true, reason: "compiled task contract grants the launch runtime" };
 }
 
-function specRouterState(spec: LaunchSpec, catalog: Catalog): RouterState {
-  const entries = [...catalog.categories.entries()].flatMap(([category, chain]) => chain.map((candidate) => {
-    const runner = catalog.runners.get(candidate.runner);
-    return {
-      name: `${category}-${candidate.runner}-${candidate.model}`,
-      description: category,
-      runner: candidate.runner,
-      model: candidate.model,
-      timeout: runner?.defaults.timeoutMinutes ?? 0
-    };
-  }));
-  return { assignment: spec.assignment, catalog: entries };
-}
-
-function specRouteLogEntry(name: string, record: SpecRouteRecord): SpecRouterLogEntry {
+/** The Task plus the ordered operating-point projection that the binding digest covers. */
+function taskRouterState(task: RoutingTask, catalog: Catalog): TaskRouterState {
   return {
-    caller: name,
-    name,
+    task,
+    points: (catalog.points ?? []).map((point) => ({
+      id: point.id,
+      runner: point.runner,
+      model: point.model,
+      ...(point.reasoning === undefined ? {} : { reasoning: point.reasoning }),
+      provider: point.provider,
+      timeout: catalog.runners.get(point.runner)?.defaults.timeoutMinutes ?? 0
+    }))
+  };
+}
+
+function taskRouteLogEntry(launchId: string, record: TaskRouteRecord): SpecRouterLogEntry {
+  return {
+    caller: launchId,
     result: record.decision,
     ...(record.binding === undefined ? {} : { binding: record.binding }),
+    ...(record.catalogRevision === undefined ? {} : { catalogRevision: record.catalogRevision }),
+    ...(record.recoveryOf === undefined ? {} : { recoveryOf: record.recoveryOf, priorOperatingPointId: record.priorOperatingPointId }),
     ...(record.decision.evidence === undefined ? {} : { evidence: record.decision.evidence }),
     ...(record.response === undefined ? {} : { probabilities: record.response }),
     ...(record.state === undefined ? {} : { state: record.state })
   };
 }
 
-export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDefinition<typeof SpecLaunchParamsSchema, LaunchDetails | LaunchBatchDetails> {
+export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDefinition<typeof LaunchTaskSchema, LaunchResult> {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   const specClient = deps.specClient ?? new TypeSafeSpecClient();
   const worktrees = deps.worktrees ?? (() => {
     const exec = (deps.cli as unknown as { exec?: PiExec }).exec;
     return exec === undefined ? undefined : createWorktreeManager({ exec, ...(deps.selfClose === undefined ? {} : { selfClose: deps.selfClose }) });
   })();
+  const availabilityGate = deps.availability ?? defaultAvailability;
 
   let packageRoot = dirname(fileURLToPath(import.meta.url));
   while (!existsSync(join(packageRoot, "package.json"))) packageRoot = dirname(packageRoot);
@@ -2033,89 +2227,103 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     return loadCatalog(join(packageRoot, CATALOG_PATH));
   };
 
-  const routeRequest = async (params: SpecLaunchRequest, signal: AbortSignal, ctx: ExtensionContext): Promise<{ catalog?: Catalog; records: SpecRouteRecord[] }> => {
+  /**
+   * One Task, one routing decision (ADR-037): the runtime minted `launchId`
+   * binds the evaluation, and the emitted decision's generated chain is the
+   * only fallback order the execution loop may consume.
+   */
+  const routeTaskOnce = async (params: NormalizedLaunchTask, task: RoutingTask, launchId: string, signal: AbortSignal, ctx: ExtensionContext, recovery?: RecoveryContext): Promise<{ catalog?: Catalog; record: TaskRouteRecord }> => {
     const root = deps.cwd ?? ctx.cwd;
     let catalog: Catalog;
     try {
       catalog = await loadLaunchCatalog();
     } catch {
       return {
-        records: params.specs.map((spec) => ({ spec, decision: { kind: "abstained", reason: "catalog_unavailable", component: "catalog" }, state: { status: "unavailable", reason: "catalog_unavailable" } }))
+        record: { task, decision: { kind: "abstained", reason: "catalog_unavailable", component: "catalog" }, state: { status: "unavailable", reason: "catalog_unavailable" } }
       };
     }
 
-    const records: SpecRouteRecord[] = [];
-    const bypassRequested = params.transportBypass !== undefined;
-    const bypass = bypassRequested ? parseBypassToken(params.transportBypass!) : undefined;
-    const retain = async (spec: LaunchSpec, state: RouterState, binding: RouterBinding, decision: SpecDecision, response?: SpecModelDecision): Promise<void> => {
-      const record: SpecRouteRecord = { spec, decision, ...(response === undefined ? {} : { response }), state, binding };
-      if (decision.kind === "abstained" && decision.reason === "transport_failed") {
-        record.bypassConfiguration = await transportBypassConfiguration(spec, catalog);
-      }
-      records.push(record);
-    };
-
-    for (const spec of params.specs) {
-      const state = specRouterState(spec, catalog);
-      const binding = launchBinding(params.name, spec, state);
-      if (bypassRequested) {
-        const decision = bypass === undefined
-          ? { kind: "abstained" as const, reason: "invalid_response" as const, component: "bypass" }
-          : await routeSpec({ spec, catalog, response: undefined, root, binding, bypass });
-        await retain(spec, state, binding, decision);
-        continue;
-      }
-
-      let evaluation: Awaited<ReturnType<TypeSafeSpecClient["evaluate"]>>;
-      const timeoutController = new AbortController();
-      let timeout: ReturnType<typeof setTimeout> | undefined;
+    // A recovery's start preference lifts one tier over the prior route (max
+    // stays max); the model request still sees the caller's raw Task and tier.
+    const routingTask: RoutingTask = recovery === undefined ? task : { ...task, tier: maxTier(params.tier, nextTier(recovery.priorRouteTier)) };
+    const state = taskRouterState(routingTask, catalog);
+    const binding = launchBinding(launchId, state);
+    // The compiled contract label is runtime-owned; the caller's label is
+    // display metadata that never enters routing contracts or evidence.
+    const spec = { label: "task", count: params.replicas };
+    const workspaceState = recovery?.workspaceState;
+    let evaluation: Awaited<ReturnType<TypeSafeSpecClient["evaluate"]>>;
+    const timeoutController = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      evaluation = await Promise.race([
+        specClient.evaluate({ task, catalog, ...(workspaceState === undefined ? {} : { workspaceState }) }, AbortSignal.any([signal, timeoutController.signal])),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            const reason = new DOMException("Task evaluation timed out", "TimeoutError");
+            timeoutController.abort(reason);
+            reject(reason);
+          }, SPEC_EVALUATION_TIMEOUT_MS);
+        }),
+      ]);
+    } catch {
+      evaluation = timeoutController.signal.aborted && !signal.aborted
+        ? { kind: "abstained", reason: "transport_failed", component: "evaluation" }
+        : { kind: "abstained", reason: signal.aborted ? "aborted" : "transport_failed", component: "transport" };
+    } finally {
+      clearTimeout(timeout);
+    }
+    let decision: SpecDecision;
+    let response: TaskModelDecision | undefined;
+    if (evaluation.kind === "response") {
+      response = evaluation.response;
       try {
-        evaluation = await Promise.race([
-          specClient.evaluate({ spec, catalog, team: params.specs }, AbortSignal.any([signal, timeoutController.signal])),
-          new Promise<never>((_, reject) => {
-            timeout = setTimeout(() => {
-              const reason = new DOMException("Spec evaluation timed out", "TimeoutError");
-              timeoutController.abort(reason);
-              reject(reason);
-            }, SPEC_EVALUATION_TIMEOUT_MS);
-          }),
-        ]);
+        decision = await routeTask({ task: routingTask, spec, catalog, response: evaluation.response, root, availability: availabilityGate, ...(workspaceState === undefined ? {} : { workspaceState }), ...(recovery === undefined ? {} : { recovery: { priorOperatingPointId: recovery.priorOperatingPointId } }) });
       } catch {
-        evaluation = timeoutController.signal.aborted && !signal.aborted
-          ? { kind: "abstained", reason: "transport_failed", component: "evaluation" }
-          : { kind: "abstained", reason: signal.aborted ? "aborted" : "transport_failed", component: "transport" };
-      } finally {
-        clearTimeout(timeout);
+        decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
       }
-      let decision: SpecDecision;
-      if (evaluation.kind === "response") {
-        try {
-          decision = await routeSpec({ spec, catalog, response: evaluation.response, root, binding, launched: params.specs.map((member) => member.label), ...(deps.availability === undefined ? {} : { availability: deps.availability }) });
-        } catch {
-          decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
-        }
-        await retain(spec, state, binding, decision, evaluation.response);
-        continue;
-      }
+    } else {
       decision = evaluation;
-      await retain(spec, state, binding, decision);
     }
-    const launched = records.filter((record) => isAdmitted(record.decision)).map((record) => record.spec.label).sort().join("\0");
-    for (const record of records) {
-      if (!isAdmitted(record.decision) || record.decision.advisory === undefined) continue;
-      record.decision = { ...record.decision, advisory: { ...record.decision.advisory, diverged: [...record.decision.advisory.assessed].sort().join("\0") !== launched } };
-    }
-    return { catalog, records };
+    return {
+      catalog,
+      record: {
+        task: routingTask,
+        decision,
+        ...(response === undefined ? {} : { response }),
+        state,
+        binding,
+        ...(catalog.catalogRevision === undefined ? {} : { catalogRevision: catalog.catalogRevision }),
+        ...(recovery === undefined ? {} : { recoveryOf: recovery.runId, priorOperatingPointId: recovery.priorOperatingPointId })
+      }
+    };
   };
 
-  const executeSingle = async (
-    params: SpecLaunchRequest,
-    routed: SpecRouteRecord,
+  /**
+   * Everything the sibling children of one launch share: the admitted decision,
+   * the resolved catalog, the canonical working directory, the classified
+   * workload intent, and the minted launch identity.
+   */
+  interface LaunchShared {
+    launchId: string;
+    catalog: Catalog;
+    resolvedCwd: string;
+    intent: WorkloadIntent;
+    replicas: number;
+    specLabel: string;
+    /** Prior-run lineage when this launch is a recovery (ADR-037). */
+    recovery?: RecoveryContext;
+  }
+
+  const executeChild = async (
+    params: NormalizedLaunchTask,
+    routed: TaskRouteRecord & { decision: AdmittedSpecDecision },
+    shared: LaunchShared,
+    childName: string,
     signal: AbortSignal,
-    onUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined,
-    ctx: ExtensionContext,
-    batch: LaunchBatchContext
-  ): Promise<AgentToolResult<LaunchDetails>> => {
+    onUpdate: AgentToolUpdateCallback<LaunchResult> | undefined,
+    ctx: ExtensionContext
+  ): Promise<LaunchDetails> => {
     const abortSignal = signal;
     let launchGate: LaunchGateLease | undefined;
     try {
@@ -2126,24 +2334,19 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       throw new LaunchError("LAUNCH_FROZEN", "Launch is frozen");
     }
 
-    const requestedDelivery: MessageDelivery = params.assignmentDelivery === "attachment" ? "attachment" : "inline";
     const attachmentStore = deps.attachments ?? defaultAttachmentStore;
     const handoffs = deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({}));
     const clock = deps.clock ?? realLaunchClock;
-    const spec = routed.spec;
-    const decision = routed.decision as Extract<SpecDecision, { kind: "admitted" }>;
-    let assignmentText = specPayload(spec);
+    const decision = routed.decision;
+    const task = routed.task;
+    let assignmentText = renderTask(task);
     let promptText: string | undefined;
-    let cwd: string;
     let launchCwd: string | undefined;
-    let placement: LaunchPlacement;
-    let label: string;
+    let topology: LaunchTopologyEvidence | undefined;
     let recipientKey: string | undefined;
     let grant: RecipientGrant | undefined;
     let published: PublishedAttachment | undefined;
     let sender: SenderIdentity | undefined;
-    let existingTarget: ResolvedTarget | undefined;
-    let workspaceId: string | undefined;
     let contextDiagnostics: ContextResolutionDiagnostics | undefined;
     let effectiveContext: CurrentContext | undefined;
     let topologyBaseline: HerdrSnapshot | undefined;
@@ -2153,8 +2356,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     let phase: LaunchPhase = "validate";
     let prepared: Awaited<ReturnType<WorktreeManager["prepare"]>> | undefined;
     let worktreeBound = false;
-    const worktreeCount = batch.worktreeCount ?? spec.count!;
-    let chainCandidates: ResolvedCandidate[] = [];
+    let chainCandidates: ResolvedPoint[] = [];
     const created: LaunchResourceIds = {};
     const attempts: LaunchAttemptEvidence[] = [];
     const contracts = new Map<string, CompiledContract>();
@@ -2163,81 +2365,76 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       topologyMutationDispatched = true;
       return operation();
     };
+    const tick = (next: LaunchPhase): void => progress(onUpdate, shared.launchId, childName, next, params.tier);
 
+    // The delivery the runtime selected for this child's rendered payload.
+    let delivery: MessageDelivery | undefined;
     try {
-      validateParams(params);
-      assignmentText = specPayload(spec);
-      assertMessageText(assignmentText);
-      assertDeliverySize(assignmentText, requestedDelivery);
-      cwd = params.cwd ?? deps.cwd ?? ctx.cwd;
-      identifier(cwd, "cwd");
-      placement = params.placement!;
-      label = params.label ?? params.name;
-      phase = "route_spec";
-      const catalog = batch.catalog;
-      const chain = resolveChain(catalog, decision.category).chain.map((candidate, index): ResolvedCandidate => ({
-        index,
-        candidate,
-        runner: catalog.runners.get(candidate.runner)!
-      }));
-      const selectedIndex = decision.evidence!.selectedCandidate!.index;
-      const availability = new Map(decision.evidence.availability?.map((entry) => [entry.index, entry.status]));
+      phase = "compile";
+      const catalog = shared.catalog;
+      const pointById = new Map(catalog.points!.map((point) => [point.id, point]));
+      // The attempt loop may only consume the decision's generated chain.
+      const chain = decision.chain.map((id, index): ResolvedPoint => {
+        const point = pointById.get(id)!;
+        return { index, point, runner: catalog.runners.get(point.runner)! };
+      });
+      const selectedIndex = decision.selectedPoint.index;
+      const availability = new Map(decision.evidence.availability?.map((entry) => [entry.id, entry.status]));
+      // The router already excluded the failed prior point and ranked a
+      // different provider first on recovery routes — the emitted chain is
+      // the recovery order, so the attempt loop consumes it verbatim.
       chainCandidates = chain.filter((candidate) => {
+        /* c8 ignore next -- admitted decisions place the selected point at chain head; the guard refuses a foreign decision whose head moved. */
         if (candidate.index < selectedIndex) return false;
-        const status = availability.get(candidate.index);
+        const status = availability.get(candidate.point.id);
         return candidate.index === selectedIndex || (status !== "known-exhausted" && status !== "local-capacity-limited");
       });
 
-      const contractFor = async (resolved: ResolvedCandidate): Promise<CompiledContract> => {
-        const key = resolvedCandidateKey(resolved);
+      const contractFor = async (resolved: ResolvedPoint): Promise<CompiledContract> => {
+        const key = resolvedPointKey(resolved);
         const selected = decision.configuration;
-        if (candidateKey(selected.candidate) === key) {
+        if (selected.candidate.id === resolved.point.id) {
           contracts.set(key, selected);
           return selected;
         }
+        /* c8 ignore next -- admitted decisions always carry the evaluation response; the fallback exists so a foreign record cannot crash compile. */
         const selection = routed.response === undefined
           ? allReviewedResources(resolved)
-          : candidateResourceSelection(routed.response, chain.map((candidate) => candidate.candidate), resolved.index);
-        const compiled = await compileCandidateContract(catalog, spec, resolved, selection);
+          : runnerResourceSelection(routed.response, resolved.point.runner);
+        const compiled = await compileCandidateContract(catalog, { label: shared.specLabel }, resolved, selection);
         contracts.set(key, compiled);
         return compiled;
       };
 
       // Compile and prepare before handoff, topology, or agent start. A typed
       // pre-spawn refusal records exactly one candidate and moves to the next.
-      phase = "compile";
-      let replicaPrepared = worktreeCount <= 1;
+      let replicaPrepared = shared.replicas <= 1;
       for (const candidate of chainCandidates) {
-        const identity = resolvedCandidateIdentity(candidate);
+        const identity = resolvedPointIdentity(candidate);
         let contract: CompiledContract;
         try {
           contract = await contractFor(candidate);
         } catch (error) {
-          attempts.push({ candidate: identity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+          attempts.push({ point: identity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
           continue;
         }
         if (!replicaPrepared) {
-          if (worktrees === undefined) {
-            contracts.delete(resolvedCandidateKey(candidate));
-            attempts.push({ candidate: identity, outcome: "agent_start_failed", errorCode: "WORKTREE_UNAVAILABLE", message: "Replica worktree manager is unavailable" });
-            continue;
-          }
           try {
-            prepared = await worktrees.prepare({ childName: params.name, cwd, count: worktreeCount, signal: abortSignal });
+            prepared = await worktrees!.prepare({ childName, cwd: shared.resolvedCwd, count: shared.replicas, signal: abortSignal });
             replicaPrepared = true;
           } catch (error) {
-            contracts.delete(resolvedCandidateKey(candidate));
-            attempts.push({ candidate: identity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+            contracts.delete(resolvedPointKey(candidate));
+            attempts.push({ point: identity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
             continue;
           }
         }
-        contracts.set(resolvedCandidateKey(candidate), contract);
-        launchCwd = prepared?.cwd ?? cwd;
+        contracts.set(resolvedPointKey(candidate), contract);
+        launchCwd = prepared?.cwd ?? shared.resolvedCwd;
       }
-      const initialCandidate = chainCandidates.find((candidate) => contracts.has(resolvedCandidateKey(candidate)));
-      const initialContract = initialCandidate === undefined ? undefined : contracts.get(resolvedCandidateKey(initialCandidate));
+      const initialCandidate = chainCandidates.find((candidate) => contracts.has(resolvedPointKey(candidate)));
+      const initialContract = initialCandidate === undefined ? undefined : contracts.get(resolvedPointKey(initialCandidate));
       if (initialCandidate === undefined || initialContract === undefined) {
-        throw new LaunchError("SPEC_NO_USABLE_CANDIDATE", "No spec chain candidate could be prepared", { attempts });
+        throw new LaunchError("SPEC_NO_USABLE_CANDIDATE", "No task chain candidate could be prepared", { attempts });
       }
       const initialRuntime = initialContract.runtime;
 
@@ -2247,72 +2444,79 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       topologyBaseline = snapshot;
       effectiveContext = effective.context;
       sender = resolveSender(snapshot, effective.context.paneId);
-      const nameTaken = existingNameTargets(snapshot).has(params.name) || batch.reservedNames.has(params.name);
-      if (nameTaken) throw new LaunchError("BATCH_NAME_COLLISION", `Agent name is already in use: ${params.name}`);
-      if (label !== params.name && (existingNameTargets(snapshot).has(label) || batch.reservedNames.has(label))) {
-        throw new LaunchError("BATCH_NAME_COLLISION", `Pane label is already in use: ${label}`);
+      if (mintedNameTaken(snapshot, childName)) {
+        throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Minted child identity collides with an existing pane or agent", { childName });
       }
-      existingTarget = placement.mode === "existing_pane" ? paneForPlacement(snapshot, placement.target, effective.context) : undefined;
-      workspaceId = placement.mode === "new_tab" ? effective.context.workspaceId : undefined;
 
       handoffRun = await handoffs.allocate();
       assignmentText += renderHandoffContract(handoffRun);
       assertMessageText(assignmentText);
-      assertDeliverySize(assignmentText, requestedDelivery);
-      const managedSpec: LaunchSpec = { ...spec, instructions: `${spec.instructions}${renderHandoffContract(handoffRun)}` };
-      if (requestedDelivery === "inline") {
-        promptText = renderSpecInstructions(sender, managedSpec, requestedDelivery);
+      // Delivery is runtime-owned (D14): the rendered Task plus contract is
+      // measured once; inline up to 16 KiB, attachment to 1 MiB, else reject.
+      delivery = utf8Bytes(assignmentText) <= MESSAGE_INLINE_MAX_BYTES ? "inline" : "attachment";
+      assertDeliverySize(assignmentText, delivery);
+      if (delivery === "inline") {
+        promptText = renderTaskInstructions(sender, assignmentText, "inline");
         assertMessageText(promptText);
       }
 
       phase = "handoff";
-      progress(onUpdate, phase, created);
+      tick(phase);
+      // The run's route and managed workspace are the lineage a later
+      // recovery resolves against this record.
+      const recordWorktree = prepared?.worktreePath ?? shared.recovery?.resumedWorktree;
       await handoffs.persist(handoffRun, {
         manager: { paneId: sender.paneId, display: sender.display, source: sender.source },
         child: {
-          agentName: params.name,
+          agentName: childName,
           agentKind: initialRuntime.kind,
-          candidateName: initialContract.candidate.model,
-          specLabel: spec.label,
-          fallbackCandidates: chainCandidates.slice(1).map((candidate) => candidate.candidate.model)
+          operatingPointId: initialContract.candidate.id,
+          specLabel: shared.specLabel,
+          fallbackCandidates: chainCandidates.slice(1).map((candidate) => candidate.point.id),
+          route: {
+            tier: decision.effectiveStartTier!,
+            operatingPointId: initialContract.candidate.id,
+            policyRevision: POLICY_REVISION,
+            workload: decision.evidence.workload!
+          },
+          workspace: {
+            resolvedCwd: launchCwd!,
+            ...(recordWorktree === undefined ? {} : { worktree: recordWorktree })
+          }
         }
       });
       recipientKey = mintRecipientKey();
       grant = await attachmentStore.ensureRecipient(recipientKey);
-      if (requestedDelivery === "attachment") {
+      if (delivery === "attachment") {
         phase = "attachment_publish";
-        progress(onUpdate, phase, created);
+        tick(phase);
         published = await attachmentStore.publish({
           body: assignmentText,
           recipientKey,
-          ...(existingTarget?.paneId ? { recipientPaneId: existingTarget.paneId } : {}),
-          recipientAgentName: params.name,
+          recipientAgentName: childName,
           senderPaneId: sender.paneId,
           senderDisplay: sender.display,
           operation: "assignment"
         });
-        promptText = renderSpecInstructions(sender, managedSpec, "attachment", { ...published, encoding: "utf-8" });
+        promptText = renderTaskInstructions(sender, assignmentText, "attachment", { ...published, encoding: "utf-8" });
         assertMessageText(promptText);
       }
 
       // Keep this reservation allowlist and serialization unchanged from R3,
-      // extended by ADR-036 W0 with the bounded digest flag and the typed
-      // policy/workspace facts below — all derived, never prose.
+      // now built from the canonical Task rather than a caller digest.
       phase = "supervision_reserve";
-      progress(onUpdate, phase, created);
+      tick(phase);
       try {
         const supervisionDigest = modelSafeJson({
-          doneWhen: params.supervisionDigest.doneWhen,
-          constraints: params.supervisionDigest.constraints,
-          // ADR-036 W0: the bounded readOnly claim, absent means false.
-          readOnly: params.supervisionDigest.readOnly === true
-        }) as { doneWhen: string[]; constraints: string[]; readOnly: boolean };
+          doneWhen: task.doneWhen,
+          constraints: task.constraints
+        }) as { doneWhen: string[]; constraints: string[] };
         reservation = await deps.supervision.reserve({
-          child: { agentName: params.name, agentKind: initialRuntime.kind, candidateName: initialContract.candidate.model },
+          child: { agentName: childName, agentKind: initialRuntime.kind, operatingPointId: initialContract.candidate.id },
           settings: {
             supervisionDigest,
             forbiddenTools: supervisionForbiddenTools(contracts),
-            workspaceRoot: supervisionWorkspaceRoot(placement, existingTarget, launchCwd)
+            workspaceRoot: supervisionWorkspaceRoot(launchCwd)
           }
         });
       } catch (error) {
@@ -2321,11 +2525,11 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         });
       }
     } catch (error) {
-      const failure = withDeliveryFailureEvidence(error, { delivery: requestedDelivery, phase, published, handoffRunId: handoffRun?.runId });
+      const failure = withDeliveryFailureEvidence(error, { delivery, phase, published, handoffRunId: handoffRun?.runId });
       try {
         await grant?.release();
         reservation?.release("launch_precondition_failed");
-        if (prepared !== undefined && !worktreeBound) await worktrees?.release(params.name);
+        if (prepared !== undefined && !worktreeBound) await worktrees?.release(childName);
       } finally {
         await launchGate?.release();
       }
@@ -2350,13 +2554,29 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     const timing: LaunchTimingEvidence = {};
 
     try {
+      // Runtime-owned workload-tab topology (D12): classify first, then reuse a
+      // matching tab under the pane cap or create the next grammar label. Panes
+      // are created by right-split only; existing panes are never closed,
+      // replaced, or moved.
       phase = "placement";
-      progress(onUpdate, phase, created);
-      if (placement.mode === "existing_pane") {
-        paneId = existingTarget!.paneId!;
-        tabId = existingTarget!.tabId;
-      } else if (placement.mode === "new_tab") {
-        const result = tabRefFrom(await dispatchMutation(() => run(deps.cli, ["tab", "create", "--workspace", workspaceId!, "--cwd", launchCwd!, "--label", placement.tabLabel, ...noFocusArgs()], abortSignal, true)));
+      tick(phase);
+      const workspaceId = effectiveContext!.workspaceId;
+      if (typeof workspaceId !== "string" || workspaceId.length === 0) {
+        throw new LaunchError("WORKSPACE_UNAVAILABLE", "Caller workspace is unavailable for workload topology");
+      }
+      const tabChoice = selectWorkloadTab(topologyBaseline!, workspaceId, shared.intent);
+      if (tabChoice.reuse !== undefined) {
+        const reuse = tabChoice.reuse;
+        const result = paneRefFrom(await dispatchMutation(() => run(deps.cli, ["pane", "split", reuse.anchorPaneId, "--direction", "right", ...noFocusArgs(), "--cwd", launchCwd!], abortSignal, true)));
+        paneId = result.paneId;
+        tabId = result.tabId ?? reuse.tabId;
+        created.paneId = paneId;
+        created.tabId = tabId;
+        deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
+        topology = { intent: shared.intent, tabId: tabId!, tabLabel: reuse.tabLabel, reused: true, layoutUnverified: true };
+      } else {
+        const tabLabel = tabChoice.create!.tabLabel;
+        const result = tabRefFrom(await dispatchMutation(() => run(deps.cli, ["tab", "create", "--workspace", workspaceId, "--cwd", launchCwd!, "--label", tabLabel, ...noFocusArgs()], abortSignal, true)));
         tabId = result.tabId;
         paneId = result.paneId;
         created.tabId = tabId;
@@ -2364,23 +2584,19 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         if (!paneId) paneId = paneRefFrom(await run(deps.cli, ["tab", "get", tabId], abortSignal)).paneId;
         created.paneId = paneId;
         deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
-      } else {
-        const result = paneRefFrom(await dispatchMutation(() => run(deps.cli, ["pane", "split", "--current", "--direction", "right", ...noFocusArgs(), "--cwd", launchCwd!], abortSignal, true)));
-        paneId = result.paneId;
-        tabId = result.tabId ?? effectiveContext!.tabId;
-        created.paneId = paneId;
-        created.tabId = tabId;
-        deps.ownership?.record({ kind: "pane", id: paneId!, parentId: tabId });
+        topology = { intent: shared.intent, tabId: tabId!, tabLabel, reused: false };
       }
       const resolvedPaneId = paneId!;
-      if (prepared !== undefined && worktreeCount > 1) {
-        worktrees!.bindPane(params.name, resolvedPaneId);
+      if (prepared !== undefined && shared.replicas > 1) {
+        worktrees!.bindPane(childName, resolvedPaneId);
         worktreeBound = true;
       }
-      if (placement.mode !== "existing_pane") await dispatchMutation(() => run(deps.cli, ["pane", "rename", resolvedPaneId, label], abortSignal));
+      // Pane identity stays runtime-minted: the caller's label is
+      // display-only metadata and never renames the pane.
+      await dispatchMutation(() => run(deps.cli, ["pane", "rename", resolvedPaneId, childName], abortSignal));
 
       phase = "agent_start";
-      progress(onUpdate, phase, created);
+      tick(phase);
       // The pre-mutation compile loop retained each usable contract for the
       // attempt machinery; no candidate is rebuilt or duplicated here.
       const attemptCandidates = [...contracts.keys()];
@@ -2388,17 +2604,32 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       let startedAgent: StartedAgent | undefined;
       for (const candidate of attemptCandidates) {
         const contract = contracts.get(candidate)!;
-        const candidateIdentityValue = candidateIdentity(contract.candidate);
+        const attemptIdentity = pointIdentity(contract.candidate);
         await launchGate!.check();
+        // Availability is re-probed immediately before every start attempt
+        // across the whole fallback loop (ADR-037): a changed status skips the
+        // point without another Jev request, and a probe that cannot answer
+        // fails closed the same way.
+        const resolved = chainCandidates.find((entry) => entry.point.id === candidate)!;
+        try {
+          const probe = await availabilityGate({ runner: contract.candidate.runner, model: contract.candidate.model }, resolved.runner, { root: deps.cwd ?? ctx.cwd });
+          if (probe.status === "known-exhausted" || probe.status === "local-capacity-limited") {
+            attempts.push({ point: attemptIdentity, outcome: "skipped_unavailable", errorCode: "CANDIDATE_UNAVAILABLE", message: `availability re-probe: ${probe.status}` });
+            continue;
+          }
+        } catch {
+          attempts.push({ point: attemptIdentity, outcome: "skipped_unavailable", errorCode: "AVAILABILITY_UNAVAILABLE", message: "availability re-probe failed closed" });
+          continue;
+        }
         let promptPath: string | undefined;
         let startArgs: string[];
         try {
           if (contract.runtime.kind !== "agy" && contract.runtime.kind !== "devin") {
             promptPath = (await (deps.promptSources ?? defaultPromptSourceStore).create(promptText!)).path;
           }
-          startArgs = ["agent", "start", params.name, "--kind", contract.runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...contractArgv(contract, promptPath, grant!.path, handoffRun!.directory)];
+          startArgs = ["agent", "start", childName, "--kind", contract.runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...contractArgv(contract, promptPath, grant!.path, handoffRun!.directory)];
         } catch (error) {
-          attempts.push({ candidate: candidateIdentityValue, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+          attempts.push({ point: attemptIdentity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
           continue;
         }
         const attemptStartedAt = clock.now();
@@ -2411,25 +2642,25 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
             } catch (startError) {
               const envelope = cliErrorEnvelope(startError);
               const shellPending = envelope?.id === "cli:agent:start" && envelope.error.code === "agent_pane_busy";
-              if (!shellPending || placement.mode === "existing_pane" || clock.now() >= shellSettleDeadline || abortSignal.aborted) throw startError;
+              if (!shellPending || clock.now() >= shellSettleDeadline || abortSignal.aborted) throw startError;
               await waitForAgentStartSettle(abortSignal, AGENT_PANE_SHELL_POLL_MS);
             }
           }
           agentStarted = true;
-          attempts.push({ candidate: candidateIdentityValue, outcome: "selected" });
+          attempts.push({ point: attemptIdentity, outcome: "selected" });
           selectedAttemptStartedAt = attemptStartedAt;
           chosenContract = contract;
-          startedAgent = agentIdentity(started, params.name, resolvedPaneId, contract.runtime.kind);
+          startedAgent = agentIdentity(started, childName, resolvedPaneId, contract.runtime.kind);
           break;
         } catch (error) {
           const envelope = cliErrorEnvelope(error);
-          await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(contract.candidate, chainCandidates.find((resolved) => resolvedCandidateKey(resolved) === candidate)!.runner, {
+          await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(contract.candidate, resolved.runner, {
             code: launchTransportCode(error),
             ...(envelope === undefined ? {} : { causeCode: envelope.error.code })
           }, { root: deps.cwd ?? ctx.cwd });
           const eligible = startFailureEvidence(error);
           if (!eligible) {
-            attempts.push({ candidate: candidateIdentityValue, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+            attempts.push({ point: attemptIdentity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
             throw error;
           }
           let failedPane: Record<string, unknown>;
@@ -2439,41 +2670,46 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
             throw new LaunchError("POSTSTATE_UNAVAILABLE", "Fallback eligibility could not be proven from authoritative pane state", { causeCode: "POSTSTATE_UNAVAILABLE", startFailureCode: eligible.code, readError: readError instanceof Error ? readError.message : String(readError), attempts });
           }
           if (!noAgentFromPane(failedPane)) {
-            attempts.push({ candidate: candidateIdentityValue, outcome: "fallback_refused", errorCode: eligible.code, message: "authoritative pane still reports an agent", postState: compactAttemptState(failedPane) });
+            attempts.push({ point: attemptIdentity, outcome: "fallback_refused", errorCode: eligible.code, message: "authoritative pane still reports an agent", postState: compactAttemptState(failedPane) });
             throw new LaunchError("LAUNCH_FAILED", "Automatic fallback refused because the failed pane still has an agent", { causeCode: eligible.code, attempts });
           }
-          attempts.push({ candidate: candidateIdentityValue, outcome: "agent_start_failed", errorCode: eligible.code, message: eligible.message, postState: compactAttemptState(failedPane) });
+          attempts.push({ point: attemptIdentity, outcome: "agent_start_failed", errorCode: eligible.code, message: eligible.message, postState: compactAttemptState(failedPane) });
         }
       }
       if (chosenContract === undefined || startedAgent === undefined || selectedAttemptStartedAt === undefined) {
-        throw new LaunchError("LAUNCH_FAILED", "Spec fallback chain exhausted after agent start failure", { attempts });
+        throw new LaunchError("LAUNCH_FAILED", "Task fallback chain exhausted after agent start failure", { attempts });
       }
       const chosenRuntime = chosenContract.runtime;
-      await handoffs.selectCandidate(handoffRun!, chosenContract.candidate.model, chosenRuntime.kind);
+      // The N4 amendment's runtime-resolved-model record is committed to the
+      // durable run state alongside the started point, then mirrored into the
+      // launch evidence below. No post-start readback carries a model field,
+      // so the degraded fact is recorded — never a fabricated id.
+      const resolvedModel: LaunchResolvedModel = { available: false, reason: "no-readback-seam", ...(shared.catalog.catalogRevision === undefined ? {} : { catalogRevision: shared.catalog.catalogRevision }) };
+      await handoffs.selectCandidate(handoffRun!, chosenContract.candidate.id, chosenRuntime.kind, resolvedModel);
       const chosenAgent = startedAgent;
       let agentId = chosenAgent.agentId;
       if (agentId) created.agentId = agentId;
       phase = "ready";
-      progress(onUpdate, phase, created);
+      tick(phase);
       await grant?.renew();
-      const ready = await waitForLaunchReadiness(deps.cli, resolvedPaneId, abortSignal, params.name, chosenRuntime.kind, chosenAgent, selectedAttemptStartedAt, true, clock, chosenRuntime.kind === "agy");
+      const ready = await waitForLaunchReadiness(deps.cli, resolvedPaneId, abortSignal, childName, chosenRuntime.kind, chosenAgent, selectedAttemptStartedAt, true, clock, chosenRuntime.kind === "agy");
       readiness = ready.evidence;
       timing.selectedStartReadinessMs = readiness.elapsedMs;
       let capturedIdentity = ready.identity;
       agentId ??= idFrom(ready.agent, "agent_id") ?? idFrom(ready.agent, "id") ?? idFrom(ready.pane, "agent_id");
 
       phase = "supervision_bind";
-      progress(onUpdate, phase, created);
+      tick(phase);
       try {
         if (chosenRuntime.kind === "agy") {
           const provisionalIdentity = capturedIdentity as ProvisionalSupervisedIdentity;
           const provisionalBaseline = { ...ready.baseline!, state: "idle" as const };
-          await reservation!.bindProvisional({ identity: provisionalIdentity, candidateName: chosenContract.candidate.model, baseline: provisionalBaseline });
-          boundSupervision = { jobId: reservation!.jobId, state: "provisional", provisional: { ...provisionalIdentity, profileName: chosenContract.candidate.model, baseline: provisionalBaseline } };
+          await reservation!.bindProvisional({ identity: provisionalIdentity, operatingPointId: chosenContract.candidate.id, baseline: provisionalBaseline });
+          boundSupervision = { jobId: reservation!.jobId, state: "provisional", provisional: { ...provisionalIdentity, operatingPointId: chosenContract.candidate.id, baseline: provisionalBaseline } };
         } else {
           const exactIdentity = capturedIdentity as PromptTargetIdentity;
-          await reservation!.bind({ identity: exactIdentity, candidateName: chosenContract.candidate.model, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
-          boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: exactIdentity.agentName, agentKind: exactIdentity.agentKind, paneId: resolvedPaneId, terminalId: exactIdentity.terminalId, profileName: chosenContract.candidate.model } };
+          await reservation!.bind({ identity: exactIdentity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
+          boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: exactIdentity.agentName, agentKind: exactIdentity.agentKind, paneId: resolvedPaneId, terminalId: exactIdentity.terminalId, operatingPointId: chosenContract.candidate.id } };
         }
       } catch (error) {
         if (!(error instanceof SupervisionBindError)) throw error;
@@ -2481,12 +2717,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       }
       supervisionBound = true;
       if (chosenRuntime.kind !== "agy") {
-        provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, (capturedIdentity as PromptTargetIdentity).agentSession, abortSignal, /^(?:manager|planner)(?:-|$)/u.test(spec.label) ? "orchestrator" : undefined);
-      }
-      if (params.focus === true) {
-        phase = "focus";
-        progress(onUpdate, phase, created);
-        await dispatchMutation(() => run(deps.cli, ["agent", "focus", resolvedPaneId], abortSignal));
+        provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, (capturedIdentity as PromptTargetIdentity).agentSession, abortSignal);
       }
       if (agentId) created.agentId = agentId;
 
@@ -2498,7 +2729,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       const baseline = ready.baseline!;
       const envelope = promptText!;
       phase = "prompt_verification";
-      progress(onUpdate, phase, created);
+      tick(phase);
       const promptSubmissionStartedAt = clock.now();
       try {
         let promptResponse: JsonEnvelope;
@@ -2546,10 +2777,10 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           capturedIdentity = confirmed.identity;
           agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
           phase = "supervision_bind";
-          progress(onUpdate, phase, created);
-          await reservation!.strengthen({ identity: confirmed.identity, candidateName: chosenContract.candidate.model, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
-          boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, profileName: chosenContract.candidate.model } };
-          provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, confirmed.identity.agentSession, abortSignal, /^(?:manager|planner)(?:-|$)/u.test(spec.label) ? "orchestrator" : undefined);
+          tick(phase);
+          await reservation!.strengthen({ identity: confirmed.identity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
+          boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, operatingPointId: chosenContract.candidate.id } };
+          provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, confirmed.identity.agentSession, abortSignal);
           phase = "prompt_verification";
         } else {
           const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt);
@@ -2572,38 +2803,51 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       if (agentId) created.agentId = agentId;
       const exactIdentity = capturedIdentity as PromptTargetIdentity;
       const capability = recipientCapability(chosenRuntime.kind);
-      const recipient = { recipientKey: recipientKey!, paneId: resolvedPaneId, agentName: exactIdentity.agentName, ...(agentId ? { agentId } : {}), profileName: chosenContract.candidate.model, kind: capability.kind, capable: capability.capable, reason: capability.reason };
-      deps.recipients?.recordFor(chosenContract.candidate.model, resolvedPaneId, recipient.recipientKey, capability, { ...exactIdentity, ...(agentId ? { agentId } : {}) }, chosenRuntime.kind === "agy" ? { agyStrengthened: true, attachmentDirectory: grant!.path } : undefined);
+      const recipient = { recipientKey: recipientKey!, paneId: resolvedPaneId, agentName: exactIdentity.agentName, ...(agentId ? { agentId } : {}), operatingPointId: chosenContract.candidate.id, kind: capability.kind, capable: capability.capable, reason: capability.reason };
+      deps.recipients?.recordFor(chosenContract.candidate.id, resolvedPaneId, recipient.recipientKey, capability, { ...exactIdentity, ...(agentId ? { agentId } : {}) }, chosenRuntime.kind === "agy" ? { agyStrengthened: true, attachmentDirectory: grant!.path } : undefined);
       recipientRegistered = deps.recipients !== undefined;
       const launchDetails: LaunchDetails = {
-        operation: "launch", outcome: "launched", name: exactIdentity.agentName, kind: chosenRuntime.kind, placement, tabId, paneId: resolvedPaneId,
+        operation: "launch", outcome: "launched", launchId: shared.launchId, name: exactIdentity.agentName, kind: chosenRuntime.kind, topology, tabId, paneId: resolvedPaneId,
+        ...(prepared?.worktreePath === undefined ? {} : { worktree: prepared.worktreePath }),
         ...contextRebindingDetails(contextDiagnostics!),
         ...(agentId ? { agentId } : {}),
         postState: boundAgentSessionStrings(modelSafeJson(postState)) as Record<string, unknown>,
         agentStarted, initialPromptSent: true, promptSubmitted, recipientRegistered, readiness,
-        promptConsumption: "confirmed", promptDispatch: promptDispatch!, assignmentState: assignmentState!, initialPromptDelivery: requestedDelivery,
+        promptConsumption: "confirmed", promptDispatch: promptDispatch!, assignmentState: assignmentState!, initialPromptDelivery: delivery,
         initialPromptSubmission: compactPromptSubmission(initialPromptSubmission!),
         initialPromptObservation: initialPromptObservation!,
         promptConfirmation: promptConfirmation!,
         timing, identityProvenance: "launched", ...(provenanceWarning === undefined ? {} : { provenanceWarning }),
         sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
-        envelope: { version: "v1" as const, kind: "assignment" as const, delivery: requestedDelivery },
+        envelope: { version: "v1" as const, kind: "assignment" as const, delivery: delivery! },
         ...(published ? { attachment: published } : {}),
         handoff: { runId: handoffRun!.runId, path: handoffRun!.artifactPath }, recipient, effectCertainty: "confirmed",
         supervision: boundSupervision!,
-        spec: {
-          label: spec.label,
-          category: decision.category,
-          count: spec.count!,
+        task: {
+          ...(params.label === undefined ? {} : { label: params.label }),
+          replicas: shared.replicas,
           quality: decision.quality,
-          ...(decision.evidence.bypass === undefined ? {} : { bypass: decision.evidence.bypass }),
-          selected: candidateIdentity(chosenContract.candidate),
+          requestedTier: decision.requestedTier,
+          workloadFloor: decision.workloadFloor,
+          effectiveStartTier: decision.effectiveStartTier,
+          effectiveCeiling: decision.effectiveCeiling,
+          selected: pointIdentity(chosenContract.candidate),
           attempts,
-          fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedCandidateIdentity(candidate)),
-          configuration: chosenContract
+          fallbackCandidates: chainCandidates.slice(1).map((candidate) => resolvedPointIdentity(candidate)),
+          resolvedModel,
+          configuration: chosenContract,
+          ...(shared.recovery === undefined ? {} : {
+            recovery: {
+              recoveryOf: shared.recovery.runId,
+              workspaceState: shared.recovery.workspaceState,
+              priorRouteTier: shared.recovery.priorRouteTier,
+              priorOperatingPointId: shared.recovery.priorOperatingPointId,
+              priorPolicyRevision: shared.recovery.priorPolicyRevision
+            }
+          })
         }
       };
-      return { content: [{ type: "text", text: `${formatResult({ operation: "launch", outcome: "success", targetId: paneId, delivery: requestedDelivery })} · supervisor ${reservation!.jobId}` }], details: launchDetails };
+      return launchDetails;
     } catch (error) {
       if (agentStarted && selectedAttemptStartedAt !== undefined && timing.selectedStartReadinessMs === undefined) {
         const failureReadiness = error instanceof LaunchError && record(error.details.readiness) ? error.details.readiness.elapsedMs : undefined;
@@ -2612,7 +2856,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       let reconciliation: LaunchReconciliationEvidence | undefined;
       if (topologyMutationDispatched) {
         try {
-          reconciliation = await reconcileLaunch({ cli: deps.cli, baseline: topologyBaseline!, ...(paneId === undefined ? {} : { paneId }), ...(tabId === undefined ? {} : { tabId }), agentStarted, promptSubmitted, agentName: params.name });
+          reconciliation = await reconcileLaunch({ cli: deps.cli, baseline: topologyBaseline!, ...(paneId === undefined ? {} : { paneId }), ...(tabId === undefined ? {} : { tabId }), agentStarted, promptSubmitted, agentName: childName });
         } catch (readbackError) {
           reconciliation = { effectCertainty: "unknown", snapshot: "unavailable", pane: "unknown", agent: "unknown", readFailures: [`reconciliation:${reconciliationFailureCode(readbackError)}`] };
         }
@@ -2621,9 +2865,9 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         if (reconciliation?.agentId !== undefined && created.agentId === undefined) created.agentId = reconciliation.agentId;
       }
       if (!supervisionBound) reservation?.release(`launch_failed_${phase}`);
-      if (prepared !== undefined && !worktreeBound) await worktrees?.release(params.name);
+      if (prepared !== undefined && !worktreeBound) await worktrees?.release(childName);
       withDeliveryFailureEvidence(error, { handoffRunId: handoffRun!.runId });
-      throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, mutationDispatched: topologyMutationDispatched, ...(assignmentState === undefined ? {} : { assignmentState }), ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }), ...(promptDispatch === undefined ? {} : { promptDispatch }), ...(readiness === undefined ? {} : { readiness }), ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }), timing, attempts }, requestedDelivery, published, reconciliation);
+      throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, mutationDispatched: topologyMutationDispatched, ...(assignmentState === undefined ? {} : { assignmentState }), ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }), ...(promptDispatch === undefined ? {} : { promptDispatch }), ...(readiness === undefined ? {} : { readiness }), ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }), timing, attempts }, delivery, published, reconciliation);
     } finally {
       try { await grant?.release(); } finally { await launchGate?.release(); }
     }
@@ -2632,12 +2876,29 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
   const executeRequest = async (
     rawParams: unknown,
     signal: AbortSignal | undefined,
-    onUpdate: AgentToolUpdateCallback<LaunchDetails | LaunchBatchDetails> | undefined,
+    onUpdate: AgentToolUpdateCallback<LaunchResult> | undefined,
     ctx: ExtensionContext
-  ): Promise<AgentToolResult<LaunchDetails | LaunchBatchDetails>> => {
-    const params = normalizedParams(rawParams as SpecLaunchRequest);
+  ): Promise<AgentToolResult<LaunchResult>> => {
+    const launchId = randomUUID();
+    const emit = (result: LaunchResult): AgentToolResult<LaunchResult> => ({ content: [{ type: "text", text: launchManifest(result) }], details: result });
+    // Fail-closed preconditions run before the gate: they are pure reads and
+    // must reject without any launch effect.
+    let params: NormalizedLaunchTask;
+    let recovery: RecoveryContext | undefined;
+    try {
+      params = normalizedParams(rawParams);
+      // A recovery resolves the prior run's managed lineage — namespace, v2
+      // record, route and workspace evidence — before any launch effect.
+      if (params.recoveryOf !== undefined) {
+        recovery = await resolveRecoveryOf(params, deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({})), deps.cwd ?? ctx.cwd);
+      }
+      if (params.replicas > 1 && worktrees === undefined) {
+        throw new LaunchError("WORKTREE_UNAVAILABLE", "Replica isolation requires a worktree manager");
+      }
+    } catch (error) {
+      throw earlyLaunchFailure(error, "validate");
+    }
     const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
-    const batchResult = (details: LaunchBatchDetails): AgentToolResult<LaunchBatchDetails> => ({ content: [{ type: "text", text: batchManifest(details) }], details });
     let gate: LaunchGateLease | undefined;
     try {
       gate = await (deps.launchGate ?? (() => acquireLaunchGate()))();
@@ -2646,12 +2907,19 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       await gate?.release().catch(() => undefined);
       throw new LaunchError("LAUNCH_FROZEN", "Launch is frozen");
     }
+    let resolvedCwd: string;
     try {
-      for (const spec of params.specs) {
-        const text = specPayload(spec);
-        assertMessageText(text);
-        assertDeliverySize(text, params.assignmentDelivery === "attachment" ? "attachment" : "inline");
+      // Early size gate on the caller-authored Task body alone — a pure check
+      // that rejects before any filesystem or CLI touch; the child's full
+      // payload (Task plus contract) is measured again after compile.
+      const body = renderTask(params);
+      assertMessageText(body);
+      if (utf8Bytes(body) > ATTACHMENT_MAX_BYTES) {
+        throw new LaunchError("MESSAGE_TOO_LARGE", "Rendered task exceeds the attachment delivery bound");
       }
+      // The canonical cwd is resolved and recorded before any effect (D13); a
+      // recovery resumes the prior run's managed workspace instead.
+      resolvedCwd = recovery === undefined ? await resolveLaunchCwd(params.cwd, deps.cwd ?? ctx.cwd) : recovery.resumedWorkspace;
       if (typeof deps.cli.prompt !== "function") throw new LaunchError("CLI_INCOMPATIBLE", "Herdr prompt transport is unavailable");
       await deps.preflight(abortSignal, "agent.prompt");
     } catch (error) {
@@ -2660,116 +2928,88 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     }
     await gate.release();
 
-    const routed = await routeRequest(params, abortSignal, ctx);
-    const decisions = routed.records.map((record) => record.decision);
+    const task: RoutingTask = { objective: params.objective, scope: params.scope, doneWhen: params.doneWhen, constraints: params.constraints, tier: params.tier };
+    const routed = await routeTaskOnce(params, task, launchId, abortSignal, ctx, recovery);
+    // The router consumed the lifted start preference; requestedTier on the
+    // recorded decision keeps its documented meaning — the caller's ask.
+    const routedRecord: TaskRouteRecord = recovery !== undefined && isAdmitted(routed.record.decision)
+      ? { ...routed.record, decision: { ...routed.record.decision, requestedTier: params.tier } }
+      : routed.record;
     const routerLog = deps.routerLog ?? appendRouterDecision;
     try {
-      for (const record of routed.records) {
-        await routerLog(specRouteLogEntry(params.name, record), { root: deps.cwd ?? ctx.cwd });
-        if (record.decision.kind === "abstained" && record.decision.reason === "transport_failed" && record.binding !== undefined && record.bypassConfiguration !== undefined) {
-          const receipt = createBypassReceipt({
-            binding: record.binding,
-            abstention: record.decision,
-            configuration: record.bypassConfiguration,
-            category: record.spec.category,
-            count: record.spec.count,
-            recorded: true
-          });
-          record.decision = { ...record.decision, receipt: JSON.stringify(receipt) };
-          decisions[routed.records.indexOf(record)] = record.decision;
-        }
-      }
+      await routerLog(taskRouteLogEntry(launchId, routedRecord), { root: deps.cwd ?? ctx.cwd });
     } catch {
-      return batchResult({ operation: "launch_batch", outcome: "failed", router: decisions, children: [], failure: { code: "ROUTER_LOG_UNAVAILABLE", message: "Spec decision could not be persisted" } });
+      return emit({ kind: "launch", launchId, outcome: "failed", requestedTier: params.tier, children: [], error: { code: "ROUTER_LOG_UNAVAILABLE", message: "Task decision could not be persisted" } });
     }
 
-    if (routed.records.every((record) => !isAdmitted(record.decision))) {
-      return batchResult({ operation: "launch_batch", outcome: "abstained", router: decisions, children: [] });
+    const decision = routedRecord.decision;
+    if (!isAdmitted(decision)) {
+      return emit({ kind: "launch", launchId, outcome: "abstained", requestedTier: params.tier, children: [] });
     }
     const catalog = routed.catalog!;
-
-    let expansion: BatchExpansion;
-    try {
-      const effective = await contextResolver(abortSignal);
-      expansion = expandBatchRequest(params, decisions, existingNameTargets(effective.snapshot));
-    } catch (error) {
-      return batchResult({ operation: "launch_batch", outcome: "failed", router: decisions, children: [], failure: { code: safeLaunchCode(launchTransportCode(error)), message: causeMessage(error) } });
+    const intent = decision.evidence.workload?.intent;
+    /* c8 ignore next 4 -- admitted decisions always carry the workload classification; the guard keeps a malformed decision from launching blind. */
+    if (intent === undefined) {
+      return emit({ kind: "launch", launchId, outcome: "failed", requestedTier: params.tier, effectiveTier: decision.effectiveStartTier, children: [], error: { code: "ROUTER_EVIDENCE_INCOMPLETE", message: "Admitted decision lacks the workload classification" } });
     }
-    if (expansion.kind === "invalid") return batchResult({ operation: "launch_batch", outcome: "failed", router: decisions, children: [], failure: { code: expansion.code, message: expansion.message } });
+    const shared: LaunchShared = {
+      launchId,
+      catalog,
+      resolvedCwd,
+      intent,
+      replicas: params.replicas,
+      specLabel: "task",
+      ...(recovery === undefined ? {} : { recovery })
+    };
 
-    if (params.specs.length === 1 && expansion.children.length === 1 && expansion.failures.length === 0) {
-      const child = expansion.children[0]!;
-      const record = routed.records.find((item) => item.spec.label === child.specLabel)!;
-      return executeSingle(
-        { ...params, name: child.name, specs: [{ ...child.spec, count: 1 }], ...(child.label === undefined ? {} : { label: child.label }), placement: child.placement },
-        { ...record, spec: { ...child.spec, count: 1 } },
-        abortSignal,
-        onUpdate as AgentToolUpdateCallback<LaunchDetails> | undefined,
-        ctx,
-        { catalog, reservedNames: new Set() }
-      );
-    }
-
-    const dispatched = new Map<string, LaunchBatchChild>();
+    const children: LaunchResultChild[] = [];
     let halted = false;
-    for (const child of expansion.children) {
-      const key = `${child.specLabel}:${child.ordinal}`;
+    for (let ordinal = 1; ordinal <= params.replicas; ordinal += 1) {
+      const childName = mintChildName(launchId, ordinal);
       if (halted || abortSignal.aborted) {
         halted = true;
-        dispatched.set(key, { name: child.name, specLabel: child.specLabel, ordinal: child.ordinal, status: "not_started", code: "ABORTED" });
+        children.push({ target: childName, state: "not_started", error: { code: "ABORTED", message: "Launch aborted before this child started" } });
         continue;
       }
-      const reservedNames = new Set<string>();
-      for (const sibling of expansion.children) {
-        if (sibling === child) continue;
-        reservedNames.add(sibling.name);
-        if (sibling.label !== undefined) reservedNames.add(sibling.label);
-      }
-      const record = routed.records[params.specs.findIndex((spec) => spec.label === child.specLabel)]!;
-      const childUpdate: AgentToolUpdateCallback<LaunchDetails> | undefined = onUpdate === undefined ? undefined : (update) => onUpdate({ ...update, content: [{ type: "text", text: `[${child.name}]` }, ...update.content] });
+      const childUpdate: AgentToolUpdateCallback<LaunchResult> | undefined = onUpdate === undefined ? undefined : (update) => onUpdate({ ...update, content: [{ type: "text", text: `[${childName}]` }, ...update.content] });
       try {
-        const result = await executeSingle({ ...params, name: child.name, specs: [{ ...child.spec, count: 1 }], ...(child.label === undefined ? {} : { label: child.label }), placement: child.placement }, { ...record, spec: { ...child.spec, count: 1 } }, abortSignal, childUpdate, ctx, { catalog, reservedNames, ...(child.count > 1 ? { worktreeCount: child.count } : {}) });
-        dispatched.set(key, { name: child.name, specLabel: child.specLabel, ordinal: child.ordinal, status: "launched", launch: result.details });
+        const details = await executeChild(params, { ...routedRecord, decision }, shared, childName, abortSignal, childUpdate, ctx);
+        children.push({
+          target: childName,
+          state: "launched",
+          operatingPointId: details.task?.selected.id,
+          supervisorJobId: details.supervision?.jobId,
+          ...(details.worktree === undefined ? {} : { worktree: details.worktree })
+        });
       } catch (error) {
-        dispatched.set(key, { name: child.name, specLabel: child.specLabel, ordinal: child.ordinal, status: "failed", failure: batchChildFailure(error) });
+        /* c8 ignore next -- executeChild throws only LaunchError; the fallback keeps a foreign throw fail-closed. */
+        const failureDetails = error instanceof LaunchError ? error.details : undefined;
+        const retainedJobId = safeDiagnosticString(failureDetails?.supervisorJobId, 128);
+        children.push({ target: childName, state: "failed", error: launchChildError(error), ...(retainedJobId === undefined ? {} : { supervisorJobId: retainedJobId }) });
       }
     }
-    const children: LaunchBatchChild[] = [];
-    for (const spec of params.specs) {
-      const decision = decisions[params.specs.indexOf(spec)];
-      if (!isAdmitted(decision)) continue;
-      const count = decision.count;
-      for (let ordinal = 1; ordinal <= count; ordinal += 1) {
-        const key = `${spec.label}:${ordinal}`;
-        const entry = dispatched.get(key);
-        if (entry !== undefined) children.push(entry);
-        else {
-          const failure = expansion.failures.find((item) => item.specLabel === spec.label && item.ordinal === ordinal)!;
-          children.push({ name: failure.name, specLabel: failure.specLabel, ordinal: failure.ordinal, status: "failed", failure: { code: failure.code, details: { code: failure.code, message: failure.message } } });
-        }
-      }
-    }
-    const launched = children.filter((child) => child.status === "launched").length;
-    const outcome: LaunchBatchDetails["outcome"] = launched === 0 ? "failed" : launched === children.length ? "launched" : "partial";
-    return batchResult({ operation: "launch_batch", outcome, router: decisions, children });
+    const launched = children.filter((child) => child.state === "launched").length;
+    const outcome: LaunchResult["outcome"] = launched === 0 ? "failed" : launched === children.length ? "launched" : "partial";
+    return emit({ kind: "launch", launchId, outcome, requestedTier: params.tier, effectiveTier: decision.effectiveStartTier, children });
   };
 
   return {
     name: "herdr_launch",
     label: "Herdr Launch",
-    description: "Launch spec-defined Herdr agents in explicitly selected pane placements; every child carries the universal supervision baseline.",
-    parameters: SpecLaunchParamsSchema,
+    description: "Launch one Task as supervised Herdr children; the runtime owns identity, topology, delivery, supervision, and evidence.",
+    parameters: LaunchTaskSchema,
     async execute(_id, rawParams, signal, onUpdate, ctx) {
       return executeRequest(rawParams, signal, onUpdate, ctx);
     },
     renderCall(args, theme) {
-      const delivery = args.assignmentDelivery ?? "inline";
-      const specs = args.specs.map((spec) => spec.label).join(",");
-      return textComponent(formatCall("herdr_launch", `${specs} · ${delivery}`, args.name), theme, "accent");
+      const label = typeof args.label === "string" ? args.label : "task";
+      const tier = typeof args.tier === "string" ? args.tier : "standard";
+      const replicas = typeof args.replicas === "number" ? args.replicas : 1;
+      return textComponent(formatCall("herdr_launch", `${label} · ${tier}${replicas > 1 ? ` ×${replicas}` : ""}`), theme, "accent");
     },
     renderResult(result, options, theme) {
       const details = result.details;
-      return renderResultComponent("launch", result, options, theme, details?.operation === "launch" ? details.paneId : undefined);
+      return renderResultComponent("launch", result, options, theme, details?.kind === "launch" ? details.launchId : undefined);
     }
   };
 }
@@ -2787,7 +3027,12 @@ export const launchTestInternals = {
   record,
   identifier,
   normalizedParams,
-  specPayload,
+  mintChildName,
+  resolveLaunchCwd,
+  mintedNameTaken,
+  workloadTabOrdinal,
+  selectWorkloadTab,
+  supervisionWorkspaceRoot,
   paneRecord,
   agentGetRecord,
   agentIdentity,
@@ -2845,9 +3090,6 @@ export const launchTestInternals = {
   parseAgyPromptAcknowledgement,
   agyPromptUnconfirmed,
   confirmAgyNativeSession,
-  existingAgentNames,
-  existingNameTargets,
-  paneForPlacement,
   noFocusArgs,
   compactCliFailureEvidence,
   cliFailureEvidence,
@@ -2859,18 +3101,15 @@ export const launchTestInternals = {
   progress,
   run,
   runPrompt,
-  batchChildFailure,
-  batchManifest,
-  candidateIdentity,
-  candidateKey,
+  launchChildError,
+  launchManifest,
+  pointIdentity,
   launchBinding,
-  parseBypassToken,
   allReviewedResources,
-  transportBypassConfiguration,
-  resolvedCandidateIdentity,
-  resolvedCandidateKey,
+  resolvedPointIdentity,
+  resolvedPointKey,
   isAdmitted,
   recipientCapability,
-  specRouterState,
-  specRouteLogEntry
+  taskRouterState,
+  taskRouteLogEntry
 } as const;

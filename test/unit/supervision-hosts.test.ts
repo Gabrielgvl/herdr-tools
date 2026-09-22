@@ -120,8 +120,8 @@ describe("the Pi host supervision wiring", () => {
       } as never,
       { HERDR_SOCKET_PATH: socket.path, HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "t", HERDR_PANE_ID: "p1" },
     );
-    const reservation = await runtime.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
-    await reservation.bind({ identity, candidateName: "worker-pi" });
+    const reservation = await runtime.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
+    await reservation.bind({ identity, operatingPointId: "worker-pi" });
     expect(runtime.jobs.get(reservation.jobId)).toMatchObject({ kind: "supervisor", supervision: { state: "active" } });
 
     socket.push(paneUpdated("blocked", 4));
@@ -180,8 +180,8 @@ describe("the MCP host supervision wiring", () => {
           expect(connectionsAtConnect).toBe(0);
           expect((server!.server as unknown as { _capabilities: Record<string, unknown> })._capabilities).toMatchObject({ experimental: { "claude/channel": {} }, tools: {} });
 
-          const reservation = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
-          await reservation.bind({ identity, candidateName: "worker-pi" });
+          const reservation = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
+          await reservation.bind({ identity, operatingPointId: "worker-pi" });
           socket.push(paneUpdated("blocked", 4));
           await vi.waitFor(() => expect(notifications.some((message) => message.method === "notifications/claude/channel")).toBe(true));
           // Claude is Channels-only: one lazy `pane get` resolved the kind and
@@ -232,8 +232,8 @@ describe("the MCP host supervision wiring", () => {
         const server = await runHerdrMcpServer({ exec, transport: transport as never, exit: () => undefined });
         try {
           expect(server).toBeDefined();
-          const reservation = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
-          await reservation.bind({ identity: { ...identity, paneId: "p2", terminalId: "t2" }, candidateName: "worker-pi" });
+          const reservation = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
+          await reservation.bind({ identity: { ...identity, paneId: "p2", terminalId: "t2" }, operatingPointId: "worker-pi" });
           socket.push(paneUpdated("blocked", 4, childPane));
           await vi.waitFor(() => expect(socket.prompts).toHaveLength(1));
           expect(socket.prompts[0]!.target).toBe("p1");
@@ -251,7 +251,7 @@ describe("the MCP host supervision wiring", () => {
             async () => ({ wait_result: "condition_met" as const, matched: true }),
           );
           const supervisor = server!.jobs.register(
-            { kind: "supervisor", label: "watch worker", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" }, settings: { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "max" } },
+            { kind: "supervisor", label: "watch worker", targets: ["worker"], targetIds: [], child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" }, settings: { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "max" } },
             async () => ({ supervision_result: "released" as const }),
           );
           await wait.promise;
@@ -326,8 +326,8 @@ describe("the MCP host supervision wiring", () => {
         const server = await runHerdrMcpServer({ exec, transport: transport as never, exit: () => undefined });
         try {
           expect(server).toBeDefined();
-          const reservation = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
-          await reservation.bind({ identity: { ...identity, paneId: "p2", terminalId: "t2" }, candidateName: "worker-pi" });
+          const reservation = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
+          await reservation.bind({ identity: { ...identity, paneId: "p2", terminalId: "t2" }, operatingPointId: "worker-pi" });
 
           const closing = server!.surface.pane.execute("close-call", { operation: "close", target: "p2" } as never, new AbortController().signal, undefined, { cwd: directory, hasUI: false } as never);
           await vi.waitFor(() => expect(closeApplied).toBe("p2"));
@@ -351,8 +351,8 @@ describe("the MCP host supervision wiring", () => {
 
           // A close that finished before its absence was observed takes the
           // same suppression path: the confirmed marker is already waiting.
-          const later = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
-          await later.bind({ identity: { ...identity, paneId: "p4", terminalId: "t4" }, candidateName: "worker-pi" });
+          const later = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
+          await later.bind({ identity: { ...identity, paneId: "p4", terminalId: "t4" }, operatingPointId: "worker-pi" });
           const finished = await server!.surface.pane.execute("close-call-2", { operation: "close", target: "p4" } as never, new AbortController().signal, undefined, { cwd: directory, hasUI: false } as never);
           expect(finished.details).toMatchObject({ operation: "close", outcome: "success", paneId: "p4" });
           socket.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p4", workspace_id: "w" } })}\n`);
@@ -362,8 +362,8 @@ describe("the MCP host supervision wiring", () => {
           expect(server!.jobs.get(later.jobId)!.supervision?.events).toEqual([]);
 
           // An absence this host did not close still wakes exactly once.
-          const external = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi" } });
-          await external.bind({ identity: { ...identity, paneId: "p3", terminalId: "t3" }, candidateName: "worker-pi" });
+          const external = await server!.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
+          await external.bind({ identity: { ...identity, paneId: "p3", terminalId: "t3" }, operatingPointId: "worker-pi" });
           remove("p3");
           socket.push(`${JSON.stringify({ event: "pane_closed", data: { type: "pane_closed", pane_id: "p3", workspace_id: "w" } })}\n`);
           await vi.waitFor(() => expect(socket.prompts).toHaveLength(1));

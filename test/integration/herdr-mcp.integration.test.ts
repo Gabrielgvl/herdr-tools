@@ -25,10 +25,10 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const serverEntry = join(repoRoot, "dist/src/mcp-server.js");
 /**
  * Herdr 0.8.0 attaches a shell to a freshly created pane asynchronously and
- * exposes no readiness field, so `agent start` against a brand-new pane races
- * with `agent_pane_busy`. The launch therefore targets a pane created earlier in
- * this run, and this bounded settle covers the remainder of that gap. It relaxes
- * no assertion: the launch must still succeed and prove its evidence.
+ * exposes no readiness field, so pane work against a brand-new pane races with
+ * `agent_pane_busy`. This bounded settle covers the remainder of that gap for
+ * the fixture's own panes. It relaxes no assertion: the launch must still
+ * succeed and prove its evidence.
  */
 const PANE_SETTLE_MS = 3_000;
 /** Planted as a pane environment override; it must never appear in a tool result. */
@@ -72,21 +72,36 @@ function evidence(result: ToolResult): Record<string, unknown> {
   return record(JSON.parse(only.text));
 }
 
-function singleLaunchEvidence(result: ToolResult): Record<string, unknown> {
+/** The uniform `herdr_launch` result: one flat Task in, one `kind:"launch"` envelope out. */
+function launchEvidence(result: ToolResult): Record<string, unknown> {
   const details = evidence(result);
-  if (details.operation === "launch") return details;
-  if (details.operation !== "launch_batch") throw new Error("herdr_launch returned neither launch nor launch_batch evidence");
-  const children = details.children;
-  if (details.outcome !== "launched" || !Array.isArray(children) || children.length !== 1) {
-    const router = Array.isArray(details.router) ? details.router.map((value) => {
-      const decision = record(value);
-      return [decision.kind, decision.reason, decision.component].filter((field) => typeof field === "string").join(":");
-    }).join(",") : "invalid";
-    throw new Error(`one-spec launch returned outcome=${String(details.outcome)} children=${Array.isArray(children) ? children.length : "invalid"} router=${router}`);
+  if (details.kind !== "launch") throw new Error("herdr_launch returned non-launch evidence");
+  return details;
+}
+
+function launchedChild(launch: Record<string, unknown>): Record<string, unknown> {
+  const children = launch.children;
+  if (launch.outcome !== "launched" || !Array.isArray(children) || children.length !== 1) {
+    throw new Error(`one-Task launch returned outcome=${String(launch.outcome)} children=${Array.isArray(children) ? children.length : "invalid"}`);
   }
   const child = record(children[0]);
-  if (child.status !== "launched") throw new Error(`one-spec launch child returned status=${String(child.status)}`);
-  return record(child.launch);
+  if (child.state !== "launched") throw new Error(`one-Task launch child returned state=${String(child.state)}`);
+  return child;
+}
+
+/**
+ * A supervisor job is the only public surface that resolves a launched child's
+ * minted target back to the pane it runs on: `child` once bound, `provisional`
+ * while still unconfirmed.
+ */
+function supervisedPaneId(job: Record<string, unknown>): string {
+  const supervision = record(job.supervision);
+  for (const slot of ["child", "provisional"]) {
+    const candidate = supervision[slot];
+    const paneId = typeof candidate === "object" && candidate !== null ? record(candidate).paneId : undefined;
+    if (typeof paneId === "string" && paneId.length > 0) return paneId;
+  }
+  throw new Error("supervisor job carried no child pane identity");
 }
 
 function text(result: ToolResult): string {
@@ -202,24 +217,6 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
         expect(text(result), withheld).not.toContain(withheld);
       }
       return diagnostic;
-    };
-    const schedulingToleranceMs = 500;
-    /** Success-path phase timing; a failure publishes no timing over MCP. */
-    const assertLaunchPhaseTiming = (details: Record<string, unknown>, monotonicWallElapsedMs: number): void => {
-      const readiness = record(details.readiness);
-      const confirmation = record(details.promptConfirmation);
-      const timing = record(details.timing);
-      const selectedStartReadinessMs = timing.selectedStartReadinessMs;
-      const promptSubmissionAckMs = timing.promptSubmissionAckMs;
-      const postAckConfirmationMs = timing.postAckConfirmationMs;
-      for (const duration of [selectedStartReadinessMs, promptSubmissionAckMs, postAckConfirmationMs]) {
-        expect(Number.isSafeInteger(duration)).toBe(true);
-        expect(Number(duration)).toBeGreaterThanOrEqual(0);
-      }
-      const decomposedPhaseElapsedMs = Number(selectedStartReadinessMs) + Number(promptSubmissionAckMs) + Number(postAckConfirmationMs);
-      expect(decomposedPhaseElapsedMs).toBeLessThanOrEqual(monotonicWallElapsedMs + schedulingToleranceMs);
-      expect(readiness.elapsedMs).toBe(selectedStartReadinessMs);
-      expect(confirmation.elapsedMs).toBe(postAckConfirmationMs);
     };
     /**
      * The model-visible diagnostic is what MCP publishes, so it is what gets
@@ -382,8 +379,8 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(evidence(health)).toMatchObject({ operation: "inspect", kind: "health", outcome: "success", socketReachable: true, compatible: true, environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true } });
 
       // Create a disposable pane through this same runtime so the result still
-      // proves environment redaction, then let the launch exercise its default
-      // same-tab placement against the rebound caller pane.
+      // proves environment redaction; launches below exercise the runtime-owned
+      // workload:<intent> topology inside the rebound workspace.
       const prepared = await call("herdr_pane", { operation: "split", target: String(movedPane.pane_id), label: "mcp-prepared", direction: "right", focus: false, env: { HERDR_TOOLS_IT_SECRET: ENVIRONMENT_SENTINEL } });
       const preparedPaneId = evidence(prepared).paneId as string;
       expect(typeof preparedPaneId).toBe("string");
@@ -403,20 +400,26 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       // starts. The MCP host has no explicit wait-review model service, so a
       // redundant reviewer would fail the job; remaining live proves the
       // supervisor retained sole semantic-review ownership.
-      const reviewerTargetLaunch = await call("herdr_launch", { name: "mcp-reviewer-target", specs: [{ label: "wait", instructions: "This is a frontier supervised-wait smoke test. Do not call tools or modify files; remain idle in this pane.", assignment: { objective: "Stay idle as a supervised wait target.", scope: "Call no tools and change nothing.", verification: "The pane stays live at the same identity." }, category: "frontier" }], supervisionDigest: { doneWhen: ["The pane stays live at the same identity."], constraints: ["none"] } });
-      expect(reviewerTargetLaunch.isError, text(reviewerTargetLaunch)).toBeUndefined();
-      const reviewerLaunchEvidence = singleLaunchEvidence(reviewerTargetLaunch);
-      expect(reviewerLaunchEvidence).toMatchObject({
-        operation: "launch",
-        outcome: "launched",
-        placement: { mode: "same_tab" },
-        kind: expect.stringMatching(/^(?:pi|claude|devin|agy)$/u),
-        initialPromptSent: true,
-        promptSubmitted: true,
-        supervision: { jobId: expect.any(String), state: "active" }
+      const reviewerTargetLaunch = await call("herdr_launch", {
+        objective: "This is a frontier supervised-wait smoke test. Do not call tools or modify files; remain idle in this pane.",
+        scope: "Call no tools and change nothing.",
+        doneWhen: ["The pane stays live at the same identity."],
+        constraints: ["none"],
+        tier: "frontier",
+        label: "mcp-reviewer-target"
       });
-      const reviewerPaneId = String(reviewerLaunchEvidence.paneId);
-      const supervisorJobId = String(record(reviewerLaunchEvidence.supervision).jobId);
+      expect(reviewerTargetLaunch.isError, text(reviewerTargetLaunch)).toBeUndefined();
+      const reviewerLaunch = launchEvidence(reviewerTargetLaunch);
+      expect(reviewerLaunch).toMatchObject({ kind: "launch", outcome: "launched", requestedTier: "frontier" });
+      const reviewerChild = launchedChild(reviewerLaunch);
+      expect(reviewerChild).toMatchObject({
+        target: expect.stringMatching(/^task-[0-9a-f]{8}-1$/u),
+        state: "launched",
+        operatingPointId: expect.stringMatching(/^(?:pi|claude|devin|agy):/u),
+        supervisorJobId: expect.any(String)
+      });
+      const supervisorJobId = String(reviewerChild.supervisorJobId);
+      const reviewerPaneId = supervisedPaneId(evidence(await call("herdr_jobs", { operation: "get", jobId: supervisorJobId })));
       const supervisedWait = await call("herdr_wait", {
         targets: [reviewerPaneId],
         match: "any",
@@ -460,71 +463,65 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       expect(prelaunchMetadata).not.toHaveProperty("agent_id");
       expect(prelaunchMetadata).not.toHaveProperty("agent");
       const launchStartedAt = performance.now();
-      const launched = await call("herdr_launch", { name: "mcp-integration-worker", specs: [{ label: "worker", instructions: "This is a frontier readback smoke test. The caller requires frontier rather than cheap or balanced. Join the two assignment words with one colon and reply with only that value. Do not call tools or modify files.", assignment: { objective: "Join the first word HERDR and the second word MCP with one colon, then reply with only the joined value.", scope: "Call no tools and change nothing.", verification: "The response is HERDR:MCP with no other text." }, category: "frontier" }], supervisionDigest: { doneWhen: ["The response is HERDR:MCP with no other text."], constraints: ["none"] } });
+      const launched = await call("herdr_launch", {
+        objective: "This is a frontier readback smoke test. Join the first word HERDR and the second word MCP with one colon, then reply with only the joined value. Do not call tools or modify files.",
+        scope: "Call no tools and change nothing.",
+        doneWhen: ["The response is HERDR:MCP with no other text."],
+        constraints: ["none"],
+        tier: "frontier",
+        label: "mcp-integration-worker"
+      });
       const launchElapsedMs = performance.now() - launchStartedAt;
       if (launched.isError) {
+        // A thrown launch error is not a tolerated outcome under the uniform
+        // result: assert the bounded diagnostic shape, record it, then fail.
         const diagnostic = launchFailureDiagnostic(launched);
         const created = record(diagnostic.created);
-        const launchFailurePaneId = typeof created.paneId === "string" ? created.paneId : preparedPaneId;
-        await recordLaunchFailureBeforeTeardown(diagnostic, launchFailurePaneId, launchElapsedMs);
-        // Exactly one live launch failure is an accepted outcome: the agent
-        // started, the prompt was acknowledged, and its consumption could not be
-        // proven inside the confirmation window, so the launch fails closed and
-        // preserves the pane. Any other failure is a real defect and must fail
-        // this run rather than be tolerated by a loose shape.
-        expect(diagnostic).toMatchObject({
-          code: "LAUNCH_FAILED",
-          phase: "prompt_verification",
-          agentStarted: true,
-          promptSubmitted: true,
-          assignmentState: "unconfirmed",
-          paneId: expect.any(String),
-          supervisorJobId: expect.any(String),
-          // Recipient registration remains gated on consumption confirmation;
-          // the exact supervisor was already bound before prompt dispatch.
-          recipientRegistered: false,
-          recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
-        });
-        // A submitted prompt can never be reconciled as having had no effect.
-        expect(["partial", "unknown"]).toContain(diagnostic.effectCertainty);
-        expect(typeof created.paneId).toBe("string");
-        // Do not run wait, steer, transcript, reviewer, job, or close assertions
-        // against an assignment whose consumption was not proven.
+        await recordLaunchFailureBeforeTeardown(diagnostic, typeof created.paneId === "string" ? created.paneId : preparedPaneId, launchElapsedMs);
+        throw new Error(`herdr_launch returned an error result: ${text(launched)}`);
+      }
+      const launchResult = launchEvidence(launched);
+      const launchChildren = Array.isArray(launchResult.children) ? launchResult.children.map(record) : [];
+      const failedChild = launchChildren.length === 1 && launchChildren[0]!.state === "failed" ? launchChildren[0]! : undefined;
+      if (failedChild !== undefined) {
+        // Exactly one live launch failure is an accepted outcome: the prompt
+        // was submitted but its consumption could not be proven inside the
+        // confirmation window, so the child fails closed and the pane survives
+        // under its retained supervisor. Any other child failure is a real
+        // defect and must fail this run rather than be tolerated.
+        const childError = record(failedChild.error);
+        expect(childError.code).toBe("PROMPT_UNCONFIRMED");
+        expect(Object.keys(childError).every((field) => field === "code" || field === "message")).toBe(true);
+        const supervisorList = evidence(await call("herdr_jobs", { operation: "list", kind: "supervisor" }));
+        const summary = (Array.isArray(supervisorList.jobs) ? supervisorList.jobs.map(record) : []).find((job) => Array.isArray(job.targets) && job.targets[0] === failedChild.target);
+        expect(summary, text(launched)).toBeDefined();
+        const retainedSupervisor = evidence(await call("herdr_jobs", { operation: "get", jobId: summary!.jobId }));
+        expect(retainedSupervisor).toMatchObject({ operation_phase: "running", supervision: { state: expect.stringMatching(/^(?:provisional|active|degraded)$/u) } });
+        await recordLaunchFailureBeforeTeardown({ launch: launchResult }, supervisedPaneId(retainedSupervisor), launchElapsedMs);
+        // Do not run wait, steer, transcript, reviewer, job, or close
+        // assertions against a child whose consumption was not proven.
         return;
       }
-      const childLaunch = singleLaunchEvidence(launched);
-      const workerPaneId = String(childLaunch.paneId);
-      expect(childLaunch).toMatchObject({
-        operation: "launch",
-        outcome: "launched",
-        placement: { mode: "same_tab" },
-        kind: expect.stringMatching(/^(?:pi|claude|devin|agy)$/u),
-        paneId: workerPaneId,
-        initialPromptSent: true,
-        envelope: { version: "v1", kind: "assignment" },
-        promptConfirmation: { elapsedMs: expect.any(Number) },
-        timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
-        spec: { label: "worker", category: "frontier" }
+      const workerChild = launchedChild(launchResult);
+      expect(launchResult).toMatchObject({ kind: "launch", outcome: "launched", requestedTier: "frontier" });
+      expect(workerChild).toMatchObject({
+        target: expect.stringMatching(/^task-[0-9a-f]{8}-1$/u),
+        state: "launched",
+        operatingPointId: expect.stringMatching(/^(?:pi|claude|devin|agy):/u),
+        supervisorJobId: expect.any(String)
       });
-      assertLaunchPhaseTiming(childLaunch, launchElapsedMs);
-      expect(record(childLaunch.sender).paneId).toBe(String(movedPane.pane_id));
-      expect(record(childLaunch.spec).label).toBe("worker");
+      // The launch result carries only the minted target; the exact pane the
+      // child runs on resolves through its supervisor job.
+      const workerSupervisor = evidence(await call("herdr_jobs", { operation: "get", jobId: String(workerChild.supervisorJobId) }));
+      const workerPaneId = supervisedPaneId(workerSupervisor);
       const launchedSnapshot = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);
       const launchedPane = (Array.isArray(launchedSnapshot.panes) ? launchedSnapshot.panes.map(record) : []).find((pane) => pane.pane_id === workerPaneId);
-      expect(launchedPane).toMatchObject({ pane_id: workerPaneId, tab_id: movedTabId, workspace_id: reboundWorkspaceId });
-
-      const confirmedState = record(childLaunch.initialPromptObservation).state;
-      const confirmedWaitState = confirmedState === "working" ? "working" : confirmedState === "blocked" ? "needs_input" : "completed";
-      const shortWait = await call("herdr_wait", { targets: [workerPaneId], match: "any", condition: { kind: "state", state: confirmedWaitState }, timeoutMs: 10_000 });
-      expect(shortWait.isError, text(shortWait)).toBeUndefined();
-      const shortWaitJobId = evidence(shortWait).jobId as string;
-      await vi.waitFor(async () => {
-        const job = await call("herdr_jobs", { operation: "get", jobId: shortWaitJobId });
-        expect(evidence(job)).toMatchObject({ operation: "jobs", view: "job", jobId: shortWaitJobId, operation_phase: "settled", wait_result: "condition_met" });
-      }, { timeout: 20_000, interval: 100 });
+      expect(launchedPane).toMatchObject({ pane_id: workerPaneId, workspace_id: reboundWorkspaceId });
+      const launchedTab = (Array.isArray(launchedSnapshot.tabs) ? launchedSnapshot.tabs.map(record) : []).find((tab) => tab.tab_id === launchedPane!.tab_id);
+      expect(String(launchedTab?.label)).toMatch(/^workload:/u);
 
       // `steer` is the provenance-preserving operation for a target that is
-      // already working on its assignment; `prompt` correctly refuses to
+      // already working on its task; `prompt` correctly refuses to
       // interrupt one.
       const communicated = await call("herdr_communicate", { target: workerPaneId, operation: "steer", text: "Also report the current user." });
       expect(communicated.isError, text(communicated)).toBeUndefined();

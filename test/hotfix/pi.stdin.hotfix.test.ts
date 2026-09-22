@@ -104,7 +104,31 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     return record(result.details, `${name} details`);
   };
 
-  const joinedIdentity = (value: Record<string, unknown>, paneId: string, expectedKind: "pi" | "claude", label: string, expected?: Record<string, unknown>): Record<string, unknown> => {
+  /** The launched child of a uniform `herdr_launch` result, or a hard failure. */
+  const launchedChildOf = (launch: Record<string, unknown>, label: string): Record<string, unknown> => {
+    const children = Array.isArray(launch.children) ? launch.children : [];
+    if (launch.kind !== "launch" || launch.outcome !== "launched" || children.length !== 1) throw new Error(`${label} did not return one launched child`);
+    const child = record(children[0], `${label} child`);
+    if (child.state !== "launched" || typeof child.supervisorJobId !== "string" || typeof child.operatingPointId !== "string") throw new Error(`${label} child was not launched under supervision`);
+    return child;
+  };
+
+  /** The runtime-minted child target resolves to its pane only through the supervisor job. */
+  const supervisedPaneId = async (supervisorJobId: string, label: string): Promise<string> => {
+    const job = await call("herdr_jobs", { operation: "get", jobId: supervisorJobId });
+    const supervision = record(job.supervision ?? {}, `${label} supervision`);
+    for (const slot of ["child", "provisional"]) {
+      const candidate = supervision[slot];
+      const paneId = typeof candidate === "object" && candidate !== null ? record(candidate, `${label} ${slot}`).paneId : undefined;
+      if (typeof paneId === "string" && paneId.length > 0) return paneId;
+    }
+    throw new Error(`${label} supervisor carried no child pane identity`);
+  };
+
+  /** The runner the router actually selected for a launched child. */
+  const routedKind = (child: Record<string, unknown>): string => String(child.operatingPointId).split(":")[0]!;
+
+  const joinedIdentity = (value: Record<string, unknown>, paneId: string, expectedKind: string, label: string, expected?: Record<string, unknown>): Record<string, unknown> => {
     const identity = {
       paneId,
       terminalId: value.terminal_id ?? value.terminalId,
@@ -131,7 +155,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     return identity;
   };
 
-  const waitForRecipientCompletion = async (paneId: string, expectedKind: "pi" | "claude", expected: Record<string, unknown>, label: string): Promise<Record<string, unknown>> => {
+  const waitForRecipientCompletion = async (paneId: string, expectedKind: string, expected: Record<string, unknown>, label: string): Promise<Record<string, unknown>> => {
     const completed = await waitForCondition(
       async () => {
         const live = record(record(await runNamed(["agent", "get", paneId])).result);
@@ -146,7 +170,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     return joinedIdentity(completed, paneId, expectedKind, label, expected);
   };
 
-  const waitForBody = async (paneId: string, body: string, expectedKind: "pi" | "claude", expected: Record<string, unknown>, label: string): Promise<Record<string, unknown>> => {
+  const waitForBody = async (paneId: string, body: string, expectedKind: string, expected: Record<string, unknown>, label: string): Promise<Record<string, unknown>> => {
     const waiting = await call("herdr_wait", {
       targets: [paneId], match: "any", condition: { kind: "output", match: { kind: "literal", value: body } }, timeoutMs: LIVE_TIMEOUT_MS, label
     });
@@ -183,8 +207,12 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
 
   const receipt = (caseName: string, details: Record<string, unknown>, request: PromptSocketRequest, completion: Record<string, unknown>, expected: string, observed: string, actualCommandExitCode: number, extra: Record<string, unknown> = {}): Record<string, unknown> => {
     if (request.method !== "agent.prompt" || typeof request.id !== "string") throw new Error(`${caseName} did not produce exactly one socket request`);
-    const dispatch = record(details.promptDispatch, `${caseName} prompt dispatch`);
-    if (dispatch.requestId !== request.id) throw new Error(`${caseName} socket request does not match the tool request ID`);
+    // The uniform launch result publishes no dispatch block; where a surface
+    // still publishes one (communicate), the socket request must match it.
+    if (details.promptDispatch !== undefined) {
+      const dispatch = record(details.promptDispatch, `${caseName} prompt dispatch`);
+      if (dispatch.requestId !== request.id) throw new Error(`${caseName} socket request does not match the tool request ID`);
+    }
     const expectedBytes = Buffer.byteLength(expected, "utf8");
     const observedBytes = Buffer.byteLength(observed, "utf8");
     return {
@@ -218,9 +246,8 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     return request;
   };
 
-  const closePane = async (details: Record<string, unknown>, label: string): Promise<void> => {
-    const paneId = details.paneId;
-    if (typeof paneId !== "string") throw new Error(`${label} omitted pane ID`);
+  const closePane = async (paneId: string, label: string): Promise<void> => {
+    if (typeof paneId !== "string" || paneId.length === 0) throw new Error(`${label} omitted pane ID`);
     await runNamed(["pane", "close", paneId]);
     state.confirmedPanes = state.confirmedPanes.filter((value) => value !== paneId);
   };
@@ -363,24 +390,22 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       const piBodyPath = join(state.cwd, `pi-inline-${piNonce}.txt`);
       const piBefore = state.proxy!.requests.length;
       const pi = await call("herdr_launch", {
-        name: `hotfix-pi-inline-${process.pid}`,
-        profile: "worker-pi",
-        placement: { mode: "new_tab", tabLabel: `${HOTFIX_LABEL}-pi-inline` },
-        assignmentDelivery: "inline",
-        assignment: {
-          objective: `Use Bash to write exactly ${piBody} to ${piBodyPath} with no trailing newline, capture that command's exit code, and write the decimal code to ${piBodyPath}.exit before replying with exactly ${piBody}. Remain ready for subsequent normal and attachment prompts.`,
-          scope: `Write only ${piBodyPath} and ${piBodyPath}.exit; do not change any other resource.`,
-          verification: `The recipient-generated file ${piBodyPath} contains exactly ${piBody}.`
-        },
-        supervisionDigest: { doneWhen: [`The recipient-generated file ${piBodyPath} contains exactly ${piBody}.`], constraints: ["none"] }
+        objective: `Use Bash to write exactly ${piBody} to ${piBodyPath} with no trailing newline, capture that command's exit code, and write the decimal code to ${piBodyPath}.exit before replying with exactly ${piBody}. Remain ready for subsequent normal and attachment prompts.`,
+        scope: `Write only ${piBodyPath} and ${piBodyPath}.exit; do not change any other resource.`,
+        doneWhen: [`The recipient-generated file ${piBodyPath} contains exactly ${piBody}.`],
+        constraints: ["none"],
+        label: `hotfix-pi-inline-${process.pid}`
       });
-      state.confirmedPanes.push(String(pi.paneId));
-      expect(pi).toMatchObject({ initialPromptDelivery: "inline", promptSubmitted: true, promptConsumption: "confirmed", recipient: { kind: "pi" }, promptDispatch: { state: "acknowledged" } });
+      const piChild = launchedChildOf(pi, "Pi inline launch");
+      const piKind = routedKind(piChild);
+      const piPaneId = await supervisedPaneId(String(piChild.supervisorJobId), "Pi inline launch");
+      state.confirmedPanes.push(piPaneId);
       const piRequest = assertOneRequest(piBefore, "Pi inline launch");
       expect(piRequest.text).toContain("delivery: inline");
       expect(piRequest.text).toContain("[HERDR AGENT MESSAGE v1]");
-      const piExpectedIdentity = joinedIdentity(record(pi.initialPromptSubmission ?? pi.submission, "Pi inline submission"), String(pi.paneId), "pi", "Pi inline expected identity");
-      const wait = await call("herdr_wait", { targets: [String(pi.paneId)], match: "any", condition: { kind: "output", match: { kind: "literal", value: `hotfix-impossible-${randomUUID()}` } }, timeoutMs: 30_000, label: `${HOTFIX_LABEL} smoke wait` });
+      const piAgent = record(record(record(await runNamed(["agent", "get", piPaneId])).result).agent ?? {}, "Pi inline agent");
+      const piExpectedIdentity = joinedIdentity(piAgent, piPaneId, piKind, "Pi inline expected identity");
+      const wait = await call("herdr_wait", { targets: [piPaneId], match: "any", condition: { kind: "output", match: { kind: "literal", value: `hotfix-impossible-${randomUUID()}` } }, timeoutMs: 30_000, label: `${HOTFIX_LABEL} smoke wait` });
       const waitJobId = wait.jobId;
       if (typeof waitJobId !== "string") throw new Error("smoke wait omitted its job ID");
       await call("herdr_jobs", { operation: "list" });
@@ -391,7 +416,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       const settledWait = await call("herdr_jobs", { operation: "get", jobId: waitJobId });
       expect(settledWait).toMatchObject({ jobId: waitJobId, operation_phase: "settled", wait_result: "cancelled" });
       const piGenerated = await generatedBody(piBodyPath, piBody, `${piBodyPath}.exit`);
-      const piCompletion = await waitForBody(String(pi.paneId), piBody, "pi", piExpectedIdentity, "Pi inline launch");
+      const piCompletion = await waitForBody(piPaneId, piBody, piKind, piExpectedIdentity, "Pi inline launch");
       const piReceipt = receipt("pi-inline-launch", pi, piRequest, piCompletion, piBody, piGenerated.body, piGenerated.commandExitCode, { bodyFilePath: piBodyPath, commandExitFilePath: `${piBodyPath}.exit`, generatedBodySha256: piGenerated.sha256 });
       await saveProvenReceipt(piReceipt);
       const steerNonce = randomUUID();
@@ -401,21 +426,19 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       const steerGateToken = `HOTFIX STEER GATE ${steerNonce}`;
       await execFileAsync("mkfifo", [steerGatePath]);
       const steer = await call("herdr_launch", {
-        name: `hotfix-pi-steer-${process.pid}`,
-        profile: "worker-pi",
-        placement: { mode: "new_tab", tabLabel: `${HOTFIX_LABEL}-steer` },
-        assignmentDelivery: "inline",
-        assignment: {
-          objective: `Use Bash to run the bounded condition command timeout 90s bash -c 'IFS= read -r gate < ${steerGatePath} && test "$gate" = "${steerGateToken}"' in the foreground. Do not use sleep. Remain in this turn until that condition exits, then remain ready for the subsequent steer instruction. Do not write a body or send a final response before the steer.`,
-          scope: `Read only ${steerGatePath}; write only ${steerPath} and ${steerPath}.exit; do not change any other resource.`,
-          verification: "The bounded gate remains pending until the subsequent steer instruction."
-        },
-        supervisionDigest: { doneWhen: ["The bounded gate remains pending until the subsequent steer instruction."], constraints: ["none"] }
+        objective: `Use Bash to run the bounded condition command timeout 90s bash -c 'IFS= read -r gate < ${steerGatePath} && test "$gate" = "${steerGateToken}"' in the foreground. Do not use sleep. Remain in this turn until that condition exits, then remain ready for the subsequent steer instruction. Do not write a body or send a final response before the steer.`,
+        scope: `Read only ${steerGatePath}; write only ${steerPath} and ${steerPath}.exit; do not change any other resource.`,
+        doneWhen: ["The bounded gate remains pending until the subsequent steer instruction."],
+        constraints: ["none"],
+        label: `hotfix-pi-steer-${process.pid}`
       });
-      state.confirmedPanes.push(String(steer.paneId));
+      const steerChild = launchedChildOf(steer, "Pi steer launch");
+      const steerKind = routedKind(steerChild);
+      const steerPaneId = await supervisedPaneId(String(steerChild.supervisorJobId), "Pi steer launch");
+      state.confirmedPanes.push(steerPaneId);
       const working = await waitForCondition(
         async () => {
-          const live = record(record(await runNamed(["agent", "get", String(steer.paneId)])).result);
+          const live = record(record(await runNamed(["agent", "get", steerPaneId])).result);
           const agent = record(live.agent ?? live);
           return agent.agent_status;
         },
@@ -426,28 +449,28 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       expect(working).toBe("working");
       const steerBefore = state.proxy!.requests.length;
       const steerDetails = await call("herdr_communicate", {
-        target: String(steer.paneId), operation: "steer", text: `After the current Bash condition completes, use Bash to write exactly ${steerBody} to ${steerPath} with no trailing newline, capture that command's exit code, write the decimal code to ${steerPath}.exit, then reply exactly ${steerBody}.`, delivery: "inline"
+        target: steerPaneId, operation: "steer", text: `After the current Bash condition completes, use Bash to write exactly ${steerBody} to ${steerPath} with no trailing newline, capture that command's exit code, write the decimal code to ${steerPath}.exit, then reply exactly ${steerBody}.`, delivery: "inline"
       });
       const steerRequest = assertOneRequest(steerBefore, "steer while working");
       expect(steerRequest.text).toContain("delivery: inline");
-      const steerExpectedIdentity = joinedIdentity(record(steerDetails.submission ?? steerDetails.initialPromptSubmission, "Pi steer submission"), String(steer.paneId), "pi", "Pi steer expected identity");
+      const steerExpectedIdentity = joinedIdentity(record(steerDetails.submission ?? steerDetails.initialPromptSubmission, "Pi steer submission"), steerPaneId, steerKind, "Pi steer expected identity");
       await appendFile(steerGatePath, `${steerGateToken}\n`);
       const steerGenerated = await generatedBody(steerPath, steerBody, `${steerPath}.exit`);
-      const steerCompletion = await waitForBody(String(steer.paneId), steerBody, "pi", steerExpectedIdentity, "Pi steer while working");
+      const steerCompletion = await waitForBody(steerPaneId, steerBody, steerKind, steerExpectedIdentity, "Pi steer while working");
       const steerReceipt = receipt("steer-working", steerDetails, steerRequest, steerCompletion, steerBody, steerGenerated.body, steerGenerated.commandExitCode, { bodyFilePath: steerPath, commandExitFilePath: `${steerPath}.exit`, generatedBodySha256: steerGenerated.sha256 });
       await saveProvenReceipt(steerReceipt);
-      await closePane(steer, "Pi steer recipient");
+      await closePane(steerPaneId, "Pi steer recipient");
 
       const smokeNonce = randomUUID();
       const smokeBody = `HOTFIX SEVEN TOOL SMOKE BODY ${smokeNonce}`;
       const smokePath = join(state.cwd, `pi-smoke-${smokeNonce}.txt`);
       const smokeBefore = state.proxy!.requests.length;
-      const smokeDetails = await call("herdr_communicate", { target: String(pi.paneId), operation: "prompt", text: `For this normal follow-up, use Bash to write exactly ${smokeBody} to ${smokePath} with no trailing newline, capture that command's exit code, write the decimal code to ${smokePath}.exit, then reply exactly ${smokeBody}. Do not reply before both files are exact.`, delivery: "inline" });
+      const smokeDetails = await call("herdr_communicate", { target: piPaneId, operation: "prompt", text: `For this normal follow-up, use Bash to write exactly ${smokeBody} to ${smokePath} with no trailing newline, capture that command's exit code, write the decimal code to ${smokePath}.exit, then reply exactly ${smokeBody}. Do not reply before both files are exact.`, delivery: "inline" });
       const smokeRequest = assertOneRequest(smokeBefore, "normal prompt smoke");
       expect(smokeRequest.text).toContain("delivery: inline");
-      const smokeExpectedIdentity = joinedIdentity(record(smokeDetails.submission ?? smokeDetails.initialPromptSubmission, "Pi smoke submission"), String(pi.paneId), "pi", "Pi smoke expected identity");
+      const smokeExpectedIdentity = joinedIdentity(record(smokeDetails.submission ?? smokeDetails.initialPromptSubmission, "Pi smoke submission"), piPaneId, piKind, "Pi smoke expected identity");
       const smokeGenerated = await generatedBody(smokePath, smokeBody, `${smokePath}.exit`);
-      const smokeCompletion = await waitForBody(String(pi.paneId), smokeBody, "pi", smokeExpectedIdentity, "Pi seven-tool normal prompt");
+      const smokeCompletion = await waitForBody(piPaneId, smokeBody, piKind, smokeExpectedIdentity, "Pi seven-tool normal prompt");
       const smokeReceipt = receipt("seven-tool-smoke", smokeDetails, smokeRequest, smokeCompletion, smokeBody, smokeGenerated.body, smokeGenerated.commandExitCode, { bodyFilePath: smokePath, commandExitFilePath: `${smokePath}.exit`, generatedBodySha256: smokeGenerated.sha256 });
       await saveProvenReceipt(smokeReceipt);
 
@@ -455,11 +478,11 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       const normalBody = `HOTFIX NORMAL COMPLETE BODY ${normalNonce}`;
       const normalPath = join(state.cwd, `pi-normal-${normalNonce}.txt`);
       const normalBefore = state.proxy!.requests.length;
-      const normalDetails = await call("herdr_communicate", { target: String(pi.paneId), operation: "prompt", text: `For this normal follow-up, use Bash to write exactly ${normalBody} to ${normalPath} with no trailing newline, capture that command's exit code, write the decimal code to ${normalPath}.exit, then reply exactly ${normalBody}. Do not reply before both files are exact.`, delivery: "inline" });
+      const normalDetails = await call("herdr_communicate", { target: piPaneId, operation: "prompt", text: `For this normal follow-up, use Bash to write exactly ${normalBody} to ${normalPath} with no trailing newline, capture that command's exit code, write the decimal code to ${normalPath}.exit, then reply exactly ${normalBody}. Do not reply before both files are exact.`, delivery: "inline" });
       const normalRequest = assertOneRequest(normalBefore, "normal prompt");
-      const normalExpectedIdentity = joinedIdentity(record(normalDetails.submission ?? normalDetails.initialPromptSubmission, "Pi normal submission"), String(pi.paneId), "pi", "Pi normal expected identity");
+      const normalExpectedIdentity = joinedIdentity(record(normalDetails.submission ?? normalDetails.initialPromptSubmission, "Pi normal submission"), piPaneId, piKind, "Pi normal expected identity");
       const normalGenerated = await generatedBody(normalPath, normalBody, `${normalPath}.exit`);
-      const normalCompletion = await waitForBody(String(pi.paneId), normalBody, "pi", normalExpectedIdentity, "Pi normal prompt");
+      const normalCompletion = await waitForBody(piPaneId, normalBody, piKind, normalExpectedIdentity, "Pi normal prompt");
       const normalReceipt = receipt("normal-prompt", normalDetails, normalRequest, normalCompletion, normalBody, normalGenerated.body, normalGenerated.commandExitCode, { bodyFilePath: normalPath, commandExitFilePath: `${normalPath}.exit`, generatedBodySha256: normalGenerated.sha256 });
       await saveProvenReceipt(normalReceipt);
 
@@ -474,7 +497,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       ].join("\n");
       const attachmentBefore = state.proxy!.requests.length;
       const attachmentDetails = await call("herdr_communicate", {
-        target: String(pi.paneId),
+        target: piPaneId,
         operation: "prompt",
         delivery: "attachment",
         text: attachmentBody
@@ -490,7 +513,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       expect(attachmentRequest.text).toContain("delivery: attachment");
       expect(attachmentRequest.text).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
       expect(attachmentRequest.text).not.toContain(attachmentBody);
-      const attachmentExpectedIdentity = joinedIdentity(record(attachmentDetails.submission ?? attachmentDetails.initialPromptSubmission, "Pi attachment submission"), String(pi.paneId), "pi", "Pi attachment expected identity");
+      const attachmentExpectedIdentity = joinedIdentity(record(attachmentDetails.submission ?? attachmentDetails.initialPromptSubmission, "Pi attachment submission"), piPaneId, piKind, "Pi attachment expected identity");
       const generatedAttachment = await generatedBody(generatedAttachmentPath, attachmentBody, `${generatedAttachmentPath}.exit`);
       expect(Buffer.compare(Buffer.from(generatedAttachment.body, "utf8"), expectedAttachmentBytes)).toBe(0);
       expect(generatedAttachment.bytes).toBe(expectedAttachmentBytes.byteLength);
@@ -498,7 +521,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       expect(generatedAttachment.sha256).toBe(attachment.sha256);
       expect(attachmentBytes.byteLength).toBe(expectedAttachmentBytes.byteLength);
       expect(attachment.bytes).toBe(expectedAttachmentBytes.byteLength);
-      const attachmentCompletion = await waitForRecipientCompletion(String(pi.paneId), "pi", attachmentExpectedIdentity, "Pi attachment readback");
+      const attachmentCompletion = await waitForRecipientCompletion(piPaneId, piKind, attachmentExpectedIdentity, "Pi attachment readback");
       const attachmentReceipt = receipt("attachment-complete-body", attachmentDetails, attachmentRequest, attachmentCompletion, attachmentBody, generatedAttachment.body, generatedAttachment.commandExitCode, {
         bodyFilePath: String(attachment.path),
         generatedBodyFilePath: generatedAttachmentPath,
@@ -507,9 +530,9 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
         attachmentSha256: digest(attachmentBytes)
       });
       await saveProvenReceipt(attachmentReceipt);
-      const piKeys = await call("herdr_communicate", { target: String(pi.paneId), operation: "keys", keys: ["escape"] });
+      const piKeys = await call("herdr_communicate", { target: piPaneId, operation: "keys", keys: ["escape"] });
       expect(piKeys).toMatchObject({ operation: "keys" });
-      await closePane(pi, "Pi attachment recipient");
+      await closePane(piPaneId, "Pi attachment recipient");
 
       const finalDefault = record(record(record(await run("api", "snapshot")).result).snapshot);
       expect(topology(finalDefault)).toEqual(state.baseline);
@@ -530,7 +553,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
         receipts,
         socketRequests: state.proxy!.requests.length,
         literalStdin: false,
-        modelQualification: "Pi is the only qualified hotfix recipient; Claude and AGY remain explicitly blocked."
+        modelQualification: "The hotfix recipient is the runtime-routed operating point; completion identity is cross-checked against the routed runner."
       };
     } catch (error) {
       state.preserve = true;

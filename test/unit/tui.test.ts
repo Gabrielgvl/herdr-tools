@@ -23,6 +23,11 @@ describe("compact tool rows", () => {
   it("renders detached, partial, and error states truthfully", () => {
     expect(resultForRender("launch", { details: { outcome: "partial" } }, {}, "p1")).toEqual({ text: "partial · p1", tone: "warning" });
     expect(resultForRender("launch", { details: { outcome: "partial" } })).toEqual({ text: "partial", tone: "warning" });
+    expect(resultForRender("launch", { details: { outcome: "abstained" } }, {}, "l1")).toEqual({ text: "abstained · l1", tone: "warning" });
+    expect(resultForRender("launch", { details: { outcome: "failed" } }, {}, "l1")).toEqual({ text: "failed · l1", tone: "error" });
+    expect(resultForRender("launch", { details: { outcome: "abstained" } })).toEqual({ text: "abstained", tone: "warning" });
+    expect(resultForRender("launch", { details: { outcome: "failed" } })).toEqual({ text: "failed", tone: "error" });
+    expect(resultForRender("launch", { details: { outcome: "launched" } }, {}, "l1")).toEqual({ text: "launch · l1", tone: "success" });
     expect(resultForRender("wait", { details: { operation_phase: "accepted" } })).toEqual({ text: "accepted", tone: "muted" });
     expect(resultForRender("wait", { details: { operation_phase: "accepted", jobId: "job_1" } })).toEqual({ text: "accepted · job_1", tone: "muted" });
     expect(resultForRender("wait", { details: { operation_phase: "accepted" } }, { isPartial: true })).toEqual({ text: "partial · wait", tone: "warning" });
@@ -62,7 +67,7 @@ describe("compact tool rows", () => {
       supervision: {
         jobId: "job_supervisor_2",
         state: "active",
-        child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", candidateName: "worker-pi" }
+        child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", operatingPointId: "worker-pi" }
       }
     };
     expect(resultForRender("launch", { isError: true, details }, {}, "stale-target")).toEqual({
@@ -82,7 +87,7 @@ describe("compact tool rows", () => {
     const supervision = {
       jobId: "job_supervisor_2",
       state: "active",
-      child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", candidateName: "worker-pi" }
+      child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", operatingPointId: "worker-pi" }
     };
     const unconfirmed = {
       assignmentState: "unconfirmed",
@@ -127,7 +132,7 @@ describe("compact tool rows", () => {
       supervision: {
         jobId: "job_supervisor_2",
         state: "active",
-        child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", candidateName: "worker-pi" }
+        child: { paneId: "w1:p2", agentName: "worker", agentKind: "pi", terminalId: "term-secret", operatingPointId: "worker-pi" }
       }
     };
     const generic = { text: "error LAUNCH_FAILED · w1:p2", tone: "error" };

@@ -1,41 +1,10 @@
-# Herdr category catalog (ADR-035). The spec launch path resolves a caller's
-# optional `category` into the first eligible, quota-available chain candidate;
-# the remainder is the pre-execution fallback. Pools are the reviewed resource
-# sets Jev may select from — never a grant by themselves.
-version: 1
-
-# ADR-026's ratified four-attempt bound, carried forward as the declared chain
-# depth (plan R4). A chain longer than this fails closed; it is never truncated.
-maxAttempts: 4
-
-categories:
-  frontier:
-    - runner: devin
-      model: swe-2-max
-    - runner: claude
-      model: claude-fable-5
-    - runner: pi
-      model: openai-codex/gpt-6-astra
-    - runner: claude
-      model: claude-opus-5
-  balanced:
-    - runner: claude
-      model: claude-opus-5
-    - runner: pi
-      model: openai-codex/gpt-5.6-sol
-    - runner: devin
-      model: swe-2-max
-    - runner: pi
-      model: openai-codex/gpt-5.6-luna
-  cheap:
-    - runner: agy
-      model: gemini-3.8-flash-low
-    - runner: pi
-      model: openai-codex/gpt-5.6-luna
-    - runner: claude
-      model: claude-sonnet-5
-    - runner: agy
-      model: gemini-3.8-flash-high
+# Herdr operating-point catalog (ADR-037). Each runner's reviewed model set is
+# crossed with its declared reasoning axis into operating points; `pointPolicy`
+# carries the reviewed cost/latency classes the tier envelopes filter on, and
+# the workload policy generates the bounded pre-execution fallback chain at
+# route time. Pools are the reviewed resource sets Jev may select from — never
+# a grant by themselves.
+version: 2
 
 # Reviewed skill trees (Pi `--skill` units), relative to the package root.
 skills:
@@ -108,10 +77,18 @@ mcp:
 
 runners:
   pi:
+    # Per-model declared reasoning axes (ADR-037 audit). GPT-5.6 supports six
+    # settings; Pi `minimal` is a runner-level alias of provider `low` and is
+    # never a canonical point. GPT-6 Astra has no `off` operating point.
     models:
-      - openai-codex/gpt-5.6-luna
-      - openai-codex/gpt-5.6-sol
-      - openai-codex/gpt-6-astra
+      - {model: openai-codex/gpt-5.6-luna, supportedReasoning: [off, low, medium, high, xhigh, max]}
+      - {model: openai-codex/gpt-5.6-terra, supportedReasoning: [off, low, medium, high, xhigh, max]}
+      - {model: openai-codex/gpt-5.6-sol, supportedReasoning: [off, low, medium, high, xhigh, max]}
+      - {model: openai-codex/gpt-6-astra, supportedReasoning: [low, medium, high, xhigh, max]}
+      # GLM-5.3-Flash routes are billed outside the runner's codex domain:
+      # provider + billingProduct keep their availability tuples distinct.
+      - {model: zai/glm-5.3-flash, provider: zai, quota: {billingProduct: zai-api}, supportedReasoning: [low, high, max]}
+      - {model: opencode-go/glm-5.3-flash, provider: opencode-go, quota: {billingProduct: opencode-go-subscription}, supportedReasoning: [low, high, max]}
     quota:
       provider: openai-codex
       billingProduct: codex
@@ -228,11 +205,16 @@ runners:
         - herdr
         - executor
   claude:
+    # Rolling CLI aliases are the deliberate catalog identity (owner decision)
+    # so the catalog follows each family. Canonical resolutions as of the
+    # 2026-09-21 audit: fable → claude-fable-5-1, opus → claude-opus-5,
+    # sonnet → claude-sonnet-5, haiku → claude-haiku-4-5-20251001. Haiku
+    # supports no Claude effort — it yields one unreasoned point.
     models:
-      - claude-opus-5
-      - claude-fable-5
-      - fable
-      - claude-sonnet-5
+      - {model: fable, supportedReasoning: [low, medium, high, max]}
+      - {model: opus, supportedReasoning: [low, medium, high, max]}
+      - {model: sonnet, supportedReasoning: [low, medium, high, max]}
+      - {model: haiku}
     quota:
       provider: anthropic
       billingProduct: claude
@@ -275,9 +257,11 @@ runners:
         - herdr
         - executor
   agy:
+    # Reasoning is encoded in the model id — one bare point per model.
     models:
-      - gemini-3.8-flash-high
-      - gemini-3.8-flash-low
+      - {model: gemini-3.8-flash-low}
+      - {model: gemini-3.8-flash-medium}
+      - {model: gemini-3.8-flash-high}
     quota:
       provider: google
       billingProduct: antigravity
@@ -293,9 +277,18 @@ runners:
       skillSelection: ambient
       toolSelection: ambient
   devin:
+    # Specialist tiers plus the audit's benchmarked Fusion pairings; reasoning
+    # is model-encoded. The `adaptive` router model is deliberately absent.
     models:
-      - swe-2-max
-      - fusion-gpt-6-astra-high-sidekick-swe-2-high
+      - {model: swe-2-medium}
+      - {model: swe-2-high}
+      - {model: swe-2-max}
+      - {model: swe-1-7-lightning-medium}
+      - {model: swe-1-7-lightning}
+      - {model: fusion-claude-fable-5-1-medium-sidekick-swe-2-medium}
+      - {model: fusion-claude-fable-5-1-high-sidekick-swe-2-medium}
+      - {model: fusion-gpt-6-astra-medium-sidekick-swe-2-medium}
+      - {model: fusion-gpt-6-astra-high-sidekick-swe-2-medium}
     quota:
       provider: cognition
       billingProduct: devin
@@ -311,9 +304,80 @@ runners:
       skillSelection: ambient
       toolSelection: ambient
 
+# Reviewed operating-point policy (ADR-037) — the FROZEN audited table from
+# plan-delta-model-audit v3.1 Appendix A, transcribed verbatim. One entry per
+# generated point — each model crossed with its own declared reasoning set —
+# keyed by the exact opaque point id; the parser requires this key set to
+# equal the generated set, so a missing or unknown id invalidates the
+# catalog. Classes derive from the audit's deterministic thresholds: cost on
+# list-equivalent output price (≤1.5 low, ≤15 medium, ≤25 high, >25 extreme;
+# subscription-included routes keep list-equivalent classes), latency on
+# end-to-end or decode evidence with a +1 step above medium reasoning.
+# Evidence limitation, recorded per the audit: the OpenCode Go GLM route has
+# no independent latency measurement and is classed conservatively high;
+# Devin classes rest on published task economics, not wall-clock latency.
+pointPolicy:
+  pi:openai-codex/gpt-5.6-luna:off: {costClass: low, latencyClass: low}
+  pi:openai-codex/gpt-5.6-luna:low: {costClass: low, latencyClass: low}
+  pi:openai-codex/gpt-5.6-luna:medium: {costClass: low, latencyClass: low}
+  pi:openai-codex/gpt-5.6-luna:high: {costClass: low, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-luna:xhigh: {costClass: low, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-luna:max: {costClass: low, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-terra:off: {costClass: medium, latencyClass: low}
+  pi:openai-codex/gpt-5.6-terra:low: {costClass: medium, latencyClass: low}
+  pi:openai-codex/gpt-5.6-terra:medium: {costClass: medium, latencyClass: low}
+  pi:openai-codex/gpt-5.6-terra:high: {costClass: medium, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-terra:xhigh: {costClass: medium, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-terra:max: {costClass: medium, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-sol:off: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-sol:low: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-sol:medium: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-5.6-sol:high: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-5.6-sol:xhigh: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-5.6-sol:max: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-6-astra:low: {costClass: extreme, latencyClass: high}
+  pi:openai-codex/gpt-6-astra:medium: {costClass: extreme, latencyClass: high}
+  pi:openai-codex/gpt-6-astra:high: {costClass: extreme, latencyClass: extreme}
+  pi:openai-codex/gpt-6-astra:xhigh: {costClass: extreme, latencyClass: extreme}
+  pi:openai-codex/gpt-6-astra:max: {costClass: extreme, latencyClass: extreme}
+  claude:fable:low: {costClass: extreme, latencyClass: high}
+  claude:fable:medium: {costClass: extreme, latencyClass: high}
+  claude:fable:high: {costClass: extreme, latencyClass: extreme}
+  claude:fable:max: {costClass: extreme, latencyClass: extreme}
+  claude:opus:low: {costClass: high, latencyClass: medium}
+  claude:opus:medium: {costClass: high, latencyClass: medium}
+  claude:opus:high: {costClass: high, latencyClass: high}
+  claude:opus:max: {costClass: high, latencyClass: high}
+  claude:sonnet:low: {costClass: medium, latencyClass: low}
+  claude:sonnet:medium: {costClass: medium, latencyClass: low}
+  claude:sonnet:high: {costClass: medium, latencyClass: medium}
+  claude:sonnet:max: {costClass: medium, latencyClass: medium}
+  claude:haiku: {costClass: medium, latencyClass: low}
+  agy:gemini-3.8-flash-low: {costClass: medium, latencyClass: medium}
+  agy:gemini-3.8-flash-medium: {costClass: medium, latencyClass: medium}
+  agy:gemini-3.8-flash-high: {costClass: medium, latencyClass: high}
+  pi:zai/glm-5.3-flash:low: {costClass: low, latencyClass: medium}
+  pi:zai/glm-5.3-flash:high: {costClass: low, latencyClass: high}
+  pi:zai/glm-5.3-flash:max: {costClass: low, latencyClass: high}
+  pi:opencode-go/glm-5.3-flash:low: {costClass: low, latencyClass: high}
+  pi:opencode-go/glm-5.3-flash:high: {costClass: low, latencyClass: high}
+  pi:opencode-go/glm-5.3-flash:max: {costClass: low, latencyClass: high}
+  devin:swe-2-medium: {costClass: medium, latencyClass: medium}
+  devin:swe-2-high: {costClass: medium, latencyClass: high}
+  devin:swe-2-max: {costClass: medium, latencyClass: high}
+  devin:swe-1-7-lightning-medium: {costClass: medium, latencyClass: low}
+  devin:swe-1-7-lightning: {costClass: medium, latencyClass: low}
+  devin:fusion-claude-fable-5-1-medium-sidekick-swe-2-medium: {costClass: extreme, latencyClass: high}
+  devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium: {costClass: extreme, latencyClass: extreme}
+  devin:fusion-gpt-6-astra-medium-sidekick-swe-2-medium: {costClass: extreme, latencyClass: high}
+  devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium: {costClass: extreme, latencyClass: extreme}
+
 # The reactive classified-failure cooldown floor is mandatory for every runner
 # (B2 owns the record). Proactive sources are declared where they exist so B12
-# can attach them without changing this schema.
+# can attach them without changing this schema. Sources stay runner-scoped:
+# `pi-quotas` covers only the runner's openai-codex domain — the zai and
+# opencode-go model entries have no proactive source in this migration (a
+# tracked follow-up keys proactive sources by quota domain).
 quotaSources:
   - name: reactive-cooldowns
     kind: floor

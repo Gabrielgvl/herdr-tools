@@ -594,7 +594,7 @@ describe("MCP server lifecycle", () => {
       agentKind: "pi",
       agentSession: { source: "pi", agent: "pi", kind: "id", value: "worker-session" },
       recipientKey: "recipient-test-12345678",
-      candidateName: "worker-pi",
+      operatingPointId: "worker-pi",
       kind: "pi",
       capable: true,
       reason: "test capability"

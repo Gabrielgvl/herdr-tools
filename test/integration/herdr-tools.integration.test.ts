@@ -6,8 +6,10 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import extension, { CORE_TOOL_NAMES } from "../../index.js";
-import { renderAssignment } from "../../src/launch-schema.js";
+import extension, { CORE_TOOL_NAMES, createRuntime, type ExtensionRuntime } from "../../index.js";
+import { createLaunchTool } from "../../src/tools/launch.js";
+import type { TaskEvaluation, TaskEvaluationInput, TypeSafeSpecClient } from "../../src/typesafe-spec.js";
+import { renderTask } from "../../src/launch-schema.js";
 import { renderHandoffContract, type HandoffAllocation } from "../../src/handoff.js";
 import { startDisposableSocketProxy, stopDisposableServer, waitForCondition } from "./disposable-session.js";
 
@@ -28,21 +30,27 @@ function resultObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function singleLaunchDetails(value: unknown): Record<string, unknown> {
+/**
+ * The uniform launch result (ADR-037): every `herdr_launch` call returns this
+ * one shape. Rich per-child evidence (readiness, prompt timing, supervision)
+ * is deliberately not published on the result — it lives on the supervisor job
+ * and the decision log, which the assertions below read back.
+ */
+function launchDetails(value: unknown): Record<string, unknown> {
   const details = resultObject(value);
-  if (details.operation === "launch") return details;
-  if (details.operation !== "launch_batch") throw new Error("herdr_launch returned neither launch nor launch_batch details");
-  const children = details.children;
-  if (details.outcome !== "launched" || !Array.isArray(children) || children.length !== 1) {
-    const router = Array.isArray(details.router) ? details.router.map((value) => {
-      const decision = resultObject(value);
-      return [decision.kind, decision.reason, decision.component].filter((field) => typeof field === "string").join(":");
-    }).join(",") : "invalid";
-    throw new Error(`one-spec launch returned outcome=${String(details.outcome)} children=${Array.isArray(children) ? children.length : "invalid"} router=${router}`);
+  if (details.kind !== "launch") throw new Error("herdr_launch returned non-launch details");
+  return details;
+}
+
+function singleLaunchChild(value: unknown): Record<string, unknown> {
+  const launch = launchDetails(value);
+  const children = launch.children;
+  if (!Array.isArray(children) || children.length !== 1) {
+    throw new Error(`one-Task launch returned outcome=${String(launch.outcome)} children=${Array.isArray(children) ? children.length : "invalid"}`);
   }
   const child = resultObject(children[0]);
-  if (child.status !== "launched") throw new Error(`one-spec launch child returned status=${String(child.status)}`);
-  return resultObject(child.launch);
+  if (typeof child.target !== "string" || child.target.length === 0) throw new Error("one-Task launch child omitted its runtime-minted target");
+  return child;
 }
 
 describe.skipIf(!enabled)("disposable Herdr integration", () => {
@@ -67,7 +75,13 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     forceNextPromptConfirmationFailure: boolean;
     promptConfirmationFailurePaneId?: string;
     forceNextAgyStartFailure: boolean;
-    captureAgyPrePromptFor?: string;
+    /** The exec interceptor shared with the AGY fixture runtime. */
+    execCli?: ExtensionAPI["exec"];
+    /** The AGY fixture's second runtime: launched only by AGY-gated tests. */
+    agyRuntime?: ExtensionRuntime;
+    agyLaunch?: ExecutableTool;
+    /** Set to capture the provisional supervisor at the next prompt submission; the minted child name is resolved from the agent-start call. */
+    captureAgyPrePromptFor?: boolean;
     agyPrePromptJob?: Record<string, unknown>;
     agyPrePromptAgent?: Record<string, unknown>;
     agyPrePromptRecipientFailureCode?: string;
@@ -112,51 +126,115 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     return diagnostic;
   };
 
-  const readinessDiagnostic = (details: Record<string, unknown>): Record<string, unknown> => {
-    const readiness = resultObject(details.readiness ?? {});
-    const records = Array.isArray(readiness.records) ? readiness.records.map((value) => {
-      const record = resultObject(value);
-      return { recordSource: record.source, ...diagnosticRecord(record) };
-    }) : [];
-    return {
-      budgetBasis: readiness.budgetBasis,
-      budgetMs: readiness.budgetMs,
-      elapsedMs: readiness.elapsedMs,
-      samples: readiness.samples,
-      lastPendingReason: readiness.lastPendingReason,
-      baselineRequired: readiness.baselineRequired,
-      records
-    };
+  /**
+   * The supervisor job targeting one runtime-minted child name. A retained
+   * supervisor is the authoritative recovery handle for a launch whose prompt
+   * submission could not be confirmed: the uniform result publishes no IDs for
+   * a failed child, so they are read back here.
+   */
+  const supervisorJobForTarget = async (target: string): Promise<Record<string, unknown>> => {
+    const listed = resultObject((await tool("herdr_jobs").execute(`supervisor-list-${target}`, { operation: "list", kind: "supervisor" }, signal(), undefined, toolContext())).details);
+    const summaries = Array.isArray(listed.jobs) ? listed.jobs.map((value) => resultObject(value)) : [];
+    const summary = summaries.find((job) => Array.isArray(job.targets) && job.targets.length === 1 && job.targets[0] === target);
+    if (!summary || typeof summary.jobId !== "string") throw new Error(`no supervisor job targets child ${target}`);
+    return resultObject((await tool("herdr_jobs").execute(`supervisor-get-${target}`, { operation: "get", jobId: summary.jobId }, signal(), undefined, toolContext())).details);
   };
 
-  const SCHEDULING_TOLERANCE_MS = 500;
-  const assertLaunchPhaseTiming = (details: Record<string, unknown>, monotonicWallElapsedMs: number, confirmationTimedOut: boolean): void => {
-    const readiness = resultObject(details.readiness);
-    const confirmation = resultObject(details.promptConfirmation);
-    const timing = resultObject(details.timing);
-    const selectedStartReadinessMs = timing.selectedStartReadinessMs;
-    const promptSubmissionAckMs = timing.promptSubmissionAckMs;
-    const postAckConfirmationMs = timing.postAckConfirmationMs;
-    for (const duration of [selectedStartReadinessMs, promptSubmissionAckMs, postAckConfirmationMs]) {
-      expect(Number.isSafeInteger(duration)).toBe(true);
-      expect(Number(duration)).toBeGreaterThanOrEqual(0);
+  /** The pane a supervisor job watches: bound child view, provisional view, else committed target ID. */
+  const jobPaneId = (job: Record<string, unknown>): string => {
+    const supervision = resultObject(job.supervision ?? {});
+    for (const view of [supervision.child, supervision.provisional]) {
+      const paneId = resultObject(view ?? {}).paneId;
+      if (typeof paneId === "string" && paneId.length > 0) return paneId;
     }
-    const decomposedPhaseElapsedMs = Number(selectedStartReadinessMs) + Number(promptSubmissionAckMs) + Number(postAckConfirmationMs);
-    expect(decomposedPhaseElapsedMs).toBeLessThanOrEqual(monotonicWallElapsedMs + SCHEDULING_TOLERANCE_MS);
-    expect(readiness.elapsedMs).toBe(selectedStartReadinessMs);
-    expect(confirmation.elapsedMs).toBe(postAckConfirmationMs);
-    if (confirmationTimedOut) {
-      expect(Number(postAckConfirmationMs)).toBeGreaterThanOrEqual(5_000 - SCHEDULING_TOLERANCE_MS);
-      expect(Number(postAckConfirmationMs)).toBeLessThanOrEqual(monotonicWallElapsedMs + SCHEDULING_TOLERANCE_MS);
+    const targetIds = resultObject(job.request ?? {}).targetIds;
+    if (Array.isArray(targetIds) && typeof targetIds[0] === "string") return targetIds[0];
+    throw new Error("supervisor job carried no child pane identity");
+  };
+
+  /**
+   * Deterministic reviewed-point selection for the AGY-gated tests: the
+   * catalog's AGY points rank first and Pi second at every tier, so the
+   * runtime's own policy, tier envelope, and availability re-checks — all real
+   * — resolve `agy:gemini-3.8-flash-low` as the first chain member. Every
+   * other piece of the launch (socket transport, supervision, attachments,
+   * recipients) stays the production plumbing.
+   */
+  const agyFirstSpecClient: Pick<TypeSafeSpecClient, "evaluate"> = {
+    evaluate: async (input: TaskEvaluationInput): Promise<TaskEvaluation> => {
+      const fitness: Record<string, Record<string, number>> = {};
+      for (const [index, point] of (input.catalog.points ?? []).entries()) {
+        const score = point.runner === "agy" ? 0.95 : point.runner === "pi" ? 0.9 : 0.5;
+        fitness[String(index)] = { utility: score, economy: score, standard: score, strong: score, frontier: score, max: score };
+      }
+      const resources: Record<string, Record<string, Record<string, number>>> = {};
+      for (const [kind, runner] of input.catalog.runners) {
+        const fields: Record<string, Record<string, number>> = {};
+        for (const field of ["tools", "extensions", "skills", "plugins", "mcp"] as const) {
+          for (const name of runner.pools[field]) (fields[field] ??= {})[name] = 0.9;
+        }
+        if (Object.keys(fields).length > 0) resources[kind] = fields;
+      }
+      return {
+        kind: "response",
+        response: {
+          quality: { done_when_verifiable: 0.95 },
+          intent: { value: "implement", confidence: 0.95 },
+          resources,
+          fitness,
+          uncertainDimensions: []
+        }
+      };
     }
   };
 
-  const recordDeliveryFailureBeforeTeardown = async (label: string, failure: { code?: string; details: Record<string, unknown> }, elapsedMs: number): Promise<void> => {
-    const details = failure.details;
-    process.stderr.write(`INTEGRATION_DELIVERY_FAILURE_DETAILS ${label} ${JSON.stringify({ elapsedMs, code: failure.code, causeCode: details.causeCode, phase: details.phase, promptSubmitted: details.promptSubmitted, promptConsumption: details.promptConsumption, readiness: readinessDiagnostic(details), initialPromptSubmission: details.initialPromptSubmission, promptConfirmation: details.promptConfirmation, timing: details.timing, created: details.created })}\n`);
-    const created = resultObject(details.created ?? {});
-    const paneId = typeof created.paneId === "string" ? created.paneId : typeof details.paneId === "string" ? details.paneId : undefined;
-    if (!paneId) return;
+  /** The lazily-built AGY fixture: a second runtime bound to the same fixture pane and socket proxy, with only the spec evaluator stubbed. */
+  const agyHarness = (): { launch: ExecutableTool; jobs: ExtensionRuntime["jobs"] } => {
+    if (state.agyRuntime === undefined) {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        HERDR_ENV: "1",
+        HERDR_WORKSPACE_ID: state.workspaceId!,
+        HERDR_TAB_ID: state.rootTabId!,
+        HERDR_PANE_ID: state.rootPaneId!,
+        HERDR_SOCKET_PATH: state.socketProxy!.path
+      };
+      const runtime = createRuntime({ exec: state.execCli! }, env);
+      state.agyLaunch = createLaunchTool({
+        cli: runtime.cli,
+        context: runtime.context,
+        cwd: state.cwd,
+        preflight: async () => undefined,
+        ownership: runtime.ownership,
+        supervision: runtime.supervision,
+        queueFlush: runtime.queueFlush,
+        attachments: runtime.attachments,
+        recipients: runtime.recipients,
+        specClient: agyFirstSpecClient
+      }) as unknown as ExecutableTool;
+      state.agyRuntime = runtime;
+    }
+    return { launch: state.agyLaunch!, jobs: state.agyRuntime.jobs };
+  };
+
+  /** The AGY fixture's supervisor job readback — its reservations live in the second runtime's registry, not the registered surface's. */
+  const agyJob = (jobId: string): Record<string, unknown> => {
+    const detail = state.agyRuntime?.jobs.get(jobId);
+    if (detail === undefined) throw new Error(`AGY supervisor job ${jobId} vanished`);
+    return resultObject({ operation: "jobs", view: "job", ...detail });
+  };
+
+  const agyJobForTarget = (target: string): Record<string, unknown> => {
+    const jobs = state.agyRuntime?.jobs;
+    if (!jobs) throw new Error("AGY fixture registry absent");
+    const summary = jobs.list(undefined, 0, 50, "supervisor").jobs.find((job) => Array.isArray(job.targets) && job.targets.length === 1 && job.targets[0] === target);
+    if (!summary || typeof summary.jobId !== "string") throw new Error(`no supervisor job targets child ${target}`);
+    return agyJob(summary.jobId);
+  };
+
+  const recordDeliveryFailureBeforeTeardown = async (label: string, launch: Record<string, unknown>, child: Record<string, unknown>, paneId: string | undefined, elapsedMs: number): Promise<void> => {
+    process.stderr.write(`INTEGRATION_DELIVERY_FAILURE_DETAILS ${label} ${JSON.stringify({ elapsedMs, launch, child })}\n`);
+    if (paneId === undefined) return;
     for (const [diagnostic, args] of [
       ["agent_get", ["agent", "get", paneId]],
       ["pane_get", ["pane", "get", paneId]]
@@ -180,36 +258,31 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
   const assertUnconfirmedRecovery = async (
     label: string,
-    details: Record<string, unknown>,
+    launch: Record<string, unknown>,
+    childTarget: string,
+    job: Record<string, unknown>,
     promptCanary: string,
     promptStart: number,
     cliStart: number,
     toolCallStart: number
   ): Promise<void> => {
-    expect(details).toMatchObject({
-      assignmentState: "unconfirmed",
-      recipientRegistered: false,
-      paneId: expect.any(String),
-      supervisorJobId: expect.any(String),
-      supervision: {
-        jobId: expect.any(String),
-        state: "active",
-        child: {
-          agentName: expect.any(String),
-          agentKind: expect.any(String),
-          paneId: expect.any(String),
-          terminalId: expect.any(String),
-          profileName: expect.any(String)
-        }
-      }
+    const supervisorJobId = job.jobId;
+    if (typeof supervisorJobId !== "string") throw new Error("unconfirmed launch's supervisor omitted its job ID");
+    const supervision = resultObject(job.supervision);
+    const childView = resultObject(supervision.child ?? supervision.provisional);
+    const paneId = jobPaneId(job);
+    expect(job).toMatchObject({
+      operation: "jobs",
+      view: "job",
+      jobId: supervisorJobId,
+      kind: "supervisor",
+      request: { kind: "supervisor" },
+      operation_phase: expect.stringMatching(/^(?:accepted|running)$/u)
     });
-    const paneId = details.paneId;
-    const supervisorJobId = details.supervisorJobId;
-    if (typeof paneId !== "string" || typeof supervisorJobId !== "string") throw new Error("unconfirmed launch omitted exact recovery IDs");
-    const launchSupervision = resultObject(details.supervision);
-    const launchChild = resultObject(launchSupervision.child);
-    expect(launchSupervision.jobId).toBe(supervisorJobId);
-    expect(launchChild.paneId).toBe(paneId);
+    // A bound child commits its pane; a provisional child still waits to bind.
+    if (supervision.child !== undefined) expect(job).toMatchObject({ request: { targetIds: [paneId] } });
+    expect(childView).toMatchObject({ agentName: childTarget, paneId });
+    expect(job).not.toHaveProperty("supervision_result");
 
     const promptCalls = state.socketProxy?.requests.slice(promptStart) ?? [];
     expect(promptCalls).toHaveLength(1);
@@ -226,50 +299,18 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
 
     const liveResult = resultObject(resultObject(await runNamed(["agent", "get", paneId])).result);
     const liveAgent = resultObject(liveResult.agent ?? liveResult);
-    const expectedSession = resultObject(resultObject(details.initialPromptSubmission).agentSession);
     expect({
       paneId: liveAgent.pane_id,
       terminalId: liveAgent.terminal_id,
       agentName: liveAgent.name ?? liveAgent.agent_name,
-      agentKind: liveAgent.agent,
-      agentSession: liveAgent.agent_session
+      agentKind: liveAgent.agent
     }).toEqual({
       paneId,
-      terminalId: launchChild.terminalId,
-      agentName: launchChild.agentName,
-      agentKind: launchChild.agentKind,
-      agentSession: expectedSession
+      terminalId: childView.terminalId,
+      agentName: childTarget,
+      agentKind: childView.agentKind
     });
 
-    const jobResult = await tool("herdr_jobs").execute(`${label}-supervisor`, { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext());
-    const job = resultObject(jobResult.details);
-    expect(job).toMatchObject({
-      operation: "jobs",
-      view: "job",
-      jobId: supervisorJobId,
-      kind: "supervisor",
-      request: { kind: "supervisor", targetIds: [paneId] },
-      supervision: {
-        state: expect.stringMatching(/^(?:active|degraded)$/u),
-        child: {
-          agentName: launchChild.agentName,
-          agentKind: launchChild.agentKind,
-          paneId,
-          terminalId: launchChild.terminalId
-        },
-        monitor: {
-          reconciliation: {
-            intervalMs: 30_000,
-            degraded: expect.any(Boolean),
-            consecutiveFailures: expect.any(Number)
-          }
-        }
-      }
-    });
-    expect(["accepted", "running"]).toContain(job.operation_phase);
-    expect(job).not.toHaveProperty("supervision_result");
-
-    const supervision = resultObject(job.supervision);
     const monitor = resultObject(supervision.monitor);
     const reconciliation = resultObject(monitor.reconciliation);
     const healthKeys = new Set(["intervalMs", "degraded", "consecutiveFailures", "lastAttemptAtMs", "lastSuccessAtMs", "lastFailureAtMs", "lastFailureReason"]);
@@ -277,71 +318,63 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(Number.isSafeInteger(reconciliation.consecutiveFailures)).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(reconciliation), "utf8")).toBeLessThanOrEqual(512);
     const jobEvidence = JSON.stringify(job);
-    expect(jobEvidence.includes(promptCanary), "the supervisor job exposed the assignment prompt canary").toBe(false);
-    expect(jobEvidence).not.toContain(String(expectedSession.value));
+    expect(jobEvidence.includes(promptCanary), "the supervisor job exposed the task prompt canary").toBe(false);
     if (!state.unconfirmedRecoveries.some((entry) => entry.paneId === paneId && entry.supervisorJobId === supervisorJobId)) {
       state.unconfirmedRecoveries.push({ paneId, supervisorJobId });
     }
     process.stderr.write(`INTEGRATION_UNCONFIRMED_RECOVERY ${label} ${JSON.stringify({ paneId, supervisorJobId, operation_phase: job.operation_phase, supervisionState: supervision.state, reconciliation })}\n`);
-    expect(JSON.stringify(details).includes(promptCanary), "rich launch failure details exposed the assignment prompt canary").toBe(false);
+    expect(JSON.stringify(launch).includes(promptCanary), "the uniform launch result exposed the task prompt canary").toBe(false);
   };
 
-  type LaunchDelivery = { confirmed: true; details: Record<string, unknown> } | { confirmed: false; details: Record<string, unknown> };
+  type LaunchDelivery = {
+    confirmed: boolean;
+    launch: Record<string, unknown>;
+    child: Record<string, unknown>;
+    paneId: string;
+    supervisorJobId: string;
+  };
 
   const deliverLaunch = async (label: string, promptCanary: string, call: () => Promise<{ details?: Record<string, unknown> }>): Promise<LaunchDelivery> => {
     const startedAt = performance.now();
     const promptStart = state.socketProxy?.requests.length ?? 0;
     const cliStart = state.cliCalls.length;
     const toolCallStart = state.toolCalls.length;
-    try {
-      const result = await call();
-      const wallElapsedMs = performance.now() - startedAt;
-      const details = singleLaunchDetails(result.details);
-      expect(details).toMatchObject({
-        promptSubmitted: true,
-        promptConsumption: "confirmed",
-        readiness: { budgetBasis: "immediately_before_selected_agent_start", budgetMs: 120_000, elapsedMs: expect.any(Number), samples: expect.any(Number), baselineRequired: true, records: expect.any(Array) },
-        initialPromptSubmission: { confirmed: true, operationId: expect.any(String) },
-        promptConfirmation: { elapsedMs: expect.any(Number) },
-        timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) }
-      });
-      assertLaunchPhaseTiming(details, wallElapsedMs, false);
+    const result = await call();
+    const elapsedMs = performance.now() - startedAt;
+    const launch = launchDetails(result.details);
+    const child = singleLaunchChild(result.details);
+    const childTarget = String(child.target);
+    if (child.state === "launched") {
+      if (typeof child.supervisorJobId !== "string") throw new Error(`${label} launched child omitted its supervisor job ID`);
+      const supervisorJobId = child.supervisorJobId;
+      const job = resultObject((await tool("herdr_jobs").execute(`${label}-launch-supervisor`, { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
+      const paneId = jobPaneId(job);
       const promptRequests = state.socketProxy?.requests.slice(promptStart) ?? [];
-      const operationId = String(resultObject(details.initialPromptSubmission).operationId);
-      const promptRequest = promptRequests.find((request) => request.id === operationId);
-      expect(promptRequest).toBeDefined();
-      process.stderr.write(`INTEGRATION_LAUNCH_READINESS ${label} ${JSON.stringify(readinessDiagnostic(details))}\n`);
-      process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label}\n`);
-      return { confirmed: true, details };
-    } catch (error) {
-      const failure = error as { code?: string; details?: Record<string, unknown> };
-      if (failure.details === undefined) throw error;
-      const attachment = resultObject(failure.details.attachment ?? {});
-      if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
-      const elapsedMs = performance.now() - startedAt;
-      process.stderr.write(`INTEGRATION_DELIVERY_FAILED ${label} code=${String(failure.code)} causeCode=${String(failure.details.causeCode)} phase=${String(failure.details.phase)}\n`);
-      await recordDeliveryFailureBeforeTeardown(label, { code: failure.code, details: failure.details }, elapsedMs);
-      if (failure.code !== "LAUNCH_FAILED" || failure.details.causeCode !== "PROMPT_UNCONFIRMED") throw error;
-      expect(failure.details).toMatchObject({
-        phase: "prompt_verification",
-        promptSubmitted: true,
-        promptConsumption: "unconfirmed",
-        readiness: { budgetBasis: "immediately_before_selected_agent_start", budgetMs: 120_000, elapsedMs: expect.any(Number), samples: expect.any(Number), baselineRequired: true, records: expect.any(Array) },
-        initialPromptSubmission: { confirmed: true, operationId: expect.any(String), agentSession: { source: expect.any(String), agent: expect.any(String), kind: expect.any(String), value: expect.any(String) } },
-        promptConfirmation: { timeoutMs: 5_000, pollIntervalMs: 100, elapsedMs: expect.any(Number) },
-        timing: { selectedStartReadinessMs: expect.any(Number), promptSubmissionAckMs: expect.any(Number), postAckConfirmationMs: expect.any(Number) },
-        created: expect.any(Object)
-      });
-      const promptRequests = state.socketProxy?.requests.slice(promptStart) ?? [];
-      const operationId = String(resultObject(failure.details.initialPromptSubmission).operationId);
-      const promptRequest = promptRequests.find((request) => request.id === operationId);
-      expect(promptRequest).toBeDefined();
-      assertLaunchPhaseTiming(failure.details, elapsedMs, resultObject(failure.details.promptConfirmation).reason === "timeout");
-      await assertUnconfirmedRecovery(label, failure.details, promptCanary, promptStart, cliStart, toolCallStart);
-      // The helper performed only read-only recovery diagnostics. Callers return
-      // immediately, so no marker, wait, communication, retry, or cleanup follows.
-      return { confirmed: false, details: failure.details };
+      expect(promptRequests).toHaveLength(1);
+      expect(promptRequests[0]).toMatchObject({ method: "agent.prompt", target: paneId });
+      process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label} ${JSON.stringify({ elapsedMs, target: childTarget, paneId, supervisorJobId, operatingPointId: child.operatingPointId })}\n`);
+      return { confirmed: true, launch, child, paneId, supervisorJobId };
     }
+    // The tolerated outcome is a post-submission failure: exactly one prompt
+    // request reached the socket, so the task may have been consumed.
+    // Any other child outcome — abstained, failed before submission, or
+    // multiple submissions — is a real defect and fails this run.
+    const childError = resultObject(child.error ?? {});
+    const promptRequests = (state.socketProxy?.requests.slice(promptStart) ?? []).filter((request) => request.method === "agent.prompt");
+    if (child.state !== "failed" || childError.code !== "PROMPT_UNCONFIRMED" || promptRequests.length !== 1) {
+      await recordDeliveryFailureBeforeTeardown(label, launch, child, undefined, elapsedMs);
+      throw new Error(`${label} returned state=${String(child.state)} code=${String(childError.code)} outcome=${String(launch.outcome)}`);
+    }
+    const attachmentPath = promptRequests[0]!.text?.match(/attachment-path: (\S+)/u)?.[1];
+    if (attachmentPath !== undefined) state.attachmentPaths.push(attachmentPath);
+    const job = await supervisorJobForTarget(childTarget);
+    const paneId = jobPaneId(job);
+    const supervisorJobId = String(job.jobId);
+    await recordDeliveryFailureBeforeTeardown(label, launch, child, paneId, elapsedMs);
+    await assertUnconfirmedRecovery(label, launch, childTarget, job, promptCanary, promptStart, cliStart, toolCallStart);
+    // The helper performed only read-only recovery diagnostics. Callers return
+    // immediately, so no marker, wait, communication, retry, or cleanup follows.
+    return { confirmed: false, launch, child, paneId, supervisorJobId };
   };
 
   const tool = (name: string): ExecutableTool => {
@@ -359,9 +392,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   const toolContext = () => ({ cwd: state.cwd, hasUI: false }) as ExtensionContext;
   const signal = () => new AbortController().signal;
 
-  const closeConfirmedFixturePane = async (label: string, details: Record<string, unknown>): Promise<void> => {
-    const paneId = details.paneId;
-    if (typeof paneId !== "string") throw new Error(`${label} omitted its pane ID before harness cleanup`);
+  const closeConfirmedFixturePane = async (label: string, paneId: string): Promise<void> => {
     await runNamed(["pane", "close", paneId]);
     const deadline = performance.now() + 10_000;
     while (performance.now() < deadline) {
@@ -408,12 +439,16 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
               state.promptConfirmationFailurePaneId = request.target;
             }
             if (request.method === "agent.prompt" && state.captureAgyPrePromptFor && request.target) {
-              const agentName = state.captureAgyPrePromptFor;
-              const listed = resultObject((await tool("herdr_jobs").execute("agy-pre-prompt-jobs", { operation: "list", kind: "supervisor" }, signal(), undefined, toolContext())).details);
-              const summaries = Array.isArray(listed.jobs) ? listed.jobs.map((value) => resultObject(value)) : [];
-              const summary = summaries.find((job) => Array.isArray(job.targets) && job.targets.length === 1 && job.targets[0] === agentName);
+              const startCall = [...state.cliCalls].reverse().find((args) => args[0] === "agent" && args[1] === "start");
+              const agentName = startCall?.[2];
+              if (typeof agentName !== "string") throw new Error("AGY pre-prompt capture found no agent start call");
+              const jobs = state.agyRuntime?.jobs;
+              if (!jobs) throw new Error("AGY pre-prompt capture ran without the AGY fixture registry");
+              const summary = jobs.list(undefined, 0, 50, "supervisor").jobs.find((job) => Array.isArray(job.targets) && job.targets.length === 1 && job.targets[0] === agentName);
               if (!summary || typeof summary.jobId !== "string") throw new Error("AGY provisional supervisor job was not published before prompt socket submission");
-              state.agyPrePromptJob = resultObject((await tool("herdr_jobs").execute("agy-pre-prompt-job", { operation: "get", jobId: summary.jobId }, signal(), undefined, toolContext())).details);
+              const detail = jobs.get(summary.jobId);
+              if (detail === undefined) throw new Error("AGY provisional supervisor job vanished before prompt socket submission");
+              state.agyPrePromptJob = resultObject({ operation: "jobs", view: "job", ...detail });
               const live = resultObject(resultObject(await runNamed(["agent", "get", request.target])).result);
               state.agyPrePromptAgent = resultObject(live.agent ?? live);
               try {
@@ -491,6 +526,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         state.handlers.push(event);
       }
     } as unknown as ExtensionAPI;
+    state.execCli = pi.exec.bind(pi);
 
     const saved = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, tab: process.env.HERDR_TAB_ID, pane: process.env.HERDR_PANE_ID, socket: process.env.HERDR_SOCKET_PATH };
     const savedCwd = process.cwd();
@@ -526,6 +562,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         expect(panes).toEqual(expect.arrayContaining([expect.objectContaining({ pane_id: recovery.paneId })]));
       }
       process.stderr.write(`INTEGRATION_UNCONFIRMED_RETAINED_UNTIL_HARNESS_TEARDOWN ${JSON.stringify(state.unconfirmedRecoveries)}\n`);
+    }
+    if (state.agyRuntime !== undefined) {
+      await state.agyRuntime.supervision.shutdown();
+      state.agyRuntime.jobs.shutdown();
+      await state.agyRuntime.queueFlush.shutdown();
+      state.agyRuntime.cli.closePromptTransport();
     }
     if (state.fixtureCreated && state.workspaceId) {
       await runNamed(["workspace", "close", state.workspaceId]).catch((error) => process.stderr.write(`INTEGRATION_TEARDOWN_FAILURE ${String(error)}\n`));
@@ -564,80 +606,81 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(topologyIds(defaultAfter)).toEqual(state.baseline);
   }, 120_000);
 
-  it.runIf(agyEnabled)("qualifies one AGY assignment from provisional publication through exact attachment readback", async () => {
-    const launchName = `it-agy-${process.pid}`;
-    const agentName = `${launchName}-qual-1`;
+  it.runIf(agyEnabled)("qualifies one AGY task from provisional publication through exact attachment readback", async () => {
+    const harness = agyHarness();
     const nonce = `agy-attachment-${randomUUID()}`;
     const promptStart = state.socketProxy?.requests.length ?? 0;
     const cliStart = state.cliCalls.length;
-    state.captureAgyPrePromptFor = agentName;
+    state.captureAgyPrePromptFor = true;
     const startedAt = performance.now();
-    let details: Record<string, unknown>;
+    // Delivery is runtime-owned, so the attachment path is exercised by making
+    // the Task body exceed the inline bound. The stubbed evaluator ranks the
+    // reviewed AGY points first, so `agy:gemini-3.8-flash-low` is the runtime's
+    // first chain member at the standard tier.
+    const padding = `Qualifier detail line ${"x".repeat(24)}.\n`.repeat(900);
+    const task = {
+      objective: `Read this task attachment through the granted directory. Respond with only this exact token: ${nonce}`,
+      scope: `Read the attachment only. Change nothing.\n\n${padding}`,
+      doneWhen: ["The reply is exactly the attachment token and nothing else."],
+      constraints: ["none"],
+      label: "agy-qualification"
+    };
+    let launch: Record<string, unknown>;
+    let child: Record<string, unknown>;
     try {
-      const launched = await tool("herdr_launch").execute("agy-qualification", {
-        name: launchName,
-        specs: [{
-          label: "qual",
-          instructions: "Read the assignment attachment and return the exact token.",
-          assignment: {
-            objective: `Read this assignment attachment through the granted directory. Respond with only this exact token: ${nonce}`,
-            scope: "Read the attachment only. Change nothing.",
-            verification: "The reply is exactly the token and nothing else."
-          },
-          category: "cheap"
-        }],
-        placement: { mode: "new_tab", tabLabel: "agy-qualification" },
-        assignmentDelivery: "attachment",
-        supervisionDigest: { doneWhen: ["The reply is exactly the attachment token and nothing else."], constraints: ["none"] }
-      }, signal(), undefined, toolContext());
-      details = singleLaunchDetails(launched.details);
-    } catch (error) {
-      const failure = error as { details?: Record<string, unknown> };
-      const failureDetails = resultObject(failure.details);
-      const attachment = resultObject(failureDetails.attachment ?? {});
-      if (typeof attachment.path === "string") state.attachmentPaths.push(attachment.path);
-      const paneId = typeof failureDetails.paneId === "string" ? failureDetails.paneId : undefined;
-      const supervisorJobId = typeof failureDetails.supervisorJobId === "string" ? failureDetails.supervisorJobId : undefined;
-      if (failureDetails.promptSubmitted === true && paneId && supervisorJobId) {
-        expect(state.socketProxy?.requests.slice(promptStart)).toHaveLength(1);
+      const launched = await harness.launch.execute("agy-qualification", task, signal(), undefined, toolContext());
+      launch = launchDetails(launched.details);
+      child = singleLaunchChild(launched.details);
+      if (child.state !== "launched") {
+        // A post-submission failure retains the provisional AGY supervisor; the
+        // result publishes no handles, so they come from the jobs readback.
+        const childError = resultObject(child.error ?? {});
+        const promptCalls = (state.socketProxy?.requests.slice(promptStart) ?? []).filter((request) => request.method === "agent.prompt");
+        if (childError.code !== "PROMPT_UNCONFIRMED" || promptCalls.length !== 1) throw new Error(`agy-qualification child returned state=${String(child.state)} code=${String(childError.code)}`);
+        const retained = agyJobForTarget(String(child.target));
+        const paneId = jobPaneId(retained);
+        const supervisorJobId = String(retained.jobId);
         const failureCalls = state.cliCalls.slice(cliStart);
         expect(failureCalls.filter((args) => args[0] === "agent" && args[1] === "start")).toHaveLength(1);
-        expect(failureCalls.filter((args) => ( ["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
-        expect(failureDetails).toMatchObject({ recipientRegistered: false, attempts: [{ candidate: { runner: "agy", model: "gemini-3.8-flash-low" }, outcome: "selected" }] });
-        const retained = resultObject((await tool("herdr_jobs").execute("agy-retained-provisional", { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
+        expect(failureCalls.filter((args) => (["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
         expect(retained).toMatchObject({
           operation_phase: "running",
           request: { targetIds: [] },
-          supervision: { state: "provisional", provisional: { paneId, agentKind: "agy", profileName: "gemini-3.8-flash-low" } }
+          supervision: { state: "provisional", provisional: { paneId, agentKind: "agy", operatingPointId: "agy:gemini-3.8-flash-low" } }
         });
         expect(retained).not.toHaveProperty("supervision_result");
         state.unconfirmedRecoveries.push({ paneId, supervisorJobId });
-        process.stderr.write(`INTEGRATION_AGY_UNCERTAIN_RETAINED ${JSON.stringify({ paneId, supervisorJobId, details: failureDetails })}\n`);
-        await recordDeliveryFailureBeforeTeardown("agy-qualification", { details: failureDetails }, performance.now() - startedAt);
+        process.stderr.write(`INTEGRATION_AGY_UNCERTAIN_RETAINED ${JSON.stringify({ paneId, supervisorJobId, launch, child })}\n`);
+        await recordDeliveryFailureBeforeTeardown("agy-qualification", launch, child, paneId, performance.now() - startedAt);
+        return;
       }
-      throw error;
     } finally {
       state.captureAgyPrePromptFor = undefined;
     }
 
-    const paneId = String(details.paneId);
-    const attachment = resultObject(details.attachment);
-    const attachmentPath = String(attachment.path);
-    state.attachmentPaths.push(attachmentPath);
-    const promptCalls = state.socketProxy?.requests.slice(promptStart) ?? [];
+    const operatingPointId = String(child.operatingPointId);
+    expect(operatingPointId).toBe("agy:gemini-3.8-flash-low");
+    const agentName = String(child.target);
+    const supervisorJobId = String(child.supervisorJobId);
+    const launchJob = agyJob(supervisorJobId);
+    const paneId = jobPaneId(launchJob);
+    const promptCalls = (state.socketProxy?.requests.slice(promptStart) ?? []).filter((request) => request.method === "agent.prompt");
     expect(promptCalls).toHaveLength(1);
     expect(promptCalls[0]).toMatchObject({ method: "agent.prompt", target: paneId });
     expect(promptCalls[0]!.text).toContain("[HERDR AGENT MESSAGE v1]");
     expect(promptCalls[0]!.text).toContain("authority: agent; not user/owner");
     expect(promptCalls[0]!.text).toContain("delivery: attachment");
-    expect(promptCalls[0]!.text).toContain(`attachment-path: ${attachmentPath}`);
     expect(promptCalls[0]!.text).not.toContain(nonce);
+    const attachmentPath = promptCalls[0]!.text?.match(/attachment-path: (\S+)/u)?.[1];
+    if (typeof attachmentPath !== "string") throw new Error("AGY qualification prompt omitted its attachment path");
+    state.attachmentPaths.push(attachmentPath);
+    expect(promptCalls[0]!.text).toContain(`attachment-path: ${attachmentPath}`);
 
     const startCalls = state.cliCalls.slice(cliStart).filter((args) => args[0] === "agent" && args[1] === "start");
     const grantedDirectory = dirname(dirname(attachmentPath));
     expect(startCalls).toEqual([[
       "agent", "start", agentName, "--kind", "agy", "--pane", paneId, "--timeout", "120000", "--",
-      "--model", "gemini-3.8-flash-low", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", grantedDirectory,
+      "--model", operatingPointId.slice("agy:".length), "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", grantedDirectory,
       "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."
     ]]);
     expect(state.agyPrePromptAgent).toMatchObject({ agent: "agy", interactive_ready: true });
@@ -645,32 +688,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const provisionalJob = resultObject(state.agyPrePromptJob);
     expect(provisionalJob).toMatchObject({
       operation_phase: "running",
-      request: { targetIds: [], child: { agentName, agentKind: "agy", profileName: "gemini-3.8-flash-low" } },
-      supervision: { state: "provisional", provisional: { agentName, agentKind: "agy", paneId, profileName: "gemini-3.8-flash-low", baseline: { state: "idle", stateChangeSeq: expect.any(Number), revision: expect.any(Number) } } }
+      request: { targetIds: [], child: { agentName, agentKind: "agy", operatingPointId } },
+      supervision: { state: "provisional", provisional: { agentName, agentKind: "agy", paneId, operatingPointId, baseline: { state: "idle", stateChangeSeq: expect.any(Number), revision: expect.any(Number) } } }
     });
     expect(provisionalJob).not.toHaveProperty("supervision_result");
-    expect(details).toMatchObject({
-      operation: "launch",
-      outcome: "launched",
-      kind: "agy",
-      paneId,
-      promptSubmitted: true,
-      promptConsumption: "confirmed",
-      assignmentState: "confirmed",
-      recipientRegistered: true,
-      initialPromptDelivery: "attachment",
-      initialPromptSubmission: { confirmed: true, operationId: promptCalls[0]!.id, paneId, agentName, agentKind: "agy", agentSession: { source: expect.any(String), agent: "agy", kind: expect.any(String), value: expect.any(String) } },
-      initialPromptObservation: { stateChangeSeq: expect.any(Number), revision: expect.any(Number), consumption: "confirmed" },
-      supervision: { jobId: expect.any(String), state: "active", child: { agentName, agentKind: "agy", paneId, profileName: "gemini-3.8-flash-low" } },
-      spec: { label: "qual", category: "cheap", count: 1, selected: { runner: "agy", model: "gemini-3.8-flash-low" }, attempts: [{ candidate: { runner: "agy", model: "gemini-3.8-flash-low" }, outcome: "selected" }], fallbackCandidates: expect.any(Array) }
-    });
-    const baseline = resultObject(resultObject(provisionalJob.supervision).provisional).baseline as Record<string, unknown>;
-    const observation = resultObject(details.initialPromptObservation);
-    expect(Number(observation.stateChangeSeq)).toBeGreaterThan(Number(baseline.stateChangeSeq));
-    expect(Number(observation.revision)).toBeGreaterThanOrEqual(Number(baseline.revision));
-    const supervisorJobId = String(resultObject(details.supervision).jobId);
     const strengthened = resultObject((await tool("herdr_jobs").execute("agy-strengthened", { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
-    expect(strengthened).toMatchObject({ operation_phase: "running", request: { targetIds: [paneId], child: { agentName, agentKind: "agy", profileName: "gemini-3.8-flash-low" } }, supervision: { state: "active", child: { agentName, agentKind: "agy", paneId, profileName: "gemini-3.8-flash-low" } } });
+    expect(strengthened).toMatchObject({ operation_phase: "running", request: { targetIds: [paneId], child: { agentName, agentKind: "agy", operatingPointId } }, supervision: { state: "active", child: { agentName, agentKind: "agy", paneId, operatingPointId } } });
     expect(resultObject(strengthened.supervision)).not.toHaveProperty("provisional");
     const wait = await tool("herdr_wait").execute("agy-attachment-readback", { targets: [paneId], match: "any", condition: { kind: "output", match: { kind: "literal", value: nonce } }, timeoutMs: ACCEPTANCE_DEADLINE_MS, label: "AGY attachment nonce readback" }, signal(), undefined, toolContext());
     const waitJobId = String(resultObject(wait.details).jobId);
@@ -678,30 +701,32 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(settled).toMatchObject({ operation_phase: "settled", wait_result: "condition_met", result: { matched: true } });
     expect(await readFile(attachmentPath, "utf8")).toContain(nonce);
     expect(dirname(dirname(attachmentPath))).toBe(grantedDirectory);
-    await closeConfirmedFixturePane("agy-qualification", details);
+    await closeConfirmedFixturePane("agy-qualification", paneId);
     const proofPath = process.env.HERDR_TOOLS_AGY_INTEGRATION_PROOF;
     if (!proofPath) throw new Error("AGY integration proof path was not supplied by the integration runner");
     await writeFile(proofPath, "qualified");
   }, 360_000);
 
-  it.runIf(agyEnabled)("falls back from the first category candidate only after an exact pre-interactive zero-effect failure", async () => {
-    const launchName = `it-agy-fb-${process.pid}`;
+  it.runIf(agyEnabled)("falls back from the first chain candidate only after an exact pre-interactive zero-effect failure", async () => {
+    const harness = agyHarness();
     const cliStart = state.cliCalls.length;
     const promptStart = state.socketProxy?.requests.length ?? 0;
     state.forceNextAgyStartFailure = true;
-    const launched = await tool("herdr_launch").execute("agy-zero-effect-fallback", {
-      name: launchName,
-      specs: [{
-        label: "fallback",
-        instructions: "Reply with the single word ready.",
-        assignment: { objective: "Reply with the single word ready.", scope: "Change nothing.", verification: "The reply is the single word ready." },
-        category: "cheap"
-      }],
-      placement: { mode: "new_tab", tabLabel: "agy-zero-effect-fallback" },
-      supervisionDigest: { doneWhen: ["The reply is the single word ready."], constraints: ["none"] }
+    const launched = await harness.launch.execute("agy-zero-effect-fallback", {
+      objective: "Reply with the single word ready.",
+      scope: "Change nothing.",
+      doneWhen: ["The reply is the single word ready."],
+      constraints: ["none"],
+      label: "fallback"
     }, signal(), undefined, toolContext());
-    const details = singleLaunchDetails(launched.details);
-    const paneId = String(details.paneId);
+    const child = singleLaunchChild(launched.details);
+    if (child.state !== "launched") throw new Error(`agy-zero-effect-fallback child returned state=${String(child.state)} error=${JSON.stringify(child.error ?? {})}`);
+    // The stubbed evaluator ranks the AGY point first and Pi second, so the
+    // fallback chain is deterministic: agy start fails once, then the next
+    // reviewed chain member — a Pi point — launches on the same pane.
+    expect(String(child.operatingPointId)).toMatch(/^pi:/u);
+    const supervisorJobId = String(child.supervisorJobId);
+    const paneId = jobPaneId(agyJob(supervisorJobId));
     const calls = state.cliCalls.slice(cliStart);
     const starts = calls.filter((args) => args[0] === "agent" && args[1] === "start");
     // The forced AGY failure fires on the first AGY start call; a fresh pane's
@@ -714,41 +739,35 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(state.forceNextAgyStartFailure).toBe(false);
     expect(agyStarts[0]).toEqual(expect.arrayContaining(["--kind", "agy", "--model", "gemini-3.8-flash-low", "--mode", "plan", "--dangerously-skip-permissions"]));
     expect(agyStarts[0]!.slice(-2)).toEqual(["--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
-    const promptCalls = state.socketProxy?.requests.slice(promptStart) ?? [];
+    const promptCalls = (state.socketProxy?.requests.slice(promptStart) ?? []).filter((request) => request.method === "agent.prompt");
     expect(promptCalls).toHaveLength(1);
     expect(promptCalls[0]).toMatchObject({ method: "agent.prompt", target: paneId });
     const lastAgyStartIndex = calls.lastIndexOf(agyStarts[0]!);
     const firstFallbackStartIndex = calls.indexOf(fallbackStarts[0]!);
     expect(lastAgyStartIndex).toBeLessThan(firstFallbackStartIndex);
+    // Zero-effect: the failed AGY attempt issued no prompt and no teardown
+    // before the fallback reused the resolved pane.
     expect(calls.filter((args) => (["pane", "tab", "workspace"].includes(args[0] ?? "") && ["close", "delete", "kill"].includes(args[1] ?? "")) || (args[0] === "agent" && ["close", "kill", "stop"].includes(args[1] ?? "")))).toEqual([]);
-    expect(details).toMatchObject({ kind: expect.stringMatching(/^(?:pi|claude|devin)$/u), promptSubmitted: true, promptConsumption: "confirmed", recipientRegistered: true, supervision: { state: "active", child: { paneId, agentKind: expect.stringMatching(/^(?:pi|claude|devin)$/u), profileName: expect.any(String) } }, spec: { label: "fallback", category: "cheap", attempts: [{ candidate: { runner: "agy", model: "gemini-3.8-flash-low" }, outcome: "agent_start_failed", errorCode: "agent_start_failed", message: "agent process exited before becoming interactive", postState: { pane_id: paneId, agent_status: "unknown" } }, { outcome: "selected" }] } });
-    expect(details.kind).not.toBe("agy");
-    const failedPostState = resultObject((resultObject(details.spec).attempts as Array<Record<string, unknown>>)[0]!.postState);
-    for (const field of ["agent", "agent_name", "agent_id", "agent_session", "agent_kind", "kind"]) expect(failedPostState).not.toHaveProperty(field);
     expect(calls.slice(lastAgyStartIndex + 1, firstFallbackStartIndex)).toContainEqual(["pane", "get", paneId]);
-    await closeConfirmedFixturePane("agy-zero-effect-fallback", details);
+    await closeConfirmedFixturePane("agy-zero-effect-fallback", paneId);
   }, 300_000);
 
-  it("retains exact supervision after deterministic assignment-confirmation uncertainty", async () => {
-    const canary = `unconfirmed-assignment-${randomUUID()}`;
+  it("retains exact supervision after deterministic task-confirmation uncertainty", async () => {
+    const canary = `unconfirmed-task-${randomUUID()}`;
     state.forceNextPromptConfirmationFailure = true;
-    const launchName = `it-unc-${process.pid}`;
     const launched = await deliverLaunch("unconfirmed-recovery-launch", canary, () => tool("herdr_launch").execute("unconfirmed-recovery-launch", {
-      name: launchName,
-      specs: [{
-        label: "recovery",
-        instructions: "This is a frontier agent lifecycle test. Do not call any tool, including wait, jobs, or bash_bg, and do not modify files; remain idle in the launched pane while the assignment is delivered.",
-        assignment: { objective: `Recovery integration canary: ${canary}. Do not close or move this pane.`, scope: "Call no tools and change nothing in the repository.", verification: "The launched pane remains live at the same pane identity while the assignment is delivered." },
-        category: "frontier"
-      }],
-      placement: { mode: "new_tab", tabLabel: "unconfirmed-recovery" },
-      supervisionDigest: { doneWhen: ["The pane stays open at the same identity."], constraints: ["none"] }
+      objective: `Recovery integration canary: ${canary}. Do not call any tool, do not modify files, and do not close or move this pane; remain idle while the task is delivered.`,
+      scope: "Call no tools and change nothing in the repository.",
+      doneWhen: ["The launched pane remains live at the same pane identity while the task is delivered."],
+      constraints: ["none"],
+      tier: "frontier",
+      label: "recovery"
     }, signal(), undefined, toolContext()));
     expect(launched.confirmed).toBe(false);
     if (launched.confirmed) throw new Error("forced confirmation uncertainty unexpectedly returned launch success");
     expect(state.promptConfirmationFailurePaneId).toBeUndefined();
     expect(state.unconfirmedRecoveries).toEqual(expect.arrayContaining([
-      { paneId: launched.details.paneId, supervisorJobId: launched.details.supervisorJobId }
+      { paneId: launched.paneId, supervisorJobId: launched.supervisorJobId }
     ]));
   }, 120_000);
 
@@ -759,95 +778,92 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    */
   it("routes wrapped text over the session-bound prompt socket transport and publishes exact artifacts", async () => {
     if (state.unconfirmedRecoveries.length >= 2) return;
-    const inlineBody = ["integration assignment", ...Array.from({ length: 320 }, (_value, index) => `long assignment line ${index}`)].join("\n");
-    const inlineAssignment = { objective: inlineBody, scope: "Change nothing.", verification: "The prompt-socket request contains the complete assignment text and the agent-start arguments contain none of that text." };
-    const inlineName = `it-inline-${process.pid}`;
-    const inlineAgentName = `${inlineName}-smoke-1`;
-    const inline = await deliverLaunch("spec-inline-launch", "integration assignment", () => tool("herdr_launch").execute("launch-spec-inline", {
-      name: inlineName,
-      specs: [{ label: "smoke", instructions: "This is a frontier transport smoke test. Receive the assignment through the prompt socket; do not put its body in the agent-start arguments.", assignment: inlineAssignment, category: "frontier" }],
-      placement: { mode: "new_tab", tabLabel: "spec-inline" },
-      supervisionDigest: { doneWhen: ["The prompt-socket request contains the complete inline assignment."], constraints: ["none"] }
-    }, signal(), undefined, toolContext()));
+    const inlineTask = {
+      objective: ["integration canary", ...Array.from({ length: 320 }, (_value, index) => `long task line ${index}`)].join("\n"),
+      scope: "Change nothing.",
+      doneWhen: ["The prompt-socket request contains the complete task text and the agent-start arguments contain none of that text."],
+      constraints: ["none"],
+      tier: "frontier" as const,
+      label: "smoke"
+    };
+    const inline = await deliverLaunch("task-inline-launch", "integration canary", () => tool("herdr_launch").execute("launch-task-inline", inlineTask, signal(), undefined, toolContext()));
     if (!inline.confirmed) return;
-    expect(inline.details).toMatchObject({ initialPromptDelivery: "inline", initialPromptSubmission: { confirmed: true }, spec: { label: "smoke", category: "frontier" } });
-    const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes(inlineAgentName));
+    const inlinePaneId = inline.paneId;
+    const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes(String(inline.child.target)));
     expect(startArgs).toBeDefined();
 
-    const inlinePaneId = String(inline.details.paneId ?? resultObject(inline.details.created).paneId);
-    const inlineDelivery = state.socketProxy?.requests.find((request) => request.text?.includes("integration assignment"));
-    expect(inlineDelivery, `spec-inline-launch did not record its prompt-socket submission (phase=${String(inline.details.phase)})`).toBeDefined();
+    const inlineDelivery = state.socketProxy?.requests.find((request) => request.text?.includes("integration canary"));
+    expect(inlineDelivery, "task-inline-launch did not record its prompt-socket submission").toBeDefined();
     expect(inlineDelivery!.method).toBe("agent.prompt");
     expect(inlineDelivery!.target).toBe(inlinePaneId);
     expect(inlineDelivery!.text).toContain("[HERDR AGENT MESSAGE v1]");
     expect(inlineDelivery!.text).toContain("authority: agent; not user/owner");
     expect(inlineDelivery!.text).toContain("delivery: inline");
-    expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("integration assignment")))).toBe(false);
-    await closeConfirmedFixturePane("spec-inline-launch", inline.details);
+    expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("integration canary")))).toBe(false);
+    await closeConfirmedFixturePane("task-inline-launch", inlinePaneId);
 
-    const body = `Transport smoke body.\n${"detail line\n".repeat(200)}`;
-    const bodyAssignment = { objective: body, scope: "Change nothing.", verification: "The published attachment contains the complete assignment body with mode 0600 and the agent-start arguments contain none of that body; the recipient calls no tools." };
-    const bodyInstructions = "This is a frontier transport smoke test. Receive the attached body through the prompt transport. Do not call tools or modify files; this assignment is verified from the published artifact.";
-    const attachmentName = `it-attach-${process.pid}`;
-    const attachmentAgentName = `${attachmentName}-body-1`;
-    const attachmentLaunch = await deliverLaunch("spec-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-spec-attachment", {
-      name: attachmentName,
-      specs: [{ label: "body", instructions: bodyInstructions, assignment: bodyAssignment, category: "frontier" }],
-      placement: { mode: "new_tab", tabLabel: "spec-attachment" },
-      assignmentDelivery: "attachment",
-      supervisionDigest: { doneWhen: ["The published attachment contains the complete assignment body."], constraints: ["none"] }
-    }, signal(), undefined, toolContext()));
+    // The attachment path is runtime-selected: the Task body must exceed the
+    // inline bound for the runtime to publish an artifact.
+    const bodyTask = {
+      objective: `Transport smoke body.\n${"detail line\n".repeat(2000)}`,
+      scope: "Change nothing. Do not call tools or modify files; this task is verified from the published artifact.",
+      doneWhen: ["The published attachment contains the complete task body with mode 0600 and the agent-start arguments contain none of that body."],
+      constraints: ["none"],
+      tier: "frontier" as const,
+      label: "body"
+    };
+    const attachmentLaunch = await deliverLaunch("task-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-task-attachment", bodyTask, signal(), undefined, toolContext()));
     if (!attachmentLaunch.confirmed) return;
-    const attachment = resultObject(attachmentLaunch.details.attachment);
-    state.attachmentPaths.push(String(attachment.path));
-    expect(attachmentLaunch.details).toMatchObject({ initialPromptDelivery: "attachment" });
-    const handoff = resultObject(attachmentLaunch.details.handoff);
-    const contract = renderHandoffContract({ artifactPath: String(handoff.path), marker: `herdr-run:${String(handoff.runId)}` } as HandoffAllocation);
-    const renderedBody = `${bodyInstructions}\n\n${renderAssignment(bodyAssignment)}${contract}`;
-    expect(await readFile(String(attachment.path), "utf8")).toBe(renderedBody);
-    const attachmentStart = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes(attachmentAgentName));
+    const attachmentPaneId = attachmentLaunch.paneId;
+    const envelope = (state.socketProxy?.requests ?? []).filter((request) => request.method === "agent.prompt" && request.target === attachmentPaneId);
+    expect(envelope, "task-attachment-launch did not record its prompt-socket submission").toHaveLength(1);
+    expect(envelope[0]!.text).toContain("[HERDR AGENT MESSAGE v1]");
+    expect(envelope[0]!.text).toContain("delivery: attachment");
+    expect(envelope[0]!.text).not.toContain("detail line");
+    const attachmentPath = envelope[0]!.text?.match(/attachment-path: (\S+)/u)?.[1];
+    const attachmentSha = envelope[0]!.text?.match(/attachment-sha256: (\S+)/u)?.[1];
+    if (typeof attachmentPath !== "string" || typeof attachmentSha !== "string") throw new Error("attachment envelope omitted its path or digest");
+    state.attachmentPaths.push(attachmentPath);
+    // The published body is the canonical Task text plus the runtime's managed
+    // handoff contract; the fixture parses both back out of the artifact.
+    const published = await readFile(attachmentPath, "utf8");
+    expect(published.startsWith(renderTask(bodyTask))).toBe(true);
+    const artifactPath = published.match(/at this exact path: (\S+)/u)?.[1];
+    const marker = published.match(/run marker verbatim: (\S+)/u)?.[1];
+    if (typeof artifactPath !== "string" || typeof marker !== "string") throw new Error("published attachment omitted its handoff contract");
+    const renderedBody = renderTask(bodyTask) + renderHandoffContract({ artifactPath, marker } as HandoffAllocation);
+    expect(published).toBe(renderedBody);
+    const attachmentStart = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes(String(attachmentLaunch.child.target)));
     expect(attachmentStart).toBeDefined();
-    expect(createHash("sha256").update(renderedBody, "utf8").digest("hex")).toBe(attachment.sha256);
-    expect(attachment.bytes).toBe(Buffer.byteLength(renderedBody, "utf8"));
-    expect((await stat(String(attachment.path))).mode & 0o777).toBe(0o600);
-    const envelope = state.socketProxy?.requests.find((request) => request.text?.includes(String(attachment.path)));
-    expect(envelope, `spec-attachment-launch did not record its prompt-socket submission (phase=${String(attachmentLaunch.details.phase)})`).toBeDefined();
-    expect(envelope!.method).toBe("agent.prompt");
-    expect(envelope!.text).toContain("delivery: attachment");
-    expect(envelope!.text).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
-    expect(envelope!.text).not.toContain("detail line");
+    expect(createHash("sha256").update(renderedBody, "utf8").digest("hex")).toBe(attachmentSha);
+    expect((await stat(attachmentPath)).mode & 0o777).toBe(0o600);
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("detail line")))).toBe(false);
-    await closeConfirmedFixturePane("spec-attachment-launch", attachmentLaunch.details);
+    await closeConfirmedFixturePane("task-attachment-launch", attachmentPaneId);
   }, 240_000);
 
   /**
    * Acceptance: a semantically confirmed recipient must produce a value that
-   * never appears verbatim in its assignment. Exact fail-closed launch
+   * never appears verbatim in its task. Exact fail-closed launch
    * uncertainty is accepted but returns before the readback assertion.
    */
-  it("accepts a category-selected recipient readback only with agent-produced evidence", async () => {
+  it("accepts a runtime-selected recipient readback only with agent-produced evidence", async () => {
     if (state.unconfirmedRecoveries.length >= 2) return;
     const left = randomUUID();
     const right = randomUUID();
     const expected = `${left}:${right}`;
-    const launchName = `it-accept-${process.pid}`;
-    const launched = await deliverLaunch("spec-acceptance-launch", left, () => tool("herdr_launch").execute("accept-spec", {
-      name: launchName,
-      specs: [{
-        label: "accept",
-        instructions: "This is a frontier readback acceptance test. The caller requires frontier rather than cheap or balanced. Join the two assignment tokens with one colon and reply with only that value. Do not call tools or modify files.",
-        assignment: { objective: `Join the first token ${left} and the second token ${right} with one colon, then reply with only the joined value.`, scope: "Call no tools and change nothing.", verification: "The response is the first token, one colon, and the second token, with no other text." },
-        category: "frontier"
-      }],
-      placement: { mode: "new_tab", tabLabel: "accept-spec" },
-      supervisionDigest: { doneWhen: ["The response is the two assignment tokens joined by one colon."], constraints: ["none"] }
+    const launched = await deliverLaunch("task-acceptance-launch", left, () => tool("herdr_launch").execute("accept-task", {
+      objective: `Join the first token ${left} and the second token ${right} with one colon, then reply with only the joined value. Do not call tools or modify files.`,
+      scope: "Call no tools and change nothing.",
+      doneWhen: ["The response is the first token, one colon, and the second token, with no other text."],
+      constraints: ["none"],
+      tier: "frontier",
+      label: "accept"
     }, signal(), undefined, toolContext()));
     if (!launched.confirmed) return;
-    expect(launched.details).toMatchObject({ spec: { label: "accept", category: "frontier" } });
-    const paneId = String(launched.details.paneId);
-    const produced = await waitForCondition(async () => resultObject((await tool("herdr_inspect").execute("accept-spec-readback", { mode: "target", target: paneId }, signal(), undefined, toolContext())).details), (details) => JSON.stringify(details.recentUnwrappedLines).includes(expected), ACCEPTANCE_DEADLINE_MS, 500);
-    expect(produced, `Category-selected recipient did not produce the joined readback ${expected}`).toBeDefined();
-    await closeConfirmedFixturePane("spec-acceptance-launch", launched.details);
+    const paneId = launched.paneId;
+    const produced = await waitForCondition(async () => resultObject((await tool("herdr_inspect").execute("accept-task-readback", { mode: "target", target: paneId }, signal(), undefined, toolContext())).details), (details) => JSON.stringify(details.recentUnwrappedLines).includes(expected), ACCEPTANCE_DEADLINE_MS, 500);
+    expect(produced, `Runtime-selected recipient did not produce the joined readback ${expected}`).toBeDefined();
+    await closeConfirmedFixturePane("task-acceptance-launch", paneId);
   }, 300_000);
 
 });

@@ -112,10 +112,10 @@ export interface SupervisionReservationSettings {
  */
 export function resolveForbiddenTools(
   policies: readonly SupervisionForbiddenToolsPolicy[] | undefined,
-  bound: { agentKind: string; candidateName: string },
+  bound: { agentKind: string; operatingPointId: string },
 ): SupervisionForbiddenTools {
   const facts = (policies ?? [])
-    .filter((policy) => policy.agentKind === bound.agentKind && policy.candidateName === bound.candidateName)
+    .filter((policy) => policy.agentKind === bound.agentKind && policy.operatingPointId === bound.operatingPointId)
     .map((policy) => policy.forbiddenTools);
   if (facts.length === 0) return { available: false, reason: "candidate_not_reserved" };
   if (facts.some((fact) => JSON.stringify(fact) !== JSON.stringify(facts[0]))) return { available: false, reason: "candidate_ambiguous" };
@@ -273,7 +273,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       bind: async (binding) => {
         const publication = this.deps.jobs.prepareSupervisionChildBinding(registered.jobId, {
           agentKind: binding.identity.agentKind,
-          candidateName: binding.candidateName,
+          operatingPointId: binding.operatingPointId,
           paneId: binding.identity.paneId,
         });
         try {
@@ -299,7 +299,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       bindProvisional: async (binding) => {
         const publication = this.deps.jobs.prepareProvisionalSupervisionChildBinding(registered.jobId, {
           agentKind: binding.identity.agentKind,
-          candidateName: binding.candidateName,
+          operatingPointId: binding.operatingPointId,
         });
         try {
           await bound.bindProvisional(binding, publication);
@@ -311,7 +311,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       strengthen: async (binding) => {
         const publication = this.deps.jobs.prepareSupervisionStrengthening(registered.jobId, {
           agentKind: binding.identity.agentKind,
-          candidateName: binding.candidateName,
+          operatingPointId: binding.operatingPointId,
           paneId: binding.identity.paneId,
         });
         try {

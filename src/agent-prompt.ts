@@ -34,7 +34,10 @@ export interface AgentPromptClientOptions {
   requestId?: () => string;
 }
 
-const HERDR_VERSION = "0.9.0";
+// The prompt socket's pong must identify the serving herdr and agree on the
+// wire protocol and endpoint generation. The exact patch version is NOT a
+// compatibility gate: same-protocol patch releases (e.g. 0.9.0 -> 0.9.1)
+// ship through the stable channel and must not sever prompt transport.
 const HERDR_PROTOCOL = 22;
 const ENDPOINT_PROTOCOL_GENERATION = 1;
 
@@ -135,7 +138,7 @@ export function createAgentPromptClient(options: AgentPromptClientOptions = {}):
     prompt: (target, text, signal) => request("agent.prompt", { target, text }, signal, (result) => record(result) && result.type === "agent_prompted" && record(result.agent)),
     ping: async (signal) => {
       await request("ping", {}, signal, (result) => {
-        if (!record(result) || result.type !== "pong" || result.version !== HERDR_VERSION || result.protocol !== HERDR_PROTOCOL || !record(result.capabilities)) return false;
+        if (!record(result) || result.type !== "pong" || result.protocol !== HERDR_PROTOCOL || !record(result.capabilities)) return false;
         return result.capabilities.endpoint_protocol_generation === ENDPOINT_PROTOCOL_GENERATION;
       });
     },

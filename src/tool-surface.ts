@@ -24,7 +24,7 @@ import { createTabTool } from "./tools/tab.js";
 import { createWaitTool } from "./tools/wait.js";
 import { CommunicateParamsSchema, InspectParamsSchema } from "./schemas.js";
 import { JobsParamsSchema } from "./jobs-schema.js";
-import { SpecLaunchParamsSchema } from "./launch-schema.js";
+import { PublishedLaunchParamsSchema } from "./launch-schema.js";
 import { PaneParamsSchema, TabParamsSchema } from "./topology-schema.js";
 import { WaitParamsSchema } from "./wait-schema.js";
 import { appendToolTelemetry, invalidInputError, monotonicDurationMs, telemetryEffectCertainty, telemetryOperation, type ToolTelemetryEntry } from "./telemetry.js";
@@ -235,7 +235,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
     queueFlush: deps.queueFlush,
     ...(deps.attachments ? { attachments: deps.attachments } : {}),
     ...(deps.recipients ? { recipients: deps.recipients } : {}),
-  }), SpecLaunchParamsSchema, deps.cwd);
+  }), PublishedLaunchParamsSchema, deps.cwd);
   const pane = instrumentTool(createPaneTool({
     cli: deps.cli,
     context: deps.context,

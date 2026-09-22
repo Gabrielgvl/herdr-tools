@@ -21,7 +21,7 @@ const DETAILS_FIELD_BYTES = Buffer.byteLength(",\"details\":", "utf8");
 const MAX_ERROR_MESSAGE_CHARS = 2_000;
 const MAX_CODE_CHARS = 120;
 const MAX_TOOL_NAME_CHARS = 120;
-const LAUNCH_DIAGNOSTIC_PHASES = new Set(["validate", "resolve_profile", "attachment_publish", "supervision_reserve", "placement", "agent_start", "ready", "focus", "prompt_verification", "supervision_bind"]);
+const LAUNCH_DIAGNOSTIC_PHASES = new Set(["validate", "route", "compile", "handoff", "attachment_publish", "supervision_reserve", "placement", "agent_start", "ready", "prompt_verification", "supervision_bind"]);
 const LAUNCH_EFFECT_CERTAINTIES = new Set(["absent", "partial", "unknown", "confirmed"]);
 const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 

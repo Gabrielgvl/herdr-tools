@@ -19,7 +19,7 @@ import {
   type CooldownRecord,
   type LaunchFailureClass
 } from "../../src/availability.js";
-import type { ChainCandidate, QuotaKey, RunnerEntry, RunnerKind } from "../../src/catalog.js";
+import type { AvailabilitySubject, QuotaKey, RunnerEntry, RunnerKind } from "../../src/catalog.js";
 
 /** fs failures the filesystem alone cannot schedule deterministically. */
 const fsControl = vi.hoisted(() => ({
@@ -141,7 +141,7 @@ const QUOTA: QuotaKey = { provider: "vendex", billingProduct: "plan", account: "
 function runner(kind: RunnerKind, quota: Partial<QuotaKey> = {}): RunnerEntry {
   return {
     kind,
-    models: ["model-1"],
+    models: [{ model: "model-1" }],
     quota: { ...QUOTA, ...quota },
     defaults: { timeoutMinutes: 30, sessionPersistence: false },
     plumbing: { sessionPersistence: "optional", promptDelivery: "file", skillSelection: "exact", toolSelection: "allowlist" },
@@ -149,8 +149,8 @@ function runner(kind: RunnerKind, quota: Partial<QuotaKey> = {}): RunnerEntry {
   };
 }
 
-const piCandidate: ChainCandidate = { runner: "pi", model: "model-1" };
-const claudeCandidate: ChainCandidate = { runner: "claude", model: "model-1" };
+const piCandidate: AvailabilitySubject = { runner: "pi", model: "model-1" };
+const claudeCandidate: AvailabilitySubject = { runner: "claude", model: "model-1" };
 
 const T0 = Date.parse("2026-03-01T00:00:00.000Z");
 const at = (offsetMs: number) => () => new Date(T0 + offsetMs);
@@ -491,7 +491,7 @@ describe("recordLaunchFailure", () => {
 });
 
 describe("recordLaunchFailure refusal", () => {
-  const refusalCases: Array<{ name: string; failure: unknown; candidate?: ChainCandidate; runner?: RunnerEntry }> = [
+  const refusalCases: Array<{ name: string; failure: unknown; candidate?: AvailabilitySubject; runner?: RunnerEntry }> = [
     { name: "a relative root", failure: "quota_exceeded" },
     { name: "a non-code failure", failure: 42 },
     { name: "a null failure", failure: null },
@@ -679,8 +679,9 @@ describe("availability", () => {
     // A different account on the same provider is a different key.
     const otherAccount = await availability(piCandidate, runner("pi", { account: "acct-2" }), { root, now: at(60_000) });
     expect(otherAccount.status).toBe("unknown");
-    // A per-candidate account override lands on the overridden key, not the runner's default.
-    const overridden = await availability({ ...piCandidate, account: "acct-2" }, runner("pi"), { root, now: at(60_000) });
+    // A model-entry account override lands on the overridden key, not the runner's default.
+    const modelKey = { ...runner("pi"), models: [{ model: "model-1", quota: { account: "acct-2" } }] };
+    const overridden = await availability(piCandidate, modelKey, { root, now: at(60_000) });
     expect(overridden.status).toBe("unknown");
   });
 

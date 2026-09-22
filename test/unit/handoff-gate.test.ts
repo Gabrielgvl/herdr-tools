@@ -38,7 +38,22 @@ afterEach(() => {
 
 const runIdentity: HandoffRunIdentity = {
   manager: { paneId: "w1:p1", display: "caller", source: "injected" },
-  child: { agentName: "worker", agentKind: "pi", candidateName: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
+  child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi", specLabel: "worker-pi", fallbackCandidates: [] }
+};
+
+/** A v2 identity carrying the recovery lineage the launch path persists. */
+const runIdentityWithLineage: HandoffRunIdentity = {
+  ...runIdentity,
+  child: {
+    ...runIdentity.child,
+    route: {
+      tier: "standard",
+      operatingPointId: "worker-pi",
+      policyRevision: "adr-037-p1",
+      workload: { intent: "implement", mutation: "bounded", scope: "local", horizon: "short", verifiability: "strong", workspaceState: "clean", ambiguity: "low" }
+    },
+    workspace: { resolvedCwd: "/repo", worktree: "/repo/.herdr/worktrees/worker" }
+  }
 };
 
 const launched: HandoffBoundIdentity = {
@@ -113,6 +128,27 @@ describe("handoff gate binding", () => {
     };
     await createHandoffGate().bind(allocation, withoutAgentId);
     expect((await readHandoffState(allocation)).child.agentId).toBeNull();
+  });
+
+  it("preserves route and workspace lineage through bind and lifecycle mutations", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "herdr-handoff-gate-"));
+    await chmod(dir, 0o700);
+    const allocator = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+    const allocation = await allocator.allocate();
+    await allocator.persist(allocation, runIdentityWithLineage);
+    const gate = createHandoffGate();
+    const run = await gate.bind(allocation, launched, { stateChangeSeq: 3, revision: 1 });
+
+    const bound = await readHandoffState(allocation);
+    expect(bound.child.route).toEqual(runIdentityWithLineage.child.route);
+    expect(bound.child.workspace).toEqual(runIdentityWithLineage.child.workspace);
+    expect(bound.child).toMatchObject({ paneId: "w1:p9", terminalId: "w1:t4", agentId: "agent-9" });
+
+    await artifact(run, "failed");
+    await gate.recordOutcome(run, "failed");
+    const failed = await readHandoffState(allocation);
+    expect(failed.child.route).toEqual(runIdentityWithLineage.child.route);
+    expect(failed.child.workspace).toEqual(runIdentityWithLineage.child.workspace);
   });
 
   it("matches on move-stable identity and follows pane moves", async () => {

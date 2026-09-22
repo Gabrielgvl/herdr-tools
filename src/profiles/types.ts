@@ -41,7 +41,12 @@ export interface PiRuntimeProfile {
 export interface ClaudeRuntimeProfile {
   kind: "claude";
   model: string;
-  effort: ClaudeEffort;
+  /**
+   * The resolved effort for a reasoned point. Absent for an unreasoned point
+   * (e.g. Haiku): it is never filled from a runner default, and argv carries
+   * no `--effort` flag.
+   */
+  effort?: ClaudeEffort;
   permissionMode: ClaudePermissionMode;
   allowedTools: string[];
   disallowedTools: string[];

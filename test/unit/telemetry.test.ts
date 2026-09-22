@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { SpecLaunchParamsSchema } from "../../src/launch-schema.js";
+import { LaunchTaskSchema } from "../../src/launch-schema.js";
 import {
   TOOL_DIAGNOSTIC_MARKER,
   TOOL_DIAGNOSTIC_MAX_BYTES,
@@ -52,8 +52,9 @@ describe("tool schema diagnostics", () => {
       patterned: Type.String({ pattern: "^[a-z]+$" }),
       positive: Type.Number({ exclusiveMinimum: 0 }),
       short: Type.String({ minLength: 2 }),
+      even: Type.Number({ multipleOf: 2 }),
     }, { additionalProperties: false });
-    const raw = { count: "raw-count-secret", tags: null, patterned: "1", positive: 0, short: "x", extra: "raw-extra-secret" };
+    const raw = { count: "raw-count-secret", tags: null, patterned: "1", positive: 0, short: "x", even: 3, extra: "raw-extra-secret" };
     const diagnostic = invalidInputDiagnostic("herdr_tab", schema, raw)!;
     expect(diagnostic).toMatchObject({
       tool: "herdr_tab",
@@ -68,6 +69,7 @@ describe("tool schema diagnostics", () => {
         { path: "/patterned", expected: "string matching schema pattern", received: "string" },
         { path: "/positive", expected: "exclusiveMinimum 0", received: "number" },
         { path: "/short", expected: "minLength 2", received: "string" },
+        { path: "/even", expected: "schema constraint multipleOf", received: "number" },
       ]) as unknown[],
       effectCertainty: "absent",
     });
@@ -79,18 +81,21 @@ describe("tool schema diagnostics", () => {
     expect(failure).toBeInstanceOf(ToolInputError);
     expect(failure.message).toContain(TOOL_DIAGNOSTIC_MARKER);
     expect(Buffer.byteLength(failure.message, "utf8")).toBeLessThanOrEqual(TOOL_DIAGNOSTIC_MAX_BYTES);
-    expect(invalidInputDiagnostic("herdr_tab", schema, { count: 1, tags: [], requiredName: "ok", patterned: "ok", positive: 1, short: "ok" })).toBeUndefined();
+    expect(invalidInputDiagnostic("herdr_tab", schema, { count: 1, tags: [], requiredName: "ok", patterned: "ok", positive: 1, short: "ok", even: 2 })).toBeUndefined();
     expect(invalidInputDiagnostic("herdr_tab", Type.Union([Type.Literal("x"), Type.Literal("y")]), "z")!.errors)
       .toContainEqual({ path: "/", expected: "matching schema variant", received: "string" });
+    expect(invalidInputDiagnostic("herdr_tab", Type.Refine(Type.String(), () => false), "x")!.errors)
+      .toContainEqual({ path: "/", expected: "custom schema constraint", received: "string" });
 
-    const duplicateLabel = "private";
-    const refined = invalidInputDiagnostic("herdr_launch", SpecLaunchParamsSchema, {
-      name: "task",
-      specs: Array.from({ length: 2 }, () => ({ label: duplicateLabel, instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } })),
-      supervisionDigest: { doneWhen: ["done"], constraints: ["none"] },
+    const secret = "private";
+    const refined = invalidInputDiagnostic("herdr_launch", LaunchTaskSchema, {
+      objective: "o",
+      scope: "s",
+      doneWhen: ["done"],
+      specs: [{ label: secret }],
     })!;
-    expect(refined.errors).toContainEqual({ path: "/specs", expected: "custom schema constraint", received: "array" });
-    expect(JSON.stringify(refined)).not.toContain(duplicateLabel);
+    expect(refined.errors.length).toBeGreaterThan(0);
+    expect(JSON.stringify(refined)).not.toContain(secret);
   });
 
   it("caps error count and falls back to marker-only valid JSON when a payload cannot fit", () => {

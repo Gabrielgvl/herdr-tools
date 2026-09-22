@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isAlias, isMap, isSeq, parseDocument, type Node } from "yaml";
 import { normalizeScopedResourcePath } from "./profiles/parser.js";
 import { AGY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, DEVIN_PERMISSION_MODES, THINKING_LEVELS, type AgyMode, type ClaudeEffort, type ClaudePermissionMode, type DevinPermissionMode, type ThinkingLevel } from "./profiles/types.js";
+import { TIER_ENVELOPES, type ClassBound, type CostClass, type LatencyClass, type QualityTier } from "./routing-policy.js";
 
 export class CatalogError extends Error {
   readonly code = "INVALID_CATALOG" as const;
@@ -12,29 +14,27 @@ export class CatalogError extends Error {
   }
 }
 
-export class ChainResolutionError extends Error {
-  readonly code = "CHAIN_UNRESOLVABLE" as const;
-  constructor(message: string, readonly details: Record<string, unknown> = {}) {
-    super(message);
-    this.name = "ChainResolutionError";
-  }
-}
-
 export const RUNNER_KINDS = ["pi", "claude", "agy", "devin"] as const;
 export type RunnerKind = (typeof RUNNER_KINDS)[number];
 
-export const CATEGORY_NAME_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 export const MAX_CATALOG_BYTES = 64 * 1024;
-/** ADR-026's ratified attempt bound, carried forward as the default chain depth (plan R4). */
-export const DEFAULT_MAX_ATTEMPTS = 4;
 /** Bundled catalog location, relative to the package (scope) root. */
 export const CATALOG_PATH = "herdr-profiles/catalog.yaml";
 
-export interface ChainCandidate {
+/** A below-runner quota override: fields present merge over the runner's quota tuple. */
+export interface QuotaOverride {
+  billingProduct?: string;
+  account?: string;
+}
+
+/**
+ * The runner+model pair an availability or launch-failure probe resolves a
+ * quota key for (ADR-037): the chain-era per-candidate provider/quota/account
+ * overrides are gone — attribution comes from the reviewed model entries.
+ */
+export interface AvailabilitySubject {
   runner: RunnerKind;
   model: string;
-  /** Account override within the runner's provider; defaults to the runner's quota account. */
-  account?: string;
 }
 
 /** The availability tuple: provider + billing product + account + scope, never a runner name. */
@@ -82,10 +82,25 @@ export interface RunnerPools {
   mcp: readonly string[];
 }
 
+/**
+ * One reviewed model entry. `provider`/`quota` attribute the model's
+ * availability to a quota domain below the runner (Pi spans openai-codex,
+ * zai, and opencode-go); absent fields fall back to the runner's tuple.
+ * `supportedReasoning` is the model's own declared reasoning axis — absent
+ * or empty means the model is unreasoned by design and yields a single
+ * bare operating point.
+ */
+export interface ModelEntry {
+  model: string;
+  provider?: string;
+  quota?: QuotaOverride;
+  supportedReasoning?: readonly (ThinkingLevel | ClaudeEffort)[];
+}
+
 export interface RunnerEntry {
   kind: RunnerKind;
-  /** The reviewed model set; a chain entry may only name one of these. */
-  models: readonly string[];
+  /** The reviewed model set; every operating point generates from one of these. */
+  models: readonly ModelEntry[];
   quota: QuotaKey;
   defaults: RunnerDefaults;
   plumbing: RunnerPlumbing;
@@ -96,15 +111,35 @@ export interface McpServer {
   plugin: string;
 }
 
+/** Reviewed per-point metadata (ADR-037): the catalog-declared cost and latency classes. */
+export interface PointPolicy {
+  readonly costClass: CostClass;
+  readonly latencyClass: LatencyClass;
+}
+
+/** A generated operating point before its reviewed classes are joined. */
+interface GeneratedPoint {
+  /** Opaque stable id — `${runner}:${model}:${reasoning}`, the reasoning segment omitted when empty or model-encoded. Never parsed or split. */
+  readonly id: string;
+  readonly runner: RunnerKind;
+  readonly model: string;
+  readonly reasoning?: ThinkingLevel | ClaudeEffort;
+  /** Provider attribution below the runner — pi/codex, pi/zai, and pi/opencode-go are distinct domains. */
+  readonly provider: string;
+  /** The merged quota tuple this point's availability is keyed under. */
+  readonly quota: QuotaKey;
+}
+
+/** One exact runner + model + runner-native reasoning combination carrying its reviewed classes. */
+export interface OperatingPoint extends GeneratedPoint, PointPolicy {}
+
 export interface CatalogSource {
   path: string;
   scopeRoot: string;
 }
 
 export interface Catalog {
-  version: 1;
-  maxAttempts: number;
-  categories: ReadonlyMap<string, readonly ChainCandidate[]>;
+  version: 2;
   runners: ReadonlyMap<RunnerKind, RunnerEntry>;
   /** Reviewed skill trees (resolved to absolute paths), the Pi `--skill` unit. */
   skills: readonly string[];
@@ -112,6 +147,17 @@ export interface Catalog {
   plugins: readonly string[];
   mcpServers: ReadonlyMap<string, McpServer>;
   quotaSources: readonly QuotaSource[];
+  /**
+   * Generated operating points joined with their reviewed policy classes.
+   * Always populated by parseCatalog; optional so hand-built Catalog values
+   * authored before ADR-037 stay valid. Empty when the file declares no
+   * pointPolicy — an unreviewed combination is never an operating point.
+   */
+  points?: readonly OperatingPoint[];
+  /** The validated pointPolicy map, keyed by exact point id. Empty when the file declares none. */
+  pointPolicy?: ReadonlyMap<string, PointPolicy>;
+  /** sha256 hex over the raw catalog bytes — the catalog revision recorded in decision evidence. */
+  catalogRevision?: string;
   source: CatalogSource;
 }
 
@@ -271,15 +317,68 @@ function runnerPools(kind: RunnerKind, value: unknown, scopeRoot: string, skills
   return pools;
 }
 
+function quotaOverride(value: unknown, field: string): QuotaOverride {
+  if (!record(value)) fail(`${field} must be an object`, { field });
+  exactKeys(value, ["billingProduct", "account"], field);
+  const override: QuotaOverride = {};
+  if (value.billingProduct !== undefined) override.billingProduct = stringField(value.billingProduct, `${field}.billingProduct`);
+  if (value.account !== undefined) override.account = stringField(value.account, `${field}.account`);
+  return override;
+}
+
+/**
+ * A model entry's declared reasoning axis. Every value must sit on the
+ * runner's native axis — a setting the runner cannot express is a reviewed
+ * data error, never silently dropped. Empty and absent both mean unreasoned.
+ */
+function reasoningSet(kind: RunnerKind, value: unknown, field: string): (ThinkingLevel | ClaudeEffort)[] | undefined {
+  if (value === undefined) return undefined;
+  const settings = uniqueStrings(value, field) as (ThinkingLevel | ClaudeEffort)[];
+  for (const setting of settings) if (!RUNNER_REASONING[kind].includes(setting)) fail(`${field} names a reasoning setting outside the ${kind} axis`, { field, setting });
+  return settings;
+}
+
+function modelEntry(kind: RunnerKind, value: unknown, field: string): ModelEntry {
+  if (!record(value)) fail(`${field} must be a model entry object`, { field });
+  exactKeys(value, ["model", "provider", "quota", "supportedReasoning"], field);
+  const provider = value.provider === undefined ? undefined : stringField(value.provider, `${field}.provider`);
+  const quota = value.quota === undefined ? undefined : quotaOverride(value.quota, `${field}.quota`);
+  // A billing product lives inside a provider namespace: overriding it while
+  // inheriting the runner's provider would mint a tuple in the wrong domain.
+  if (quota?.billingProduct !== undefined && provider === undefined) fail(`${field}.quota.billingProduct requires a provider override`, { field });
+  const entry: ModelEntry = { model: stringField(value.model, `${field}.model`) };
+  if (provider !== undefined) entry.provider = provider;
+  if (quota !== undefined) entry.quota = quota;
+  const reasoning = reasoningSet(kind, value.supportedReasoning, `${field}.supportedReasoning`);
+  if (reasoning !== undefined) entry.supportedReasoning = reasoning;
+  return entry;
+}
+
+function modelEntries(kind: RunnerKind, value: unknown, field: string): ModelEntry[] {
+  if (!Array.isArray(value)) fail(`${field} must be an array of model entries`, { field });
+  const entries = value.map((item, index) => modelEntry(kind, item, `${field}[${index}]`));
+  if (new Set(entries.map((entry) => entry.model)).size !== entries.length) fail(`${field} must not contain duplicates`, { field });
+  return entries;
+}
+
 function runnerEntry(kind: RunnerKind, value: unknown, scopeRoot: string, skills: readonly string[], plugins: readonly string[], mcp: ReadonlyMap<string, McpServer>): RunnerEntry {
   const field = `runners.${kind}`;
   if (!record(value)) fail(`${field} must be an object`, { field });
   exactKeys(value, ["models", "quota", "defaults", "plumbing", "pools"], field);
-  const models = uniqueStrings(value.models, `${field}.models`);
+  const models = modelEntries(kind, value.models, `${field}.models`);
   if (models.length === 0) fail(`${field}.models must be a non-empty reviewed set`, { field });
+  const quota = quotaKey(value.quota, `${field}.quota`);
+  // A `provider/name` model id names a quota domain. When that domain is not
+  // the runner's own (pi's zai and opencode-go entries), `provider` is
+  // required — without it the model's availability keys would silently fall
+  // back to the runner's tuple and collide with its identities.
+  for (const [index, entry] of models.entries()) {
+    const slash = entry.model.indexOf("/");
+    if (slash > 0 && entry.model.slice(0, slash) !== quota.provider && entry.provider === undefined) fail(`${field}.models[${index}].provider is required: the id names a provider domain outside the runner quota`, { field: `${field}.models[${index}]`, model: entry.model });
+  }
   const defaults = runnerDefaults(kind, value.defaults);
   const plumbing = runnerPlumbing(kind, value.plumbing);
-  return { kind, models, quota: quotaKey(value.quota, `${field}.quota`), defaults, plumbing, pools: runnerPools(kind, value.pools, scopeRoot, skills, plugins, mcp) };
+  return { kind, models, quota, defaults, plumbing, pools: runnerPools(kind, value.pools, scopeRoot, skills, plugins, mcp) };
 }
 
 function runnerEntries(value: unknown, scopeRoot: string, skills: readonly string[], plugins: readonly string[], mcp: ReadonlyMap<string, McpServer>): Map<RunnerKind, RunnerEntry> {
@@ -306,36 +405,83 @@ function mcpServers(value: unknown): Map<string, McpServer> {
   return map;
 }
 
-function chainCandidate(value: unknown, field: string, runners: ReadonlyMap<RunnerKind, RunnerEntry>): ChainCandidate {
-  if (!record(value)) fail(`${field} must be a chain entry object`, { field });
-  exactKeys(value, ["runner", "model", "account"], field);
-  const runnerName = stringField(value.runner, `${field}.runner`);
-  const runner = runners.get(runnerName as RunnerKind);
-  if (runner === undefined) fail(`${field}.runner names a runner the catalog does not declare`, { field, runner: runnerName });
-  const model = stringField(value.model, `${field}.model`);
-  if (!runner.models.includes(model)) fail(`${field}.model is not in the reviewed ${runnerName} model set`, { field, model });
-  if (value.account === undefined) return { runner: runnerName as RunnerKind, model };
-  return { runner: runnerName as RunnerKind, model, account: stringField(value.account, `${field}.account`) };
+/** Reviewed class order shared by cost and latency: low < medium < high < extreme. */
+const CLASS_ORDER = ["low", "medium", "high", "extreme"] as const;
+
+/**
+ * Each runner's native reasoning axis — the validation bound for per-model
+ * `supportedReasoning` sets. Empty where reasoning is model-encoded. Pi
+ * `minimal` is excluded: it is a runner-level alias of the provider's `low`,
+ * and canonical points never mint it.
+ */
+const RUNNER_REASONING: Record<RunnerKind, readonly (ThinkingLevel | ClaudeEffort)[]> = {
+  pi: THINKING_LEVELS.filter((level) => level !== "minimal"),
+  claude: CLAUDE_EFFORTS,
+  agy: [],
+  devin: [],
+};
+
+/** A model entry's below-runner attribution merged over the runner's quota tuple. */
+function modelQuotaKey(entry: ModelEntry | undefined, runner: RunnerEntry): QuotaKey {
+  return {
+    provider: entry?.provider ?? runner.quota.provider,
+    billingProduct: entry?.quota?.billingProduct ?? runner.quota.billingProduct,
+    account: entry?.quota?.account ?? runner.quota.account,
+    scope: runner.quota.scope,
+  };
 }
 
-function categories(value: unknown, runners: ReadonlyMap<RunnerKind, RunnerEntry>, maxAttempts: number): Map<string, ChainCandidate[]> {
-  if (!record(value) || Object.keys(value).length === 0) fail("categories must be a non-empty mapping");
-  const map = new Map<string, ChainCandidate[]>();
-  for (const [name, entries] of Object.entries(value)) {
-    if (!CATEGORY_NAME_PATTERN.test(name)) fail("category names must be lowercase kebab-case", { category: name });
-    const field = `categories.${name}`;
-    if (!Array.isArray(entries) || entries.length === 0) fail(`${field} must be a non-empty chain`, { category: name });
-    if (entries.length > maxAttempts) fail(`${field} exceeds the attempt bound`, { category: name, chainLength: entries.length, maxAttempts });
-    const chain = entries.map((entry, index) => chainCandidate(entry, `${field}[${index}]`, runners));
-    const seen = new Set<string>();
-    for (const candidate of chain) {
-      const key = `${candidate.runner}\0${candidate.model}\0${candidate.account ?? ""}`;
-      if (seen.has(key)) fail(`${field} must not contain duplicate entries`, { category: name, runner: candidate.runner, model: candidate.model });
-      seen.add(key);
+/**
+ * Generate the operating points (ADR-037): each reviewed model entry crossed
+ * with its own declared `supportedReasoning` set. An absent or empty set —
+ * model-encoded runners, or a reasoning runner's unreasoned model — emits
+ * one bare `runner:model` point with no reasoning segment.
+ */
+function generatePoints(runners: ReadonlyMap<RunnerKind, RunnerEntry>): GeneratedPoint[] {
+  const points: GeneratedPoint[] = [];
+  for (const [runner, entry] of runners) {
+    for (const model of entry.models) {
+      const quota = modelQuotaKey(model, entry);
+      const settings = model.supportedReasoning ?? [];
+      if (settings.length === 0) points.push({ id: `${runner}:${model.model}`, runner, model: model.model, provider: quota.provider, quota });
+      else for (const reasoning of settings) points.push({ id: `${runner}:${model.model}:${reasoning}`, runner, model: model.model, reasoning, provider: quota.provider, quota });
     }
-    map.set(name, chain);
   }
+  return points;
+}
+
+function classValue(value: unknown, field: string): CostClass {
+  const name = stringField(value, field);
+  if (!CLASS_ORDER.includes(name as CostClass)) fail(`${field} must be one of ${CLASS_ORDER.join(", ")}`, { field, value: name });
+  return name as CostClass;
+}
+
+/**
+ * The declared pointPolicy must cover exactly the generated point set: a
+ * missing id, an unknown id, or a duplicate key (refused by the parser's
+ * uniqueKeys check) invalidates the catalog. An omitted section stays
+ * additive — catalogs authored before ADR-037 still parse — and leaves every
+ * generated combination unreviewed, so none survive a tier envelope.
+ */
+function pointPolicy(value: unknown, generated: readonly GeneratedPoint[]): Map<string, PointPolicy> {
+  const map = new Map<string, PointPolicy>();
+  if (value === undefined) return map;
+  if (!record(value)) fail("pointPolicy must be a mapping keyed by operating point id");
+  const expected = new Set(generated.map((point) => point.id));
+  for (const [id, entry] of Object.entries(value)) {
+    const field = `pointPolicy.${id}`;
+    if (!expected.has(id)) fail("pointPolicy names a point the catalog does not generate", { point: id });
+    if (!record(entry)) fail(`${field} must be an object`, { field });
+    exactKeys(entry, ["costClass", "latencyClass"], field);
+    map.set(id, { costClass: classValue(entry.costClass, `${field}.costClass`), latencyClass: classValue(entry.latencyClass, `${field}.latencyClass`) });
+  }
+  const missing = generated.filter((point) => !map.has(point.id)).map((point) => point.id);
+  if (missing.length > 0) fail("pointPolicy must declare every generated operating point", { missing });
   return map;
+}
+
+function withinBound(value: CostClass, bound: ClassBound): boolean {
+  return bound === "unbounded" || CLASS_ORDER.indexOf(value) <= CLASS_ORDER.indexOf(bound);
 }
 
 function quotaSources(value: unknown, runners: ReadonlyMap<RunnerKind, RunnerEntry>): QuotaSource[] {
@@ -364,32 +510,46 @@ function quotaSources(value: unknown, runners: ReadonlyMap<RunnerKind, RunnerEnt
   return sources;
 }
 
+/** sha256 hex over the raw catalog bytes — the catalog revision recorded in decision evidence. */
+export function catalogRevisionOf(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
 /**
  * Parse and validate the catalog config. Pure: no I/O. Fails closed — an
- * over-long chain, an undeclared runner or model, a duplicate entry, or a pool
- * naming anything outside the reviewed set invalidates the whole catalog.
+ * undeclared runner, a duplicate or malformed model entry, a pool naming
+ * anything outside the reviewed set, or a declared pointPolicy whose keys do
+ * not equal the generated point set invalidates the whole catalog.
+ * `revision` defaults to the digest of the parsed text; callers holding the
+ * raw bytes may pass their own.
  */
-export function parseCatalog(text: string, source: CatalogSource): Catalog {
+export function parseCatalog(text: string, source: CatalogSource, revision: string = catalogRevisionOf(text)): Catalog {
   if (Buffer.byteLength(text, "utf8") > MAX_CATALOG_BYTES) fail("catalog exceeds the 64 KiB limit");
   const document = parseDocument(text, { version: "1.2", schema: "core", strict: true, uniqueKeys: true, prettyErrors: false });
   if (document.errors.length > 0) fail("catalog is not valid YAML", { errors: document.errors.map((error) => error.message) });
   if (document.contents === null || !isMap(document.contents)) fail("catalog must be a YAML mapping");
   validateNode(document.contents);
   const values = document.contents.toJSON() as Record<string, unknown>;
-  exactKeys(values, ["version", "maxAttempts", "categories", "runners", "skills", "plugins", "mcp", "quotaSources"], "catalog");
-  if (values.version !== 1) fail("catalog version must be 1");
-  const maxAttempts = values.maxAttempts === undefined ? DEFAULT_MAX_ATTEMPTS : values.maxAttempts;
-  if (!Number.isInteger(maxAttempts) || (maxAttempts as number) < 1) fail("maxAttempts must be a positive integer");
+  exactKeys(values, ["version", "runners", "skills", "plugins", "mcp", "quotaSources", "pointPolicy"], "catalog");
+  if (values.version !== 2) fail("catalog version must be 2");
   const scopeRoot = resolve(source.scopeRoot);
   const skills = scopedPaths(values.skills ?? [], "skills", scopeRoot);
   const plugins = scopedPaths(values.plugins ?? [], "plugins", scopeRoot);
   const mcp = mcpServers(values.mcp);
   const runners = runnerEntries(values.runners, scopeRoot, skills, plugins, mcp);
+  const generated = generatePoints(runners);
+  const policy = pointPolicy(values.pointPolicy, generated);
+  const points: OperatingPoint[] = [];
+  for (const point of generated) {
+    const classes = policy.get(point.id);
+    if (classes !== undefined) points.push({ ...point, ...classes });
+  }
   return {
-    version: 1,
-    maxAttempts: maxAttempts as number,
-    categories: categories(values.categories, runners, maxAttempts as number),
+    version: 2,
     runners,
+    points,
+    pointPolicy: policy,
+    catalogRevision: revision,
     skills,
     plugins,
     mcpServers: mcp,
@@ -409,77 +569,21 @@ export interface CatalogReadIo {
  */
 export async function loadCatalog(path: string, scopeRoot = dirname(dirname(resolve(path))), io: CatalogReadIo = fs): Promise<Catalog> {
   const resolved = resolve(path);
-  return parseCatalog(await io.readFile(resolved, "utf8"), { path: resolved, scopeRoot });
-}
-
-/** `true` admits; `false` or a string rejects with the string as the recorded reason; an object carries both. */
-export type CandidateVerdict = boolean | string | { admissible: boolean; reason?: string };
-export type CandidateGate = (candidate: ChainCandidate, runner: RunnerEntry) => CandidateVerdict;
-
-export interface ResolvedCandidate {
-  index: number;
-  candidate: ChainCandidate;
-  runner: RunnerEntry;
-}
-
-export interface RejectedCandidate {
-  index: number;
-  candidate: ChainCandidate;
-  gate: "eligibility" | "availability";
-  reason?: string;
-}
-
-export interface ChainResolution {
-  category: string;
-  chain: readonly ChainCandidate[];
-  /** First admissible candidate, or undefined when the chain is exhausted — the caller reports evidence and a nullable retryNotBefore, never a fabricated ETA. */
-  selected: ResolvedCandidate | undefined;
-  /** Admissible candidates after the selected one, in chain order — the pre-execution-only fallback. */
-  remainder: readonly ResolvedCandidate[];
-  /** Every excluded candidate with the gate that excluded it, in chain order. */
-  rejected: readonly RejectedCandidate[];
-}
-
-function verdict(value: CandidateVerdict): { admissible: boolean; reason?: string } {
-  if (typeof value === "boolean") return { admissible: value };
-  if (typeof value === "string") return { admissible: false, reason: value };
-  return value.reason === undefined ? { admissible: value.admissible } : { admissible: value.admissible, reason: value.reason };
+  const text = await io.readFile(resolved, "utf8");
+  return parseCatalog(text, { path: resolved, scopeRoot }, catalogRevisionOf(text));
 }
 
 /**
- * Pure chain resolution: eligibility first, then the quota/availability filter,
- * in declared order. The first satisfying candidate is selected; the ordered
- * remainder is the fallback. A chain that is unresolvable — unknown category,
- * empty, or over the attempt bound — throws rather than truncating. Exhausted
- * chains are a result, not an error: `selected` is undefined and `rejected`
- * carries the evidence.
+ * The quota key a subject is admitted under: the named model entry's
+ * below-runner attribution merged over the runner's tuple — so pi/zai and
+ * pi/opencode-go points can never collide with the runner's codex identity.
  */
-export function resolveChain(catalog: Catalog, category: string, eligibility: CandidateGate = () => true, availability: CandidateGate = () => true): ChainResolution {
-  if (!CATEGORY_NAME_PATTERN.test(category)) throw new ChainResolutionError("category must be lowercase kebab-case", { category });
-  const chain = catalog.categories.get(category);
-  if (chain === undefined || chain.length === 0) throw new ChainResolutionError(`category ${category} is not resolvable`, { category });
-  if (chain.length > catalog.maxAttempts) throw new ChainResolutionError("category chain exceeds the attempt bound", { category, chainLength: chain.length, maxAttempts: catalog.maxAttempts });
-  const admissible: ResolvedCandidate[] = [];
-  const rejected: RejectedCandidate[] = [];
-  for (const [index, candidate] of chain.entries()) {
-    const runner = catalog.runners.get(candidate.runner);
-    if (runner === undefined) throw new ChainResolutionError(`category ${category} names undeclared runner ${candidate.runner}`, { category, runner: candidate.runner });
-    let admitted = true;
-    for (const [gate, check] of [["eligibility", eligibility], ["availability", availability]] as const) {
-      const result = verdict(check(candidate, runner));
-      if (!result.admissible) {
-        rejected.push(result.reason === undefined ? { index, candidate, gate } : { index, candidate, gate, reason: result.reason });
-        admitted = false;
-        break;
-      }
-    }
-    if (admitted) admissible.push({ index, candidate, runner });
-  }
-  const [selected, ...remainder] = admissible;
-  return { category, chain, selected, remainder, rejected };
+export function quotaKeyFor(subject: AvailabilitySubject, runner: RunnerEntry): QuotaKey {
+  return modelQuotaKey(runner.models.find((entry) => entry.model === subject.model), runner);
 }
 
-/** The quota key a candidate is admitted under: the runner's tuple with any per-candidate account override applied. */
-export function quotaKeyFor(candidate: ChainCandidate, runner: RunnerEntry): QuotaKey {
-  return { ...runner.quota, account: candidate.account ?? runner.quota.account };
+/** The subset of classed points admissible under the tier's cost/latency envelope (ADR-037). */
+export function pointsWithinTier<T extends PointPolicy>(points: readonly T[], tier: QualityTier): T[] {
+  const envelope = TIER_ENVELOPES[tier];
+  return points.filter((point) => withinBound(point.costClass, envelope.maxCostClass) && withinBound(point.latencyClass, envelope.maxLatencyClass));
 }

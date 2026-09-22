@@ -2,7 +2,7 @@ import { access, mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { AGY_MODES, attachmentCapability, buildClaudeArgv, buildPiArgv, buildProfileArgv, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileNameFromPath, profileSource, readProfileText, ProfileParseError, MAX_PROFILE_BYTES, type DevinPermissionMode, type ProfileReadIo } from "../../src/profiles/index.js";
+import { AGY_MODES, attachmentCapability, buildClaudeArgv, buildPiArgv, buildProfileArgv, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileNameFromPath, profileSource, readProfileText, resolveClaudeRuntime, ProfileAdapterError, ProfileParseError, MAX_PROFILE_BYTES, type DevinPermissionMode, type Profile, type ProfileReadIo } from "../../src/profiles/index.js";
 import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
 import { createRuntime } from "../../index.js";
 
@@ -264,6 +264,30 @@ describe("profile catalog", () => {
     // variadic flag group ahead of the fixed flags that follow.
     const channeled = parseProfile(profileText("channeled", "claude").replace("effort: medium", "effort: medium\n  developmentChannels: [server:herdr]"), source("/tmp/profile-scope", "channeled"));
     expect(buildProfileArgv(channeled)).toEqual(expect.arrayContaining(["--dangerously-load-development-channels", "server:herdr"]));
+  });
+
+  it("emits no --effort for an unreasoned Claude point and never fills one from a default", () => {
+    // An unreasoned point (e.g. Haiku) compiles to a runtime profile with no
+    // effort — the adapter resolves undefined and emits no flag (ADR-037 N2r).
+    const effortless: Extract<Profile["runtime"], { kind: "claude" }> = { kind: "claude", model: "haiku", permissionMode: "default", allowedTools: [], disallowedTools: [], addDirs: [], pluginDirs: [], developmentChannels: [] };
+    expect(resolveClaudeRuntime(effortless).effort).toBeUndefined();
+    const argv = buildClaudeArgv(effortless, true);
+    expect(argv).toEqual(["--model", "haiku", "--permission-mode", "default"]);
+    expect(argv).not.toContain("--effort");
+    // A valid explicit override is emitted; an invalid one is a typed error.
+    expect(resolveClaudeRuntime(effortless, { effort: "max" }).effort).toBe("max");
+    expect(buildClaudeArgv(effortless, true, { effort: "high" })).toEqual(["--model", "haiku", "--effort", "high", "--permission-mode", "default"]);
+    expect(() => resolveClaudeRuntime(effortless, { effort: "bogus" as never })).toThrow(ProfileAdapterError);
+    expect(() => buildClaudeArgv(effortless, true, { effort: "bogus" as never })).toThrow(ProfileAdapterError);
+    // The profile's own declared effort is the only fallback — a reasoned
+    // profile keeps it, an effort-less one gains nothing from anywhere.
+    const claude = parseProfile(profileText("reviewer", "claude"), source("/tmp/profile-scope", "reviewer"));
+    const runtime = claude.runtime as Extract<typeof claude.runtime, { kind: "claude" }>;
+    expect(resolveClaudeRuntime(runtime).effort).toBe("medium");
+    const { effort, ...noEffort } = runtime;
+    void effort;
+    expect(resolveClaudeRuntime(noEffort).effort).toBeUndefined();
+    expect(buildClaudeArgv(noEffort, true)).not.toContain("--effort");
   });
 
   it("parses and adapts strict AGY profiles", () => {

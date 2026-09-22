@@ -1,21 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import { Value } from "typebox/value";
 import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
-import { parseCatalog, type Catalog, type ChainCandidate, type RunnerEntry, type RunnerKind } from "../../src/catalog.js";
-import { PublishedLaunchParamsSchema, SpecLaunchParamsSchema, type LaunchSpec, type SpecLaunchRequest } from "../../src/launch-schema.js";
+import { parseCatalog, type AvailabilitySubject, type Catalog, type OperatingPoint, type RunnerEntry, type RunnerKind } from "../../src/catalog.js";
+import { PublishedLaunchParamsSchema, LaunchTaskSchema, renderTask, type LaunchTask } from "../../src/launch-schema.js";
 import { SPEC_BASELINE } from "../../src/spec-baseline.js";
-import { createLaunchTool, launchTestInternals, validateLaunchParams, type LaunchCli, type LaunchDependencies, type LaunchDetails, type LaunchRouterLog } from "../../src/tools/launch.js";
-import { routeSpec } from "../../src/router.js";
-import type { SpecModelDecision } from "../../src/router.js";
+import { createLaunchTool, launchTestInternals, validateLaunchParams, type LaunchCli, type LaunchDependencies, type LaunchResult, type LaunchRouterLog } from "../../src/tools/launch.js";
+import { routeTask } from "../../src/router.js";
+import type { RoutingTask, TaskModelDecision } from "../../src/router.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { parsePromptTargetIdentityFields } from "../../src/messages/prompt.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
-import type { HandoffAllocator } from "../../src/handoff.js";
+import { createHandoffAllocator, readHandoffState, updateHandoffState, type HandoffAllocation, type HandoffAllocator, type HandoffState, type HandoffStatus } from "../../src/handoff.js";
+import { POLICY_REVISION, type QualityTier, type WorkspaceState } from "../../src/routing-policy.js";
+import type { TypeSafeSpecClient } from "../../src/typesafe-spec.js";
 import type { SupervisionReserveRequest } from "../../src/supervision/registry.js";
 import { SupervisionBindError } from "../../src/supervision/supervisor.js";
 import type { WorktreeManager } from "../../src/worktree.js";
@@ -24,16 +26,22 @@ import { attachmentCapability, handoffWriteCapability } from "../../src/profiles
 import { parseProfile, profileSource, refreshBundledProfileResourceSelection, SKILL_BUNDLE_REGISTRY_FILE, skillTreeDigest, validateProfileResourceSelection } from "../../src/profiles/index.js";
 import { stubSupervision, type StubSupervision } from "./supervision-fixtures.js";
 
+/** A real directory: the runtime canonicalizes `cwd` before any effect. */
+const repoRoot = realpathSync(process.cwd());
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
-const extensionContext = { cwd: "/repo", signal: new AbortController().signal } as ExtensionContext;
-const assignment = (objective = "Ship the focused change.") => ({ objective, scope: "Only the assigned worktree.", verification: "Run the focused test." });
-const digest = () => ({ doneWhen: ["The assigned objective is complete and verified."], constraints: ["Do not broaden the assignment."] });
+const extensionContext = { cwd: repoRoot, signal: new AbortController().signal } as ExtensionContext;
+const TASK = {
+  objective: "Reduce the latency without changing the public contract.",
+  scope: "Only the assigned worktree.",
+  doneWhen: ["The assigned objective is complete and verified."],
+  constraints: ["Do not broaden the assignment."],
+};
 const ok = (id: string, result: unknown): JsonEnvelope => ({ id, result });
 
-function runnerEntry(models: readonly string[]): RunnerEntry {
+function runnerEntry(modelIds: readonly string[]): RunnerEntry {
   return {
     kind: "pi",
-    models: [...models],
+    models: modelIds.map((model) => ({ model, supportedReasoning: ["low" as const] })),
     quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
     defaults: { timeoutMinutes: 30, sessionPersistence: false, thinking: "low" },
     plumbing: { sessionPersistence: "optional", promptDelivery: "file", skillSelection: "exact", toolSelection: "allowlist" },
@@ -41,10 +49,10 @@ function runnerEntry(models: readonly string[]): RunnerEntry {
   };
 }
 
-function claudeRunner(models: readonly string[]): RunnerEntry {
+function claudeRunner(modelIds: readonly string[]): RunnerEntry {
   return {
     kind: "claude",
-    models: [...models],
+    models: modelIds.map((model) => ({ model, supportedReasoning: ["low" as const] })),
     quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
     defaults: { timeoutMinutes: 30, sessionPersistence: true, effort: "low", permissionMode: "dontAsk" },
     plumbing: { sessionPersistence: "required", promptDelivery: "file", skillSelection: "additive", toolSelection: "allowlist" },
@@ -52,10 +60,10 @@ function claudeRunner(models: readonly string[]): RunnerEntry {
   };
 }
 
-function agyRunner(models: readonly string[]): RunnerEntry {
+function agyRunner(modelIds: readonly string[]): RunnerEntry {
   return {
     kind: "agy",
-    models: [...models],
+    models: modelIds.map((model) => ({ model })),
     quota: { provider: "google", billingProduct: "antigravity", account: "primary", scope: "account" },
     defaults: { timeoutMinutes: 30, sessionPersistence: true, mode: "plan" },
     plumbing: { sessionPersistence: "required", promptDelivery: "bootstrap", skillSelection: "ambient", toolSelection: "ambient" },
@@ -63,10 +71,10 @@ function agyRunner(models: readonly string[]): RunnerEntry {
   };
 }
 
-function devinRunner(models: readonly string[]): RunnerEntry {
+function devinRunner(modelIds: readonly string[]): RunnerEntry {
   return {
     kind: "devin",
-    models: [...models],
+    models: modelIds.map((model) => ({ model })),
     quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
     defaults: { timeoutMinutes: 30, sessionPersistence: true, permissionMode: "dangerous" },
     plumbing: { sessionPersistence: "required", promptDelivery: "none", skillSelection: "ambient", toolSelection: "ambient" },
@@ -74,46 +82,66 @@ function devinRunner(models: readonly string[]): RunnerEntry {
   };
 }
 
-function catalogOf(chain: readonly ChainCandidate[], runners?: ReadonlyMap<RunnerKind, RunnerEntry>): Catalog {
-  const models = chain.filter((candidate) => candidate.runner === "pi").map((candidate) => candidate.model);
+function catalogOf(subjects: readonly AvailabilitySubject[], runners?: ReadonlyMap<RunnerKind, RunnerEntry>): Catalog {
+  const models = subjects.filter((subject) => subject.runner === "pi").map((subject) => subject.model);
+  const resolvedRunners = runners ?? new Map<RunnerKind, RunnerEntry>([["pi", runnerEntry(models)]]);
+  // One reviewed operating point per subject, in the caller's order.
+  // Reasoned runners get their default level; every point sits inside the
+  // lowest cost/latency class so the fixtures pass any tier envelope.
+  const points = subjects.map((subject): OperatingPoint => {
+    const runner = resolvedRunners.get(subject.runner)!;
+    const reasoning = subject.runner === "pi" || subject.runner === "claude" ? ("low" as const) : undefined;
+    return {
+      id: reasoning === undefined ? `${subject.runner}:${subject.model}` : `${subject.runner}:${subject.model}:${reasoning}`,
+      runner: subject.runner,
+      model: subject.model,
+      ...(reasoning === undefined ? {} : { reasoning }),
+      provider: runner.quota.provider,
+      quota: { ...runner.quota },
+      costClass: "low",
+      latencyClass: "low",
+    };
+  });
   return {
-    version: 1,
-    maxAttempts: 4,
-    categories: new Map([["worker", [...chain]]]),
-    runners: runners ?? new Map<RunnerKind, RunnerEntry>([["pi", runnerEntry(models)]]),
+    version: 2,
+    runners: resolvedRunners,
     skills: [],
     plugins: [],
     mcpServers: new Map(),
     quotaSources: [{ name: "reactive-cooldowns", kind: "floor" }],
+    points,
+    pointPolicy: new Map(points.map((point) => [point.id, { costClass: point.costClass, latencyClass: point.latencyClass }])),
     source: { path: "/tmp/catalog.yaml", scopeRoot: "/tmp" },
   };
 }
 
-function spec(overrides: Partial<LaunchSpec> = {}): LaunchSpec {
-  return {
-    label: "worker",
-    instructions: "Reduce the latency without changing the public contract.",
-    assignment: assignment(),
-    category: "worker",
-    count: 1,
-    ...overrides,
-  };
+function task(overrides: Partial<LaunchTask> = {}): LaunchTask {
+  return { ...TASK, ...overrides };
 }
 
-function request(overrides: Partial<SpecLaunchRequest> = {}): SpecLaunchRequest {
-  return { name: "task", specs: [spec()], supervisionDigest: digest(), ...overrides };
+/** The internal label/count remnant the router seam still annotates. */
+function spec(): { label: string; count: number } {
+  return { label: "worker", count: 1 };
 }
 
-function responseFor(catalog: Catalog, quality = { instructions_adequate: 0.95, assignment_verifiable: 0.95 }): SpecModelDecision {
+/** The normalized Task response the fixtures admit: verifiable done-when, confident implement intent, per-runner resource picks, and descending point fitness so the generated chain keeps catalog order. */
+function responseFor(catalog: Catalog, quality: { done_when_verifiable?: number } = {}): TaskModelDecision {
+  const resources: Record<string, Record<string, Record<string, number>>> = {};
+  for (const [kind, runner] of catalog.runners) {
+    if (runner.plumbing.toolSelection === "ambient" || runner.pools.tools.length === 0) continue;
+    resources[kind] = { tools: { read: 0.95 } };
+  }
+  const fitness: Record<string, Record<string, number>> = {};
+  for (const index of (catalog.points ?? []).keys()) {
+    const score = 0.95 - index * 0.01;
+    fitness[String(index)] = { utility: score, economy: score, standard: score, strong: score, frontier: score, max: score };
+  }
   return {
-    quality,
-    category: { category: "worker", confidence: 0.95 },
-    candidates: (catalog.categories.get("worker") ?? []).map((candidate, index) => ({
-      index,
-      runner: candidate.runner,
-      model: candidate.model,
-      resources: catalog.runners.get(candidate.runner)?.plumbing.toolSelection === "ambient" ? {} : { tools: ["read"] },
-    })),
+    quality: { done_when_verifiable: quality.done_when_verifiable ?? 0.95 },
+    intent: { value: "implement", confidence: 0.95 },
+    resources,
+    fitness,
+    uncertainDimensions: [],
   };
 }
 
@@ -132,7 +160,11 @@ function fakeHandoffs(): HandoffAllocator {
     allocate: vi.fn(async () => {
       const runId = randomUUID();
       const directory = join(tmpdir(), `herdr-b8-${runId}`);
-      return { runId, namespaceDir: tmpdir(), directory, artifactPath: join(directory, "handoff.md"), toolsDir: join(directory, ".tools"), statePath: join(directory, ".tools", "state.json"), lockPath: join(directory, ".tools", "lock"), marker: `herdr-run:${runId}` };
+      return { runId, namespaceDir: tmpdir(), endpoint: "test-endpoint", directory, artifactPath: join(directory, "handoff.md"), toolsDir: join(directory, ".tools"), statePath: join(directory, ".tools", "state.json"), lockPath: join(directory, ".tools", "lock"), marker: `herdr-run:${runId}` };
+    }),
+    open: vi.fn(async (runId) => {
+      const directory = join(tmpdir(), runId);
+      return { runId, namespaceDir: tmpdir(), endpoint: "test-endpoint", directory, artifactPath: join(directory, "handoff.md"), toolsDir: join(directory, ".tools"), statePath: join(directory, ".tools", "state.json"), lockPath: join(directory, ".tools", "lock"), marker: `herdr-run:${runId}` };
     }),
     persist: vi.fn(async () => undefined),
     selectCandidate: vi.fn(async () => undefined),
@@ -169,9 +201,9 @@ function makeCli(options: {
     tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
     panes: [
       { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" },
-      ...children.map((child) => ({ pane_id: child.paneId, tab_id: child.tabId, workspace_id: "w1", label: child.name, agent_name: child.name, agent: child.kind, terminal_id: child.terminalId, agent_session: child.session, agent_status: child.prompt ? "working" : "idle", state_change_seq: child.prompt ? 8 : 7, revision: child.prompt ? 4 : 3, interactive_ready: true, ...(child.agentId === undefined ? {} : { agent_id: child.agentId }) })), 
+      ...children.map((child) => ({ pane_id: child.paneId, tab_id: child.tabId, workspace_id: "w1", label: child.name, agent_name: child.name, agent: child.kind, terminal_id: child.terminalId, agent_session: child.session, agent_status: child.prompt ? "working" : "idle", state_change_seq: child.prompt ? 8 : 7, revision: child.prompt ? 4 : 3, interactive_ready: true, ...(child.agentId === undefined ? {} : { agent_id: child.agentId }) })),
     ],
-    agents: children.map((child) => ({ pane_id: child.paneId, name: child.name, agent: child.kind, terminal_id: child.terminalId, agent_session: child.session, agent_status: child.prompt ? "working" : "idle", state_change_seq: child.prompt ? 8 : 7, revision: child.prompt ? 4 : 3, interactive_ready: true, ...(child.agentId === undefined ? {} : { agent_id: child.agentId }) })), 
+    agents: children.map((child) => ({ pane_id: child.paneId, name: child.name, agent: child.kind, terminal_id: child.terminalId, agent_session: child.session, agent_status: child.prompt ? "working" : "idle", state_change_seq: child.prompt ? 8 : 7, revision: child.prompt ? 4 : 3, interactive_ready: true, ...(child.agentId === undefined ? {} : { agent_id: child.agentId }) })),
   });
 
   const cli: LaunchCli = {
@@ -266,14 +298,14 @@ function toolFor(options: {
   ownership?: LaunchDependencies["ownership"];
   launchGate?: LaunchDependencies["launchGate"];
   worktrees?: WorktreeManager;
-  routerLog?: LaunchRouterLog;
+  routerLog?: LaunchRouterLog | null;
   catalogLoad?: () => Promise<Catalog>;
   preflight?: LaunchDependencies["preflight"];
   contextResolver?: LaunchDependencies["contextResolver"];
   promptSources?: LaunchDependencies["promptSources"];
   queueFlush?: LaunchDependencies["queueFlush"];
   clock?: LaunchDependencies["clock"];
-  handoffs?: HandoffAllocator;
+  handoffs?: HandoffAllocator | null;
   availability?: LaunchDependencies["availability"];
   availabilityFailureRecorder?: LaunchDependencies["availabilityFailureRecorder"];
   cwd?: string | null;
@@ -284,18 +316,18 @@ function toolFor(options: {
   return createLaunchTool({
     cli: options.cli,
     context,
-    ...(options.cwd === null ? {} : { cwd: options.cwd ?? "/repo" }),
+    ...(options.cwd === null ? {} : { cwd: options.cwd ?? repoRoot }),
     preflight: options.preflight ?? (async () => undefined),
     supervision,
     specClient,
     catalog: { load: options.catalogLoad ?? (async () => options.catalog) },
     attachments: options.attachments ?? fakeAttachments(),
-    handoffs: options.handoffs ?? fakeHandoffs(),
+    ...(options.handoffs === null ? {} : { handoffs: options.handoffs ?? fakeHandoffs() }),
     ...(options.useDefaultFailureRecorder ? {} : { availabilityFailureRecorder: options.availabilityFailureRecorder ?? vi.fn(async () => undefined) }),
     ...(options.availability === undefined ? {} : { availability: options.availability }),
     ...(options.ownership === undefined ? {} : { ownership: options.ownership }),
     recipients: new RecipientRegistry(),
-    routerLog: options.routerLog ?? (vi.fn(async () => undefined) as LaunchRouterLog),
+    ...(options.routerLog === null ? {} : { routerLog: options.routerLog ?? (vi.fn(async () => undefined) as LaunchRouterLog) }),
     ...(options.contextResolver === undefined ? {} : { contextResolver: options.contextResolver }),
     ...(options.promptSources === undefined ? {} : { promptSources: options.promptSources }),
     ...(options.queueFlush === undefined ? {} : { queueFlush: options.queueFlush }),
@@ -308,170 +340,518 @@ function toolFor(options: {
 type UnsafeTestValue = { (...args: unknown[]): UnsafeTestValue; [key: string]: UnsafeTestValue };
 type UnsafeLaunchInternals = { [K in keyof typeof launchTestInternals]: UnsafeTestValue };
 
-async function execute(tool: ReturnType<typeof createLaunchTool>, params: unknown): Promise<AgentToolResult<LaunchDetails>> {
+async function execute(tool: ReturnType<typeof createLaunchTool>, params: unknown): Promise<AgentToolResult<LaunchResult>> {
   const result = await tool.execute("call", params as never, new AbortController().signal, undefined, extensionContext);
-  if (result.details?.operation !== "launch") throw new Error("expected one launched child");
-  return result as AgentToolResult<LaunchDetails>;
+  if (result.details?.kind !== "launch") throw new Error("expected a launch result");
+  return result;
 }
 
-describe("herdr_launch spec cutover", () => {
-  it("publishes and validates only the strict spec request", () => {
-    const valid = request();
-    expect(Value.Check(SpecLaunchParamsSchema, valid)).toBe(true);
-    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, transportBypass: "receipt-token" })).toBe(true);
-    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, transportBypass: "" })).toBe(false);
+const baseDiagnostics = { injected: context, effective: context, rebound: false, attempts: 1 };
+const baseOperationIds = { current: "current", snapshot: "snapshot" };
+const resolverFor = (snapshot: HerdrSnapshot) => async () => ({ snapshot, context, diagnostics: baseDiagnostics, operationIds: baseOperationIds });
+
+describe("herdr_launch task cutover", () => {
+  it("publishes and validates only the strict flat Task", () => {
+    const valid = task();
+    expect(Value.Check(LaunchTaskSchema, valid)).toBe(true);
     expect(Value.Check(PublishedLaunchParamsSchema, valid)).toBe(true);
     expect(() => validateLaunchParams(valid)).not.toThrow();
-    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, profile: "worker" })).toBe(false);
-    expect(() => validateLaunchParams({ ...valid, profile: "worker" } as never)).toThrow();
-    expect(() => validateLaunchParams({ ...valid, supervisionDigest: undefined } as never)).toThrow();
-    const duplicate = { ...valid, specs: [spec(), spec({ label: "worker" })] };
-    expect(Value.Check(SpecLaunchParamsSchema, duplicate)).toBe(false);
-    expect(() => validateLaunchParams(duplicate)).toThrow();
-    expect([...Value.Errors(SpecLaunchParamsSchema, duplicate)]).toEqual(expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining("duplicate spec.label") })]));
-    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, specs: [spec({ label: "worker-overlong" })] })).toBe(false);
-    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, specs: [spec({ count: 8 })] })).toBe(true);
-    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, specs: [spec({ count: 9 })] })).toBe(false);
+    // The deleted caller-authority fields are unknown properties now: no alias survives.
+    for (const deleted of ["name", "specs", "tasks", "instructions", "assignment", "supervisionDigest", "category", "count", "placement", "focus", "assignmentDelivery", "transportBypass", "profile"]) {
+      expect(Value.Check(LaunchTaskSchema, { ...valid, [deleted]: "x" }), deleted).toBe(false);
+      expect(() => validateLaunchParams({ ...valid, [deleted]: "x" } as never)).toThrow();
+    }
+    expect(Value.Check(LaunchTaskSchema, { ...valid, doneWhen: [] })).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, doneWhen: Array.from({ length: 9 }, (_, index) => `d${index}`) })).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, doneWhen: Array.from({ length: 8 }, (_, index) => `d${index}`) })).toBe(true);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, constraints: Array.from({ length: 9 }, (_, index) => `c${index}`) })).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, constraints: [] })).toBe(true);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, replicas: 0 })).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, replicas: 9 })).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, replicas: 8 })).toBe(true);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, replicas: 1.5 })).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, task({ tier: "frontier" }))).toBe(true);
+    expect(Value.Check(LaunchTaskSchema, { ...valid, tier: "bogus" })).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, task({ objective: "" }))).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, task({ objective: "a\0b" }))).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, task({ label: "a\nb" }))).toBe(false);
+    expect(Value.Check(LaunchTaskSchema, task({ label: "docs sprint" }))).toBe(true);
+    const minimal = { objective: "o", scope: "s", doneWhen: ["d"] };
+    expect(Value.Check(LaunchTaskSchema, minimal)).toBe(true);
+    expect(() => validateLaunchParams(minimal)).not.toThrow();
+    expect(() => validateLaunchParams({ objective: "o", scope: "s" } as never)).toThrow();
+    expect(() => validateLaunchParams(null as never)).toThrow();
   });
 
-  it("derives the child name, carries the universal baseline, and reserves the caller digest", async () => {
+  it("bounds the display label at 256 UTF-8 bytes before any effect", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const harness = makeCli({ agentId: "agent-task-worker-1" });
+    // The bound is bytes, not code units: 256 ASCII pass, 257 and 258-byte
+    // multibyte strings reject. A 10KB label is refused at validation — it
+    // never reaches evaluation, routing persistence, or any CLI mutation.
+    expect(() => validateLaunchParams(task({ label: "x".repeat(256) }))).not.toThrow();
+    expect(() => validateLaunchParams(task({ label: "x".repeat(257) }))).toThrowError(expect.objectContaining({ code: "INVALID_INPUT" }));
+    expect(() => validateLaunchParams(task({ label: "€".repeat(85) }))).not.toThrow();
+    expect(() => validateLaunchParams(task({ label: "€".repeat(86) }))).toThrowError(expect.objectContaining({ code: "INVALID_INPUT" }));
+    const harness = makeCli();
+    const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+    const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
+    const tool = toolFor({ catalog, cli: harness.cli, specClient, routerLog });
+    await expect(tool.execute("call", task({ label: "x".repeat(10 * 1024) }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(harness.calls).toEqual([]);
+    expect(specClient.evaluate).not.toHaveBeenCalled();
+    expect(routerLog).not.toHaveBeenCalled();
+  });
+
+  it("keeps the caller label display-only: distinct minted targets, minted pane rename, nothing in routing evidence", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
+    // Two Tasks carrying the same label still launch into distinct minted
+    // targets — the label never becomes identity.
+    const first = makeCli();
+    const firstResult = await execute(toolFor({ catalog, cli: first.cli, routerLog }), task({ label: "sprint" }));
+    const second = makeCli();
+    const secondResult = await execute(toolFor({ catalog, cli: second.cli, routerLog }), task({ label: "sprint" }));
+    const firstTarget = firstResult.details!.children[0]!.target;
+    const secondTarget = secondResult.details!.children[0]!.target;
+    expect(firstTarget).toMatch(/^task-[0-9a-f]{8}-1$/u);
+    expect(secondTarget).toMatch(/^task-[0-9a-f]{8}-1$/u);
+    expect(firstTarget).not.toBe(secondTarget);
+    // The pane rename carries the minted child name, and no CLI argv carries
+    // the caller's label.
+    const rename = first.calls.find((argv) => argv[0] === "pane" && argv[1] === "rename")!;
+    expect(rename[3]).toBe(firstTarget);
+    expect(first.calls.some((argv) => argv.includes("sprint"))).toBe(false);
+    // The persisted routing decision never contains the caller label.
+    for (const call of routerLog.mock.calls) expect(JSON.stringify(call[0])).not.toContain("sprint");
+  });
+
+  it("mints the child name, carries the universal baseline, and reserves the task digest", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const harness = makeCli({ agentId: "agent-1" });
     const supervision = stubSupervision();
     const requests: SupervisionReserveRequest[] = [];
     const reserve = supervision.reserve;
     supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
-    const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), request());
+    const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), task());
 
-    expect(result.details).toMatchObject({ outcome: "launched", name: "task-worker-1", kind: "pi", spec: { label: "worker", count: 1, selected: { model: "pi-model" }, configuration: { runtime: { kind: "pi", model: "pi-model", thinking: "low", tools: ["read"] }, timeoutMinutes: 30, resources: { tools: { permitted: ["read"] } } } }, supervision: { state: "active" } });
+    expect(result.details).toMatchObject({ kind: "launch", outcome: "launched", requestedTier: "standard" });
+    const child = result.details!.children[0]!;
+    expect(child.target).toMatch(/^task-[0-9a-f]{8}-1$/u);
+    expect(child).toMatchObject({ state: "launched", operatingPointId: "pi:pi-model:low", supervisorJobId: "job_supervisor" });
     expect(harness.prompts).toHaveLength(1);
     expect(harness.prompts[0]).toContain(SPEC_BASELINE);
-    expect(harness.prompts[0]).toContain("Reduce the latency without changing the public contract.");
-    expect(requests[0]).toMatchObject({ child: { agentName: "task-worker-1", agentKind: "pi", candidateName: "pi-model" }, settings: { supervisionDigest: { ...digest(), readOnly: false } } });
-    expect(Object.keys(requests[0]!.settings!.supervisionDigest!).sort()).toEqual(["constraints", "doneWhen", "readOnly"]);
+    expect(harness.prompts[0]).toContain(renderTask(TASK));
+    expect(requests[0]).toMatchObject({ child: { agentName: child.target, agentKind: "pi", operatingPointId: "pi:pi-model:low" }, settings: { supervisionDigest: { doneWhen: TASK.doneWhen, constraints: TASK.constraints } } });
+    expect(Object.keys(requests[0]!.settings!.supervisionDigest!).sort()).toEqual(["constraints", "doneWhen"]);
   });
 
-  it("bounds the digest's readOnly claim — absent and false stay false, non-boolean rejects", () => {
-    const valid = request();
-    for (const flag of [true, false]) {
-      expect(Value.Check(SpecLaunchParamsSchema, { ...valid, supervisionDigest: { ...digest(), readOnly: flag } }), String(flag)).toBe(true);
-    }
-    for (const flag of ["yes", 1, null, {}, []]) {
-      expect(Value.Check(SpecLaunchParamsSchema, { ...valid, supervisionDigest: { ...digest(), readOnly: flag } }), JSON.stringify(flag)).toBe(false);
-    }
-    // The digest stays strict: an unknown field rejects rather than slipping into policy.
-    expect(Value.Check(SpecLaunchParamsSchema, { ...valid, supervisionDigest: { ...digest(), writable: true } })).toBe(false);
-  });
-
-  it("reserves the caller readOnly claim and per-candidate deny lists with the trusted workspace root", async () => {
+  it("reserves every compiled candidate's deny list with the trusted workspace root", async () => {
     const catalog = catalogOf(
       [{ runner: "claude", model: "opus" }, { runner: "pi", model: "pi-model" }, { runner: "devin", model: "swe-2-max" }],
       new Map<RunnerKind, RunnerEntry>([["claude", claudeRunner(["opus"])], ["pi", runnerEntry(["pi-model"])], ["devin", devinRunner(["swe-2-max"])]]),
     );
-    const harness = makeCli({ agentId: "agent-task-worker-1" });
+    const harness = makeCli();
     const supervision = stubSupervision();
     const requests: SupervisionReserveRequest[] = [];
     const reserve = supervision.reserve;
     supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
-    const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), request({ supervisionDigest: { ...digest(), readOnly: true } }));
+    const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), task());
 
-    expect(result.details).toMatchObject({ outcome: "launched", kind: "claude" });
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:opus:low" }] });
     const settings = requests[0]!.settings!;
-    // The authorial claim crosses verbatim — a caller-set true stays true.
-    expect(settings.supervisionDigest).toEqual({ ...digest(), readOnly: true });
+    expect(settings.supervisionDigest).toEqual({ doneWhen: TASK.doneWhen, constraints: TASK.constraints });
     // The deny list belongs to the runner that may actually start, so the
-    // reservation carries every compiled candidate's fact: claude's argv deny
-    // channel is the only authoritative source; pi and devin have none.
+    // reservation carries every compiled candidate's fact keyed on the exact
+    // operating-point id: claude's argv deny channel is the only authoritative
+    // source; pi and devin have none.
     expect(settings.forbiddenTools).toEqual([
-      { agentKind: "claude", candidateName: "opus", forbiddenTools: { available: true, tools: ["write", "bash"] } },
-      { agentKind: "pi", candidateName: "pi-model", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
-      { agentKind: "devin", candidateName: "swe-2-max", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
+      { agentKind: "claude", operatingPointId: "claude:opus:low", forbiddenTools: { available: true, tools: ["write", "bash"] } },
+      { agentKind: "pi", operatingPointId: "pi:pi-model:low", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
+      { agentKind: "devin", operatingPointId: "devin:swe-2-max", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
     ]);
-    // The launch-resolved --cwd is the trusted workspace root.
-    expect(settings.workspaceRoot).toEqual({ available: true, root: "/repo" });
+    // The canonical launch cwd is the trusted workspace root.
+    expect(settings.workspaceRoot).toEqual({ available: true, root: repoRoot });
   });
 
-  it("carries the existing pane's cwd or a typed gap as the workspace root — never a guess", async () => {
+  it("canonicalizes the launch cwd and fails closed on unusable directories", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const targetSnapshot = {
-      version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
-      panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "target", agent_status: "idle", cwd: "/workspace/child" }],
-      agents: []
-    } as HerdrSnapshot;
-    const resolver = async () => ({ snapshot: targetSnapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } });
-    const existingChild: Child = { paneId: "w1:p9", tabId: "w1:t1", name: "", kind: "pi", terminalId: "terminal-w1:p9", session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing" }, prompt: false };
-
     const supervision = stubSupervision();
     const requests: SupervisionReserveRequest[] = [];
     const reserve = supervision.reserve;
     supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
-    const existing = await execute(toolFor({ catalog, cli: makeCli({ existingPane: existingChild }).cli, contextResolver: resolver, supervision }), request({ placement: { mode: "existing_pane", target: "w1:p9" } }));
-    expect(existing.details).toMatchObject({ paneId: "w1:p9" });
-    // The pane's own cwd is the trusted root — not the caller's or the host's.
-    expect(requests[0]!.settings!.workspaceRoot).toEqual({ available: true, root: "/workspace/child" });
 
-    // A relative caller cwd cannot be resolved against the pane's shell and
-    // degrades to a typed gap rather than guessing a base.
-    const relative = await execute(toolFor({ catalog, cli: makeCli().cli, supervision }), request({ cwd: "relative/dir" }));
-    expect(relative.details).toMatchObject({ outcome: "launched" });
-    expect(requests[1]!.settings!.workspaceRoot).toEqual({ available: false, reason: "root_not_absolute" });
+    const real = mkdtempSync(join(tmpdir(), "herdr-launch-cwd-"));
+    const link = join(tmpdir(), `herdr-launch-cwd-link-${randomUUID()}`);
+    symlinkSync(real, link, "dir");
+    const file = join(real, "file");
+    writeFileSync(file, "x");
+    try {
+      const linked = await execute(toolFor({ catalog, cli: makeCli().cli, supervision }), task({ cwd: link }));
+      expect(linked.details).toMatchObject({ outcome: "launched" });
+      // The canonical realpath is the trusted root — not the caller's spelling.
+      expect(requests[0]!.settings!.workspaceRoot).toEqual({ available: true, root: realpathSync(real) });
 
-    // An existing pane whose record carries no cwd yields the same typed gap.
-    const bareSnapshot = { ...targetSnapshot, panes: targetSnapshot.panes.map((pane) => ({ ...pane, cwd: undefined })) };
-    const bareResolver = async () => ({ snapshot: bareSnapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } });
-    const noCwd = await execute(toolFor({ catalog, cli: makeCli({ existingPane: { ...existingChild, prompt: false, session: { ...existingChild.session, value: "session-bare" } } }).cli, contextResolver: bareResolver, supervision }), request({ placement: { mode: "existing_pane", target: "w1:p9" } }));
-    expect(noCwd.details).toMatchObject({ paneId: "w1:p9" });
-    expect(requests[2]!.settings!.workspaceRoot).toEqual({ available: false, reason: "root_unavailable" });
+      const tool = toolFor({ catalog, cli: makeCli().cli, supervision });
+      await expect(tool.execute("call", task({ cwd: "definitely/missing" }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CWD_UNAVAILABLE" });
+      await expect(tool.execute("call", task({ cwd: file }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CWD_UNAVAILABLE" });
+      // A directory that exists but denies search/read fails closed too.
+      const locked = join(real, "locked");
+      mkdirSync(locked, { mode: 0o000 });
+      try {
+        await expect(tool.execute("call", task({ cwd: locked }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CWD_UNAVAILABLE" });
+      } finally {
+        chmodSync(locked, 0o700);
+      }
+    } finally {
+      rmSync(real, { recursive: true, force: true });
+      rmSync(link, { force: true });
+    }
   });
 
-  it("rejects digest-absent and legacy profile requests before any CLI mutation", async () => {
+  it("rejects deleted caller-authority fields before any CLI mutation", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const harness = makeCli();
     const tool = toolFor({ catalog, cli: harness.cli });
-    await expect(tool.execute("call", { name: "task", specs: [spec()] } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
-    await expect(tool.execute("call", { name: "task", profile: "worker", assignment: assignment(), supervisionDigest: digest() } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(tool.execute("call", { name: "task", specs: [{ label: "worker" }] } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(tool.execute("call", { ...task(), profile: "worker", assignment: { objective: "o" } } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(tool.execute("call", { ...task(), instructions: "x" } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     expect(harness.calls).toEqual([]);
   });
 
-  it("keeps rejected specs rejected and performs no launch mutation", async () => {
+  it("fails closed on an unresolvable recoveryOf before any effect", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const harness = makeCli();
-    const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog, { instructions_adequate: 0.1, assignment_verifiable: 0.1 }) })) };
+    const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+    await expect(toolFor({ catalog, cli: harness.cli, specClient }).execute("call", task({ recoveryOf: "run-1" }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE", details: { reason: "run_id_malformed" } });
+    expect(harness.calls).toEqual([]);
+    expect(specClient.evaluate).not.toHaveBeenCalled();
+  });
+
+  describe("recovery lineage (ADR-037)", () => {
+    const RECOVERY_WORKLOAD = { intent: "implement" as const, mutation: "bounded" as const, scope: "local" as const, horizon: "short" as const, verifiability: "strong" as const, workspaceState: "clean" as const, ambiguity: "low" as const };
+
+    /**
+     * A real allocator over a private namespace dir, plus one persisted prior
+     * run whose recorded managed workspace is a canonical real directory.
+     */
+    async function seedRecoveryRun(options: {
+      lifecycle?: HandoffState["lifecycle"]["state"];
+      artifactStatus?: HandoffStatus;
+      routeTier?: QualityTier;
+      operatingPointId?: string;
+      endpoint?: string;
+      worktree?: string;
+      workspaceDir?: string;
+      omitRoute?: boolean;
+      omitWorkspace?: boolean;
+    } = {}): Promise<{ run: HandoffAllocation; allocator: HandoffAllocator; namespaceDir: string; workspaceDir: string }> {
+      const namespaceDir = realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-ns-")));
+      const workspaceDir = options.workspaceDir ?? realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-ws-")));
+      const allocator = createHandoffAllocator({ namespace: { dir: namespaceDir, endpoint: options.endpoint ?? "test-endpoint" } });
+      const run = await allocator.allocate();
+      const operatingPointId = options.operatingPointId ?? "pi:primary:low";
+      await allocator.persist(run, {
+        manager: { paneId: "w1:p1", display: "caller", source: "injected" },
+        child: {
+          agentName: "prior-worker",
+          agentKind: "pi",
+          operatingPointId,
+          specLabel: "worker",
+          fallbackCandidates: [],
+          ...(options.omitRoute ? {} : { route: { tier: options.routeTier ?? "standard", operatingPointId, policyRevision: "adr-037-p1", workload: RECOVERY_WORKLOAD } }),
+          ...(options.omitWorkspace ? {} : { workspace: { resolvedCwd: workspaceDir, ...(options.worktree === undefined ? {} : { worktree: options.worktree }) } })
+        }
+      });
+      await updateHandoffState(run, (state) => {
+        state.lifecycle.state = options.lifecycle ?? "handed_off";
+        if (options.artifactStatus !== undefined) state.artifact.status = options.artifactStatus;
+      });
+      return { run, allocator, namespaceDir, workspaceDir };
+    }
+
+    /** Mutate a persisted state document directly — for records that must fail the v2 parse. */
+    function rewriteState(run: HandoffAllocation, mutate: (doc: Record<string, unknown>) => void): void {
+      const doc = JSON.parse(readFileSync(run.statePath, "utf8")) as Record<string, unknown>;
+      mutate(doc);
+      writeFileSync(run.statePath, JSON.stringify(doc), { mode: 0o600 });
+    }
+
+    /** The new run id a launch allocated, recovered from the task's injected marker. */
+    function launchedRunId(harness: ReturnType<typeof makeCli>): string {
+      return /herdr-run:([0-9a-f-]{36})/u.exec(harness.prompts[0]!)![1]!;
+    }
+
+    /** The cwd the placement call launched the child into — split or tab create. */
+    function placementCwd(harness: ReturnType<typeof makeCli>): string {
+      const placement = harness.calls.find((argv) => (argv[0] === "pane" && argv[1] === "split") || (argv[0] === "tab" && argv[1] === "create"))!;
+      return placement[placement.indexOf("--cwd") + 1]!;
+    }
+
+    it("resumes the prior managed workspace, lifts the route tier, and excludes the failed point", async () => {
+      const { run, allocator, workspaceDir } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", operatingPointId: "pi:primary:low", routeTier: "standard" });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const harness = makeCli();
+      const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
+      const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId, replicas: 1 }));
+
+      // nextTier(standard) lifts the start preference to strong.
+      expect(result.details).toMatchObject({ outcome: "launched", requestedTier: "standard", effectiveTier: "strong" });
+      // The exact failed point is excluded; the remaining candidate ran.
+      expect(result.details!.children[0]).toMatchObject({ state: "launched", operatingPointId: "pi:fallback:low" });
+      // The evaluator saw the derived workspace state and the caller's own tier.
+      expect(evaluate.mock.calls[0]![0]).toMatchObject({ workspaceState: "clean" as WorkspaceState, task: { tier: "standard" } });
+      // The child started inside the resumed prior workspace, not the ambient cwd.
+      expect(placementCwd(harness)).toBe(workspaceDir);
+      expect(workspaceDir).not.toBe(repoRoot);
+      // The new run's record carries its own route and workspace lineage.
+      const newState = await readHandoffState(await allocator.open(launchedRunId(harness)));
+      expect(newState.child.route).toMatchObject({ tier: "strong", operatingPointId: "pi:fallback:low", policyRevision: POLICY_REVISION });
+      expect(newState.child.route?.workload).toMatchObject({ workspaceState: "clean", intent: "implement" });
+      expect(newState.child.workspace).toEqual({ resolvedCwd: workspaceDir });
+      // The persisted workspace identity did not come from a caller cwd — none was given.
+      expect(newState.child.agentName).toBe(result.details!.children[0]!.target);
+    });
+
+    it("resumes the recorded worktree when the prior child ran inside one", async () => {
+      const worktreeDir = realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-wt-")));
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", worktree: worktreeDir });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const harness = makeCli();
+      const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
+
+      expect(result.details).toMatchObject({ outcome: "launched" });
+      expect(placementCwd(harness)).toBe(worktreeDir);
+      const newState = await readHandoffState(await allocator.open(launchedRunId(harness)));
+      expect(newState.child.workspace).toEqual({ resolvedCwd: worktreeDir, worktree: worktreeDir });
+    });
+
+    it("computes the effective start as max(requested, workload floor, next tier after the prior route)", async () => {
+      // prior route strong -> lift frontier; caller asks economy -> frontier wins.
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", routeTier: "strong" });
+      const catalog = { ...catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), catalogRevision: "f".repeat(64) };
+      const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
+      const result = await execute(toolFor({ catalog, cli: makeCli().cli, handoffs: allocator, routerLog }), task({ recoveryOf: run.runId, tier: "economy" }));
+
+      expect(result.details).toMatchObject({ outcome: "launched", requestedTier: "economy", effectiveTier: "frontier" });
+      // The logged decision keeps requestedTier = the caller's ask; the lift
+      // rides on effectiveStartTier.
+      expect(routerLog.mock.calls[0]![0].result).toMatchObject({ requestedTier: "economy", effectiveStartTier: "frontier" });
+      // The logged record carries the catalog revision and the recovery
+      // lineage pair — the recovered run and the failed point it excludes.
+      expect(routerLog.mock.calls[0]![0]).toMatchObject({ catalogRevision: catalog.catalogRevision, recoveryOf: run.runId, priorOperatingPointId: "pi:primary:low" });
+    });
+
+    it("derives a partial workspace from an unresolved prior lifecycle and lifts the floor", async () => {
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "recovery_pending", routeTier: "standard" });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
+      const result = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
+
+      expect(evaluate.mock.calls[0]![0].workspaceState).toBe("partial");
+      // partial raises the workload floor to strong; nextTier(standard) agrees.
+      expect(result.details).toMatchObject({ outcome: "launched", effectiveTier: "strong" });
+    });
+
+    it("resumes a cancelled prior run as failed-workspace evidence", async () => {
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "cancelled", routeTier: "standard" });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
+      const result = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
+      expect(evaluate.mock.calls[0]![0].workspaceState).toBe("failed");
+      expect(result.details).toMatchObject({ outcome: "launched" });
+    });
+
+    it("reaches the max fixed point when the prior route was frontier", async () => {
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "failed", routeTier: "frontier" });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
+      const result = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
+
+      expect(evaluate.mock.calls[0]![0].workspaceState).toBe("failed");
+      expect(result.details).toMatchObject({ outcome: "launched", effectiveTier: "max" });
+    });
+
+    it("ranks a different provider ahead of the failed point's provider", async () => {
+      const claude = claudeRunner(["c", "b"]);
+      const catalog = catalogOf(
+        [{ runner: "claude", model: "c" }, { runner: "pi", model: "a" }, { runner: "claude", model: "b" }],
+        new Map<RunnerKind, RunnerEntry>([["claude", { ...claude, quota: { ...claude.quota, provider: "prov-b" } }], ["pi", runnerEntry(["a"])]]),
+      );
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "claude:b:low", routeTier: "standard" });
+      const harness = makeCli();
+      const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
+
+      expect(result.details).toMatchObject({ outcome: "launched" });
+      // claude:b:low is excluded; claude:c:low shares its provider, so the
+      // test-provider point pi:a:low starts first despite lower fitness order.
+      const firstStart = harness.calls.find((argv) => argv[0] === "agent" && argv[1] === "start")!;
+      expect(firstStart[4]).toBe("pi");
+      expect(result.details!.children[0]!.operatingPointId).toBe("pi:a:low");
+    });
+
+    it("keeps fitness order when the head already carries a different provider, and when the failed point is gone from the catalog", async () => {
+      const claude = claudeRunner(["c", "b"]);
+      const catalog = catalogOf(
+        [{ runner: "pi", model: "a" }, { runner: "claude", model: "c" }, { runner: "claude", model: "b" }],
+        new Map<RunnerKind, RunnerEntry>([["claude", { ...claude, quota: { ...claude.quota, provider: "prov-b" } }], ["pi", runnerEntry(["a"])]]),
+      );
+      // Failed point's provider differs from the post-exclusion head's — order stands.
+      const first = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "claude:b:low" });
+      const result = await execute(toolFor({ catalog, cli: makeCli().cli, handoffs: first.allocator }), task({ recoveryOf: first.run.runId }));
+      expect(result.details!.children[0]!.operatingPointId).toBe("pi:a:low");
+
+      // A failed point no longer in the catalog is simply absent — no reorder.
+      const single = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const second = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "pi:gone:low" });
+      const again = await execute(toolFor({ catalog: single, cli: makeCli().cli, handoffs: second.allocator }), task({ recoveryOf: second.run.runId }));
+      expect(again.details!.children[0]!.operatingPointId).toBe("pi:primary:low");
+    });
+
+    it("abstains closed when the exclusion empties the usable chain", async () => {
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "pi:primary:low" });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }]);
+      const harness = makeCli();
+      const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
+      // The failed point is excluded inside the routing decision itself, so the
+      // launch abstains before any child exists rather than failing one.
+      expect(result.details).toMatchObject({ outcome: "abstained", children: [] });
+      expect(harness.calls.filter((argv) => argv[0] === "agent" && argv[1] === "start")).toEqual([]);
+    });
+
+    it("abstains a recovery whose decision does not admit", async () => {
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done" });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }]);
+      const harness = makeCli();
+      const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog, { done_when_verifiable: 0.1 }) })) };
+      const result = await execute(toolFor({ catalog, cli: harness.cli, specClient, handoffs: allocator }), task({ recoveryOf: run.runId }));
+      expect(result.details).toMatchObject({ outcome: "abstained", children: [] });
+      expect(harness.calls).toEqual([]);
+    });
+
+    it("fails closed on a missing run before any launch effect", async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-ns-")));
+      const allocator = createHandoffAllocator({ namespace: { dir, endpoint: "test-endpoint" } });
+      const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+      const harness = makeCli();
+      const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+      await expect(toolFor({ catalog, cli: harness.cli, specClient, handoffs: allocator }).execute("call", task({ recoveryOf: randomUUID() }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE", details: { reason: "state_unreadable" } });
+      expect(harness.calls).toEqual([]);
+      expect(specClient.evaluate).not.toHaveBeenCalled();
+    });
+
+    it("fails closed on every unresolvable source record before any launch effect", async () => {
+      const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+      const cases: Array<{ name: string; reason: string; seed: () => Promise<{ run: HandoffAllocation; allocator: HandoffAllocator }> }> = [
+        // A v1 record predates recovery lineage — never reinterpreted.
+        { name: "v1 record", reason: "state_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); rewriteState(seeded.run, (doc) => { doc.v = 1; }); return seeded; } },
+        // A record pinned to a foreign endpoint is not this namespace's lineage —
+        // the same run dir opened under this endpoint refuses the pinned record.
+        { name: "foreign namespace", reason: "state_unreadable", seed: async () => {
+          const seeded = await seedRecoveryRun({ endpoint: "other-endpoint" });
+          return { run: seeded.run, allocator: createHandoffAllocator({ namespace: { dir: seeded.namespaceDir, endpoint: "test-endpoint" } }) };
+        } },
+        { name: "malformed route", reason: "state_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); rewriteState(seeded.run, (doc) => { (doc.child as Record<string, unknown>).route = { tier: "bogus" }; }); return seeded; } },
+        { name: "malformed workspace", reason: "state_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); rewriteState(seeded.run, (doc) => { (doc.child as Record<string, unknown>).workspace = {}; }); return seeded; } },
+        { name: "route absent", reason: "lineage_incomplete", seed: async () => { const seeded = await seedRecoveryRun({ omitRoute: true }); return seeded; } },
+        { name: "workspace absent", reason: "lineage_incomplete", seed: async () => { const seeded = await seedRecoveryRun({ omitWorkspace: true }); return seeded; } },
+        { name: "unresolvable evidence", reason: "evidence_unresolvable", seed: async () => { const seeded = await seedRecoveryRun(); await updateHandoffState(seeded.run, (state) => { state.lifecycle.state = "bogus" as never; }); return seeded; } },
+        // A live prior lifecycle may still have a writer over the workspace —
+        // recovery rejects it before any effect, never reuses the workspace.
+        { name: "awaiting handoff", reason: "lifecycle_non_terminal", seed: async () => { const seeded = await seedRecoveryRun({ lifecycle: "awaiting_handoff" }); return seeded; } },
+        { name: "handed_off without terminal artifact", reason: "lifecycle_non_terminal", seed: async () => { const seeded = await seedRecoveryRun({ lifecycle: "handed_off" }); return seeded; } },
+        { name: "workspace gone", reason: "workspace_unavailable", seed: async () => { const seeded = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", workspaceDir: join(tmpdir(), `herdr-missing-${randomUUID()}`) }); return seeded; } },
+      ];
+      for (const { name, reason, seed } of cases) {
+        const { run, allocator } = await seed();
+        const harness = makeCli();
+        const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+        await expect(toolFor({ catalog, cli: harness.cli, specClient, handoffs: allocator }).execute("call", task({ recoveryOf: run.runId }), new AbortController().signal, undefined, extensionContext), name).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE", details: { reason } });
+        expect(harness.calls, name).toEqual([]);
+        expect(specClient.evaluate, name).not.toHaveBeenCalled();
+      }
+    });
+
+    it("fails closed when the recorded workspace now resolves elsewhere", async () => {
+      const real = realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-real-")));
+      const link = join(tmpdir(), `herdr-recovery-link-${randomUUID()}`);
+      symlinkSync(real, link, "dir");
+      try {
+        const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", workspaceDir: link });
+        const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+        const harness = makeCli();
+        const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+        await expect(toolFor({ catalog, cli: harness.cli, specClient, handoffs: allocator }).execute("call", task({ recoveryOf: run.runId }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE", details: { reason: "workspace_moved" } });
+        expect(harness.calls).toEqual([]);
+        expect(specClient.evaluate).not.toHaveBeenCalled();
+      } finally {
+        rmSync(link, { force: true });
+      }
+    });
+
+    it("fails closed when the opener itself cannot resolve the run", async () => {
+      const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+      const harness = makeCli();
+      const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+      const failing: HandoffAllocator = { ...fakeHandoffs(), open: vi.fn(async () => { throw new Error("namespace down"); }) };
+      await expect(toolFor({ catalog, cli: harness.cli, specClient, handoffs: failing }).execute("call", task({ recoveryOf: randomUUID() }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE", details: { reason: "run_unavailable" } });
+      expect(harness.calls).toEqual([]);
+      expect(specClient.evaluate).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the ambient handoff allocator when none is injected", async () => {
+      const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+      const harness = makeCli();
+      const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+      const tool = toolFor({ catalog, cli: harness.cli, specClient, cwd: null, handoffs: null });
+      // open() only reads, so an unknown run id fails closed whether or not the
+      // ambient endpoint namespace resolves on this machine.
+      await expect(tool.execute("call", task({ recoveryOf: randomUUID() }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE" });
+      // A second ambient recovery reuses the memoized default allocator.
+      await expect(tool.execute("call", task({ recoveryOf: randomUUID() }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE" });
+      expect(harness.calls).toEqual([]);
+      expect(specClient.evaluate).not.toHaveBeenCalled();
+    });
+
+    it("rejects a recovery request carrying cwd or replicas > 1 before any effect", async () => {
+      const { run, allocator } = await seedRecoveryRun();
+      const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+      for (const overrides of [{ cwd: repoRoot }, { replicas: 2 }, { cwd: repoRoot, replicas: 2 }]) {
+        const harness = makeCli();
+        const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+        const params = task({ recoveryOf: run.runId, ...overrides });
+        expect(() => validateLaunchParams(params)).toThrowError(expect.objectContaining({ code: "INVALID_INPUT" }));
+        await expect(toolFor({ catalog, cli: harness.cli, specClient, handoffs: allocator }).execute("call", params, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+        expect(harness.calls).toEqual([]);
+        expect(specClient.evaluate).not.toHaveBeenCalled();
+      }
+    });
+  });
+
+  it("keeps rejected decisions abstained and performs no launch mutation", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const harness = makeCli();
+    const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog, { done_when_verifiable: 0.1 }) })) };
     const tool = toolFor({ catalog, cli: harness.cli, specClient });
-    const result = await tool.execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(result.details).toMatchObject({ operation: "launch_batch", outcome: "abstained", router: [{ kind: "rejected", quality: "rejected" }], children: [] });
+    const result = await tool.execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(result.details).toMatchObject({ kind: "launch", outcome: "abstained", children: [] });
     expect(harness.calls).toEqual([]);
   });
 
-  it("assesses every spec against the complete planned team", async () => {
+  it("evaluates the one canonical Task against the loaded catalog", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const evaluate = vi.fn(async ({ spec: routedSpec, team }: { spec: LaunchSpec; team?: readonly LaunchSpec[] }) => ({
-      kind: "response" as const,
-      response: { ...responseFor(catalog), composition: { missing_area: 0.9, assessed: team?.map((member) => member.label) ?? [routedSpec.label] } },
-    }));
+    const evaluate = vi.fn(async (input: { task: RoutingTask; catalog: Catalog }) => ({ kind: "response" as const, response: responseFor(input.catalog) }));
     const result = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate } }).execute(
       "call",
-      request({ specs: [spec(), spec({ label: "critic" })] }),
+      task(),
       new AbortController().signal,
       undefined,
       extensionContext,
     );
-    expect(evaluate).toHaveBeenCalledTimes(2);
-    expect(evaluate.mock.calls.every(([input]) => input.team?.map((member) => member.label).join(",") === "worker,critic")).toBe(true);
-    expect(result.details).toMatchObject({ router: [{ advisory: { assessed: ["worker", "critic"], diverged: false } }, { advisory: { assessed: ["worker", "critic"], diverged: false } }] });
-
-    const partial = await toolFor({
-      catalog,
-      cli: makeCli().cli,
-      specClient: { evaluate: vi.fn(async ({ spec: routedSpec, team }: { spec: LaunchSpec; team?: readonly LaunchSpec[] }) => ({
-        kind: "response" as const,
-        response: {
-          ...responseFor(catalog, routedSpec.label === "critic" ? { instructions_adequate: 0.1, assignment_verifiable: 0.1 } : undefined),
-          composition: { missing_area: 0.9, assessed: team!.map((member) => member.label) },
-        },
-      })) },
-    }).execute("call", request({ specs: [spec(), spec({ label: "critic" })] }), new AbortController().signal, undefined, extensionContext);
-    expect(partial.details).toMatchObject({ router: [{ advisory: { assessed: ["worker", "critic"], diverged: true } }, { kind: "rejected" }] });
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    const input = evaluate.mock.calls[0]![0];
+    expect(input.task).toMatchObject({ objective: TASK.objective, scope: TASK.scope, doneWhen: TASK.doneWhen, constraints: TASK.constraints, tier: "standard" });
+    expect(input.catalog).toBe(catalog);
+    expect(result.details).toMatchObject({ outcome: "launched" });
   });
 
   it("launches a Bash-only task after excluding every hedged alternative execution tool", async () => {
@@ -480,9 +860,9 @@ describe("herdr_launch spec cutover", () => {
     const runners = new Map(baseCatalog.runners);
     runners.set("pi", { ...pi, pools: { ...pi.pools, tools: ["read", "bash", "executor_execute", "exec_command"] } });
     const catalog: Catalog = { ...baseCatalog, runners };
-    const response: SpecModelDecision = {
+    const response: TaskModelDecision = {
       ...responseFor(catalog),
-      candidates: [{ index: 0, runner: "pi", model: "pi-model", resources: { tools: { read: 0.95, bash: 0.95, executor_execute: 0.5, exec_command: 0.5 } } }],
+      resources: { pi: { tools: { read: 0.95, bash: 0.95, executor_execute: 0.5, exec_command: 0.5 } } },
     };
     const exclusions = [
       { field: "tools", name: "executor_execute", noul: 0.5 },
@@ -494,9 +874,9 @@ describe("herdr_launch spec cutover", () => {
       cli: makeCli().cli,
       routerLog,
       specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) },
-    }), request({ specs: [spec({ instructions: "Use only the Bash tool for the git commands and only the Read tool for CONTEXT.md; use no other tool." })] }));
+    }), task({ objective: "Use only the Bash tool for the git commands and only the Read tool for CONTEXT.md; use no other tool." }));
 
-    expect(result.details).toMatchObject({ outcome: "launched", kind: "pi" });
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:pi-model:low" }] });
     expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({
       probabilities: response,
       result: expect.objectContaining({
@@ -510,30 +890,31 @@ describe("herdr_launch spec cutover", () => {
     const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
     const harness = makeCli({
       failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-      start: (_argv, attempt) => {
+      start: (argv, attempt) => {
         if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
-        return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+        return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
       },
     });
     const handoffs = fakeHandoffs();
     const availabilityFailureRecorder = vi.fn(async () => undefined);
-    const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs, availabilityFailureRecorder }), request());
-    expect(result.details).toMatchObject({ spec: { selected: { model: "fallback" }, attempts: [{ outcome: "agent_start_failed" }, { outcome: "selected" }] } });
-    expect(availabilityFailureRecorder).toHaveBeenCalledWith(expect.objectContaining({ model: "primary" }), expect.anything(), { code: "CLI_PROTOCOL_ERROR", causeCode: "agent_start_failed" }, { root: "/repo" });
-    expect(handoffs.selectCandidate).toHaveBeenCalledWith(expect.anything(), "fallback", "pi");
+    const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs, availabilityFailureRecorder }), task());
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }] });
+    expect(availabilityFailureRecorder).toHaveBeenCalledWith(expect.objectContaining({ model: "primary" }), expect.anything(), { code: "CLI_PROTOCOL_ERROR", causeCode: "agent_start_failed" }, { root: repoRoot });
+    // The runtime-resolved-model record rides the started-point commit into the durable run state.
+    expect(handoffs.selectCandidate).toHaveBeenCalledWith(expect.anything(), "pi:fallback:low", "pi", { available: false, reason: "no-readback-seam" });
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
 
     const root = mkdtempSync(join(tmpdir(), "herdr-launch-availability-"));
     try {
       const persistedHarness = makeCli({
         failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-        start: (_argv, attempt) => {
+        start: (argv, attempt) => {
           if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
-          return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+          return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
         },
       });
       const persisted = toolFor({ catalog, cli: persistedHarness.cli, cwd: null, useDefaultFailureRecorder: true });
-      await persisted.execute("call", request(), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
+      await persisted.execute("call", task(), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
       expect(readFileSync(join(root, ".herdr", "availability", "cooldowns.jsonl"), "utf8")).toContain('"code":"CLI_PROTOCOL_ERROR"');
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -549,9 +930,9 @@ describe("herdr_launch spec cutover", () => {
       );
       const harness = makeCli({
         failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-        start: (_argv, attempt) => {
+        start: (argv, attempt) => {
           if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "Individual quota reached", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "quota_exceeded", message: "Individual quota reached" } } });
-          return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+          return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
         },
       });
       const result = await toolFor({
@@ -559,15 +940,10 @@ describe("herdr_launch spec cutover", () => {
         cli: harness.cli,
         cwd: null,
         useDefaultFailureRecorder: true,
-        specClient: { evaluate: vi.fn(async ({ spec: routedSpec }: { spec: LaunchSpec }) => ({ kind: "response" as const, response: responseFor(catalog, routedSpec.label === "ignored" ? { instructions_adequate: 0.1, assignment_verifiable: 0.1 } : undefined) })) },
-      }).execute("call", request({ specs: [spec(), spec({ label: "ignored" })] }), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
+      }).execute("call", task(), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
 
-      expect(result.details).toMatchObject({
-        operation: "launch_batch",
-        outcome: "launched",
-        children: [{ status: "launched", launch: { kind: "pi", spec: { selected: { runner: "pi", model: "luna" }, attempts: [{ candidate: { runner: "agy", model: "flash-low" }, outcome: "agent_start_failed", errorCode: "quota_exceeded" }, { candidate: { runner: "pi", model: "luna" }, outcome: "selected" }] } } }],
-      });
-      expect((result.details as { children: unknown[] }).children).toHaveLength(1);
+      expect(result.details).toMatchObject({ kind: "launch", outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:luna:low" }] });
+      expect(result.details!.children).toHaveLength(1);
       expect(harness.starts).toBe(2);
       expect(harness.children).toHaveLength(1);
       expect(readFileSync(join(root, ".herdr", "availability", "cooldowns.jsonl"), "utf8")).toContain('"failureClass":"quota"');
@@ -585,9 +961,9 @@ describe("herdr_launch spec cutover", () => {
       );
       const harness = makeCli({
         failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-        start: (_argv, attempt) => {
+        start: (argv, attempt) => {
           if (attempt === 0) throw new CliProtocolError("CLI_TIMEOUT", "start surfaced timeout", { exitCode: null, killed: true, errorEnvelope: { id: "cli:agent:start", error: { code: "quota_exceeded", message: "AGY individual quota reached" } } });
-          return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+          return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
         },
       });
       const result = await toolFor({
@@ -595,17 +971,10 @@ describe("herdr_launch spec cutover", () => {
         cli: harness.cli,
         cwd: null,
         useDefaultFailureRecorder: true,
-        specClient: { evaluate: vi.fn(async ({ spec: routedSpec }: { spec: LaunchSpec }) => ({ kind: "response" as const, response: responseFor(catalog, routedSpec.label === "ignored" ? { instructions_adequate: 0.1, assignment_verifiable: 0.1 } : undefined) })) },
-      }).execute("call", request({ specs: [spec(), spec({ label: "ignored" })] }), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
+      }).execute("call", task(), new AbortController().signal, undefined, { ...extensionContext, cwd: root });
 
-      expect(result.details).toMatchObject({
-        operation: "launch_batch",
-        outcome: "launched",
-        children: [{ status: "launched", launch: { kind: "pi", spec: { selected: { runner: "pi", model: "luna" }, attempts: [{ candidate: { runner: "agy", model: "flash-low" }, outcome: "agent_start_failed", errorCode: "CLI_TIMEOUT", message: "AGY individual quota reached" }, { candidate: { runner: "pi", model: "luna" }, outcome: "selected" }] } } }],
-      });
-      expect((result.details as { children: unknown[] }).children).toHaveLength(1);
+      expect(result.details).toMatchObject({ kind: "launch", outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:luna:low" }] });
       expect(harness.starts).toBe(2);
-      expect(harness.children).toHaveLength(1);
       expect(readFileSync(join(root, ".herdr", "availability", "cooldowns.jsonl"), "utf8")).toContain('"failureClass":"quota"');
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -618,51 +987,98 @@ describe("herdr_launch spec cutover", () => {
       new Map<RunnerKind, RunnerEntry>([["pi", runnerEntry(["primary"])], ["claude", claudeRunner(["fallback"])]]),
     );
     const response = responseFor(catalog);
-    for (const candidate of response.candidates as unknown as Array<{ resources: unknown }>) candidate.resources = { tools: { read: 0.95 } };
     const harness = makeCli({
       failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-      start: (_argv, attempt) => {
+      start: (argv, attempt) => {
         if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
-        return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:claude", agent: "claude", kind: "id", value: "session-1" } } });
+        return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:claude", agent: "claude", kind: "id", value: "session-1" } } });
       },
     });
-    const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) } }), request());
-    expect(result.details.spec).toMatchObject({ selected: { runner: "claude", model: "fallback" }, configuration: { runtime: { kind: "claude", allowedTools: ["read"] } } });
+    const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) } }), task());
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:fallback:low" }] });
+    expect(harness.starts).toBe(2);
   });
 
   it("does not re-admit unavailable candidates into the fallback chain", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "exhausted" }, { runner: "pi", model: "primary" }, { runner: "pi", model: "cooled" }, { runner: "pi", model: "fallback" }]);
-    const availability = vi.fn(async (candidate: ChainCandidate) => ({
+    const availability = vi.fn(async (candidate: AvailabilitySubject) => ({
       status: candidate.model === "exhausted" ? "known-exhausted" as const : candidate.model === "cooled" ? "local-capacity-limited" as const : "unknown" as const,
       retryNotBefore: null,
       evidence: { records: 0 },
     }));
     const harness = makeCli({
       failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-      start: (_argv, attempt) => {
+      start: (argv, attempt) => {
         if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
-        return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+        return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
       },
     });
-    const result = await execute(toolFor({ catalog, cli: harness.cli, availability }), request());
-    expect(result.details.spec).toMatchObject({ selected: { model: "fallback" }, fallbackCandidates: [{ model: "fallback" }] });
+    const result = await execute(toolFor({ catalog, cli: harness.cli, availability }), task());
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }] });
     expect(harness.starts).toBe(2);
+  });
+
+  it("skips a candidate whose availability re-probe flips before its start attempt", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+    // The routing-time probe admits both points; the re-probe immediately
+    // before the first start reports exhaustion, so only the fallback starts.
+    let exhausted = false;
+    const availability = vi.fn(async (candidate: AvailabilitySubject) => ({
+      status: exhausted && candidate.model === "primary" ? "known-exhausted" as const : "unknown" as const,
+      retryNotBefore: null,
+      evidence: { records: 0 },
+    }));
+    const routerLog = vi.fn(async () => { exhausted = true; }) as unknown as LaunchRouterLog;
+    const harness = makeCli();
+    const result = await execute(toolFor({ catalog, cli: harness.cli, availability, routerLog }), task());
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }] });
+    expect(harness.starts).toBe(1);
+
+    // A probe that cannot answer fails closed the same way.
+    let throwOnReprobe = false;
+    const failingAvailability = vi.fn(async (candidate: AvailabilitySubject) => {
+      if (throwOnReprobe && candidate.model === "primary") throw new Error("probe unavailable");
+      return { status: "unknown" as const, retryNotBefore: null, evidence: { records: 0 } };
+    });
+    const failingLog = vi.fn(async () => { throwOnReprobe = true; }) as unknown as LaunchRouterLog;
+    const failed = await toolFor({ catalog, cli: makeCli().cli, availability: failingAvailability, routerLog: failingLog }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(failed.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }] });
   });
 
   it("preserves fallback_refused when authoritative pane state still has an agent", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
     const harness = makeCli({
-      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "working", agent_name: "task-worker-1", agent: "pi" },
+      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "working", agent_name: "task-x-1", agent: "pi" },
       start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } }); },
     });
-    await expect(execute(toolFor({ catalog, cli: harness.cli }), request())).rejects.toMatchObject({ details: { attempts: [{ outcome: "fallback_refused" }] } });
+    const result = await execute(toolFor({ catalog, cli: harness.cli }), task());
+    expect(result.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+  });
+
+  it("recovers readiness timing when a post-start readiness check fails", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "primary" }]);
+    const harness = makeCli({ readinessError: new Error("poststate") });
+    const result = await execute(toolFor({ catalog, cli: harness.cli }), task());
+    expect(result.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
+  });
+
+  it("appends the router decision through the default log when none is injected", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-launch-routerlog-"));
+    try {
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }]);
+      const result = await execute(toolFor({ catalog, cli: makeCli().cli, routerLog: null, cwd: root }), task());
+      expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched" }] });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("does not duplicate a spawned but unacknowledged agent", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
     const harness = makeCli({ start: () => ok("start", { agent: { name: "unexpected", pane_id: "w1:p2", agent: "pi" } }) });
-    await expect(execute(toolFor({ catalog, cli: harness.cli }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    const result = await execute(toolFor({ catalog, cli: harness.cli }), task());
+    expect(result.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
   });
 
@@ -670,193 +1086,305 @@ describe("herdr_launch spec cutover", () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const harness = makeCli();
     const isolated = worktrees();
-    const result = await toolFor({ catalog, cli: harness.cli, worktrees: isolated.manager }).execute("call", request({ specs: [spec({ count: 2 })] }), new AbortController().signal, undefined, extensionContext);
-    expect(result.details).toMatchObject({ operation: "launch_batch", outcome: "launched", children: [{ name: "task-worker-1", status: "launched" }, { name: "task-worker-2", status: "launched" }] });
+    const handoffs = fakeHandoffs();
+    const result = await toolFor({ catalog, cli: harness.cli, worktrees: isolated.manager, handoffs }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
+    expect(result.details).toMatchObject({ outcome: "launched" });
+    const children = result.details!.children;
+    expect(children).toHaveLength(2);
+    expect(children.every((child) => child.state === "launched")).toBe(true);
+    expect(children.every((child) => typeof child.worktree === "string")).toBe(true);
+    expect(new Set(children.map((child) => child.worktree)).size).toBe(2);
     expect(isolated.prepare).toHaveBeenCalledTimes(2);
-    expect(isolated.prepare.mock.calls.map(([value]) => value.childName)).toEqual(["task-worker-1", "task-worker-2"]);
-    expect(isolated.prepare.mock.calls.every(([value]) => value.cwd === "/repo" && value.count === 2)).toBe(true);
+    expect(isolated.prepare.mock.calls.map(([value]) => value.childName)).toEqual(children.map((child) => child.target));
+    expect(isolated.prepare.mock.calls.every(([value]) => value.cwd === repoRoot && value.count === 2)).toBe(true);
     expect(harness.prompts).toHaveLength(2);
     expect(harness.prompts.every((prompt) => prompt.includes(SPEC_BASELINE))).toBe(true);
     expect(isolated.bindPane).toHaveBeenCalledTimes(2);
-    expect(isolated.bindPane.mock.calls.map(([name]) => name)).toEqual(["task-worker-1", "task-worker-2"]);
-    const children = (result.details as { children: Array<{ launch?: LaunchDetails }> }).children;
-    expect(new Set(children.map((child) => child.launch?.handoff?.runId)).size).toBe(2);
-    expect(new Set(children.map((child) => child.launch?.recipient?.recipientKey)).size).toBe(2);
+    expect(isolated.bindPane.mock.calls.map(([name]) => name)).toEqual(children.map((child) => child.target));
+    const runs = (handoffs.persist as ReturnType<typeof vi.fn>).mock.calls.map(([run]) => (run as { runId: string }).runId);
+    expect(new Set(runs).size).toBe(2);
   });
 
-  it("retains expansion failures, partial children, and aborted tails", async () => {
+  it("retains child failures, partial children, and aborted tails", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const occupiedSnapshot = {
-      version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }], panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "occupied", agent_name: "task-worker-1", agent_status: "working" }], agents: [{ pane_id: "w1:p9", name: "task-worker-1", agent: "pi", agent_status: "working" }]
-    } as HerdrSnapshot;
-    const resolver = async () => ({ snapshot: occupiedSnapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } });
-    const collision = await toolFor({ catalog, cli: makeCli().cli, contextResolver: resolver, worktrees: worktrees().manager }).execute("call", request({ specs: [spec({ count: 2 })] }), new AbortController().signal, undefined, extensionContext);
-    expect(collision.details).toMatchObject({ outcome: "partial", children: [{ status: "failed", failure: { code: "BATCH_NAME_COLLISION" } }, { status: "launched" }] });
-    const invalidPlacement = await toolFor({ catalog, cli: makeCli().cli }).execute("call", request({ specs: [spec({ count: 2 })], placement: { mode: "existing_pane", target: "w1:p1" } }), new AbortController().signal, undefined, extensionContext);
-    expect(invalidPlacement.details).toMatchObject({ outcome: "failed", failure: { code: "BATCH_PLACEMENT_INVALID" } });
+
+    // A minted-name collision fails that child only; the sibling still launches.
+    let launchId: string | undefined;
+    const routerLog = vi.fn(async (entry: { caller?: string }) => { launchId = entry.caller; }) as unknown as LaunchRouterLog;
+    const occupiedResolver = async () => {
+      const minted = `task-${launchId!.slice(0, 8)}-1`;
+      const occupied = {
+        version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
+        panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "occupied", agent_name: minted, agent_status: "working" }],
+        agents: [{ pane_id: "w1:p9", name: minted, agent: "pi", agent_status: "working" }],
+      } as HerdrSnapshot;
+      return { snapshot: occupied, context, diagnostics: baseDiagnostics, operationIds: baseOperationIds };
+    };
+    const collision = await toolFor({ catalog, cli: makeCli().cli, contextResolver: occupiedResolver, worktrees: worktrees().manager, routerLog }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
+    expect(collision.details).toMatchObject({ outcome: "partial", children: [{ state: "failed", error: { code: "TARGET_IDENTITY_UNAVAILABLE" } }, { state: "launched" }] });
+
+    // A failed second child keeps the launched sibling.
     const failedHarness = makeCli({
       failedPane: { pane_id: "w1:p3", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-      start: (_argv, attempt) => {
+      start: (argv, attempt) => {
         if (attempt === 1) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
-        return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } } });
+        return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } } });
       }
     });
-    const partial = await toolFor({ catalog, cli: failedHarness.cli, worktrees: worktrees().manager }).execute("call", request({ specs: [spec({ count: 2 })] }), new AbortController().signal, undefined, extensionContext);
-    expect(partial.details).toMatchObject({ outcome: "partial", children: [{ status: "launched" }, { status: "failed" }] });
+    const partial = await toolFor({ catalog, cli: failedHarness.cli, worktrees: worktrees().manager }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
+    expect(partial.details).toMatchObject({ outcome: "partial", children: [{ state: "launched" }, { state: "failed", error: { code: "LAUNCH_FAILED" } }] });
+
+    // An abort between routing and the first child leaves every tail not_started.
     const abort = new AbortController();
-    abort.abort();
-    const abortedBatch = await toolFor({ catalog, cli: makeCli().cli }).execute("call", request({ specs: [spec({ count: 2 })] }), abort.signal, undefined, extensionContext);
-    expect(abortedBatch.details).toMatchObject({ outcome: "failed", children: [{ status: "not_started", code: "ABORTED" }, { status: "not_started", code: "ABORTED" }] });
+    const abortLog = vi.fn(async () => { abort.abort(); }) as unknown as LaunchRouterLog;
+    const abortedLaunch = await toolFor({ catalog, cli: makeCli().cli, worktrees: worktrees().manager, routerLog: abortLog }).execute("call", task({ replicas: 2 }), abort.signal, undefined, extensionContext);
+    expect(abortedLaunch.details).toMatchObject({ outcome: "failed", children: [{ state: "not_started", error: { code: "ABORTED" } }, { state: "not_started", error: { code: "ABORTED" } }] });
   });
 
-  it("covers existing-pane, tab fallback, replica preconditions, and start recovery", async () => {
+  it("reuses a matching workload tab under the pane cap and creates the next label past it", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const targetSnapshot = {
-      version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }], panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "target", agent_status: "idle" }], agents: []
-    } as HerdrSnapshot;
-    const existingChild: Child = { paneId: "w1:p9", tabId: "w1:t1", name: "", kind: "pi", terminalId: "terminal-w1:p9", session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing" }, prompt: false };
-    const existingHarness = makeCli({ existingPane: existingChild });
-    const existing = await execute(toolFor({ catalog, cli: existingHarness.cli, contextResolver: async () => ({ snapshot: targetSnapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } }) }), request({ placement: { mode: "existing_pane", target: "w1:p9" } }));
-    expect(existing.details).toMatchObject({ placement: { mode: "existing_pane", target: "w1:p9" }, paneId: "w1:p9" });
+    const caller = { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" };
+    const snapshotWith = (tabs: HerdrSnapshot["tabs"], panes: HerdrSnapshot["panes"]): HerdrSnapshot => ({
+      version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs, panes, agents: [],
+    } as HerdrSnapshot);
 
+    // Reuse: the matching tab has room, so the child right-splits its last pane.
+    const reuseSnapshot = snapshotWith(
+      [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }, { tab_id: "w1:t9", workspace_id: "w1", label: "workload:implement" }],
+      [caller, { pane_id: "w1:p9", tab_id: "w1:t9", workspace_id: "w1", label: "worker", agent_status: "idle" }],
+    );
+    const reuseHarness = makeCli();
+    await execute(toolFor({ catalog, cli: reuseHarness.cli, contextResolver: resolverFor(reuseSnapshot) }), task());
+    const split = reuseHarness.calls.find((call) => call[0] === "pane" && call[1] === "split");
+    expect(split).toBeDefined();
+    expect(split).toEqual(expect.arrayContaining(["w1:p9", "--direction", "right", "--no-focus"]));
+    expect(reuseHarness.calls.some((call) => call[0] === "tab" && call[1] === "create")).toBe(false);
+
+    // At the four-pane cap the next grammar label is created instead.
+    const cappedSnapshot = snapshotWith(
+      [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }, { tab_id: "w1:t9", workspace_id: "w1", label: "workload:implement" }],
+      [caller, ...Array.from({ length: 4 }, (_, index) => ({ pane_id: `w1:p${9 + index}`, tab_id: "w1:t9", workspace_id: "w1", label: `w${index}`, agent_status: "idle" }))],
+    );
+    const cappedHarness = makeCli();
+    await execute(toolFor({ catalog, cli: cappedHarness.cli, contextResolver: resolverFor(cappedSnapshot) }), task());
+    const created = cappedHarness.calls.find((call) => call[0] === "tab" && call[1] === "create");
+    expect(created).toBeDefined();
+    expect(created).toEqual(expect.arrayContaining(["--label", "workload:implement:2", "--no-focus"]));
+
+    // A caller-labeled tab that merely resembles the grammar is never reused.
+    const alienSnapshot = snapshotWith(
+      [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }, { tab_id: "w1:t9", workspace_id: "w1", label: "workload:implement-extra" }],
+      [caller, { pane_id: "w1:p9", tab_id: "w1:t9", workspace_id: "w1", label: "other", agent_status: "idle" }],
+    );
+    const alienHarness = makeCli();
+    await execute(toolFor({ catalog, cli: alienHarness.cli, contextResolver: resolverFor(alienSnapshot) }), task());
+    const alienCreate = alienHarness.calls.find((call) => call[0] === "tab" && call[1] === "create");
+    expect(alienCreate).toBeDefined();
+    expect(alienCreate).toEqual(expect.arrayContaining(["--label", "workload:implement"]));
+    expect(alienHarness.calls.some((call) => call[0] === "pane" && call[1] === "split")).toBe(false);
+
+    // With no matching tab the first grammar label is created; focus is never taken.
+    const createHarness = makeCli();
+    await execute(toolFor({ catalog, cli: createHarness.cli }), task());
+    const createdTab = createHarness.calls.find((call) => call[0] === "tab" && call[1] === "create");
+    expect(createdTab).toEqual(expect.arrayContaining(["--workspace", "w1", "--label", "workload:implement", "--no-focus"]));
+    expect(createHarness.calls.some((call) => call[0] === "agent" && call[1] === "focus")).toBe(false);
+
+    // A tab create without a root pane reads the tab back for its anchor.
     const tabHarness = makeCli({ tabWithoutPane: true });
-    const tab = await execute(toolFor({ catalog, cli: tabHarness.cli }), request({ placement: { mode: "new_tab", tabLabel: "worker-tab" } }));
-    expect(tab.details.tabId).toBe("w1:t2");
+    await execute(toolFor({ catalog, cli: tabHarness.cli }), task());
     expect(tabHarness.calls.some((call) => call[0] === "tab" && call[1] === "get")).toBe(true);
+
+    // A reuse split that omits the tab id keeps the matched tab's id.
     const ownership = { record: vi.fn() };
     const splitHarness = makeCli({ splitWithoutTab: true });
-    const split = await execute(toolFor({ catalog, cli: splitHarness.cli, ownership }), request());
-    expect(split.details.tabId).toBe("w1:t1");
-    expect(ownership.record).toHaveBeenCalledWith(expect.objectContaining({ kind: "pane", id: split.details.paneId }));
-    const attachmentExisting = makeCli({ existingPane: { ...existingChild, name: "", prompt: false, session: { ...existingChild.session, value: "session-attachment" } } });
-    const attachmentResult = await execute(toolFor({ catalog, cli: attachmentExisting.cli, contextResolver: async () => ({ snapshot: targetSnapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } }) }), request({ placement: { mode: "existing_pane", target: "w1:p9" }, assignmentDelivery: "attachment" }));
-    expect(attachmentResult.details.attachment).toBeDefined();
+    await execute(toolFor({ catalog, cli: splitHarness.cli, contextResolver: resolverFor(reuseSnapshot), ownership }), task());
+    expect(ownership.record).toHaveBeenCalledWith(expect.objectContaining({ kind: "pane" }));
+  });
 
-    const noWorktree = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: makeCli().cli }).execute("call", request({ specs: [spec({ count: 2 })] }), new AbortController().signal, undefined, extensionContext);
-    expect(noWorktree.details).toMatchObject({ outcome: "failed", children: [{ status: "failed", failure: { code: "SPEC_NO_USABLE_CANDIDATE" } }, { status: "failed" }] });
+  it("covers replica preconditions, reserve failures, and start recovery", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+
+    // Replicas require the worktree manager before any effect.
+    await expect(toolFor({ catalog, cli: makeCli().cli }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "WORKTREE_UNAVAILABLE" });
+
+    // A reserve failure fails each child closed and releases its worktree.
     const prepared = worktrees();
-    const reserveFailure = await toolFor({ catalog, cli: makeCli().cli, worktrees: prepared.manager, supervision: stubSupervision({ reserveError: new Error("reserve") }) }).execute("call", request({ specs: [spec({ count: 2 })] }), new AbortController().signal, undefined, extensionContext).catch((error) => error);
-    expect(reserveFailure.details).toMatchObject({ outcome: "failed", children: [{ status: "failed", failure: { code: "SUPERVISION_UNAVAILABLE" } }, { status: "failed" }] });
+    const reserveFailure = await toolFor({ catalog, cli: makeCli().cli, worktrees: prepared.manager, supervision: stubSupervision({ reserveError: new Error("reserve") }) }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
+    expect(reserveFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "SUPERVISION_UNAVAILABLE" } }, { state: "failed", error: { code: "SUPERVISION_UNAVAILABLE" } }] });
     expect(prepared.release).toHaveBeenCalledTimes(2);
-    expect(prepared.release).toHaveBeenCalledWith("task-worker-1");
+    expect(prepared.release).toHaveBeenCalledWith(reserveFailure.details!.children[0]!.target);
 
     const genericStart = makeCli({ start: () => { throw new Error("start exploded"); } });
-    await expect(execute(toolFor({ catalog, cli: genericStart.cli }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    const failed = await toolFor({ catalog, cli: genericStart.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(failed.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
+
     const fallbackReadFailure = makeCli({
       paneError: new Error("pane read failed"),
       start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } }); }
     });
-    await expect(execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: fallbackReadFailure.cli }), request())).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    const unreadable = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: fallbackReadFailure.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(unreadable.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "POSTSTATE_UNAVAILABLE" } }] });
     const nonErrorReadFailure = makeCli({ paneError: "pane read failed", start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } }); } });
-    await expect(execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: nonErrorReadFailure.cli }), request())).rejects.toMatchObject({ code: "POSTSTATE_UNAVAILABLE" });
+    const unreadableNonError = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: nonErrorReadFailure.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(unreadableNonError.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "POSTSTATE_UNAVAILABLE" } }] });
 
     let busyAttempt = 0;
-    const busy = makeCli({ start: () => {
+    const busy = makeCli({ start: (argv) => {
       if (busyAttempt++ === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "busy", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_pane_busy", message: "pane busy" } } });
-      return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+      return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
     } });
-    const busyResult = await execute(toolFor({ catalog, cli: busy.cli }), request());
-    expect(busyResult.details.outcome).toBe("launched");
+    const busyResult = await execute(toolFor({ catalog, cli: busy.cli }), task());
+    expect(busyResult.details).toMatchObject({ outcome: "launched" });
+
+    // A spawn-deadline timeout without an error envelope records its own prose.
+    let timedAttempt = 0;
+    const timedOut = makeCli({
+      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+      start: (argv) => {
+        if (timedAttempt++ === 0) throw new CliProtocolError("CLI_TIMEOUT", "spawn deadline exceeded", { exitCode: null, killed: true, errorStream: "stderr", stderrTruncated: false });
+        return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
+      },
+    });
+    const timedResult = await execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: timedOut.cli }), task());
+    expect(timedResult.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }] });
+
+    // A mutation whose envelope omitted the ids is reconciled back into
+    // `created` from the live snapshot before the failure returns.
+    const caller = { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" };
+    const baselineSnapshot = { version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }], panes: [caller], agents: [] } as HerdrSnapshot;
+    const ghostPane = { pane_id: "w1:p9", tab_id: "w1:t9", workspace_id: "w1", label: "ghost" };
+    const ghostAgent = { pane_id: "w1:p9", name: "ghost", agent: "pi", agent_id: "agent-9" };
+    const ghostSnapshot = { ...baselineSnapshot, tabs: [...baselineSnapshot.tabs, { tab_id: "w1:t9", workspace_id: "w1", label: "workload:implement" }], panes: [...baselineSnapshot.panes, ghostPane], agents: [ghostAgent] } as HerdrSnapshot;
+    const ghostCli: LaunchCli = {
+      prompt: vi.fn(async () => ok("prompt", {})),
+      runJson: vi.fn(async (argv) => {
+        if (argv[0] === "pane" && argv[1] === "current") return ok("current", { type: "pane_current", pane: caller });
+        if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: ghostSnapshot });
+        if (argv[0] === "tab" && argv[1] === "create") return ok("tab", {});
+        if (argv[0] === "pane" && argv[1] === "get") return ok("pane-get", { pane: ghostPane });
+        if (argv[0] === "agent" && argv[1] === "get") return ok("agent-get", { agent: ghostAgent });
+        throw new Error(`unexpected argv: ${argv.join(" ")}`);
+      }),
+    };
+    const ghosted = await toolFor({ catalog, cli: ghostCli, contextResolver: resolverFor(baselineSnapshot) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(ghosted.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
   });
 
-  it("covers executor guards, abort fencing, expansion errors, and prepared cleanup", async () => {
+  it("covers executor guards, abort fencing, resolver errors, and prepared cleanup", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const frozenRelease = vi.fn(async () => { throw new Error("release"); });
-    await expect(toolFor({ catalog, cli: makeCli().cli, launchGate: async () => ({ check: vi.fn(async () => { throw new Error("frozen"); }), release: frozenRelease }) }).execute("call", request(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FROZEN" });
+    await expect(toolFor({ catalog, cli: makeCli().cli, launchGate: async () => ({ check: vi.fn(async () => { throw new Error("frozen"); }), release: frozenRelease }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FROZEN" });
     expect(frozenRelease).toHaveBeenCalled();
 
+    // The per-child gate is rechecked; a frozen child fails closed inside the result.
     let gateCalls = 0;
     const childRelease = vi.fn(async () => { throw new Error("child release"); });
-    await expect(toolFor({ catalog, cli: makeCli().cli, launchGate: async () => gateCalls++ === 0 ? { check: vi.fn(async () => undefined), release: vi.fn(async () => undefined) } : { check: vi.fn(async () => { throw new Error("child frozen"); }), release: childRelease } }).execute("call", request(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FROZEN" });
+    const frozenChild = await toolFor({ catalog, cli: makeCli().cli, launchGate: async () => gateCalls++ === 0 ? { check: vi.fn(async () => undefined), release: vi.fn(async () => undefined) } : { check: vi.fn(async () => { throw new Error("child frozen"); }), release: childRelease } }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(frozenChild.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FROZEN" } }] });
     expect(childRelease).toHaveBeenCalled();
 
     const snapshot = { version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }], panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }], agents: [] } as HerdrSnapshot;
     const abort = new AbortController();
-    let resolverCalls = 0;
-    await expect(toolFor({ catalog, cli: makeCli().cli, contextResolver: async () => { resolverCalls += 1; if (resolverCalls === 2) abort.abort("caller"); return { snapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } }; } }).execute("call", request(), abort.signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+    const abortedChild = await toolFor({ catalog, cli: makeCli().cli, contextResolver: async () => { abort.abort("caller"); return { snapshot, context, diagnostics: baseDiagnostics, operationIds: baseOperationIds }; } }).execute("call", task(), abort.signal, undefined, extensionContext);
+    expect(abortedChild.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "ABORTED" } }] });
 
-    const expansionFailure = await toolFor({ catalog, cli: makeCli().cli, contextResolver: async () => { throw new Error("expand"); } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(expansionFailure.details).toMatchObject({ outcome: "failed", failure: { code: "CLI_PROTOCOL_ERROR" } });
+    const resolverFailure = await toolFor({ catalog, cli: makeCli().cli, contextResolver: async () => { throw new Error("resolve"); } }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(resolverFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "CLI_PROTOCOL_ERROR" } }] });
 
+    // A caller context with no workspace id fails the child closed before any
+    // workload topology mutation.
+    const noWorkspace = await toolFor({ catalog, cli: makeCli().cli, contextResolver: async () => ({ snapshot, context: { workspaceId: "", tabId: "w1:t1", paneId: "w1:p1" }, diagnostics: baseDiagnostics, operationIds: baseOperationIds }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(noWorkspace.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
+
+    // A failed topology mutation releases the child's prepared worktree.
+    const workloadSnapshot = { ...snapshot, tabs: [...snapshot.tabs, { tab_id: "w1:t9", workspace_id: "w1", label: "workload:implement" }], panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t9", workspace_id: "w1", label: "worker", agent_status: "idle" }] } as HerdrSnapshot;
     const isolated = worktrees();
-    const splitFailure = await toolFor({ catalog, cli: makeCli({ splitError: new Error("split") }).cli, worktrees: isolated.manager }).execute("call", request({ specs: [spec({ count: 2 })] }), new AbortController().signal, undefined, extensionContext);
-    expect(splitFailure.details).toMatchObject({ outcome: "failed", children: [{ status: "failed" }, { status: "failed" }] });
-    expect(isolated.release).toHaveBeenCalledWith("task-worker-1");
+    const splitFailure = await toolFor({ catalog, cli: makeCli({ splitError: new Error("split") }).cli, contextResolver: resolverFor(workloadSnapshot), worktrees: isolated.manager }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
+    expect(splitFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }, { state: "failed" }] });
+    expect(isolated.release).toHaveBeenCalledWith(splitFailure.details!.children[0]!.target);
   });
 
-  it("covers pre-spawn compile/source fallback and existing-pane reconciliation", async () => {
-    const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
-    const invalidFallbackResponse = responseFor(catalog);
-    const invalidFallbackCandidates = invalidFallbackResponse.candidates as unknown as Array<Record<string, unknown>>;
-    invalidFallbackCandidates[1]!.resources = { tools: ["forbidden"] };
-    const compiledFallback = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: invalidFallbackResponse })) } }), request());
-    expect(compiledFallback.details.spec!.attempts).toEqual(expect.arrayContaining([expect.objectContaining({ candidate: expect.objectContaining({ model: "fallback" }), outcome: "agent_start_failed" })]));
+  it("covers pre-spawn compile/source fallback and reconciliation", async () => {
+    const catalog = catalogOf(
+      [{ runner: "pi", model: "primary" }, { runner: "claude", model: "fallback" }],
+      new Map<RunnerKind, RunnerEntry>([["pi", runnerEntry(["primary"])], ["claude", claudeRunner(["fallback"])]]),
+    );
+    const invalidFallbackResponse: TaskModelDecision = { ...responseFor(catalog), resources: { pi: { tools: { read: 0.95 } }, claude: { tools: { forbidden: 0.95 } } } };
+    const compiledFallback = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: invalidFallbackResponse })) } }), task());
+    expect(compiledFallback.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:primary:low" }] });
 
     const promptSources = { create: vi.fn().mockRejectedValueOnce(new Error("prompt source unavailable")).mockResolvedValue({ path: "/tmp/prompt-source" }) };
-    const sourceFallback = await execute(toolFor({ catalog, cli: makeCli().cli, promptSources }), request());
-    expect(sourceFallback.details.spec!.attempts).toEqual(expect.arrayContaining([expect.objectContaining({ candidate: expect.objectContaining({ model: "primary" }), outcome: "agent_start_failed" }), expect.objectContaining({ outcome: "selected" })]));
+    const sourceFallback = await execute(toolFor({ catalog, cli: makeCli().cli, promptSources }), task());
+    expect(sourceFallback.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:fallback:low" }] });
 
-    await expect(execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: makeCli().cli, supervision: stubSupervision({ bindError: new Error("bind transport") }) }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    const bindFailed = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: makeCli().cli, supervision: stubSupervision({ bindError: new Error("bind transport") }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(bindFailed.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
 
-    const targetSnapshot = { version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }], panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "target", agent_status: "idle" }], agents: [] } as HerdrSnapshot;
-    const existingChild: Child = { paneId: "w1:p9", tabId: "w1:t1", name: "", kind: "pi", terminalId: "terminal-w1:p9", session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-existing" }, prompt: false };
-    const existingFailure = makeCli({ existingPane: existingChild, start: () => { throw new Error("existing pane start"); } });
-    await expect(execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: existingFailure.cli, contextResolver: async () => ({ snapshot: targetSnapshot, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } }) }), request({ placement: { mode: "existing_pane", target: "w1:p9" } }))).rejects.toMatchObject({ details: { created: { paneId: "w1:p9", tabId: "w1:t1" } } });
-    const readinessId = makeCli({ agentId: "agent-from-readback", readinessError: new Error("readiness failed"), start: () => ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } } }) });
-    await expect(execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: readinessId.cli }), request())).rejects.toMatchObject({ details: { created: { agentId: "agent-from-readback" }, reconciliation: { effectCertainty: "partial" } } });
-
-    const emptySnapshot = { version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }], panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }], agents: [] } as HerdrSnapshot;
-    const nameOccupied = { ...emptySnapshot, panes: [...emptySnapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "task-worker-1", agent_status: "idle" }] } as HerdrSnapshot;
-    let nameChecks = 0;
-    await expect(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: makeCli().cli, contextResolver: async () => ({ snapshot: nameChecks++ === 0 ? emptySnapshot : nameOccupied, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } }) }).execute("call", request(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "BATCH_NAME_COLLISION" });
-    const labelOccupied = { ...emptySnapshot, panes: [...emptySnapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", label: "batch-worker-1", agent_status: "idle" }] } as HerdrSnapshot;
-    let labelChecks = 0;
-    await expect(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: makeCli().cli, contextResolver: async () => ({ snapshot: labelChecks++ === 0 ? emptySnapshot : labelOccupied, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } }) }).execute("call", request({ label: "batch" }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "BATCH_NAME_COLLISION" });
-
+    // A reconciliation readback that throws mid-failure degrades to unknown certainty.
     let throwBaseline = false;
     const baselinePanes = [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" }];
     const throwingBaseline = { version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }], tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }], get panes() { if (throwBaseline) throw new Error("baseline readback"); return baselinePanes; }, agents: [] } as HerdrSnapshot;
     const reconciliationFailure = makeCli({ start: () => { throwBaseline = true; throw new Error("start after baseline"); } });
-    await expect(execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: reconciliationFailure.cli, contextResolver: async () => ({ snapshot: throwingBaseline, context, diagnostics: { injected: context, effective: context, rebound: false, attempts: 1 }, operationIds: { current: "current", snapshot: "snapshot" } }) }), request())).rejects.toMatchObject({ details: { reconciliation: { effectCertainty: "unknown", snapshot: "unavailable" } } });
+    const reconciled = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: reconciliationFailure.cli, contextResolver: resolverFor(throwingBaseline) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(reconciled.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
   });
 
   it("covers prompt dispatch, acknowledgement, and confirmation failures", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const dispatchFailure = makeCli({ prompt: () => { throw Object.assign(new Error("dispatch"), { details: { promptDispatch: { state: "rejected", requestId: "req-1" } } }); } });
-    await expect(execute(toolFor({ catalog, cli: dispatchFailure.cli }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { promptDispatch: { state: "rejected", requestId: "req-1" } } });
+    const rejected = await toolFor({ catalog, cli: dispatchFailure.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(rejected.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
     const invalidAcknowledgement = makeCli({ prompt: () => ok("prompt", { invalid: true }) });
-    await expect(execute(toolFor({ catalog, cli: invalidAcknowledgement.cli }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { promptDispatch: { state: "unknown", requestId: "prompt" } } });
+    const invalidAck = await toolFor({ catalog, cli: invalidAcknowledgement.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(invalidAck.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
     const confirmationFailure = makeCli({ agentError: new Error("poststate") });
-    await expect(execute(toolFor({ catalog, cli: confirmationFailure.cli }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "PROMPT_UNCONFIRMED", assignmentState: "unconfirmed" } });
+    const unconfirmed = await toolFor({ catalog, cli: confirmationFailure.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    // PROMPT_UNCONFIRMED stays distinguishable in the uniform child error and
+    // carries the recovery handles — the pane and the retained supervisor job —
+    // a caller needs to inspect a possibly-consumed child instead of relaunching.
+    const unconfirmedError = unconfirmed.details!.children[0]!.error!;
+    expect(unconfirmed.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "PROMPT_UNCONFIRMED" } }] });
+    expect(unconfirmedError.causeCode).toBe("PROMPT_UNCONFIRMED");
+    expect(unconfirmedError.paneId).toMatch(/^w1:p\d+$/u);
+    expect(unconfirmedError.supervisorJobId).toBe("job_supervisor");
     for (const state of ["not_written", "acknowledged", "unknown", "other"]) {
       const malformedDispatch = makeCli({ prompt: () => { throw Object.assign(new Error("dispatch state"), { details: { promptDispatch: { state, requestId: "bad\n" } } }); } });
-      await expect(execute(toolFor({ catalog, cli: malformedDispatch.cli }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+      const malformed = await toolFor({ catalog, cli: malformedDispatch.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+      expect(malformed.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
     }
     const malformedDetails = makeCli({ prompt: () => { throw Object.assign(new Error("dispatch details"), { details: "bad" }); } });
-    await expect(execute(toolFor({ catalog, cli: malformedDetails.cli }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
+    const malformedResult = await toolFor({ catalog, cli: malformedDetails.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(malformedResult.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
+    // The published child error never carries the diagnostic blob or cause prose.
+    expect(unconfirmed.details!.children[0]!.error!.message).not.toContain("HERDR_LAUNCH_DIAGNOSTIC");
+    expect(unconfirmed.details!.children[0]!.error!.message).not.toContain("poststate");
   });
 
-  it("covers labeled batch siblings and mixed admitted decisions", async () => {
+  it("publishes launch updates and renders task calls and results", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const updates = vi.fn();
     const labeledTool = toolFor({ catalog, cli: makeCli().cli });
-    const labeled = await labeledTool.execute("call", request({ label: "batch", specs: [spec(), spec({ label: "review" })] }), new AbortController().signal, updates, extensionContext);
-    expect(labeled.details).toMatchObject({ outcome: "launched", children: [{ name: "task-worker-1", status: "launched" }, { name: "task-review-1", status: "launched" }] });
-    expect(labeledTool.renderResult?.(labeled as never, {} as never, {} as never, {} as never)).toBeDefined();
+    const call = labeledTool.renderCall?.(task({ label: "sprint", replicas: 2, tier: "strong" }), {} as never, {} as never);
+    expect(call).toBeDefined();
+    const labeled = await labeledTool.execute("call", task({ label: "sprint" }), new AbortController().signal, updates, extensionContext);
+    expect(labeled.details).toMatchObject({ outcome: "launched", children: [{ state: "launched" }] });
     expect(updates).toHaveBeenCalled();
-    const mixedSpecClient = { evaluate: vi.fn(async ({ spec: current }: { spec: LaunchSpec }) => current.label === "review" ? { kind: "response" as const, response: responseFor(catalog, { instructions_adequate: 0.1, assignment_verifiable: 0.1 }) } : { kind: "response" as const, response: responseFor(catalog) }) };
-    const mixed = await toolFor({ catalog, cli: makeCli().cli, specClient: mixedSpecClient }).execute("call", request({ specs: [spec(), spec({ label: "review" })] }), new AbortController().signal, undefined, extensionContext);
-    expect(mixed.details).toMatchObject({ outcome: "launched", children: [{ specLabel: "worker", status: "launched" }] });
+    expect((updates.mock.calls[0]![0] as { details: LaunchResult }).details).toMatchObject({ kind: "launch" });
+    const rendered = labeledTool.renderResult?.(labeled as never, {} as never, {} as never, {} as never);
+    expect(rendered).toBeDefined();
+    // renderCall tolerates absent or mistyped display fields.
+    expect(labeledTool.renderCall?.({} as never, {} as never, {} as never)).toBeDefined();
+    expect(labeledTool.renderCall?.({ label: 7, tier: 3, replicas: "x" } as never, {} as never, {} as never)).toBeDefined();
+    expect(labeledTool.renderResult?.({ details: undefined } as never, {} as never, {} as never, {} as never)).toBeDefined();
+    expect(labeledTool.renderResult?.({ details: { kind: "other" } } as never, {} as never, {} as never, {} as never)).toBeDefined();
   });
 
   it("covers AGY, Devin, agent identity, and supervision-bind lifecycle branches", async () => {
-    const agyCatalog = parseCatalog(`version: 1
-categories:
-  worker:
-    - {runner: agy, model: agy-model}
+    const agyCatalog = parseCatalog(`version: 2
 runners:
   agy:
-    models: [agy-model]
+    models: [{model: agy-model}]
     quota: {provider: google, billingProduct: antigravity, account: primary, scope: account}
     defaults: {mode: plan, timeoutMinutes: 30, sessionPersistence: true}
     plumbing: {sessionPersistence: required, promptDelivery: bootstrap, skillSelection: ambient, toolSelection: ambient}
@@ -865,24 +1393,27 @@ plugins: []
 mcp: {}
 quotaSources:
   - {name: reactive-cooldowns, kind: floor}
+pointPolicy:
+  agy:agy-model: {costClass: medium, latencyClass: medium}
 `, { path: "/tmp/agy-catalog.yaml", scopeRoot: "/tmp" });
-    const agyHarness = makeCli({ agentId: "agy-agent", prompt: () => ok("prompt", { type: "agent_prompted", agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "agy", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:agy", agent: "agy", kind: "id", value: "session-0" }, agent_status: "working", state_change_seq: 8, revision: 4, interactive_ready: true } }) });
+    const agyHarness = makeCli({ agentId: "agy-agent", prompt: () => ok("prompt", { type: "agent_prompted", agent: agentRecord(agyHarness.children[0]!) }) });
     const agySupervision = stubSupervision();
-    const agyResult = await execute(toolFor({ catalog: agyCatalog, cli: agyHarness.cli, supervision: agySupervision }), request());
-    expect(agyResult.details).toMatchObject({ kind: "agy", supervision: { state: "active" } });
+    const agyResult = await execute(toolFor({ catalog: agyCatalog, cli: agyHarness.cli, supervision: agySupervision }), task());
+    expect(agyResult.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "agy:agy-model", supervisorJobId: "job_supervisor" }] });
     expect(agySupervision.provisionalBindAttempts).toHaveLength(1);
+    expect(agySupervision.provisionalBindAttempts[0]).toMatchObject({ operatingPointId: "agy:agy-model" });
     expect(agySupervision.strengthenAttempts).toHaveLength(1);
-    await expect(execute(toolFor({ catalog: agyCatalog, cli: makeCli().cli, supervision: stubSupervision({ strengthenError: new Error("strengthen transport") }) }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED" });
-    const managerAgy = makeCli({ prompt: () => ok("prompt", { type: "agent_prompted", agent: { name: "task-manager-1", pane_id: "w1:p2", agent: "agy", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:agy", agent: "agy", kind: "id", value: "session-0" }, agent_status: "working", state_change_seq: 8, revision: 4, interactive_ready: true } }) });
-    await expect(execute(toolFor({ catalog: agyCatalog, cli: managerAgy.cli }), request({ specs: [spec({ label: "manager" })] }))).resolves.toMatchObject({ details: { name: "task-manager-1" } });
+    const strengthened = await toolFor({ catalog: agyCatalog, cli: makeCli().cli, supervision: stubSupervision({ strengthenError: new Error("strengthen transport") }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(strengthened.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
+    const managerAgy = makeCli({ prompt: () => ok("prompt", { type: "agent_prompted", agent: agentRecord(managerAgy.children[0]!) }) });
+    const labeled = await execute(toolFor({ catalog: agyCatalog, cli: managerAgy.cli }), task({ label: "manager" }));
+    expect(labeled.details!.children[0]!.target).toMatch(/^task-[0-9a-f]{8}-1$/u);
+    expect(managerAgy.calls.some((call) => call[0] === "pane" && call[1] === "report-metadata")).toBe(true);
 
-    const devinCatalog = parseCatalog(`version: 1
-categories:
-  worker:
-    - {runner: devin, model: devin-model}
+    const devinCatalog = parseCatalog(`version: 2
 runners:
   devin:
-    models: [devin-model]
+    models: [{model: devin-model}]
     quota: {provider: cognition, billingProduct: devin, account: primary, scope: account}
     defaults: {permissionMode: dangerous, timeoutMinutes: 30, sessionPersistence: true}
     plumbing: {sessionPersistence: required, promptDelivery: none, skillSelection: ambient, toolSelection: ambient}
@@ -891,80 +1422,69 @@ plugins: []
 mcp: {}
 quotaSources:
   - {name: reactive-cooldowns, kind: floor}
+pointPolicy:
+  devin:devin-model: {costClass: medium, latencyClass: medium}
 `, { path: "/tmp/devin-catalog.yaml", scopeRoot: "/tmp" });
     const lease = { release: vi.fn(async () => undefined) };
     const queueFlush = { writeSection: vi.fn(async () => lease) };
-    const devin = await execute(toolFor({ catalog: devinCatalog, cli: makeCli().cli, queueFlush: queueFlush as unknown as LaunchDependencies["queueFlush"] }), request());
-    expect(devin.details.kind).toBe("devin");
+    const devin = await execute(toolFor({ catalog: devinCatalog, cli: makeCli().cli, queueFlush: queueFlush as unknown as LaunchDependencies["queueFlush"] }), task());
+    expect(devin.details).toMatchObject({ children: [{ state: "launched", operatingPointId: "devin:devin-model" }] });
     expect(queueFlush.writeSection).toHaveBeenCalledWith("w1:p2");
     expect(lease.release).toHaveBeenCalled();
 
-    const withId = makeCli({ start: () => ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_id: "agent-1", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } } }) });
-    const idResult = await execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: withId.cli }), request());
-    expect(idResult.details.agentId).toBe("agent-1");
+    const withId = makeCli({ start: (argv) => ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_id: "agent-1", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } } }) });
+    const supervision = stubSupervision();
+    await execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: withId.cli, supervision }), task());
+    expect(supervision.bound[0]).toMatchObject({ handoff: { agentId: "agent-1" } });
 
     const bindFailure = new SupervisionBindError("bind failed", { cause: "test" });
-    await expect(execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: makeCli().cli, supervision: stubSupervision({ bindError: bindFailure }) }), request())).rejects.toMatchObject({ code: "LAUNCH_FAILED", details: { causeCode: "SUPERVISION_UNCONFIRMED" } });
+    const bound = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: makeCli().cli, supervision: stubSupervision({ bindError: bindFailure }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(bound.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
   });
 
-  it("appends one decision per spec before child mutation", async () => {
+  it("appends the one decision before any child mutation", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const harness = makeCli();
-    const routerLog = vi.fn(async () => undefined) as LaunchRouterLog;
-    const tool = toolFor({ catalog, cli: harness.cli, routerLog });
-    await tool.execute("call", request({ specs: [spec({ label: "worker" }), spec({ label: "review" })] }), new AbortController().signal, undefined, extensionContext).catch(() => undefined);
-    expect(routerLog).toHaveBeenCalledTimes(2);
-    expect(harness.calls.findIndex((call) => call[0] === "pane" && call[1] === "split")).toBeGreaterThanOrEqual(0);
+    const routerLogFn = vi.fn(async () => undefined);
+    const tool = toolFor({ catalog, cli: harness.cli, routerLog: routerLogFn as LaunchRouterLog });
+    await tool.execute("call", task(), new AbortController().signal, undefined, extensionContext).catch(() => undefined);
+    expect(routerLogFn).toHaveBeenCalledTimes(1);
+    const firstMutation = (harness.cli.runJson as ReturnType<typeof vi.fn>).mock.calls.findIndex(([argv]) => (argv[0] === "tab" && argv[1] === "create") || (argv[0] === "pane" && argv[1] === "split"));
+    expect(firstMutation).toBeGreaterThanOrEqual(0);
+    expect(routerLogFn.mock.invocationCallOrder[0]).toBeLessThan((harness.cli.runJson as ReturnType<typeof vi.fn>).mock.invocationCallOrder[firstMutation]!);
   });
 
-  it("covers routing failures, placement modes, focus, and attachment delivery", async () => {
+  it("covers routing failures and automatic delivery selection", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const abstained = await toolFor({ catalog, cli: makeCli().cli, catalogLoad: async () => { throw new Error("catalog unavailable"); } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(abstained.details).toMatchObject({ operation: "launch_batch", outcome: "abstained", router: [{ kind: "abstained", reason: "catalog_unavailable" }] });
-    const transportFailure = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(transportFailure.details).toMatchObject({ outcome: "abstained", router: [{ reason: "transport_failed", receipt: expect.any(String) }] });
-    const token = (transportFailure.details as { router: Array<{ receipt?: string }> }).router[0]!.receipt!;
-    const uncategorized = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", request({ specs: [spec({ category: undefined })] }), new AbortController().signal, undefined, extensionContext);
-    expect(uncategorized.details).toMatchObject({ outcome: "abstained", router: [{ reason: "transport_failed", receipt: expect.any(String) }] });
-    const noCategories = await toolFor({ catalog: { ...catalog, categories: new Map() }, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", request({ specs: [spec({ category: undefined })] }), new AbortController().signal, undefined, extensionContext);
-    expect(noCategories.details).toMatchObject({ outcome: "abstained", router: [{ reason: "transport_failed" }] });
-    expect((noCategories.details as { router: Array<{ receipt?: string }> }).router[0]!.receipt).toBeUndefined();
-    const replayEvaluate = vi.fn(async () => { throw new Error("replay must not evaluate"); });
-    const replayLog = vi.fn(async () => undefined) as LaunchRouterLog;
-    const replay = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: replayEvaluate }, routerLog: replayLog }), request({ transportBypass: token }));
-    expect(replayEvaluate).not.toHaveBeenCalled();
-    expect(replay.details).toMatchObject({ outcome: "launched", spec: { quality: "not_evaluated", bypass: { label: "transport-abstain", quality: "not_evaluated" } } });
-    expect(replayLog).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ kind: "admitted", quality: "not_evaluated", evidence: expect.objectContaining({ bypass: { label: "transport-abstain", quality: "not_evaluated" } }) }) }), expect.anything());
-    const fallbackCatalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
-    const fallbackSource = await toolFor({ catalog: fallbackCatalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    const fallbackToken = (fallbackSource.details as { router: Array<{ receipt?: string }> }).router[0]!.receipt!;
-    const fallbackHarness = makeCli({
-      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-      start: (_argv, attempt) => {
-        if (attempt === 0) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
-        return ok("start", { agent: { name: "task-worker-1", pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" } } });
-      },
-    });
-    const fallbackReplay = await execute(toolFor({ catalog: fallbackCatalog, cli: fallbackHarness.cli, specClient: { evaluate: replayEvaluate } }), request({ transportBypass: fallbackToken }));
-    expect(fallbackReplay.details.spec).toMatchObject({ selected: { model: "fallback" }, attempts: [{ outcome: "agent_start_failed" }, { outcome: "selected" }] });
-    const foreign = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: replayEvaluate } }).execute("call", request({ name: "other", transportBypass: token }), new AbortController().signal, undefined, extensionContext);
-    expect(foreign.details).toMatchObject({ outcome: "abstained", router: [{ kind: "abstained", reason: "invalid_response", component: "bypass" }], children: [] });
-    const malformed = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: replayEvaluate } }).execute("call", request({ transportBypass: "not-json" }), new AbortController().signal, undefined, extensionContext);
-    expect(malformed.details).toMatchObject({ outcome: "abstained", router: [{ kind: "abstained", reason: "invalid_response", component: "bypass" }], children: [] });
-    const invalidResponse = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: undefined as never })) } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(invalidResponse.details).toMatchObject({ outcome: "abstained", router: [{ reason: "invalid_response" }] });
-    const logFailure = await toolFor({ catalog, cli: makeCli().cli, routerLog: vi.fn(async () => { throw new Error("log"); }) as LaunchRouterLog }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(logFailure.details).toMatchObject({ outcome: "failed", failure: { code: "ROUTER_LOG_UNAVAILABLE" } });
-    const preflight = await toolFor({ catalog, cli: makeCli().cli, preflight: async () => { throw Object.assign(new Error("preflight"), { code: "PREFLIGHT_FAILED" }); } }).execute("call", request(), new AbortController().signal, undefined, extensionContext).catch((error) => error);
+    const catalogRouterLog = vi.fn(async () => undefined) as LaunchRouterLog;
+    const abstained = await toolFor({ catalog, cli: makeCli().cli, catalogLoad: async () => { throw new Error("catalog unavailable"); }, routerLog: catalogRouterLog }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(abstained.details).toMatchObject({ kind: "launch", outcome: "abstained", children: [] });
+    expect(catalogRouterLog).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ kind: "abstained", reason: "catalog_unavailable" }) }), expect.anything());
+    const transportFailure = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(transportFailure.details).toMatchObject({ outcome: "abstained", children: [] });
+    const noPoints = await toolFor({ catalog: { ...catalog, points: [] }, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(noPoints.details).toMatchObject({ outcome: "abstained", children: [] });
+    const invalidResponse = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: undefined as never })) } }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(invalidResponse.details).toMatchObject({ outcome: "abstained", children: [] });
+    const logFailure = await toolFor({ catalog, cli: makeCli().cli, routerLog: vi.fn(async () => { throw new Error("log"); }) as LaunchRouterLog }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(logFailure.details).toMatchObject({ outcome: "failed", children: [], error: { code: "ROUTER_LOG_UNAVAILABLE" } });
+    const preflight = await toolFor({ catalog, cli: makeCli().cli, preflight: async () => { throw Object.assign(new Error("preflight"), { code: "PREFLIGHT_FAILED" }); } }).execute("call", task(), new AbortController().signal, undefined, extensionContext).catch((error) => error);
     expect(preflight).toMatchObject({ code: "PREFLIGHT_FAILED", details: { phase: "validate" } });
+
+    // Delivery is runtime-owned: a rendered payload over the inline bound moves
+    // to the attachment, and one over the attachment bound fails closed.
+    const attachments = fakeAttachments();
     const harness = makeCli();
-    const placed = await execute(toolFor({ catalog, cli: harness.cli }), request({ placement: { mode: "new_tab", tabLabel: "worker-tab" }, focus: true, assignmentDelivery: "attachment" }));
-    expect(placed.details).toMatchObject({ placement: { mode: "new_tab", tabLabel: "worker-tab-worker-1" }, attachment: { attachmentId: "attachment" } });
-    expect(harness.calls.some((call) => call[0] === "tab" && call[1] === "create")).toBe(true);
-    expect(harness.calls.some((call) => call[0] === "agent" && call[1] === "focus")).toBe(true);
+    const big = await execute(toolFor({ catalog, cli: harness.cli, attachments }), task({ objective: `Ship ${"x".repeat(20_000)}` }));
+    expect(big.details).toMatchObject({ outcome: "launched" });
+    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining("Objective:") }));
+    expect(harness.prompts[0]).toContain("delivery: attachment");
+    expect(harness.prompts[0]).toContain("attachment-path: /tmp/recipient/body.txt");
+    expect(harness.prompts[0]).not.toContain("x".repeat(1_000));
+    await expect(toolFor({ catalog, cli: makeCli().cli }).execute("call", task({ objective: "x".repeat(1_100_000) }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "MESSAGE_TOO_LARGE" });
   });
 
-  it("times out and logs a hung spec evaluation without starting a child", async () => {
+  it("times out and logs a hung task evaluation without starting a child", async () => {
     vi.useFakeTimers();
     try {
       const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
@@ -972,12 +1492,12 @@ quotaSources:
       const routerLog = vi.fn(async () => undefined) as LaunchRouterLog;
       const evaluate = vi.fn(async () => new Promise<never>(() => undefined));
       const tool = toolFor({ catalog, cli: harness.cli, routerLog, specClient: { evaluate } });
-      const pending = tool.execute("call", request(), new AbortController().signal, undefined, extensionContext);
+      const pending = tool.execute("call", task(), new AbortController().signal, undefined, extensionContext);
       await vi.waitFor(() => expect(evaluate).toHaveBeenCalledTimes(1));
       await vi.advanceTimersByTimeAsync(20_000);
       const result = await pending;
-      expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({ result: { kind: "abstained", reason: "transport_failed", component: "evaluation" } }), expect.objectContaining({ root: "/repo" }));
-      expect(result.details).toMatchObject({ operation: "launch_batch", outcome: "abstained", router: [{ kind: "abstained", reason: "transport_failed", component: "evaluation" }], children: [] });
+      expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({ result: { kind: "abstained", reason: "transport_failed", component: "evaluation" } }), expect.objectContaining({ root: repoRoot }));
+      expect(result.details).toMatchObject({ kind: "launch", outcome: "abstained", children: [] });
       expect(harness.children).toHaveLength(0);
     } finally {
       vi.useRealTimers();
@@ -986,78 +1506,79 @@ quotaSources:
 
   it("loads the shipped catalog when the project cwd has no catalog", async () => {
     let loaded: Catalog | undefined;
+    const routerLog = vi.fn(async () => undefined) as LaunchRouterLog;
     const tool = createLaunchTool({
       cli: makeCli().cli,
       context,
-      cwd: "/tmp/project-without-a-catalog",
+      cwd: repoRoot,
       preflight: async () => undefined,
       supervision: stubSupervision(),
       specClient: {
-        evaluate: vi.fn(async ({ catalog }) => {
-          loaded = catalog;
+        evaluate: vi.fn(async (input: { catalog: Catalog }) => {
+          loaded = input.catalog;
           return {
             kind: "response" as const,
-            response: {
-              quality: { instructions_adequate: 0.1, assignment_verifiable: 0.1 },
-              category: { category: "frontier", confidence: 0.95 },
-              candidates: [],
-            },
+            response: responseFor(input.catalog, { done_when_verifiable: 0.1 }),
           };
         }),
       },
-      routerLog: vi.fn(async () => undefined) as LaunchRouterLog,
+      routerLog,
     });
-    const result = await tool.execute("call", request({ specs: [spec({ category: "frontier" })] }), new AbortController().signal, undefined, extensionContext);
-    expect(loaded?.categories.has("frontier")).toBe(true);
-    expect(result.details).toMatchObject({ operation: "launch_batch", outcome: "abstained", router: [{ kind: "rejected", quality: "rejected" }] });
-    expect(result.details).not.toMatchObject({ router: [{ reason: "catalog_unavailable" }] });
+    const result = await tool.execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(loaded).toBeDefined();
+    expect(result.details).toMatchObject({ kind: "launch", outcome: "abstained", children: [] });
+    expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ kind: "rejected" }) }), expect.anything());
   });
 
   it("rechecks the child gate and rejects an unavailable prompt transport", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const gate = { check: vi.fn(async () => undefined), release: vi.fn(async () => undefined) };
     gate.check.mockImplementationOnce(async () => undefined).mockImplementationOnce(async () => { throw new Error("frozen after routing"); });
-    await expect(toolFor({ catalog, cli: makeCli().cli, launchGate: async () => gate }).execute("call", request(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FROZEN" });
+    const frozen = await toolFor({ catalog, cli: makeCli().cli, launchGate: async () => gate }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(frozen.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FROZEN" } }] });
     const harness = makeCli();
     const noPrompt = { runJson: harness.cli.runJson } as unknown as LaunchCli;
-    await expect(toolFor({ catalog, cli: noPrompt }).execute("call", request(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
+    await expect(toolFor({ catalog, cli: noPrompt }).execute("call", task(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "CLI_INCOMPATIBLE" });
   });
 
   it("cannot bypass the freeze gate", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const harness = makeCli();
     const gate = { check: vi.fn(async () => { throw new Error("frozen"); }), release: vi.fn(async () => undefined) };
-    await expect(toolFor({ catalog, cli: harness.cli, launchGate: async () => gate }).execute("call", request(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FROZEN" });
+    await expect(toolFor({ catalog, cli: harness.cli, launchGate: async () => gate }).execute("call", task(), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "LAUNCH_FROZEN" });
     expect(harness.calls).toEqual([]);
     expect(gate.release).toHaveBeenCalled();
   });
 
-  it("retains precondition failures, reservation failures, worktree failures, and provenance warnings", async () => {
+  it("retains precondition failures, worktree failures, and provenance warnings", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const reservation = stubSupervision({ reserveError: new Error("reserve failed") });
     const reserveHarness = makeCli();
-    await expect(execute(toolFor({ catalog, cli: reserveHarness.cli, supervision: reservation }), request())).rejects.toMatchObject({ code: "SUPERVISION_UNAVAILABLE", details: { phase: "supervision_reserve" } });
+    const reserved = await toolFor({ catalog, cli: reserveHarness.cli, supervision: reservation }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(reserved.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "SUPERVISION_UNAVAILABLE" } }] });
     expect(reserveHarness.calls.some((call) => call[0] === "pane" && call[1] === "split")).toBe(false);
-    await expect(execute(toolFor({ catalog, cli: makeCli().cli, supervision: stubSupervision({ reserveError: Object.assign(new Error("coded reserve"), { code: "RESERVE_CODE" }) }) }), request())).rejects.toMatchObject({ code: "SUPERVISION_UNAVAILABLE", details: { causeCode: "RESERVE_CODE" } });
+    expect(reserveHarness.calls.some((call) => call[0] === "tab" && call[1] === "create")).toBe(false);
+    const coded = await toolFor({ catalog, cli: makeCli().cli, supervision: stubSupervision({ reserveError: Object.assign(new Error("coded reserve"), { code: "RESERVE_CODE" }) }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(coded.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "SUPERVISION_UNAVAILABLE" } }] });
     const release = vi.fn(async () => undefined);
     const grant = { path: "/tmp/grant", token: "token", renew: vi.fn(async () => undefined), release };
     const publishFailure: AttachmentStore = { ...fakeAttachments(), ensureRecipient: vi.fn(async () => grant), publish: vi.fn(async () => { throw new Error("publish failed"); }) };
-    await expect(execute(toolFor({ catalog, cli: makeCli().cli, attachments: publishFailure }), request({ assignmentDelivery: "attachment" }))).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { phase: "attachment_publish" } });
+    const unpublished = await toolFor({ catalog, cli: makeCli().cli, attachments: publishFailure }).execute("call", task({ objective: `x${"y".repeat(20_000)}` }), new AbortController().signal, undefined, extensionContext);
+    expect(unpublished.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
     expect(release).toHaveBeenCalled();
     const metadataHarness = makeCli({ metadataError: new Error("metadata failed") });
-    const warned = await execute(toolFor({ catalog, cli: metadataHarness.cli }), request({ specs: [spec({ label: "manager" })] }));
-    expect(warned.details.provenanceWarning).toContain("metadata failed");
+    const warned = await execute(toolFor({ catalog, cli: metadataHarness.cli }), task());
+    expect(warned.details).toMatchObject({ outcome: "launched" });
     const failingWorktrees = worktrees();
     failingWorktrees.prepare.mockImplementation(async () => { throw new Error("prepare failed"); });
-    const worktreeFailure = await toolFor({ catalog, cli: makeCli().cli, worktrees: failingWorktrees.manager }).execute("call", request({ specs: [spec({ count: 2 })] }), new AbortController().signal, undefined, extensionContext);
+    const worktreeFailure = await toolFor({ catalog, cli: makeCli().cli, worktrees: failingWorktrees.manager }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
     expect(failingWorktrees.prepare).toHaveBeenCalledTimes(2);
-    expect(worktreeFailure.details).toMatchObject({ outcome: "failed", children: [{ status: "failed" }, { status: "failed" }] });
+    expect(worktreeFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "SPEC_NO_USABLE_CANDIDATE" } }, { state: "failed", error: { code: "SPEC_NO_USABLE_CANDIDATE" } }] });
     const retryWorktrees = worktrees();
     retryWorktrees.prepare.mockImplementationOnce(async () => { throw new Error("first worktree failed"); });
     const retryHarness = makeCli();
-    const retryResult = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: retryHarness.cli, worktrees: retryWorktrees.manager }).execute("call", request({ specs: [spec({ count: 2 })] }), new AbortController().signal, undefined, extensionContext);
-    expect(retryResult.details).toMatchObject({ outcome: "launched" });
-    expect((retryResult.details as { children: Array<unknown> }).children[0]).toMatchObject({ status: "launched", launch: { spec: { selected: { model: "fallback" }, attempts: [{ outcome: "agent_start_failed" }, { outcome: "selected" }] } } });
+    const retryResult = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: retryHarness.cli, worktrees: retryWorktrees.manager }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
+    expect(retryResult.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }, { state: "launched", operatingPointId: "pi:primary:low" }] });
   });
 
   it("covers runner capability and empty skill-selection branches", async () => {
@@ -1092,26 +1613,13 @@ quotaSources:
     await expect(refreshBundledProfileResourceSelection(missingProfile as never, missingProfile.runtime as never)).resolves.toBeUndefined();
   });
 
-  it("renders spec calls and launch results", async () => {
-    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const harness = makeCli();
-    const tool = toolFor({ catalog, cli: harness.cli });
-    const call = tool.renderCall?.(request(), {} as never, {} as never);
-    expect(call).toBeDefined();
-    const result = await execute(tool, request());
-    const rendered = tool.renderResult?.(result, {} as never, {} as never, {} as never);
-    expect(rendered).toBeDefined();
-  });
-
   it("covers remaining defensive identity and reconciliation projections", async () => {
     const i = launchTestInternals as unknown as UnsafeLaunchInternals;
-    const bypassCatalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const piResolved = { index: 0, candidate: { runner: "pi" as const, model: "pi-model" }, runner: bypassCatalog.runners.get("pi")! };
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const piResolved = { index: 0, point: catalog.points![0]!, runner: catalog.runners.get("pi")! };
     expect(i.allReviewedResources(piResolved)).toMatchObject({ tools: ["read"], extensions: [], skills: [], mcp: [] });
     expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "claude" } })).toMatchObject({ tools: ["read"], plugins: [], mcp: [] });
     expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "agy" } })).toEqual({});
-    await expect(i.transportBypassConfiguration(spec({ category: undefined }), { ...bypassCatalog, categories: new Map() })).resolves.toBeUndefined();
-    await expect(i.transportBypassConfiguration(spec(), { ...bypassCatalog, categories: new Map() })).resolves.toBeUndefined();
     const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s" };
     expect(i.launchDiagnosticMessage({ code: "OK", phase: "ready", created: {}, assignmentState: "unconfirmed", paneId: "p", agentStarted: true, promptSubmitted: true, recipientRegistered: false, effectCertainty: "unknown", recoveryGuidance: "Inspect" })).toContain("HERDR_LAUNCH_DIAGNOSTIC");
     expect(() => i.agentIdentity(null, "worker", "p", "pi")).toThrow();
@@ -1525,9 +2033,15 @@ quotaSources:
     expect(i.record([])).toBe(false);
     expect(() => i.identifier("", "name")).toThrow();
     expect(() => i.identifier("ok", "name")).not.toThrow();
-    expect(i.normalizedParams(request()).specs[0].count).toBe(1);
-    expect(i.normalizedParams(request({ specs: [spec({ count: undefined })] })).specs[0].count).toBe(1);
-    expect(i.specPayload(spec({ label: "worker" }))).toContain("Reduce the latency");
+    expect(i.normalizedParams(task())).toMatchObject({ replicas: 1, tier: "standard", constraints: TASK.constraints });
+    expect(i.normalizedParams({ objective: "o", scope: "s", doneWhen: ["d"] })).toMatchObject({ replicas: 1, tier: "standard", constraints: [] });
+    expect(renderTask(task())).toContain("Reduce the latency");
+    expect(renderTask({ objective: "o", scope: "s", doneWhen: ["d"] })).toContain("Constraints: (none)");
+    expect(i.mintChildName("abcdef12-3456-7890-abcd-ef1234567890", 2)).toBe("task-abcdef12-2");
+    expect(i.supervisionWorkspaceRoot(undefined)).toEqual({ available: false, reason: "root_unavailable" });
+    expect(i.supervisionWorkspaceRoot("")).toEqual({ available: false, reason: "root_unavailable" });
+    expect(i.supervisionWorkspaceRoot("relative/dir")).toEqual({ available: false, reason: "root_not_absolute" });
+    expect(i.supervisionWorkspaceRoot("/abs")).toEqual({ available: true, root: "/abs" });
     expect(i.paneRecord({ pane }, "p")).toEqual(pane);
     expect(() => i.paneRecord({}, "p")).toThrow();
     expect(() => i.paneRecord(null, "p")).toThrow();
@@ -1579,10 +2093,36 @@ quotaSources:
     expect(i.startFailureEvidence(startFailure)).toMatchObject({ code: "agent_start_failed" });
     expect(i.startFailureEvidence(new Error("x"))).toBeUndefined();
     expect(i.snapshotOf({ type: "session_snapshot", snapshot: baseline })).toEqual(baseline);
-    expect(i.existingAgentNames({ ...baseline, agents: [{ name: "agent" }], panes: [{ ...baseline.panes[0], label: "label", agent: "pane-agent" }] })).toEqual(["agent", "pane-agent"]);
-    expect(i.existingNameTargets({ ...baseline, agents: [{ name: "agent" }], panes: [{ ...baseline.panes[0], label: "label", agent: "pane-agent" }] })).toEqual(new Set(["agent", "pane-agent", "label"]));
-    expect(i.existingNameTargets({ ...baseline, agents: [{}], panes: [{ ...baseline.panes[0], label: "", agent: 1 }] })).toEqual(new Set());
-    expect(i.paneForPlacement(baseline, "p", context)).toMatchObject({ paneId: "p", tabId: "t" });
+    const taken = { ...baseline, agents: [{ name: "agent" }], panes: [{ ...baseline.panes[0], label: "label", agent: "pane-agent" }] } as HerdrSnapshot;
+    expect(i.mintedNameTaken(taken, "agent")).toBe(true);
+    expect(i.mintedNameTaken(taken, "pane-agent")).toBe(true);
+    expect(i.mintedNameTaken(taken, "label")).toBe(true);
+    expect(i.mintedNameTaken(taken, "free")).toBe(false);
+    const cwdDir = mkdtempSync(join(tmpdir(), "herdr-launch-cwd-x-"));
+    try {
+      await expect(i.resolveLaunchCwd(cwdDir, repoRoot)).resolves.toBe(realpathSync(cwdDir));
+      await expect(i.resolveLaunchCwd(undefined, repoRoot)).resolves.toBe(repoRoot);
+      await expect(i.resolveLaunchCwd("missing-dir", repoRoot)).rejects.toMatchObject({ code: "CWD_UNAVAILABLE" });
+      await expect(i.resolveLaunchCwd("/nonexistent/herdr-x", repoRoot)).rejects.toMatchObject({ code: "CWD_UNAVAILABLE" });
+      await expect(i.resolveLaunchCwd(undefined, "bad\0cwd")).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    } finally {
+      rmSync(cwdDir, { recursive: true, force: true });
+    }
+    expect(i.workloadTabOrdinal("implement", "workload:implement")).toBe(1);
+    expect(i.workloadTabOrdinal("implement", "workload:implement:3")).toBe(3);
+    expect(i.workloadTabOrdinal("implement", "workload:implement:x")).toBeUndefined();
+    expect(i.workloadTabOrdinal("implement", "workload:review")).toBeUndefined();
+    expect(i.workloadTabOrdinal("implement", "other")).toBeUndefined();
+    expect(i.workloadTabOrdinal("implement", undefined)).toBeUndefined();
+    const tabbed = { ...baseline, tabs: [{ tab_id: "t", workspace_id: "w", label: "workload:implement" }] } as HerdrSnapshot;
+    expect(i.selectWorkloadTab(tabbed, "w", "implement")).toMatchObject({ reuse: { tabId: "t", tabLabel: "workload:implement", anchorPaneId: "p" } });
+    const empty = { ...baseline, panes: [], tabs: [{ tab_id: "t", workspace_id: "w", label: "workload:implement" }] } as HerdrSnapshot;
+    expect(i.selectWorkloadTab(empty, "w", "implement")).toEqual({ create: { tabLabel: "workload:implement:2" } });
+    expect(i.selectWorkloadTab(baseline, "w", "implement")).toEqual({ create: { tabLabel: "workload:implement" } });
+    const capped = { ...baseline, tabs: [{ tab_id: "t", workspace_id: "w", label: "workload:implement" }], panes: Array.from({ length: 4 }, (_, index) => ({ pane_id: `p${index}`, tab_id: "t", workspace_id: "w" })) } as HerdrSnapshot;
+    expect(i.selectWorkloadTab(capped, "w", "implement")).toEqual({ create: { tabLabel: "workload:implement:2" } });
+    const spilled = { ...baseline, tabs: [{ tab_id: "t", workspace_id: "w", label: "workload:implement" }, { tab_id: "t2", workspace_id: "w", label: "workload:implement:2" }], panes: [{ pane_id: "p1", tab_id: "t2", workspace_id: "w" }] } as HerdrSnapshot;
+    expect(i.selectWorkloadTab(spilled, "w", "implement")).toMatchObject({ reuse: { tabId: "t2" } });
     expect(i.noFocusArgs()).toEqual(["--no-focus"]);
     expect(i.compactCliFailureEvidence({ code: "X", message: "message", details: { exitCode: 1, killed: false, stdout: "out", stderr: "err", errorStream: "stderr", errorEnvelope: { id: "e", error: { code: "C", message: "M" } } } })).toMatchObject({ code: "X", details: { exitCode: 1, errorStream: "stderr", errorEnvelope: { id: "e" } } });
     expect(i.compactCliFailureEvidence({ details: { evidence: "omitted_for_prompt_delivery", errorStream: "stdout", stdout: "out", errorEnvelope: { id: "e", error: { code: 1, message: "bad" } } } })).toMatchObject({ details: { evidence: "omitted_for_prompt_delivery", errorStream: "stdout" } });
@@ -1599,23 +2139,24 @@ quotaSources:
     expect(i.failureEffectCertainty({ agentStarted: false, promptSubmitted: false }, false, undefined)).toBe("absent");
     expect(i.failureEffectCertainty({ agentStarted: true, promptSubmitted: false }, true, undefined)).toBe("unknown");
     expect(i.failureEffectCertainty({ agentStarted: false, promptSubmitted: false }, true, { effectCertainty: "partial" })).toBe("partial");
-    expect(i.batchChildFailure(new Error("child failure"))).toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { causeMessage: "child failure" } });
-    expect(i.batchChildFailure(Object.assign(new Error("child"), { code: "CHILD", details: { created: { paneId: "p" } } }))).toMatchObject({ code: "CHILD", details: { created: { paneId: "p" } } });
-    expect(i.batchManifest({ operation: "launch_batch", outcome: "partial", router: [{ kind: "abstained", reason: "x", component: "y" }], children: [{ name: "task-worker-1", specLabel: "worker", ordinal: 1, status: "failed", code: "CHILD", failure: { code: "CHILD", details: { paneId: "p", supervisorJobId: "j" } } }] })).toContain("supervisor=j");
-    expect(i.candidateIdentity({ index: 1, runner: "pi", model: "m" })).toEqual({ index: 1, runner: "pi", model: "m" });
-    expect(i.candidateKey({ index: 1, runner: "pi", model: "m" })).toBe("1:pi:m");
-    expect(i.resolvedCandidateIdentity({ index: 1, candidate: { runner: "pi", model: "m" } })).toEqual({ index: 1, runner: "pi", model: "m" });
-    expect(i.resolvedCandidateKey({ index: 1, candidate: { runner: "pi", model: "m" } })).toBe("1:pi:m");
+    expect(i.launchChildError(new Error("child failure"))).toEqual({ code: "CLI_PROTOCOL_ERROR" });
+    expect(i.launchChildError(Object.assign(new Error("child"), { code: "CHILD" }))).toEqual({ code: "CHILD" });
+    expect(i.launchChildError(i.earlyLaunchFailure(new Error("hidden cause"), "validate"))).toEqual({ code: "CLI_PROTOCOL_ERROR", message: "Launch failed; inspect the structured diagnostic", causeCode: "CLI_PROTOCOL_ERROR" });
+    expect(i.launchManifest({ kind: "launch", launchId: "l1", outcome: "partial", requestedTier: "standard", children: [{ target: "task-l1-1", state: "launched", operatingPointId: "pt", supervisorJobId: "j" }, { target: "task-l1-2", state: "failed", error: { code: "CHILD" } }] })).toContain("supervisor=j");
+    expect(i.launchManifest({ kind: "launch", launchId: "l1", outcome: "failed", requestedTier: "standard", children: [], error: { code: "FAILED" } })).toContain("error=FAILED");
+    expect(i.pointIdentity({ index: 1, id: "pt:m", runner: "pi", model: "m" })).toEqual({ index: 1, id: "pt:m", runner: "pi", model: "m" });
+    expect(i.resolvedPointIdentity({ index: 1, point: { id: "pt:m", runner: "pi", model: "m" } })).toEqual({ index: 1, id: "pt:m", runner: "pi", model: "m" });
+    expect(i.resolvedPointKey({ index: 1, point: { id: "pt:m", runner: "pi", model: "m" } })).toBe("pt:m");
     expect(i.isAdmitted({ kind: "admitted" })).toBe(true);
     expect(i.isAdmitted({ kind: "abstained" })).toBe(false);
     expect(i.recipientCapability("pi")).toMatchObject({ kind: "pi", capable: true });
     expect(i.recipientCapability("devin")).toMatchObject({ kind: "devin", capable: true });
-    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    expect(i.specRouterState(spec(), catalog).catalog).toHaveLength(1);
-    expect(i.specRouteLogEntry("task", { spec: spec(), decision: { kind: "abstained", reason: "x", component: "y" } })).toMatchObject({ caller: "task", name: "task" });
+    const routedTask: RoutingTask = { objective: "o", scope: "s", doneWhen: ["d"], constraints: [] };
+    expect(i.taskRouterState(routedTask, catalogOf([{ runner: "pi", model: "pi-model" }])).points).toHaveLength(1);
+    expect(i.taskRouteLogEntry("launch-1", { task: routedTask, decision: { kind: "abstained", reason: "x", component: "y" } })).toMatchObject({ caller: "launch-1", result: { kind: "abstained" } });
     const updates: unknown[] = [];
-    i.progress((update: unknown) => updates.push(update), "ready", { paneId: "p" });
-    i.progress(undefined, "focus", {});
+    i.progress((update: unknown) => updates.push(update), "launch-1", "task-l1-1", "ready", "standard");
+    i.progress(undefined, "launch-1", "task-l1-1", "agent_start", "standard");
     expect(updates).toHaveLength(1);
     const runCli: LaunchCli = { runJson: vi.fn(async () => ok("run", { value: 1 })), prompt: vi.fn(async () => ok("prompt", {})) };
     expect(await i.run(runCli, ["api"], new AbortController().signal)).toEqual({ value: 1 });
@@ -1627,7 +2168,7 @@ quotaSources:
     await expect(i.run(failedRunCli, ["api"], new AbortController().signal)).rejects.toThrow("run failed");
     const grant = { path: "/tmp/grant", token: "token", renew: vi.fn(), release: vi.fn() };
     expect(i.partialError(new Error("partial"), { paneId: "p" }, "ready", grant, { agentStarted: true, promptSubmitted: true, recipientRegistered: false, mutationDispatched: true, assignmentState: "unconfirmed", timing: {}, attempts: [] }, "inline")).toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "ready" } });
-    expect(i.partialError(new Error("\0"), {}, "focus", grant, { agentStarted: false, promptSubmitted: false, recipientRegistered: false, mutationDispatched: false, timing: {}, attempts: [] })).toMatchObject({ code: "LAUNCH_FAILED" });
+    expect(i.partialError(new Error("\0"), {}, "placement", grant, { agentStarted: false, promptSubmitted: false, recipientRegistered: false, mutationDispatched: false, timing: {}, attempts: [] })).toMatchObject({ code: "LAUNCH_FAILED" });
   });
 
   it("covers prompt confirmation reason variants", async () => {
@@ -1693,8 +2234,8 @@ quotaSources:
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const cli = makeCli();
     const tool = createLaunchTool({ cli: cli.cli, context, preflight: async () => undefined, supervision: stubSupervision(), specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) }, catalog: { load: async () => catalog }, routerLog: vi.fn(async () => undefined) as LaunchRouterLog });
-    const result = await tool.execute("call", request(), undefined, undefined, { cwd: "/repo", signal: undefined } as unknown as ExtensionContext);
-    expect(result.details).toMatchObject({ operation: "launch", outcome: "launched" });
+    const result = await tool.execute("call", task(), undefined, undefined, { cwd: repoRoot, signal: undefined } as unknown as ExtensionContext);
+    expect(result.details).toMatchObject({ kind: "launch", outcome: "launched", children: [{ state: "launched" }] });
     const executableCli = makeCli();
     Object.assign(executableCli.cli, { exec: vi.fn() });
     createLaunchTool({ cli: executableCli.cli, context, preflight: async () => undefined, supervision: stubSupervision(), catalog: { load: async () => catalog } });
@@ -1703,21 +2244,21 @@ quotaSources:
 
   it("covers router availability and compile error projections", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-    const input = { spec: spec(), catalog, response: responseFor(catalog), root: "/tmp", availability: async () => ({ status: "unknown", retryNotBefore: null, evidence: { records: 0 } }), compile: async () => { throw new Error("compile unavailable"); } };
-    await expect(routeSpec(input as never)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "configuration" });
+    const input = { task: { objective: "o", scope: "s", doneWhen: ["d"], constraints: [] }, spec: spec(), catalog, response: responseFor(catalog), root: "/tmp", availability: async () => ({ status: "unknown", retryNotBefore: null, evidence: { records: 0 } }), compile: async () => { throw new Error("compile unavailable"); } };
+    await expect(routeTask(input as never)).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "configuration" });
     const unavailable = { ...input, availability: async () => { throw new Error("availability unavailable"); }, compile: async () => ({}) };
-    await expect(routeSpec(unavailable as never)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
+    await expect(routeTask(unavailable as never)).resolves.toMatchObject({ kind: "abstained", reason: "transport_failed", component: "availability" });
     const throwingResponse = new Proxy(responseFor(catalog), { get() { throw new Error("routing response access"); } });
-    const launchRouting = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: throwingResponse })) } }).execute("call", request(), new AbortController().signal, undefined, extensionContext);
-    expect(launchRouting.details).toMatchObject({ outcome: "abstained", router: [{ reason: "invalid_response", component: "routing" }] });
+    const launchRouting = await toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: throwingResponse })) } }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(launchRouting.details).toMatchObject({ outcome: "abstained", children: [] });
     const aborted = new AbortController();
     aborted.abort("caller");
     const abortedTool = toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate: vi.fn(async () => { throw new Error("transport"); }) } });
-    const abortedResult = await abortedTool.execute("call", request(), aborted.signal, undefined, extensionContext);
-    expect(abortedResult.details).toMatchObject({ outcome: "abstained", router: [{ reason: "aborted" }] });
+    const abortedResult = await abortedTool.execute("call", task(), aborted.signal, undefined, extensionContext);
+    expect(abortedResult.details).toMatchObject({ outcome: "abstained", children: [] });
   });
 
-  it("covers diagnostic, batch-manifest, and route-state projections", () => {
+  it("covers diagnostic, manifest, and route-state projections", () => {
     const i = launchTestInternals as unknown as UnsafeLaunchInternals;
     const grant = { path: "/tmp/grant", token: "token", renew: vi.fn(), release: vi.fn() };
     const cliError = new CliProtocolError("CLI_PROTOCOL_ERROR", "cli failure", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "failed" } } });
@@ -1726,15 +2267,18 @@ quotaSources:
     expect(i.earlyLaunchFailure(Object.assign(new Error("\0"), { code: "CUSTOM" }), "validate")).toMatchObject({ code: "CUSTOM" });
     const activeSupervision = { state: "active", jobId: "job", child: { paneId: "p" } };
     const provisionalSupervision = { state: "provisional", jobId: "job", provisional: { paneId: "p" } };
-    const effects = { agentStarted: true, promptSubmitted: true, recipientRegistered: true, mutationDispatched: true, promptDispatch: { state: "acknowledged", requestId: "req" }, assignmentState: "confirmed", initialPromptSubmission: { confirmed: true }, readiness: { elapsedMs: 1 }, supervision: activeSupervision, timing: { selectedStartReadinessMs: 1 }, attempts: [{ candidate: { index: 0, runner: "pi", model: "m" }, outcome: "selected" }] };
+    const effects = { agentStarted: true, promptSubmitted: true, recipientRegistered: true, mutationDispatched: true, promptDispatch: { state: "acknowledged", requestId: "req" }, assignmentState: "confirmed", initialPromptSubmission: { confirmed: true }, readiness: { elapsedMs: 1 }, supervision: activeSupervision, timing: { selectedStartReadinessMs: 1 }, attempts: [{ point: { index: 0, id: "pt:m", runner: "pi", model: "m" }, outcome: "selected" }] };
     expect(i.partialError(cliError, { paneId: "p" }, "agent_start", grant, effects, "attachment", { attachmentId: "a" }, { effectCertainty: "partial", pane: "present", agent: "present", snapshot: "present" })).toMatchObject({ code: "LAUNCH_FAILED", details: { attachmentRetained: true, supervision: activeSupervision } });
     const readyTimeout = i.earlyLaunchFailure(Object.assign(new Error("timeout"), { code: "READY_TIMEOUT" }), "ready");
     readyTimeout.details.readiness = { elapsedMs: 1 } as unknown as UnsafeTestValue;
     expect(i.partialError(readyTimeout, {}, "ready", grant, { ...effects, supervision: provisionalSupervision, readiness: undefined, assignmentState: undefined, initialPromptSubmission: undefined, promptDispatch: undefined, timing: {}, attempts: [] }, undefined, undefined, undefined)).toMatchObject({ code: "READY_TIMEOUT", details: { readiness: expect.any(Object) } });
-    expect(i.partialError(Object.assign(new Error("aborted"), { code: "ABORTED" }), {}, "focus", grant, { agentStarted: false, promptSubmitted: false, recipientRegistered: false, mutationDispatched: false, timing: {}, attempts: [] })).toMatchObject({ code: "ABORTED" });
-    expect(i.batchManifest({ operation: "launch_batch", outcome: "failed", router: [], children: [], failure: { code: "FAILED", message: "failed" } })).toContain("router=none");
+    expect(i.partialError(Object.assign(new Error("aborted"), { code: "ABORTED" }), {}, "placement", grant, { agentStarted: false, promptSubmitted: false, recipientRegistered: false, mutationDispatched: false, timing: {}, attempts: [] })).toMatchObject({ code: "ABORTED" });
+    expect(i.launchManifest({ kind: "launch", launchId: "l1", outcome: "failed", requestedTier: "standard", children: [], error: { code: "FAILED", message: "failed" } })).toContain("children=0");
     const missingRunnerCatalog = { ...catalogOf([{ runner: "pi", model: "m" }]), runners: new Map() };
-    expect(i.specRouterState(spec(), missingRunnerCatalog).catalog[0]).toMatchObject({ timeout: 0 });
+    expect(i.taskRouterState({ objective: "o", scope: "s", doneWhen: ["d"], constraints: [] }, missingRunnerCatalog).points[0]).toMatchObject({ timeout: 0 });
+    const ungeneratedCatalog = { ...catalogOf([{ runner: "pi", model: "m" }]) };
+    delete ungeneratedCatalog.points;
+    expect(i.taskRouterState({ objective: "o", scope: "s", doneWhen: ["d"], constraints: [] }, ungeneratedCatalog).points).toEqual([]);
   });
 
   it("covers nullish identity and readiness projection variants", async () => {
@@ -1749,7 +2293,7 @@ quotaSources:
     expect(i.agyInteractiveReadiness([{ source: "pane_get", value: {} }])).toEqual([]);
     expect(i.readinessBaseline({ pane_id: "p", terminal_id: "t", name: "worker", agent: "pi", agent_session: session, agent_status: "idle", state_change_seq: 1, revision: 2 }, identity, { agentStatus: "idle", stateChangeSeq: 1, revision: 2, screenDetectionSkipped: true }).baseline).toMatchObject({ screenDetectionSkipped: true });
     expect(i.readinessEvidence({ now: () => 1 }, 0, 1, [], false, undefined)).toMatchObject({ baselineRequired: false });
-    const baseline = { version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w", label: "w", focused: true }], tabs: [{ tab_id: "t", workspace_id: "w", label: "t", focused: true }], panes: [{ pane_id: "p", tab_id: "t", workspace_id: "w" }], agents: [] } as HerdrSnapshot;
+    const baseline = { version: "0.8.0", protocol: 22, workspaces: [{ workspace_id: "w", label: "workspace", focused: true }], tabs: [{ tab_id: "t", workspace_id: "w", label: "main", focused: true }], panes: [{ pane_id: "p", tab_id: "t", workspace_id: "w" }], agents: [] } as HerdrSnapshot;
     const presentPaneNoAgent: LaunchCli = { runJson: vi.fn(async (argv) => {
       if (argv[0] === "api") return ok("snapshot", { type: "session_snapshot", snapshot: { ...baseline, panes: [...baseline.panes, { pane_id: "p", tab_id: "t", workspace_id: "w" }], agents: [] } });
       if (argv[0] === "pane") return ok("pane", { pane: { pane_id: "p", tab_id: "t", workspace_id: "w" } });

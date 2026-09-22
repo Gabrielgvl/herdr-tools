@@ -6,60 +6,80 @@ A Pi extension that turns the Herdr terminal multiplexer into a supervised multi
 
 ### Delegation
 
-**Spec**:
-A caller-authored launch unit in `herdr_launch.specs`: `label`, `instructions`, a typed `assignment` (`objective`/`scope`/`verification`), optional `category`, optional replica `count`. Specs replaced profiles and roles in the ADR-035 migration; the words "profile" and "role" describe only deleted machinery.
-_Avoid_: profile, role, preset, template
+**Task**:
+The one caller-authored unit passed to `herdr_launch`: an objective, scope, completion evidence, caller constraints, and optional routing or recovery policy. One call launches one Task, with optional isolated replicas.
+_Avoid_: spec, assignment, profile, role, preset, template
 
-**Category**:
-The public `specs[].category` field names a catalog capability group (`frontier`, `balanced`, `cheap`) that resolves to an ordered chain of `{runner, model}` candidates in `herdr-profiles/catalog.yaml`. A spec may name its category; otherwise Jev chooses it. The current schema has no `qualityTier` field and no `standard` default.
-_Avoid_: quality tier, tier, class, profile family
+**Task contract**:
+The Task's single semantic authority: `objective`, `scope`, `doneWhen`, and `constraints`. The same contract feeds child rendering, Jev, required-resource checks, and supervision.
+_Avoid_: instructions, supervision digest, verification field, prompt body
+
+**Quality tier**:
+A caller's requested starting quality and compute posture: `utility`, `economy`, `standard`, `strong`, `frontier`, or `max`. Omission means `standard`; workload policy may raise the effective start and bounds later recovery escalation.
+_Avoid_: category, class, profile family
 
 **Workload profile**:
-Jev's routing description of an assignment across `intent`, `mutation`, `scope`, `horizon`, `verifiability`, `workspaceState`, and `ambiguity`, derived during evaluation to inform the category and resource judgments. Shape labels have no policy authority; the caller's `category` (or its absence) decides the chain.
+The routing description of a Task across `intent`, `mutation`, `scope`, `horizon`, `verifiability`, `workspaceState`, and `ambiguity`. Jev derives semantic fields while authoritative runtime evidence supplies workspace state; shape labels have no policy authority.
 _Avoid_: workload shape, role, task type
 
 **Operating point**:
-A reviewed runner, model, and native reasoning-setting combination that routing may select. The reasoning setting is runner-specific, such as Pi thinking or Claude effort, and may be encoded in the model for other runners.
+A reviewed runner, model, and native reasoning-setting combination that routing may select. Relative cost and latency are catalog facts; quality tier suitability is contextual to each route.
 _Avoid_: model, model configuration, runner default
 
 **Candidate**:
 One admissible operating point considered inside a deterministic quality-tier and recovery bucket. Jev ranks candidates within a bucket; the resulting bounded order is the pre-execution fallback chain.
-_Avoid_: profile (deleted), model pick, runner choice
+_Avoid_: profile, model pick, runner choice
 
-**candidateName**:
-The public `herdr_jobs` projection field carrying the model of the candidate that actually bound and started the child (under `request.child`, `supervision.child`, `supervision.provisional`).
-_Avoid_: profileName (retired), model, runnerName
+**Recovery lineage**:
+The `recoveryOf` link from a new Task to a prior managed handoff run. Runtime resolves the prior run's workspace, state, and route evidence; recovery is not fallback or a workload intent.
+_Avoid_: retry, recovery role, failed profile
 
-**requestedCandidateName**:
-The public `herdr_jobs` projection field emitted only when chain fallback changed which candidate started the child — it carries the candidate recorded at reservation and is omitted when equal to `candidateName`.
-_Avoid_: requestedProfileName (retired), originalProfile
+**Replica**:
+One of the `replicas` children created from a Task. Replicas share one routing contract and use isolated Git worktrees.
+_Avoid_: fan-out, copy, clone
 
-**Reviewer**:
-Judges a running child's progress from transcript evidence into one of progress, stalled, blocked, risk, appears_complete, unknown. The supervisor reviewer is Jev (`typesafe/jev-latest`): six `noul` predicates plus a `reason` choice reduced by `reduceSupervisionReview`. Not the router.
-_Avoid_: router, judge, verifier
+**Launch ID**:
+The runtime-generated identity of one `herdr_launch` operation. Callers do not author launch or child machine names.
+_Avoid_: name, launch name, batch name
+
+**Child target**:
+The runtime-generated exact identifier returned for one launched child. Communication, waits, jobs, and lifecycle operations target this value rather than a human label.
+_Avoid_: child name, task label, pane label
+
+**operatingPointId**:
+The public evidence field naming the exact runner, model, and reasoning configuration that bound and started a child.
+_Avoid_: candidateName, profileName, model
+
+**requestedOperatingPointId**:
+The public evidence field emitted only when pre-execution fallback changed which operating point started the child. It is omitted when equal to `operatingPointId`.
+_Avoid_: requestedCandidateName, requestedProfileName, originalProfile
 
 **Label**:
-One field name, two scopes: a request-level `label` is the pane label shown in the mux, while a spec-level `label` is the caller's name for the spec that derived child names (`{name}-{spec.label}-{N}`) are built from. Neither is renamed; the overload is ratified.
-_Avoid_: pane-label, spec-name — the field is spelled `label` at both levels
+Optional presentation metadata for a Task. A label may repeat and never affects routing, revision, tab selection, machine identity, or target resolution.
+_Avoid_: name, target, task ID
+
+**Workload tab**:
+A same-workspace tab whose exact label follows `workload:<intent>` or `workload:<intent>:<number>`. Runtime-created tabs use one row and hold at most four total panes. A pre-existing exact-label tab may be reused by pane-count proxy when non-focused geometry cannot be inspected. The owning manager handles cleanup.
+_Avoid_: role tab, task tab, placement
+
+**Reviewer**:
+Judges a running child's progress from transcript evidence into one of progress, stalled, blocked, risk, appears_complete, unknown. The supervisor reviewer is Jev (`typesafe/jev-latest`): six `noul` predicates plus a `reason` choice reduced by `reduceSupervisionReview`.
+_Avoid_: router, judge, verifier
 
 ### Routing
 
 **Jev**:
-TypeSafe's decision-only model: typed questions in, calibrated probabilities out, no generated text. Serves spec evaluation (`jev-latest`), the supervisor reviewer (`typesafe/jev-latest`), and — when configured with `typesafe/<model>` — the explicit wait reviewer.
+TypeSafe's decision-only model: typed questions in, calibrated probabilities out, no generated text. It supplies Task evaluation, resource fitness, operating-point fitness, supervisor review, and optional explicit wait review.
 _Avoid_: classifier, LLM
 
-**supervisionDigest**:
-The required request-level authorial digest — `doneWhen` plus `constraints` — recorded at supervision reservation and supplied to every supervisor review as the judgeable completion contract.
-_Avoid_: done criteria, success spec, checklist
+**doneWhen**:
+The Task's concrete, externally judgeable completion conditions. They are the only caller-authored completion authority used by both launch admission and supervision.
+_Avoid_: verification, supervision digest, success spec, checklist
 
-**Spec decision**:
-The per-spec output of `routeSpec` after deterministic policy is applied to Jev's judgments: admitted (selected candidate plus fallback chain), rejected (quality gate), or a typed abstention. One record is appended to `.herdr/router/decisions.jsonl` before the first child mutation.
-_Avoid_: RouteDecision (retired), recommendation, suggestion, plan
+**Task decision**:
+The per-Task output after deterministic policy is applied to Jev judgments: admitted, rejected by the done-when gate, or a typed abstention. One record is appended to `.herdr/router/decisions.jsonl` before the first child mutation.
+_Avoid_: spec decision, RouteDecision, recommendation, suggestion, plan
 
 **Abstain**:
-The router declining to launch a spec — `low_confidence`, `no_assignments`, `catalog_unavailable`, `invalid_response`, `authentication_unavailable`, `transport_failed`, `aborted` — with zero launch effects.
-_Avoid_: unknown (reserved for the reviewer), fallback (reserved for candidate chains)
-
-**Replica**:
-One of the `count` children a spec expands to. Replicas share the spec's instructions and selected chain, get deterministic `{name}-{spec.label}-{N}` names, and — when `count > 1` — launch into isolated worktrees under `.herdr/worktrees/`.
-_Avoid_: fan-out (role-derived fan-out is deleted), copy, clone
+The router declining to launch with zero launch effects, for example low-confidence workload classification, no candidate at the effective tier, invalid response, unavailable catalog, authentication failure, transport failure, or abort.
+_Avoid_: unknown, fallback, rejection

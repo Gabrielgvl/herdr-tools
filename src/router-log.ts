@@ -39,7 +39,6 @@ export const ROUTER_LOG_LOCK_WAIT_MS = 5_000;
 const ROUTER_LOG_READY = "HERDR_ROUTER_LOG_LOCK_READY";
 const REASONS = new Set([
   "low_confidence",
-  "no_assignments",
   "no_candidates_at_tier",
   "catalog_unavailable",
   "invalid_response",
@@ -111,7 +110,7 @@ export interface RouterLogRecord {
 export type LoggedRouterResult =
   | Pick<Admitted, "kind" | "quality" | "count" | "requestedTier" | "workloadFloor" | "effectiveStartTier" | "effectiveCeiling" | "chain" | "selectedPoint" | "configuration" | "evidence">
   | Pick<Rejected, "kind" | "quality" | "reason" | "evidence">
-  | Pick<Abstained, "kind" | "reason" | "component" | "evidence">;
+  | Pick<Abstained, "kind" | "reason" | "component" | "requestSize" | "evidence">;
 
 export interface LoggedEvidence {
   quality?: RouterEvidence["quality"];
@@ -506,7 +505,9 @@ function projectSpecResult(result: SpecDecision): LoggedRouterResult {
     return { kind: "rejected", quality: "rejected", reason: result.reason, evidence: projectEvidence(result.evidence) };
   }
   if (result.kind !== "abstained" || !REASONS.has(result.reason) || (result.component !== undefined && !bounded(result.component))) throw routerLogFailure("Router decision result is malformed");
-  return { kind: "abstained", reason: result.reason, ...(result.component === undefined ? {} : { component: result.component }), ...(result.evidence === undefined ? {} : { evidence: projectEvidence(result.evidence) }) };
+  const requestSize = result.requestSize;
+  if (requestSize !== undefined && (!Number.isInteger(requestSize.questions) || requestSize.questions < 0 || !Number.isInteger(requestSize.bytes) || requestSize.bytes < 0)) throw routerLogFailure("Router decision result is malformed");
+  return { kind: "abstained", reason: result.reason, ...(result.component === undefined ? {} : { component: result.component }), ...(requestSize === undefined ? {} : { requestSize }), ...(result.evidence === undefined ? {} : { evidence: projectEvidence(result.evidence) }) };
 }
 
 function buildRecord(entry: SpecRouterLogEntry, now: () => Date): RouterLogRecord {

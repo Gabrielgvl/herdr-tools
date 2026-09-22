@@ -228,20 +228,19 @@ export class TypeSafeReviewer implements WaitReviewer {
 }
 
 /**
- * Resolve the Jev API key in precedence order. A caller-supplied explicit
- * option always wins by construction (`TypeSafeReviewer` prefers
- * `options.apiKey`); this helper supplies the next two legs —
- * `TYPESAFE_API_KEY`, then the "typesafe" `api_key` entry in the Pi auth
- * credential store, the same file the Pi host logs into. A missing,
- * unreadable, or non-api-key entry resolves to `undefined`, which leaves the
- * reviewer's own "not authenticated" failure to surface at review time. Key
- * material is never logged or persisted here.
+ * Resolve the Jev API key from the Pi auth store first. A caller-supplied
+ * explicit option still wins by construction (`TypeSafeReviewer` prefers
+ * `options.apiKey`); otherwise the extension's shared `auth.json` is the
+ * canonical source, so a stale `TYPESAFE_API_KEY` cannot silently override a
+ * rotated key. The environment remains a compatibility fallback for isolated
+ * tests and bootstrap processes. Key material is never logged or persisted
+ * here.
  */
 export async function resolveTypesafeApiKey(store: Pick<AuthJsonCredentialStore, "read"> = new AuthJsonCredentialStore()): Promise<string | undefined> {
-  const fromEnv = process.env.TYPESAFE_API_KEY;
-  if (fromEnv !== undefined && fromEnv.length > 0) return fromEnv;
   const credential = await store.read("typesafe").catch(() => undefined);
-  return credential?.type === "api_key" ? credential.key : undefined;
+  if (credential?.type === "api_key" && typeof credential.key === "string" && credential.key.length > 0) return credential.key;
+  const fromEnv = process.env.TYPESAFE_API_KEY;
+  return fromEnv !== undefined && fromEnv.length > 0 ? fromEnv : undefined;
 }
 
 /** Select the opt-in System One path or preserve the existing Pi reviewer unchanged. */

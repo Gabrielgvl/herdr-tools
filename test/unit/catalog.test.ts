@@ -497,6 +497,44 @@ describe("catalog", () => {
     expect(unreviewed.points).toEqual([]);
   });
 
+  it("fails closed when a pi model declares no reasoning axis", () => {
+    // The pi runtime always launches with a thinking setting: an undeclared
+    // axis would mint a bare point the compiler rejects at start time.
+    const stripped = VALID.replace(
+      "{model: openai/pi-pro, supportedReasoning: [off, low, medium, high, xhigh, max]}",
+      "{model: openai/pi-pro}",
+    );
+    expect(() => parse(stripped)).toThrow(CatalogError);
+    try {
+      parse(stripped);
+      expect.unreachable("expected INVALID_CATALOG");
+    } catch (error) {
+      expect(error).toBeInstanceOf(CatalogError);
+      expect((error as CatalogError).code).toBe("INVALID_CATALOG");
+    }
+    // Duplicate model entries are equally invalid.
+    const duplicated = VALID.replace(
+      "      - {model: openai/pi-pro, supportedReasoning: [off, low, medium, high, xhigh, max]}",
+      "      - {model: openai/pi-pro, supportedReasoning: [off, low, medium, high, xhigh, max]}\n      - {model: openai/pi-pro, supportedReasoning: [low, high]}",
+    );
+    expect(() => parse(duplicated)).toThrow(CatalogError);
+    // Claude effort is optional (haiku is unreasoned): a claude model without
+    // an axis stays valid — the adapter emits no --effort for it.
+    const unreasonedClaude = VALID
+      .replace("{model: claude-sonnet-5, supportedReasoning: [low, medium, high, max]}", "{model: claude-sonnet-5}")
+      .replace(/ {2}claude:claude-sonnet-5:(low|medium|high|max): \{costClass: \w+, latencyClass: \w+\}\n/g, "")
+      .replace("  devin:swe-2-max: {costClass: low, latencyClass: low}", "  devin:swe-2-max: {costClass: low, latencyClass: low}\n  claude:claude-sonnet-5: {costClass: medium, latencyClass: medium}");
+    expect(() => parse(unreasonedClaude)).not.toThrow();
+    // An empty axis is also refused for reasoning-required runners.
+    const emptyAxis = VALID.replace(
+      "{model: openai/pi-pro, supportedReasoning: [off, low, medium, high, xhigh, max]}",
+      "{model: openai/pi-pro, supportedReasoning: []}",
+    );
+    expect(() => parse(emptyAxis)).toThrow(CatalogError);
+    // Model-encoded runners (agy/devin) stay valid without an axis.
+    expect(() => parse(MINIMAL)).not.toThrow();
+  });
+
   it("filters operating points by the tier envelope", () => {
     const quota = { provider: "p", billingProduct: "b", account: "a", scope: "account" };
     const points: OperatingPoint[] = [

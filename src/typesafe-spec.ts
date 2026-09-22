@@ -92,7 +92,7 @@ const TIER_DESCRIPTIONS: Record<string, string> = {
 export type TaskEvaluation = { kind: "response"; response: TaskModelDecision } | Abstained;
 
 export interface TypeSafeSpecOptions {
-  /** Explicit key wins; otherwise `resolveTypesafeApiKey` (env → Pi auth store). */
+  /** Explicit key wins; otherwise `resolveTypesafeApiKey` (Pi auth store → env fallback). */
   apiKey?: string;
   fetch?: Fetch;
   /** Credential-store seam for `resolveTypesafeApiKey`; defaults to the real auth.json store. */
@@ -142,8 +142,8 @@ function isReadonlyMap<K, V>(value: unknown): value is ReadonlyMap<K, V> {
   return value instanceof Map;
 }
 
-function refuse(reason: AbstainReason, component?: string): TaskEvaluation {
-  return { kind: "abstained", reason, ...(component === undefined ? {} : { component }) };
+function refuse(reason: AbstainReason, component?: string, requestSize?: { questions: number; bytes: number }): TaskEvaluation {
+  return { kind: "abstained", reason, ...(component === undefined ? {} : { component }), ...(requestSize === undefined ? {} : { requestSize }) };
 }
 
 /** Exact-key probability map: every sent key present once, each in [0,1], summing to one. */
@@ -332,7 +332,7 @@ export class TypeSafeSpecClient {
       response = await client.systemOne({ state: built.state as EntryType, questions: built.questions }, { signal });
     } catch (error) {
       if (signal.aborted) return refuse("aborted");
-      return refuse("transport_failed", error instanceof APIError ? `http_${error.status}` : "transport");
+      return refuse("transport_failed", error instanceof APIError ? `http_${error.status}` : "transport", specRequestSize(built));
     }
     const evaluated = this.normalize(response, built.resourceQuestions, built.fitnessQuestions);
     if (evaluated.kind === "response" && signal.aborted) return refuse("aborted");

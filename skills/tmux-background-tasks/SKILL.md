@@ -32,9 +32,9 @@ Save the printed task ID. Use a descriptive name. The helper adds a unique suffi
 
 Commands run through tmux's configured shell. Shell operators, pipelines, environment expansion, and redirection work inside the quoted command. Do not put secrets directly in the command because the command is visible in process and tmux metadata.
 
-Only session-bound starts use the notification wrapper. The wrapper invokes tmux's effective default shell with the original command, requested cwd, inherited environment, and pane stdin/stdout/stderr. It preserves the submitted command in running `status` and `list` output. Signals are forwarded to the direct command-shell child only; independently grouped or daemonized descendants are outside the guarantee. Because Bash exposes signal-derived waits as 128 plus the signal number, intentional exits 129 through 192 can be classified as signals; statuses 193 through 255 remain numeric failures.
+Every start uses a small wrapper that invokes tmux's effective default shell with the original command, requested cwd, inherited environment, and pane stdin/stdout/stderr. It preserves the submitted command and exact exit status in `status` and `list` output. Signals are forwarded to the direct command-shell child only; independently grouped or daemonized descendants are outside the guarantee. Because Bash exposes signal-derived waits as 128 plus the signal number, intentional exits 129 through 192 can be classified as signals; statuses 193 through 255 remain numeric failures.
 
-Use the registered `tmux_bg_start` tool from Pi. It supplies Pi's actual session ID, starts this helper, and refreshes the session footer. Completion is delivered to that origin session through a private per-session outbox; no command, cwd, or output is copied into the notification. Calling this script directly without `PI_SESSION_ID` keeps its legacy behavior and does not create notification records.
+Use the registered `tmux_bg_start` tool from Pi. It supplies Pi's actual session ID, starts this helper, and refreshes the session footer. Session-bound completion is delivered to that origin session through a private per-session outbox; no command, cwd, or output is copied into the notification. Calling this script directly without `PI_SESSION_ID` uses the same tmux wrapper and retained status but does not create notification records.
 
 For a server or watcher, run the foreground form of the program. Do not add `&`, `nohup`, or another daemonization layer.
 
@@ -172,14 +172,3 @@ Rollback must leave the hidden completion action compatible: notification-enable
 - If setup fails after session creation, the partial session is removed.
 - If a task exits quickly, `remain-on-exit` preserves its output and exit code.
 - If `list` runs with no tmux server or no managed tasks, it returns no tasks successfully.
-
-## Opt-in systemd backend
-
-An alternative file-backed backend (`scripts/systemd-bg`) lets systemd own the process lifecycle instead of tmux. It is opt-in per invocation and not the default:
-
-```bash
-PI_BG_BACKEND=systemd "$TMUX_BG" start NAME CWD COMMAND
-PI_BG_BACKEND=systemd "$TMUX_BG" {list|status|output|kill|clean}
-```
-
-Unset or empty `PI_BG_BACKEND` keeps the legacy tmux behavior documented above; any other value fails explicitly. The backend requires systemd >= 255, a reachable user manager (`systemctl --user`), and python3; an unreachable manager is a hard failure, never a tmux fallback. Jobs are noninteractive, file-backed under `$PI_CODING_AGENT_DIR/tmux-bg/jobs/<id>`, and completion uses the same origin-session outbox: exit 0 with a successful service result publishes `succeeded`, a classifiable nonzero exit or signal death publishes `failed`, and cancellation, exit 0 with a non-success service result, or an unclassifiable result publishes nothing. Cancellation is confirmed or reported unconfirmed — never guessed. The `/bg` command and footer widget do not display these jobs. See `README.md` for full semantics, limits, and rollback; the backend is reviewed and qualified, and the skill is globally installed for Pi.

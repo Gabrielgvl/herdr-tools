@@ -283,10 +283,9 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(childView).toMatchObject({ agentName: childTarget, paneId });
     expect(job).not.toHaveProperty("supervision_result");
 
-    const promptCalls = state.socketProxy?.requests.slice(promptStart) ?? [];
+    const promptCalls = (state.socketProxy?.requests.slice(promptStart) ?? [])
+      .filter((request) => request.method === "agent.prompt" && request.target === paneId);
     expect(promptCalls).toHaveLength(1);
-    expect(promptCalls[0]!.method).toBe("agent.prompt");
-    expect(promptCalls[0]!.target).toBe(paneId);
     expect(state.toolCalls.slice(toolCallStart).map(({ name }) => name).filter((name) => name === "herdr_wait" || name === "herdr_communicate")).toEqual([]);
 
     const launchCliCalls = state.cliCalls.slice(cliStart);
@@ -348,26 +347,32 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       const supervisorJobId = child.supervisorJobId;
       const job = resultObject((await tool("herdr_jobs").execute(`${label}-launch-supervisor`, { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
       const paneId = jobPaneId(job);
-      const promptRequests = state.socketProxy?.requests.slice(promptStart) ?? [];
+      const promptRequests = (state.socketProxy?.requests.slice(promptStart) ?? [])
+        .filter((request) => request.method === "agent.prompt" && request.target === paneId);
       expect(promptRequests).toHaveLength(1);
-      expect(promptRequests[0]).toMatchObject({ method: "agent.prompt", target: paneId });
       process.stderr.write(`INTEGRATION_DELIVERY_CONFIRMED ${label} ${JSON.stringify({ elapsedMs, target: childTarget, paneId, supervisorJobId, operatingPointId: child.operatingPointId })}\n`);
       return { confirmed: true, launch, child, paneId, supervisorJobId };
     }
     // The tolerated outcome is a post-submission failure: exactly one prompt
-    // request reached the socket, so the task may have been consumed.
-    // Any other child outcome — abstained, failed before submission, or
-    // multiple submissions — is a real defect and fails this run.
+    // request reached this child's pane, so the task may have been consumed.
+    // Unrelated supervisor wakes can share the socket and are not submissions
+    // to this child. Any other child outcome — abstained or pre-submission
+    // failure — remains a real defect.
     const childError = resultObject(child.error ?? {});
-    const promptRequests = (state.socketProxy?.requests.slice(promptStart) ?? []).filter((request) => request.method === "agent.prompt");
-    if (child.state !== "failed" || childError.code !== "PROMPT_UNCONFIRMED" || promptRequests.length !== 1) {
+    if (child.state !== "failed" || childError.code !== "PROMPT_UNCONFIRMED") {
       await recordDeliveryFailureBeforeTeardown(label, launch, child, undefined, elapsedMs);
       throw new Error(`${label} returned state=${String(child.state)} code=${String(childError.code)} outcome=${String(launch.outcome)}`);
     }
-    const attachmentPath = promptRequests[0]!.text?.match(/attachment-path: (\S+)/u)?.[1];
-    if (attachmentPath !== undefined) state.attachmentPaths.push(attachmentPath);
     const job = await supervisorJobForTarget(childTarget);
     const paneId = jobPaneId(job);
+    const promptRequests = (state.socketProxy?.requests.slice(promptStart) ?? [])
+      .filter((request) => request.method === "agent.prompt" && request.target === paneId);
+    if (promptRequests.length !== 1) {
+      await recordDeliveryFailureBeforeTeardown(label, launch, child, paneId, elapsedMs);
+      throw new Error(`${label} submitted ${promptRequests.length} prompts to ${paneId}`);
+    }
+    const attachmentPath = promptRequests[0]!.text?.match(/attachment-path: (\S+)/u)?.[1];
+    if (attachmentPath !== undefined) state.attachmentPaths.push(attachmentPath);
     const supervisorJobId = String(job.jobId);
     await recordDeliveryFailureBeforeTeardown(label, launch, child, paneId, elapsedMs);
     await assertUnconfirmedRecovery(label, launch, childTarget, job, promptCanary, promptStart, cliStart, toolCallStart);
@@ -846,7 +851,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    * uncertainty is accepted but returns before the readback assertion.
    */
   it("accepts a runtime-selected recipient readback only with agent-produced evidence", async () => {
-    if (state.unconfirmedRecoveries.length > 0) return;
+    if (state.unconfirmedRecoveries.length >= 2) return;
     const left = randomUUID();
     const right = randomUUID();
     const expected = `${left}:${right}`;
@@ -855,7 +860,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       scope: "Call no tools and change nothing.",
       doneWhen: ["The response is the first token, one colon, and the second token, with no other text."],
       constraints: ["none"],
-      tier: "frontier",
+      tier: "strong",
       label: "accept"
     }, signal(), undefined, toolContext()));
     if (!launched.confirmed) return;

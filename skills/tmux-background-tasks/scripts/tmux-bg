@@ -34,6 +34,7 @@ require_tmux() {
   local resolved
   resolved="$(command -v "$TMUX_BIN" 2>/dev/null || true)"
   [[ -n "$resolved" && -x "$resolved" ]] || fail "tmux is not installed or not executable: $TMUX_BIN"
+  [[ "$resolved" == /* ]] || resolved="$(CDPATH= cd -- "$(dirname -- "$resolved")" && pwd -P)/$(basename -- "$resolved")"
   TMUX_BIN="$resolved"
 }
 
@@ -373,21 +374,6 @@ complete_task() {
   publish_event "$agent_dir" "$pi_session_id" "$task_id" "$event" "$temp_name" "$chain_identity" || exit 1
 }
 
-# Publish through the unchanged complete_task path; used by the systemd
-# backend's trusted finalizer. An optional sixth argument carries the outbox
-# chain identity captured at launch; when absent it is captured now.
-publish_task() {
-  [[ $# -eq 5 || $# -eq 6 ]] || exit 1
-  local agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" chain_identity="${6:-}"
-  [[ "$agent_dir" == /* ]] || exit 1
-  if [[ -n "$chain_identity" ]]; then
-    [[ "$chain_identity" =~ ^[0-9]+:[0-9]+(\|[0-9]+:[0-9]+){3}$ ]] || exit 1
-  else
-    chain_identity="$(capture_outbox_identity "$agent_dir" "$2")" || exit 1
-  fi
-  PI_TMUX_BG_CHAIN_IDENTITY="$chain_identity" complete_task "$1" "$2" "$3" "$4" "$5"
-}
-
 session_exists() {
   tmux_cmd has-session -t "$1" 2>/dev/null
 }
@@ -405,23 +391,28 @@ start_task() {
   [[ $# -eq 3 ]] || usage
   local name="$1" cwd="$2" command="$3" slug id
   local pi_session_id="${PI_SESSION_ID:-}" session_persisted=0 notify_enabled=0
-  local agent_dir script_path default_shell shell_command
+  local agent_dir script_path default_shell shell_command tmux_bin
   [[ -n "${name//[[:space:]]/}" ]] || fail "task name must not be empty"
   [[ -d "$cwd" ]] || fail "working directory does not exist: $cwd"
   [[ -n "${command//[[:space:]]/}" ]] || fail "command must not be empty"
 
   if [[ -n "$pi_session_id" ]]; then
     require_session_id "$pi_session_id"
+  fi
+
+  script_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+  require_absolute_executable "$script_path" "completion helper"
+  tmux_bin="$TMUX_BIN"
+  default_shell="$(tmux_cmd start-server \; show-options -gv default-shell 2>/dev/null || true)"
+  [[ "$default_shell" != *$'\n'* && -n "$default_shell" ]] || fail "could not determine tmux default shell"
+  require_absolute_executable "$default_shell" "tmux default shell"
+
+  if [[ -n "$pi_session_id" ]]; then
     notify_enabled=1
     [[ "${PI_SESSION_FILE+x}" ]] && session_persisted=1
     agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
     [[ "$agent_dir" == /* ]] || fail "PI_CODING_AGENT_DIR must be an absolute path"
     ensure_outbox_chain "$agent_dir" "$pi_session_id" 1 || fail "could not create notification outbox"
-    script_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
-    require_absolute_executable "$script_path" "completion helper"
-    default_shell="$(tmux_cmd start-server \; show-options -gv default-shell 2>/dev/null || true)"
-    [[ "$default_shell" != *$'\n'* && -n "$default_shell" ]] || fail "could not determine tmux default shell"
-    require_absolute_executable "$default_shell" "tmux default shell"
   fi
 
   slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-32)"
@@ -441,12 +432,15 @@ start_task() {
     tmux_cmd set-option -p -t "$id" @pi_bg_wrapper 1
     tmux_cmd respawn-pane -k -t "$id" -c "$cwd" "$shell_command"
   else
+    shell_command="exec $(shell_quote "$script_path") __wrap $(shell_quote "$id") $(shell_quote "$tmux_bin") $(shell_quote "$default_shell") $(shell_quote "$command")"
     tmux_cmd new-session -d -s "$id" -c "$cwd"
     tmux_cmd set-option -t "$id" @pi_bg_managed 1
     tmux_cmd set-option -w -t "$id" remain-on-exit on
     tmux_cmd set-option -w -t "$id" remain-on-exit-format ''
     tmux_cmd set-option -t "$id" history-limit 5000
-    tmux_cmd respawn-pane -k -t "$id" -c "$cwd" "$command"
+    tmux_cmd set-option -p -t "$id" @pi_bg_public_command "$command"
+    tmux_cmd set-option -p -t "$id" @pi_bg_wrapper 1
+    tmux_cmd respawn-pane -k -t "$id" -c "$cwd" "$shell_command"
   fi
   trap - ERR
   printf '%s\n' "$id"
@@ -454,7 +448,7 @@ start_task() {
 
 status_task() {
   [[ $# -eq 1 ]] || usage
-  local id="$1" state dead exit_code pid signal command wrapper event_result result_kind result_value result_signal_number
+  local id="$1" state dead exit_code pid signal command wrapper retained event_result result_kind result_value result_signal_number
   require_id "$id"
   is_managed_session "$id" || fail "task not found: $id"
   state="$(pane_state "$id")" || true
@@ -464,10 +458,15 @@ status_task() {
     wrapper="$(tmux_cmd show-options -p -v -t "$id" @pi_bg_wrapper 2>/dev/null || true)"
     if [[ -z "$exit_code" && "$signal" =~ ^[0-9]+$ ]]; then
       exit_code=$((128 + signal))
-    elif [[ -z "$exit_code" && -z "$signal" && "$wrapper" == "1" ]]; then
-      # tmux can briefly retain a dead pane before publishing a zero status;
-      # the wrapper's committed event is the same exact child result.
-      event_result="$(python3 - "$id" "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" <<'PY'
+    elif [[ -z "$exit_code" && -z "$signal" ]]; then
+      # tmux marks a pane dead before it publishes the dead status; the exit
+      # status recorded on the pane before its death is the same exact result.
+      retained="$(tmux_cmd show-options -p -v -t "$id" @pi_bg_exit 2>/dev/null || true)"
+      if [[ "$retained" =~ ^[0-9]+$ ]] && (( 10#$retained <= 255 )); then
+        exit_code=$((10#$retained))
+      elif [[ "$wrapper" == "1" ]]; then
+        # The wrapper's committed event is the same exact child result.
+        event_result="$(python3 - "$id" "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" <<'PY'
 import json
 import os
 import sys
@@ -487,12 +486,12 @@ for session in os.listdir(path):
     except (OSError, ValueError):
         continue
 PY
-      )" || true
-      IFS='|' read -r result_kind result_value <<<"$event_result"
-      if [[ "$result_kind" == "exit" && "$result_value" =~ ^[0-9]+$ ]]; then
-        exit_code="$result_value"
-      elif [[ "$result_kind" == "signal" ]]; then
-        result_signal_number="$(python3 - "${result_value#SIG}" <<'PY'
+        )" || true
+        IFS='|' read -r result_kind result_value <<<"$event_result"
+        if [[ "$result_kind" == "exit" && "$result_value" =~ ^[0-9]+$ ]]; then
+          exit_code="$result_value"
+        elif [[ "$result_kind" == "signal" ]]; then
+          result_signal_number="$(python3 - "${result_value#SIG}" <<'PY'
 import signal
 import sys
 try:
@@ -500,9 +499,10 @@ try:
 except (KeyError, ValueError):
     raise SystemExit(1)
 PY
-        )" || true
-        if [[ "$result_signal_number" =~ ^[0-9]+$ ]]; then
-          exit_code=$((128 + result_signal_number))
+          )" || true
+          if [[ "$result_signal_number" =~ ^[0-9]+$ ]]; then
+            exit_code=$((128 + result_signal_number))
+          fi
         fi
       fi
     fi
@@ -707,6 +707,26 @@ run_task() {
   fi
 }
 
+# Legacy tasks have no notification outbox, so the wrapper records the child's
+# wait status on its own pane before exiting; the pane cannot die earlier.
+wrap_task() {
+  [[ $# -eq 4 ]] || exit 1
+  local task_id="$1" tmux_bin="$2" default_shell="$3" command="$4" child_status
+  require_id "$task_id"
+  require_absolute_executable "$tmux_bin" "tmux"
+  require_absolute_executable "$default_shell" "tmux default shell"
+  [[ -n "${command//[[:space:]]/}" ]] || exit 1
+  if "$default_shell" -c "$command" <&0; then
+    child_status=0
+  else
+    child_status=$?
+  fi
+  # The pane's TMUX environment names its own server; a failed record never
+  # masks the child's status or writes into the retained output.
+  "$tmux_bin" set-option -p -t "$task_id" @pi_bg_exit "$child_status" 2>/dev/null || true
+  exit "$child_status"
+}
+
 command="${1:-}"
 [[ $# -gt 0 ]] && shift || true
 if [[ "$command" == __complete ]]; then
@@ -717,29 +737,11 @@ if [[ "$command" == __run ]]; then
   run_task "$@"
   exit 0
 fi
-if [[ "$command" == __prepare ]]; then
-  # Create/validate the notification outbox chain for a bound session (used by
-  # the opt-in systemd backend before launch) and print the captured chain
-  # identity so the caller can pin publication to this launch. No tmux involved.
-  require_session_id "${1:-}"
-  _prepare_agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
-  [[ "$_prepare_agent_dir" == /* ]] || fail "PI_CODING_AGENT_DIR must be an absolute path"
-  ensure_outbox_chain "$_prepare_agent_dir" "$1" 1
-  capture_outbox_identity "$_prepare_agent_dir" "$1"
+if [[ "$command" == __wrap ]]; then
+  wrap_task "$@"
   exit 0
 fi
-if [[ "$command" == __publish ]]; then
-  publish_task "$@"
-  exit 0
-fi
-if [[ -n "${PI_BG_BACKEND:-}" && "$PI_BG_BACKEND" != systemd ]]; then
-  fail "unknown PI_BG_BACKEND: $PI_BG_BACKEND"
-fi
-if [[ "${PI_BG_BACKEND:-}" == systemd ]]; then
-  _backend_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-  require_absolute_executable "$_backend_dir/systemd-bg" "systemd backend"
-  exec "$_backend_dir/systemd-bg" "$command" "$@"
-fi
+[[ -z "${PI_BG_BACKEND:-}" ]] || fail "unsupported PI_BG_BACKEND: $PI_BG_BACKEND"
 require_tmux
 case "$command" in
   start) start_task "$@" ;;

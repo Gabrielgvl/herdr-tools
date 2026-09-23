@@ -12,7 +12,7 @@ import type { CompatibilityPreflight } from "../health.js";
 import { contextRebindingDetails, createContextResolver, resolveManagerSession, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
-import { createHandoffAllocator, HandoffError, readHandoffProvenance, readHandoffState, renderHandoffContract, RUN_ID_PATTERN, type HandoffAllocation, type HandoffAllocator, type HandoffState } from "../handoff.js";
+import { createHandoffAllocator, HandoffError, readHandoffProvenance, readHandoffState, renderHandoffContract, RUN_ID_PATTERN, type HandoffAllocation, type HandoffAllocator, type HandoffProvenance, type HandoffState } from "../handoff.js";
 import { assertDeliverySize, assertMessageText, utf8Bytes, ATTACHMENT_MAX_BYTES, MESSAGE_INLINE_MAX_BYTES, type MessageDelivery } from "../messages/limits.js";
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type AgentSessionIdentity, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
@@ -526,6 +526,8 @@ interface RecoveryContext {
   priorOperatingPointId: string;
   priorPolicyRevision: string;
   priorWorkload: WorkloadProfile;
+  /** The provenance manager session the prior run launched under — the only native session a recovery authorizes. */
+  managerSession: AgentSessionIdentity | null;
 }
 
 /**
@@ -558,8 +560,9 @@ async function resolveRecoveryOf(params: NormalizedLaunchTask, handoffs: Handoff
   }
   // Provenance is the recovery-authorizing record: a run persisted before it
   // existed stays readable as state but can never authorize a recovery.
+  let provenance: HandoffProvenance;
   try {
-    await readHandoffProvenance(allocation);
+    provenance = await readHandoffProvenance(allocation);
   } catch (error) {
     throw unresolvable(error instanceof HandoffError && error.details.reason === "missing" ? "provenance_missing" : "provenance_unreadable");
   }
@@ -604,7 +607,8 @@ async function resolveRecoveryOf(params: NormalizedLaunchTask, handoffs: Handoff
     priorRouteTier: route.tier,
     priorOperatingPointId: route.operatingPointId,
     priorPolicyRevision: route.policyRevision,
-    priorWorkload: route.workload
+    priorWorkload: route.workload,
+    managerSession: provenance.manager.session
   };
 }
 
@@ -2467,6 +2471,13 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       // same authoritative snapshot as the sender identity — never a
       // caller-overridable field — and rides the pre-effect persist below.
       const managerSession = resolveManagerSession(snapshot, effective.context.paneId);
+      // A recovery's lineage reopens only for the exact native manager session
+      // the prior run's provenance recorded; a missing or foreign session
+      // refuses before allocation, persistence, topology, or agent start.
+      if (shared.recovery !== undefined
+        && (managerSession === null || shared.recovery.managerSession === null || !sameSession(managerSession, shared.recovery.managerSession))) {
+        throw new LaunchError("RECOVERY_UNRESOLVABLE", "recoveryOf cannot be resolved by this runtime", { recoveryOf: shared.recovery.runId, reason: "owner_mismatch" });
+      }
       if (mintedNameTaken(snapshot, childName)) {
         throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Minted child identity collides with an existing pane or agent", { childName });
       }
@@ -2932,6 +2943,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     const emit = (result: LaunchResult): AgentToolResult<LaunchResult> => ({ content: [{ type: "text", text: launchManifest(result) }], details: result });
     // Fail-closed preconditions run before the gate: they are pure reads and
     // must reject without any launch effect.
+    const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
     let params: NormalizedLaunchTask;
     let recovery: RecoveryContext | undefined;
     try {
@@ -2940,6 +2952,14 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       // record, route and workspace evidence — before any launch effect.
       if (params.recoveryOf !== undefined) {
         recovery = await resolveRecoveryOf(params, deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({})), deps.cwd ?? ctx.cwd);
+        // Reject a foreign recovery owner before evaluation or durable routing.
+        // executeChild repeats this against its fresh pre-effect snapshot so an
+        // identity change between routing and launch still fails closed.
+        const effective = await contextResolver(abortSignal);
+        const managerSession = resolveManagerSession(effective.snapshot, effective.context.paneId);
+        if (managerSession === null || recovery.managerSession === null || !sameSession(managerSession, recovery.managerSession)) {
+          throw new LaunchError("RECOVERY_UNRESOLVABLE", "recoveryOf cannot be resolved by this runtime", { recoveryOf: recovery.runId, reason: "owner_mismatch" });
+        }
       }
       if (params.replicas > 1 && worktrees === undefined) {
         throw new LaunchError("WORKTREE_UNAVAILABLE", "Replica isolation requires a worktree manager");
@@ -2947,7 +2967,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     } catch (error) {
       throw earlyLaunchFailure(error, "validate");
     }
-    const abortSignal = signal ?? ctx.signal ?? new AbortController().signal;
     let gate: LaunchGateLease | undefined;
     try {
       gate = await (deps.launchGate ?? (() => acquireLaunchGate()))();

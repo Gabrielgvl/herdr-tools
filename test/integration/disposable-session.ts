@@ -1,8 +1,9 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { mkdtemp, unlink } from "node:fs/promises";
 import { execFileSync, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 
 export interface PromptSocketRequest {
   id: string;
@@ -172,9 +173,22 @@ export async function stopDisposableServer(server: ChildProcess | undefined): Pr
  */
 export async function createDisposableGitWorkspace(prefix: string): Promise<string> {
   const trustedRoot = process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT;
-  const cwd = await mkdtemp(join(trustedRoot ? resolve(trustedRoot) : tmpdir(), trustedRoot ? `.${prefix}` : prefix));
-  if (trustedRoot) {
+  const trustedPath = trustedRoot ? realpathSync(resolve(trustedRoot)) : undefined;
+  const cwd = await mkdtemp(join(trustedPath ?? tmpdir(), trustedPath ? `.${prefix}` : prefix));
+  if (trustedPath) {
     execFileSync("git", ["rev-parse", "--verify", "HEAD"], { cwd, stdio: "ignore" });
+    // Self-exclude the fixture pattern through the repository's own
+    // info/exclude — never a config mutation — so a crashed fixture left
+    // behind does not dirty the trusted root's status.
+    const commonGitDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+    const worktreeRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim();
+    mkdirSync(join(commonGitDir, "info"), { recursive: true });
+    const exclude = join(commonGitDir, "info", "exclude");
+    const trustedRelativePath = relative(worktreeRoot, trustedPath).split(sep).join("/");
+    const pattern = `/${trustedRelativePath === "" ? "" : `${trustedRelativePath}/`}.${prefix}*`;
+    const contents = existsSync(exclude) ? readFileSync(exclude, "utf8") : "";
+    const patterns = contents.split(/\r?\n/u);
+    if (!patterns.includes(pattern)) appendFileSync(exclude, `${contents.length > 0 && !contents.endsWith("\n") ? "\n" : ""}${pattern}\n`);
   } else {
     execFileSync("git", ["init", "-q", "-b", "main"], { cwd });
     execFileSync("git", ["-c", "user.email=herdr-integration@example.invalid", "-c", "user.name=herdr-integration", "commit", "-qm", "init", "--allow-empty"], { cwd });

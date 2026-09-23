@@ -175,6 +175,38 @@ describe("read-only handoff recovery", () => {
     await expect(resumeHandoff(incomplete.run, incomplete.caller)).rejects.toMatchObject({ code: "HANDOFF_CHILD_CHANGED" });
   });
 
+  it("bounds model-visible child identity while comparing full strings", async () => {
+    const { run, caller } = await fixture();
+    const longName = `worker-${"w".repeat(300)}`;
+    const longSession = session(`/sessions/${"s".repeat(300)}.jsonl`);
+    await updateHandoffState(run, (state) => {
+      state.child.agentName = longName;
+      state.nativeSession = longSession;
+    });
+    caller.snapshot.panes[1]!.agent_name = longName;
+    caller.snapshot.panes[1]!.agent_session = longSession;
+    caller.snapshot.agents[1]!.agent_name = longName;
+    caller.snapshot.agents[1]!.name = longName;
+    caller.snapshot.agents[1]!.agent_session = longSession;
+
+    const resumed = await resumeHandoff(run, caller);
+    expect(resumed.currentChild).toMatchObject({
+      presence: "present",
+      agentName: longName.slice(0, 256),
+      agentSession: { ...longSession, value: longSession.value.slice(0, 256) }
+    });
+    if (resumed.currentChild.presence !== "present") throw new Error("expected a present child");
+    expect(resumed.currentChild.agentName).toHaveLength(256);
+    expect(resumed.currentChild.agentSession.value).toHaveLength(256);
+
+    // A live occupant differing only beyond the bound still refuses: ownership
+    // and child comparisons run on the full identity, not the compacted output.
+    caller.snapshot.panes[1]!.agent_name = `${longName}x`;
+    caller.snapshot.agents[1]!.agent_name = `${longName}x`;
+    caller.snapshot.agents[1]!.name = `${longName}x`;
+    await expect(resumeHandoff(run, caller)).rejects.toMatchObject({ code: "HANDOFF_CHILD_CHANGED" });
+  });
+
   it("reports an absent child without inventing completion", async () => {
     const { run, caller } = await fixture();
     caller.snapshot.panes.splice(1);

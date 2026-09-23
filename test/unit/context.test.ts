@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { JsonEnvelope } from "../../src/cli.js";
-import { CONTEXT_RESOLUTION_ATTEMPTS, contextRebindingDetails, createContextResolver, resolveEffectiveContext, type ContextCli } from "../../src/context.js";
+import { CONTEXT_RESOLUTION_ATTEMPTS, contextRebindingDetails, createContextResolver, resolveEffectiveContext, resolveManagerSession, type ContextCli } from "../../src/context.js";
 import type { CurrentContext, HerdrSnapshot } from "../../src/targets.js";
 
 const injected: CurrentContext = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
@@ -238,5 +238,90 @@ describe("shared effective caller context", () => {
     const cli = queuedCli([currentPane({ tab_id: "w1:t2" }), snapshotEnvelope(moved)]);
     const resolver = createContextResolver(cli, injected);
     await expect(resolver(new AbortController().signal)).resolves.toMatchObject({ context: { tabId: "w1:t2" }, diagnostics: { rebound: true } });
+  });
+});
+
+describe("manager native session provenance", () => {
+  const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "sess-1" };
+  const callerPane = (extra: Record<string, unknown> = {}) => ({ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", terminal_id: "term-1", ...extra });
+  const capture = (fn: () => unknown): unknown => { try { fn(); } catch (error) { return error; } return undefined; };
+
+  it("joins the session the authoritative pane and agent records agree on", () => {
+    const snapshot = snapshotFor({
+      panes: [callerPane({ agent_session: session })],
+      agents: [{ pane_id: "w1:p1", name: "manager", agent: "pi", terminal_id: "term-1", agent_session: session }]
+    });
+    expect(resolveManagerSession(snapshot, "w1:p1")).toEqual(session);
+  });
+
+  it("accepts a session supplied by only one of the two records", () => {
+    expect(resolveManagerSession(snapshotFor({ panes: [callerPane({ agent_session: session })] }), "w1:p1")).toEqual(session);
+    expect(resolveManagerSession(snapshotFor({ agents: [{ pane_id: "w1:p1", agent: "pi", agent_session: session }] }), "w1:p1")).toEqual(session);
+  });
+
+  it("records null when the caller has no native session rather than fabricating one", () => {
+    expect(resolveManagerSession(snapshotFor(), "w1:p1")).toBeNull();
+    expect(resolveManagerSession(snapshotFor({ panes: [callerPane({ agent_session: null })] }), "w1:p1")).toBeNull();
+    expect(resolveManagerSession(snapshotFor({ agents: [{ pane_id: "w1:p1", agent: "pi", agent_session: null }] }), "w1:p1")).toBeNull();
+  });
+
+  it("fails closed when another pane's paired agent record claims the manager session", () => {
+    const otherPane = { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", terminal_id: "term-2" };
+    const duplicateSession = snapshotFor({
+      panes: [callerPane({ agent_session: session }), otherPane],
+      agents: [
+        { pane_id: "w1:p1", agent: "pi", agent_session: session },
+        { pane_id: "w1:p2", agent: "pi", agent_session: session }
+      ]
+    });
+    expect(capture(() => resolveManagerSession(duplicateSession, "w1:p1"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "manager_session_ambiguous", candidates: 2 } });
+  });
+
+  it("fails closed when another pane has contradictory paired session evidence", () => {
+    const other = { ...session, value: "session-other" };
+    const contradictory = snapshotFor({
+      panes: [callerPane({ agent_session: session }), { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_session: other }],
+      agents: [
+        { pane_id: "w1:p1", agent: "pi", agent_session: session },
+        { pane_id: "w1:p2", agent: "pi", agent_session: { ...other, value: "session-third" } }
+      ]
+    });
+    expect(capture(() => resolveManagerSession(contradictory, "w1:p1"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "session_untrusted" } });
+  });
+
+  it("fails closed on unresolved or ambiguous manager identity", () => {
+    const duplicatePane = snapshotFor({ panes: [callerPane(), callerPane()] });
+    expect(capture(() => resolveManagerSession(duplicatePane, "w1:p1"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "manager_ambiguous", candidates: 2 } });
+
+    const duplicateAgent = snapshotFor({ agents: [{ pane_id: "w1:p1", agent: "pi" }, { pane_id: "w1:p1", agent: "pi" }] });
+    expect(capture(() => resolveManagerSession(duplicateAgent, "w1:p1"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "manager_ambiguous", candidates: 2 } });
+
+    expect(capture(() => resolveManagerSession(snapshotFor(), "w1:pX"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "manager_unresolved" } });
+  });
+
+  it("fails closed on contradictory or malformed session evidence", () => {
+    const contradictory = snapshotFor({
+      panes: [callerPane({ agent_session: session })],
+      agents: [{ pane_id: "w1:p1", agent: "pi", agent_session: { ...session, value: "other-session" } }]
+    });
+    expect(capture(() => resolveManagerSession(contradictory, "w1:p1"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "session_untrusted", causeCode: "TARGET_IDENTITY_CHANGED" } });
+
+    const kindMismatch = snapshotFor({ agents: [{ pane_id: "w1:p1", agent: "claude", agent_session: session }] });
+    expect(capture(() => resolveManagerSession(kindMismatch, "w1:p1"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "session_untrusted" } });
+
+    const terminalMismatch = snapshotFor({
+      panes: [callerPane({ terminal_id: "term-1", agent_session: session })],
+      agents: [{ pane_id: "w1:p1", agent: "pi", terminal_id: "term-2", agent_session: session }]
+    });
+    expect(capture(() => resolveManagerSession(terminalMismatch, "w1:p1"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "session_untrusted" } });
+
+    for (const bad of [
+      callerPane({ agent_session: { source: "herdr:pi" } }),
+      callerPane({ agent_session: { ...session, value: "" } }),
+      callerPane({ agent_session: "sess-1" }),
+      callerPane({ agent_session: { ...session, value: "a\nb" } })
+    ]) {
+      expect(capture(() => resolveManagerSession(snapshotFor({ panes: [bad] }), "w1:p1"))).toMatchObject({ code: "CONTEXT_UNAVAILABLE", details: { reason: "session_untrusted" } });
+    }
   });
 });

@@ -29,7 +29,7 @@ Format: `[ticket-id]/[lowercase-kebab-slug]`. Example: `C-17620/add-user-auth`.
 
 When `/linear-execute-all` or the `manager` agent dispatches independent sub-tickets in parallel:
 
-- Create worktrees at absolute workspace-sibling paths, never inside the source repository. For a repo at `/workspace/services`, use a path such as `/workspace/services-c-12345-short-slug` and pass that absolute path to `git worktree add`; do not use `services/.worktrees/...` or a current-directory-relative destination.
+- Create worktrees only under the nearest workspace `.worktrees/<repo>/<branch-slug>` directory, using an absolute path. For a repo at `/workspace/services`, use `/workspace/.worktrees/services/c-12345-short-slug`; never create top-level siblings such as `/workspace/services-c-12345-short-slug`.
 - Each parallel child runs in its own git worktree (`isolation: "worktree"` on the `Agent` tool).
 - Worktrees require a clean working tree at dispatch time.
 - `node_modules/` is symlinked into the worktree by Claude Code — no re-install needed.

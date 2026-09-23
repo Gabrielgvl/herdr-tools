@@ -286,13 +286,14 @@ describe("generated skill bundles", () => {
     const registry = await loadSkillBundleRegistry(packageRoot, "bundled");
     expect(registry.bundles.size).toBeGreaterThan(0);
     expect(registry.approvedSourceRoots.length).toBeGreaterThan(0);
-    // The only in-package canonical sources are the two tracked manager role
-    // skills the generated manager profile plugin re-materializes. Everything
-    // else is an external owner-approved tree, never a hand-maintained copy.
+    // In-package canonical sources are tracked once and re-materialized into
+    // generated profile trees. Everything else is an external owner-approved
+    // tree, never a hand-maintained generated copy.
     const inPackage = [...registry.bundles.values()].filter((record) => record.source.startsWith(packageRoot + sep)).map((record) => relative(packageRoot, record.source)).sort();
     expect(inPackage).toEqual([
       join("herdr-profiles", "role-plugins", "manager", "skills", "harness-flow"),
-      join("herdr-profiles", "role-plugins", "manager", "skills", "manager")
+      join("herdr-profiles", "role-plugins", "manager", "skills", "manager"),
+      join("skills", "tmux-background-tasks")
     ]);
     for (const [target, record] of registry.bundles) {
       const physical = await resolveCanonicalSourceTree(record, registry, packageRoot);

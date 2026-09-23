@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -14,7 +13,7 @@ import { RuntimeOwnership } from "../../src/ownership.js";
 import { publishedInputSchema } from "../../src/mcp/adapter.js";
 import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_DIAGNOSTIC_SUMMARY, LAUNCH_RECOVERY_GUIDANCE } from "../../src/tools/launch.js";
 import { createPreflight, createToolSurface, CORE_TOOL_NAMES } from "../../src/tool-surface.js";
-import { stopDisposableServer } from "./disposable-session.js";
+import { createDisposableGitWorkspace, stopDisposableServer } from "./disposable-session.js";
 import { stubSupervision } from "../unit/supervision-fixtures.js";
 
 const execFileAsync = promisify(execFile);
@@ -141,7 +140,7 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
     let server: ChildProcess | undefined;
     let client: Client | undefined;
     let failure: unknown;
-    const cwd = await mkdtemp(`${tmpdir()}/herdr-mcp-it-`);
+    const cwd = await createDisposableGitWorkspace("herdr-mcp-it-");
     const label = `mcp-herdr-tools-it-${process.pid}`;
     const socketPath = `/home/gabriel/.config/herdr/sessions/${REQUIRED_SESSION}/herdr.sock`;
 
@@ -482,6 +481,26 @@ describe.skipIf(!enabled)("disposable Herdr MCP integration", () => {
       }
       const launchResult = launchEvidence(launched);
       const launchChildren = Array.isArray(launchResult.children) ? launchResult.children.map(record) : [];
+      if (launchResult.outcome === "abstained") {
+        // A bare abstention is not a passing canary. The live reviewer launch
+        // above already proved the router admits this shape, so a later
+        // abstention is tolerated only when it carries a bounded, known
+        // reason; anything else is a defect and fails the run.
+        expect(launchChildren).toEqual([]);
+        if (launchResult.abstention === undefined) {
+          throw new Error(`herdr_launch abstained bare (no abstention record): ${text(launched)}`);
+        }
+        const abstention = record(launchResult.abstention);
+        const knownReasons = ["low_confidence", "no_candidates_at_tier", "catalog_unavailable", "invalid_response", "authentication_unavailable", "transport_failed", "aborted"];
+        if (!knownReasons.includes(String(abstention.reason))) {
+          throw new Error(`herdr_launch abstained without a known bounded reason: ${text(launched)}`);
+        }
+        if (abstention.component !== undefined) {
+          expect(abstention.component).toMatch(/^[a-z][a-z_-]{0,31}$/u);
+        }
+        process.stderr.write(`INTEGRATION_LAUNCH_ABSTAINED reason=${String(abstention.reason)}\n`);
+        return;
+      }
       const failedChild = launchChildren.length === 1 && launchChildren[0]!.state === "failed" ? launchChildren[0]! : undefined;
       if (failedChild !== undefined) {
         // Exactly one live launch failure is an accepted outcome: the prompt

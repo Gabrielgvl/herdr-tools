@@ -20,7 +20,7 @@ Runs the local `pi-review` CLI (adversarial cross-model harness: agentic finder(
    - **PR mode:** parse the owner/repo, locate its local clone, and run from that clone. In a multi-repo workspace, never run from the workspace root unless it is the repository itself.
    - **Plan mode:** materialize the complete document as a local UTF-8 text or Markdown file. For a Notion blueprint, fetch it through the configured Notion MCP, preserve the full body (headings, tables, diagrams, and decisions), write it to a temporary `.md` file, and verify that the export is nonempty before review.
    - `pi-review plan` must still run inside a Git repository because the reviewers ground design claims against repo code and conventions. Choose the repo that owns most of the proposed implementation. If ownership is ambiguous, ask. For a cross-repo blueprint, state which repo provides the grounding context; if full code-grounded coverage of every repo is required, run separate plan reviews from each repo and report them separately.
-4. **Check calibration before spending**: from the selected repo, run `pi-review calibrate status --json`. Both matcher and adjudicator must be `CALIBRATED`. For lifecycle-v3, the final-audit role must also be `CALIBRATED`; if it is missing or stale, run `pi-review qualify --role final-audit --repo-local --write` (or the exact remediation printed by the CLI) before starting the terminal review. The paid fallback route is a separate artifact and is only needed if the operator intends to authorize `--final-audit-fallback`. It requires a configured provider budget and an explicit positive per-call reservation: `pi-review qualify --role final-audit --model openrouter/z-ai/glm-5.3-flash --final-audit-fallback-cost <usd> --repo-local --write`. Never qualify or invoke the paid route without current operator authorization. If any required role is degraded, do not spend on the review.
+4. **Calibration is diagnostic-only**: `pi-review calibrate status --json` and `pi-review qualify` measure configured seats but never enable or disable runtime paths. Do not run a calibration or qualification campaign as a review preflight. Runtime admission is controlled by configuration, credentials, provider budgets/reservations, provenance, lifecycle identity, and structural safety checks. A diagnostic warning is not a reason to block or spend on calibration.
 5. **Run with a long timeout**. Preserve stdout JSON even when exit code 1 means `BLOCKED`:
    ```bash
    out=$(mktemp)
@@ -111,21 +111,13 @@ four mean the loop is not converging — file the residual and stop, do not re-r
 coverage-manifest identity. `PASS` with an anomaly is invalid and is converted to
 `BLOCKED`/`needsUser`.
 
-The audit primary is exactly `opencode-go/glm-5.3-flash` at high thinking and is
-qualified separately with the bundled 16-case production-shaped dataset. A passing
-artifact requires 16/16 parseable, exact decisions with zero false positives or false
-negatives and positive coverage of every audit anomaly code. Each route is qualified
-on its own: `pi-review qualify --role final-audit --write` covers the primary. The paid
-`openrouter/z-ai/glm-5.3-flash` route needs its own artifact, a configured provider
-budget, current operator authorization, and an explicit positive reservation:
-`pi-review qualify --role final-audit --model openrouter/z-ai/glm-5.3-flash --final-audit-fallback-cost <usd> --write`.
-A paid fallback without that artifact does not run at all — the audit records
-`status: "failed"` naming the missing paid-fallback qualification. The fallback is
-never automatic either: use it only when the operator explicitly authorizes
-`--final-audit-fallback --final-audit-fallback-cost <usd>`.
-`finalAudit.route`/`finalAudit.provider` name the route that actually answered, and
-`finalAudit.qualificationConfigurationHash` is that route's artifact, never the
-primary's. Never substitute a `:free` alias and never use `--models` to select the audit.
+The final-audit seat is selected by the validated `finalAudit.model` configuration
+from the closed audit shortlist. An unset model takes the existing self-route degraded
+path; no calibration or qualification artifact selects or enables an auditor. Provider
+credentials, budgets/reservations, exact route binding, and participant-based
+independence remain authoritative. A paid route still requires current operator
+authorization and an explicit positive reservation. Never substitute a `:free` alias
+and never use `--models` to select the audit.
 Activation of lifecycle-v3 invalidates active sessions that predate policy version 1;
 it does not migrate their evidence. That activation stops the run that triggered it:
 an unbound admission reports `lifecycle-v3-new-session-required` naming the invalidated
@@ -164,7 +156,7 @@ pi-review runs a **convergence protocol**: every finding becomes a durable *thre
 
 - **Freeze the branch while a run is in flight.** Amending, rebasing, or force-pushing the reviewed branch mid-run kills the run with `ERROR: reconcile headSha mismatch` and its model spend is lost (aicodeflow 2026-07-23: an amend during round 5 wasted the whole round). Land every commit BEFORE launching, and queue further edits until the report returns.
 
-- **Ops notes.** Serialize all `pi-review` operations within one repository; different repositories may run concurrently. Check semantic-matching health with `pi-review calibrate status` (matcher + adjudicator must show CALIBRATED; artifacts live machine-wide in `~/.local/share/pi-review/calibration/`); a degraded role warns on stderr at run start with the exact `pi-review calibrate protocol --role <role>` remediation — calibrate before spending on a review, since without the matcher, drifted threads can't close and dismissal suppression narrows to exact-id.
+- **Ops notes.** Serialize all `pi-review` operations within one repository; different repositories may run concurrently. Calibration status is diagnostic-only: degraded or missing artifacts may be reported, but they do not gate matcher, adjudicator, finder, verifier, audit, or routing execution. Do not spend on calibration as a prerequisite for a review.
 
 - **Failure mode observed 2026-07-16 (why this section exists).** Two PRs were fixed and re-run without ever submitting responses. Every following invocation re-listed the same threads and stayed `BLOCKED` — the verdict was gated on stale thread artifacts, not live code findings, and a post-fix rebase then blocked the responses path too (this predated `--rebased`).
 
@@ -213,7 +205,7 @@ pi-review runs a **convergence protocol**: every finding becomes a durable *thre
 - **Stacked PRs need no flag:** `pi-review pr <n>` diffs against the PR's own base branch (`Mode: diff (base: <branch>)`), so a PR based on another PR branch is already scoped.
 - **Pristine checkout means no node_modules either**; use `git worktree add --detach /tmp/<x> <sha>`; the report cache is keyed by that checkout's directory name but the session follows the PR — the same session id continues.
 - **A closed-by-human session has zero "responded" threads** — it cannot feed `qualify --role batch-verifier --record`.
-- **The batch verifier IS the adjudicator seat** (`cfg.adjudicator`): re-seating it changes production single-thread adjudication, drifts the adjudicator calibration (terminal decisions disabled until `calibrate protocol --role adjudicator` re-runs its 40-case corpus), and qualification is per repository. ADR-0007 R3 refuses any sample group containing a thread found by the same model → with luna as adjudicator, only sessions whose finders were sol-only (post-ADR-0008) can qualify. `glm-5.3-flash` routes are reserved for the lifecycle-v3 final audit; deepseek-v4-flash is in the finder corpus and refused for core seats.
+- **The batch verifier IS the adjudicator seat** (`cfg.adjudicator`): re-seating it changes production single-thread adjudication and must preserve the configured provenance/self-check policy. Calibration and qualification artifacts are diagnostic-only and do not enable the seat. Structural no-self-verification and exact-seat checks remain authoritative.
 - **Advisory seats can kill a paid run**: `remediation-bundle-advisor … parser-failure` aborted a round before report.json (fixed in `001127f`: fails open). Until the fixed binary is what PATH resolves (`~/.local/bin/pi-review` → main), `remediationBundles.mode="off"` is the workaround.
 - **Round cap with a non-converging finder** (6→3→4, 12→4→8, 13→5→7 confirmed across three rounds while every prior thread resolved): the cap is a signal about the defect population, not the review. No extra round is purchasable, so the option set is: fix-and-waive (the owner's standing 2026-09-04 decision — round-three confirmed fixes only, `BLOCKED` kept as recorded, the pi-review gate owner-waived, `/claude-review` on the final head as the reading gate); fix-and-human-close via `threads escalate|resolve`; a design-level hardening pass on a fresh session; or hold. Bring it with costs and the residual risk named.
 - **Companion gate quirks:** the reusable `claude-pr-review` workflow skips DRAFT PRs silently (run "success", zero objects) — mark ready first; it produced no review body twice on a 16.7k-line single-commit diff (C-20484) — a yellow-tier PR then needs an owner-decided substitute gate.

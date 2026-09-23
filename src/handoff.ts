@@ -18,6 +18,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { ATTACHMENT_MAX_BYTES } from "./messages/limits.js";
+import type { AgentSessionIdentity } from "./messages/prompt.js";
 import { acquireFlockHolder, assertOwnerOnlyDirectory } from "./pane-write-lock.js";
 import { QUALITY_TIERS, type QualityTier, type WorkloadProfile } from "./routing-policy.js";
 import { resolveSocketPath } from "./supervision/socket.js";
@@ -51,8 +53,17 @@ export const HANDOFF_STATE_DIR_NAME = "herdr-handoffs";
 export const HANDOFF_ARTIFACT_NAME = "handoff.md";
 export const HANDOFF_TOOLS_DIR_NAME = ".tools";
 export const HANDOFF_STATE_NAME = "state.json";
+export const HANDOFF_PROVENANCE_NAME = "provenance.json";
 export const HANDOFF_LOCK_NAME = "lock";
 export const HANDOFF_MAX_BYTES = 64 * 1024;
+/**
+ * The provenance record carries the caller-authored Task verbatim; the
+ * delivery bound caps a canonical render at one attachment, and JSON escaping
+ * can expand that text several-fold, so the file bound sits well above it —
+ * every admissible Task fits, and anything larger is not a record this runtime
+ * wrote.
+ */
+export const HANDOFF_PROVENANCE_MAX_BYTES = 8 * ATTACHMENT_MAX_BYTES;
 const HANDOFF_LOCK_READY = "HERDR_HANDOFF_LOCK_READY";
 export const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -220,6 +231,54 @@ export interface HandoffRunIdentity {
   };
 }
 
+/**
+ * The canonical Task launch contract a run was persisted under: the normalized
+ * caller-authored Task exactly as admitted, every schema default concrete. The
+ * four semantic fields are what the canonical render — and therefore the child —
+ * received; `tier`, `replicas`, `recoveryOf`, `label`, and `cwd` complete the
+ * launch contract. Text fields are unbounded caller text by design: the record
+ * bound, not per-field limits, is the size authority.
+ */
+export interface HandoffTaskContract {
+  objective: string;
+  scope: string;
+  doneWhen: string[];
+  constraints: string[];
+  tier: QualityTier;
+  replicas: number;
+  recoveryOf?: string;
+  label?: string;
+  cwd?: string;
+}
+
+/** The pre-launch provenance `persist` records beside the state sidecar. */
+export interface HandoffProvenanceInput {
+  /**
+   * The manager's verified native session — captured from the authoritative
+   * snapshot, never a caller-overridable field — or `null` when the caller is
+   * a non-agent pane with no native session to record.
+   */
+  managerSession: AgentSessionIdentity | null;
+  /** The canonical Task launch contract exactly as admitted. */
+  task: HandoffTaskContract;
+}
+
+/**
+ * The versioned provenance record (v1): which manager session launched which
+ * canonical Task under this run. Written atomically beside `state.json` inside
+ * the same flock section, before any launch effect, and validated whole at
+ * read. Runs persisted before provenance existed stay readable as state but
+ * can never satisfy this contract, so they never authorize recovery.
+ */
+export interface HandoffProvenance {
+  v: 1;
+  runId: string;
+  endpoint: string;
+  createdAt: string;
+  manager: { paneId: string; display: string; source: string; session: AgentSessionIdentity | null };
+  task: HandoffTaskContract;
+}
+
 /** The exact run-directory layout a run id derives under one namespace. */
 function deriveRun(namespace: HandoffNamespace, runId: string): HandoffAllocation {
   const directory = join(namespace.dir, runId);
@@ -253,6 +312,11 @@ function openIn(namespace: HandoffNamespace, runId: string): HandoffAllocation {
   const run = deriveRun(namespace, runId);
   assertRunPaths(run, "HANDOFF_STORE_FAILED");
   return run;
+}
+
+/** The run's provenance sidecar, derived from the flock-pinned tools directory. */
+function provenancePath(run: HandoffAllocation): string {
+  return join(run.toolsDir, HANDOFF_PROVENANCE_NAME);
 }
 
 /** Paths must be exactly the UUID-derived layout; anything else is refused. */
@@ -339,8 +403,14 @@ export interface HandoffAllocator {
    * reads the sidecar next, where a missing or malformed record fails closed.
    */
   open(runId: string): Promise<HandoffAllocation>;
-  /** Create the run directory and `.tools`, then write `state.json` under the short flock. */
-  persist(run: HandoffAllocation, identity: HandoffRunIdentity): Promise<void>;
+  /**
+   * Create the run directory and `.tools`, then write `state.json` under the
+   * short flock. When `provenance` is supplied it is validated and committed
+   * in the same critical section, so the run's state and provenance are either
+   * both durable or the persist fails before any launch effect. Runs persisted
+   * without it stay readable but can never satisfy the provenance contract.
+   */
+  persist(run: HandoffAllocation, identity: HandoffRunIdentity, provenance?: HandoffProvenanceInput): Promise<void>;
   /** Replace the requested candidate with the candidate that actually started. */
   selectCandidate(run: HandoffAllocation, operatingPointId: string, agentKind: string, resolvedModel?: HandoffResolvedModel): Promise<void>;
 }
@@ -368,11 +438,45 @@ export function createHandoffAllocator(options: {
     async open(runId) {
       return openIn(await namespace(), runId);
     },
-    async persist(run, identity) {
+    async persist(run, identity, provenance) {
       const ns = await namespace();
       assertRunPaths(run, "HANDOFF_STORE_FAILED");
       if (resolve(run.namespaceDir) !== resolve(ns.dir)) {
         throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff run is outside this endpoint namespace", { path: safePath(run.directory) });
+      }
+      // The record is validated against its read contract before anything is
+      // created: a caller that cannot express a well-formed provenance fails
+      // closed instead of persisting a run its own reader would refuse.
+      if (provenance !== undefined && (!validProvenanceInput(provenance)
+        || !validProvenanceManager({ paneId: identity.manager.paneId, display: identity.manager.display, source: identity.manager.source, session: provenance.managerSession }))) {
+        throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is malformed", { path: safePath(provenancePath(run)), reason: "input_invalid" });
+      }
+      const createdAt = now().toISOString();
+      const serializedProvenance = provenance === undefined ? undefined : JSON.stringify({
+        v: 1,
+        runId: run.runId,
+        endpoint: ns.endpoint,
+        createdAt,
+        manager: {
+          paneId: identity.manager.paneId,
+          display: identity.manager.display,
+          source: identity.manager.source,
+          session: provenance.managerSession === null ? null : { ...provenance.managerSession }
+        },
+        task: {
+          objective: provenance.task.objective,
+          scope: provenance.task.scope,
+          doneWhen: [...provenance.task.doneWhen],
+          constraints: [...provenance.task.constraints],
+          tier: provenance.task.tier,
+          replicas: provenance.task.replicas,
+          ...(provenance.task.recoveryOf === undefined ? {} : { recoveryOf: provenance.task.recoveryOf }),
+          ...(provenance.task.label === undefined ? {} : { label: provenance.task.label }),
+          ...(provenance.task.cwd === undefined ? {} : { cwd: provenance.task.cwd })
+        }
+      } satisfies HandoffProvenance);
+      if (serializedProvenance !== undefined && Buffer.byteLength(serializedProvenance, "utf8") > HANDOFF_PROVENANCE_MAX_BYTES) {
+        throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance exceeds the accepted bound", { path: safePath(provenancePath(run)), reason: "oversized" });
       }
       // A run directory is minted from a fresh UUID, so anything already there
       // is foreign: refuse rather than adopt it.
@@ -393,7 +497,7 @@ export function createHandoffAllocator(options: {
         v: 2,
         runId: run.runId,
         endpoint: ns.endpoint,
-        createdAt: now().toISOString(),
+        createdAt,
         manager: { paneId: identity.manager.paneId, display: identity.manager.display, source: identity.manager.source },
         child: {
           agentName: identity.child.agentName,
@@ -433,6 +537,7 @@ export function createHandoffAllocator(options: {
       });
       try {
         await writeFileAtomic(run.statePath, JSON.stringify(state));
+        if (serializedProvenance !== undefined) await writeFileAtomic(provenancePath(run), serializedProvenance);
       } finally {
         await holder.release().catch(() => undefined);
       }
@@ -592,6 +697,114 @@ export async function readHandoffState(run: HandoffAllocation): Promise<HandoffS
     throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff state exceeds the accepted bound", { path: safePath(run.statePath) });
   }
   return parseHandoffState(content, run);
+}
+
+const SESSION_KEYS = new Set(["source", "agent", "kind", "value"]);
+const PROVENANCE_KEYS = new Set(["v", "runId", "endpoint", "createdAt", "manager", "task"]);
+const PROVENANCE_MANAGER_KEYS = new Set(["paneId", "display", "source", "session"]);
+const PROVENANCE_TASK_KEYS = new Set(["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd"]);
+/** The display-source values `resolveSender` can emit for a manager record. */
+const MANAGER_SOURCES = new Set(["agent_name", "pane_agent_name", "label", "agent_kind", "pane_id"]);
+const PROVENANCE_CREATED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+
+/** Single-line identifier text: the shape capture-side identity checks require. */
+function safeLine(value: unknown): value is string {
+  return nonempty(value) && !/[\0\r\n]/u.test(value);
+}
+
+/** TaskText fields: NUL-free caller text, newlines allowed. */
+function taskText(value: unknown): value is string {
+  return nonempty(value) && !value.includes("\0");
+}
+
+/**
+ * A persisted session is the complete four-field identity the capture-side
+ * join produces — nothing partial, nothing extra, no line breaks.
+ */
+function validSessionRecord(value: unknown): value is AgentSessionIdentity {
+  return stateRecord(value)
+    && Object.keys(value).every((key) => SESSION_KEYS.has(key))
+    && safeLine(value.source) && safeLine(value.agent) && safeLine(value.kind) && safeLine(value.value);
+}
+
+function validProvenanceManager(value: unknown): value is HandoffProvenance["manager"] {
+  return stateRecord(value)
+    && Object.keys(value).every((key) => PROVENANCE_MANAGER_KEYS.has(key))
+    && safeLine(value.paneId) && safeLine(value.display)
+    && typeof value.source === "string" && MANAGER_SOURCES.has(value.source)
+    && (value.session === null || validSessionRecord(value.session));
+}
+
+/**
+ * The canonical contract is validated field by field against the same shapes
+ * the launch schema admits, so a tampered or version-skewed record fails
+ * closed instead of being reinterpreted.
+ */
+function validTaskContract(value: unknown): value is HandoffTaskContract {
+  return stateRecord(value)
+    && Object.keys(value).every((key) => PROVENANCE_TASK_KEYS.has(key))
+    && taskText(value.objective) && taskText(value.scope)
+    && Array.isArray(value.doneWhen) && value.doneWhen.length >= 1 && value.doneWhen.length <= 8 && value.doneWhen.every(taskText)
+    && Array.isArray(value.constraints) && value.constraints.length <= 8 && value.constraints.every(taskText)
+    && typeof value.tier === "string" && (QUALITY_TIERS as readonly string[]).includes(value.tier)
+    && Number.isSafeInteger(value.replicas) && (value.replicas as number) >= 1 && (value.replicas as number) <= 8
+    && (value.recoveryOf === undefined || (typeof value.recoveryOf === "string" && RUN_ID_PATTERN.test(value.recoveryOf)))
+    && (value.label === undefined || (safeLine(value.label) && Buffer.byteLength(value.label, "utf8") <= 256))
+    && (value.cwd === undefined || safeLine(value.cwd));
+}
+
+function validProvenanceInput(input: HandoffProvenanceInput): boolean {
+  return (input.managerSession === null || validSessionRecord(input.managerSession)) && validTaskContract(input.task);
+}
+
+function parseHandoffProvenance(content: string, run: HandoffAllocation): HandoffProvenance {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is malformed", { path: safePath(provenancePath(run)), reason: "malformed" });
+  }
+  const provenance = value as HandoffProvenance;
+  // v1 records only, pinned to this run and endpoint: anything else — including
+  // a run predating provenance — is never reinterpreted into recovery lineage.
+  if (!stateRecord(provenance) || !Object.keys(provenance).every((key) => PROVENANCE_KEYS.has(key))
+    || provenance.v !== 1 || provenance.runId !== run.runId || provenance.endpoint !== run.endpoint
+    || typeof provenance.createdAt !== "string" || !PROVENANCE_CREATED_AT.test(provenance.createdAt)
+    || !validProvenanceManager(provenance.manager) || !validTaskContract(provenance.task)) {
+    throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is malformed", { path: safePath(provenancePath(run)), reason: "malformed" });
+  }
+  return provenance;
+}
+
+/**
+ * Read the provenance sidecar with the same trust checks as the state record:
+ * a missing, swapped, oversized, or malformed file fails closed, so a legacy
+ * run — one persisted before provenance existed — stays readable through
+ * `readHandoffState` but can never satisfy the record recovery requires.
+ */
+export async function readHandoffProvenance(run: HandoffAllocation): Promise<HandoffProvenance> {
+  assertRunPaths(run, "HANDOFF_STORE_FAILED");
+  const path = provenancePath(run);
+  let leaf;
+  try {
+    leaf = await lstat(path);
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is missing", { path: safePath(path), reason: "missing" });
+    throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is indeterminate", { path: safePath(path), reason: "untrusted" });
+  }
+  if (!leaf.isFile() || leaf.isSymbolicLink() || leaf.uid !== uid() || (Number(leaf.mode) & 0o22) !== 0 || leaf.nlink !== 1 || leaf.size > HANDOFF_PROVENANCE_MAX_BYTES) {
+    throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is not trusted", { path: safePath(path), reason: "untrusted" });
+  }
+  let content: string;
+  try {
+    content = await readFile(path, "utf8");
+  } catch {
+    throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance could not be read", { path: safePath(path), reason: "untrusted" });
+  }
+  if (Buffer.byteLength(content, "utf8") > HANDOFF_PROVENANCE_MAX_BYTES) {
+    throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance exceeds the accepted bound", { path: safePath(path), reason: "oversized" });
+  }
+  return parseHandoffProvenance(content, run);
 }
 
 /**

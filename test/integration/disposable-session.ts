@@ -1,6 +1,8 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { unlink } from "node:fs/promises";
-import type { ChildProcess } from "node:child_process";
+import { mkdtemp, unlink } from "node:fs/promises";
+import { execFileSync, type ChildProcess } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 export interface PromptSocketRequest {
   id: string;
@@ -161,4 +163,21 @@ export async function stopDisposableServer(server: ChildProcess | undefined): Pr
     server.once("error", finish);
     if (!server.kill("SIGTERM") && server.exitCode !== null) finish();
   });
+}
+
+/**
+ * Create a disposable workspace with a resolvable Git HEAD. Local live gates
+ * may place it under an already trusted repository so Claude's upstream
+ * workspace-trust dialog does not make the automated harness interactive.
+ */
+export async function createDisposableGitWorkspace(prefix: string): Promise<string> {
+  const trustedRoot = process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT;
+  const cwd = await mkdtemp(join(trustedRoot ? resolve(trustedRoot) : tmpdir(), trustedRoot ? `.${prefix}` : prefix));
+  if (trustedRoot) {
+    execFileSync("git", ["rev-parse", "--verify", "HEAD"], { cwd, stdio: "ignore" });
+  } else {
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd });
+    execFileSync("git", ["-c", "user.email=herdr-integration@example.invalid", "-c", "user.name=herdr-integration", "commit", "-qm", "init", "--allow-empty"], { cwd });
+  }
+  return cwd;
 }

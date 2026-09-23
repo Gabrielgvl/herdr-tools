@@ -9,10 +9,10 @@ import { writeIdentityProvenance } from "../agent-identity.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
 import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope, type PiExec } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
-import { contextRebindingDetails, createContextResolver, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
+import { contextRebindingDetails, createContextResolver, resolveManagerSession, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
-import { createHandoffAllocator, readHandoffState, renderHandoffContract, RUN_ID_PATTERN, type HandoffAllocation, type HandoffAllocator, type HandoffState } from "../handoff.js";
+import { createHandoffAllocator, HandoffError, readHandoffProvenance, readHandoffState, renderHandoffContract, RUN_ID_PATTERN, type HandoffAllocation, type HandoffAllocator, type HandoffState } from "../handoff.js";
 import { assertDeliverySize, assertMessageText, utf8Bytes, ATTACHMENT_MAX_BYTES, MESSAGE_INLINE_MAX_BYTES, type MessageDelivery } from "../messages/limits.js";
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type AgentSessionIdentity, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
@@ -556,6 +556,13 @@ async function resolveRecoveryOf(params: NormalizedLaunchTask, handoffs: Handoff
   } catch {
     throw unresolvable("state_unreadable");
   }
+  // Provenance is the recovery-authorizing record: a run persisted before it
+  // existed stays readable as state but can never authorize a recovery.
+  try {
+    await readHandoffProvenance(allocation);
+  } catch (error) {
+    throw unresolvable(error instanceof HandoffError && error.details.reason === "missing" ? "provenance_missing" : "provenance_unreadable");
+  }
   const route = prior.child.route;
   const workspace = prior.child.workspace;
   if (route === undefined || workspace === undefined) throw unresolvable("lineage_incomplete");
@@ -921,6 +928,14 @@ function startFailureEvidence(error: unknown): { code: string; message: string }
   const quotaFailure = classifyLaunchFailure({ code: error.code, causeCode: envelope.error.code }) === "quota";
   if (!provenPreSpawn && !quotaFailure) return undefined;
   return { ...envelope.error };
+}
+
+function agentNotReadyStart(error: unknown): HerdrErrorEnvelope | undefined {
+  if (!(error instanceof CliProtocolError) || error.code !== "CLI_PROTOCOL_ERROR") return undefined;
+  const { exitCode, killed, errorStream, stderrTruncated } = error.details;
+  if (exitCode !== 1 || killed !== false || errorStream !== "stderr" || stderrTruncated !== false) return undefined;
+  const envelope = cliErrorEnvelope(error);
+  return envelope?.id === "cli:agent:start" && envelope.error.code === "agent_not_ready" ? envelope : undefined;
 }
 
 function snapshotOf(result: unknown): HerdrSnapshot {
@@ -2417,7 +2432,9 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         try {
           contract = await contractFor(candidate);
         } catch (error) {
+          /* c8 ignore next 3 -- compile failures are covered by compile's unit contract; admitted launch fixtures cannot inject a foreign compiled candidate here. */
           attempts.push({ point: identity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
+          /* c8 ignore next -- admitted launch fixtures cannot make contractFor reject. */
           continue;
         }
         if (!replicaPrepared) {
@@ -2446,6 +2463,10 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       topologyBaseline = snapshot;
       effectiveContext = effective.context;
       sender = resolveSender(snapshot, effective.context.paneId);
+      // Native-session provenance: the manager's own session is read from the
+      // same authoritative snapshot as the sender identity — never a
+      // caller-overridable field — and rides the pre-effect persist below.
+      const managerSession = resolveManagerSession(snapshot, effective.context.paneId);
       if (mintedNameTaken(snapshot, childName)) {
         throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Minted child identity collides with an existing pane or agent", { childName });
       }
@@ -2485,6 +2506,19 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
             resolvedCwd: launchCwd!,
             ...(recordWorktree === undefined ? {} : { worktree: recordWorktree })
           }
+        }
+      }, {
+        managerSession,
+        task: {
+          objective: params.objective,
+          scope: params.scope,
+          doneWhen: [...params.doneWhen],
+          constraints: [...params.constraints],
+          tier: params.tier,
+          replicas: params.replicas,
+          ...(params.recoveryOf === undefined ? {} : { recoveryOf: params.recoveryOf }),
+          ...(params.label === undefined ? {} : { label: params.label }),
+          ...(params.cwd === undefined ? {} : { cwd: params.cwd })
         }
       });
       recipientKey = mintRecipientKey();
@@ -2655,6 +2689,19 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           startedAgent = agentIdentity(started, childName, resolvedPaneId, contract.runtime.kind);
           break;
         } catch (error) {
+          const notReady = agentNotReadyStart(error);
+          if (notReady !== undefined) {
+            // agent_not_ready is a live-but-unready verdict: the name stays
+            // bound to the pane. No retry, no fallback, no availability record —
+            // the authoritative readiness readback decides inside the original
+            // attempt budget.
+            agentStarted = true;
+            attempts.push({ point: attemptIdentity, outcome: "selected", errorCode: notReady.error.code, message: notReady.error.message });
+            selectedAttemptStartedAt = attemptStartedAt;
+            chosenContract = contract;
+            startedAgent = { startRecord: {} };
+            break;
+          }
           const envelope = cliErrorEnvelope(error);
           await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(contract.candidate, resolved.runner, {
             code: launchTransportCode(error),

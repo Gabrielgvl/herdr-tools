@@ -396,6 +396,10 @@ start_task() {
   [[ -d "$cwd" ]] || fail "working directory does not exist: $cwd"
   [[ -n "${command//[[:space:]]/}" ]] || fail "command must not be empty"
 
+  if [[ -n "$pi_session_id" ]]; then
+    require_session_id "$pi_session_id"
+  fi
+
   script_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
   require_absolute_executable "$script_path" "completion helper"
   tmux_bin="$TMUX_BIN"
@@ -404,7 +408,6 @@ start_task() {
   require_absolute_executable "$default_shell" "tmux default shell"
 
   if [[ -n "$pi_session_id" ]]; then
-    require_session_id "$pi_session_id"
     notify_enabled=1
     [[ "${PI_SESSION_FILE+x}" ]] && session_persisted=1
     agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"

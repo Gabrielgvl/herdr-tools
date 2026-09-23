@@ -82,6 +82,16 @@ bash -n "$BG"
 # Validate the public trust boundaries before touching tmux.
 assert_fails /usr/bin/env PI_BG_BACKEND=removed "$BG" list
 assert_fails /usr/bin/env TMUX_BIN=/no/such/tmux "$BG" list
+validation_log="$TMP/invalid-session-tmux-called"
+validation_tmux="$TMP/invalid-session-tmux"
+cat >"$validation_tmux" <<EOF
+#!/usr/bin/env bash
+printf called >"$validation_log"
+exit 99
+EOF
+chmod +x "$validation_tmux"
+assert_fails /usr/bin/env PI_SESSION_ID=- TMUX_BIN="$validation_tmux" "$BG" start invalid-session "$TMP" ':'
+[[ ! -e "$validation_log" ]] || fail "invalid PI_SESSION_ID touched tmux"
 assert_fails "$BG" start "" "$TMP" "printf x"
 assert_fails "$BG" start "!!!" "$TMP" "printf x"
 assert_fails "$BG" start test "$TMP/missing" "printf x"

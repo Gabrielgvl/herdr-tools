@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createConnection, createServer, type Server } from "node:net";
 import { execFileSync, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -43,11 +43,15 @@ describe("disposable integration server cleanup", () => {
       execFileSync("git", ["-C", root, "-c", "user.name=Herdr Test", "-c", "user.email=herdr@example.invalid", "commit", "-q", "--allow-empty", "-m", "fixture"]);
       const exclude = join(root, ".git", "info", "exclude");
       await writeFile(exclude, "# keep this comment");
-      process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT = root;
+      const trustedRoot = join(root, "nested");
+      const trustedAlias = join(root, "trusted-alias");
+      await mkdir(trustedRoot);
+      await symlink(trustedRoot, trustedAlias, "dir");
+      process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT = trustedAlias;
 
       const workspace = await createDisposableGitWorkspace("herdr-no-newline-");
 
-      expect(await readFile(exclude, "utf8")).toBe("# keep this comment\n/.herdr-no-newline-*\n");
+      expect(await readFile(exclude, "utf8")).toBe("# keep this comment\n/nested/.herdr-no-newline-*\n");
       expect(() => execFileSync("git", ["-C", root, "check-ignore", "-q", workspace])).not.toThrow();
     } finally {
       if (previous === undefined) delete process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT;

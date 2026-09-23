@@ -7,7 +7,7 @@
  */
 
 import { createTargetGenerationRef } from "../wait-target-evidence.js";
-import type { JobGeneration, JobRegistry, SupervisionForbiddenTools, SupervisionForbiddenToolsPolicy, SupervisionReservationDigest, SupervisionWorkspaceRoot, SupervisorJobRequestSnapshot } from "../job-registry.js";
+import type { JobGeneration, JobRegistry, SupervisionReservationDigest, SupervisionWorkspaceRoot, SupervisorJobRequestSnapshot } from "../job-registry.js";
 import type { Settings } from "../settings.js";
 import { SessionEventMonitor, type SupervisionMonitorDependencies } from "./monitor.js";
 import { inertNotifier, type ManagerNotifier } from "./notify.js";
@@ -94,32 +94,8 @@ export interface SupervisionRegistryDependencies {
 export interface SupervisionReservationSettings {
   /** The launch's authorial done-when/constraints plus the bounded `readOnly` claim (ADR-034; ADR-036 W0). */
   supervisionDigest?: SupervisionReservationDigest;
-  /**
-   * Every compiled chain candidate's deny-list fact, tagged by the identity a
-   * binding reports (ADR-036 W0). The reservation spans the whole usable chain
-   * because fallback may start a different runner than the one reserved.
-   */
-  forbiddenTools?: readonly SupervisionForbiddenToolsPolicy[];
   /** The trusted launch workspace root the workspace evidence reads; never the supervisor's own cwd. */
   workspaceRoot?: SupervisionWorkspaceRoot;
-}
-
-/**
- * Resolve the reserved deny-list fact for the runner that actually started
- * (ADR-036 W0). A binding that matches no reserved candidate — or several
- * candidates with different facts — degrades to a typed unavailable value
- * rather than guessing another runner's policy.
- */
-export function resolveForbiddenTools(
-  policies: readonly SupervisionForbiddenToolsPolicy[] | undefined,
-  bound: { agentKind: string; operatingPointId: string },
-): SupervisionForbiddenTools {
-  const facts = (policies ?? [])
-    .filter((policy) => policy.agentKind === bound.agentKind && policy.operatingPointId === bound.operatingPointId)
-    .map((policy) => policy.forbiddenTools);
-  if (facts.length === 0) return { available: false, reason: "candidate_not_reserved" };
-  if (facts.some((fact) => JSON.stringify(fact) !== JSON.stringify(facts[0]))) return { available: false, reason: "candidate_ambiguous" };
-  return facts[0]!;
 }
 
 export interface SupervisionReserveRequest {
@@ -219,7 +195,6 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         reviewCadenceMinutes: settings.reviewCadenceMinutes,
         reviewerModel: SUPERVISION_REVIEWER_MODEL,
         supervisionDigest,
-        forbiddenTools: request.settings?.forbiddenTools,
         workspaceRoot: request.settings?.workspaceRoot,
       },
     };
@@ -234,10 +209,6 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         jobId: identity.jobId,
         child: { ...request.child },
         ...(supervisionDigest === undefined ? {} : { assignmentDigest: supervisionDigest }),
-        // W0 policy facts resolve at review time against the runner identity
-        // that actually bound — fallback may have started a different reserved
-        // candidate than `request.child` names.
-        resolveForbiddenTools: resolveForbiddenTools.bind(null, request.settings?.forbiddenTools),
         ...(request.settings?.workspaceRoot === undefined ? {} : { workspaceRoot: request.settings.workspaceRoot }),
         ...(workspaceBase === undefined ? {} : { workspaceBase }),
         workspaceRunner: this.workspaceRunner,

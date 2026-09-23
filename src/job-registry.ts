@@ -134,27 +134,6 @@ export interface SupervisionReservationDigest extends SupervisionAssignmentDiges
   readOnly?: boolean;
 }
 
-/**
- * One fact about the compiled runner's deny channel (ADR-036 W0). Only the
- * claude runtime has a `disallowedTools` argv surface; every other runner —
- * and any binding that cannot be matched to a reserved candidate — records
- * the typed gap rather than an inferred list.
- */
-export type SupervisionForbiddenTools =
-  | { readonly available: true; readonly tools: readonly string[] }
-  | { readonly available: false; readonly reason: "runner_lacks_disallowed_tools" | "candidate_not_reserved" | "candidate_ambiguous" };
-
-/**
- * The deny-list fact of one compiled chain candidate, tagged by the identity
- * the binding reports. The reservation carries every usable candidate's fact
- * because fallback may start a different runner than the one reserved.
- */
-export interface SupervisionForbiddenToolsPolicy {
-  readonly agentKind: string;
-  readonly operatingPointId: string;
-  readonly forbiddenTools: SupervisionForbiddenTools;
-}
-
 export type SupervisionWorkspaceRootUnavailableReason =
   /** No usable root string exists — e.g. an existing pane whose record carries no cwd. */
   | "root_unavailable"
@@ -186,8 +165,6 @@ export interface SupervisorJobRequestSnapshot extends JobRequestCommon {
     reviewerThinking?: "max";
     /** The reservation's authorial digest (ADR-034; `readOnly` added by ADR-036 W0). Private to the job record; the public projection drops it. */
     supervisionDigest?: SupervisionReservationDigest;
-    /** Per-compiled-candidate deny-list facts (ADR-036 W0); the binding resolves the entry for the runner that started. Private to the job record. */
-    forbiddenTools?: readonly SupervisionForbiddenToolsPolicy[];
     /** The trusted child workspace root the workspace evidence reads (ADR-036 W0). Private to the job record. */
     workspaceRoot?: SupervisionWorkspaceRoot;
   };

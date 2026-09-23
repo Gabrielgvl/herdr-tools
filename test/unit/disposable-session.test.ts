@@ -1,11 +1,11 @@
 import { EventEmitter } from "node:events";
 import { createConnection, createServer, type Server } from "node:net";
-import type { ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFileSync, type ChildProcess } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { startDisposableSocketProxy, stopDisposableServer } from "../integration/disposable-session.js";
+import { createDisposableGitWorkspace, startDisposableSocketProxy, stopDisposableServer } from "../integration/disposable-session.js";
 
 describe("disposable integration server cleanup", () => {
   it("waits for the named server child to close before returning", async () => {
@@ -33,6 +33,27 @@ describe("disposable integration server cleanup", () => {
     await stopDisposableServer(child as ChildProcess);
 
     expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("separates a trusted-root exclusion from an unterminated existing rule", async () => {
+    const root = await mkdtemp(join(tmpdir(), "herdr-exclude-test-"));
+    const previous = process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT;
+    try {
+      execFileSync("git", ["init", "-q", root]);
+      execFileSync("git", ["-C", root, "-c", "user.name=Herdr Test", "-c", "user.email=herdr@example.invalid", "commit", "-q", "--allow-empty", "-m", "fixture"]);
+      const exclude = join(root, ".git", "info", "exclude");
+      await writeFile(exclude, "# keep this comment");
+      process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT = root;
+
+      const workspace = await createDisposableGitWorkspace("herdr-no-newline-");
+
+      expect(await readFile(exclude, "utf8")).toBe("# keep this comment\n/.herdr-no-newline-*\n");
+      expect(() => execFileSync("git", ["-C", root, "check-ignore", "-q", workspace])).not.toThrow();
+    } finally {
+      if (previous === undefined) delete process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT;
+      else process.env.HERDR_TOOLS_INTEGRATION_TRUSTED_ROOT = previous;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("forwards one complete prompt frame and records its target and body", async () => {

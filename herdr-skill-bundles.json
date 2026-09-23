@@ -40,7 +40,7 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "0e03167bee4a7e6daf4f9ff296fb2a8c03a5990b0a23dc87d1539e3eea44187e"
+      "treeHash": "620895d39c22bdd727aa427005dd1a8a4e65ed085442f37206b6bdefe5b0eea4"
     },
     "herdr-profiles/role-plugins/planner/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -120,7 +120,7 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "0e03167bee4a7e6daf4f9ff296fb2a8c03a5990b0a23dc87d1539e3eea44187e"
+      "treeHash": "620895d39c22bdd727aa427005dd1a8a4e65ed085442f37206b6bdefe5b0eea4"
     },
     "herdr-profiles/role-plugins/reviewer/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",
@@ -163,8 +163,8 @@
       "treeHash": "a3896427a62d98c5d67bf260157a8852794153dc3047df38a9568e7345718f2d"
     },
     "herdr-profiles/pi-skills/tmux-background-tasks": {
-      "source": "skills/tmux-background-tasks",
-      "treeHash": "3e17bfd09fa514c3dcbf435192db1c8b47be30c939bb28952fd8087d7a785125"
+      "source": "./skills/tmux-background-tasks",
+      "treeHash": "463fada3b8fa33a75eb16c45aac77df0e737812f70e462aa72779ee9d92225de"
     }
   }
 }

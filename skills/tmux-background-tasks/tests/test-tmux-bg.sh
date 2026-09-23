@@ -6,6 +6,7 @@ BG="$ROOT/scripts/tmux-bg"
 SOCKET="pi-tmux-bg-test-$$"
 TMP="$(mktemp -d /tmp/tmux-bg-test.XXXXXX)"
 export PI_TMUX_SOCKET="$SOCKET"
+unset PI_SESSION_ID PI_SESSION_FILE PI_CODING_AGENT_DIR
 
 cleanup() {
   tmux -L "$SOCKET" kill-server 2>/dev/null || true
@@ -25,9 +26,13 @@ assert_fails() {
   (( rc != 0 )) || fail "expected failure: $*; output: $output"
 }
 wait_done() {
-  local id="$1" result i
+  local id="$1" agent="${2:-}" result i
   for ((i=0; i<200; i+=1)); do
-    result="$($BG status "$id" 2>&1)" || true
+    if [[ -n "$agent" ]]; then
+      result="$(PI_CODING_AGENT_DIR="$agent" "$BG" status "$id" 2>&1)" || true
+    else
+      result="$("$BG" status "$id" 2>&1)" || true
+    fi
     [[ "$result" == *"status=done"* && "$result" != *"exit=unknown"* ]] && { printf '%s\n' "$result"; return; }
     sleep 0.01
   done
@@ -75,6 +80,7 @@ bash -n "$BG"
 [[ -z "$($BG list)" ]] || fail "fresh task list was not empty"
 
 # Validate the public trust boundaries before touching tmux.
+assert_fails /usr/bin/env PI_BG_BACKEND=removed "$BG" list
 assert_fails /usr/bin/env TMUX_BIN=/no/such/tmux "$BG" list
 assert_fails "$BG" start "" "$TMP" "printf x"
 assert_fails "$BG" start "!!!" "$TMP" "printf x"
@@ -92,6 +98,15 @@ id="$($BG start "Quick Success" "$TMP" "printf 'hello world\\n'")"
 assert_contains "$id" "pi-bg-quick-success-"
 assert_contains "$(wait_done "$id")" "exit=0"
 assert_contains "$($BG output "$id")" "hello world"
+
+# A valid relative tmux path is normalized before the retained-exit wrapper.
+# CDPATH=. makes an unguarded `cd bin` print its destination into the result.
+relative_root="$TMP/relative-tmux-root"
+mkdir -p "$relative_root/bin"
+ln -s "$(command -v tmux)" "$relative_root/bin/tmux"
+relative_id="$(cd "$relative_root" && CDPATH=. TMUX_BIN=bin/tmux "$BG" start relative-tmux "$TMP" "printf 'relative tmux works\\n'")"
+assert_contains "$(wait_done "$relative_id")" "exit=0"
+assert_contains "$($BG output "$relative_id")" "relative tmux works"
 
 notify_agent_dir="$TMP/pi-agent"
 notify_session_file="$TMP/session.jsonl"
@@ -126,7 +141,7 @@ NODE
 
 # Exit 0, exit 7, exact numeric range, and the inherited private environment.
 notify_task0="$(PI_CODING_AGENT_DIR="$notify_agent_dir" PI_SESSION_ID=notify-session-0 PI_SESSION_FILE="$notify_session_file" SECRET_VALUE=not-for-event "$BG" start notify-zero "$TMP" "printf 'secret-output\\nSECRET_VALUE\\n'; test \"\$SECRET_VALUE\" = not-for-event; exit 0")"
-assert_contains "$(wait_done "$notify_task0")" "exit=0"
+assert_contains "$(wait_done "$notify_task0" "$notify_agent_dir")" "exit=0"
 notify_event0="$notify_agent_dir/tmux-bg/outbox/notify-session-0/$notify_task0.json"
 wait_event "$notify_event0"
 assert_event "$notify_event0" "$notify_task0" notify-session-0 succeeded 0
@@ -134,7 +149,7 @@ assert_private_chain "$notify_agent_dir" notify-session-0
 for code in 7 128 193 255; do
   session="notify-session-$code"
   task="$(PI_CODING_AGENT_DIR="$notify_agent_dir" PI_SESSION_ID="$session" PI_SESSION_FILE="$notify_session_file" "$BG" start "notify-$code" "$TMP" "exit $code")"
-  assert_contains "$(wait_done "$task")" "exit=$code"
+  assert_contains "$(wait_done "$task" "$notify_agent_dir")" "exit=$code"
   event="$notify_agent_dir/tmux-bg/outbox/$session/$task.json"
   wait_event "$event"
   assert_event "$event" "$task" "$session" failed "$code"
@@ -145,7 +160,7 @@ notify_signal="$(PI_CODING_AGENT_DIR="$notify_agent_dir" PI_SESSION_ID=notify-se
 notify_signal_event="$notify_agent_dir/tmux-bg/outbox/notify-session-signal/$notify_signal.json"
 wait_event "$notify_signal_event"
 assert_signal_event "$notify_signal_event" "$notify_signal" notify-session-signal TERM
-assert_contains "$(wait_done "$notify_signal")" "exit=143"
+assert_contains "$(wait_done "$notify_signal" "$notify_agent_dir")" "exit=143"
 
 # Inferred fatal signals must agree across the event and retained status/list output.
 for signal_case in KILL SEGV; do
@@ -156,8 +171,8 @@ for signal_case in KILL SEGV; do
   signal_event="$notify_agent_dir/tmux-bg/outbox/$signal_session/$signal_task.json"
   wait_event "$signal_event"
   assert_signal_event "$signal_event" "$signal_task" "$signal_session" "$signal_case"
-  assert_contains "$(wait_done "$signal_task")" "exit=$expected_exit"
-  assert_contains "$($BG list)" "id=$signal_task status=done exit=$expected_exit"
+  assert_contains "$(wait_done "$signal_task" "$notify_agent_dir")" "exit=$expected_exit"
+  assert_contains "$(PI_CODING_AGENT_DIR="$notify_agent_dir" "$BG" list)" "id=$signal_task status=done exit=$expected_exit"
 done
 
 # The wrapper reports the original command exactly while running, including shell syntax.
@@ -165,7 +180,7 @@ special_command="sleep 2; printf '%s\\n' 'a|b \"quote\" \$() operators | backsla
 special_task="$(PI_CODING_AGENT_DIR="$notify_agent_dir" PI_SESSION_ID=notify-session-special "$BG" start special "$TMP" "$special_command")"
 special_status="$($BG status "$special_task")"
 [[ "${special_status##*command=}" == "$special_command" ]] || fail "status did not preserve the original command: $special_status"
-list_status="$($BG list)"
+list_status="$(PI_CODING_AGENT_DIR="$notify_agent_dir" "$BG" list)"
 assert_contains "$list_status" "command=$special_command"
 tmux -L "$SOCKET" show-options -p -v -t "$special_task" @pi_bg_wrapper | grep -qx 1 || fail "wrapper marker missing"
 tmux -L "$SOCKET" show-options -v -t "$special_task" @pi_bg_pi_session_id | grep -qx notify-session-special || fail "origin session marker missing"
@@ -181,7 +196,7 @@ for i in $(seq 1 100); do
   sleep .01
 done
 tmux -L "$SOCKET" send-keys -l -t "$stdin_task" -- 'line from stdin'; tmux -L "$SOCKET" send-keys -t "$stdin_task" Enter
-assert_contains "$(wait_done "$stdin_task")" "exit=0"
+assert_contains "$(wait_done "$stdin_task" "$stdin_agent")" "exit=0"
 assert_contains "$($BG output "$stdin_task")" "got=line from stdin"
 wait_event "$stdin_agent/tmux-bg/outbox/notify-session-stdin/$stdin_task.json"
 
@@ -201,7 +216,7 @@ assert_contains "$($BG kill "$completed_task")" "killed $completed_task"
 # Event-write failure preserves the child's status and retained output.
 write_fail_agent="$TMP/write-failure-agent"
 write_fail_task="$(PI_CODING_AGENT_DIR="$write_fail_agent" PI_SESSION_ID=notify-session-write-failure PI_SESSION_FILE="$notify_session_file" "$BG" start write-failure "$TMP" "printf retained-output; sleep 0.2; chmod 500 $(printf '%q' "$write_fail_agent/tmux-bg/outbox/notify-session-write-failure"); exit 7")"
-assert_contains "$(wait_done "$write_fail_task")" "exit=7"
+assert_contains "$(wait_done "$write_fail_task" "$write_fail_agent")" "exit=7"
 assert_contains "$($BG output "$write_fail_task")" retained-output
 assert_no_event "$write_fail_agent/tmux-bg/outbox/notify-session-write-failure/$write_fail_task.json"
 chmod 700 "$write_fail_agent/tmux-bg/outbox/notify-session-write-failure"
@@ -226,12 +241,42 @@ spaced_task="$(PI_CODING_AGENT_DIR="$spaced_agent_dir" PI_SESSION_ID=notify-sess
 spaced_event="$spaced_agent_dir/tmux-bg/outbox/notify-session-spaces/$spaced_task.json"; wait_event "$spaced_event"; assert_event "$spaced_event" "$spaced_task" notify-session-spaces succeeded 0
 mkdir -p "$TMP/dir with spaces"; cwd_task="$($BG start cwd "$TMP/dir with spaces" pwd)"; wait_done "$cwd_task" >/dev/null; assert_contains "$($BG output "$cwd_task")" "$TMP/dir with spaces"
 
-# Legacy starts have no outbox or wrapper marker and retain the pane command fallback.
+# Legacy starts have no outbox but retain the exact exit status on the pane.
 legacy_agent="$TMP/legacy-agent"
 legacy_task="$(/usr/bin/env -u PI_SESSION_ID -u PI_SESSION_FILE PI_CODING_AGENT_DIR="$legacy_agent" "$BG" start legacy "$TMP" "printf legacy\\n")"
-assert_contains "$(wait_done "$legacy_task")" "exit=0"
+assert_contains "$(wait_done "$legacy_task" "$legacy_agent")" "exit=0"
 assert_contains "$($BG output "$legacy_task")" legacy
 [[ ! -e "$legacy_agent/tmux-bg/outbox" ]] || fail "legacy start created an outbox"
+[[ "$(tmux -L "$SOCKET" show-options -p -v -t "$legacy_task" @pi_bg_exit)" == 0 ]] || fail "legacy pane did not retain its exit status"
+[[ "$(tmux -L "$SOCKET" show-options -p -v -t "$legacy_task" @pi_bg_wrapper)" == 1 ]] || fail "legacy wrapper marker missing"
+[[ "$(tmux -L "$SOCKET" show-options -p -v -t "$legacy_task" @pi_bg_public_command)" == 'printf legacy\n' ]] || fail "legacy command was not published on the pane"
+
+# Fast legacy exit 0 and a nonzero legacy exit both report their exact status.
+legacy_zero="$(/usr/bin/env -u PI_SESSION_ID -u PI_SESSION_FILE "$BG" start legacy-zero "$TMP" 'exit 0')"
+legacy_seven="$(/usr/bin/env -u PI_SESSION_ID -u PI_SESSION_FILE "$BG" start legacy-seven "$TMP" 'printf kept; exit 7')"
+assert_contains "$(wait_done "$legacy_zero")" "status=done exit=0"
+assert_contains "$(wait_done "$legacy_seven")" "status=done exit=7"
+assert_contains "$($BG output "$legacy_seven")" kept
+assert_contains "$($BG list)" "id=$legacy_seven status=done exit=7"
+[[ "$(tmux -L "$SOCKET" show-options -p -v -t "$legacy_zero" @pi_bg_exit)" == 0 ]] || fail "exit 0 was not retained on the pane"
+[[ "$(tmux -L "$SOCKET" show-options -p -v -t "$legacy_seven" @pi_bg_exit)" == 7 ]] || fail "exit 7 was not retained on the pane"
+legacy_signal="$(/usr/bin/env -u PI_SESSION_ID -u PI_SESSION_FILE "$BG" start legacy-signal "$TMP" 'kill -TERM $$')"
+assert_contains "$(wait_done "$legacy_signal")" "exit=143"
+
+# The retained pane status answers status/list only while tmux's dead status is
+# empty, and a missing record is still reported unknown rather than inferred.
+dead_fake="$TMP/dead-status-tmux"
+cat >"$dead_fake" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" display-message "* ]]; then printf '1||12345|\n'; exit 0; fi
+exec /usr/bin/tmux "$@"
+EOF
+chmod +x "$dead_fake"
+[[ "$(TMUX_BIN="$dead_fake" "$BG" status "$legacy_seven")" == *"status=done exit=7"* ]] || fail "empty dead status did not use the retained exit"
+[[ "$(TMUX_BIN="$dead_fake" "$BG" status "$legacy_zero")" == *"status=done exit=0"* ]] || fail "empty dead status did not use the retained zero"
+[[ "$(TMUX_BIN="$dead_fake" "$BG" list)" == *"id=$legacy_seven status=done exit=7"* ]] || fail "list did not use the retained exit"
+tmux -L "$SOCKET" set-option -p -u -t "$legacy_seven" @pi_bg_exit
+[[ "$(TMUX_BIN="$dead_fake" "$BG" status "$legacy_seven")" == *"exit=unknown"* ]] || fail "missing retained exit was not reported unknown"
 
 # Setup validation rejects symlinked and group/world-writable chain entries before new-session.
 symlink_agent="$TMP/symlink-agent"; symlink_target="$TMP/symlink-target"; mkdir -p "$symlink_target"; ln -s "$symlink_target" "$symlink_agent"
@@ -247,7 +292,7 @@ chmod 700 "$race_agent" "$race_agent/tmux-bg" "$race_agent/tmux-bg/outbox" "$rac
 race_original="$race_agent/original-inbox"; race_decoy="$TMP/race-decoy"; mkdir -p "$race_decoy"; chmod 700 "$race_decoy"
 race_command="mv $(printf '%q' "$race_agent/tmux-bg/outbox/$race_session") $(printf '%q' "$race_original"); mv $(printf '%q' "$race_decoy") $(printf '%q' "$race_agent/tmux-bg/outbox/$race_session"); exit 0"
 race_task="$(PI_CODING_AGENT_DIR="$race_agent" PI_SESSION_ID="$race_session" "$BG" start race "$TMP" "$race_command")"
-assert_contains "$(wait_done "$race_task")" "exit=0"
+assert_contains "$(wait_done "$race_task" "$race_agent")" "exit=0"
 assert_no_event "$race_decoy/$race_task.json"
 assert_no_event "$race_agent/tmux-bg/outbox/$race_session/$race_task.json"
 [[ -z "$(find "$race_agent" -type f -name '.*.tmp' -print)" ]] || fail "temporary publication file leaked"

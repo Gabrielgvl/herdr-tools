@@ -6,7 +6,7 @@ import {
   readHandoffState,
   type HandoffAllocation
 } from "./handoff.js";
-import { requirePromptTargetIdentity } from "./messages/prompt.js";
+import { compactPromptTargetIdentity, requirePromptTargetIdentity } from "./messages/prompt.js";
 import { snapshotIdentityRecords } from "./messages/prompt-target.js";
 import type { AgentSessionIdentity } from "./messages/prompt.js";
 
@@ -85,11 +85,7 @@ export async function resumeHandoff(run: HandoffAllocation, caller: EffectiveCon
     }
     currentChild = {
       presence: "present",
-      paneId: live.paneId,
-      terminalId: live.terminalId,
-      agentName: live.agentName,
-      agentKind: live.agentKind,
-      agentSession: live.agentSession,
+      ...compactPromptTargetIdentity(live),
       state: pane.agent_status
     };
   }

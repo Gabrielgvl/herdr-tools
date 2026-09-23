@@ -1,4 +1,5 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdtemp, unlink } from "node:fs/promises";
 import { execFileSync, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -175,6 +176,16 @@ export async function createDisposableGitWorkspace(prefix: string): Promise<stri
   const cwd = await mkdtemp(join(trustedRoot ? resolve(trustedRoot) : tmpdir(), trustedRoot ? `.${prefix}` : prefix));
   if (trustedRoot) {
     execFileSync("git", ["rev-parse", "--verify", "HEAD"], { cwd, stdio: "ignore" });
+    // Self-exclude the fixture pattern through the repository's own
+    // info/exclude — never a config mutation — so a crashed fixture left
+    // behind does not dirty the trusted root's status.
+    const commonGitDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+    mkdirSync(join(commonGitDir, "info"), { recursive: true });
+    const exclude = join(commonGitDir, "info", "exclude");
+    const pattern = `/.${prefix}*`;
+    const contents = existsSync(exclude) ? readFileSync(exclude, "utf8") : "";
+    const patterns = contents.split(/\r?\n/u);
+    if (!patterns.includes(pattern)) appendFileSync(exclude, `${contents.length > 0 && !contents.endsWith("\n") ? "\n" : ""}${pattern}\n`);
   } else {
     execFileSync("git", ["init", "-q", "-b", "main"], { cwd });
     execFileSync("git", ["-c", "user.email=herdr-integration@example.invalid", "-c", "user.name=herdr-integration", "commit", "-qm", "init", "--allow-empty"], { cwd });

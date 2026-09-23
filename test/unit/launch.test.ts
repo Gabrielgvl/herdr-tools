@@ -627,6 +627,13 @@ describe("herdr_launch task cutover", () => {
 
   describe("recovery lineage (ADR-037)", () => {
     const RECOVERY_WORKLOAD = { intent: "implement" as const, mutation: "bounded" as const, scope: "local" as const, horizon: "short" as const, verifiability: "strong" as const, workspaceState: "clean" as const, ambiguity: "low" as const };
+    /** The provenance session every seeded prior run records — recovery authorizes only this exact identity. */
+    const PRIOR_MANAGER_SESSION = { source: "herdr:pi", agent: "pi", kind: "id", value: "prior-manager-session" };
+    /** Caller pane evidence carrying the seeded provenance session (the 549-shape: pane and agent records must agree). */
+    const priorCaller = {
+      pane: { agent: "pi", terminal_id: "term-w1:p1", agent_session: PRIOR_MANAGER_SESSION },
+      agents: [{ pane_id: "w1:p1", name: "manager", agent: "pi", terminal_id: "term-w1:p1", agent_session: PRIOR_MANAGER_SESSION }]
+    };
 
     /**
      * A real allocator over a private namespace dir, plus one persisted prior
@@ -664,7 +671,7 @@ describe("herdr_launch task cutover", () => {
           ...(options.omitWorkspace ? {} : { workspace: { resolvedCwd: workspaceDir, ...(options.worktree === undefined ? {} : { worktree: options.worktree }) } })
         }
       }, options.omitProvenance ? undefined : {
-        managerSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "prior-manager-session" },
+        managerSession: PRIOR_MANAGER_SESSION,
         task: { objective: "prior objective", scope: "prior scope", doneWhen: ["prior done"], constraints: [], tier: "standard", replicas: 1 }
       });
       await updateHandoffState(run, (state) => {
@@ -704,7 +711,7 @@ describe("herdr_launch task cutover", () => {
     it("resumes the prior managed workspace, lifts the route tier, and excludes the failed point", async () => {
       const { run, allocator, workspaceDir } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", operatingPointId: "pi:primary:low", routeTier: "standard" });
       const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
-      const harness = makeCli();
+      const harness = makeCli({ caller: priorCaller });
       const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
       const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId, replicas: 1 }));
 
@@ -730,7 +737,7 @@ describe("herdr_launch task cutover", () => {
       const worktreeDir = realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-wt-")));
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", worktree: worktreeDir });
       const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
-      const harness = makeCli();
+      const harness = makeCli({ caller: priorCaller });
       const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
 
       expect(result.details).toMatchObject({ outcome: "launched" });
@@ -744,7 +751,7 @@ describe("herdr_launch task cutover", () => {
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done", routeTier: "strong" });
       const catalog = { ...catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), catalogRevision: "f".repeat(64) };
       const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
-      const result = await execute(toolFor({ catalog, cli: makeCli().cli, handoffs: allocator, routerLog }), task({ recoveryOf: run.runId, tier: "economy" }));
+      const result = await execute(toolFor({ catalog, cli: makeCli({ caller: priorCaller }).cli, handoffs: allocator, routerLog }), task({ recoveryOf: run.runId, tier: "economy" }));
 
       expect(result.details).toMatchObject({ outcome: "launched", requestedTier: "economy", effectiveTier: "frontier" });
       // The logged decision keeps requestedTier = the caller's ask; the lift
@@ -759,7 +766,7 @@ describe("herdr_launch task cutover", () => {
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "recovery_pending", routeTier: "standard" });
       const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
       const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
-      const result = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
+      const result = await execute(toolFor({ catalog, cli: makeCli({ caller: priorCaller }).cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
 
       expect(evaluate.mock.calls[0]![0].workspaceState).toBe("partial");
       // partial raises the workload floor to strong; nextTier(standard) agrees.
@@ -770,7 +777,7 @@ describe("herdr_launch task cutover", () => {
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "cancelled", routeTier: "standard" });
       const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
       const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
-      const result = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
+      const result = await execute(toolFor({ catalog, cli: makeCli({ caller: priorCaller }).cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
       expect(evaluate.mock.calls[0]![0].workspaceState).toBe("failed");
       expect(result.details).toMatchObject({ outcome: "launched" });
     });
@@ -779,7 +786,7 @@ describe("herdr_launch task cutover", () => {
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "failed", routeTier: "frontier" });
       const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
       const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
-      const result = await execute(toolFor({ catalog, cli: makeCli().cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
+      const result = await execute(toolFor({ catalog, cli: makeCli({ caller: priorCaller }).cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
 
       expect(evaluate.mock.calls[0]![0].workspaceState).toBe("failed");
       expect(result.details).toMatchObject({ outcome: "launched", effectiveTier: "max" });
@@ -792,7 +799,7 @@ describe("herdr_launch task cutover", () => {
         new Map<RunnerKind, RunnerEntry>([["claude", { ...claude, quota: { ...claude.quota, provider: "prov-b" } }], ["pi", runnerEntry(["a"])]]),
       );
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "claude:b:low", routeTier: "standard" });
-      const harness = makeCli();
+      const harness = makeCli({ caller: priorCaller });
       const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
 
       expect(result.details).toMatchObject({ outcome: "launched" });
@@ -811,21 +818,21 @@ describe("herdr_launch task cutover", () => {
       );
       // Failed point's provider differs from the post-exclusion head's — order stands.
       const first = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "claude:b:low" });
-      const result = await execute(toolFor({ catalog, cli: makeCli().cli, handoffs: first.allocator }), task({ recoveryOf: first.run.runId }));
+      const result = await execute(toolFor({ catalog, cli: makeCli({ caller: priorCaller }).cli, handoffs: first.allocator }), task({ recoveryOf: first.run.runId }));
       expect(result.details!.children[0]!.operatingPointId).toBe("pi:a:low");
 
       // A failed point no longer in the catalog cannot resolve its provider,
       // so recovery fails closed instead of guessing.
       const single = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
       const second = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "pi:gone:low" });
-      const again = await execute(toolFor({ catalog: single, cli: makeCli().cli, handoffs: second.allocator }), task({ recoveryOf: second.run.runId }));
+      const again = await execute(toolFor({ catalog: single, cli: makeCli({ caller: priorCaller }).cli, handoffs: second.allocator }), task({ recoveryOf: second.run.runId }));
       expect(again.details).toMatchObject({ outcome: "abstained", children: [] });
     });
 
     it("abstains closed when the exclusion empties the usable chain", async () => {
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "failed", operatingPointId: "pi:primary:low" });
       const catalog = catalogOf([{ runner: "pi", model: "primary" }]);
-      const harness = makeCli();
+      const harness = makeCli({ caller: priorCaller });
       const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
       // The failed point is excluded inside the routing decision itself, so the
       // launch abstains before any child exists rather than failing one.
@@ -836,11 +843,11 @@ describe("herdr_launch task cutover", () => {
     it("abstains a recovery whose decision does not admit", async () => {
       const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done" });
       const catalog = catalogOf([{ runner: "pi", model: "primary" }]);
-      const harness = makeCli();
+      const harness = makeCli({ caller: priorCaller });
       const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog, { done_when_verifiable: 0.1 }) })) };
       const result = await execute(toolFor({ catalog, cli: harness.cli, specClient, handoffs: allocator }), task({ recoveryOf: run.runId }));
       expect(result.details).toMatchObject({ outcome: "abstained", children: [] });
-      expect(harness.calls).toEqual([]);
+      expect(harness.calls.filter((argv) => !(argv[0] === "pane" && argv[1] === "current") && argv[0] !== "api")).toEqual([]);
     });
 
     it("fails closed on a missing run before any launch effect", async () => {
@@ -946,6 +953,77 @@ describe("herdr_launch task cutover", () => {
         expect(harness.calls).toEqual([]);
         expect(specClient.evaluate).not.toHaveBeenCalled();
       }
+    });
+
+    it("refuses a missing, foreign, or unrecorded manager session before evaluation or any launch effect", async () => {
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
+      const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
+      const mutationCalls = (harness: ReturnType<typeof makeCli>) =>
+        harness.calls.filter((argv) => !(argv[0] === "pane" && argv[1] === "current") && argv[0] !== "api");
+      const refusal = { code: "RECOVERY_UNRESOLVABLE", details: { reason: "owner_mismatch" } };
+
+      // A caller pane with no native session can never authorize a recovery.
+      const anonymous = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done" });
+      const anonymousAllocate = vi.spyOn(anonymous.allocator, "allocate");
+      const anonymousPersist = vi.spyOn(anonymous.allocator, "persist");
+      const anonymousHarness = makeCli();
+      await expect(toolFor({ catalog, cli: anonymousHarness.cli, handoffs: anonymous.allocator, specClient: { evaluate }, routerLog }).execute("call", task({ recoveryOf: anonymous.run.runId }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject(refusal);
+      expect(anonymousAllocate).not.toHaveBeenCalled();
+      expect(anonymousPersist).not.toHaveBeenCalled();
+      expect(mutationCalls(anonymousHarness)).toEqual([]);
+
+      // A different native manager session owns the run: refuse identically.
+      const foreign = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done" });
+      const foreignAllocate = vi.spyOn(foreign.allocator, "allocate");
+      const foreignPersist = vi.spyOn(foreign.allocator, "persist");
+      const otherSession = { source: "herdr:pi", agent: "pi", kind: "id", value: "other-manager-session" };
+      const foreignHarness = makeCli({ caller: { pane: { agent: "pi", terminal_id: "term-w1:p1", agent_session: otherSession }, agents: [{ pane_id: "w1:p1", name: "manager", agent: "pi", terminal_id: "term-w1:p1", agent_session: otherSession }] } });
+      await expect(toolFor({ catalog, cli: foreignHarness.cli, handoffs: foreign.allocator, specClient: { evaluate }, routerLog }).execute("call", task({ recoveryOf: foreign.run.runId }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject(refusal);
+      expect(foreignAllocate).not.toHaveBeenCalled();
+      expect(foreignPersist).not.toHaveBeenCalled();
+      expect(mutationCalls(foreignHarness)).toEqual([]);
+
+      // A prior run launched by a non-agent manager recorded a null session and
+      // can never authorize a recovery — even for an agent caller.
+      const unrecorded = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done" });
+      rewriteProvenance(unrecorded.run, (doc) => { (doc.manager as Record<string, unknown>).session = null; });
+      const unrecordedAllocate = vi.spyOn(unrecorded.allocator, "allocate");
+      const unrecordedPersist = vi.spyOn(unrecorded.allocator, "persist");
+      const unrecordedHarness = makeCli({ caller: priorCaller });
+      await expect(toolFor({ catalog, cli: unrecordedHarness.cli, handoffs: unrecorded.allocator, specClient: { evaluate }, routerLog }).execute("call", task({ recoveryOf: unrecorded.run.runId }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject(refusal);
+      expect(unrecordedAllocate).not.toHaveBeenCalled();
+      expect(unrecordedPersist).not.toHaveBeenCalled();
+      expect(mutationCalls(unrecordedHarness)).toEqual([]);
+      expect(evaluate).not.toHaveBeenCalled();
+      expect(routerLog).not.toHaveBeenCalled();
+    });
+
+    it("refuses when the manager session changes after routing but before launch effects", async () => {
+      const { run, allocator } = await seedRecoveryRun({ lifecycle: "handed_off", artifactStatus: "done" });
+      const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+      const snapshotFor = (session: typeof PRIOR_MANAGER_SESSION): HerdrSnapshot => ({
+        version: "0.8.0",
+        protocol: 22,
+        workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
+        tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
+        panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "manager", agent: "pi", terminal_id: "term-w1:p1", agent_session: session, agent_status: "idle" }],
+        agents: [{ pane_id: "w1:p1", name: "manager", agent: "pi", terminal_id: "term-w1:p1", agent_session: session, agent_status: "idle" }],
+      });
+      const resolved = (snapshot: HerdrSnapshot) => ({ snapshot, context, diagnostics: baseDiagnostics, operationIds: baseOperationIds });
+      const foreignSession = { ...PRIOR_MANAGER_SESSION, value: "replacement-manager-session" };
+      const contextResolver = vi.fn()
+        .mockResolvedValueOnce(resolved(snapshotFor(PRIOR_MANAGER_SESSION)))
+        .mockResolvedValueOnce(resolved(snapshotFor(foreignSession)));
+      const allocate = vi.spyOn(allocator, "allocate");
+      const persist = vi.spyOn(allocator, "persist");
+
+      const result = await execute(toolFor({ catalog, cli: makeCli().cli, contextResolver, handoffs: allocator }), task({ recoveryOf: run.runId }));
+
+      expect(result.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "RECOVERY_UNRESOLVABLE", causeCode: "RECOVERY_UNRESOLVABLE" } }] });
+      expect(contextResolver).toHaveBeenCalledTimes(2);
+      expect(allocate).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
     });
   });
 

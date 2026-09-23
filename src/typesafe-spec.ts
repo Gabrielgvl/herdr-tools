@@ -23,12 +23,12 @@ const INTENT_DESCRIPTIONS: Record<string, string> = {
 };
 
 const TIER_DESCRIPTIONS: Record<QualityTier, string> = {
-  utility: "Routine, narrow work where the cheapest competent agent should suffice.",
-  economy: "Bounded work needing modest judgment or implementation ability.",
-  standard: "Typical production work needing reliable coding and reasoning.",
-  strong: "Difficult work with substantial reasoning, debugging, or integration risk.",
-  frontier: "Very difficult work where top-tier capability materially improves success.",
-  max: "Exceptional work requiring the strongest available capability and reasoning.",
+  utility: "Deterministic, read-only, or mechanical work with one obvious path and cheap, direct verification. No production-code mutation and no material diagnosis or design uncertainty. Examples: locate one configuration value; count exact references; list a fixed enum or known files.",
+  economy: "One local, reversible, low-risk change or bounded explanation with clear requirements, an obvious approach, and a focused check. Few files alone do not make uncertain work economy. Examples: update one documentation example and snapshot; rename a local helper and run focused tests; summarize an already-defined fallback order.",
+  standard: "Normal production work within one subsystem: several related files or tests, a clear contract, moderate implementation/debugging/review effort, ordinary rollback, and no exceptional uncertainty or blast radius. Examples: fix a bounded admission bug; implement a scoped feature across two or three related files; verify an evidence join across several known sources.",
+  strong: "Hard but bounded work requiring sustained reasoning or coordination, while the governing contract and failure boundaries are known. This includes broad changes under one known contract, repo-wide read-only analysis/review with a concrete checklist, or multi-stage work with known handoffs. Examples: regenerate all fixtures after a known schema change; map every consumer and produce a dependency-ordered cutover DAG; coordinate four gated workers within one subsystem.",
+  frontier: "Work with one exceptional uncertainty or risk trigger for which ordinary strong execution is materially likely to fail: unknown or intermittent root cause, concurrency/race/locking behavior, security or trust-boundary analysis, or state migration with multiple plausible designs and difficult evidence. Examples: diagnose intermittent persisted-record corruption with no reproduction; fix an availability/start race; design a historical-state migration with compatibility constraints.",
+  max: "Compound exceptional work with at least two frontier triggers, or recovery from a failed high-blast-radius migration with inconsistent partial state. It combines cross-system scope, severe uncertainty, difficult verification, compatibility or security constraints, and/or multi-node coordination such that the strongest available execution is required. Examples: replace a public contract across runtime, MCP, TUI, documentation, and tests while preserving compatibility; recover a partially failed repo migration with inconsistent state; coordinate a repository-wide multi-node migration through independent review and promotion.",
 };
 
 export type TaskEvaluation = { kind: "response"; response: TaskModelDecision } | Abstained;
@@ -122,7 +122,7 @@ export function buildEvaluationRequest(input: TaskEvaluationInput): EvaluationRe
         { ...INTENT_DESCRIPTIONS },
       ),
       [TIER_QUESTION]: choice(
-        "What is the weakest quality tier likely to complete this exact Task successfully? Judge only the Task semantics; no model, provider, runner, or fallback information is available.",
+        "Choose the lowest tier sufficient for a capable agent to complete this exact Task successfully on the first attempt. Judge the Task's semantic difficulty, uncertainty, coordination burden, verification burden, and failure risk. Ignore caller tier or preference, model/provider/runner identity, cost, quota, availability, and fallback-chain contents. Large file count alone does not imply frontier or max. A high tier requires the qualitative conditions in the option descriptions, not merely important work. Counterexamples: a one-file documentation change is economy, not standard, merely because it lives in a production repository; a repo-wide checklist review with clear boundaries is strong, not automatically max; raw file count, repository scope, or business importance alone does not imply frontier or max; max means compound exceptional factors, and hard by itself is strong; a caller-requested tier is local policy input and must not influence the answer.",
         { ...TIER_DESCRIPTIONS },
       ),
     },

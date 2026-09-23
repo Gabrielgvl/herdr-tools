@@ -137,7 +137,12 @@ function requiredPaneId(value: unknown, expectedPaneId: string, source: string):
   return paneId;
 }
 
-function optionalCandidateStrings(records: Record<string, unknown>[], fields: string[], field: string): string | undefined {
+/**
+ * The single value a record set proves for one field alias group: absent/null
+ * fields contribute nothing, and any two supplied values that differ are a
+ * contradiction — never merged or averaged.
+ */
+export function optionalCandidateStrings(records: Record<string, unknown>[], fields: string[], field: string): string | undefined {
   let selected: string | undefined;
   let selectedSource: string | undefined;
   for (const [recordIndex, value] of records.entries()) {
@@ -166,7 +171,13 @@ function sameSession(left: AgentSessionIdentity, right: AgentSessionIdentity): b
   return left.source === right.source && left.agent === right.agent && left.kind === right.kind && left.value === right.value;
 }
 
-function optionalSessionCandidate(records: Record<string, unknown>[]): AgentSessionIdentity | undefined {
+/**
+ * The single native-session candidate a record set proves: absent/null
+ * `agent_session` fields contribute nothing, every present session must be a
+ * complete `{source,agent,kind,value}`, and any disagreement between records is
+ * a contradiction — never merged or averaged.
+ */
+export function optionalSessionCandidate(records: Record<string, unknown>[]): AgentSessionIdentity | undefined {
   let selected: AgentSessionIdentity | undefined;
   for (const [recordIndex, value] of records.entries()) {
     if (!own(value, "agent_session") || value.agent_session === null) continue;

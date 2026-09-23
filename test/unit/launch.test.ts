@@ -15,7 +15,7 @@ import type { RoutingTask, TaskModelDecision } from "../../src/router.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { parsePromptTargetIdentityFields } from "../../src/messages/prompt.js";
 import type { AttachmentStore } from "../../src/messages/store.js";
-import { createHandoffAllocator, readHandoffState, updateHandoffState, type HandoffAllocation, type HandoffAllocator, type HandoffState, type HandoffStatus } from "../../src/handoff.js";
+import { createHandoffAllocator, HANDOFF_PROVENANCE_NAME, readHandoffState, updateHandoffState, type HandoffAllocation, type HandoffAllocator, type HandoffRunIdentity, type HandoffState, type HandoffStatus } from "../../src/handoff.js";
 import { POLICY_REVISION, type QualityTier, type WorkspaceState } from "../../src/routing-policy.js";
 import type { TypeSafeSpecClient } from "../../src/typesafe-spec.js";
 import type { SupervisionReserveRequest } from "../../src/supervision/registry.js";
@@ -184,6 +184,8 @@ type Child = { paneId: string; tabId: string; name: string; kind: string; termin
 
 function makeCli(options: {
   start?: (argv: string[], attempt: number) => JsonEnvelope | never;
+  /** Models the live-but-unready verdict: the child stays bound to the pane even when the scripted start throws. */
+  startLeavesBoundAgent?: boolean;
   failedPane?: Record<string, unknown>;
   paneError?: unknown;
   splitError?: unknown;
@@ -195,6 +197,8 @@ function makeCli(options: {
   metadataError?: unknown;
   existingPane?: Child;
   tabWithoutPane?: boolean;
+  /** Authoritative records for the caller pane w1:p1, plus optional sibling evidence. */
+  caller?: { pane?: Record<string, unknown>; panes?: Record<string, unknown>[]; agents?: Record<string, unknown>[] };
 } = {}): { cli: LaunchCli; calls: string[][]; prompts: string[]; children: Child[]; starts: number } {
   const calls: string[][] = [];
   const prompts: string[] = [];
@@ -209,10 +213,14 @@ function makeCli(options: {
     workspaces: [{ workspace_id: "w1", label: "workspace", focused: true }],
     tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "main", focused: true }],
     panes: [
-      { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle" },
+      { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", label: "caller", agent_status: "idle", ...(options.caller?.pane ?? {}) },
+      ...(options.caller?.panes ?? []) as HerdrSnapshot["panes"],
       ...children.map((child) => ({ pane_id: child.paneId, tab_id: child.tabId, workspace_id: "w1", label: child.name, agent_name: child.name, agent: child.kind, terminal_id: child.terminalId, agent_session: child.session, agent_status: child.prompt ? "working" : "idle", state_change_seq: child.prompt ? 8 : 7, revision: child.prompt ? 4 : 3, interactive_ready: true, ...(child.agentId === undefined ? {} : { agent_id: child.agentId }) })),
     ],
-    agents: children.map((child) => ({ pane_id: child.paneId, name: child.name, agent: child.kind, terminal_id: child.terminalId, agent_session: child.session, agent_status: child.prompt ? "working" : "idle", state_change_seq: child.prompt ? 8 : 7, revision: child.prompt ? 4 : 3, interactive_ready: true, ...(child.agentId === undefined ? {} : { agent_id: child.agentId }) })),
+    agents: [
+      ...(options.caller?.agents ?? []) as HerdrSnapshot["agents"],
+      ...children.map((child) => ({ pane_id: child.paneId, name: child.name, agent: child.kind, terminal_id: child.terminalId, agent_session: child.session, agent_status: child.prompt ? "working" : "idle", state_change_seq: child.prompt ? 8 : 7, revision: child.prompt ? 4 : 3, interactive_ready: true, ...(child.agentId === undefined ? {} : { agent_id: child.agentId }) })),
+    ],
   });
 
   const cli: LaunchCli = {
@@ -252,8 +260,9 @@ function makeCli(options: {
         active.session = { source: `herdr:${active.kind}`, agent: active.kind, kind: "id", value: `session-${attempt}` };
         if (options.agentId !== undefined) active.agentId = options.agentId;
         if (options.start !== undefined) {
+          if (options.startLeavesBoundAgent === true) children.push(active);
           const result = options.start(argv, attempt);
-          children.push(active);
+          if (!children.includes(active)) children.push(active);
           return result;
         }
         children.push(active);
@@ -536,6 +545,86 @@ describe("herdr_launch task cutover", () => {
     expect(specClient.evaluate).not.toHaveBeenCalled();
   });
 
+  it("persists the authoritative manager session and canonical Task before any launch effect", async () => {
+    const managerSession = { source: "herdr:pi", agent: "pi", kind: "id", value: "manager-session-1" };
+    const harness = makeCli({
+      caller: {
+        pane: { agent: "pi", terminal_id: "term-w1:p1", agent_session: managerSession },
+        agents: [{ pane_id: "w1:p1", name: "manager", agent: "pi", terminal_id: "term-w1:p1", agent_session: managerSession }]
+      }
+    });
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const handoffs = fakeHandoffs();
+    const attachments = fakeAttachments();
+    const supervision = stubSupervision();
+    const order: string[] = [];
+    let callsAtPersist: string[][] = [];
+    (handoffs.persist as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("persist"); callsAtPersist = [...harness.calls]; });
+    (attachments.ensureRecipient as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("recipient"); return { path: "/tmp/recipient", token: "grant", renew: vi.fn(async () => undefined), release: vi.fn(async () => undefined) }; });
+    const reserve = supervision.reserve;
+    supervision.reserve = vi.fn(async (value) => { order.push("reserve"); return reserve(value); });
+
+    const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs, attachments, supervision }), task({ label: "docs sprint", cwd: repoRoot }));
+    expect(result.details).toMatchObject({ outcome: "launched" });
+
+    // The provenance write precedes the first recipient and supervision effect,
+    // and every CLI call it observed was a read.
+    expect(order.slice(0, 3)).toEqual(["persist", "recipient", "reserve"]);
+    expect(callsAtPersist.every((argv) => (argv[0] === "pane" && argv[1] === "current") || argv[0] === "api")).toBe(true);
+    expect(handoffs.persist).toHaveBeenCalledTimes(1);
+    const [runArg, identityArg, provenanceArg] = (handoffs.persist as ReturnType<typeof vi.fn>).mock.calls[0]! as [HandoffAllocation, HandoffRunIdentity, unknown];
+    expect(runArg.marker).toMatch(/^herdr-run:/u);
+    // Manager identity comes from the authoritative snapshot — and the session
+    // is the manager's own native session, never a caller field.
+    expect(identityArg.manager).toEqual({ paneId: "w1:p1", display: "manager", source: "agent_name" });
+    expect(provenanceArg).toEqual({
+      managerSession,
+      task: { ...TASK, tier: "standard", replicas: 1, label: "docs sprint", cwd: repoRoot }
+    });
+  });
+
+  it("persists a null manager session when the caller pane has no native session", async () => {
+    const harness = makeCli();
+    const handoffs = fakeHandoffs();
+    const result = await execute(toolFor({ catalog: catalogOf([{ runner: "pi", model: "pi-model" }]), cli: harness.cli, handoffs }), task());
+    expect(result.details).toMatchObject({ outcome: "launched" });
+    expect((handoffs.persist as ReturnType<typeof vi.fn>).mock.calls[0]![2]).toMatchObject({ managerSession: null });
+  });
+
+  it("fails closed on ambiguous or contradictory manager session evidence before any launch effect", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s-1" };
+    const cases: Array<{ name: string; caller: { pane?: Record<string, unknown>; panes?: Record<string, unknown>[]; agents?: Record<string, unknown>[] } }> = [
+      { name: "duplicate agent records", caller: { agents: [{ pane_id: "w1:p1", agent: "pi" }, { pane_id: "w1:p1", agent: "pi" }] } },
+      { name: "contradictory sessions", caller: { pane: { agent: "pi", agent_session: session }, agents: [{ pane_id: "w1:p1", agent: "pi", agent_session: { ...session, value: "other" } }] } },
+      { name: "malformed session", caller: { pane: { agent_session: { source: "herdr:pi" } } } },
+      {
+        name: "same session supplied only by a sibling agent record",
+        caller: {
+          pane: { agent: "pi", agent_session: session },
+          panes: [{ pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1", agent: "pi" }],
+          agents: [
+            { pane_id: "w1:p1", agent: "pi", agent_session: session },
+            { pane_id: "w1:p9", agent: "pi", agent_session: session }
+          ]
+        }
+      }
+    ];
+    for (const { name, caller } of cases) {
+      const harness = makeCli({ caller });
+      const handoffs = fakeHandoffs();
+      const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+      const result = await execute(toolFor({ catalog, cli: harness.cli, specClient, handoffs }), task());
+      // The launch fails closed on the child record rather than starting over
+      // ambiguous provenance — and nothing persisted or mutated first.
+      expect(result.details!.outcome, name).toBe("failed");
+      expect(result.details!.children[0], name).toMatchObject({ state: "failed", error: { code: "CONTEXT_UNAVAILABLE" } });
+      expect(handoffs.persist, name).not.toHaveBeenCalled();
+      // Only context reads ran — no split, start, prompt, or metadata mutation.
+      expect(harness.calls.filter((argv) => !(argv[0] === "pane" && argv[1] === "current") && argv[0] !== "api"), name).toEqual([]);
+    }
+  });
+
   describe("recovery lineage (ADR-037)", () => {
     const RECOVERY_WORKLOAD = { intent: "implement" as const, mutation: "bounded" as const, scope: "local" as const, horizon: "short" as const, verifiability: "strong" as const, workspaceState: "clean" as const, ambiguity: "low" as const };
 
@@ -553,14 +642,18 @@ describe("herdr_launch task cutover", () => {
       workspaceDir?: string;
       omitRoute?: boolean;
       omitWorkspace?: boolean;
+      omitProvenance?: boolean;
     } = {}): Promise<{ run: HandoffAllocation; allocator: HandoffAllocator; namespaceDir: string; workspaceDir: string }> {
       const namespaceDir = realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-ns-")));
       const workspaceDir = options.workspaceDir ?? realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-ws-")));
       const allocator = createHandoffAllocator({ namespace: { dir: namespaceDir, endpoint: options.endpoint ?? "test-endpoint" } });
       const run = await allocator.allocate();
       const operatingPointId = options.operatingPointId ?? "pi:primary:low";
+      // Recovery lineage is only authoritative with its provenance record: the
+      // seeded run carries the manager session and canonical Task it launched
+      // under — or, with omitProvenance, a pre-provenance legacy record.
       await allocator.persist(run, {
-        manager: { paneId: "w1:p1", display: "caller", source: "injected" },
+        manager: { paneId: "w1:p1", display: "caller", source: "agent_name" },
         child: {
           agentName: "prior-worker",
           agentKind: "pi",
@@ -570,6 +663,9 @@ describe("herdr_launch task cutover", () => {
           ...(options.omitRoute ? {} : { route: { tier: options.routeTier ?? "standard", operatingPointId, policyRevision: "adr-037-p1", workload: RECOVERY_WORKLOAD } }),
           ...(options.omitWorkspace ? {} : { workspace: { resolvedCwd: workspaceDir, ...(options.worktree === undefined ? {} : { worktree: options.worktree }) } })
         }
+      }, options.omitProvenance ? undefined : {
+        managerSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "prior-manager-session" },
+        task: { objective: "prior objective", scope: "prior scope", doneWhen: ["prior done"], constraints: [], tier: "standard", replicas: 1 }
       });
       await updateHandoffState(run, (state) => {
         state.lifecycle.state = options.lifecycle ?? "handed_off";
@@ -583,6 +679,15 @@ describe("herdr_launch task cutover", () => {
       const doc = JSON.parse(readFileSync(run.statePath, "utf8")) as Record<string, unknown>;
       mutate(doc);
       writeFileSync(run.statePath, JSON.stringify(doc), { mode: 0o600 });
+    }
+
+    const provenancePathOf = (run: HandoffAllocation): string => join(run.toolsDir, HANDOFF_PROVENANCE_NAME);
+
+    /** Mutate a persisted provenance document directly — for records that must fail the v1 parse. */
+    function rewriteProvenance(run: HandoffAllocation, mutate: (doc: Record<string, unknown>) => void): void {
+      const doc = JSON.parse(readFileSync(provenancePathOf(run), "utf8")) as Record<string, unknown>;
+      mutate(doc);
+      writeFileSync(provenancePathOf(run), JSON.stringify(doc), { mode: 0o600 });
     }
 
     /** The new run id a launch allocated, recovered from the task's injected marker. */
@@ -762,6 +867,13 @@ describe("herdr_launch task cutover", () => {
         } },
         { name: "malformed route", reason: "state_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); rewriteState(seeded.run, (doc) => { (doc.child as Record<string, unknown>).route = { tier: "bogus" }; }); return seeded; } },
         { name: "malformed workspace", reason: "state_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); rewriteState(seeded.run, (doc) => { (doc.child as Record<string, unknown>).workspace = {}; }); return seeded; } },
+        // A run persisted before provenance existed stays readable as state —
+        // and can never authorize a recovery.
+        { name: "legacy record without provenance", reason: "provenance_missing", seed: async () => seedRecoveryRun({ omitProvenance: true }) },
+        { name: "provenance not JSON", reason: "provenance_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); writeFileSync(provenancePathOf(seeded.run), "not json", { mode: 0o600 }); return seeded; } },
+        { name: "provenance pinned to a foreign run", reason: "provenance_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); rewriteProvenance(seeded.run, (doc) => { doc.runId = randomUUID(); }); return seeded; } },
+        { name: "provenance pinned to a foreign endpoint", reason: "provenance_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); rewriteProvenance(seeded.run, (doc) => { doc.endpoint = "other-endpoint"; }); return seeded; } },
+        { name: "provenance with a malformed Task", reason: "provenance_unreadable", seed: async () => { const seeded = await seedRecoveryRun(); rewriteProvenance(seeded.run, (doc) => { (doc.task as Record<string, unknown>).tier = "bogus"; }); return seeded; } },
         { name: "route absent", reason: "lineage_incomplete", seed: async () => { const seeded = await seedRecoveryRun({ omitRoute: true }); return seeded; } },
         { name: "workspace absent", reason: "lineage_incomplete", seed: async () => { const seeded = await seedRecoveryRun({ omitWorkspace: true }); return seeded; } },
         { name: "unresolvable evidence", reason: "evidence_unresolvable", seed: async () => { const seeded = await seedRecoveryRun(); await updateHandoffState(seeded.run, (state) => { state.lifecycle.state = "bogus" as never; }); return seeded; } },
@@ -1062,6 +1174,36 @@ describe("herdr_launch task cutover", () => {
     const result = await execute(toolFor({ catalog, cli: harness.cli }), task());
     expect(result.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+  });
+
+  it("treats agent_not_ready as a live-but-unready start proven by authoritative readiness", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+    const harness = makeCli({
+      startLeavesBoundAgent: true,
+      start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_not_ready", message: "agent is not an active named agent" } } }); },
+    });
+    const availabilityFailureRecorder = vi.fn(async () => undefined);
+    const supervision = stubSupervision();
+    const result = await execute(toolFor({ catalog, cli: harness.cli, availabilityFailureRecorder, supervision }), task());
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:primary:low" }] });
+    expect(harness.starts).toBe(1);
+    expect(availabilityFailureRecorder).not.toHaveBeenCalled();
+    expect(supervision.bound).toHaveLength(1);
+    expect(harness.prompts).toHaveLength(1);
+  });
+
+  it("fails closed on an agent_not_ready envelope without authoritative transport metadata", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+    const harness = makeCli({
+      startLeavesBoundAgent: true,
+      start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 2, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_not_ready", message: "agent is not an active named agent" } } }); },
+    });
+    const availabilityFailureRecorder = vi.fn(async () => undefined);
+    const result = await execute(toolFor({ catalog, cli: harness.cli, availabilityFailureRecorder }), task());
+    expect(result.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
+    expect(harness.starts).toBe(1);
+    expect(harness.prompts).toHaveLength(0);
+    expect(availabilityFailureRecorder).toHaveBeenCalledTimes(1);
   });
 
   it("recovers readiness timing when a post-start readiness check fails", async () => {

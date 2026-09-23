@@ -11,17 +11,21 @@ import {
   HANDOFF_ARTIFACT_NAME,
   HANDOFF_HEADINGS,
   HANDOFF_MAX_BYTES,
+  HANDOFF_PROVENANCE_MAX_BYTES,
+  HANDOFF_PROVENANCE_NAME,
   HANDOFF_STATE_DIR_NAME,
   HandoffError,
   openHandoffRun,
   parseHandoffArtifact,
   readHandoffArtifact,
+  readHandoffProvenance,
   readHandoffState,
   renderHandoffContract,
   resolveHandoffNamespace,
   RUN_ID_PATTERN,
   updateHandoffState,
   type HandoffAllocation,
+  type HandoffProvenanceInput,
   type HandoffRunIdentity,
   type HandoffState,
 } from "../../src/handoff.js";
@@ -170,6 +174,28 @@ const identityWithLineage: HandoffRunIdentity = {
 function allocatorFor(dir: string, endpoint = "test-endpoint") {
   return createHandoffAllocator({ namespace: { dir, endpoint } });
 }
+
+const managerSession = { source: "herdr:pi", agent: "pi", kind: "id", value: "sess-1" };
+
+/** The canonical Task launch contract a run was persisted under. */
+const taskContract: HandoffProvenanceInput["task"] = {
+  objective: "Implement the feature",
+  scope: "src/a.ts only",
+  doneWhen: ["tests pass", "lint clean"],
+  constraints: ["no new dependencies"],
+  tier: "standard",
+  replicas: 1,
+  recoveryOf: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  label: "feature work",
+  cwd: "/repo"
+};
+
+const provenanceInput: HandoffProvenanceInput = { managerSession, task: taskContract };
+
+/** A manager identity whose display source is one `resolveSender` can emit. */
+const provenanceIdentity: HandoffRunIdentity = { ...identity, manager: { ...identity.manager, source: "agent_name" } };
+
+const provenancePathFor = (run: HandoffAllocation) => join(run.toolsDir, HANDOFF_PROVENANCE_NAME);
 
 const validBody = (marker: string) => `${marker}
 
@@ -477,6 +503,186 @@ describe("recovery lineage records", () => {
       await writeFile(run.statePath, JSON.stringify(state), { mode: 0o600 });
       await expect(readHandoffState(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", message: "Handoff state is malformed" });
     }
+  });
+});
+
+describe("provenance record", () => {
+  it("persists the session and canonical Task contract atomically beside the state record", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir, "endpoint-A");
+    const run = await allocator.allocate();
+    await allocator.persist(run, provenanceIdentity, provenanceInput);
+
+    const path = provenancePathFor(run);
+    const stat = await lstat(path);
+    expect(stat.isFile() && stat.isSymbolicLink()).toBe(false);
+    expect(stat.mode & MODE).toBe(0o600);
+    expect(stat.nlink).toBe(1);
+
+    // Round-trip: the record read back is exactly what was persisted.
+    const record = await readHandoffProvenance(run);
+    expect(record).toEqual({
+      v: 1,
+      runId: run.runId,
+      endpoint: "endpoint-A",
+      createdAt: expect.any(String),
+      manager: { ...provenanceIdentity.manager, session: managerSession },
+      task: taskContract
+    });
+    // No staging files survive either atomic commit.
+    expect((await readdir(run.toolsDir)).sort()).toEqual(["lock", "provenance.json", "state.json"]);
+    // The state record is untouched by the addition.
+    expect((await readHandoffState(run)).runId).toBe(run.runId);
+  });
+
+  it("records a null session for a caller with no native session", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, provenanceIdentity, { managerSession: null, task: taskContract });
+    expect((await readHandoffProvenance(run)).manager.session).toBeNull();
+  });
+
+  it("refuses malformed provenance input before the run directory exists", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const badInputs: HandoffProvenanceInput[] = [
+      { managerSession: { source: "herdr:pi" } as never, task: taskContract },
+      { managerSession: { ...managerSession, value: "a\nb" }, task: taskContract },
+      { managerSession, task: { ...taskContract, doneWhen: [] } },
+      { managerSession, task: { ...taskContract, doneWhen: ["ok", ""] } },
+      { managerSession, task: { ...taskContract, constraints: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] } },
+      { managerSession, task: { ...taskContract, tier: "bogus" as never } },
+      { managerSession, task: { ...taskContract, replicas: 9 } },
+      { managerSession, task: { ...taskContract, replicas: 1.5 } },
+      { managerSession, task: { ...taskContract, recoveryOf: "not-a-run-id" } },
+      { managerSession, task: { ...taskContract, label: "x".repeat(300) } },
+      { managerSession, task: { ...taskContract, cwd: "a\nb" } },
+      { managerSession, task: { ...taskContract, objective: "" } },
+      { managerSession, task: { ...taskContract, objective: "has\0nul" } },
+    ];
+    for (const [index, input] of badInputs.entries()) {
+      const attempt = await allocator.allocate();
+      await expect(allocator.persist(attempt, provenanceIdentity, input), `input ${index}`).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "input_invalid" } });
+      await expect(lstat(attempt.directory)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    // A display source outside the resolveSender vocabulary is equally refused.
+    const attempt = await allocator.allocate();
+    await expect(allocator.persist(attempt, identity, provenanceInput)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "input_invalid" } });
+    await expect(lstat(attempt.directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fails closed on a serialized record over the provenance bound", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    const huge = { managerSession: null, task: { ...taskContract, objective: "x".repeat(HANDOFF_PROVENANCE_MAX_BYTES) } };
+    await expect(allocator.persist(run, provenanceIdentity, huge)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "oversized" } });
+    await expect(lstat(run.directory)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "missing" } });
+  });
+
+  it("keeps a legacy run — persisted without provenance — readable while refusing its provenance", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, identity);
+
+    // The state record reads exactly as before...
+    expect((await readHandoffState(run)).runId).toBe(run.runId);
+    // ...but the provenance contract it cannot satisfy fails closed.
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", message: "Handoff provenance is missing", details: { reason: "missing" } });
+  });
+
+  it("fails closed on untrusted, oversized, or malformed provenance files", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, provenanceIdentity, provenanceInput);
+    const path = provenancePathFor(run);
+
+    // A foreign write bit and a non-single-link leaf are untrusted.
+    await chmod(path, 0o666);
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "untrusted" } });
+    await chmod(path, 0o600);
+    const dup = join(run.toolsDir, "dup.json");
+    await link(path, dup);
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "untrusted" } });
+    await rm(dup);
+
+    // A symlink leaf is not the record.
+    const target = await readFile(path, "utf8");
+    await rm(path);
+    await symlink(join(run.toolsDir, "elsewhere.json"), path);
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "untrusted" } });
+    await rm(path);
+    await writeFile(path, target, { mode: 0o600 });
+
+    // A leaf over the bound is untrusted before it is read.
+    await writeFile(path, Buffer.alloc(HANDOFF_PROVENANCE_MAX_BYTES + 1, 0x61), { mode: 0o600 });
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "untrusted" } });
+
+    // A bounded leaf whose content exceeds the bound fails as oversized.
+    await writeFile(path, "{}", { mode: 0o600 });
+    fsControl.readFileResult = (candidate) => candidate === path ? "x".repeat(HANDOFF_PROVENANCE_MAX_BYTES + 1) : undefined;
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "oversized" } });
+    fsControl.readFileResult = undefined;
+
+    fsControl.failLstat = (candidate) => candidate === path ? eacces() : undefined;
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "untrusted" } });
+    fsControl.failLstat = undefined;
+    fsControl.failReadFile = (candidate) => candidate === path ? eacces() : undefined;
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "untrusted" } });
+    fsControl.failReadFile = undefined;
+
+    // Non-JSON content is malformed, not unreadable.
+    await writeFile(path, "not json", { mode: 0o600 });
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "malformed" } });
+  });
+
+  it("fails closed on any malformed provenance field, and never on a foreign run", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, provenanceIdentity, provenanceInput);
+    const path = provenancePathFor(run);
+    const original = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    const originalManager = JSON.parse(JSON.stringify(original.manager)) as Record<string, unknown>;
+    const originalTask = JSON.parse(JSON.stringify(original.task)) as Record<string, unknown>;
+
+    const mutations: Array<(doc: Record<string, unknown>) => void> = [
+      (doc) => { doc.v = 2; },
+      (doc) => { doc.v = "1"; },
+      (doc) => { doc.runId = randomUUID(); },
+      (doc) => { doc.endpoint = "other-endpoint"; },
+      (doc) => { doc.createdAt = "yesterday"; },
+      (doc) => { delete doc.createdAt; },
+      (doc) => { doc.manager = null; },
+      (doc) => { doc.manager = { ...originalManager, paneId: "" }; },
+      (doc) => { doc.manager = { ...originalManager, source: "made_up" }; },
+      (doc) => { doc.manager = { ...originalManager, session: { source: "" } }; },
+      (doc) => { doc.manager = { ...originalManager, session: { ...managerSession, extra: 1 } }; },
+      (doc) => { doc.manager = { ...originalManager, foreign: true }; },
+      (doc) => { delete doc.manager; },
+      (doc) => { doc.task = "contract"; },
+      (doc) => { doc.task = { ...originalTask, tier: "bogus" }; },
+      (doc) => { doc.task = { ...originalTask, replicas: 0 }; },
+      (doc) => { doc.task = { ...originalTask, doneWhen: [] }; },
+      (doc) => { doc.task = { ...originalTask, recoveryOf: "not-a-run" }; },
+      (doc) => { doc.task = { ...originalTask, label: 5 }; },
+      (doc) => { doc.task = { ...originalTask, foreign: true }; },
+      (doc) => { delete doc.task; },
+      (doc) => { doc.foreign = true; },
+    ];
+    for (const [index, mutate] of mutations.entries()) {
+      const doc = JSON.parse(JSON.stringify(original)) as Record<string, unknown>;
+      mutate(doc);
+      await writeFile(path, JSON.stringify(doc), { mode: 0o600 });
+      await expect(readHandoffProvenance(run), `mutation ${index}`).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED", details: { reason: "malformed" } });
+    }
+    // The unmutated record still parses — the matrix proved field-level strictness.
+    await writeFile(path, JSON.stringify(original), { mode: 0o600 });
+    expect((await readHandoffProvenance(run)).task.tier).toBe("standard");
   });
 });
 

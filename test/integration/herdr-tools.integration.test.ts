@@ -1,6 +1,5 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
@@ -11,7 +10,7 @@ import { createLaunchTool } from "../../src/tools/launch.js";
 import type { TaskEvaluation, TaskEvaluationInput, TypeSafeSpecClient } from "../../src/typesafe-spec.js";
 import { renderTask } from "../../src/launch-schema.js";
 import { renderHandoffContract, type HandoffAllocation } from "../../src/handoff.js";
-import { startDisposableSocketProxy, stopDisposableServer, waitForCondition } from "./disposable-session.js";
+import { createDisposableGitWorkspace, startDisposableSocketProxy, stopDisposableServer, waitForCondition } from "./disposable-session.js";
 
 interface ExecutableTool {
   name: string;
@@ -412,7 +411,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(process.env.HERDR_ENV).toBe("1");
     const currentIds = [process.env.HERDR_WORKSPACE_ID, process.env.HERDR_TAB_ID, process.env.HERDR_PANE_ID];
     expect(currentIds.every(Boolean)).toBe(true);
-    state.cwd = await mkdtemp(`${tmpdir()}/herdr-tools-it-`);
+    state.cwd = await createDisposableGitWorkspace("herdr-tools-it-");
 
     const sessions = resultObject(await run("session", "list", "--json"));
     const existing = Array.isArray(sessions.sessions) && sessions.sessions.some((session) => resultObject(session).name === REQUIRED_SESSION);
@@ -792,7 +791,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const startArgs = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes(String(inline.child.target)));
     expect(startArgs).toBeDefined();
 
-    const inlineDelivery = state.socketProxy?.requests.find((request) => request.text?.includes("integration canary"));
+    const inlineDelivery = state.socketProxy?.requests.find((request) => request.target === inlinePaneId && request.text?.includes("integration canary"));
     expect(inlineDelivery, "task-inline-launch did not record its prompt-socket submission").toBeDefined();
     expect(inlineDelivery!.method).toBe("agent.prompt");
     expect(inlineDelivery!.target).toBe(inlinePaneId);
@@ -847,7 +846,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    * uncertainty is accepted but returns before the readback assertion.
    */
   it("accepts a runtime-selected recipient readback only with agent-produced evidence", async () => {
-    if (state.unconfirmedRecoveries.length >= 2) return;
+    if (state.unconfirmedRecoveries.length > 0) return;
     const left = randomUUID();
     const right = randomUUID();
     const expected = `${left}:${right}`;

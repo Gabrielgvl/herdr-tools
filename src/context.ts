@@ -1,4 +1,5 @@
 import type { JsonEnvelope } from "./cli.js";
+import { boundAgentSessionStrings, optionalCandidateStrings, optionalSessionCandidate, PromptIdentityError, type AgentSessionIdentity } from "./messages/prompt.js";
 import { parseSnapshotResult, type CurrentContext, type HerdrSnapshot, type PaneRecord } from "./targets.js";
 
 export interface ResolvedContext {
@@ -216,6 +217,77 @@ export async function resolveEffectiveContext(cli: ContextCli, context: CurrentC
 
 export function createContextResolver(cli: ContextCli, context: CurrentContext): ContextResolver {
   return (signal) => resolveEffectiveContext(cli, context, signal);
+}
+
+/**
+ * The manager's native agent session captured from the authoritative snapshot —
+ * launch provenance resolved from the same records sender identity is, never a
+ * caller-overridable field. The caller pane is already verified by context
+ * resolution; this join proves which session actually occupied it: every
+ * supplied record must agree, a present `agent_session` must be complete, and
+ * duplicate or contradictory evidence fails closed. A caller with no native
+ * session — a non-agent pane — records `null` rather than fabricating one.
+ */
+export function resolveManagerSession(snapshot: HerdrSnapshot, paneId: string): AgentSessionIdentity | null {
+  const panes = snapshot.panes.filter((pane) => pane.pane_id === paneId);
+  if (panes.length === 0) throw contextError("manager pane could not be resolved in the authoritative snapshot", { paneId: bounded(paneId), reason: "manager_unresolved" });
+  if (panes.length > 1) throw contextError("authoritative snapshot contains duplicate manager panes", { paneId: bounded(paneId), reason: "manager_ambiguous", candidates: panes.length });
+  const agents = snapshot.agents.filter((agent) => agent.pane_id === paneId);
+  if (agents.length > 1) throw contextError("authoritative snapshot contains duplicate manager agents", { paneId: bounded(paneId), reason: "manager_ambiguous", candidates: agents.length });
+  const records: Record<string, unknown>[] = [panes[0]!, ...agents];
+  let session: AgentSessionIdentity | undefined;
+  try {
+    session = optionalSessionCandidate(records);
+    // Records describing one occupant agree on kind and terminal too: a session
+    // joined over contradictory evidence is ambiguous provenance, not a fact.
+    const kind = optionalCandidateStrings(records, ["agent", "agent_kind", "kind"], "agent_kind");
+    optionalCandidateStrings(records, ["terminal_id"], "terminal_id");
+    if (session !== undefined && kind !== undefined && kind !== session.agent) {
+      throw new PromptIdentityError("TARGET_IDENTITY_CHANGED", "Authoritative manager identity is contradictory", { field: "agent_session.agent", expected: kind, actual: session.agent });
+    }
+  } catch (error) {
+    /* c8 ignore next -- optionalSessionCandidate/optionalCandidateStrings throw only PromptIdentityError. */
+    if (error instanceof PromptIdentityError) {
+      throw contextError("manager native session identity is malformed or contradictory", {
+        paneId: bounded(paneId),
+        reason: "session_untrusted",
+        causeCode: error.code,
+        ...boundAgentSessionStrings(error.details)
+      });
+    }
+    /* c8 ignore next -- optionalSessionCandidate only ever throws PromptIdentityError; the rethrow keeps a foreign throw fail-closed. */
+    throw error;
+  }
+  if (session !== undefined) {
+    let matches = 0;
+    for (const pane of snapshot.panes) {
+      const paired = snapshot.agents.filter((agent) => agent.pane_id === pane.pane_id);
+      let candidate: AgentSessionIdentity | undefined;
+      try {
+        candidate = optionalSessionCandidate([pane, ...paired]);
+      } catch (error) {
+        /* c8 ignore next -- optionalSessionCandidate throws only PromptIdentityError. */
+        if (error instanceof PromptIdentityError) {
+          throw contextError("manager native session identity is malformed or contradictory", {
+            paneId: bounded(pane.pane_id), reason: "session_untrusted", causeCode: error.code
+          });
+        }
+        /* c8 ignore next -- optionalSessionCandidate only throws PromptIdentityError; preserve a foreign programming error. */
+        throw error;
+      }
+      if (candidate !== undefined
+        && candidate.source === session.source
+        && candidate.agent === session.agent
+        && candidate.kind === session.kind
+        && candidate.value === session.value) matches += 1;
+    }
+    if (matches !== 1) {
+      throw contextError("manager native session is not uniquely bound to one pane", {
+        paneId: bounded(paneId), reason: "manager_session_ambiguous", candidates: matches
+      });
+    }
+  }
+  return session ?? null;
 }
 
 export function contextRebindingDetails(diagnostics: ContextResolutionDiagnostics): { contextRebinding?: ContextResolutionDiagnostics } {

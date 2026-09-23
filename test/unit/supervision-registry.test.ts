@@ -7,7 +7,7 @@ import { createHandoffAllocator, readHandoffState, type HandoffAllocation } from
 import { createHandoffGate, type HandoffGate } from "../../src/handoff-gate.js";
 import { ReviewerFailure } from "../../src/reviewer.js";
 import { SessionEventMonitor } from "../../src/supervision/monitor.js";
-import { resolveForbiddenTools, SupervisionRegistry } from "../../src/supervision/registry.js";
+import { SupervisionRegistry } from "../../src/supervision/registry.js";
 import { scriptedServer } from "./supervision-peer.js";
 import { TypeSafeSupervisionReviewer, type SupervisionReviewer } from "../../src/supervision/reviewer.js";
 import type { EvidenceState, WorkspaceCommandRunner } from "../../src/supervision/evidence.js";
@@ -138,28 +138,22 @@ describe("the supervision registry", () => {
     await f.supervision.shutdown();
   });
 
-  it("carries the reservation's Tier-0 policy facts on the private request, never the public view", async () => {
+  it("carries the reservation's workspace facts on the private request, never the public view", async () => {
     const f = fixture();
     const register = vi.spyOn(f.jobs, "register");
-    const forbiddenTools = [
-      { agentKind: "claude", operatingPointId: "worker-opus", forbiddenTools: { available: true as const, tools: ["Write", "Bash"] } },
-      { agentKind: "pi", operatingPointId: "worker-pi", forbiddenTools: { available: false as const, reason: "runner_lacks_disallowed_tools" as const } },
-    ];
     const workspaceRoot = { available: true as const, root: "/repo" };
     const reservation = await f.supervision.reserve({
       child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
       settings: {
         supervisionDigest: { doneWhen: ["tests pass"], constraints: ["read-only"], readOnly: true },
-        forbiddenTools,
         workspaceRoot,
       },
     });
     const jobRequest = register.mock.calls[0]![0];
     if (jobRequest.kind !== "supervisor") throw new Error("expected a supervisor job request");
     // Typed private carriers: the digest keeps its authorial readOnly claim,
-    // and the policy facts cross verbatim — no constraint prose is consulted.
+    // and the workspace root crosses verbatim — no constraint prose is consulted.
     expect(jobRequest.settings.supervisionDigest).toEqual({ doneWhen: ["tests pass"], constraints: ["read-only"], readOnly: true });
-    expect(jobRequest.settings.forbiddenTools).toEqual(forbiddenTools);
     expect(jobRequest.settings.workspaceRoot).toEqual(workspaceRoot);
     // The public projection keeps its allowlisted settings shape.
     const detail = f.jobs.get(reservation.jobId)!;
@@ -229,26 +223,6 @@ describe("the supervision registry", () => {
     });
     expect(f.jobs.size()).toBe(0);
     await f.supervision.shutdown();
-  });
-
-  it("resolves the bound candidate's deny-list fact and degrades unmatched or ambiguous bindings", () => {
-    const policies = [
-      { agentKind: "claude", operatingPointId: "opus", forbiddenTools: { available: true as const, tools: ["Write"] } },
-      { agentKind: "pi", operatingPointId: "pi-1", forbiddenTools: { available: false as const, reason: "runner_lacks_disallowed_tools" as const } },
-      { agentKind: "claude", operatingPointId: "dup", forbiddenTools: { available: true as const, tools: ["Write"] } },
-      { agentKind: "claude", operatingPointId: "dup", forbiddenTools: { available: true as const, tools: ["Bash"] } },
-      { agentKind: "pi", operatingPointId: "same", forbiddenTools: { available: false as const, reason: "runner_lacks_disallowed_tools" as const } },
-      { agentKind: "pi", operatingPointId: "same", forbiddenTools: { available: false as const, reason: "runner_lacks_disallowed_tools" as const } },
-    ];
-    expect(resolveForbiddenTools(policies, { agentKind: "claude", operatingPointId: "opus" })).toEqual({ available: true, tools: ["Write"] });
-    expect(resolveForbiddenTools(policies, { agentKind: "pi", operatingPointId: "pi-1" })).toEqual({ available: false, reason: "runner_lacks_disallowed_tools" });
-    // Identical duplicate chain entries resolve to their shared fact.
-    expect(resolveForbiddenTools(policies, { agentKind: "pi", operatingPointId: "same" })).toEqual({ available: false, reason: "runner_lacks_disallowed_tools" });
-    // A binding the reservation never compiled — or one that matches reserved
-    // candidates with different facts — degrades rather than guessing.
-    expect(resolveForbiddenTools(policies, { agentKind: "devin", operatingPointId: "swe" })).toEqual({ available: false, reason: "candidate_not_reserved" });
-    expect(resolveForbiddenTools(policies, { agentKind: "claude", operatingPointId: "dup" })).toEqual({ available: false, reason: "candidate_ambiguous" });
-    expect(resolveForbiddenTools(undefined, { agentKind: "pi", operatingPointId: "pi-1" })).toEqual({ available: false, reason: "candidate_not_reserved" });
   });
 
   it("publishes AGY provisional supervision and atomically strengthens it to exact coverage", async () => {

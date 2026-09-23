@@ -31,7 +31,7 @@ import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/in
 import type { ProfileKind } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import { boundedDiagnosticMessage } from "../telemetry.js";
-import type { SupervisionForbiddenToolsPolicy, SupervisionWorkspaceRoot } from "../job-registry.js";
+import type { SupervisionWorkspaceRoot } from "../job-registry.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
@@ -1871,22 +1871,6 @@ function supervisionWorkspaceRoot(launchCwd: string | undefined): SupervisionWor
   return isAbsolute(launchCwd) ? { available: true, root: launchCwd } : { available: false, reason: "root_not_absolute" };
 }
 
-/**
- * Every compiled chain candidate's deny-list fact (ADR-036 W0). Only the
- * claude runtime has a `disallowedTools` argv surface; other runners record
- * the typed gap rather than a list inferred from prose. The tag is the exact
- * operating-point id the binding reports (ADR-037).
- */
-function supervisionForbiddenTools(contracts: ReadonlyMap<string, CompiledContract>): SupervisionForbiddenToolsPolicy[] {
-  return [...contracts.values()].map((contract) => ({
-    agentKind: contract.runtime.kind,
-    operatingPointId: contract.candidate.id,
-    forbiddenTools: contract.runtime.kind === "claude"
-      ? { available: true, tools: [...contract.runtime.disallowedTools] }
-      : { available: false, reason: "runner_lacks_disallowed_tools" },
-  }));
-}
-
 function noFocusArgs(): string[] {
   return ["--no-focus"];
 }
@@ -2551,7 +2535,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           child: { agentName: childName, agentKind: initialRuntime.kind, operatingPointId: initialContract.candidate.id },
           settings: {
             supervisionDigest,
-            forbiddenTools: supervisionForbiddenTools(contracts),
             workspaceRoot: supervisionWorkspaceRoot(launchCwd)
           }
         });

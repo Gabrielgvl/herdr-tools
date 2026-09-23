@@ -450,14 +450,14 @@ describe("appendSupervisionReview violation records", () => {
     await appendSupervisionReview(violationEntry({
       violations: [
         { eventId: "sev_1", eventType: "reviewer_attention", atMs: 1_000, violation: "read_only_dirty_workspace", details: { violation: "read_only_dirty_workspace", workspace: "dirty" } },
-        { eventId: "sev_2", eventType: "reviewer_attention", atMs: 1_000, violation: "forbidden_tool_observed", details: { violation: "forbidden_tool_observed", tools: "deploy", retried: true } },
+        { eventId: "sev_2", eventType: "reviewer_attention", atMs: 1_000, violation: "evidence_budget_exceeded", details: { violation: "evidence_budget_exceeded", cause: "record_exceeds_budget", retried: true } },
         { eventId: "sev_3", eventType: "reviewer_attention", atMs: 1_000, violation: "process_exit" },
         { eventId: "sev_4", eventType: "reviewer_attention", atMs: 1_000, violation: "process_exit", details: null },
       ],
     }), { root });
     const records = await readRecords(reviewLogPaths(root).reviews);
     expect(records).toHaveLength(4);
-    expect(records.map((item) => (item as { violation: string }).violation)).toEqual(["read_only_dirty_workspace", "forbidden_tool_observed", "process_exit", "process_exit"]);
+    expect(records.map((item) => (item as { violation: string }).violation)).toEqual(["read_only_dirty_workspace", "evidence_budget_exceeded", "process_exit", "process_exit"]);
     expect(records.map((item) => (item as { eventId: string }).eventId)).toEqual(["sev_1", "sev_2", "sev_3", "sev_4"]);
     // Boolean detail scalars persist verbatim.
     expect(records[1]).toMatchObject({ details: { retried: true } });

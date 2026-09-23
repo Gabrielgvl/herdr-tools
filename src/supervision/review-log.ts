@@ -110,7 +110,6 @@ export function representationForTraceSource(source: TraceSourceKind): Supervisi
  */
 export const SUPERVISION_TIER0_VIOLATIONS = [
   "read_only_dirty_workspace",
-  "forbidden_tool_observed",
   "evidence_budget_exceeded",
   "process_exit",
 ] as const;

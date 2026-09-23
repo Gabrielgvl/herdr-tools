@@ -463,7 +463,7 @@ describe("herdr_launch task cutover", () => {
     expect(Object.keys(requests[0]!.settings!.supervisionDigest!).sort()).toEqual(["constraints", "doneWhen"]);
   });
 
-  it("reserves every compiled candidate's deny list with the trusted workspace root", async () => {
+  it("reserves the task digest and the trusted workspace root, with no deny-list policy", async () => {
     const catalog = catalogOf(
       [{ runner: "claude", model: "opus" }, { runner: "pi", model: "pi-model" }, { runner: "devin", model: "swe-2-max" }],
       new Map<RunnerKind, RunnerEntry>([["claude", claudeRunner(["opus"])], ["pi", runnerEntry(["pi-model"])], ["devin", devinRunner(["swe-2-max"])]]),
@@ -478,15 +478,9 @@ describe("herdr_launch task cutover", () => {
     expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:opus:low" }] });
     const settings = requests[0]!.settings!;
     expect(settings.supervisionDigest).toEqual({ doneWhen: TASK.doneWhen, constraints: TASK.constraints });
-    // The deny list belongs to the runner that may actually start, so the
-    // reservation carries every compiled candidate's fact keyed on the exact
-    // operating-point id: claude's argv deny channel is the only authoritative
-    // source; pi and devin have none.
-    expect(settings.forbiddenTools).toEqual([
-      { agentKind: "claude", operatingPointId: "claude:opus:low", forbiddenTools: { available: true, tools: [] } },
-      { agentKind: "pi", operatingPointId: "pi:pi-model:low", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
-      { agentKind: "devin", operatingPointId: "devin:swe-2-max", forbiddenTools: { available: false, reason: "runner_lacks_disallowed_tools" } },
-    ]);
+    // Tool permission enforcement lives in the compiled argv, not the
+    // reservation: the reserve settings carry no forbiddenTools policy.
+    expect(settings).not.toHaveProperty("forbiddenTools");
     // The canonical launch cwd is the trusted workspace root.
     expect(settings.workspaceRoot).toEqual({ available: true, root: repoRoot });
   });

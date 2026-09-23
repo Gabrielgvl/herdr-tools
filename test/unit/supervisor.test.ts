@@ -124,8 +124,6 @@ interface HarnessOptions {
   traceSource?: TraceSource;
   /** The Devin structured-session reader the default source plugs in. */
   devinSession?: DevinSessionReader;
-  /** The reservation's deny-list resolver, keyed by the bound identity. */
-  resolveForbiddenTools?: SupervisorDependencies["resolveForbiddenTools"];
   /** The trusted launch workspace root the cadence reads. */
   workspaceRoot?: SupervisionWorkspaceRoot;
   /** The reserve-time workspace base handed to the cadence. */
@@ -198,7 +196,6 @@ function harness(options: HarnessOptions = {}): Harness {
       readTerminal: readTranscript,
       devinSession: options.devinSession ?? (async () => ({ position: undefined, events: [] })),
     }),
-    ...(options.resolveForbiddenTools === undefined ? {} : { resolveForbiddenTools: options.resolveForbiddenTools }),
     ...(options.workspaceRoot === undefined ? {} : { workspaceRoot: options.workspaceRoot }),
     ...(options.workspaceBase === undefined ? {} : { workspaceBase: options.workspaceBase }),
     ...(options.workspaceRunner === undefined ? {} : { workspaceRunner: options.workspaceRunner }),
@@ -2745,103 +2742,6 @@ describe("the ADR-036 evidence cadence", () => {
     });
   });
 
-  it("reports a deny-listed tool observed in the trace, resolved against the bound identity", async () => {
-    const boundArgs: Array<{ agentKind: string; operatingPointId: string }> = [];
-    const h = await working({
-      traceFile: piJsonl([piToolCall("Deploy")]),
-      resolveForbiddenTools: (bound) => { boundArgs.push(bound); return { available: true, tools: ["deploy"] }; },
-    });
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
-    // The resolver saw the runner identity that actually bound — pi/worker-pi.
-    expect(boundArgs).toEqual([{ agentKind: "pi", operatingPointId: "worker-pi" }]);
-    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "forbidden_tool_observed", tools: "deploy" });
-    expect(h.wakes[0]!.event.details).not.toHaveProperty("classification");
-    expect(h.reviews).toBe(0);
-    // The digest hash persisted is the digest the violation was judged on —
-    // recomputable from the same window the violation cadence consumed.
-    expect(h.logged).toHaveLength(1);
-    expect(h.logged[0]).toMatchObject({
-      provenance: {
-        traceSource: "pi-jsonl",
-        representation: "B-runner-trace",
-        traceFromCursor: null,
-        traceToCursor: expect.stringMatching(/^pi-jsonl@\d+:[0-9a-f]{64}$/u),
-        traceDigestHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
-        stateBytes: expect.any(Number),
-        terminalBytes: expect.any(Number),
-      },
-      violations: [{ violation: "forbidden_tool_observed", details: { violation: "forbidden_tool_observed", tools: "deploy" } }],
-    });
-    // The violation cadence consumed its window: the next cadence reviews
-    // normally and sees no new terminal delta.
-    h.fireTimer();
-    await vi.waitFor(() => expect(h.reviews).toBe(1));
-    expect(h.reviewRequests[0]!.evidence!.terminal.lines).toEqual([]);
-    expect(h.reviewRequests[0]!.evidence!.trace.cursorFrom).toMatchObject({ source: "pi-jsonl" });
-  });
-
-  it("reviews normally when the deny-list has no match", async () => {
-    const noMatch = await working({
-      traceFile: piJsonl([piToolCall("Bash")]),
-      resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
-    });
-    noMatch.fireTimer();
-    await vi.waitFor(() => expect(noMatch.reviews).toBe(1));
-    expect(noMatch.wakes).toEqual([]);
-  });
-
-  it("reports a typed policy gap — once — when the armed deny list is a typed resolver gap", async () => {
-    // ADR-036 V2-07: the armed rule is unenforceable without a real deny-list
-    // fact, so it reports the typed gap as evidence_gap instead of claiming
-    // the check ran — while the review itself proceeds normally.
-    const h = await working({
-      resolveForbiddenTools: () => ({ available: false, reason: "candidate_not_reserved" }),
-    });
-    h.fireTimer();
-    await vi.waitFor(() => expect(h.reviews).toBe(1));
-    expect(types(h.wakes)).toEqual(["evidence_gap"]);
-    expect(h.wakes[0]!.event.details).toMatchObject({ gap: "forbidden_tool_policy", reason: "candidate_not_reserved" });
-    // Once: a persistent typed gap does not wake again on later cadences.
-    h.fireTimer();
-    await vi.waitFor(() => expect(h.reviews).toBe(2));
-    expect(types(h.wakes)).toEqual(["evidence_gap"]);
-  });
-
-  it("reports a typed policy gap when the bound trace source can never observe tools", async () => {
-    // Claude carries a deny list but binds tmux-fallback, whose window emits
-    // no tool entries — armed but unenforceable, reported once (V2-07).
-    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
-    const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
-    const h = harness({
-      child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
-      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
-      resolveForbiddenTools: () => ({ available: true, tools: ["Bash"] }),
-    });
-    await h.supervisor.bind({ identity: claudeIdentity, operatingPointId: "worker-claude" });
-    h.fireTimer();
-    await vi.waitFor(() => expect(h.reviews).toBe(1));
-    expect(types(h.wakes)).toEqual(["evidence_gap"]);
-    expect(h.wakes[0]!.event.details).toMatchObject({ gap: "forbidden_tool_policy", reason: "no_tool_observations" });
-    h.fireTimer();
-    await vi.waitFor(() => expect(h.reviews).toBe(2));
-    expect(types(h.wakes)).toEqual(["evidence_gap"]);
-  });
-
-  it("stays silent when the armed deny list is empty — trivially enforceable is not a gap", async () => {
-    const claudeSession = { source: "herdr:claude", agent: "claude", kind: "id", value: "s1" };
-    const claudeIdentity: SupervisedIdentity = { ...identity, agentKind: "claude", agentSession: claudeSession };
-    const h = harness({
-      child: { agentName: "worker", agentKind: "claude", operatingPointId: "worker-claude" },
-      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "claude", agentSession: claudeSession })])],
-      resolveForbiddenTools: () => ({ available: true, tools: [] }),
-    });
-    await h.supervisor.bind({ identity: claudeIdentity, operatingPointId: "worker-claude" });
-    h.fireTimer();
-    await vi.waitFor(() => expect(h.reviews).toBe(1));
-    expect(h.wakes).toEqual([]);
-  });
-
   it("reports a dirty workspace under a read-only reservation as a Tier-0 violation", async () => {
     const h = await working({
       assignmentDigest: { doneWhen: ["x"], constraints: [], readOnly: true },
@@ -3193,13 +3093,12 @@ describe("the ADR-036 evidence cadence", () => {
       assignmentDigest: { doneWhen: ["tests pass"], constraints: [], readOnly: true },
       workspaceRoot,
       workspaceRunner: cleanRunner,
-      resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
       traceFile: piJsonl([piToolCall("Read")]),
     });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     const json = JSON.stringify(h.supervisor.view());
-    for (const key of ["traceCursor", "traceFromCursor", "traceToCursor", "previousReview", "patch", "workspaceRoot", "workspaceBaseRevision", "forbiddenTools", "assignmentDigest", "readOnly", "unreportedExit", "evidenceBaseline", "traceSource", "evidenceScanner"]) {
+    for (const key of ["traceCursor", "traceFromCursor", "traceToCursor", "previousReview", "patch", "workspaceRoot", "workspaceBaseRevision", "assignmentDigest", "readOnly", "unreportedExit", "evidenceBaseline", "traceSource", "evidenceScanner"]) {
       expect(json).not.toContain(`"${key}"`);
     }
     // The public review record keeps the consumer shape — no evidence payload.
@@ -3223,33 +3122,6 @@ describe("the ADR-036 evidence cadence", () => {
     // next cadence retries the same read and stays silent the same way.
     h.fireTimer();
     await vi.waitFor(() => expect(h.progress.filter((line) => line.includes("review unavailable"))).toHaveLength(2));
-  });
-
-  it("still detects a forbidden tool from the raw trace when the build refuses the cadence", async () => {
-    const h = await working({
-      traceFile: piJsonl([piToolCall("Write")]),
-      resolveForbiddenTools: () => ({ available: true, tools: ["write"] }),
-      evidenceScanner: () => ({ outcome: "sensitive" }),
-    });
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
-    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "forbidden_tool_observed", tools: "write" });
-    expect(h.reviews).toBe(0);
-    // The refused build's byte counts are honest nulls; the recomputed digest
-    // hash still pins the exact window the violation was judged on.
-    expect(h.logged).toHaveLength(1);
-    expect(h.logged[0]).toMatchObject({
-      provenance: {
-        traceSource: "pi-jsonl",
-        representation: "B-runner-trace",
-        traceDigestHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
-        workspaceFingerprint: null,
-        stateBytes: null,
-        terminalBytes: null,
-        identityHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
-      },
-      violations: [{ violation: "forbidden_tool_observed", details: { violation: "forbidden_tool_observed", tools: "write" } }],
-    });
   });
 
   it("forwards a carried outcome into the attention fallback", async () => {
@@ -3380,11 +3252,10 @@ describe("the ADR-036 evidence cadence", () => {
       const h = harness({
         reviewLog: "default",
         reviewLogRoot: root,
-        snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])],
-        traceFile: piJsonl([piToolCall("Deploy")]),
-        resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), snapshot([paneRecord({ status: "working", revision: 5 })])],
       });
       await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+      await h.supervisor.onEvent(exitEvent("p1", { exit_code: 9 }));
       h.fireTimer();
       await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
       const paths = reviewLogPaths(root);
@@ -3402,8 +3273,8 @@ describe("the ADR-036 evidence cadence", () => {
           eventType: "reviewer_attention",
           atMs: 1_000,
           disposition: "unknown",
-          violation: "forbidden_tool_observed",
-          details: { violation: "forbidden_tool_observed", tools: "deploy" },
+          violation: "process_exit",
+          details: { violation: "process_exit", exitCode: 9 },
           provenance: {
             traceSource: "pi-jsonl",
             representation: "B-runner-trace",
@@ -3422,10 +3293,10 @@ describe("the ADR-036 evidence cadence", () => {
     const persisted: SupervisionLogEntry[] = [];
     let fail = true;
     const h = await working({
-      traceFile: piJsonl([piToolCall("Deploy")]),
-      resolveForbiddenTools: () => ({ available: true, tools: ["deploy"] }),
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])],
       reviewLog: async (entry) => { if (fail) throw new ReviewLogError(); persisted.push(entry); },
     });
+    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 9 }));
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded"]));
     expect(h.reviews).toBe(0);

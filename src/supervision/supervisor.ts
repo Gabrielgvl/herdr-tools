@@ -100,7 +100,6 @@ import type {
 } from "./state.js";
 import type {
   SupervisionChildBindingPublication,
-  SupervisionForbiddenTools,
   SupervisionReservationDigest,
   SupervisionResult,
   SupervisionWorkspaceRoot,
@@ -176,14 +175,6 @@ export interface SupervisorDependencies {
    * never part of the public projection.
    */
   assignmentDigest?: SupervisionReservationDigest;
-  /**
-   * The reservation's deny-list resolver (ADR-036 W0), keyed by the runner
-   * identity that actually bound — fallback may have started a different
-   * reserved candidate. Absent means no rule is armed; a typed gap answer
-   * means the armed rule is unenforceable and reports its coverage gap once
-   * as `evidence_gap` (ADR-036 V2-07).
-   */
-  resolveForbiddenTools?: (bound: { agentKind: string; operatingPointId: string }) => SupervisionForbiddenTools;
   /**
    * The trusted launch workspace root the per-cadence workspace evidence reads
    * (ADR-036 W0). Absent or a typed gap ⇒ the view reports the gap verbatim;
@@ -418,8 +409,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * pane's process is no longer this child.
    */
   private unreportedExit: { exitCode?: number; signal?: string } | undefined;
-  /** Whether the armed-but-unenforceable forbidden-tool rule already reported its typed gap (ADR-036 V2-07). */
-  private forbiddenToolGapReported = false;
   private settlement: Settlement | undefined;
   private selectedOperatingPointId: string | undefined;
   private bindStarted = false;
@@ -1678,7 +1667,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // violation evidence, never a probabilistic claim. A cadence that
       // reports one consumed this window, so the cursors advance with it and
       // no Jev request leaves.
-      const violations = this.emitTier0Violations(reviewed, trace, workspace, build);
+      const violations = this.emitTier0Violations(trace, workspace, build);
       if (violations.length > 0) {
         this.reviewedTranscript = transcript;
         this.traceCursor = trace.cursorTo;
@@ -1945,12 +1934,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * violation evidence — no probabilistic classification, no review record —
    * and the cadence is consumed (the emitted reports drive the violation-log
    * append and tell the caller to return). Everything here is a code fact: a
-   * read-only reservation whose workspace went dirty, a deny-listed tool the
-   * structured trace observed, an E3 byte budget that refused, or an
-   * authoritative non-clean process exit.
+   * read-only reservation whose workspace went dirty, an E3 byte budget that
+   * refused, or an authoritative non-clean process exit.
    */
   private emitTier0Violations(
-    reviewed: SupervisedIdentity,
     trace: TraceWindow,
     workspace: WorkspaceView,
     build: EvidenceBuild,
@@ -1984,36 +1971,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         });
       }
     }
-    const forbidden = this.deps.resolveForbiddenTools?.({
-      agentKind: reviewed.agentKind,
-      operatingPointId: this.selectedOperatingPointId!,
-    });
-    if (forbidden !== undefined) {
-      // ADR-036 V2-07: the matcher enforces only where a real deny-list fact
-      // meets a trace source that can observe tool calls. A typed resolver
-      // gap — or the terminal fallback, which produces no tool entries by
-      // construction — means the armed rule is unenforceable: report that
-      // coverage gap once rather than silently claiming the check ran.
-      if (forbidden.available === false) {
-        this.reportForbiddenToolGap(forbidden.reason);
-      } else if (trace.source === "tmux-fallback" && forbidden.tools.length > 0) {
-        // An empty deny list is trivially enforceable — nothing to observe.
-        this.reportForbiddenToolGap("no_tool_observations");
-      } else {
-        // Tool names the digest observed — classified and unclassified alike.
-        // Case-insensitive: a deny-listed tool is the same tool in any spelling.
-        const digest = build.available ? build.state.trace : buildExecutionDigest(trace);
-        const observed = new Set([...digest.actions, ...digest.other].map((entry) => entry.tool.toLowerCase()));
-        const matched = forbidden.tools.filter((tool) => observed.has(tool.toLowerCase()));
-        if (matched.length > 0) {
-          violations.push({
-            reason: "forbidden_tool_observed",
-            detail: `forbidden tools observed in the trace: ${matched.join(", ")}`,
-            evidence: { violation: "forbidden_tool_observed", tools: matched.join(",") },
-          });
-        }
-      }
-    }
     // The typed detail rides the record too — bounded scalars (bytes, budget,
     // offset) are the violation's own provenance.
     const overflow = trace.typedFailure !== undefined && EVIDENCE_OVERFLOW_FAILURES.has(trace.typedFailure.kind)
@@ -2044,19 +2001,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // latched so the next cadence still reports it.
     if (exit !== undefined) this.unreportedExit = undefined;
     return reported;
-  }
-
-  /**
-   * ADR-036 V2-07: an armed forbidden-tool rule that cannot enforce — the
-   * resolver returned a typed gap, or the bound trace source can never carry
-   * a tool observation — reports its coverage gap once as `evidence_gap`
-   * rather than silently claiming the check ran. The matcher itself stays
-   * for the pairing where a real deny list meets a tool-observing source.
-   */
-  private reportForbiddenToolGap(reason: string): void {
-    if (this.forbiddenToolGapReported) return;
-    this.forbiddenToolGapReported = true;
-    this.emit("evidence_gap", `the forbidden-tool Tier-0 check is unenforced for this child (${reason})`, { gap: "forbidden_tool_policy", reason });
   }
 
   /**

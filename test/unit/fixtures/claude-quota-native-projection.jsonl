@@ -1,0 +1,1 @@
+{"type":"assistant","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/home/worker/project","isApiErrorMessage":true,"error":"rate_limit","apiErrorStatus":429,"requestId":"req-redacted","timestamp":"2026-09-24T12:00:01.000Z"}

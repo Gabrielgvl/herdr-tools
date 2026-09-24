@@ -310,6 +310,16 @@ describe("supervisor binding", () => {
     expect(types(h.wakes)).toEqual(["identity_replaced"]);
   });
 
+  it("checks the bound session when reconnect loses continuity", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    const signal = vi.fn().mockResolvedValue(true);
+    h.supervisor.onCompletionSignal(signal);
+    await h.supervisor.onBootstrap(snapshot([], []), 2, true);
+    expect(signal).toHaveBeenCalledExactlyOnceWith(identity);
+    expect(await h.supervisor.run()).toMatchObject({ outcome: "identity_lost" });
+  });
+
   it("surfaces cooldown persistence failure once without settling the child", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord()])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });

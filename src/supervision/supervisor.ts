@@ -848,8 +848,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
           this.scheduleCompletionSignal();
         }, 250);
         this.completionRetry.unref();
-      } else if (!this.completionRecorded && this.completionAttempts >= 3 && this.transitions.last()?.to === this.status) {
-        this.scheduleHandoffEvaluation();
+      } else if (!this.completionRecorded && this.completionAttempts >= 3) {
+        const last = this.transitions.last()?.to;
+        // Claude can normalize done → idle without another transition.
+        if (last === this.status || (last === "done" && this.status === "idle")) this.scheduleHandoffEvaluation();
       }
     }).catch(() => undefined);
   }

@@ -3783,6 +3783,23 @@ describe("managed handoff evaluation", () => {
     }
   });
 
+  it("repairs after the quota window even when done normalizes to idle", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn(async () => false as const);
+      h.supervisor.onCompletionSignal(signal);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 7, stateChangeSeq: 7 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(3), { timeout: 2000 });
+      expect(h.supervisor.view().status).toBe("idle");
+      await vi.waitFor(() => expect(prompts).toHaveLength(1), { timeout: 2000 });
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not repair from initial idle and rechecks the first blocked turn", async () => {
     const prompts: string[] = [];
     const initialIdle = snapshot([paneRecord({ status: "idle", revision: 5, stateChangeSeq: 5 })]);

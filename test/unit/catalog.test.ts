@@ -22,7 +22,8 @@ const PI_MODELS = `    models:
 const POINT_POLICY = `pointPolicy:\n${[
   ...["openai/pi-pro", "openai/pi-lite"].flatMap((model) => ["off", "low", "medium", "high", "xhigh", "max"].map((level) => `  pi:${model}:${level}: {costClass: low, latencyClass: low}`)),
   ...["low", "high", "max"].map((level) => `  pi:zai/test-glm:${level}: {costClass: low, latencyClass: low}`),
-  ...["claude-opus-5", "claude-sonnet-5"].flatMap((model) => CLAUDE_EFFORTS.map((effort) => `  claude:${model}:${effort}: {costClass: low, latencyClass: low}`)),
+  ...CLAUDE_EFFORTS.map((effort) => `  claude:claude-opus-5:${effort}: {costClass: low, latencyClass: low}`),
+  ...CLAUDE_EFFORTS.filter((effort) => effort !== "xhigh").map((effort) => `  claude:claude-sonnet-5:${effort}: {costClass: low, latencyClass: low}`),
   "  agy:gemini-high: {costClass: low, latencyClass: low}",
   "  agy:gemini-low: {costClass: low, latencyClass: low}",
   "  devin:swe-2-max: {costClass: low, latencyClass: low}",
@@ -49,7 +50,7 @@ ${PI_MODELS}
       skills: [skills/adr, skills/tdd]
       mcp: [herdr, executor]
   claude:
-    models: [{model: claude-opus-5, supportedReasoning: [low, medium, high, max]}, {model: claude-sonnet-5, supportedReasoning: [low, medium, high, max]}]
+    models: [{model: claude-opus-5, supportedReasoning: [low, medium, high, xhigh, max]}, {model: claude-sonnet-5, supportedReasoning: [low, medium, high, max]}]
     quota: {provider: anthropic, billingProduct: claude, account: primary, scope: account}
     defaults: {effort: high, permissionMode: dontAsk, timeoutMinutes: 30, sessionPersistence: true}
     plumbing: {sessionPersistence: required, promptDelivery: file, skillSelection: additive, toolSelection: allowlist}
@@ -101,12 +102,12 @@ describe("catalog", () => {
   it("parses the shipped catalog config and its generated point set", async () => {
     const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
     expect(catalog.version).toBe(2);
-    expect(catalog.points).toHaveLength(48);
+    expect(catalog.points).toHaveLength(49);
     expect(catalog.tierChains).toEqual({
       utility: ["pi:openai-codex/gpt-6-luna:low", "devin:swe-1-7-lightning-medium"],
       economy: ["devin:swe-2-medium", "pi:openai-codex/gpt-6-luna:max", "pi:zai/glm-5.3-flash:low", "claude:sonnet:low"],
-      standard: ["devin:swe-2-high", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6-sol:high", "agy:gemini-3.8-flash-low"],
-      strong: ["devin:swe-2-max", "pi:openai-codex/gpt-6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "claude:opus:low", "agy:gemini-3.8-flash-high"],
+      standard: ["devin:swe-2-high", "claude:opus:low", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6-sol:high", "agy:gemini-3.8-flash-low"],
+      strong: ["devin:swe-2-max", "claude:opus:xhigh", "pi:openai-codex/gpt-6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "agy:gemini-3.8-flash-high"],
       frontier: ["claude:fable:low", "pi:openai-codex/gpt-6-astra:high", "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium"],
       max: ["claude:fable:max", "pi:openai-codex/gpt-6-astra:max", "devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium"],
     });
@@ -200,7 +201,7 @@ describe("catalog", () => {
       VALID.replace("supportedReasoning: [off, low, medium, high, xhigh, max]}", "supportedReasoning: [off, off]}"),
       VALID.replace("supportedReasoning: [off, low, medium, high, xhigh, max]}", "supportedReasoning: [minimal]}"),
       VALID.replace("supportedReasoning: [off, low, medium, high, xhigh, max]}", "supportedReasoning: [bogus]}"),
-      VALID.replace("{model: claude-opus-5, supportedReasoning: [low, medium, high, max]}", "{model: claude-opus-5, supportedReasoning: [low, off]}"),
+      VALID.replace("{model: claude-opus-5, supportedReasoning: [low, medium, high, xhigh, max]}", "{model: claude-opus-5, supportedReasoning: [low, off]}"),
       VALID.replace("models: [{model: gemini-high}, {model: gemini-low}]", "models: [{model: gemini-high, supportedReasoning: [low]}, {model: gemini-low}]"),
       VALID.replace("    quota: {provider: openai", "    quota: {provider: openai, tenant: x"),
       VALID.replace("quota: {provider: openai, billingProduct: codex, account: primary, scope: account}", "quota: {provider: openai, billingProduct: codex, account: primary}"),
@@ -293,11 +294,11 @@ describe("catalog", () => {
     await expect(loadCatalog(join(root, "missing.yaml"))).rejects.toThrow();
   });
 
-  it("ships exactly the reviewed 48 operating points with the migrated policy table", async () => {
+  it("ships exactly the reviewed 49 operating points with the migrated policy table", async () => {
     const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
     const points = catalog.points ?? [];
-    expect(points).toHaveLength(48);
-    expect(catalog.pointPolicy?.size).toBe(48);
+    expect(points).toHaveLength(49);
+    expect(catalog.pointPolicy?.size).toBe(49);
     for (const point of points) expect(catalog.pointPolicy?.get(point.id)).toEqual({ costClass: point.costClass, latencyClass: point.latencyClass });
     // The audited Appendix A table (plan-delta-model-audit v3.1) with the GPT-6
     // migration applied: Luna/Sol rows carry the audited classes verbatim by
@@ -328,6 +329,7 @@ describe("catalog", () => {
       "claude:opus:low": { costClass: "high", latencyClass: "medium" },
       "claude:opus:medium": { costClass: "high", latencyClass: "medium" },
       "claude:opus:high": { costClass: "high", latencyClass: "high" },
+      "claude:opus:xhigh": { costClass: "high", latencyClass: "high" },
       "claude:opus:max": { costClass: "high", latencyClass: "high" },
       "claude:sonnet:low": { costClass: "medium", latencyClass: "low" },
       "claude:sonnet:medium": { costClass: "medium", latencyClass: "low" },
@@ -354,7 +356,7 @@ describe("catalog", () => {
       "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium": { costClass: "extreme", latencyClass: "extreme" },
     });
     expect(points.filter((point) => point.runner === "pi")).toHaveLength(23);
-    expect(points.filter((point) => point.runner === "claude")).toHaveLength(13);
+    expect(points.filter((point) => point.runner === "claude")).toHaveLength(14);
     expect(points.filter((point) => point.runner === "agy")).toHaveLength(3);
     expect(points.filter((point) => point.runner === "devin")).toHaveLength(9);
     // Pi `minimal` never mints a canonical point; the adaptive router model is absent.
@@ -409,6 +411,7 @@ describe("catalog", () => {
       "claude:opus:low",
       "claude:opus:max",
       "claude:opus:medium",
+      "claude:opus:xhigh",
       "claude:sonnet:high",
       "claude:sonnet:low",
       "claude:sonnet:max",
@@ -447,14 +450,15 @@ describe("catalog", () => {
   it("generates model x declared-reasoning points with opaque ids and merged quota attribution", () => {
     const catalog = parse();
     const points = catalog.points ?? [];
-    expect(points).toHaveLength(26);
+    expect(points).toHaveLength(27);
     const ids = points.map((point) => point.id);
     expect(new Set(ids).size).toBe(ids.length);
     for (const model of ["openai/pi-pro", "openai/pi-lite"]) for (const level of ["off", "low", "medium", "high", "xhigh", "max"]) expect(ids).toContain(`pi:${model}:${level}`);
     for (const level of ["low", "high", "max"]) expect(ids).toContain(`pi:zai/test-glm:${level}`);
     // The runner-level `minimal` alias never mints a canonical point.
     expect(ids.some((id) => id.endsWith(":minimal"))).toBe(false);
-    for (const model of ["claude-opus-5", "claude-sonnet-5"]) for (const effort of CLAUDE_EFFORTS) expect(ids).toContain(`claude:${model}:${effort}`);
+    for (const effort of CLAUDE_EFFORTS) expect(ids).toContain(`claude:claude-opus-5:${effort}`);
+    for (const effort of CLAUDE_EFFORTS.filter((effort) => effort !== "xhigh")) expect(ids).toContain(`claude:claude-sonnet-5:${effort}`);
     // Model-encoded runners emit one bare `runner:model` point — no reasoning segment or field.
     expect(ids).toEqual(expect.arrayContaining(["agy:gemini-high", "agy:gemini-low", "devin:swe-2-max"]));
     for (const point of points) {

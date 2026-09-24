@@ -212,7 +212,7 @@ runners:
     # supports no Claude effort — it yields one unreasoned point.
     models:
       - {model: fable, supportedReasoning: [low, medium, high, max]}
-      - {model: opus, supportedReasoning: [low, medium, high, max]}
+      - {model: opus, supportedReasoning: [low, medium, high, xhigh, max]}
       - {model: sonnet, supportedReasoning: [low, medium, high, max]}
       - {model: haiku}
     quota:
@@ -318,14 +318,15 @@ tierChains:
     - claude:sonnet:low
   standard:
     - devin:swe-2-high
+    - claude:opus:low
     - pi:zai/glm-5.3-flash:high
     - pi:openai-codex/gpt-6-sol:high
     - agy:gemini-3.8-flash-low
   strong:
     - devin:swe-2-max
+    - claude:opus:xhigh
     - pi:openai-codex/gpt-6-sol:xhigh
     - pi:zai/glm-5.3-flash:max
-    - claude:opus:low
     - agy:gemini-3.8-flash-high
   frontier:
     - claude:fable:low
@@ -376,6 +377,8 @@ pointPolicy:
   claude:opus:low: {costClass: high, latencyClass: medium}
   claude:opus:medium: {costClass: high, latencyClass: medium}
   claude:opus:high: {costClass: high, latencyClass: high}
+  # xhigh inherits max's classes provisionally pending Claude-specific calibration.
+  claude:opus:xhigh: {costClass: high, latencyClass: high}
   claude:opus:max: {costClass: high, latencyClass: high}
   claude:sonnet:low: {costClass: medium, latencyClass: low}
   claude:sonnet:medium: {costClass: medium, latencyClass: low}

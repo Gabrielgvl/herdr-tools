@@ -209,6 +209,16 @@ function projectSpecProbabilities(value: unknown): Record<string, unknown> {
       ...(value.intent.probabilities === undefined ? {} : { probabilities: distribution(value.intent.probabilities) })
     };
   }
+  if (value.tier !== undefined) {
+    if (!record(value.tier) || !TIERS.has(value.tier.value as string) || !probability(value.tier.confidence)) {
+      throw routerLogFailure("Router decision probabilities are untrusted");
+    }
+    out.tier = {
+      value: value.tier.value,
+      confidence: value.tier.confidence,
+      ...(value.tier.probabilities === undefined ? {} : { probabilities: distribution(value.tier.probabilities) })
+    };
+  }
   if (value.modifiers !== undefined) {
     if (!record(value.modifiers)) throw routerLogFailure("Router decision probabilities are untrusted");
     const modifiers: Record<string, unknown> = {};

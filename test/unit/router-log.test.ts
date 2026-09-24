@@ -167,6 +167,7 @@ function specProbabilities(): Record<string, unknown> {
   return {
     quality: { done_when_verifiable: 0.9 },
     intent: { value: "implement", confidence: 0.9, probabilities: { explore: 0.01, reason: 0.01, implement: 0.94, debug: 0.01, verify: 0.01, review: 0.01, coordinate: 0.01 } },
+    tier: { value: "standard", confidence: 0.6, probabilities: { utility: 0.02, economy: 0.18, standard: 0.6, strong: 0.15, frontier: 0.04, max: 0.01 } },
     modifiers: { mutation_broad: { probability: 0.8, applied: true, confidence: 0.8 } },
     resources: { pi: { tools: { read: 0.9, executor_execute: 0.5 } } },
     fitness: { "0": { utility: 0.9, economy: 0.9, standard: 0.9, strong: 0.9, frontier: 0.9, max: 0.9 } },
@@ -523,6 +524,10 @@ describe("appendRouterDecision refusal", () => {
     { name: "an invalid intent confidence", mutate: (input) => ({ ...input, probabilities: { intent: { value: "implement", confidence: 2 } } }) },
     { name: "a non-record intent distribution", mutate: (input) => ({ ...input, probabilities: { intent: { value: "implement", confidence: 0.9, probabilities: 5 } } }) },
     { name: "an intent distribution that does not sum to one", mutate: (input) => ({ ...input, probabilities: { intent: { value: "implement", confidence: 0.9, probabilities: { implement: 0.5 } } } }) },
+    { name: "a non-record probability tier", mutate: (input) => ({ ...input, probabilities: { tier: 5 } }) },
+    { name: "an unknown probability tier value", mutate: (input) => ({ ...input, probabilities: { tier: { value: "ghost", confidence: 0.9 } } }) },
+    { name: "an invalid tier confidence", mutate: (input) => ({ ...input, probabilities: { tier: { value: "standard", confidence: 2 } } }) },
+    { name: "a tier distribution that does not sum to one", mutate: (input) => ({ ...input, probabilities: { tier: { value: "standard", confidence: 0.9, probabilities: { standard: 0.5 } } } }) },
     { name: "a non-record probability modifiers", mutate: (input) => ({ ...input, probabilities: { modifiers: 5 } }) },
     { name: "an unknown probability modifier", mutate: (input) => ({ ...input, probabilities: { modifiers: { ghost: { probability: 0.9, applied: true, confidence: 0.9 } } } }) },
     { name: "a malformed probability modifier", mutate: (input) => ({ ...input, probabilities: { modifiers: { horizon_long: { probability: 0.9, confidence: 0.9 } } } }) },

@@ -102,6 +102,7 @@ const FAILURE_CLASS_BY_CODE: Readonly<Record<string, LaunchFailureClass>> = {
   account_quota_exceeded: "quota",
   billing_exhausted: "quota",
   credits_exhausted: "quota",
+  rate_limit: "quota",
   rate_limited: "quota",
   rate_limit_exceeded: "quota",
   too_many_requests: "quota",

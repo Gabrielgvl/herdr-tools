@@ -331,6 +331,7 @@ function toolFor(options: {
   handoffs?: HandoffAllocator | null;
   availability?: LaunchDependencies["availability"];
   availabilityFailureRecorder?: LaunchDependencies["availabilityFailureRecorder"];
+  claudeQuotaReader?: LaunchDependencies["claudeQuotaReader"];
   cwd?: string | null;
   useDefaultFailureRecorder?: boolean;
 }): ReturnType<typeof createLaunchTool> {
@@ -348,6 +349,7 @@ function toolFor(options: {
     ...(options.handoffs === null ? {} : { handoffs: options.handoffs ?? fakeHandoffs() }),
     ...(options.useDefaultFailureRecorder ? {} : { availabilityFailureRecorder: options.availabilityFailureRecorder ?? vi.fn(async () => undefined) }),
     ...(options.availability === undefined ? {} : { availability: options.availability }),
+    ...(options.claudeQuotaReader === undefined ? {} : { claudeQuotaReader: options.claudeQuotaReader }),
     ...(options.ownership === undefined ? {} : { ownership: options.ownership }),
     recipients: new RecipientRegistry(),
     ...(options.routerLog === null ? {} : { routerLog: options.routerLog ?? (vi.fn(async () => undefined) as LaunchRouterLog) }),
@@ -1110,9 +1112,16 @@ describe("herdr_launch task cutover", () => {
         return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "claude", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:claude", agent: "claude", kind: "id", value: "session-1" } } });
       },
     });
-    const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) } }), task());
+    const supervision = stubSupervision();
+    const availabilityFailureRecorder = vi.fn(async () => undefined);
+    const claudeQuotaReader = vi.fn(async () => true);
+    const result = await execute(toolFor({ catalog, cli: harness.cli, supervision, availabilityFailureRecorder, claudeQuotaReader, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) } }), task());
     expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:fallback:low" }] });
     expect(harness.starts).toBe(2);
+    expect(supervision.completionSignals).toHaveLength(1);
+    expect(await supervision.completionSignals[0](supervision.bound[0].identity)).toBe(true);
+    expect(claudeQuotaReader).toHaveBeenCalledWith(supervision.bound[0].identity.agentSession, repoRoot, expect.any(Number));
+    expect(availabilityFailureRecorder).toHaveBeenLastCalledWith(expect.objectContaining({ runner: "claude", model: "fallback" }), claudeRunner(["fallback"]), { code: "CLAUDE_API_ERROR", causeCode: "rate_limit" }, { root: repoRoot });
   });
 
   it("does not re-admit unavailable candidates into the fallback chain", async () => {

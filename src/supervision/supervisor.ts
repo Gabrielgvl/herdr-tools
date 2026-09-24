@@ -314,6 +314,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private state: SupervisionState = "reserved";
   private paneId: string | undefined;
   private identity: SupervisedIdentity | undefined;
+  private completionSignal?: (identity: SupervisedIdentity) => Promise<boolean>;
+  private completionRecorded = false;
+  private completionLogDegraded = false;
+  private completionAttempts = 0;
+  private completionRetry?: NodeJS.Timeout;
   private provisional: ProvisionalSupervisionBinding | undefined;
   private provisionalFailure: string | undefined;
   private provisionalNativeIdentity: SupervisedIdentity | undefined;
@@ -791,6 +796,47 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       this.publish("supervision reviewer cadence could not be armed");
     }
     this.publish(`supervising ${this.deps.child.agentName}`);
+  }
+
+  /** Called after the launched prompt was acknowledged; also checks an already-terminal child. */
+  onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<boolean>): void {
+    if (this.completionSignal !== undefined || !this.bindingPublished || this.isSettled()) return;
+    this.completionSignal = signal;
+    this.scheduleCompletionSignal();
+  }
+
+  private async recordCompletionSignal(): Promise<void> {
+    if (this.completionRecorded || this.completionSignal === undefined || this.identity === undefined) return;
+    try {
+      this.completionRecorded = await this.completionSignal(this.identity);
+    } catch {
+      // The production reader turns missing/untrusted evidence into false. A
+      // thrown callback means the typed signal could not be persisted: surface
+      // one fixed-code gap, never a transcript, message, path, or credential.
+      if (!this.completionLogDegraded) {
+        this.completionLogDegraded = true;
+        this.emit("evidence_gap", "Claude quota cooldown could not be recorded", { reason: "availability_record_unavailable" });
+      }
+    }
+  }
+
+  private scheduleCompletionSignal(): void {
+    if (this.stopped || this.completionRecorded || this.completionSignal === undefined || !this.bindingPublished || this.isSettled()
+      || (this.status !== "idle" && this.status !== "done")) return;
+    void this.serialize(async () => {
+      if (this.stopped || !this.bindingPublished || this.isSettled()
+        || (this.status !== "idle" && this.status !== "done")) return;
+      await this.recordCompletionSignal();
+      // The native writer can flush just after completion. Check twice more
+      // promptly; later same-status reconciliation can catch a slower response.
+      if (!this.completionRecorded && ++this.completionAttempts < 3 && this.completionRetry === undefined) {
+        this.completionRetry = setTimeout(() => {
+          this.completionRetry = undefined;
+          this.scheduleCompletionSignal();
+        }, 250);
+        this.completionRetry.unref();
+      }
+    }).catch(() => undefined);
   }
 
   /** Resolve when the supervisor settles. This is the supervisor job's run body. */
@@ -1303,7 +1349,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       return;
     }
     if (pane.revision === previousRevision) {
-      if (pane.agentStatus === this.status) return;
+      if (pane.agentStatus === this.status) {
+        this.scheduleCompletionSignal();
+        return;
+      }
       if (sequence !== "advanced") {
         this.recordEvidenceGap("event", "status_changed_without_revision", previousRevision, pane.revision, undefined, previousStateChangeSeq, pane.stateChangeSeq);
       }
@@ -1386,7 +1435,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const sequence = this.observeStateChangeSeq(occupant.stateChangeSeq);
     this.lastEndpoint = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, stateChangeSeq: occupant.stateChangeSeq };
     if (occupant.pane.revision === previousRevision) {
-      if (occupant.pane.agentStatus === this.status) return;
+      if (occupant.pane.agentStatus === this.status) {
+        this.scheduleCompletionSignal();
+        return;
+      }
       if (sequence !== "advanced") {
         this.recordEvidenceGap("snapshot", "status_changed_without_revision", previousRevision, occupant.pane.revision, undefined, previousStateChangeSeq, occupant.stateChangeSeq);
       }
@@ -1498,16 +1550,23 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   private applyStatus(next: SupervisionAgentStatus, revision: number, source: SupervisionTransition["source"]): void {
     const from = this.status!;
-    if (from === next) return;
+    if (from === next) {
+      this.scheduleCompletionSignal();
+      return;
+    }
     this.status = next;
     // Claude may normalize a completed turn from done to idle. It carries no
     // new work or manager decision, so do not surface or re-evaluate it.
     if (from === "done" && next === "idle") {
       this.enterStatus(next);
+      this.scheduleCompletionSignal();
       return;
     }
     this.transitions.push({ atMs: this.deps.clock.now(), from, to: next, revision, source });
     if (next === "working") {
+      this.completionAttempts = 0;
+      if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
+      this.completionRetry = undefined;
       // An authoritative working transition opens a fresh artifact cycle: the
       // previously accepted handoff version is stale from this point on.
       const managed = this.managedRun();
@@ -1519,6 +1578,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // current-cycle artifact check runs on the mutation chain behind the
       // fold that produced it, so it sees every earlier transition first.
       this.scheduleHandoffEvaluation();
+      this.scheduleCompletionSignal();
     }
     const material = materialTransitionEvent(from, next);
     if (material === undefined) {
@@ -2038,11 +2098,22 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // `identity_lost` is the one settling outcome reached without its own event,
     // because a move or a reconnect proves it directly rather than observing it.
     if (outcome === "identity_lost") this.emit("identity_lost", `supervision lost the exact child's identity (${reason})`, { reason });
+    // A proven exit may skip idle/done entirely. Check the bound native session
+    // before dropping it, then allow one brief flush of a late error record.
+    if (outcome === "released" && this.completionSignal !== undefined && !this.completionRecorded && this.identity !== undefined) {
+      await this.recordCompletionSignal();
+      if (!this.completionRecorded) {
+        await new Promise<void>((resolve) => { setTimeout(resolve, 250); });
+        await this.recordCompletionSignal();
+      }
+    }
     // The managed run's outcome is durable before the supervisor settles.
     await this.persistHandoffOutcome(outcome, reason);
     this.state = "settled";
     this.settlement = { outcome, reason };
     this.clearReviewTimer();
+    if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
+    this.completionRetry = undefined;
     this.deps.monitor.removeObserver(this);
     this.publish(`supervision settled ${outcome}`);
     this.resolveSettled(this.settlement);
@@ -2272,6 +2343,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (this.stopped) return;
     this.stopped = true;
     this.clearReviewTimer();
+    if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
+    this.completionRetry = undefined;
     this.abort.abort();
     this.deps.monitor.removeObserver(this);
     if (this.isSettled()) return;
@@ -2291,6 +2364,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (this.stopped) return;
     this.stopped = true;
     this.clearReviewTimer();
+    if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
+    this.completionRetry = undefined;
     this.abort.abort();
     this.deps.monitor.removeObserver(this);
     if (this.isSettled()) return;

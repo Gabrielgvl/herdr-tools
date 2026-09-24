@@ -16,7 +16,7 @@ import { resolveTypesafeApiKey } from "../typesafe-reviewer.js";
 import type { AuthJsonCredentialStore } from "./auth-json-credential-store.js";
 import { buildWorkspaceView, createNodeWorkspaceRunner, type WorkspaceCommandRunner, type WorkspaceView } from "./evidence.js";
 import type { SupervisionModelService } from "./model-service.js";
-import type { ProvisionalSupervisionBinding } from "./identity.js";
+import type { ProvisionalSupervisionBinding, SupervisedIdentity } from "./identity.js";
 import type { SelfCloseTracker } from "./self-close.js";
 import type { HandoffGate, HandoffRun } from "../handoff-gate.js";
 import { TRACE_FALLBACK_CURSOR_MAX_LINES } from "./trace-source.js";
@@ -109,6 +109,8 @@ export interface SupervisionReservation {
   bind(binding: SupervisionBinding): Promise<void>;
   bindProvisional(binding: ProvisionalSupervisionBinding): Promise<void>;
   strengthen(binding: SupervisionBinding): Promise<void>;
+  /** Observe typed post-prompt completion evidence on the exact bound child. */
+  onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<boolean>): void;
   release(reason: string): void;
 }
 
@@ -292,6 +294,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
           throw error;
         }
       },
+      onCompletionSignal: (signal) => bound.onCompletionSignal(signal),
       release: (reason) => bound.release(reason),
     };
   }

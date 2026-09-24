@@ -2774,6 +2774,18 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       tick(phase);
       const promptSubmissionStartedAt = clock.now();
       const promptSubmissionWallMs = Date.now();
+      // A child may fail and exit while the prompt RPC is awaiting its ack.
+      // Bind the typed session reader before dispatch so supervision can record
+      // that failure before it settles, without replaying the prompt.
+      if (chosenRuntime.kind === "claude") {
+        const selectedRunner = chainCandidates.find((entry) => entry.point.id === chosenContract!.candidate.id)!.runner;
+        reservation!.onCompletionSignal(async (identity) => {
+          if (!await (deps.claudeQuotaReader ?? claudeQuotaSignal)(identity.agentSession, launchCwd!, promptSubmissionWallMs)) return false;
+          await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(chosenContract!.candidate, selectedRunner,
+            { code: "CLAUDE_API_ERROR", causeCode: "rate_limit" }, { root: deps.cwd ?? ctx.cwd });
+          return true;
+        });
+      }
       try {
         let promptResponse: JsonEnvelope;
         try {
@@ -2804,15 +2816,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         }
         promptSubmitted = true;
         promptDispatch = { state: "acknowledged", requestId: promptResponse.id };
-        if (chosenRuntime.kind === "claude") {
-          const selectedRunner = chainCandidates.find((entry) => entry.point.id === chosenContract!.candidate.id)!.runner;
-          reservation!.onCompletionSignal(async (identity) => {
-            if (!await (deps.claudeQuotaReader ?? claudeQuotaSignal)(identity.agentSession, launchCwd!, promptSubmissionWallMs)) return false;
-            await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(chosenContract!.candidate, selectedRunner,
-              { code: "CLAUDE_API_ERROR", causeCode: "rate_limit" }, { root: deps.cwd ?? ctx.cwd });
-            return true;
-          });
-        }
       } finally {
         timing.promptSubmissionAckMs = monotonicDurationMs(clock, promptSubmissionStartedAt);
       }

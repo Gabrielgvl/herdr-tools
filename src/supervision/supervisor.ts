@@ -798,7 +798,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.publish(`supervising ${this.deps.child.agentName}`);
   }
 
-  /** Called after the launched prompt was acknowledged; also checks an already-terminal child. */
+  /** Bound before prompt dispatch; also checks a child already observed as terminal. */
   onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<boolean>): void {
     if (this.completionSignal !== undefined || !this.bindingPublished || this.isSettled()) return;
     this.completionSignal = signal;

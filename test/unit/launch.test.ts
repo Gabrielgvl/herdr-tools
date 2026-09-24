@@ -1115,6 +1115,11 @@ describe("herdr_launch task cutover", () => {
     const supervision = stubSupervision();
     const availabilityFailureRecorder = vi.fn(async () => undefined);
     const claudeQuotaReader = vi.fn(async () => true);
+    const prompt = harness.cli.prompt;
+    harness.cli.prompt = vi.fn(async (target, text, signal) => {
+      expect(supervision.completionSignals).toHaveLength(1); // registered even before the prompt ack
+      return prompt(target, text, signal);
+    });
     const result = await execute(toolFor({ catalog, cli: harness.cli, supervision, availabilityFailureRecorder, claudeQuotaReader, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) } }), task());
     expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:fallback:low" }] });
     expect(harness.starts).toBe(2);

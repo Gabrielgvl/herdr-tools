@@ -119,6 +119,8 @@ export const realSupervisionScheduler: SupervisionScheduler = {
   clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+export type ProviderLimitSignal = false | { readonly cooldownRecorded: boolean };
+
 export interface SupervisionChildRequest {
   agentName: string;
   agentKind: string;
@@ -314,7 +316,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private state: SupervisionState = "reserved";
   private paneId: string | undefined;
   private identity: SupervisedIdentity | undefined;
-  private completionSignal?: (identity: SupervisedIdentity) => Promise<boolean>;
+  private completionSignal?: (identity: SupervisedIdentity) => Promise<ProviderLimitSignal>;
   private completionRecorded = false;
   private completionLogDegraded = false;
   private completionAttempts = 0;
@@ -799,7 +801,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   /** Bound before prompt dispatch; also checks a child already observed as terminal. */
-  onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<boolean>): void {
+  onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<ProviderLimitSignal>): void {
     if (this.completionSignal !== undefined || !this.bindingPublished || this.isSettled()) return;
     this.completionSignal = signal;
     this.scheduleCompletionSignal();
@@ -808,11 +810,21 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private async recordCompletionSignal(): Promise<void> {
     if (this.completionRecorded || this.completionSignal === undefined || this.identity === undefined) return;
     try {
-      this.completionRecorded = await this.completionSignal(this.identity);
+      const result = await this.completionSignal(this.identity);
+      if (result === false) return;
+      this.completionRecorded = true;
+      const runId = this.managedRun()?.run.runId;
+      this.emit("provider_limit", "child hit a typed provider limit after start; close it before recovery", {
+        code: "PROVIDER_LIMIT",
+        operatingPointId: this.selectedOperatingPointId ?? this.deps.child.operatingPointId,
+        ...(runId === undefined ? {} : { runId }),
+      });
+      if (!result.cooldownRecorded && !this.completionLogDegraded) {
+        this.completionLogDegraded = true;
+        this.emit("evidence_gap", "Claude quota cooldown could not be recorded", { reason: "availability_record_unavailable" });
+      }
     } catch {
-      // The production reader turns missing/untrusted evidence into false. A
-      // thrown callback means the typed signal could not be persisted: surface
-      // one fixed-code gap, never a transcript, message, path, or credential.
+      // Missing or untrusted native evidence never becomes a provider failure.
       if (!this.completionLogDegraded) {
         this.completionLogDegraded = true;
         this.emit("evidence_gap", "Claude quota cooldown could not be recorded", { reason: "availability_record_unavailable" });
@@ -822,19 +834,24 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   private scheduleCompletionSignal(): void {
     if (this.stopped || this.completionRecorded || this.completionSignal === undefined || !this.bindingPublished || this.isSettled()
-      || (this.status !== "idle" && this.status !== "done")) return;
+      || (this.status !== "idle" && this.status !== "done" && this.status !== "blocked")) return;
     void this.serialize(async () => {
       if (this.stopped || !this.bindingPublished || this.isSettled()
-        || (this.status !== "idle" && this.status !== "done")) return;
+        || (this.status !== "idle" && this.status !== "done" && this.status !== "blocked")) return;
       await this.recordCompletionSignal();
       // The native writer can flush just after completion. Check twice more
-      // promptly; later same-status reconciliation can catch a slower response.
+      // promptly before a managed repair; later reconciliation can still catch
+      // a slower response.
       if (!this.completionRecorded && ++this.completionAttempts < 3 && this.completionRetry === undefined) {
         this.completionRetry = setTimeout(() => {
           this.completionRetry = undefined;
           this.scheduleCompletionSignal();
         }, 250);
         this.completionRetry.unref();
+      } else if (!this.completionRecorded && this.completionAttempts >= 3) {
+        const last = this.transitions.last()?.to;
+        // Claude can normalize done → idle without another transition.
+        if (last === this.status || (last === "done" && this.status === "idle")) this.scheduleHandoffEvaluation();
       }
     }).catch(() => undefined);
   }
@@ -1563,10 +1580,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       return;
     }
     this.transitions.push({ atMs: this.deps.clock.now(), from, to: next, revision, source });
+    // Every new observation earns its own bounded native-write window. The
+    // initial idle preflight must not consume the first blocked turn's retries.
+    this.completionAttempts = 0;
+    if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
+    this.completionRetry = undefined;
     if (next === "working") {
-      this.completionAttempts = 0;
-      if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
-      this.completionRetry = undefined;
       // An authoritative working transition opens a fresh artifact cycle: the
       // previously accepted handoff version is stale from this point on.
       const managed = this.managedRun();
@@ -1577,8 +1596,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // A managed terminal observation is not acceptance by itself. The
       // current-cycle artifact check runs on the mutation chain behind the
       // fold that produced it, so it sees every earlier transition first.
-      this.scheduleHandoffEvaluation();
       this.scheduleCompletionSignal();
+      this.scheduleHandoffEvaluation();
     }
     const material = materialTransitionEvent(from, next);
     if (material === undefined) {
@@ -2163,6 +2182,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       }
       return;
     }
+    // A typed provider limit cannot justify a repair prompt. Before repairing,
+    // give the existing bounded native-session reads time to see a late 429;
+    // a valid artifact above still wins without waiting.
+    if (this.completionRecorded || (this.completionSignal !== undefined && this.completionAttempts < 3)) return;
     const prompt = this.deps.repairPrompt;
     if (prompt === undefined || this.stopped || this.isSettled()) return;
     // The attempt and fence are durable before this returns a token; a version

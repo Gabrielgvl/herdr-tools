@@ -26,6 +26,7 @@ import {
   type SupervisionBinding,
   type SupervisionChildRequest,
   type SupervisionScheduler,
+  type ProviderLimitSignal,
 } from "./supervisor.js";
 
 /** The transcript source the reviewer reads. Bounded by the CLI's own evidence limits. */
@@ -110,7 +111,7 @@ export interface SupervisionReservation {
   bindProvisional(binding: ProvisionalSupervisionBinding): Promise<void>;
   strengthen(binding: SupervisionBinding): Promise<void>;
   /** Observe typed post-prompt completion evidence on the exact bound child. */
-  onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<boolean>): void;
+  onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<ProviderLimitSignal>): void;
   release(reason: string): void;
 }
 

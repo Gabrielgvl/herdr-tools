@@ -1,5 +1,5 @@
 import type { SupervisionCoordinator, SupervisionReservation } from "../../src/supervision/registry.js";
-import type { ProvisionalSupervisionBinding, SupervisedIdentity } from "../../src/supervision/identity.js";
+import type { ProvisionalSupervisionBinding } from "../../src/supervision/identity.js";
 import type { SupervisionBinding } from "../../src/supervision/supervisor.js";
 
 export interface StubSupervision extends SupervisionCoordinator {
@@ -11,7 +11,7 @@ export interface StubSupervision extends SupervisionCoordinator {
   readonly strengthenAttempts: SupervisionBinding[];
   readonly strengthened: SupervisionBinding[];
   readonly released: string[];
-  readonly completionSignals: Array<(identity: SupervisedIdentity) => Promise<boolean>>;
+  readonly completionSignals: Array<Parameters<SupervisionReservation["onCompletionSignal"]>[0]>;
   readonly jobId: string;
 }
 

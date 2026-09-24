@@ -21,8 +21,9 @@ const TaskItem = Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" });
  *
  * `tier` is the optional requested quality posture — omission resolves to
  * `standard` inside the tier policy. `replicas` repeats one Task over isolated
- * runtime worktrees. `recoveryOf` names a managed handoff run the runtime
- * resolves; it is accepted here and fails closed until N6 lands recovery.
+ * runtime worktrees. `recoveryOf` names the failed child's managed handoff
+ * run UUID (not its child target or launch ID). Recovery requires one replica
+ * and forbids `cwd`; it resumes the recorded workspace.
  * `label` is display metadata bounded at 256 UTF-8 bytes that never affects
  * routing, Jev state, Task revision, machine identity, pane naming, tab
  * selection, or target resolution. `cwd` is any accessible directory,
@@ -53,7 +54,7 @@ export const LaunchTaskSchema = Type.Object({
     default: 1,
     description: "Identical Task replicas over provably isolated Git worktrees; values above one fail closed without isolation."
   })),
-  recoveryOf: Type.Optional(Identifier),
+  recoveryOf: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$", description: "Managed handoff run UUID from the failed child's Herdr supervision receipt, not a child target or launch ID. Recovery requires one replica and no cwd; close the failed child first." })),
   label: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$", maxByteLength: 256, description: "Display-only metadata; never enters routing contracts, pane identity, or decision evidence. Bounded at 256 UTF-8 bytes." })),
   cwd: Type.Optional(Identifier)
 }, { additionalProperties: false });

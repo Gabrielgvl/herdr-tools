@@ -13,6 +13,7 @@ import type { SupervisionAgentStatus } from "./protocol.js";
 
 export const SUPERVISION_EVENT_TYPES = [
   "work_cycle_completed",
+  "provider_limit",
   "blocked",
   "reviewer_attention",
   "reviewer_degraded",
@@ -48,6 +49,7 @@ export type ReconciliationFailureReason = (typeof RECONCILIATION_FAILURE_REASONS
 export const SUPERVISION_SETTLING_EVENT_TYPES = ["identity_replaced", "identity_lost", "released", "pane_closed"] as const;
 
 const HIGH_PRIORITY_EVENT_TYPES = new Set<SupervisionEventType>([
+  "provider_limit",
   "blocked",
   "reviewer_attention",
   "identity_replaced",

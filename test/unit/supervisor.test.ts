@@ -268,7 +268,7 @@ describe("supervisor binding", () => {
       h.supervisor.onCompletionSignal(async (exact) => {
         if (!await claudeQuotaSignal(exact.agentSession, cwd, notBefore, home)) return false;
         recorded();
-        return true;
+        return { cooldownRecorded: true };
       });
       await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 6, agentKind: "claude", agentSession })));
       await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 7, agentKind: "claude", agentSession })));
@@ -288,12 +288,12 @@ describe("supervisor binding", () => {
   it("records a late native quota signal before settling an exited child with no idle observation", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })]), snapshot([], [])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
-    const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue({ cooldownRecorded: true });
     h.supervisor.onCompletionSignal(signal);
     await h.supervisor.onEvent(thinEvent("pane_exited"));
     expect(signal).toHaveBeenCalledTimes(2);
     expect(h.supervisor.view().state).toBe("settled");
-    expect(types(h.wakes)).toEqual(["pane_closed"]);
+    expect(types(h.wakes)).toEqual(["pane_closed", "provider_limit"]);
     await h.supervisor.onEvent(thinEvent("pane_closed"));
     expect(signal).toHaveBeenCalledTimes(2);
   });
@@ -302,30 +302,41 @@ describe("supervisor binding", () => {
     const replacement = paneRecord({ terminalId: "t9", status: "working", revision: 6 });
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })]), snapshot([replacement])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
-    const signal = vi.fn().mockResolvedValue(true);
+    const signal = vi.fn().mockResolvedValue({ cooldownRecorded: true });
     h.supervisor.onCompletionSignal(signal);
     await h.supervisor.onEvent(paneEvent("pane_updated", replacement));
     expect(signal).toHaveBeenCalledExactlyOnceWith(identity);
     expect(await h.supervisor.run()).toMatchObject({ outcome: "identity_replaced" });
-    expect(types(h.wakes)).toEqual(["identity_replaced"]);
+    expect(types(h.wakes)).toEqual(["identity_replaced", "provider_limit"]);
   });
 
   it("checks the bound session when reconnect loses continuity", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
-    const signal = vi.fn().mockResolvedValue(true);
+    const signal = vi.fn().mockResolvedValue({ cooldownRecorded: true });
     h.supervisor.onCompletionSignal(signal);
     await h.supervisor.onBootstrap(snapshot([], []), 2, true);
     expect(signal).toHaveBeenCalledExactlyOnceWith(identity);
     expect(await h.supervisor.run()).toMatchObject({ outcome: "identity_lost" });
   });
 
-  it("surfaces cooldown persistence failure once without settling the child", async () => {
+  it("reports a typed provider limit even when cooldown persistence fails", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord()])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    h.supervisor.onCompletionSignal(async () => ({ cooldownRecorded: false }));
+    await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(true));
+    expect(h.wakes.find((wake) => wake.event.type === "provider_limit")?.event).toMatchObject({ priority: "high", details: { code: "PROVIDER_LIMIT", operatingPointId: "worker-pi" } });
+    expect(h.wakes.filter((wake) => wake.event.type === "evidence_gap")).toHaveLength(1);
+    expect(h.supervisor.childLive()).toBe(true);
+  });
+
+  it("surfaces an unreadable completion signal once without inventing a provider limit", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord()])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     h.supervisor.onCompletionSignal(async () => { throw new Error("do not expose this error"); });
     await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "evidence_gap")).toBe(true));
     expect(h.wakes.filter((wake) => wake.event.type === "evidence_gap")).toHaveLength(1);
+    expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(false);
     expect(JSON.stringify(h.wakes)).not.toContain("do not expose this error");
     expect(h.supervisor.childLive()).toBe(true);
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6 })));
@@ -335,7 +346,7 @@ describe("supervisor binding", () => {
   it("checks an immediate terminal status and records a later completion only once", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord()])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
-    const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue({ cooldownRecorded: true });
     h.supervisor.onCompletionSignal(signal);
     await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(1));
     expect(signal).toHaveBeenCalledWith(identity);
@@ -3694,6 +3705,119 @@ describe("managed handoff evaluation", () => {
     const run = await gate.bind(allocation, identity);
     return { gate, h, allocation, run };
   }
+
+  it("wakes on a typed provider limit without re-prompting a live child", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      h.supervisor.onCompletionSignal(async () => ({ cooldownRecorded: true }));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(true));
+      expect(h.wakes.find((wake) => wake.event.type === "provider_limit")?.event).toMatchObject({
+        priority: "high", details: { code: "PROVIDER_LIMIT", operatingPointId: "worker-pi", runId: allocation.runId },
+      });
+      expect(prompts).toHaveLength(0);
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 7, stateChangeSeq: 7 })));
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 8, stateChangeSeq: 8 })));
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+      expect(prompts).toHaveLength(0);
+      expect(h.wakes.filter((wake) => wake.event.type === "provider_limit")).toHaveLength(1);
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a blocked child's typed limit before any handoff repair", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn(async () => ({ cooldownRecorded: true }));
+      h.supervisor.onCompletionSignal(signal);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(true));
+      expect(signal).toHaveBeenCalledExactlyOnceWith(identity);
+      expect(prompts).toHaveLength(0);
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets a late native 429 win the bounded retry before repairing a handoff", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue({ cooldownRecorded: true });
+      h.supervisor.onCompletionSignal(signal);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(1));
+      expect(prompts).toHaveLength(0);
+      await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(true), { timeout: 2000 });
+      expect(signal).toHaveBeenCalledTimes(2);
+      expect(prompts).toHaveLength(0);
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs only after the bounded native checks find no provider limit", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn(async () => false as const);
+      h.supervisor.onCompletionSignal(signal);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(3), { timeout: 2000 });
+      expect(h.supervisor.view().status).toBe("done");
+      await vi.waitFor(() => expect(prompts).toHaveLength(1), { timeout: 2000 });
+      expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(false);
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs after the quota window even when done normalizes to idle", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn(async () => false as const);
+      h.supervisor.onCompletionSignal(signal);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 7, stateChangeSeq: 7 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(3), { timeout: 2000 });
+      expect(h.supervisor.view().status).toBe("idle");
+      await vi.waitFor(() => expect(prompts).toHaveLength(1), { timeout: 2000 });
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not repair from initial idle and rechecks the first blocked turn", async () => {
+    const prompts: string[] = [];
+    const initialIdle = snapshot([paneRecord({ status: "idle", revision: 5, stateChangeSeq: 5 })]);
+    const { h, allocation } = await managed({ snapshots: [initialIdle], repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn(async () => false as const);
+      h.supervisor.onCompletionSignal(signal);
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(3), { timeout: 2000 });
+      expect(prompts).toHaveLength(0);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(6), { timeout: 2000 });
+      expect(h.supervisor.view().status).toBe("blocked");
+      await vi.waitFor(() => expect(prompts).toHaveLength(1), { timeout: 2000 });
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
 
   it("keeps a blocked child in repair when its artifact reports done", async () => {
     const prompts: Array<{ paneId: string; text: string }> = [];

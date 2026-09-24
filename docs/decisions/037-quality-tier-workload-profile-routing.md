@@ -274,7 +274,9 @@ Recovery rules are:
 - every operating point on the failed provider is excluded (`recovery_excluded`), not only the failed point;
 - unresolved or non-terminal prior-run evidence fails closed (`RECOVERY_SOURCE_UNRESOLVABLE`) rather than guessing the workspace state.
 
-A started-child failure never invokes the pre-execution fallback chain.
+A started-child failure never invokes the pre-execution fallback chain. When the exact Claude session emits an observed typed post-prompt HTTP 429 (including a blocked child), supervision wakes the manager with a high-priority `provider_limit` event (`code: PROVIDER_LIMIT`, started operating point, and managed handoff `runId`) and records a provider cooldown for later launches. An ordinary work-cycle completion may arrive before this failure signal; the provider-limit event is the later, authoritative diagnosis. It does not close a live child or retroactively change the already-returned `herdr_launch` result. If cooldown persistence fails, the provider-limit event still fires with an `evidence_gap`. Before a managed repair prompt, supervision completes its existing bounded native-write retries; a 429 written after those reads can still be detected later, but cannot retract an already-sent repair. No provider-prose matching or automatic redispatch is permitted.
+
+For manual recovery, get `handoff.runId` from `herdr_jobs get`, close the failed child so the run has terminal lifecycle evidence, and pass that UUID as `recoveryOf` on a complete new Task. A child target or launch ID is not a run ID; omit `cwd` and use one replica. Recovery still follows the tier lift and failed-provider exclusion above.
 
 ### Delivery
 

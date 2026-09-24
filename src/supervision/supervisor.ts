@@ -2098,9 +2098,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     // `identity_lost` is the one settling outcome reached without its own event,
     // because a move or a reconnect proves it directly rather than observing it.
     if (outcome === "identity_lost") this.emit("identity_lost", `supervision lost the exact child's identity (${reason})`, { reason });
-    // A proven exit may skip idle/done entirely. Check the bound native session
-    // before dropping it, then allow one brief flush of a late error record.
-    if (outcome === "released" && this.completionSignal !== undefined && !this.completionRecorded && this.identity !== undefined) {
+    // A proven exit or replacement may skip idle/done entirely. Check the
+    // original bound session before dropping it, then allow one brief flush.
+    if ((outcome === "released" || outcome === "identity_replaced")
+      && this.completionSignal !== undefined && !this.completionRecorded && this.identity !== undefined) {
       await this.recordCompletionSignal();
       if (!this.completionRecorded) {
         await new Promise<void>((resolve) => { setTimeout(resolve, 250); });

@@ -298,6 +298,18 @@ describe("supervisor binding", () => {
     expect(signal).toHaveBeenCalledTimes(2);
   });
 
+  it("checks the original bound session when a working child is replaced", async () => {
+    const replacement = paneRecord({ terminalId: "t9", status: "working", revision: 6 });
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })]), snapshot([replacement])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    const signal = vi.fn().mockResolvedValue(true);
+    h.supervisor.onCompletionSignal(signal);
+    await h.supervisor.onEvent(paneEvent("pane_updated", replacement));
+    expect(signal).toHaveBeenCalledExactlyOnceWith(identity);
+    expect(await h.supervisor.run()).toMatchObject({ outcome: "identity_replaced" });
+    expect(types(h.wakes)).toEqual(["identity_replaced"]);
+  });
+
   it("surfaces cooldown persistence failure once without settling the child", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord()])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });

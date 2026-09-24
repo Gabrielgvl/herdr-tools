@@ -902,6 +902,25 @@ describe("buildWorkspaceView — evidence", () => {
     });
   });
 
+  it("consumes a worktree-column rename/copy source record instead of failing closed", async () => {
+    const { run } = git({
+      [GIT_HEAD]: `${WS_HEAD}\n`,
+      [GIT_STATUS]: " R new.ts\x00old.ts\x00 C dup.ts\x00src.ts\x00",
+      [gitNameStatus(WS_HEAD)]: "R\x00old.ts\x00new.ts\x00C\x00src.ts\x00dup.ts\x00",
+      [gitNumstat(WS_HEAD)]: "1\t0\t\x00old.ts\x00new.ts\x002\t2\t\x00src.ts\x00dup.ts\x00",
+    });
+    const view = await buildWorkspaceView({ root: WS_ROOT }, { run }, new AbortController().signal);
+    expect(view).toMatchObject({
+      ...okView,
+      dirty: true,
+      changedFiles: [
+        { path: "dup.ts", status: "copied", from: "src.ts", added: 2, deleted: 2 },
+        { path: "new.ts", status: "renamed", from: "old.ts", added: 1, deleted: 0 },
+      ],
+      stats: { filesChanged: 2, insertions: 3, deletions: 2, untrackedFiles: 0 },
+    });
+  });
+
   it("keeps a name-status entry whose numstat raced away, honestly omitting its counts", async () => {
     const { run } = git({
       [GIT_HEAD]: `${WS_HEAD}\n`,
@@ -1216,6 +1235,8 @@ describe("buildWorkspaceView — failures are explicit, never fabricated", () =>
     ["a stray empty numstat record", { [gitNumstat(WS_HEAD)]: "3\t4\ta.ts\x00\x00" }, "diff"],
     ["a truncated numstat rename", { [gitNumstat(WS_HEAD)]: "1\t2\t\x00old.ts\x00" }, "diff"],
     ["a malformed status mid-record gap", { [GIT_STATUS]: " M a\x00\x00 M b\x00" }, "status"],
+    ["a status rename missing its source", { [GIT_STATUS]: "R  dst.ts\x00" }, "status"],
+    ["a worktree status rename missing its source", { [GIT_STATUS]: " R dst.ts\x00" }, "status"],
   ])("fails closed as output_malformed on %s", async (_name, overrides, command) => {
     const view = await buildWorkspaceView({ root: WS_ROOT }, git({ ...cleanWorkspace(), ...overrides }), new AbortController().signal);
     expect(view).toEqual({ version: WORKSPACE_VIEW_VERSION, available: false, failure: { reason: "output_malformed", detail: { command } } });
@@ -1521,7 +1542,7 @@ describe("buildEvidenceState — UTF-8 byte budgets", () => {
   // `{"constraints":[],"doneWhen":[],"objective":"","progressMarkers":[]}`
   const assignmentWrapBytes = Buffer.byteLength(canonicalJson({ constraints: [], doneWhen: [], objective: "", progressMarkers: [] }), "utf8");
 
-  it("admits an assignment at exactly 8 KiB and refuses one byte over — never truncated", () => {
+  it("admits an assignment at exactly 128 KiB and refuses one byte over — never truncated", () => {
     const pad = EVIDENCE_ASSIGNMENT_MAX_BYTES - assignmentWrapBytes;
     const at = e3Ok(buildEvidenceState(e3Request({ assignment: { objective: "x".repeat(pad) } })));
     expect(at.bytes.assignment).toBe(EVIDENCE_ASSIGNMENT_MAX_BYTES);
@@ -1538,10 +1559,36 @@ describe("buildEvidenceState — UTF-8 byte budgets", () => {
   });
 
   it("measures the assignment budget in UTF-8 bytes, not characters", () => {
-    const over = buildEvidenceState(e3Request({ assignment: { objective: "é".repeat(5000) } }));
+    const over = buildEvidenceState(e3Request({ assignment: { objective: "é".repeat(66_000) } }));
     if (over.available) throw new Error("expected unavailable");
-    // 5000 chars fits a character budget; 10000 bytes does not fit a byte budget.
+    // 66,000 chars fits a character budget; 132,000 bytes does not fit a byte budget.
     expect(over.failure.cause).toBe("assignment_over_budget");
+  });
+
+  it("admits a legal ~20 KiB objective the old 8 KiB cap would have refused", () => {
+    // The Task schema bounds delivery at 1 MiB, so a 20 KiB objective is a
+    // legal launch; the raised assignment budget lets it reach review
+    // evidence instead of refusing every cadence.
+    const objective = `Ship ${"x".repeat(20_000)}`;
+    const build = e3Ok(buildEvidenceState(e3Request({ assignment: { objective } })));
+    expect(build.state.assignment.objective).toBe(objective);
+    expect(build.bytes.assignment).toBeLessThanOrEqual(EVIDENCE_ASSIGNMENT_MAX_BYTES);
+    expect(build.bytes.total).toBeLessThanOrEqual(EVIDENCE_TOTAL_MAX_BYTES);
+  });
+
+  it("fits an exact-cap assignment inside the total budget, and the scan still gates it", () => {
+    // A boundary assignment plus the ordinary structural sections stays under
+    // the total — nothing structural gives way.
+    const pad = EVIDENCE_ASSIGNMENT_MAX_BYTES - assignmentWrapBytes;
+    const build = e3Ok(buildEvidenceState(e3Request({ assignment: { objective: "x".repeat(pad) }, terminal: ["supplement"] })));
+    expect(build.bytes.assignment).toBe(EVIDENCE_ASSIGNMENT_MAX_BYTES);
+    expect(build.bytes.total).toBeLessThanOrEqual(EVIDENCE_TOTAL_MAX_BYTES);
+    expect(build.state.terminal).toEqual({ lines: ["supplement"], droppedLines: 0 });
+
+    // …and a secret inside a near-cap assignment is still refused locally.
+    const secret = buildEvidenceState(e3Request({ assignment: { objective: `${E3_GH_TOKEN}${"x".repeat(pad - E3_GH_TOKEN.length)}` } }));
+    if (secret.available) throw new Error("expected unavailable");
+    expect(secret.failure.cause).toBe("sensitive");
   });
 
   it("bounds the trace section at 32 KiB — a digest that cannot fit is unavailable, not truncated", () => {
@@ -1593,8 +1640,8 @@ describe("buildEvidenceState — UTF-8 byte budgets", () => {
   });
 
   it("sacrifices terminal below its own budget before touching structural evidence", () => {
-    const files = Array.from({ length: 240 }, (_, i) => ({
-      path: `f/${String(i).padStart(3, "0")}${"x".repeat(205)}.ts`,
+    const files = Array.from({ length: 1040 }, (_, i) => ({
+      path: `f/${String(i).padStart(4, "0")}${"x".repeat(205)}.ts`,
       status: "modified" as const,
     }));
     const terminal = Array.from({ length: 12 }, (_, i) => `t${i}:${"y".repeat(1000)}`);
@@ -1614,8 +1661,8 @@ describe("buildEvidenceState — UTF-8 byte budgets", () => {
   });
 
   it("sacrifices terminal before shrinking the 16 KiB patch slot against the total", () => {
-    const files = Array.from({ length: 240 }, (_, index) => ({
-      path: `f/${String(index).padStart(3, "0")}${"x".repeat(205)}.ts`,
+    const files = Array.from({ length: 1030 }, (_, index) => ({
+      path: `f/${String(index).padStart(4, "0")}${"x".repeat(205)}.ts`,
       status: "modified" as const,
     }));
     const inputPatch: WorkspacePatch = {
@@ -1641,7 +1688,7 @@ describe("buildEvidenceState — UTF-8 byte budgets", () => {
 
   it("returns reviewer_unavailable when even an empty terminal cannot fit — structural overflow", () => {
     const files = Array.from({ length: 256 }, (_, i) => ({
-      path: `f/${String(i).padStart(3, "0")}${"x".repeat(230)}.ts`,
+      path: `f/${String(i).padStart(3, "0")}${"x".repeat(1000)}.ts`,
       status: "modified" as const,
     }));
     const build = buildEvidenceState(e3Request({ workspace: e3Workspace(files), terminal: ["t"] }));

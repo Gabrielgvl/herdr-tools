@@ -178,14 +178,13 @@ export class TypeSafeSpecClient {
     if (pickedIntent === undefined) return refuse("invalid_response", INTENT_QUESTION);
     const pickedTier = parseChoiceAnswer(body.answers[TIER_QUESTION], QUALITY_TIERS);
     if (pickedTier === undefined) return refuse("invalid_response", TIER_QUESTION);
-    const intent = (pickedIntent.confidence < 0.8 ? "unknown" : pickedIntent.choice) as WorkloadIntent;
     return {
       kind: "response",
       response: {
         quality: { done_when_verifiable: doneWhen },
-        intent: { value: intent, confidence: pickedIntent.confidence, probabilities: pickedIntent.probabilities },
+        intent: { value: pickedIntent.choice as WorkloadIntent, confidence: pickedIntent.confidence, probabilities: pickedIntent.probabilities },
         tier: { value: pickedTier.choice as QualityTier, confidence: pickedTier.confidence, probabilities: pickedTier.probabilities },
-        uncertainDimensions: intent === "unknown" ? ["intent"] : [],
+        uncertainDimensions: [],
       },
     };
   }

@@ -64,12 +64,12 @@ describe("TypeSafeSpecClient", () => {
     expect(JSON.stringify(body.state)).not.toMatch(/strong|failed|model|runner|provider|chain|catalog/u);
   });
 
-  it("maps low-confidence intent to unknown but accepts any structurally valid tier confidence", async () => {
+  it("keeps the top intent at low confidence and accepts any structurally valid tier confidence", async () => {
     const outcome = await client(async () => wire({ answers: answers({
       intent: choiceAnswer("debug", INTENTS, 0.1),
       weakest_sufficient_tier: choiceAnswer("frontier", TIERS, 0),
     }) })).evaluate({ task: TASK, catalog: CATALOG }, signal());
-    expect(outcome).toMatchObject({ kind: "response", response: { intent: { value: "unknown", confidence: 0.1 }, tier: { value: "frontier", confidence: 0 }, uncertainDimensions: ["intent"] } });
+    expect(outcome).toMatchObject({ kind: "response", response: { intent: { value: "debug", confidence: 0.1 }, tier: { value: "frontier", confidence: 0 }, uncertainDimensions: [] } });
   });
 
   it("measures the exact serialized SDK request and enforces 96 KiB before fetch or credential lookup", async () => {

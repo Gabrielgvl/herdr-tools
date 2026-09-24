@@ -246,11 +246,8 @@ export async function routeTask(input: TaskRouteInput): Promise<SpecDecision> {
   const transport = transportComponent(input.response);
   if (transport !== undefined) return abstain("transport_failed", transport);
   const response = input.response as Record<string, unknown>;
-  const parsedIntent = intentJudgment(response.intent);
-  if (parsedIntent === undefined) return abstain("invalid_response", "intent");
-  const intent: IntentEvidence = parsedIntent.confidence < ROUTER_CONFIDENCE_THRESHOLD
-    ? { ...parsedIntent, value: "unknown" }
-    : parsedIntent;
+  const intent = intentJudgment(response.intent);
+  if (intent === undefined) return abstain("invalid_response", "intent");
   const tier = tierJudgment(response.tier);
   if (tier === undefined) return abstain("invalid_response", "tier");
 

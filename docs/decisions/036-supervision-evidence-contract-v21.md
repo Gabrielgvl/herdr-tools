@@ -4,7 +4,7 @@
 
 Accepted (owner-authored contract, 2026-09-19). Implementation sequenced after the C1 reducer move (file-collision avoidance) and the router promotion (landed). V2.2 elements are explicitly conditional on observed unknown-rates.
 
-Implementation accuracy note: the current launch carrier supplies only `doneWhen` and `constraints` to reviewer assignment evidence. It does not copy `spec.assignment.objective`, and the public schema has no `progressMarkers`, so those fields are absent and empty respectively. The current porcelain parser can reject a valid worktree-column rename as `output_malformed`. A status-bearing `pane_exited` latches a non-clean exit before identity reconciliation. These are current behavior, not completed parts of the intended contract below.
+Implementation accuracy note (reconciled 2026-09-24): the launch carrier now supplies `objective`, `doneWhen`, and `constraints` to reviewer assignment evidence — `scope` is deliberately absent, and the public schema still has no `progressMarkers`, so that field stays empty. Worktree-column porcelain renames parse (the source record is consumed when either status column is `R`/`C`). An identity-free `pane_exited` is a reconciliation trigger only and never produces `process_exit`; that kind remains in the closed violation vocabulary for historical records. The forbidden-tool Tier-0 check was removed upstream. The assignment budget is 128 KiB against a 256 KiB total-state budget, enforced at launch preflight on the exact normalized digest bytes (`ASSIGNMENT_OVER_BUDGET` before child effects) — and independently, the TypeSafe evaluation request is capped at 96 KiB, so an under-128 KiB Task can still abstain `request_too_large` rather than launch.
 
 ## Date
 
@@ -26,7 +26,7 @@ Owner-authored replacement contract, informed by scout reports: VCC (lllyasviel/
 - Per-runner trace source: Pi children expose session JSONL paths in their agent records (consumed directly); Devin children expose structured session records (scout-verified: tool calls with outcomes, observations, metrics — reader adapter required); runners without structured traces fall back to bounded terminal lines (`source: "tmux-fallback"` is part of the state).
 - Workspace view per cadence: `baseRevision`, `headRevision`, `dirty`, `changedFiles` (path/status/added/deleted), diff stats, `fingerprint` — no full diff. Bounded recent hunks and files-written-since-last-review are V2.2.
 - Deterministic `executionDigest`: actions compacted by class (read/search/edit/command with exit code and duration), never LLM-summarized. The evidence chain `edit → failing test → edit → passing test` must survive compaction (non-zero exits, errors, writes, first/last occurrences are never compacted away).
-- Byte budgets with truncation priority: assignment 8KB (never truncated), trace 32KB, patch 16KB (V2.2), terminal 8KB (sacrificed first), total state 64KB. Over-budget structural evidence → `reviewer_unavailable`, never silent truncation of causal events.
+- Byte budgets with truncation priority: assignment 128 KiB (never truncated — launch preflight measures the exact normalized digest and rejects over-budget Tasks before child effects), trace 32 KiB, patch 16 KiB, terminal 8 KiB (sacrificed first), total state 256 KiB. Over-budget structural evidence → `reviewer_unavailable`, never silent truncation of causal events. The separate 96 KiB TypeSafe request cap means passing the assignment budget does not guarantee the evaluation launches.
 - Outbound safety: build → deterministic compaction → byte bounding → local sensitive-context scan → only `safe` sends. `sensitive|indeterminate` → no request, `reviewer_unavailable`. No semantic redaction (it silently alters evidence). The implementation uses configured shaped patterns, so `safe` means no detector matched. It is not a general proof that arbitrary credential text is absent.
 - **Attention policy separated from classification** (code, not Jev): `risk`/`blocked`/`appears_complete`/`stalled` → wake; `progress` → silent; `unknown` → silent during **baseline grace** (first review of a reservation with `workingForMs ≤ 2×cadence`), wake otherwise. Baseline acquisitions are expected states, not findings.
 - **Reducer amendment (supersedes ADR-034's gate-first ordering for interrupts):** `risk` and `blocked` are interrupt signals evaluated BEFORE the evidence gate — they wake a human, so a miss is more expensive than a false wake; the evidence gate still governs `appears_complete`/`stalled`/`progress`/fallthrough. `stalled` on a first observation requires ≥ 0.85 (no trajectory exists to ground a lower bar).
@@ -78,16 +78,16 @@ Six independent nouls in one `systemOne` call. Wording is contract — workers d
 
 Several checks leave Jev's jurisdiction entirely — code raises them directly as attention, no probabilistic judgment:
 
-- read-only assignment + dirty workspace
-- forbidden tool used
-- budget exceeded
-- process crashed
+- read-only assignment + workspace delta (`read_only_dirty_workspace`)
+- evidence byte budget exceeded (`evidence_budget_exceeded`)
+
+`process_exit` remains in the closed violation vocabulary so historical records stay readable, but no current code emits it: an identity-free `pane_exited` can never prove which occupant exited, so it triggers reconciliation instead. The earlier forbidden-tool check was removed upstream; assignment-conformance risk stays with Jev's `risk` predicate.
 
 Evidence hierarchy: Tier 0 deterministic violations (code) → Tier 1 structured activity (JSONL events, git/worktree state, test results, file changes) → Tier 2 narrative evidence (terminal transcript) → Tier 3 semantic interpretation (Jev). Jev observes the convergence of Tiers 1–2 and answers probabilities; code owns Tier 0 and every deterministic decision.
 
 ## Assignment digest fields
 
-The intended shape is `assignment: { objective, doneWhen (terminal criteria only), progressMarkers (intermediate observable states that never count as completion criteria), constraints }`. The evidence builder supports that shape, but the production launch-to-supervisor carrier currently supplies only `doneWhen` and `constraints`. `objective` is omitted and `progressMarkers` is empty in production reviews.
+The shape is `assignment: { objective, doneWhen (terminal criteria only), progressMarkers (intermediate observable states that never count as completion criteria), constraints }`. The production launch carrier supplies `objective`, `doneWhen`, and `constraints` — `scope` is deliberately not part of the digest — and the public schema has no `progressMarkers`, so that field is empty in production reviews.
 
 ## V2 result shape
 
@@ -117,6 +117,8 @@ The auditability payoff: `risk = .81; evidence refs #188–#193` reconstructs to
 ## Measurement plan (A/B/C before V2.2 adoption)
 
 A = tmux 100 lines (current), B = raw JSONL bounded, C = VCC SupervisionView. Metrics: evidence-sufficient rate, progress/stall/block/risk accuracy, tokens, payload bytes, false-positive wakeups, missed wakeups. V2.2 proceeds only if C beats A/B on the accuracy metrics at acceptable payload cost.
+
+Status (2026-09-23 measurement pass, `.herdr/artifacts/adr037-036-flow-20260923/measurement.md`): 205 real review records exist — 150 A (115 legacy-inferred) and 55 B across disjoint job sets — but there are zero `supervision-outcome` labels, zero adjudicated wake dispositions, and no token telemetry, so every accuracy and wake metric is unmeasured. C has never run: no production or replay path compiles real trace windows through `vcc-view`. Evidence-sufficient rates (A ≈ 74.7%, B = 100%) measure coverage, not correctness. No adoption decision has been made, and none can be made from this data.
 
 ## Scout findings annex (2026-09-19, consolidated before pane loss)
 

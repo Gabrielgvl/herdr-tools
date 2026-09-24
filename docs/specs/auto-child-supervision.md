@@ -92,12 +92,12 @@ status agree.
   proves. This is the `evidence_gap` condition in requirement 7, and it is correct whether or
   not the outage is still in the log.
 - **C4.** Thin events (`pane_closed`, `pane_exited`, `pane_agent_detected`) carry only a
-  pane ID, and **F6** makes a pane ID untrustworthy. They normally trigger a fresh
-  `session.snapshot`, and lifecycle settlement still comes from authoritative state. The
-  implemented `pane_exited` path has one exception: a reported non-clean exit for the
-  currently bound pane ID is latched as `process_exit` before reconciliation. Because the
-  event has no occupant identity, a delayed exit from a prior occupant of a reused pane ID
-  can be attributed to the replacement child.
+  pane ID, and **F6** makes a pane ID untrustworthy. They trigger a fresh
+  `session.snapshot`, and lifecycle settlement still comes from authoritative state. An
+  identity-free `pane_exited` is never a `process_exit` proof: its carried exit fact
+  names no occupant, so neither the pane ID nor the answering snapshot can bind it to
+  the child. `process_exit` remains in the closed violation vocabulary for historical
+  records only.
 - **C5.** Every accepted event is validated on its own fields at the protocol boundary, not
   merely proven to be an object. A known kind that is malformed is refused — dropping the
   connection, which the monitor reports and reconnects from — rather than accepted and
@@ -325,10 +325,7 @@ Material wakes, each with an opaque `eventId`:
 | `evidence_gap` | event or snapshot revision evidence is incomplete | high |
 
 `identity_replaced`, `identity_lost`, `released`, and `pane_closed` are **settling**: the
-supervisor job settles immediately after the wake. A status-bearing non-clean `pane_exited`
-may also produce a high-priority `reviewer_attention` event with violation `process_exit`.
-That violation is latched before reconciliation and is flushed before a settling lifecycle
-event. It is not lifecycle-correlated beyond the matching pane ID.
+supervisor job settles immediately after the wake.
 
 ## 9. Supervisor reviewer (requirement 8)
 
@@ -357,16 +354,15 @@ event. It is not lifecycle-correlated beyond the matching pane ID.
 - Evidence: one bounded V2.1 state assembled in fixed order from the Task digest, structured
   trace, Git workspace state, supplemental terminal lines, and version identity. Pi and Devin
   use their structured trace readers. Other runners use a labelled `tmux-fallback` trace.
-  The production carrier builds the internal `supervisionDigest` from the Task's `doneWhen` and `constraints`.
-  It does not copy the Task's `objective`, and the strict public schema has no
-  `progressMarkers`, so reviewer evidence omits `objective` and carries an empty
-  `progressMarkers` list. the digest's `readOnly` remains a code-owned Tier-0 claim.
+  The production carrier builds the internal `supervisionDigest` from the Task's
+  `objective`, `doneWhen`, and `constraints` — `scope` is not part of the digest — and
+  the strict public schema has no `progressMarkers`, so reviewer evidence carries an
+  empty `progressMarkers` list. The digest's `readOnly` remains a code-owned Tier-0 claim.
   The previous review's classification and signals are carried separately.
 - Workspace evidence pins the Git base during reservation. A failed pin refuses launch before
   child effects. At cadence, unavailable workspace evidence skips the read-only dirty-workspace
-  violation. The porcelain v1 parser consumes an extra rename/copy source record only when the
-  index status column is `R` or `C`; a valid worktree-column rename/copy can therefore return
-  `output_malformed` and make the workspace view unavailable for that cadence.
+  violation. The porcelain v1 parser consumes the rename/copy source record when either
+  status column is `R` or `C`, so staged and worktree-column renames both parse.
 - Outbound safety is a local configured-pattern scan over each bounded canonical section and
   its decoded string leaves. Only a state labelled `safe` is sent, but `safe` means no current
   detector matched. It is not a general proof that arbitrary credential text is absent.

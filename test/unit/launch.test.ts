@@ -20,6 +20,7 @@ import { POLICY_REVISION, type QualityTier, type WorkspaceState } from "../../sr
 import type { TypeSafeSpecClient } from "../../src/typesafe-spec.js";
 import type { SupervisionReserveRequest } from "../../src/supervision/registry.js";
 import { SupervisionBindError } from "../../src/supervision/supervisor.js";
+import { canonicalJson, EVIDENCE_ASSIGNMENT_MAX_BYTES } from "../../src/supervision/evidence.js";
 import type { WorktreeManager } from "../../src/worktree.js";
 import { RecipientRegistry } from "../../src/messages/recipients.js";
 import { attachmentCapability, handoffWriteCapability } from "../../src/profiles/capability.js";
@@ -459,8 +460,8 @@ describe("herdr_launch task cutover", () => {
     expect(harness.prompts).toHaveLength(1);
     expect(harness.prompts[0]).toContain(SPEC_BASELINE);
     expect(harness.prompts[0]).toContain(renderTask(TASK));
-    expect(requests[0]).toMatchObject({ child: { agentName: child.target, agentKind: "pi", operatingPointId: "pi:pi-model:low" }, settings: { supervisionDigest: { doneWhen: TASK.doneWhen, constraints: TASK.constraints } } });
-    expect(Object.keys(requests[0]!.settings!.supervisionDigest!).sort()).toEqual(["constraints", "doneWhen"]);
+    expect(requests[0]).toMatchObject({ child: { agentName: child.target, agentKind: "pi", operatingPointId: "pi:pi-model:low" }, settings: { supervisionDigest: { objective: TASK.objective, doneWhen: TASK.doneWhen, constraints: TASK.constraints } } });
+    expect(Object.keys(requests[0]!.settings!.supervisionDigest!).sort()).toEqual(["constraints", "doneWhen", "objective"]);
   });
 
   it("reserves the task digest and the trusted workspace root, with no deny-list policy", async () => {
@@ -477,7 +478,7 @@ describe("herdr_launch task cutover", () => {
 
     expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:opus:low" }] });
     const settings = requests[0]!.settings!;
-    expect(settings.supervisionDigest).toEqual({ doneWhen: TASK.doneWhen, constraints: TASK.constraints });
+    expect(settings.supervisionDigest).toEqual({ objective: TASK.objective, doneWhen: TASK.doneWhen, constraints: TASK.constraints });
     // Tool permission enforcement lives in the compiled argv, not the
     // reservation: the reserve settings carry no forbiddenTools policy.
     expect(settings).not.toHaveProperty("forbiddenTools");
@@ -1346,6 +1347,17 @@ describe("herdr_launch task cutover", () => {
     expect(ownership.record).toHaveBeenCalledWith(expect.objectContaining({ kind: "pane" }));
   });
 
+  it("groups the workload tab by the picked intent even at low confidence", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const harness = makeCli();
+    const response: TaskModelDecision = { ...responseFor(catalog), intent: { value: "debug", confidence: 0.2 } };
+    const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response })) };
+    await execute(toolFor({ catalog, cli: harness.cli, specClient }), task());
+    const createdTab = harness.calls.find((call) => call[0] === "tab" && call[1] === "create");
+    expect(createdTab).toEqual(expect.arrayContaining(["--label", "workload:debug"]));
+    expect(harness.calls.some((call) => call[0] === "tab" && call.slice(1).includes("workload:unknown"))).toBe(false);
+  });
+
   it("covers replica preconditions, reserve failures, and start recovery", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
 
@@ -1649,7 +1661,53 @@ tierChains:
     expect(harness.prompts[0]).toContain("delivery: attachment");
     expect(harness.prompts[0]).toContain("attachment-path: /tmp/recipient/body.txt");
     expect(harness.prompts[0]).not.toContain("x".repeat(1_000));
-    await expect(toolFor({ catalog, cli: makeCli().cli }).execute("call", task({ objective: "x".repeat(1_100_000) }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "MESSAGE_TOO_LARGE" });
+    // `scope` stays out of the supervision digest, so it still reaches the
+    // delivery bound — an oversized objective is refused earlier by the
+    // assignment budget preflight.
+    await expect(toolFor({ catalog, cli: makeCli().cli }).execute("call", task({ scope: "x".repeat(1_100_000) }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "MESSAGE_TOO_LARGE" });
+  });
+
+  it("admits an assignment at the evidence cap and rejects one byte over before any effect", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    // The exact normalized canonical bytes the evidence builder measures:
+    // {constraints, doneWhen, objective, progressMarkers} in canonical order.
+    const wrapBytes = Buffer.byteLength(canonicalJson({ constraints: TASK.constraints, doneWhen: TASK.doneWhen, objective: "", progressMarkers: [] }), "utf8");
+    const objective = "x".repeat(EVIDENCE_ASSIGNMENT_MAX_BYTES - wrapBytes);
+
+    // At the boundary the Task launches and the reservation gets the digest.
+    const harness = makeCli();
+    const supervision = stubSupervision();
+    const requests: SupervisionReserveRequest[] = [];
+    const reserve = supervision.reserve;
+    supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
+    const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), task({ objective }));
+    expect(result.details).toMatchObject({ outcome: "launched" });
+    expect(requests[0]!.settings!.supervisionDigest).toMatchObject({ objective });
+
+    // One byte over is a validate-phase refusal with count-only diagnostics —
+    // before the gate, evaluation, routing persistence, or any child effect.
+    const over = makeCli();
+    const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+    const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
+    const launchGate = { check: vi.fn(async () => undefined), release: vi.fn(async () => undefined) };
+    const overSupervision = stubSupervision();
+    await expect(
+      toolFor({ catalog, cli: over.cli, specClient, routerLog, launchGate: async () => launchGate, supervision: overSupervision })
+        .execute("call", task({ objective: `${objective}y` }), new AbortController().signal, undefined, extensionContext),
+    ).rejects.toMatchObject({
+      code: "ASSIGNMENT_OVER_BUDGET",
+      details: {
+        bytes: EVIDENCE_ASSIGNMENT_MAX_BYTES + 1,
+        budget: EVIDENCE_ASSIGNMENT_MAX_BYTES,
+        phase: "validate",
+        causeMessage: "Task assignment exceeds the supervision evidence byte budget",
+      },
+    });
+    expect(over.calls).toEqual([]);
+    expect(launchGate.check).not.toHaveBeenCalled();
+    expect(specClient.evaluate).not.toHaveBeenCalled();
+    expect(routerLog).not.toHaveBeenCalled();
+    expect(overSupervision.reserved).toEqual([]);
   });
 
   it("times out and logs a hung task evaluation without starting a child", async () => {

@@ -181,8 +181,9 @@ export {
 } from "../reviewer.js";
 export type { SupervisionReason, SupervisionSignalProbabilities } from "../reviewer.js";
 
-/** The launch's authorial contract. Either array may be empty. The reviewer sees it only as `evidence.assignment`, never as a raw field. */
+/** The launch's authorial contract. `objective` is absent only on reservations recorded before the digest carried it — it is never fabricated for them. Either array may be empty. The reviewer sees it only as `evidence.assignment`, never as a raw field. */
 export interface SupervisionAssignmentDigest {
+  objective?: string;
   doneWhen: string[];
   constraints: string[];
 }

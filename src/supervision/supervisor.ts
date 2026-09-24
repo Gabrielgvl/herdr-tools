@@ -296,18 +296,6 @@ function digestCursorLabel(cursor: DigestCursorRef | undefined): string | null {
   return cursor.position === undefined ? `${cursor.source}:${cursor.hash}` : `${cursor.source}@${cursor.position}:${cursor.hash}`;
 }
 
-/** The process-exit violation's detail string and bounded evidence scalars — shared by the cadence emit and the settle-time flush. */
-function exitViolationEvidence(exit: { exitCode?: number; signal?: string }): { detail: string; evidence: Record<string, string | number | boolean> } {
-  return {
-    detail: `the child process exited (${exit.signal ?? `code ${exit.exitCode}`})`,
-    evidence: {
-      violation: "process_exit",
-      ...(exit.exitCode === undefined ? {} : { exitCode: exit.exitCode }),
-      ...(exit.signal === undefined ? {} : { signal: exit.signal }),
-    },
-  };
-}
-
 export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private readonly log: SupervisionEventLog;
   private readonly transitions = new BoundedHistory<SupervisionTransition>(SUPERVISION_MAX_TRANSITIONS);
@@ -400,15 +388,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private traceCursor: TraceCursor | undefined;
   /** The reservation's evidence version identity; drift is measured against it. */
   private evidenceBaseline: EvidenceVersionIdentity | undefined;
-  /**
-   * An authoritative process-exit fact folded from `pane_exited` but not yet
-   * reported (ADR-036 W0). The next cadence's Tier-0 check consumes it —
-   * unless the exit settles the supervisor first, in which case settlement
-   * flushes it (`reportLatchedExit`, ADR-036 V2-05): a settled supervisor
-   * never runs another cadence. An adopted move clears it — the exited
-   * pane's process is no longer this child.
-   */
-  private unreportedExit: { exitCode?: number; signal?: string } | undefined;
   private settlement: Settlement | undefined;
   private selectedOperatingPointId: string | undefined;
   private bindStarted = false;
@@ -850,9 +829,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.pendingMoveEndpoints.length = 0;
     this.pendingMoveInitialStateChangeSeq = undefined;
     this.selectedOperatingPointId = undefined;
-    // An unreported exit belongs to the identity that folded it; a failed
-    // binding drops both together so the latch can never outlive its pane.
-    this.unreportedExit = undefined;
     this.eventStreamDegraded = false;
     this.bindingPublished = false;
     this.provisionalPublished = false;
@@ -1091,20 +1067,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     if (!isPaneRecordEvent(event.event)) {
       // A thin event carries only a pane id, and Herdr reuses pane ids, so it is
-      // a reconciliation trigger and never a conclusion.
-      const exit = event.event === "pane_exited" && this.pendingMoveDestination === undefined && event.paneId === this.identity?.paneId
-        ? event.exit
-        : undefined;
-      // ADR-036 W0: an authoritative non-clean exit while the child is still
-      // bound is a Tier-0 crash fact, latched for the next cadence's code
-      // check. A thin event reporting no status is a typed gap — pane loss
-      // alone is never a crash.
-      if (exit?.available === true && (exit.signal !== undefined || (exit.exitCode ?? 0) !== 0)) {
-        this.unreportedExit = {
-          ...(exit.exitCode === undefined ? {} : { exitCode: exit.exitCode }),
-          ...(exit.signal === undefined ? {} : { signal: exit.signal }),
-        };
-      }
+      // a reconciliation trigger and never a conclusion. `pane_exited` is no
+      // different: its carried exit fact names no occupant, so neither the
+      // pane id nor the answering snapshot can bind it to this child — an
+      // exit is never a process_exit proof.
       await this.reconcile(`event:${event.event}`);
       return;
     }
@@ -1257,9 +1223,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const initialStateChangeSeq = this.pendingMoveInitialStateChangeSeq;
     this.pendingMoveDestination = undefined;
     this.pendingMoveInitialStateChangeSeq = undefined;
-    // The exited-pane fact was folded against the origin pane; an adopted move
-    // means that pane's process is no longer this child.
-    this.unreportedExit = undefined;
     this.paneIdentityGeneration += 1;
     this.identity = next;
     this.paneId = next.paneId;
@@ -1934,8 +1897,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * violation evidence — no probabilistic classification, no review record —
    * and the cadence is consumed (the emitted reports drive the violation-log
    * append and tell the caller to return). Everything here is a code fact: a
-   * read-only reservation whose workspace went dirty, an E3 byte budget that
-   * refused, or an authoritative non-clean process exit.
+   * read-only reservation whose workspace went dirty, or an E3 byte budget
+   * that refused.
    */
   private emitTier0Violations(
     trace: TraceWindow,
@@ -1985,11 +1948,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         evidence: { ...overflow.detail, violation: "evidence_budget_exceeded", cause: overflow.kind },
       });
     }
-    const exit = this.unreportedExit;
-    if (exit !== undefined) {
-      const { detail, evidence } = exitViolationEvidence(exit);
-      violations.push({ reason: "process_exit", detail, evidence });
-    }
     const reported: Tier0ViolationReport[] = [];
     for (const violation of violations) {
       reported.push({
@@ -1997,69 +1955,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         event: this.emit("reviewer_attention", `supervision violation ${violation.reason}: ${violation.detail}`, violation.evidence),
       });
     }
-    // Cleared only after the emit: a notifier that throws leaves the fact
-    // latched so the next cadence still reports it.
-    if (exit !== undefined) this.unreportedExit = undefined;
     return reported;
-  }
-
-  /**
-   * Emit and persist a latched non-clean exit that settlement is about to
-   * make unreachable (ADR-036 V2-05): a settled supervisor never runs the
-   * cadence that consumes `unreportedExit`, so the fact is flushed here —
-   * the violation wake precedes the lifecycle event it explains. Clearing
-   * follows the emit, exactly like the cadence's own consume.
-   */
-  private async reportLatchedExit(): Promise<void> {
-    const exit = this.unreportedExit;
-    if (exit === undefined) return;
-    // The latch only exists on a bound exact identity — the fold set it after
-    // matching this pane, and resetPreparedBinding clears both together.
-    const identity = this.identity!;
-    const { detail, evidence } = exitViolationEvidence(exit);
-    const event = this.emit("reviewer_attention", `supervision violation process_exit: ${detail}`, evidence);
-    this.unreportedExit = undefined;
-    try {
-      const append = this.deps.reviewLog ?? appendSupervisionReview;
-      // No cadence produced this violation, so its provenance is the honest
-      // absence of one: the bound trace-source kind, the minted baseline
-      // hash, and nulls where a window, digest, or state would have been.
-      const source = this.traceSource.select(identity);
-      await append({
-        jobId: this.deps.jobId,
-        agentName: identity.agentName,
-        agentKind: identity.agentKind,
-        provenance: {
-          traceSource: source,
-          representation: representationForTraceSource(source),
-          traceFromCursor: null,
-          traceToCursor: null,
-          traceDigestHash: null,
-          workspaceFingerprint: null,
-          stateBytes: null,
-          terminalBytes: null,
-          identityHash: this.evidenceBaseline?.hash ?? null,
-        },
-        violations: [{
-          eventId: event.eventId,
-          eventType: event.type,
-          atMs: event.atMs,
-          violation: "process_exit",
-          details: event.details,
-        }],
-      }, {
-        root: this.deps.reviewLogRoot ?? defaultReviewLogRoot(),
-        now: () => new Date(this.deps.clock.now()),
-      });
-    } catch (error) {
-      // The wake already fired — a sink failure costs only the dataset row.
-      // The degrade episode mirrors the cadence's append failure: reported
-      // once, supervision state untouched.
-      if (!this.reviewerDegraded) {
-        this.reviewerDegraded = true;
-        this.emit("reviewer_degraded", `the violation record could not be persisted (${reviewerReason(error)})`, { reason: reviewerReason(error) });
-      }
-    }
   }
 
   /**
@@ -2119,10 +2015,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private async settleWithEvent(type: SupervisionEventType, outcome: SupervisionResult, trigger: string, summary: string): Promise<void> {
-    // A latched non-clean exit reports before the lifecycle event it explains
-    // — a settled supervisor never runs the cadence that would consume it
-    // (ADR-036 V2-05).
-    await this.reportLatchedExit();
     if (type === "pane_closed" && this.deps.selfClose !== undefined) {
       // A manager-requested close is successful bookkeeping, not an event for
       // that same manager. Wait for the bounded close proof before deciding so
@@ -2143,9 +2035,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   private async settle(outcome: SupervisionResult, reason: string): Promise<void> {
     if (this.state === "settled") return;
-    // The same settle-time flush for direct settle callers (identity_lost has
-    // no settleWithEvent wrapper of its own); idempotent via the latch.
-    await this.reportLatchedExit();
     // `identity_lost` is the one settling outcome reached without its own event,
     // because a move or a reconnect proves it directly rather than observing it.
     if (outcome === "identity_lost") this.emit("identity_lost", `supervision lost the exact child's identity (${reason})`, { reason });

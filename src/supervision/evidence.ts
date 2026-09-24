@@ -726,7 +726,12 @@ function parsePorcelainZ(text: string): { dirty: boolean; untracked: string[] } 
     const y = entry[1]!;
     if (x === "!" && y === "!") continue;
     dirty = true;
-    if (x === "R" || x === "C") i += 1; // consume the rename/copy source record
+    // A rename/copy may sit in either XY column (staged or worktree rename
+    // detection); both emit the source path as the next record.
+    if (x === "R" || x === "C" || y === "R" || y === "C") {
+      i += 1;
+      if (records[i] === undefined || records[i] === "") return undefined;
+    }
     if (x === "?" && y === "?") untracked.push(entry.slice(3));
   }
   return { dirty, untracked };
@@ -1019,7 +1024,7 @@ export async function buildWorkspaceView(request: WorkspaceViewRequest, deps: Wo
  *
  * Budgets are UTF-8 bytes (ADR-036):
  *
- * - assignment ≤ 8 KiB, never truncated — over is structural overflow.
+ * - assignment ≤ 128 KiB, never truncated — over is structural overflow.
  * - trace ≤ 32 KiB — the compacted digest; over is structural overflow
  *   (a truncated digest silently drops causal events, which is the one
  *   thing compaction is forbidden to do).
@@ -1028,7 +1033,7 @@ export async function buildWorkspaceView(request: WorkspaceViewRequest, deps: Wo
  * - terminal ≤ 8 KiB — supplemental narrative, bounded to a contiguous
  *   newest suffix of whole lines (the same rule the trace source applies
  *   to a tmux window), and sacrificed first against the total.
- * - total state ≤ 64 KiB — terminal then patch give way. When the remaining
+ * - total state ≤ 256 KiB — terminal then patch give way. When the remaining
  *   structural sections still exceed it, the review is unavailable; nothing
  *   causal is ever cut to fit.
  *
@@ -1039,10 +1044,10 @@ export const EVIDENCE_STATE_VERSION = 1;
 /** The ADR-036 contract revision this state implements, inside the version identity. */
 export const EVIDENCE_CONTRACT_VERSION = "2.1";
 
-export const EVIDENCE_ASSIGNMENT_MAX_BYTES = 8 * 1024;
+export const EVIDENCE_ASSIGNMENT_MAX_BYTES = 128 * 1024;
 export const EVIDENCE_TRACE_MAX_BYTES = 32 * 1024;
 export const EVIDENCE_TERMINAL_MAX_BYTES = 8 * 1024;
-export const EVIDENCE_TOTAL_MAX_BYTES = 64 * 1024;
+export const EVIDENCE_TOTAL_MAX_BYTES = 256 * 1024;
 
 /**
  * The assignment as the launcher supplied it. Fields are `unknown` because
@@ -1178,11 +1183,11 @@ export interface EvidenceStateRequest {
 export type EvidenceUnavailableCause =
   /** The request itself or its identity components are malformed. */
   | "input_invalid"
-  /** Assignment bytes exceed the never-truncated 8 KiB budget. */
+  /** Assignment bytes exceed the never-truncated 128 KiB budget. */
   | "assignment_over_budget"
   /** The compacted digest exceeds the 32 KiB trace budget. */
   | "trace_over_budget"
-  /** Fixed sections alone exceed the 64 KiB total — terminal cannot sacrifice enough. */
+  /** Fixed sections alone exceed the 256 KiB total — terminal cannot sacrifice enough. */
   | "state_over_budget"
   /** The scan found sensitive content; nothing is sent. */
   | "sensitive"
@@ -1280,6 +1285,16 @@ function normalizeAssignment(input: EvidenceAssignmentInput | undefined): Eviden
   };
   if (typeof input?.objective === "string" && input.objective !== "") assignment.objective = input.objective;
   return assignment;
+}
+
+/**
+ * The exact byte measure the build applies to the assignment section:
+ * normalize the carrier, serialize canonically, count UTF-8 bytes. The launch
+ * preflight measures the same value it will later reserve so an over-budget
+ * Task is refused at the launch boundary, not at every review cadence.
+ */
+export function normalizedAssignmentBytes(input: EvidenceAssignmentInput | undefined): number {
+  return utf8Length(canonicalJson(normalizeAssignment(input)));
 }
 
 /** Thresholds must be a finite-number table to be a meaningful identity component. */

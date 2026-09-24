@@ -17,6 +17,7 @@ import type { SupervisionReviewRequest, SupervisionReviewResult, SupervisionRevi
 import { createTraceSource, type DevinSessionReader, type TraceSource } from "../../src/supervision/trace-source.js";
 import type { SupervisionWorkspaceRoot } from "../../src/job-registry.js";
 import { Supervisor, SupervisionBindError, type SupervisionBinding, type SupervisionScheduler, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
+import { modelSafeJson } from "../../src/redaction.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 
 const session = { source: "herdr:pi", agent: "pi", kind: "path", value: "/pi/session.jsonl" };
@@ -2571,6 +2572,46 @@ describe("the ADR-036 evidence cadence", () => {
     expect(h.reviewRequests[1]!.evidence!.trace.cursorFrom).toEqual(h.reviewRequests[0]!.evidence!.trace.cursorTo);
   });
 
+  it("carries the launched Task's objective through the reservation into evidence.assignment, and still accepts a pre-objective digest", async () => {
+    // The launch's reserve path builds the digest through modelSafeJson over
+    // the canonical Task; the registry hands it to the supervisor verbatim.
+    const task = { objective: "land the reserve-to-review objective", doneWhen: ["tests pass"], constraints: ["read-only"] };
+    const h = await working({
+      assignmentDigest: modelSafeJson({
+        objective: task.objective,
+        doneWhen: task.doneWhen,
+        constraints: task.constraints,
+      }) as SupervisorDependencies["assignmentDigest"],
+    });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.assignment).toEqual({
+      objective: task.objective,
+      doneWhen: task.doneWhen,
+      progressMarkers: [],
+      constraints: task.constraints,
+    });
+
+    // A reservation recorded before the digest carried an objective still
+    // reviews — the evidence leaves the field absent rather than fabricating one.
+    const legacy = await working({ assignmentDigest: { doneWhen: ["tests pass"], constraints: ["read-only"] } });
+    legacy.fireTimer();
+    await vi.waitFor(() => expect(legacy.reviews).toBe(1));
+    expect(legacy.reviewRequests[0]!.evidence!.assignment).toEqual({ doneWhen: ["tests pass"], progressMarkers: [], constraints: ["read-only"] });
+  });
+
+  it("reviews a legal ~20 KiB objective the old 8 KiB cap would have refused", async () => {
+    // A launch-legal objective (delivery bound is 1 MiB) now fits the raised
+    // assignment budget: the cadence reviews instead of waking
+    // evidence_budget_exceeded on every tick.
+    const objective = `Ship ${"x".repeat(20_000)}`;
+    const h = await working({ assignmentDigest: { objective, doneWhen: ["tests pass"], constraints: [] } });
+    h.fireTimer();
+    await vi.waitFor(() => expect(h.reviews).toBe(1));
+    expect(h.reviewRequests[0]!.evidence!.assignment).toEqual({ objective, doneWhen: ["tests pass"], progressMarkers: [], constraints: [] });
+    expect(h.wakes).toEqual([]);
+  });
+
   it("carries each compiled cursor range in previousReview and emits hunks only for writes in that range", async () => {
     const patchCalls: string[][] = [];
     const h = await working({
@@ -2689,7 +2730,7 @@ describe("the ADR-036 evidence cadence", () => {
   });
 
   it("reports an evidence-budget overflow as Tier-0 attention with typed evidence and no reviewer call", async () => {
-    const h = await working({ assignmentDigest: { doneWhen: ["x".repeat(9_000)], constraints: [] } });
+    const h = await working({ assignmentDigest: { doneWhen: ["x".repeat(140_000)], constraints: [] } });
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
     expect(h.wakes[0]!.event.priority).toBe("high");
@@ -2886,137 +2927,55 @@ describe("the ADR-036 evidence cadence", () => {
     expect(runner).not.toHaveBeenCalled();
   });
 
-  it("reports an authoritative non-clean pane exit as a process_exit violation on the next cadence", async () => {
+  it("never turns a pane_exited exit fact into a process_exit — even with the occupant still proven present", async () => {
+    // Pane ids are reused and the event names no occupant, so an exit status
+    // can never be attributed to the bound child: a stale exit from a prior
+    // occupant of a reused pane is indistinguishable from a genuine one. The
+    // event is a reconciliation trigger only — the snapshot still proves this
+    // child continuous, and the cadence reviews normally.
     const h = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
     await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
-    expect(h.wakes[0]!.event.priority).toBe("high");
-    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "process_exit", exitCode: 137 });
-    expect(h.wakes[0]!.event.details).not.toHaveProperty("classification");
-    expect(h.reviews).toBe(0);
-    // The persisted violation carries the exit fact and the cadence provenance.
-    expect(h.logged).toHaveLength(1);
-    expect(h.logged[0]).toMatchObject({
-      provenance: { traceSource: "pi-jsonl", representation: "B-runner-trace" },
-      violations: [{ eventId: h.wakes[0]!.event.eventId, violation: "process_exit", details: { violation: "process_exit", exitCode: 137 } }],
-    });
-    // The fact is consumed once: the following cadence reviews normally.
+    expect(h.supervisor.view()).toMatchObject({ state: "active", status: "working", child: { paneId: "p1" } });
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
-    expect(types(h.wakes)).toEqual(["reviewer_attention"]);
+    expect(h.wakes).toEqual([]);
+    expect(h.logged.filter((entry) => "violations" in entry)).toEqual([]);
   });
 
-  it("flushes a latched non-clean exit before settlement — the violation precedes pane_closed", async () => {
-    // ADR-036 V2-05: when pane loss settles the supervisor between the exit
-    // event and the next cadence, the latched fact is still reported — first.
+  it("settles pane loss after an exit event as pane_closed — no process_exit violation", async () => {
+    // The exit fact is identity-free, so pane loss is the lifecycle verdict on
+    // its own; there is no crash wake to precede it and no violation row.
     const h = await working({ snapshots: [snapshot([], [])] });
     await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
     await h.supervisor.onEvent(thinEvent("pane_closed"));
     await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
-    expect(types(h.wakes)).toEqual(["reviewer_attention", "pane_closed"]);
-    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "process_exit", exitCode: 137 });
-    // Settle-time provenance is the honest absence of a cadence: bound trace
-    // source kind, nulls for window/digest/state — the baseline identity was
-    // never minted either, since no evidence build ever ran.
-    expect(h.logged).toHaveLength(1);
-    expect(h.logged[0]).toMatchObject({
-      provenance: { traceSource: "pi-jsonl", traceFromCursor: null, traceDigestHash: null, identityHash: null },
-      violations: [{ violation: "process_exit", details: { violation: "process_exit", exitCode: 137 } }],
-    });
+    expect(types(h.wakes)).toEqual(["pane_closed"]);
+    expect(h.logged).toEqual([]);
     h.supervisor.shutdown();
   });
 
-  it("persists the settle-flushed violation through the default review-log seam", async () => {
-    const root = await mkdtemp(join(tmpdir(), "herdr-supervisor-v205-"));
-    try {
-      const h = harness({
-        reviewLog: "default",
-        reviewLogRoot: root,
-        snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), snapshot([], [])],
-      });
-      await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
-      await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
-      await h.supervisor.onEvent(thinEvent("pane_closed"));
-      await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
-      expect(types(h.wakes)).toEqual(["reviewer_attention", "pane_closed"]);
-      const paths = reviewLogPaths(root);
-      const records = (await readFile(paths.reviews, "utf8")).split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line) as SupervisionLogRecord);
-      expect(records).toHaveLength(1);
-      expect(records[0]).toMatchObject({
-        type: "violation",
-        eventId: h.wakes[0]!.event.eventId,
-        eventType: "reviewer_attention",
-        disposition: "unknown",
-        violation: "process_exit",
-        details: { violation: "process_exit", exitCode: 137 },
-        provenance: { traceSource: "pi-jsonl", traceFromCursor: null, identityHash: null },
-      });
-      h.supervisor.shutdown();
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("still settles when the settle-flushed violation's append fails — the wake fired, only the row is lost", async () => {
-    const h = await working({
-      snapshots: [snapshot([], [])],
-      reviewLog: async () => { throw new Error("disk full"); },
-    });
-    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
-    await h.supervisor.onEvent(thinEvent("pane_closed"));
-    await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
-    // The violation wake precedes the lifecycle event; the sink failure opens
-    // the one degraded episode between them.
-    expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded", "pane_closed"]);
-    h.supervisor.shutdown();
-  });
-
-  it("does not reopen the episode when the settle-flushed append fails while already degraded", async () => {
-    // The cadence's evidence-read failure opened the episode first; the
-    // violation's own append failure inside it is a second sink loss, not a
-    // second wake.
-    const h = await working({
-      snapshots: [snapshot([], [])],
-      transcript: async () => { throw new Error("pane read failed"); },
-      reviewLog: async () => { throw new Error("disk full"); },
-    });
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_degraded"]));
-    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 137 }));
-    await h.supervisor.onEvent(thinEvent("pane_closed"));
-    await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
-    expect(types(h.wakes)).toEqual(["reviewer_degraded", "reviewer_attention", "pane_closed"]);
-    h.supervisor.shutdown();
-  });
-
-  it("reports a signal-only exit with the signal fact and no invented code", async () => {
-    const h = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
-    await h.supervisor.onEvent(exitEvent("p1", { signal: "SIGKILL" }));
-    h.fireTimer();
-    await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
-    expect(h.wakes[0]!.event.details).toMatchObject({ violation: "process_exit", signal: "SIGKILL" });
-    expect(h.wakes[0]!.event.details).not.toHaveProperty("exitCode");
-    expect(h.logged[0]).toMatchObject({ violations: [{ violation: "process_exit", details: { violation: "process_exit", signal: "SIGKILL" } }] });
-  });
-
-  it("treats a thin pane_exited with no exit status as a lifecycle gap, never a crash", async () => {
+  it("treats every thin pane_exited as a lifecycle trigger, never a crash", async () => {
     const h = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
     await h.supervisor.onEvent(thinEvent("pane_exited"));
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     expect(h.wakes).toEqual([]);
 
-    // A clean exit code is not a crash either.
-    const clean = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
-    await clean.supervisor.onEvent(exitEvent("p1", { exit_code: 0 }));
-    clean.fireTimer();
-    await vi.waitFor(() => expect(clean.reviews).toBe(1));
-    expect(clean.wakes).toEqual([]);
+    // A carried status changes nothing: clean, non-clean, and signal-only
+    // facts all stay unattributable and only trigger reconciliation.
+    for (const exit of [{ exit_code: 0 }, { exit_code: 137 }, { signal: "SIGKILL" }]) {
+      const bound = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
+      await bound.supervisor.onEvent(exitEvent("p1", exit));
+      bound.fireTimer();
+      await vi.waitFor(() => expect(bound.reviews).toBe(1));
+      expect(bound.wakes).toEqual([]);
+      expect(bound.logged.filter((entry) => "violations" in entry)).toEqual([]);
+    }
   });
 
-  it("does not latch an exit for a different pane or a pending move", async () => {
-    // An exit attributed to a pane this supervisor does not own is not its fact.
+  it("treats a pane_exited for a different pane or a pending move as a bare trigger", async () => {
+    // An exit reported for a pane this supervisor does not own reconciles and
+    // changes nothing.
     const otherPane = await working({ snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])] });
     await otherPane.supervisor.onEvent(exitEvent("p9", { exit_code: 9 }));
     otherPane.fireTimer();
@@ -3098,7 +3057,7 @@ describe("the ADR-036 evidence cadence", () => {
     h.fireTimer();
     await vi.waitFor(() => expect(h.reviews).toBe(1));
     const json = JSON.stringify(h.supervisor.view());
-    for (const key of ["traceCursor", "traceFromCursor", "traceToCursor", "previousReview", "patch", "workspaceRoot", "workspaceBaseRevision", "assignmentDigest", "readOnly", "unreportedExit", "evidenceBaseline", "traceSource", "evidenceScanner"]) {
+    for (const key of ["traceCursor", "traceFromCursor", "traceToCursor", "previousReview", "patch", "workspaceRoot", "workspaceBaseRevision", "forbiddenTools", "assignmentDigest", "readOnly", "unreportedExit", "evidenceBaseline", "traceSource", "evidenceScanner"]) {
       expect(json).not.toContain(`"${key}"`);
     }
     // The public review record keeps the consumer shape — no evidence payload.
@@ -3229,20 +3188,22 @@ describe("the ADR-036 evidence cadence", () => {
     const devinIdentity: SupervisedIdentity = { ...identity, agentKind: "devin", agentSession: devinSession };
     const h = harness({
       child: { agentName: "worker", agentKind: "devin", operatingPointId: "worker-devin" },
-      snapshots: [
-        snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })]),
-        snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })]),
-      ],
+      snapshots: [snapshot([paneRecord({ status: "working", revision: 5, agentKind: "devin", agentSession: devinSession })])],
       devinSession: async () => ({ position: "opaque-token", events: [] }),
+      // A read-only reservation over a dirty workspace is the violation the
+      // cadence reports; the devin window still supplies the cursor label.
+      assignmentDigest: { doneWhen: ["x"], constraints: [], readOnly: true },
+      workspaceRoot,
+      workspaceRunner: dirtyRunner,
+      workspaceBase: await buildWorkspaceView({ root: workspaceRoot.root }, { run: dirtyRunner }, new AbortController().signal),
     });
     await h.supervisor.bind({ identity: devinIdentity, operatingPointId: "worker-devin" });
-    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 9 }));
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
     expect(h.logged).toHaveLength(1);
     expect(h.logged[0]).toMatchObject({
       provenance: { traceSource: "devin-session", representation: "B-runner-trace", traceToCursor: expect.stringMatching(/^devin-session:[0-9a-f]{64}$/u) },
-      violations: [{ violation: "process_exit" }],
+      violations: [{ violation: "read_only_dirty_workspace" }],
     });
   });
 
@@ -3252,10 +3213,15 @@ describe("the ADR-036 evidence cadence", () => {
       const h = harness({
         reviewLog: "default",
         reviewLogRoot: root,
-        snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })]), snapshot([paneRecord({ status: "working", revision: 5 })])],
+        snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])],
+        // A read-only reservation over a dirty workspace is the violation the
+        // cadence reports — a code fact, never a probabilistic claim.
+        assignmentDigest: { doneWhen: ["x"], constraints: [], readOnly: true },
+        workspaceRoot,
+        workspaceRunner: dirtyRunner,
+        workspaceBase: await buildWorkspaceView({ root: workspaceRoot.root }, { run: dirtyRunner }, new AbortController().signal),
       });
       await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
-      await h.supervisor.onEvent(exitEvent("p1", { exit_code: 9 }));
       h.fireTimer();
       await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention"]));
       const paths = reviewLogPaths(root);
@@ -3273,8 +3239,8 @@ describe("the ADR-036 evidence cadence", () => {
           eventType: "reviewer_attention",
           atMs: 1_000,
           disposition: "unknown",
-          violation: "process_exit",
-          details: { violation: "process_exit", exitCode: 9 },
+          violation: "read_only_dirty_workspace",
+          details: { violation: "read_only_dirty_workspace", delta: "dirty, 1 changed paths", filesChanged: 1 },
           provenance: {
             traceSource: "pi-jsonl",
             representation: "B-runner-trace",
@@ -3292,11 +3258,15 @@ describe("the ADR-036 evidence cadence", () => {
   it("degrades like a reviewer failure when a violation's log write fails — the wake already fired and the child is untouched", async () => {
     const persisted: SupervisionLogEntry[] = [];
     let fail = true;
+    // The violation source is a read-only reservation whose workspace is
+    // dirty on the first cadence and clean on the recovery cadence.
+    let workspaceDirty = true;
     const h = await working({
-      snapshots: [snapshot([paneRecord({ status: "working", revision: 5 })])],
+      assignmentDigest: { doneWhen: ["x"], constraints: [], readOnly: true },
+      workspaceRoot,
+      workspaceRunner: async (argv, cwd, signal) => (workspaceDirty ? dirtyRunner : cleanRunner)(argv, cwd, signal),
       reviewLog: async (entry) => { if (fail) throw new ReviewLogError(); persisted.push(entry); },
     });
-    await h.supervisor.onEvent(exitEvent("p1", { exit_code: 9 }));
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded"]));
     expect(h.reviews).toBe(0);
@@ -3306,6 +3276,7 @@ describe("the ADR-036 evidence cadence", () => {
     // The next cadence retries the sink; a clean window reviews normally and
     // the recovered reviewer emits the recovery wake.
     fail = false;
+    workspaceDirty = false;
     h.fireTimer();
     await vi.waitFor(() => expect(types(h.wakes)).toEqual(["reviewer_attention", "reviewer_degraded", "reviewer_recovered"]));
     expect(persisted).toHaveLength(1);

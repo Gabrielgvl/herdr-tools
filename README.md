@@ -83,6 +83,26 @@ claude plugin update herdr-tools@herdr-tools --scope user -y
 
 The cached plugin intentionally points back to `/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js`, so main installed at that path must be built. For development or sideloading, `claude --plugin-dir /home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/role-plugins/manager` remains an explicit alternative to the global marketplace installation.
 
+### Automatic refresh
+
+Hosted CI cannot write this machine, so the installed checkout refreshes itself through a user systemd timer (`deploy/systemd/herdr-tools-autoupdate.{service,timer}`) that runs `scripts/herdr-tools-autoupdate.sh` on boot and on a `*:0/2` wall-clock cadence — every even minute — so retries after a failed run do not depend on the service's post-failure state. Bootstrap once this lands on `origin/main` and the installed checkout has been pulled:
+
+```bash
+install -D -m644 -t ~/.config/systemd/user \
+  ~/.pi/agent/extensions/herdr-tools/deploy/systemd/herdr-tools-autoupdate.service \
+  ~/.pi/agent/extensions/herdr-tools/deploy/systemd/herdr-tools-autoupdate.timer
+systemctl --user daemon-reload
+systemctl --user enable --now herdr-tools-autoupdate.timer
+```
+
+Each run fetches `origin/main`, then fast-forwards `~/.pi/agent/extensions/herdr-tools` only while that checkout is clean, on `main`, and the update is a fast-forward. It runs `npm ci` when `package.json`/`package-lock.json` changed or `node_modules` is missing, then `npm run build:mcp`. Success is appended to `~/.local/state/herdr-tools-autoupdate/last-success` only after `dist/src/mcp-server.js` exists, so a run that dies mid-build converges on the next timer tick; runs are bounded by `TimeoutStartSec=600` and serialized by a lockfile.
+
+A dirty checkout, a different branch, or divergent history is refused: nothing beyond the fetch changes, the service exits nonzero, and the refusal stays visible in `journalctl --user -u herdr-tools-autoupdate.service` until a human resolves the checkout — retries are safe and automatic. The installed path is a linked worktree of the dirty development checkout; the fetch updates only shared objects and remote-tracking refs, and the updater never modifies the dirty development worktree's files or branch — its writes outside the installed checkout are only its state dir (`lock`, `last-success`), a `/tmp` self-snapshot, and the npm cache. Fetch uses the ambient user git/ssh credentials; an auth or network failure is the same visible, retried failure.
+
+New sessions spawn the refreshed `dist/src/mcp-server.js`; existing Pi/Claude processes need a restart to load new code, and the updater does not restart them. The owner chose best-effort in-place dependency updates: `npm ci` removes live `node_modules` before reinstalling, so a failed install can prevent new MCP sessions from starting until a later timer retry succeeds. This is not zero-downtime deployment. Check the service journal and restore dependencies with `npm ci && npm run build:mcp` if retries keep failing. `claude plugin update` refreshes plugin assets (skills, commands) rather than MCP code and currently hangs — it is not part of this path and remains a manual step.
+
+`bash scripts/test-autoupdate.sh` regression-checks the updater against a fake remote and install with a stubbed npm; it runs in the `validate` PR workflow.
+
 ## Automatic child supervision
 
 A supervisor is reserved before the first topology mutation for every qualified launch. Every qualified recipient retains strict complete native-session readiness and exact binding before prompt dispatch. Every launch carries the canonical Task, so there is no promptless launch path. Binding drains queued evidence while the public job remains `reserved`, then commits `request.targetIds: [paneId]` and bound state together. A queued settlement or failed bind throws `SUPERVISION_UNCONFIRMED`, sends no prompt, registers no recipient, performs no retry or cleanup, and leaves the child and binding evidence available for inspection.

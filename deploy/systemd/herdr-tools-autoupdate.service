@@ -1,0 +1,9 @@
+[Unit]
+Description=Fast-forward the installed herdr-tools checkout to origin/main and rebuild the MCP server
+ConditionPathIsDirectory=%h/.pi/agent/extensions/herdr-tools
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.volta/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/bash %h/.pi/agent/extensions/herdr-tools/scripts/herdr-tools-autoupdate.sh
+TimeoutStartSec=600

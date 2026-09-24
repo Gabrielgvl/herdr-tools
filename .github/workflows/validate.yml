@@ -19,6 +19,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: bash scripts/test-autoupdate.sh
       # The installed manager plugin and launch gate pin Gabriel's local paths.
       # Supply only their CI fixtures; no live credentials or Herdr service.
       - run: |

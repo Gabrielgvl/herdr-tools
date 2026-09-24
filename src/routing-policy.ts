@@ -6,7 +6,7 @@
  */
 
 /** Policy revision recorded in decision evidence. */
-export const POLICY_REVISION = "adr-037-p3";
+export const POLICY_REVISION = "adr-037-p4";
 
 /**
  * The caller's requested starting quality and compute posture, in ascending

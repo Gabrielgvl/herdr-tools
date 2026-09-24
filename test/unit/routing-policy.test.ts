@@ -52,7 +52,7 @@ function thrown(fn: () => unknown): unknown {
 
 describe("policy revision", () => {
   it("stamps the ADR-037 p3 revision", () => {
-    expect(POLICY_REVISION).toBe("adr-037-p3");
+    expect(POLICY_REVISION).toBe("adr-037-p4");
   });
 });
 

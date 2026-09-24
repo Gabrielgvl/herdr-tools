@@ -73,8 +73,18 @@ describe("TypeSafeSpecClient", () => {
     expect(tier.criteria.economy).toContain("bounded single-file production-code change");
     expect(tier.criteria.standard).toContain("one or a few related files");
     expect(tier.criteria.standard).toContain("multi-step procedure with known steps stays standard");
-    expect(tier.criteria.strong).toContain("coordination across agents or handoffs");
-    expect(tier.criteria.strong).toContain("known multi-step procedures are standard, not strong");
+    expect(tier.criteria.standard).toContain("review of a bounded diff or of several named files within one subsystem");
+    expect(tier.criteria.strong).toContain("orchestrating and gating other agents' work");
+    expect(tier.criteria.strong).toContain("sending one result report to a caller are standard, not strong");
+  });
+
+  it("keeps operating constraints from moving the tier except where they are the work, and frontier triggers from being discounted", () => {
+    const built = buildEvaluationRequest({ task: TASK, catalog: CATALOG })!;
+    const tier = built.questions["weakest_sufficient_tier"] as { instructions: string };
+    expect(tier.instructions).toContain("they do not raise the tier by themselves");
+    expect(tier.instructions).toContain("acting on live production systems or data");
+    expect(tier.instructions).toContain("Delivering one result report or handoff is not coordination");
+    expect(tier.instructions).toContain("takes that trigger's tier even when it is read-only, small, or fully specified");
   });
 
   it("keeps the top intent at low confidence and accepts any structurally valid tier confidence", async () => {

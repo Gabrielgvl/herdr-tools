@@ -194,6 +194,8 @@ An operating point has no intrinsic quality tier.
 
 Jev's `weakest_sufficient_tier` answer is the workload floor directly. The effective start tier is `max(requested ?? "standard", floor)` and the effective ceiling is `max`: the fallback chain is the deduplicated concatenation of the catalog's authored `tierChains` from the effective start tier upward, in catalog order. Catalog `tierChains` are authored per tier with distinct providers and no reused point.
 
+The tier question was calibrated 2026-09-24 after live p2 metadata showed bounded Tasks receiving strong floors. The instructions keep the first-attempt-sufficiency target but forbid adding a speculative safety margin, and the economy/standard/strong boundary descriptions were tightened so a bounded local or scoped change with clear requirements lands below strong while work decomposed into dependent stages with known handoffs remains strong. A bounded A/B probe on representative Tasks confirmed the reworded question moved a near-verbatim observed launch contract — a bounded prompt-fix Task that production floored at strong — from strong to standard, while utility, economy, and the multi-stage strong counterexample were unchanged. One observation per cell; no accuracy claim over unlabeled production logs.
+
 *Historical:* the migrated design derived the floor from an intent base interval (`INTENT_TIER_INTERVALS`) shifted by one tier per difficult workload modifier, with a matching recovery-ceiling adjustment (`resolveTierPolicy`). The shipped router replaced it with the direct tier question; that machinery remains in `src/routing-policy.ts` but is not on the routing path.
 
 ### Deterministic authority

@@ -308,6 +308,10 @@ function worktrees(): { manager: WorktreeManager; prepare: ReturnType<typeof vi.
   return { manager: { prepare, bindPane, release } as unknown as WorktreeManager, prepare, bindPane, release };
 }
 
+// Unit fixtures inject an always-open lease; the real fail-closed gate is
+// covered by launch-freeze.test.ts.
+const openLaunchGate: NonNullable<LaunchDependencies["launchGate"]> = async () => ({ check: async () => undefined, release: async () => undefined });
+
 function toolFor(options: {
   catalog: Catalog;
   cli: LaunchCli;
@@ -351,7 +355,7 @@ function toolFor(options: {
     ...(options.promptSources === undefined ? {} : { promptSources: options.promptSources }),
     ...(options.queueFlush === undefined ? {} : { queueFlush: options.queueFlush }),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
-    ...(options.launchGate === undefined ? {} : { launchGate: options.launchGate }),
+    launchGate: options.launchGate ?? openLaunchGate,
     ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
   });
 }
@@ -1739,6 +1743,7 @@ tierChains:
       cwd: repoRoot,
       preflight: async () => undefined,
       supervision: stubSupervision(),
+      launchGate: openLaunchGate,
       specClient: {
         evaluate: vi.fn(async (input: { catalog: Catalog }) => {
           loaded = input.catalog;
@@ -2459,7 +2464,7 @@ tierChains:
   it("covers default launch dependencies and omitted signals", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const cli = makeCli();
-    const tool = createLaunchTool({ cli: cli.cli, context, preflight: async () => undefined, supervision: stubSupervision(), specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) }, catalog: { load: async () => catalog }, routerLog: vi.fn(async () => undefined) as LaunchRouterLog });
+    const tool = createLaunchTool({ cli: cli.cli, context, preflight: async () => undefined, supervision: stubSupervision(), launchGate: openLaunchGate, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) }, catalog: { load: async () => catalog }, routerLog: vi.fn(async () => undefined) as LaunchRouterLog });
     const result = await tool.execute("call", task(), undefined, undefined, { cwd: repoRoot, signal: undefined } as unknown as ExtensionContext);
     expect(result.details).toMatchObject({ kind: "launch", outcome: "launched", children: [{ state: "launched" }] });
     const executableCli = makeCli();

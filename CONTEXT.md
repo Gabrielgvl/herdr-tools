@@ -15,7 +15,7 @@ The Task's single semantic authority: `objective`, `scope`, `doneWhen`, and `con
 _Avoid_: instructions, supervision digest, verification field, prompt body
 
 **Quality tier**:
-A caller's requested starting quality and compute posture: `utility`, `economy`, `standard`, `strong`, `frontier`, or `max`. Omission means `standard`; workload policy may raise the effective start and bounds later recovery escalation.
+A starting quality and compute posture: `utility`, `economy`, `standard`, `strong`, `frontier`, or `max`. The workload floor sets the effective start; a caller's explicit tier may raise it by at most one tier, and recovery starts at least one tier above the prior route.
 _Avoid_: category, class, profile family
 
 **Workload profile**:

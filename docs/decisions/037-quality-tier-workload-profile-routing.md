@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Ratified 2026-09-24 against the shipped implementation at policy revision `adr-037-p3`: the originally migrated speculative design (six workload choices, resource Nouls, per-point fitness Nouls, intent-interval tier policy, four-attempt same-tier chain) was simplified to three questions, a direct weakest-sufficient-tier answer, and catalog-authored chains. The sections below describe the shipped behavior; the superseded design is marked historical where it remains for context.
+Accepted. Ratified 2026-09-24 against the shipped implementation at policy revision `adr-037-p3`: the originally migrated speculative design (six workload choices, resource Nouls, per-point fitness Nouls, intent-interval tier policy, four-attempt same-tier chain) was simplified to three questions, a direct weakest-sufficient-tier answer, and catalog-authored chains. Amended 2026-09-24 at policy revision `adr-037-p5`: the caller tier became a bounded override (see Workload tier policy). The sections below describe the shipped behavior; the superseded design is marked historical where it remains for context.
 
 ## Date
 
@@ -37,7 +37,7 @@ interface HerdrLaunchParams {
   doneWhen: string[];       // 1..8
   constraints?: string[];   // 0..8, default []
 
-  tier?: QualityTier;       // default "standard"
+  tier?: QualityTier;       // bounded override; omission lets the workload floor decide
   replicas?: number;        // integer 1..8, default 1
   recoveryOf?: string;      // managed handoff run ID
 
@@ -108,13 +108,13 @@ A confident bad answer rejects the Task. A passing answer remains `not_rejected`
 
 ### Quality tiers
 
-A quality tier is the caller's requested starting quality and compute posture:
+A quality tier is a starting quality and compute posture:
 
 ```text
 utility < economy < standard < strong < frontier < max
 ```
 
-Omission means `standard`.
+Omission lets the workload floor decide (`adr-037-p5`; earlier revisions defaulted to `standard`).
 
 | Tier | Routing objective |
 | --- | --- |
@@ -125,7 +125,7 @@ Omission means `standard`.
 | `frontier` | Strongly bias toward completion reliability. |
 | `max` | Maximize success probability within reviewed limits. |
 
-A requested tier below the workload floor is raised automatically: the effective start is `max(requested ?? "standard", floor)`. Evidence records the requested tier, workload floor, effective start, and effective ceiling — always `max`, because the chain continues upward through every stronger tier.
+A requested tier below the workload floor is raised to the floor, and a requested tier more than one tier above it is lowered to one tier above it: the effective start is `max(floor, min(requested, next(floor)))`, or the floor itself when `tier` is omitted. Evidence records the requested tier (absent when omitted), workload floor, effective start, and effective ceiling — always `max`, because the chain continues upward through every stronger tier.
 
 ### Workload profile
 
@@ -192,11 +192,13 @@ An operating point has no intrinsic quality tier.
 
 ### Workload tier policy
 
-Jev's `weakest_sufficient_tier` answer is the workload floor directly. The effective start tier is `max(requested ?? "standard", floor)` and the effective ceiling is `max`: the fallback chain is the deduplicated concatenation of the catalog's authored `tierChains` from the effective start tier upward, in catalog order. A tier chain may repeat providers, and operating points may appear in multiple tiers; duplicate point IDs within one tier chain remain invalid.
+Jev's `weakest_sufficient_tier` answer is the workload floor directly. The effective start tier is the floor when `tier` is omitted and `max(floor, min(requested, next(floor)))` otherwise (`effectiveStartTier`), and the effective ceiling is `max`: the fallback chain is the deduplicated concatenation of the catalog's authored `tierChains` from the effective start tier upward, in catalog order. A tier chain may repeat providers, and operating points may appear in multiple tiers; duplicate point IDs within one tier chain remain invalid.
 
 The tier question was calibrated 2026-09-24 after live p2 metadata showed bounded Tasks receiving strong floors. The instructions keep the first-attempt-sufficiency target but forbid adding a speculative safety margin, and the economy/standard/strong boundary descriptions were tightened so a bounded local or scoped change with clear requirements lands below strong while work decomposed into dependent stages with known handoffs remains strong. A bounded A/B probe on representative Tasks confirmed the reworded question moved a near-verbatim observed launch contract — a bounded prompt-fix Task that production floored at strong — from strong to standard, while utility, economy, and the multi-stage strong counterexample were unchanged. One observation per cell; no accuracy claim over unlabeled production logs.
 
 Policy revision `adr-037-p4` recalibrates the tier question against labeled production Tasks. p3 still floored about 60% of real Tasks at strong or above against roughly a third under the approved rubric, mostly bounded read-only research, audits, and scouts: every Herdr Task carries reply-channel, permission, and PII boilerplate, and the strong description's "coordination across agents or handoffs" matched the single result report every Task sends. The instruction now treats those operating constraints as not raising the tier unless satisfying one is the hard part of the work (live production systems or data, keeping sensitive data inside a boundary), says one result report is not coordination, and states that a Task whose core work is a frontier trigger keeps that tier even when read-only, small, or fully specified; standard now covers bounded read-only investigation or review within one subsystem, and strong covers orchestrating and gating other agents. Measurement: 180 real `herdr_launch` Tasks (one later excluded as unlabelable from its text) labeled blind by two independent labelers against the approved rubric (interval gold where they differ by one tier, adjudicated beyond), direct `systemOne` calls only. On a fresh 60-Task holdout frozen and pre-registered before any call (2 repeats), p4 against p3: inside the gold interval 85.0% vs 60.8%, within one tier 100% vs 96.7%, mean tier distance 0.150 vs 0.425 (paired bootstrap 95% CI of the difference [−0.375, −0.183]), runs below gold 11 vs 14, runs two tiers below 0 vs 2, strong-or-above floors 44/120 vs 73/120 against 44 in gold; intent and done-when answers unchanged, and the burned 24-case D2 set unchanged at 22/24. The labelers are models, so the gold measures agreement with the rubric as they read it, not first-attempt outcomes. The requested tier still dominates the effective start: on the same holdout, `max(requested, floor)` is strong or above for 85/120 runs under p4.
+
+Policy revision `adr-037-p5` bounds the caller tier. Callers never saw the tier rubric — the launch schema carried only the tier names, and the harness-flow skill mapped tiers to phases — and chose tiers by phase label and importance: scored against the same blind gold, requested tiers were inside the interval for 30/60 fresh-holdout Tasks (56/119 in sample 1) against 85% of runs for the p4 floor, with `utility`/`economy` requests mostly too low and `frontier`/`max` requests mostly too high. Because the effective start was the stronger of the two, the floor already corrected low requests, but high requests passed through unchanged: `max(requested, floor)` was above gold on 39/120 holdout runs, 8 of them by two or more tiers. Omission now lets the floor decide, an explicit request raises the start by at most one tier and never lowers it, and the launch schema and manager skills carry a short tier rubric and tell callers to describe the work in the Task rather than point at a task file. Replaying the holdout under the cap: inside gold 67% vs 64%, mean tier distance 0.35 vs 0.44, two or more tiers over 2 vs 8, below gold unchanged at 4/120. Most remaining excess is one tier and shrinks only when callers omit `tier`, which cannot be measured before new launches. Accepted trade-offs: the gold is model-labeled, not first-attempt outcomes, so trusting the floor more can add first-attempt failures the labels cannot show, bounded by recovery's one-tier lift with the failed provider excluded; and about one Task in ten names its work only by a task-file path, which Jev and the labelers judge as written, so for such a Task a caller can add only one tier unless the Task text describes the work. An omitted tier is no longer recorded as `standard`: `requestedTier` is absent from the launch result, decision record, and persisted Task.
 
 *Historical:* the migrated design derived the floor from an intent base interval (`INTENT_TIER_INTERVALS`) shifted by one tier per difficult workload modifier, with a matching recovery-ceiling adjustment (`resolveTierPolicy`). The shipped router replaced it with the direct tier question; that machinery remains in `src/routing-policy.ts` but is not on the routing path.
 
@@ -271,7 +273,7 @@ Recovery rules are:
 - `replicas` must be one;
 - `cwd` is forbidden;
 - runtime resumes the prior managed workspace or fails closed;
-- the routed Task's requested tier is lifted to `max(requested or default, next tier after the prior route tier)` before evaluation, so the effective start is `max(lifted request, Jev floor)`;
+- the effective start is at least the tier after the prior route tier; this recovery minimum applies after the one-tier caller cap, so the cap never removes it, and the Jev request, decision record, and persisted Task keep the caller's own tier;
 - at `max`, the next tier remains `max`;
 - every operating point on the failed provider is excluded (`recovery_excluded`), not only the failed point;
 - unresolved or non-terminal prior-run evidence fails closed (`RECOVERY_SOURCE_UNRESOLVABLE`) rather than guessing the workspace state.
@@ -293,7 +295,7 @@ interface LaunchResult {
   kind: "launch";
   launchId: string;
   outcome: "abstained" | "launched" | "partial" | "failed";
-  requestedTier: QualityTier;
+  requestedTier?: QualityTier;   // absent when the caller omitted tier
   effectiveTier?: QualityTier;
   children: Array<{
     target: string;
@@ -319,7 +321,7 @@ The decision log records bounded, non-secret evidence for:
 - operating-point metadata and deterministic exclusions;
 - the generated chain and selected point;
 - availability and recovery evidence;
-- catalog and policy revisions (`adr-037-p4` on new records, distinguishing them from historical `adr-037-p2` and `adr-037-p3` measurements).
+- catalog and policy revisions (`adr-037-p5` on new records, distinguishing them from historical `adr-037-p2`, `adr-037-p3`, and `adr-037-p4` measurements).
 
 Caller text, resource bodies, credentials, raw provider responses, and exception messages remain excluded.
 

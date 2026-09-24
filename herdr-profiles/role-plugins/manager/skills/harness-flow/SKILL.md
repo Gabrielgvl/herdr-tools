@@ -28,7 +28,7 @@ Do not use for a localized change that one bounded worker can implement and veri
 
 ## Task Routing
 
-Launch one flat caller-authored Task per `herdr_launch` call, labeled by phase such as `scout`, `research`, `plan`, `work`, and `critic`. Each Task carries `objective`, `scope`, `doneWhen`, and optional `constraints` — the single work contract that routing, supervision, and evidence all share. Supply `tier` only as the requested starting quality/compute posture: `frontier` or `max` when the phase needs the strongest admissible operating point, `standard` by default (omission means `standard`), `economy` or `utility` for routine bounded work.
+Launch one flat caller-authored Task per `herdr_launch` call, labeled by phase such as `scout`, `research`, `plan`, `work`, and `critic`. Each Task carries `objective`, `scope`, `doneWhen`, and optional `constraints` — the single work contract that routing, supervision, and evidence all share. Omit `tier` by default: the runtime judges the weakest sufficient tier from the Task text, not from the phase label, so state the phase's real difficulty in `objective` and `scope` rather than pointing at a task file. An explicit `tier` raises that start by at most one tier and never lowers it.
 
 Never name a runner, model, account, or deleted profile. The runtime derives the workload profile, selects a reviewed operating point deterministically, and owns fallback, identity, topology, delivery, and supervision. AGY and Devin receive only self-contained, provenance-wrapped Task prompts. Do not assume this skill reaches the child.
 

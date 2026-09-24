@@ -19,8 +19,9 @@ const TaskItem = Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" });
  * `constraints`; the same values feed instruction rendering, Jev evaluation,
  * supervision reservation, and bounded evidence.
  *
- * `tier` is the optional requested quality posture — omission resolves to
- * `standard` inside the tier policy. `replicas` repeats one Task over isolated
+ * `tier` is an optional bounded override (adr-037-p5): omission lets Jev's
+ * weakest-sufficient floor decide; an explicit tier raises the start by at
+ * most one tier and never lowers it. `replicas` repeats one Task over isolated
  * runtime worktrees. `recoveryOf` names the failed child's managed handoff
  * run UUID (not its child target or launch ID). Recovery requires one replica
  * and forbids `cwd`; it resumes the recorded workspace.
@@ -31,7 +32,7 @@ const TaskItem = Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" });
  * Unknown fields fail validation.
  */
 export const LaunchTaskSchema = Type.Object({
-  objective: TaskText("What the child must achieve, stated as work to perform now."),
+  objective: TaskText("What the child must achieve, stated as work to perform now. Describe the work itself: a bare pointer to a task file hides its difficulty from routing."),
   scope: TaskText("What the child may and may not change, including files, contracts, and boundaries."),
   doneWhen: Type.Array(TaskItem, {
     minItems: 1,
@@ -45,8 +46,7 @@ export const LaunchTaskSchema = Type.Object({
     description: "Caller-specific constraints beyond the universal baseline; empty or absent means none."
   })),
   tier: Type.Optional(StringEnum(QUALITY_TIERS, {
-    description: "Requested starting quality/compute posture; the workload floor may raise it. Omission means standard.",
-    default: "standard"
+    description: "Optional; usually omit it. Omitted, routing starts at the weakest sufficient tier it judges from the Task text. Set, it raises that start by at most one tier and never lowers it; if the Task text hides the real difficulty, describe the difficulty instead. utility: mechanical read-only lookup or listing. economy: one local low-risk change or bounded explanation. standard: bounded work within one subsystem, including read-only review of a diff or named files. strong: sustained reasoning across components, repo-wide checklist review, or orchestrating other agents. frontier: one exceptional risk such as an unknown root cause, a race or locking, a trust boundary, or a state migration. max: two or more frontier risks together. Importance, phase labels such as scout or critic, file count, and reply, PII, or read-only rules do not raise a tier."
   })),
   replicas: Type.Optional(Type.Integer({
     minimum: 1,

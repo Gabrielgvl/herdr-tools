@@ -264,14 +264,18 @@ describe("compile", () => {
     await expect(compileCandidateContract(catalog, SPEC, { ...resolved, point: { ...resolved.point, reasoning: "max" } }, { tools: ["read"] })).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED" });
     // A pi point with no reasoning cannot express argv thinking at all.
     await expect(compileCandidateContract(catalog, SPEC, { ...resolved, point: { ...resolved.point, reasoning: undefined } }, { tools: ["read"] })).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED" });
-    // A claude point carrying a non-effort reasoning setting is equally unreviewed.
+    // A valid Claude effort still needs to be declared for this model.
     const claude = point(catalog, "claude", "high");
-    await expect(compileCandidateContract(catalog, SPEC, { ...claude, point: { ...claude.point, reasoning: "xhigh" } }, { tools: ["Read"] })).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED" });
-    // Even inside the model's declared axis, a claude point's reasoning must be a real effort value.
+    await expect(compileCandidateContract(catalog, SPEC, { ...claude, point: { ...claude.point, reasoning: "max" } }, { tools: ["Read"] })).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED" });
+    // A model-declared Claude xhigh point compiles to the native effort value.
     const widened = catalogAt(scope());
     widened.runners.get("claude")!.models[0]!.supportedReasoning = ["low", "high", "xhigh"];
     const claudeX = point(widened, "claude", "high");
-    await expect(compileCandidateContract(widened, SPEC, { ...claudeX, point: { ...claudeX.point, reasoning: "xhigh" } }, { tools: ["Read"] })).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED" });
+    await expect(compileCandidateContract(widened, SPEC, { ...claudeX, point: { ...claudeX.point, reasoning: "xhigh" } }, { tools: ["Read"] })).resolves.toMatchObject({ runtime: { effort: "xhigh" } });
+    // Even if declared on a test axis, a Pi thinking level is not a Claude effort.
+    widened.runners.get("claude")!.models[0]!.supportedReasoning = ["low", "high", "off"];
+    const claudeOff = point(widened, "claude", "high");
+    await expect(compileCandidateContract(widened, SPEC, { ...claudeOff, point: { ...claudeOff.point, reasoning: "off" } }, { tools: ["Read"] })).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED" });
     // A model that declares no reasoning axis at all reviews no reasoned point.
     const axisless = catalogAt(scope());
     delete (axisless.runners.get("pi")!.models[0]! as { supportedReasoning?: unknown }).supportedReasoning;

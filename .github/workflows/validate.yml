@@ -19,8 +19,15 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      # test/unit/skill-bundles.test.ts asserts the checked-in registry pins
-      # against external canonical skill trees under /home/gabriel/... (see
-      # approvedSourceRoots in herdr-skill-bundles.json). Those trees do not
-      # exist on a CI runner, so this pre-existing failure is excluded by name.
-      - run: npx vitest run --exclude 'test/unit/skill-bundles.test.ts'
+      # The installed manager plugin and launch gate pin Gabriel's local paths.
+      # Supply only their CI fixtures; no live credentials or Herdr service.
+      - run: |
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0755 /home/gabriel
+          mkdir -p /home/gabriel/.pi/agent /home/gabriel/.volta/tools/image/node/25.9.0/bin
+          ln -s "$(command -v node)" /home/gabriel/.volta/tools/image/node/25.9.0/bin/node
+      # Permission tests create world-writable fixtures with mkdir(mode: 0777).
+      # The runner's umask otherwise makes those fixtures safe and hides the test.
+      # The skill-bundle suite needs external canonical trees absent from CI.
+      - run: |
+          umask 000
+          npx vitest run --exclude 'test/unit/skill-bundles.test.ts'

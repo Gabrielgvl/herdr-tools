@@ -1124,9 +1124,11 @@ describe("herdr_launch task cutover", () => {
     expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "claude:fallback:low" }] });
     expect(harness.starts).toBe(2);
     expect(supervision.completionSignals).toHaveLength(1);
-    expect(await supervision.completionSignals[0](supervision.bound[0].identity)).toBe(true);
+    expect(await supervision.completionSignals[0](supervision.bound[0].identity)).toEqual({ cooldownRecorded: true });
     expect(claudeQuotaReader).toHaveBeenCalledWith(supervision.bound[0].identity.agentSession, repoRoot, expect.any(Number));
     expect(availabilityFailureRecorder).toHaveBeenLastCalledWith(expect.objectContaining({ runner: "claude", model: "fallback" }), claudeRunner(["fallback"]), { code: "CLAUDE_API_ERROR", causeCode: "rate_limit" }, { root: repoRoot });
+    availabilityFailureRecorder.mockRejectedValueOnce(new Error("private cooldown error"));
+    expect(await supervision.completionSignals[0](supervision.bound[0].identity)).toEqual({ cooldownRecorded: false });
   });
 
   it("does not re-admit unavailable candidates into the fallback chain", async () => {

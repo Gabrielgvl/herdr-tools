@@ -2781,9 +2781,13 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         const selectedRunner = chainCandidates.find((entry) => entry.point.id === chosenContract!.candidate.id)!.runner;
         reservation!.onCompletionSignal(async (identity) => {
           if (!await (deps.claudeQuotaReader ?? claudeQuotaSignal)(identity.agentSession, launchCwd!, promptSubmissionWallMs)) return false;
-          await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(chosenContract!.candidate, selectedRunner,
-            { code: "CLAUDE_API_ERROR", causeCode: "rate_limit" }, { root: deps.cwd ?? ctx.cwd });
-          return true;
+          try {
+            await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(chosenContract!.candidate, selectedRunner,
+              { code: "CLAUDE_API_ERROR", causeCode: "rate_limit" }, { root: deps.cwd ?? ctx.cwd });
+            return { cooldownRecorded: true };
+          } catch {
+            return { cooldownRecorded: false };
+          }
         });
       }
       try {

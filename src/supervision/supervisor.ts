@@ -834,19 +834,22 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   private scheduleCompletionSignal(): void {
     if (this.stopped || this.completionRecorded || this.completionSignal === undefined || !this.bindingPublished || this.isSettled()
-      || (this.status !== "idle" && this.status !== "done")) return;
+      || (this.status !== "idle" && this.status !== "done" && this.status !== "blocked")) return;
     void this.serialize(async () => {
       if (this.stopped || !this.bindingPublished || this.isSettled()
-        || (this.status !== "idle" && this.status !== "done")) return;
+        || (this.status !== "idle" && this.status !== "done" && this.status !== "blocked")) return;
       await this.recordCompletionSignal();
       // The native writer can flush just after completion. Check twice more
-      // promptly; later same-status reconciliation can catch a slower response.
+      // promptly before a managed repair; later reconciliation can still catch
+      // a slower response.
       if (!this.completionRecorded && ++this.completionAttempts < 3 && this.completionRetry === undefined) {
         this.completionRetry = setTimeout(() => {
           this.completionRetry = undefined;
           this.scheduleCompletionSignal();
         }, 250);
         this.completionRetry.unref();
+      } else if (!this.completionRecorded && this.completionAttempts >= 3 && this.transitions.last()?.to === this.status) {
+        this.scheduleHandoffEvaluation();
       }
     }).catch(() => undefined);
   }
@@ -1575,10 +1578,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       return;
     }
     this.transitions.push({ atMs: this.deps.clock.now(), from, to: next, revision, source });
+    // Every new observation earns its own bounded native-write window. The
+    // initial idle preflight must not consume the first blocked turn's retries.
+    this.completionAttempts = 0;
+    if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
+    this.completionRetry = undefined;
     if (next === "working") {
-      this.completionAttempts = 0;
-      if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
-      this.completionRetry = undefined;
       // An authoritative working transition opens a fresh artifact cycle: the
       // previously accepted handoff version is stale from this point on.
       const managed = this.managedRun();
@@ -2175,9 +2180,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       }
       return;
     }
-    // A typed provider limit cannot justify a repair prompt, but a valid
-    // artifact still wins if the child later completes under a new model.
-    if (this.completionRecorded) return;
+    // A typed provider limit cannot justify a repair prompt. Before repairing,
+    // give the existing bounded native-session reads time to see a late 429;
+    // a valid artifact above still wins without waiting.
+    if (this.completionRecorded || (this.completionSignal !== undefined && this.completionAttempts < 3)) return;
     const prompt = this.deps.repairPrompt;
     if (prompt === undefined || this.stopped || this.isSettled()) return;
     // The attempt and fence are durable before this returns a token; a version

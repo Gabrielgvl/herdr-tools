@@ -3730,6 +3730,78 @@ describe("managed handoff evaluation", () => {
     }
   });
 
+  it("reports a blocked child's typed limit before any handoff repair", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn(async () => ({ cooldownRecorded: true }));
+      h.supervisor.onCompletionSignal(signal);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(true));
+      expect(signal).toHaveBeenCalledExactlyOnceWith(identity);
+      expect(prompts).toHaveLength(0);
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets a late native 429 win the bounded retry before repairing a handoff", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue({ cooldownRecorded: true });
+      h.supervisor.onCompletionSignal(signal);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(1));
+      expect(prompts).toHaveLength(0);
+      await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(true), { timeout: 2000 });
+      expect(signal).toHaveBeenCalledTimes(2);
+      expect(prompts).toHaveLength(0);
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs only after the bounded native checks find no provider limit", async () => {
+    const prompts: string[] = [];
+    const { h, allocation } = await managed({ repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn(async () => false as const);
+      h.supervisor.onCompletionSignal(signal);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(3), { timeout: 2000 });
+      expect(h.supervisor.view().status).toBe("done");
+      await vi.waitFor(() => expect(prompts).toHaveLength(1), { timeout: 2000 });
+      expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(false);
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not repair from initial idle and rechecks the first blocked turn", async () => {
+    const prompts: string[] = [];
+    const initialIdle = snapshot([paneRecord({ status: "idle", revision: 5, stateChangeSeq: 5 })]);
+    const { h, allocation } = await managed({ snapshots: [initialIdle], repairPrompt: async (_paneId, text) => { prompts.push(text); } });
+    try {
+      const signal = vi.fn(async () => false as const);
+      h.supervisor.onCompletionSignal(signal);
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(3), { timeout: 2000 });
+      expect(prompts).toHaveLength(0);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(6), { timeout: 2000 });
+      expect(h.supervisor.view().status).toBe("blocked");
+      await vi.waitFor(() => expect(prompts).toHaveLength(1), { timeout: 2000 });
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a blocked child in repair when its artifact reports done", async () => {
     const prompts: Array<{ paneId: string; text: string }> = [];
     const { h, allocation, run } = await managed({ repairPrompt: async (paneId, text) => { prompts.push({ paneId, text }); } });

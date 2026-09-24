@@ -157,7 +157,7 @@ describe("tier-chain routing", () => {
     const intentProbabilities = { explore: 0, reason: 0, implement: 0, debug: 1, verify: 0, review: 0, coordinate: 0 };
     const tierProbabilities = { utility: 0, economy: 0, standard: 0, strong: 0, frontier: 1, max: 0 };
     const result = await routeTask(input({ response: response({ intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, tier: { value: "frontier", confidence: 0, probabilities: tierProbabilities } }) }));
-    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "frontier", evidence: { policyRevision: "adr-037-p3", intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, workload: { intent: "debug" } } });
+    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "frontier", evidence: { policyRevision: "adr-037-p4", intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, workload: { intent: "debug" } } });
 
     // A persisted historical unknown intent stays readable.
     await expect(routeTask(input({ response: response({ intent: { value: "unknown", confidence: 0.9 } }) }))).resolves.toMatchObject({ kind: "admitted", evidence: { intent: { value: "unknown" }, workload: { intent: "unknown" } } });

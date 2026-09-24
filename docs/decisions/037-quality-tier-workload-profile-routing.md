@@ -192,7 +192,7 @@ An operating point has no intrinsic quality tier.
 
 ### Workload tier policy
 
-Jev's `weakest_sufficient_tier` answer is the workload floor directly. The effective start tier is `max(requested ?? "standard", floor)` and the effective ceiling is `max`: the fallback chain is the deduplicated concatenation of the catalog's authored `tierChains` from the effective start tier upward, in catalog order. Catalog `tierChains` are authored per tier with distinct providers and no reused point.
+Jev's `weakest_sufficient_tier` answer is the workload floor directly. The effective start tier is `max(requested ?? "standard", floor)` and the effective ceiling is `max`: the fallback chain is the deduplicated concatenation of the catalog's authored `tierChains` from the effective start tier upward, in catalog order. A tier chain may repeat providers, and operating points may appear in multiple tiers; duplicate point IDs within one tier chain remain invalid.
 
 The tier question was calibrated 2026-09-24 after live p2 metadata showed bounded Tasks receiving strong floors. The instructions keep the first-attempt-sufficiency target but forbid adding a speculative safety margin, and the economy/standard/strong boundary descriptions were tightened so a bounded local or scoped change with clear requirements lands below strong while work decomposed into dependent stages with known handoffs remains strong. A bounded A/B probe on representative Tasks confirmed the reworded question moved a near-verbatim observed launch contract — a bounded prompt-fix Task that production floored at strong — from strong to standard, while utility, economy, and the multi-stage strong counterexample were unchanged. One observation per cell; no accuracy claim over unlabeled production logs.
 
@@ -214,7 +214,7 @@ Jev supplies the done-when gate, workload intent, and weakest-sufficient-tier ju
 
 ### Pre-execution fallback
 
-The chain is the deduplicated catalog `tierChains` order from the effective start tier through `max`; it widens into stronger tiers by construction. It has no fixed attempt cap — the chain length is the bound — and the start loop consumes the emitted order verbatim.
+The chain is the deduplicated catalog `tierChains` order from the effective start tier through `max`; repeated operating points keep their first position. It widens into stronger tiers by construction. It has no fixed attempt cap — the chain length is the bound — and the start loop consumes the emitted order verbatim.
 
 The router probes availability once per candidate and admits the first available point in chain order. Launch then re-probes availability immediately before every start attempt across the whole fallback loop; a point that became unavailable is skipped without another Jev request, and a proven agent-free start failure advances to the next point. Fallback remains limited to the established safe pre-execution failure envelope.
 

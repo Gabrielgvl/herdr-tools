@@ -331,10 +331,12 @@ tierChains:
   frontier:
     - claude:fable:low
     - pi:openai-codex/gpt-6-astra:high
+    - claude:opus:max
     - devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium
   max:
     - claude:fable:max
     - pi:openai-codex/gpt-6-astra:max
+    - claude:opus:max
     - devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium
 
 # Reviewed operating-point policy (ADR-037) — audited classes from

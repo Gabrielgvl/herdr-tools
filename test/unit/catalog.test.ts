@@ -108,8 +108,8 @@ describe("catalog", () => {
       economy: ["devin:swe-2-medium", "pi:openai-codex/gpt-6-luna:max", "pi:zai/glm-5.3-flash:low", "claude:sonnet:low"],
       standard: ["devin:swe-2-high", "claude:opus:low", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6-sol:high", "agy:gemini-3.8-flash-low"],
       strong: ["devin:swe-2-max", "claude:opus:xhigh", "pi:openai-codex/gpt-6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "agy:gemini-3.8-flash-high"],
-      frontier: ["claude:fable:low", "pi:openai-codex/gpt-6-astra:high", "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium"],
-      max: ["claude:fable:max", "pi:openai-codex/gpt-6-astra:max", "devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium"],
+      frontier: ["claude:fable:low", "pi:openai-codex/gpt-6-astra:high", "claude:opus:max", "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium"],
+      max: ["claude:fable:max", "pi:openai-codex/gpt-6-astra:max", "claude:opus:max", "devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium"],
     });
     expect(catalog.quotaSources.some((source) => source.kind === "floor")).toBe(true);
     // Every declared resource pool path must exist inside the package root.
@@ -471,15 +471,16 @@ describe("catalog", () => {
     expect(catalog.pointPolicy?.get("devin:swe-2-max")).toEqual({ costClass: "low", latencyClass: "low" });
   });
 
-  it("validates authoritative tier chains without length caps, point reuse, or same-tier provider reuse", () => {
+  it("validates tier-chain references while allowing provider and cross-tier point reuse", () => {
     const withChains = VALID.replace("quotaSources:", `${TIER_CHAINS}quotaSources:`);
     expect(parse(withChains).tierChains?.strong).toEqual(["agy:gemini-high"]);
+    expect(parse(withChains.replace("  economy: [pi:openai/pi-lite:off]", "  economy: [pi:openai/pi-lite:off, pi:openai/pi-pro:off]")).tierChains?.economy).toEqual(["pi:openai/pi-lite:off", "pi:openai/pi-pro:off"]);
+    expect(parse(withChains.replace("  economy: [pi:openai/pi-lite:off]", "  economy: [pi:openai/pi-pro:off]")).tierChains?.economy).toEqual(["pi:openai/pi-pro:off"]);
     const cases = [
       VALID.replace("quotaSources:", "tierChains: 5\nquotaSources:"),
       withChains.replace("  utility: [pi:openai/pi-pro:off]", "  utility: []"),
       withChains.replace("  utility: [pi:openai/pi-pro:off]", "  utility: [pi:missing:low]"),
-      withChains.replace("  economy: [pi:openai/pi-lite:off]", "  economy: [pi:openai/pi-pro:off]"),
-      withChains.replace("  utility: [pi:openai/pi-pro:off]", "  utility: [pi:openai/pi-pro:off, pi:openai/pi-lite:low]"),
+      withChains.replace("  utility: [pi:openai/pi-pro:off]", "  utility: [pi:openai/pi-pro:off, pi:openai/pi-pro:off]"),
       withChains.replace("  max: [pi:zai/test-glm:low]\n", ""),
       withChains.replace("tierChains:", "tierChains:\n  ghost: [pi:openai/pi-pro:low]"),
     ];

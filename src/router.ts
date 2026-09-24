@@ -5,7 +5,8 @@ import type { ClaudeEffort, ThinkingLevel } from "./profiles/types.js";
 import {
   POLICY_REVISION,
   QUALITY_TIERS,
-  maxTier,
+  effectiveStartTier,
+  nextTier,
   tierRank,
   type ChainExclusion,
   type QualityTier,
@@ -21,6 +22,7 @@ export interface RoutingTask {
   scope: string;
   doneWhen: readonly string[];
   constraints: readonly string[];
+  /** The caller's explicit request; omission lets Jev's floor decide. */
   tier?: QualityTier;
 }
 
@@ -97,6 +99,7 @@ export interface Admitted {
   kind: "admitted";
   quality: Exclude<QualityOutcome, "rejected">;
   count: number;
+  /** The caller's explicit request; absent when the caller omitted `tier`. */
   requestedTier?: QualityTier;
   /** Jev's weakest-sufficient tier. */
   workloadFloor?: QualityTier;
@@ -159,7 +162,8 @@ export interface TaskRouteInput {
   compile?: CompileGate;
   now?: () => Date;
   workspaceState?: WorkspaceState;
-  recovery?: { priorOperatingPointId: string };
+  /** Prior-run lineage: its provider is excluded and the start is at least one tier above its route. */
+  recovery?: { priorOperatingPointId: string; priorRouteTier: QualityTier };
 }
 
 interface ParsedBinary { probability: number; confidence: number }
@@ -255,8 +259,8 @@ export async function routeTask(input: TaskRouteInput): Promise<SpecDecision> {
   const points = input.catalog.points ?? [];
   if (chains === undefined || points.length === 0) return abstain("catalog_unavailable", "tierChains");
   const pointById = new Map(points.map((point) => [point.id, point]));
-  const requestedTier = input.task.tier ?? "standard";
-  const effectiveTier = maxTier(requestedTier, tier.value);
+  const requestedTier = input.task.tier;
+  const effectiveTier = effectiveStartTier(tier.value, requestedTier, input.recovery === undefined ? undefined : nextTier(input.recovery.priorRouteTier));
   const ids = [...new Set(QUALITY_TIERS.slice(tierRank(effectiveTier)).flatMap((name) => chains[name]))];
   if (ids.some((id) => !pointById.has(id))) return abstain("catalog_unavailable", "tierChains");
 
@@ -344,7 +348,7 @@ export async function routeTask(input: TaskRouteInput): Promise<SpecDecision> {
     kind: "admitted",
     quality: "not_rejected",
     count: input.spec.count ?? 1,
-    requestedTier,
+    ...(requestedTier === undefined ? {} : { requestedTier }),
     workloadFloor: tier.value,
     effectiveStartTier: effectiveTier,
     effectiveCeiling: "max",

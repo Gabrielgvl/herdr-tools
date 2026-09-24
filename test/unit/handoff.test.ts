@@ -541,6 +541,12 @@ describe("provenance record", () => {
     const run = await allocator.allocate();
     await allocator.persist(run, provenanceIdentity, { managerSession: null, task: taskContract });
     expect((await readHandoffProvenance(run)).manager.session).toBeNull();
+    // An omitted caller tier stays omitted (adr-037-p5): Jev's floor decided the start.
+    const untiered = { ...taskContract };
+    delete untiered.tier;
+    const untieredRun = await allocator.allocate();
+    await allocator.persist(untieredRun, provenanceIdentity, { managerSession: null, task: untiered });
+    expect((await readHandoffProvenance(untieredRun)).task).not.toHaveProperty("tier");
   });
 
   it("refuses malformed provenance input before the run directory exists", async () => {

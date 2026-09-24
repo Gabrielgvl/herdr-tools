@@ -459,7 +459,10 @@ describe("herdr_launch task cutover", () => {
     supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
     const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), task());
 
-    expect(result.details).toMatchObject({ kind: "launch", outcome: "launched", requestedTier: "standard" });
+    expect(result.details).toMatchObject({ kind: "launch", outcome: "launched" });
+    // An omitted tier stays omitted: Jev's floor decided the start.
+    expect(result.details).not.toHaveProperty("requestedTier");
+    expect(result.content[0]).toMatchObject({ text: expect.not.stringContaining(" tier=") });
     const child = result.details!.children[0]!;
     expect(child.target).toMatch(/^task-[0-9a-f]{8}-1$/u);
     expect(child).toMatchObject({ state: "launched", operatingPointId: "pi:pi-model:low", supervisorJobId: "job_supervisor" });
@@ -580,7 +583,7 @@ describe("herdr_launch task cutover", () => {
     expect(identityArg.manager).toEqual({ paneId: "w1:p1", display: "manager", source: "agent_name" });
     expect(provenanceArg).toEqual({
       managerSession,
-      task: { ...TASK, tier: "standard", replicas: 1, label: "docs sprint", cwd: repoRoot }
+      task: { ...TASK, replicas: 1, label: "docs sprint", cwd: repoRoot }
     });
   });
 
@@ -709,12 +712,14 @@ describe("herdr_launch task cutover", () => {
       const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
       const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId, replicas: 1 }));
 
-      // nextTier(standard) lifts the start preference to strong.
-      expect(result.details).toMatchObject({ outcome: "launched", requestedTier: "standard", effectiveTier: "strong" });
+      // nextTier(standard) lifts the start to strong; the caller asked for no tier.
+      expect(result.details).toMatchObject({ outcome: "launched", effectiveTier: "strong" });
+      expect(result.details).not.toHaveProperty("requestedTier");
       // The exact failed point is excluded; the remaining candidate ran.
       expect(result.details!.children[0]).toMatchObject({ state: "launched", operatingPointId: "pi:fallback:low" });
       // The evaluator saw the derived workspace state and the caller's own tier.
-      expect(evaluate.mock.calls[0]![0]).toMatchObject({ workspaceState: "clean" as WorkspaceState, task: { tier: "standard" } });
+      expect(evaluate.mock.calls[0]![0]).toMatchObject({ workspaceState: "clean" as WorkspaceState });
+      expect(evaluate.mock.calls[0]![0].task).not.toHaveProperty("tier");
       // The child started inside the resumed prior workspace, not the ambient cwd.
       expect(placementCwd(harness)).toBe(workspaceDir);
       expect(workspaceDir).not.toBe(repoRoot);
@@ -972,7 +977,7 @@ describe("herdr_launch task cutover", () => {
     );
     expect(evaluate).toHaveBeenCalledTimes(1);
     const input = evaluate.mock.calls[0]![0];
-    expect(input.task).toMatchObject({ objective: TASK.objective, scope: TASK.scope, doneWhen: TASK.doneWhen, constraints: TASK.constraints, tier: "standard" });
+    expect(input.task).toEqual({ objective: TASK.objective, scope: TASK.scope, doneWhen: TASK.doneWhen, constraints: TASK.constraints });
     expect(input.catalog).toBe(catalog);
     expect(result.details).toMatchObject({ outcome: "launched" });
   });
@@ -2280,8 +2285,9 @@ tierChains:
     expect(i.record([])).toBe(false);
     expect(() => i.identifier("", "name")).toThrow();
     expect(() => i.identifier("ok", "name")).not.toThrow();
-    expect(i.normalizedParams(task())).toMatchObject({ replicas: 1, tier: "standard", constraints: TASK.constraints });
-    expect(i.normalizedParams({ objective: "o", scope: "s", doneWhen: ["d"] })).toMatchObject({ replicas: 1, tier: "standard", constraints: [] });
+    expect(i.normalizedParams(task())).toMatchObject({ replicas: 1, constraints: TASK.constraints });
+    expect(i.normalizedParams({ objective: "o", scope: "s", doneWhen: ["d"] })).not.toHaveProperty("tier");
+    expect(i.normalizedParams({ objective: "o", scope: "s", doneWhen: ["d"], tier: "strong" })).toMatchObject({ replicas: 1, tier: "strong", constraints: [] });
     expect(renderTask(task())).toContain("Reduce the latency");
     expect(renderTask({ objective: "o", scope: "s", doneWhen: ["d"] })).toContain("Constraints: (none)");
     expect(i.mintChildName("abcdef12-3456-7890-abcd-ef1234567890", 2)).toBe("task-abcdef12-2");

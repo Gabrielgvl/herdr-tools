@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -15,6 +15,7 @@ import { reviewLogPaths, ReviewLogError, type SupervisionLogEntry, type Supervis
 import { buildWorkspaceView, executionDigestHash, type EvidenceScanner, type WorkspaceCommandRunner, type WorkspaceView } from "../../src/supervision/evidence.js";
 import type { SupervisionReviewRequest, SupervisionReviewResult, SupervisionReviewer } from "../../src/supervision/reviewer.js";
 import { createTraceSource, type DevinSessionReader, type TraceSource } from "../../src/supervision/trace-source.js";
+import { claudeQuotaSignal } from "../../src/supervision/claude-quota.js";
 import type { SupervisionWorkspaceRoot } from "../../src/job-registry.js";
 import { Supervisor, SupervisionBindError, type SupervisionBinding, type SupervisionScheduler, type SupervisorDependencies } from "../../src/supervision/supervisor.js";
 import { modelSafeJson } from "../../src/redaction.js";
@@ -251,6 +252,100 @@ describe("target-local snapshot evidence", () => {
 });
 
 describe("supervisor binding", () => {
+  it("retries a fast Claude completion after the native record reaches disk", async () => {
+    const home = await mkdtemp(join(tmpdir(), "claude-completion-"));
+    try {
+      const cwd = "/home/worker/project";
+      const uuid = "5ab55aa9-8ec3-47dd-896b-156ad524e7e6";
+      const agentSession = { source: "herdr:claude", agent: "claude", kind: "id", value: uuid };
+      const child = { ...identity, agentKind: "claude", agentSession };
+      const directory = join(home, ".claude", "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const h = harness({ child: { agentName: "worker", agentKind: "claude", operatingPointId: "claude-point" }, snapshots: [snapshot([paneRecord({ agentKind: "claude", agentSession })])] });
+      await h.supervisor.bind({ identity: child, operatingPointId: "claude-point" });
+      const recorded = vi.fn();
+      const notBefore = Date.now() - 1000;
+      h.supervisor.onCompletionSignal(async (exact) => {
+        if (!await claudeQuotaSignal(exact.agentSession, cwd, notBefore, home)) return false;
+        recorded();
+        return true;
+      });
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 6, agentKind: "claude", agentSession })));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 7, agentKind: "claude", agentSession })));
+      expect(recorded).not.toHaveBeenCalled();
+      await writeFile(join(directory, `${uuid}.jsonl`), JSON.stringify({ type: "assistant", sessionId: uuid, cwd, timestamp: new Date().toISOString(), isApiErrorMessage: true, error: "rate_limit", apiErrorStatus: 429, requestId: "req" }) + "\n", { mode: 0o600 });
+      // No further lifecycle event is required: the bounded native-write retry
+      // catches a file flushed after the first terminal observation.
+      await vi.waitFor(() => expect(recorded).toHaveBeenCalledTimes(1));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 8, agentKind: "claude", agentSession })));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 9, agentKind: "claude", agentSession })));
+      expect(recorded).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("records a late native quota signal before settling an exited child with no idle observation", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })]), snapshot([], [])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    h.supervisor.onCompletionSignal(signal);
+    await h.supervisor.onEvent(thinEvent("pane_exited"));
+    expect(signal).toHaveBeenCalledTimes(2);
+    expect(h.supervisor.view().state).toBe("settled");
+    expect(types(h.wakes)).toEqual(["pane_closed"]);
+    await h.supervisor.onEvent(thinEvent("pane_closed"));
+    expect(signal).toHaveBeenCalledTimes(2);
+  });
+
+  it("checks the original bound session when a working child is replaced", async () => {
+    const replacement = paneRecord({ terminalId: "t9", status: "working", revision: 6 });
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })]), snapshot([replacement])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    const signal = vi.fn().mockResolvedValue(true);
+    h.supervisor.onCompletionSignal(signal);
+    await h.supervisor.onEvent(paneEvent("pane_updated", replacement));
+    expect(signal).toHaveBeenCalledExactlyOnceWith(identity);
+    expect(await h.supervisor.run()).toMatchObject({ outcome: "identity_replaced" });
+    expect(types(h.wakes)).toEqual(["identity_replaced"]);
+  });
+
+  it("checks the bound session when reconnect loses continuity", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord({ status: "working" })])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    const signal = vi.fn().mockResolvedValue(true);
+    h.supervisor.onCompletionSignal(signal);
+    await h.supervisor.onBootstrap(snapshot([], []), 2, true);
+    expect(signal).toHaveBeenCalledExactlyOnceWith(identity);
+    expect(await h.supervisor.run()).toMatchObject({ outcome: "identity_lost" });
+  });
+
+  it("surfaces cooldown persistence failure once without settling the child", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord()])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    h.supervisor.onCompletionSignal(async () => { throw new Error("do not expose this error"); });
+    await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "evidence_gap")).toBe(true));
+    expect(h.wakes.filter((wake) => wake.event.type === "evidence_gap")).toHaveLength(1);
+    expect(JSON.stringify(h.wakes)).not.toContain("do not expose this error");
+    expect(h.supervisor.childLive()).toBe(true);
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6 })));
+    expect(h.wakes.filter((wake) => wake.event.type === "evidence_gap")).toHaveLength(1);
+  });
+
+  it("checks an immediate terminal status and records a later completion only once", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord()])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    const signal = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    h.supervisor.onCompletionSignal(signal);
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(1));
+    expect(signal).toHaveBeenCalledWith(identity);
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 6 })));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 7 })));
+    await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(2));
+    await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 8 })));
+    expect(signal).toHaveBeenCalledTimes(2);
+  });
+
   it("binds to the proven occupant and anchors on its revision", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord({ status: "working", revision: 9 })])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 4 });

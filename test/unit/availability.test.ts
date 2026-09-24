@@ -237,6 +237,7 @@ const OBSERVED_CODES: ReadonlyArray<readonly [string, LaunchFailureClass]> = [
   ["account_quota_exceeded", "quota"],
   ["billing_exhausted", "quota"],
   ["credits_exhausted", "quota"],
+  ["rate_limit", "quota"],
   ["rate_limited", "quota"],
   ["rate_limit_exceeded", "quota"],
   ["too_many_requests", "quota"],
@@ -305,6 +306,7 @@ describe("classifyLaunchFailure", () => {
   });
 
   it("classifies an unrecognized code as task-failure, never quota", () => {
+    expect(classifyLaunchFailure("429")).toBe("task-failure");
     expect(classifyLaunchFailure("FUTURE_CODE")).toBe("task-failure");
     expect(classifyLaunchFailure("mystery_backend_code")).toBe("task-failure");
     expect(classifyLaunchFailure(42 as never)).toBe("task-failure");
@@ -313,6 +315,7 @@ describe("classifyLaunchFailure", () => {
   });
 
   it("prefers a known causeCode over the surfaced code", () => {
+    expect(classifyLaunchFailure({ code: "CLAUDE_API_ERROR", causeCode: "rate_limit" })).toBe("quota");
     expect(classifyLaunchFailure({ code: "LAUNCH_FAILED", causeCode: "quota_exceeded" })).toBe("quota");
     expect(classifyLaunchFailure({ code: "LAUNCH_FAILED", causeCode: "agent_start_transport_failed" })).toBe("transport");
     expect(classifyLaunchFailure({ code: "LAUNCH_FAILED", causeCode: "unauthorized" })).toBe("auth");

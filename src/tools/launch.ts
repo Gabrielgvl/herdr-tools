@@ -35,6 +35,7 @@ import type { SupervisionWorkspaceRoot } from "../job-registry.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
+import { claudeQuotaSignal } from "../supervision/claude-quota.js";
 import { EVIDENCE_ASSIGNMENT_MAX_BYTES, normalizedAssignmentBytes } from "../supervision/evidence.js";
 import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
 import type { SelfCloseTracker } from "../supervision/self-close.js";
@@ -99,6 +100,8 @@ export interface LaunchDependencies {
   worktrees?: WorktreeManager;
   /** B2 failure recorder seam; production uses the durable cooldown log. */
   availabilityFailureRecorder?: (candidate: AvailabilitySubject, runner: RunnerEntry, failure: LaunchFailureSignal, options: RecordLaunchFailureOptions) => Promise<unknown>;
+  /** Native Claude session reader; injectable for bounded post-start evidence checks. */
+  claudeQuotaReader?: typeof claudeQuotaSignal;
   /**
    * The one-shot decision-log append sink, run once per spec decision before
    * any child mutation. Defaults to the local JSONL record rooted at the
@@ -2770,6 +2773,19 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       phase = "prompt_verification";
       tick(phase);
       const promptSubmissionStartedAt = clock.now();
+      const promptSubmissionWallMs = Date.now();
+      // A child may fail and exit while the prompt RPC is awaiting its ack.
+      // Bind the typed session reader before dispatch so supervision can record
+      // that failure before it settles, without replaying the prompt.
+      if (chosenRuntime.kind === "claude") {
+        const selectedRunner = chainCandidates.find((entry) => entry.point.id === chosenContract!.candidate.id)!.runner;
+        reservation!.onCompletionSignal(async (identity) => {
+          if (!await (deps.claudeQuotaReader ?? claudeQuotaSignal)(identity.agentSession, launchCwd!, promptSubmissionWallMs)) return false;
+          await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(chosenContract!.candidate, selectedRunner,
+            { code: "CLAUDE_API_ERROR", causeCode: "rate_limit" }, { root: deps.cwd ?? ctx.cwd });
+          return true;
+        });
+      }
       try {
         let promptResponse: JsonEnvelope;
         try {

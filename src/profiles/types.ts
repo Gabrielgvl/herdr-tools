@@ -1,7 +1,7 @@
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-export const CLAUDE_EFFORTS = ["low", "medium", "high", "max"] as const;
+export const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type ClaudeEffort = (typeof CLAUDE_EFFORTS)[number];
 
 export const CLAUDE_PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"] as const;

@@ -41,7 +41,7 @@ old=$(git rev-parse HEAD)
 new=$(git rev-parse FETCH_HEAD)
 
 built=$(awk 'END {print $3}' "$STATE/last-success" 2>/dev/null || true)
-if [ "$old" = "$new" ] && [ "$built" = "$new" ] && [ -s "$ENTRY" ]; then
+if [ "$old" = "$new" ] && [ "$built" = "$new" ] && [ -s "$ENTRY" ] && [ -d node_modules ]; then
 	log "up-to-date at $old"
 	exit 0
 fi

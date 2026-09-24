@@ -77,6 +77,13 @@ try; eq "$rc" 0 'no-op rc'
 echo "$out" | grep -q 'up-to-date' || fail "no-op message: $out"
 eq "$(wc -l <"$STUB_NPM_LOG")" "$before" 'no-op invoked npm'
 
+echo '== restore missing dependencies at the same revision'
+rm -rf "$ROOT/installed/node_modules"
+try; eq "$rc" 0 'missing-dependencies retry rc'
+[ -d "$ROOT/installed/node_modules" ] || fail 'missing dependencies were not restored'
+[ "$(wc -l <"$STUB_NPM_LOG")" -gt "$before" ] || fail 'missing dependencies skipped npm ci'
+eq "$(receipt_head)" "$(head_of "$ROOT/installed")" 'receipt after dependency recovery'
+
 echo '== fast-forward with dependency change'
 push_commit v2 lock
 v2=$(head_of "$ROOT/upstream")

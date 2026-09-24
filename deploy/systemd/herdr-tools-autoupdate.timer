@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll origin/main and refresh the installed herdr-tools MCP code
+
+[Timer]
+OnBootSec=1min
+OnCalendar=*:0/2
+Persistent=true
+AccuracySec=30s
+Unit=herdr-tools-autoupdate.service
+
+[Install]
+WantedBy=timers.target

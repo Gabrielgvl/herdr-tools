@@ -102,12 +102,12 @@ describe("catalog", () => {
   it("parses the shipped catalog config and its generated point set", async () => {
     const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
     expect(catalog.version).toBe(2);
-    expect(catalog.points).toHaveLength(49);
+    expect(catalog.points).toHaveLength(51);
     expect(catalog.tierChains).toEqual({
       utility: ["pi:openai-codex/gpt-6-luna:low", "devin:swe-1-7-lightning-medium"],
       economy: ["devin:swe-2-medium", "pi:openai-codex/gpt-6-luna:max", "pi:zai/glm-5.3-flash:low", "claude:sonnet:low"],
-      standard: ["devin:swe-2-high", "claude:opus:low", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6-sol:high", "agy:gemini-3.8-flash-low"],
-      strong: ["devin:swe-2-max", "claude:opus:xhigh", "pi:openai-codex/gpt-6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "agy:gemini-3.8-flash-high"],
+      standard: ["devin:swe-2-high", "pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high", "claude:opus:low", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6-sol:high", "agy:gemini-3.8-flash-low"],
+      strong: ["devin:swe-2-max", "claude:opus:xhigh", "pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high", "pi:openai-codex/gpt-6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "agy:gemini-3.8-flash-high"],
       frontier: ["claude:fable:low", "pi:openai-codex/gpt-6-astra:high", "claude:opus:max", "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium"],
       max: ["claude:fable:max", "pi:openai-codex/gpt-6-astra:max", "claude:opus:max", "devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium"],
     });
@@ -294,16 +294,15 @@ describe("catalog", () => {
     await expect(loadCatalog(join(root, "missing.yaml"))).rejects.toThrow();
   });
 
-  it("ships exactly the reviewed 49 operating points with the migrated policy table", async () => {
+  it("ships the exact operating points with reviewed and provisional policy classes", async () => {
     const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
     const points = catalog.points ?? [];
-    expect(points).toHaveLength(49);
-    expect(catalog.pointPolicy?.size).toBe(49);
+    expect(points).toHaveLength(51);
+    expect(catalog.pointPolicy?.size).toBe(51);
     for (const point of points) expect(catalog.pointPolicy?.get(point.id)).toEqual({ costClass: point.costClass, latencyClass: point.latencyClass });
     // The audited Appendix A table (plan-delta-model-audit v3.1) with the GPT-6
-    // migration applied: Luna/Sol rows carry the audited classes verbatim by
-    // reasoning setting — provisional pending fresh calibration. Every declared
-    // class is compared, key for key.
+    // migration applied, plus provisional conservative Xiaomi latency classes.
+    // Every declared class is compared, key for key.
     expect(Object.fromEntries(catalog.pointPolicy ?? new Map())).toEqual({
       "pi:openai-codex/gpt-6-luna:off": { costClass: "low", latencyClass: "low" },
       "pi:openai-codex/gpt-6-luna:low": { costClass: "low", latencyClass: "low" },
@@ -345,6 +344,8 @@ describe("catalog", () => {
       "pi:opencode-go/glm-5.3-flash:low": { costClass: "low", latencyClass: "high" },
       "pi:opencode-go/glm-5.3-flash:high": { costClass: "low", latencyClass: "high" },
       "pi:opencode-go/glm-5.3-flash:max": { costClass: "low", latencyClass: "high" },
+      "pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high": { costClass: "low", latencyClass: "high" },
+      "pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high": { costClass: "low", latencyClass: "high" },
       "devin:swe-2-medium": { costClass: "medium", latencyClass: "medium" },
       "devin:swe-2-high": { costClass: "medium", latencyClass: "high" },
       "devin:swe-2-max": { costClass: "medium", latencyClass: "high" },
@@ -355,7 +356,7 @@ describe("catalog", () => {
       "devin:fusion-gpt-6-astra-medium-sidekick-swe-2-medium": { costClass: "extreme", latencyClass: "high" },
       "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium": { costClass: "extreme", latencyClass: "extreme" },
     });
-    expect(points.filter((point) => point.runner === "pi")).toHaveLength(23);
+    expect(points.filter((point) => point.runner === "pi")).toHaveLength(25);
     expect(points.filter((point) => point.runner === "claude")).toHaveLength(14);
     expect(points.filter((point) => point.runner === "agy")).toHaveLength(3);
     expect(points.filter((point) => point.runner === "devin")).toHaveLength(9);
@@ -366,6 +367,13 @@ describe("catalog", () => {
     // quota domain, never the runner's codex tuple.
     expect(points.find((point) => point.id === "pi:zai/glm-5.3-flash:low")).toMatchObject({ provider: "zai", quota: { provider: "zai", billingProduct: "zai-api", account: "primary", scope: "account" } });
     expect(points.find((point) => point.id === "pi:opencode-go/glm-5.3-flash:low")).toMatchObject({ provider: "opencode-go", quota: { billingProduct: "opencode-go-subscription" } });
+    for (const model of ["mimo-v2.6-flash", "mimo-v2.6-pro"]) {
+      expect(points.find((point) => point.id === `pi:xiaomi-token-plan-sgp/${model}:high`)).toMatchObject({
+        runner: "pi", model: `xiaomi-token-plan-sgp/${model}`, reasoning: "high", provider: "xiaomi-token-plan-sgp",
+        quota: { provider: "xiaomi-token-plan-sgp", billingProduct: "xiaomi-token-plan", account: "primary", scope: "account" },
+        costClass: "low", latencyClass: "high",
+      });
+    }
     expect(catalog.catalogRevision).toMatch(/^[0-9a-f]{64}$/);
     // Per-tier exact eligible-id sets, derived from the reviewed table.
     const ids = (tier: QualityTier) => pointsWithinTier(points, tier).map((point) => point.id).sort();
@@ -436,6 +444,8 @@ describe("catalog", () => {
       "pi:opencode-go/glm-5.3-flash:high",
       "pi:opencode-go/glm-5.3-flash:low",
       "pi:opencode-go/glm-5.3-flash:max",
+      "pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high",
+      "pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high",
       "pi:zai/glm-5.3-flash:high",
       "pi:zai/glm-5.3-flash:low",
       "pi:zai/glm-5.3-flash:max",

@@ -2464,7 +2464,7 @@ tierChains:
   it("covers default launch dependencies and omitted signals", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const cli = makeCli();
-    const tool = createLaunchTool({ cli: cli.cli, context, preflight: async () => undefined, supervision: stubSupervision(), launchGate: openLaunchGate, specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) }, catalog: { load: async () => catalog }, routerLog: vi.fn(async () => undefined) as LaunchRouterLog });
+    const tool = createLaunchTool({ cli: cli.cli, context, preflight: async () => undefined, supervision: stubSupervision(), launchGate: openLaunchGate, handoffs: fakeHandoffs(), specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) }, catalog: { load: async () => catalog }, routerLog: vi.fn(async () => undefined) as LaunchRouterLog });
     const result = await tool.execute("call", task(), undefined, undefined, { cwd: repoRoot, signal: undefined } as unknown as ExtensionContext);
     expect(result.details).toMatchObject({ kind: "launch", outcome: "launched", children: [{ state: "launched" }] });
     const executableCli = makeCli();

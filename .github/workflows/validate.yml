@@ -1,0 +1,33 @@
+name: Validate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "25.9.0"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # The installed manager plugin and launch gate pin Gabriel's local paths.
+      # Supply only their CI fixtures; no live credentials or Herdr service.
+      - run: |
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0755 /home/gabriel
+          mkdir -p /home/gabriel/.pi/agent /home/gabriel/.volta/tools/image/node/25.9.0/bin
+          ln -s "$(command -v node)" /home/gabriel/.volta/tools/image/node/25.9.0/bin/node
+      # Permission tests create world-writable fixtures with mkdir(mode: 0777).
+      # The runner's umask otherwise makes those fixtures safe and hides the test.
+      # The skill-bundle suite needs external canonical trees absent from CI.
+      - run: |
+          umask 000
+          npx vitest run --exclude 'test/unit/skill-bundles.test.ts'

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted. Ratified 2026-09-24 against the shipped implementation at policy revision `adr-037-p3`: the originally migrated speculative design (six workload choices, resource Nouls, per-point fitness Nouls, intent-interval tier policy, four-attempt same-tier chain) was simplified to three questions, a direct weakest-sufficient-tier answer, and catalog-authored chains. The sections below describe the shipped behavior; the superseded design is marked historical where it remains for context.
 
 ## Date
 
@@ -80,12 +80,12 @@ doneWhen
 constraints
 ```
 
-The same values feed:
+The contract feeds:
 
 1. deterministic child instruction rendering;
 2. Jev evaluation;
-3. caller-required resource checks;
-4. supervision reservation and review;
+3. the launch assignment-budget preflight;
+4. supervision reservation and review — the digest carries `objective`, `doneWhen`, and `constraints`, never `scope`;
 5. bounded decision evidence.
 
 The universal baseline remains a separate trusted system block. It owns platform conduct such as single-writer behavior, contract preservation, evidence reporting, delegation limits, and handoff obligations. Callers do not repeat those rules.
@@ -125,7 +125,7 @@ Omission means `standard`.
 | `frontier` | Strongly bias toward completion reliability. |
 | `max` | Maximize success probability within reviewed limits. |
 
-A requested tier below the workload floor is raised automatically. Evidence records the requested tier, workload floor, and effective tier. A requested tier above the normal recovery ceiling remains allowed and raises the effective ceiling to at least the effective start.
+A requested tier below the workload floor is raised automatically: the effective start is `max(requested ?? "standard", floor)`. Evidence records the requested tier, workload floor, effective start, and effective ceiling — always `max`, because the chain continues upward through every stronger tier.
 
 ### Workload profile
 
@@ -133,7 +133,7 @@ There is no authoritative flat workload-shape enum. The routing profile is:
 
 ```ts
 interface WorkloadProfile {
-  intent: "explore" | "reason" | "implement" | "debug" | "verify" | "review" | "coordinate";
+  intent: "explore" | "reason" | "implement" | "debug" | "verify" | "review" | "coordinate" | "unknown";
   mutation: "none" | "bounded" | "broad";
   scope: "local" | "multi_file" | "repo_wide";
   horizon: "short" | "medium" | "long";
@@ -143,26 +143,21 @@ interface WorkloadProfile {
 }
 ```
 
-Jev derives every semantic field except `workspaceState`. Runtime lifecycle and handoff evidence supply `workspaceState`. Caller prose cannot override it.
+Jev classifies `intent`. Runtime lifecycle and handoff evidence supply `workspaceState`. `verifiability` is derived from the `done_when_verifiable` probability. The remaining fields (`mutation`, `scope`, `horizon`, `ambiguity`) are fixed placeholder values (`none`/`local`/`short`/`low`) that keep the evidence shape stable — they are synthetic evidence, not Jev classifications, and drive no tier policy. Caller prose cannot override any field.
 
-A workload choice below `0.8` confidence abstains before topology or launch effects. The abstention names the uncertain dimensions. The caller clarifies the canonical Task contract and submits a new launch. There is no classification receipt and no public workload override.
+Policy revision `adr-037-p3` records the owner-chosen intent rule: Jev's top intent is used verbatim regardless of its scalar confidence. A low-confidence intent no longer abstains and never produces a new `unknown` workload record or a `workload:unknown` tab; `unknown` remains in the vocabulary only so historical persisted evidence stays readable. Offline replay of `adr-037-p2` decision metadata moved 30/109 admitted Tasks from `unknown` to a real intent (0/109 unknown) — a coverage change only; intent accuracy is unlabeled and unmeasured. There is no classification receipt and no public workload override.
 
 ### One Jev request
 
-The migration retains one `systemOne` request per Task. The request uses the raw canonical Task, requested tier, runtime state, reviewed operating-point metadata, and catalog resource projections.
+The migration retains one `systemOne` request per Task. The request sends only the semantic Task projection — `objective`, `scope`, `doneWhen`, `constraints` — never the requested tier, runtime state, operating-point metadata, or catalog projections.
 
-It contains:
+It asks exactly three questions:
 
-- `done_when_verifiable`;
-- six closed workload choices;
-- runner-qualified resource Nouls;
-- six tier-specific fitness Nouls for every statically admissible operating point.
+- `done_when_verifiable` (noul);
+- `intent` — a closed choice over the seven real intents;
+- `weakest_sufficient_tier` — a closed choice over the six tiers, judged against the tier rubric and explicitly ignoring caller tier or preference, model/provider identity, cost, quota, availability, and chain contents.
 
-The six speculative fitness judgments avoid sibling-answer dependency. After workload policy computes the effective tier, the router consumes that tier's fitness Noul for each point.
-
-Fitness is a ranking signal, not an admission gate. If all policy-admissible points have low fitness, the highest value still ranks first. D2 records the judgments for later calibration.
-
-Resource requirements explicitly named anywhere in `objective`, `scope`, `doneWhen`, or `constraints` cannot silently disappear because Jev excluded the resource.
+A serialized request over 96 KiB abstains `invalid_response` (`request_too_large`) before any model call; the request is never truncated. There are no resource Nouls and no fitness Nouls: the tool surface is deterministic (`runnerResourceSelection`), and Jev never ranks operating points. Resource requirements named anywhere in the Task cannot silently disappear because no model excludes them.
 
 ### Operating points
 
@@ -191,33 +186,17 @@ Tier envelopes are:
 | `frontier` | `extreme` | `extreme` |
 | `max` | unbounded | unbounded |
 
+The envelopes remain reviewed catalog/policy metadata (`TIER_ENVELOPES`); the shipped router does not filter points by envelope — the authored `tierChains` are the admissible set.
+
 An operating point has no intrinsic quality tier.
 
 ### Workload tier policy
 
-Intent supplies the base interval:
+Jev's `weakest_sufficient_tier` answer is the workload floor directly. The effective start tier is `max(requested ?? "standard", floor)` and the effective ceiling is `max`: the fallback chain is the deduplicated concatenation of the catalog's authored `tierChains` from the effective start tier upward, in catalog order. Catalog `tierChains` are authored per tier with distinct providers and no reused point.
 
-| Intent | Base floor | Base ceiling |
-| --- | --- | --- |
-| `explore` | `utility` | `standard` |
-| `reason` | `economy` | `frontier` |
-| `implement` | `standard` | `frontier` |
-| `debug` | `standard` | `max` |
-| `verify` | `utility` | `standard` |
-| `review` | `standard` | `frontier` |
-| `coordinate` | `standard` | `frontier` |
+The tier question was calibrated 2026-09-24 after live p2 metadata showed bounded Tasks receiving strong floors. The instructions keep the first-attempt-sufficiency target but forbid adding a speculative safety margin, and the economy/standard/strong boundary descriptions were tightened so a bounded local or scoped change with clear requirements lands below strong while work decomposed into dependent stages with known handoffs remains strong. A bounded A/B probe on representative Tasks confirmed the reworded question moved a near-verbatim observed launch contract — a bounded prompt-fix Task that production floored at strong — from strong to standard, while utility, economy, and the multi-stage strong counterexample were unchanged. One observation per cell; no accuracy claim over unlabeled production logs.
 
-Each value below adds one tier to the admission floor:
-
-- `mutation = broad`;
-- `scope = repo_wide`;
-- `horizon = long`;
-- `ambiguity = high`;
-- `workspaceState = partial` or `failed`.
-
-The increments accumulate and cap at `max`. Weak verifiability does not raise the floor.
-
-Any difficult semantic modifier raises the base recovery ceiling by one tier. `workspaceState = failed` raises it to `max`. If the adjusted floor or explicit requested tier exceeds the adjusted ceiling, the effective ceiling rises to the effective start.
+*Historical:* the migrated design derived the floor from an intent base interval (`INTENT_TIER_INTERVALS`) shifted by one tier per difficult workload modifier, with a matching recovery-ceiling adjustment (`resolveTierPolicy`). The shipped router replaced it with the direct tier question; that machinery remains in `src/routing-policy.ts` but is not on the routing path.
 
 ### Deterministic authority
 
@@ -227,28 +206,19 @@ Deterministic code owns:
 - runner compatibility;
 - authorization and account eligibility;
 - capability, resource-pool, permission, and execution-policy limits;
-- tier cost and latency envelopes;
-- workload floor and ceiling calculation;
+- effective start tier and chain assembly;
 - recovery lineage and exclusions;
-- dynamic availability filtering;
-- the four-attempt fallback bound.
+- dynamic availability filtering.
 
-Jev supplies semantic workload, resource, and operating-point fitness judgments within those bounds. The compiler remains the final security and capability authority.
+Jev supplies the done-when gate, workload intent, and weakest-sufficient-tier judgments within those bounds. The compiler remains the final security and capability authority.
 
 ### Pre-execution fallback
 
-The chain remains bounded by `maxAttempts = 4` and contains points from the effective start tier only. It never widens into a stronger tier.
+The chain is the deduplicated catalog `tierChains` order from the effective start tier through `max`; it widens into stronger tiers by construction. It has no fixed attempt cap — the chain length is the bound — and the start loop consumes the emitted order verbatim.
 
-Ordering is:
+The router probes availability once per candidate and admits the first available point in chain order. Launch then re-probes availability immediately before every start attempt across the whole fallback loop; a point that became unavailable is skipped without another Jev request, and a proven agent-free start failure advances to the next point. Fallback remains limited to the established safe pre-execution failure envelope.
 
-1. highest-fitness available point;
-2. providers not already represented;
-3. remaining points by fitness;
-4. stable `operatingPointId` tie-break.
-
-If the effective tier has no available point, routing abstains with `no_candidates_at_tier`.
-
-The initial availability filter runs after fitness scoring. Availability is rechecked immediately before every start attempt across the entire fallback loop. A point that becomes unavailable is skipped without another Jev request. Fallback remains limited to the established safe pre-execution failure envelope.
+If the chain has no available point, routing abstains with `no_candidates_at_tier` — or `transport_failed` when every probed point is local-capacity-limited.
 
 ### Runtime identity
 
@@ -299,10 +269,10 @@ Recovery rules are:
 - `replicas` must be one;
 - `cwd` is forbidden;
 - runtime resumes the prior managed workspace or fails closed;
-- effective start is the maximum of requested or default tier, adjusted workload floor, and the next tier after the prior route tier;
+- the routed Task's requested tier is lifted to `max(requested or default, next tier after the prior route tier)` before evaluation, so the effective start is `max(lifted request, Jev floor)`;
 - at `max`, the next tier remains `max`;
-- the failed operating point is excluded;
-- a different provider ranks ahead of the failed provider when an eligible alternative exists.
+- every operating point on the failed provider is excluded (`recovery_excluded`), not only the failed point;
+- unresolved or non-terminal prior-run evidence fails closed (`RECOVERY_SOURCE_UNRESOLVABLE`) rather than guessing the workspace state.
 
 A started-child failure never invokes the pre-execution fallback chain.
 
@@ -334,19 +304,18 @@ interface LaunchResult {
 
 One replica produces a one-element `children` array. Partial replica failure keeps successful children running and never rolls them back. Errors remain bounded and redacted.
 
-Detailed workload probabilities, fitness judgments, exclusions, availability, and compiled contracts remain in the decision log and jobs evidence rather than the immediate launch response.
+Detailed workload probabilities, tier judgments, exclusions, availability, and compiled contracts remain in the decision log and jobs evidence rather than the immediate launch response.
 
 ### Logs and learning
 
 The decision log records bounded, non-secret evidence for:
 
 - requested tier, workload floor, effective start, and ceiling;
-- workload choices, probabilities, and confidence;
-- consumed fitness judgments;
+- intent and tier answers with probabilities and confidence;
 - operating-point metadata and deterministic exclusions;
 - the generated chain and selected point;
 - availability and recovery evidence;
-- catalog and policy revisions.
+- catalog and policy revisions (`adr-037-p3` on new records, distinguishing them from historical `adr-037-p2` measurements).
 
 Caller text, resource bodies, credentials, raw provider responses, and exception messages remain excluded.
 
@@ -410,8 +379,8 @@ Rejected. Presentation text should not create machine identity constraints, coll
 - Managers must retain returned child target IDs instead of predicting names.
 - Topology becomes workload-aware and runtime-owned. Exact canonical tab labels opt an existing tab into reuse by pane-count proxy when non-focused geometry is unavailable.
 - Arbitrary accessible `cwd` values are permitted. This does not grant capabilities beyond the process user's access and compiled policy.
-- Vague objective or scope text has no independent semantic quality gate. The done-when gate checks relevance, and uncertain workload classification abstains.
-- The one-call design can ask approximately six times the operating-point count in fitness questions. Request size, latency, and held-out route agreement remain required migration measurements.
+- Vague objective or scope text has no independent semantic quality gate. The done-when gate checks relevance, and a confident unverifiable answer rejects the Task.
+- The request is a fixed three-question semantic evaluation independent of catalog size; a serialized request over 96 KiB abstains rather than truncating. The p3 always-top intent rule accepts occasional misleading workload-tab labels for low-confidence classifications; intent accuracy remains unlabeled and unmeasured.
 - Weak inherent verifiability can launch only when its concrete `doneWhen` evidence passes the gate.
 - Recovery remains explicit lineage and never creates concurrent writers over partial state.
 - The accepted public contract can later front a two-phase router without another API migration.

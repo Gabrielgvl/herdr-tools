@@ -64,12 +64,25 @@ describe("TypeSafeSpecClient", () => {
     expect(JSON.stringify(body.state)).not.toMatch(/strong|failed|model|runner|provider|chain|catalog/u);
   });
 
-  it("maps low-confidence intent to unknown but accepts any structurally valid tier confidence", async () => {
+  it("anchors the tier floor at weakest-sufficient capability: bounded local work stays below strong, multi-stage work stays strong", () => {
+    const built = buildEvaluationRequest({ task: TASK, catalog: CATALOG })!;
+    const tier = built.questions["weakest_sufficient_tier"] as { instructions: string; criteria: Record<string, string> };
+    expect(tier.instructions).toContain("successfully on the first attempt");
+    expect(tier.instructions).toContain("do not add a speculative safety margin");
+    expect(tier.instructions).toContain("not merely important work or a multi-step procedure");
+    expect(tier.criteria.economy).toContain("bounded single-file production-code change");
+    expect(tier.criteria.standard).toContain("one or a few related files");
+    expect(tier.criteria.standard).toContain("multi-step procedure with known steps stays standard");
+    expect(tier.criteria.strong).toContain("coordination across agents or handoffs");
+    expect(tier.criteria.strong).toContain("known multi-step procedures are standard, not strong");
+  });
+
+  it("keeps the top intent at low confidence and accepts any structurally valid tier confidence", async () => {
     const outcome = await client(async () => wire({ answers: answers({
       intent: choiceAnswer("debug", INTENTS, 0.1),
       weakest_sufficient_tier: choiceAnswer("frontier", TIERS, 0),
     }) })).evaluate({ task: TASK, catalog: CATALOG }, signal());
-    expect(outcome).toMatchObject({ kind: "response", response: { intent: { value: "unknown", confidence: 0.1 }, tier: { value: "frontier", confidence: 0 }, uncertainDimensions: ["intent"] } });
+    expect(outcome).toMatchObject({ kind: "response", response: { intent: { value: "debug", confidence: 0.1 }, tier: { value: "frontier", confidence: 0 }, uncertainDimensions: [] } });
   });
 
   it("measures the exact serialized SDK request and enforces 96 KiB before fetch or credential lookup", async () => {

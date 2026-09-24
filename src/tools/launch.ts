@@ -35,6 +35,7 @@ import type { SupervisionWorkspaceRoot } from "../job-registry.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
 import { SupervisionBindError } from "../supervision/supervisor.js";
+import { EVIDENCE_ASSIGNMENT_MAX_BYTES, normalizedAssignmentBytes } from "../supervision/evidence.js";
 import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
 import type { SelfCloseTracker } from "../supervision/self-close.js";
 import { CATALOG_PATH, loadCatalog, type AvailabilitySubject, type Catalog, type RunnerEntry, type RunnerKind } from "../catalog.js";
@@ -472,6 +473,15 @@ interface NormalizedLaunchTask extends LaunchTask {
 function normalizedParams(params: unknown): NormalizedLaunchTask {
   validateParams(params);
   return { ...params, constraints: params.constraints ?? [], replicas: params.replicas ?? 1, tier: params.tier ?? "standard" };
+}
+
+/**
+ * The reservation's authorial digest (ADR-036): exactly the canonical Task
+ * fields the evidence builder later normalizes. Built in one place so the
+ * preflight budget check measures the same value the reservation stores.
+ */
+function supervisionAssignmentDigest(task: { objective: string; doneWhen: readonly string[]; constraints: readonly string[] }): { objective: string; doneWhen: string[]; constraints: string[] } {
+  return modelSafeJson({ objective: task.objective, doneWhen: task.doneWhen, constraints: task.constraints }) as { objective: string; doneWhen: string[]; constraints: string[] };
 }
 
 /**
@@ -2527,10 +2537,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       phase = "supervision_reserve";
       tick(phase);
       try {
-        const supervisionDigest = modelSafeJson({
-          doneWhen: task.doneWhen,
-          constraints: task.constraints
-        }) as { doneWhen: string[]; constraints: string[] };
+        const supervisionDigest = supervisionAssignmentDigest(task);
         reservation = await deps.supervision.reserve({
           child: { agentName: childName, agentKind: initialRuntime.kind, operatingPointId: initialContract.candidate.id },
           settings: {
@@ -2919,6 +2926,14 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     let recovery: RecoveryContext | undefined;
     try {
       params = normalizedParams(rawParams);
+      // The assignment evidence section is never truncated, so a Task whose
+      // normalized canonical bytes exceed its budget could never be reviewed.
+      // Refuse it here — before the gate, routing, or any child effect — with
+      // a count-only diagnostic that never echoes Task text.
+      const assignmentBytes = normalizedAssignmentBytes(supervisionAssignmentDigest(params));
+      if (assignmentBytes > EVIDENCE_ASSIGNMENT_MAX_BYTES) {
+        throw new LaunchError("ASSIGNMENT_OVER_BUDGET", "Task assignment exceeds the supervision evidence byte budget", { bytes: assignmentBytes, budget: EVIDENCE_ASSIGNMENT_MAX_BYTES });
+      }
       // A recovery resolves the prior run's managed lineage — namespace, v2
       // record, route and workspace evidence — before any launch effect.
       if (params.recoveryOf !== undefined) {

@@ -361,12 +361,14 @@ describe("MCP argument validation", () => {
   });
 
   /**
-   * The rendered assignment's UTF-8 byte length is the only size authority. A
+   * Schema bounds and size bounds are deliberately separate authorities. A
    * per-field `maxLength` in the public schema would fail an oversized field as
-   * `INVALID_INPUT` during MCP validation, before rendering, so the caller's
-   * error code would depend on which limit was crossed first.
+   * `INVALID_INPUT` during MCP validation, so Task text stays unbounded there.
+   * An oversized Task is instead refused deterministically by the supervision
+   * assignment-budget preflight (`ASSIGNMENT_OVER_BUDGET`), which runs before
+   * the rendered-payload `MESSAGE_TOO_LARGE` check.
    */
-  it("splits schema label bounds from rendered payload bounds", async () => {
+  it("splits schema label bounds from assignment preflight bounds", async () => {
     const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
     const multiLineLabel = { objective: "o", scope: "s", doneWhen: ["d"], label: "a\nb" };
     expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, multiLineLabel)).toBe(false);
@@ -381,12 +383,13 @@ describe("MCP argument validation", () => {
       doneWhen: ["The oversized task body is rejected."]
     };
     // Task text remains intentionally unbounded at the schema layer; the
-    // rendered-payload size limit owns this later rejection.
+    // assignment-budget preflight owns this rejection ahead of the
+    // rendered-payload size limit.
     expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, oversizedTask)).toBe(true);
     expect(Value.Check(definition.parameters, oversizedTask)).toBe(true);
     const outcome = await callTool({ surface: realSurface(), name: "herdr_launch", args: oversizedTask, host, callId: "c", queue: new SequentialToolQueue() });
     expect(outcome.isError).toBe(true);
-    expect(payload(outcome).code).toBe("MESSAGE_TOO_LARGE");
+    expect(payload(outcome).code).toBe("ASSIGNMENT_OVER_BUDGET");
   });
 
   it("rejects invalid arguments for every tool before mutation", async () => {

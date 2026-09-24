@@ -140,6 +140,19 @@ describe("tier-chain routing", () => {
     expect(seen).toEqual([{ tools: ["read", "bash", "write"] }]);
   });
 
+  it("deduplicates operating points repeated across tier segments", async () => {
+    const source = catalog();
+    const repeated: Catalog = {
+      ...source,
+      tierChains: { ...source.tierChains!, max: ["pi:f:low", "claude:m:low"] },
+    };
+    const result = await routeTask(input({
+      catalog: repeated,
+      response: response({ tier: { value: "frontier", confidence: 0.9 } }),
+    }));
+    expect(result).toMatchObject({ kind: "admitted", chain: ["pi:f:low", "claude:m:low"] });
+  });
+
   it("accepts low tier confidence, keeps the top low-confidence intent, and validates optional distributions", async () => {
     const intentProbabilities = { explore: 0, reason: 0, implement: 0, debug: 1, verify: 0, review: 0, coordinate: 0 };
     const tierProbabilities = { utility: 0, economy: 0, standard: 0, strong: 0, frontier: 1, max: 0 };

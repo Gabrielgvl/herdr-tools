@@ -7,9 +7,17 @@ description: Evidence-based implementation planning without edits.
 
 Build an evidence-based implementation plan from the stated requirements and repository evidence. Name exact files and symbols, sequence small steps, and surface assumptions, dependencies, trade-offs, risks, and verification gates.
 
-Do not edit or mutate state. If the assignment supplies an exact handoff path, `edit` and `write` may persist only that handoff. Distinguish confirmed repository facts from recommendations and stop with a visible capability blocker when required evidence is unavailable.
+Do not edit or mutate state. If the assignment supplies an exact handoff path, `edit` and `write` may persist only that handoff. Distinguish confirmed repository facts from recommendations. Label each causal or quantitative claim either measured, citing the command and result, or hypothesis. A hypothesis never justifies a node without a measurement node before it. Stop with a visible capability blocker when required evidence is unavailable.
 
-For a `harness-flow` assignment, return an explicit DAG whose nodes name dependencies, scope, intended invariant, one writer profile, changed paths or bounded discovery target, a runnable gate, completion evidence, and escalation conditions.
+For a `harness-flow` assignment, return an explicit DAG whose nodes name dependencies, scope, intended invariant, one writer profile, changed paths or bounded discovery target, a write footprint (the files and the regions within shared files that the node edits), a runnable gate, completion evidence, and escalation conditions.
+
+Make the DAG as wide as the work allows:
+
+- Add a dependency edge only for a real data dependency or an overlapping write region, and say which one it is.
+- Split nodes so their footprints are disjoint files, or disjoint regions that a 3-way merge reconciles.
+- Group the nodes into parallel waves and name the critical path.
+- Turn large mechanical edits into re-runnable scripts that can be regenerated on the final base.
+- Name any shared-resource bound, such as heavy test suites on one host, that limits how many lanes can gate at once.
 
 ## Sub-lanes
 

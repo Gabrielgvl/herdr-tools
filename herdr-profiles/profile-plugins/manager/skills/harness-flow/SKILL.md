@@ -49,7 +49,7 @@ Fix root causes at the shared path after checking callers. Do not simplify away 
 
 ### 1. Explore
 
-Launch a fresh `scout`-labeled Task for bounded repository reconnaissance. Launch a separate `research`-labeled Task only when the task depends on external facts. Run independent exploration in parallel.
+Launch a fresh `scout`-labeled Task for bounded repository reconnaissance. Launch a separate `research`-labeled Task only when the task depends on external facts. Launch every independent explorer in the same turn.
 
 Each explorer returns exact evidence, constraints, unresolved decisions, and provenance. Exploration is complete when the planner no longer needs to guess about retrievable facts.
 
@@ -61,21 +61,46 @@ Launch a fresh `plan`-labeled Task with the owner's requirements and complete ex
 - exact scope and intended invariant;
 - one writer Task;
 - changed paths or bounded discovery target;
+- write footprint: the files, and the regions within shared files, that the node edits;
 - runnable verification gate;
 - completion evidence;
 - escalation conditions.
 
+Plan for maximum parallel width. Add a dependency edge only for a real data dependency or an overlapping write region, and state which one each edge is. Split nodes so that writers touch disjoint files, or disjoint regions of a shared file that a 3-way merge can reconcile. Group the nodes into parallel waves and name the critical path. Express large mechanical changes (renames, moves, import rewrites, bulk formatting) as re-runnable scripts, so they can be regenerated on the final base instead of rebased by hand. An unexplained sequential order is a planning defect.
+
+Overlap phases across a multi-step plan. While one step is in work, explore and plan the next independent step, and start its writers as soon as its footprint no longer overlaps in-flight work.
+
+Separate facts from hypotheses. Every causal or quantitative claim in the plan is either measured, citing the command and its result, or labeled a hypothesis. A hypothesis can't justify a work node; add a measurement node first. The same rule applies to any plan document the manager writes for the owner.
+
+Check the release path before work starts. State how production would be hotfixed while the flow is in progress: which branch a hotfix deploys from, and which merged flow work would ride along with it. If an emergency deploy would carry unproven flow changes, get the owner's merge-timing decision before any merge.
+
+Persist the DAG with hflow for parallel or multi-flow runs. Write each flow's `plan.json` through `hflow apply` (see the `hflow` skill), stamp `pane_id` from each launch, update node states as results are verified, and serve the dashboard to the owner. A markdown DAG is enough only for a single, sequential flow.
+
 Include required documentation, changelog, artifact-path setup, and delivery files in the DAG. Work Tasks may not leave those for promotion.
 
-Use `pi-review plan` when the plan has material architectural risk or uncertainty. Route irreversible or high-blast-radius architecture, security/IAM, infrastructure/deployment, production, or data-migration plans to Oracle instead. Continue automatically for reversible in-scope work; pause only at an escalation gate.
+Use `pi-review plan` when the plan has material architectural risk or uncertainty. For irreversible or high-blast-radius plans (architecture, security/IAM, infrastructure/deployment, production, data migration), use Oracle only when the owner has requested Oracle for the current task, as the manager skill's review routing requires; otherwise use `pi-review plan` and flag the risk to the owner. Continue automatically for reversible in-scope work; pause only at an escalation gate.
 
 ### 3. Work
 
 Launch one fresh `work`-labeled Task per ready DAG node. Supply the complete node, relevant evidence, current repository state, and exact gate. Never make the worker rediscover the whole plan.
 
-Run writers sequentially by default. Parallel writers require independent DAG nodes and isolated Git worktrees. Never run two writers in one checkout.
+Run in parallel by default. A node is ready when its dependencies are done and its write footprint does not overlap an in-flight node's. Launch every ready node in the same turn, each writer in its own Git worktree; never run two writers in one checkout. Tell each writer which regions its siblings own, and forbid reformatting or reordering outside its own footprint. Run nodes sequentially only for a real dependency or an overlapping footprint.
 
-A worker is complete only when its gate passes and it reports changed paths plus evidence. Workers leave changes uncommitted. The manager verifies each result before releasing dependent nodes.
+Batch tiny nodes. When several ready nodes are each tiny (a few lines, one gate) and have disjoint footprints, one writer may take them together as a wave in one worktree. The report must keep each node's own gate result and evidence. Never batch nodes with overlapping footprints or different risk classes, such as a test-only change together with a production-path change.
+
+Bound the width by shared resources, not by habit. Expensive gates, such as DB-backed suites or container builds, contend on one host, so lanes may run targeted gates while the integrated tree always runs the full gate. State the bound you chose.
+
+Seeding lanes. When a lane needs uncommitted results from finished nodes, seed it from a scratch commit object without moving any branch:
+
+1. In the integration worktree, build a temporary index: `GIT_INDEX_FILE=<tmp> git read-tree HEAD`, then `GIT_INDEX_FILE=<tmp> git add -A -- . ':!<in-flight paths>'`.
+2. `git write-tree`, then `git commit-tree <tree> -p HEAD`.
+3. `git worktree add -b <lane-branch> <path> <seed>`.
+
+The seed and the lane branches are scratch and are never promoted.
+
+Integrating lanes. As each lane's nodes pass their gates, the manager merges that lane into the integration worktree one lane at a time, with a per-file 3-way merge against the seed. For each path in `git -C <lane> diff --name-only <seed>`, run `git merge-file <integration>/<path> <seed version of path> <lane>/<path>`; that seed version comes from `git show <seed>:<path>`. Loop over the paths line by line (`while IFS= read -r`), because zsh does not word-split `$var`. Do not use `git apply --3way`: it goes through the index and refuses a dirty integration worktree (`does not match index`). A conflict goes to a fresh `work` Task, and the manager never hand-resolves one. Once all lanes are integrated, a fresh worker runs the full gate on the integrated tree before the critic. Delete the lane worktrees and branches after promotion.
+
+A worker is complete only when its gate passes and it reports changed paths plus evidence. Workers leave changes uncommitted. The manager verifies each result as soon as it arrives and immediately releases the nodes that become ready.
 
 ### 4. Critic
 
@@ -127,6 +152,7 @@ A scheduler status, worker claim, commit exit code, or manager summary alone is 
 - Do not let every agent orchestrate; only managers own the full flow.
 - Do not use runner or model IDs as workflow policy.
 - Do not run a full harness for work that passes the one-worker test.
+- Do not serialize nodes whose footprints are disjoint, and do not let a finished result wait unverified while ready nodes sit idle.
 - Do not let promotion repair code or change the reviewed tree.
 - Do not retry an ambiguous Herdr launch or pi-review run blindly.
 

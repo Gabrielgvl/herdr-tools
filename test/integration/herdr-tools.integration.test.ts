@@ -18,7 +18,7 @@ interface ExecutableTool {
 }
 
 const execFileAsync = promisify(execFile);
-const REQUIRED_SESSION = "herdr-tools-integration";
+const REQUIRED_SESSION = process.env.HERDR_TOOLS_INTEGRATION_SESSION ?? "herdr-tools-integration";
 const requestedSession = process.env.HERDR_TOOLS_INTEGRATION_SESSION ?? REQUIRED_SESSION;
 const enabled = process.env.HERDR_TOOLS_RUN_INTEGRATION === "1";
 const agyEnabled = process.env.HERDR_TOOLS_RUN_AGY_INTEGRATION === "1";

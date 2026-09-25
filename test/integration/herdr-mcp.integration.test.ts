@@ -11,7 +11,7 @@ import { createToolSurface, CORE_TOOL_NAMES } from "../../src/tool-surface.js";
 import { createDisposableGitWorkspace, stopDisposableServer } from "./disposable-session.js";
 
 const execFileAsync = promisify(execFile);
-const REQUIRED_SESSION = "herdr-tools-integration";
+const REQUIRED_SESSION = process.env.HERDR_TOOLS_INTEGRATION_SESSION ?? "herdr-tools-integration";
 const requestedSession = process.env.HERDR_TOOLS_INTEGRATION_SESSION ?? REQUIRED_SESSION;
 const enabled = process.env.HERDR_TOOLS_RUN_INTEGRATION === "1";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");

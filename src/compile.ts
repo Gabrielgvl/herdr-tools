@@ -104,7 +104,10 @@ const CONSUMABLE_FIELDS: Record<RunnerKind, readonly (keyof RunnerPools)[]> = {
 /** Pool fields whose members are scope-rooted paths; the rest are bare names. */
 const PATH_FIELDS: ReadonlySet<keyof RunnerPools> = new Set(["extensions", "skills", "plugins"]);
 const BASE_TOOLS: Record<"pi" | "claude", readonly string[]> = {
-  pi: ["read", "bash", "write"],
+  // The five native tools are unconditional on every pi lane; the executor
+  // gateway trio rides pool membership through selection, so only lanes whose
+  // reviewed pool carries the gateway recipe receive it.
+  pi: ["read", "bash", "edit", "write", "ask_user_question"],
   claude: ["Read", "Bash", "Write"],
 };
 

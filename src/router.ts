@@ -223,9 +223,15 @@ function tierJudgment(value: unknown): TierEvidence | undefined {
   return probabilities === undefined ? undefined : { value: value.value as QualityTier, confidence: value.confidence, probabilities };
 }
 
-/** Deterministic initial tool surface; skill/plugin/MCP selection remains disabled. */
+/**
+ * Deterministic tool surface; skill/plugin/MCP selection remains disabled.
+ * Pi lanes pin the five native tools plus the executor-gateway trio — the
+ * `--tools` allowlist is the only channel that can reach executor_* tools, so
+ * a lane whose reviewed pool carries the gateway recipe gets the trio, and a
+ * pool without it degrades to the natives alone.
+ */
 export function runnerResourceSelection(_response: TaskModelDecision, runner: RunnerKind, entry?: RunnerEntry): ResourceSelection {
-  const desired = runner === "pi" ? ["read", "bash", "write"] : runner === "claude" ? ["Read", "Bash", "Write"] : [];
+  const desired = runner === "pi" ? ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] : runner === "claude" ? ["Read", "Bash", "Write"] : [];
   const tools = entry === undefined ? desired : desired.filter((tool) => entry.pools.tools.includes(tool));
   return tools.length === 0 ? {} : { tools };
 }

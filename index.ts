@@ -1,18 +1,18 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { HerdrCli } from "./src/cli.js";
-import { createAgentPromptClient, type AgentPromptClient } from "./src/agent-prompt.js";
-import { createPreflight, createToolSurface, readInjectedContext } from "./src/tool-surface.js";
-import { createDevinQueueFlush, type DevinQueueFlush } from "./src/messages/devin-queue-flush.js";
-import { createPaneWriteGuard, resolvePaneWriteNamespace } from "./src/pane-write-lock.js";
-import { defaultAttachmentStore, type AttachmentStore } from "./src/messages/store.js";
-import { RecipientRegistry } from "./src/messages/recipients.js";
+import type { HerdrCli } from "./src/cli.js";
+import { type AgentPromptClient } from "./src/agent-prompt.js";
+import { type DevinQueueFlush } from "./src/messages/devin-queue-flush.js";
+import { type AttachmentStore } from "./src/messages/store.js";
+import type { RecipientRegistry } from "./src/messages/recipients.js";
 import { JobRegistry } from "./src/job-registry.js";
 import { notificationForJob } from "./src/job-notification.js";
-import { createCliTranscriptReader, SupervisionRegistry } from "./src/supervision/registry.js";
-import { createHandoffGate, type HandoffGate } from "./src/handoff-gate.js";
+import type { SupervisionRegistry } from "./src/supervision/registry.js";
+import { type HandoffGate } from "./src/handoff-gate.js";
 import { createPiSupervisionNotifier } from "./src/supervision/notify.js";
 import { WaitJobsUi } from "./src/wait-jobs-ui.js";
-import { RuntimeOwnership, resetOwnership, type OwnedResource } from "./src/ownership.js";
+import { type OwnedResource, type RuntimeOwnership } from "./src/ownership.js";
+import { createSharedRuntime } from "./src/daemon/runtime.js";
+import { readInjectedContext } from "./src/tool-surface.js";
 import { loadSettings, type Settings } from "./src/settings.js";
 import type { CurrentContext } from "./src/targets.js";
 import type { ProfileCatalog } from "./src/profiles/types.js";
@@ -27,6 +27,12 @@ export interface CreatedResourceRegistry {
   record(resource: OwnedResource): void;
 }
 
+/**
+ * The shared host assembly plus the Pi-session extras (wait-job UI, terminal
+ * notifications, profile discovery) — retained as a construction seam for
+ * harnesses and tests that compose `createSharedRuntime` with an injected Pi
+ * `exec`. The extension itself never calls this: Pi registers nothing (C7).
+ */
 export interface ExtensionRuntime {
   cli: HerdrCli;
   context: CurrentContext;
@@ -59,46 +65,43 @@ export interface RuntimeOptions {
 export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<ExtensionAPI, "sendMessage">>, env: NodeJS.ProcessEnv = process.env, options: RuntimeOptions = {}): ExtensionRuntime {
   const injected = readInjectedContext(env);
   const uiRef: { current?: WaitJobsUi } = {};
-  const jobs = new JobRegistry({
-    onChange: () => uiRef.current?.refresh(),
-    onTerminal: (detail) => {
-      if (!pi.sendMessage || detail.kind !== "wait") return;
-      const notification = notificationForJob(detail);
-      try {
-        void Promise.resolve(pi.sendMessage({ customType: "herdr-wait-job", content: notification.content, display: true, details: notification.details }, { deliverAs: "steer", triggerTurn: true })).catch(() => undefined);
-      } catch {
-        // Pi may be shutting down; notification is best effort.
-      }
-    }
+  // The Pi host's wiring onto the shared assembly: its wait-job UI refresh,
+  // terminal notifications, and the Pi wake channel.
+  const shared = createSharedRuntime({
+    exec: pi.exec.bind(pi),
+    env,
+    ...(options.promptClient === undefined ? {} : { promptClient: options.promptClient }),
+    ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
+    ...(options.recipients === undefined ? {} : { recipients: options.recipients }),
+    wire: () => ({
+      jobs: new JobRegistry({
+        onChange: () => uiRef.current?.refresh(),
+        onTerminal: (detail) => {
+          if (!pi.sendMessage || detail.kind !== "wait") return;
+          const notification = notificationForJob(detail);
+          try {
+            void Promise.resolve(pi.sendMessage({ customType: "herdr-wait-job", content: notification.content, display: true, details: notification.details }, { deliverAs: "steer", triggerTurn: true })).catch(() => undefined);
+          } catch {
+            // Pi may be shutting down; notification is best effort.
+          }
+        }
+      }),
+      ...(pi.sendMessage ? { notifier: createPiSupervisionNotifier((message, deliveryOptions) => pi.sendMessage!(message, deliveryOptions)) } : {}),
+    }),
   });
-  const waitJobsUi = new WaitJobsUi(jobs);
+  const waitJobsUi = new WaitJobsUi(shared.jobs);
   uiRef.current = waitJobsUi;
-  const cli = new HerdrCli(pi.exec.bind(pi), 10_000, 50_000, options.promptClient ?? createAgentPromptClient({ env }));
-  // The coordinator's namespace resolves lazily on first use, so constructing
-  // the runtime still performs no filesystem or Herdr calls.
-  const queueFlush = createDevinQueueFlush({ cli, guard: createPaneWriteGuard({ namespace: resolvePaneWriteNamespace.bind(null, env) }) });
-  queueFlush.begin();
-  const handoffs = createHandoffGate();
-  const supervision = new SupervisionRegistry({
-    jobs,
-    settingsLoader: () => loadSettings(),
-    readTranscript: createCliTranscriptReader(cli),
-    ...(pi.sendMessage ? { notifier: createPiSupervisionNotifier((message, deliveryOptions) => pi.sendMessage!(message, deliveryOptions)) } : {}),
-    monitorOptions: { env },
-    handoffs,
-    repairPrompt: (paneId, text, signal) => cli.prompt(paneId, text, signal),
-  });
   return {
-    cli,
+    cli: shared.cli,
     context: injected.context,
-    ownership: new RuntimeOwnership(),
-    jobs,
-    supervision,
-    handoffs,
+    ownership: shared.ownership,
+    jobs: shared.jobs,
+    supervision: shared.supervision,
+    handoffs: shared.handoffs,
     waitJobsUi,
-    attachments: options.attachments ?? defaultAttachmentStore,
-    recipients: options.recipients ?? new RecipientRegistry(),
-    queueFlush,
+    attachments: shared.attachments,
+    recipients: shared.recipients,
+    queueFlush: shared.queueFlush,
     settings: { load: () => loadSettings() },
     profiles: { load: () => discoverProfiles({ bundledDir: resolve(dirname(fileURLToPath(import.meta.url)), "herdr-profiles"), bundledScopeRoot: dirname(fileURLToPath(import.meta.url)), projectCwd: process.cwd() }) },
     idsPresent: injected.idsPresent,
@@ -106,70 +109,11 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   };
 }
 
-export default function herdrToolsExtension(pi: ExtensionAPI): void {
-  if (process.env.HERDR_ENV !== "1") return;
-
-  const runtime = createRuntime(pi);
-  const environment = {
-    enabled: true,
-    currentIdsPresent: runtime.idsPresent,
-    currentIdsValid: runtime.idsValid,
-  };
-
-  pi.on("session_shutdown", async () => {
-    runtime.waitJobsUi.endSession();
-    // Abort pending flush cycles before the prompt transport closes: no new
-    // operation may be dispatched into a closed session.
-    await runtime.queueFlush.shutdown();
-    runtime.cli.closePromptTransport();
-    await runtime.supervision.shutdown();
-    runtime.jobs.shutdown();
-    runtime.recipients.reset();
-    resetOwnership(runtime.ownership);
-  });
-  pi.on("session_start", async (_event, context) => {
-    // A fresh controller per session: cycles a dead session left pending keep
-    // their aborted signal and can never revive under the new one.
-    runtime.queueFlush.begin();
-    // Supervision is session-scoped: the previous session's supervisors and
-    // event connection are stopped and a fresh monitor replaces them, so a
-    // session that follows a shutdown can still launch.
-    await runtime.supervision.beginSession();
-    runtime.jobs.beginSession();
-    runtime.waitJobsUi.beginSession(context);
-    runtime.recipients.reset();
-    resetOwnership(runtime.ownership);
-  });
-
-  pi.registerCommand("herdr-waits", {
-    description: "Toggle the active Herdr wait-job list",
-    handler: async (_args, context) => {
-      const visible = runtime.waitJobsUi.toggle(context);
-      context.ui.notify(`Herdr active waits ${visible ? "shown" : "hidden"}`, "info");
-    }
-  });
-
-  const surface = createToolSurface({
-    cli: runtime.cli,
-    context: runtime.context,
-    environment,
-    preflight: createPreflight(runtime.cli),
-    settingsLoader: runtime.settings.load,
-    jobs: runtime.jobs,
-    profiles: runtime.profiles,
-    ownership: runtime.ownership,
-    cwd: process.cwd(),
-    attachments: runtime.attachments,
-    recipients: runtime.recipients,
-    supervision: runtime.supervision,
-    handoffs: runtime.handoffs,
-    queueFlush: runtime.queueFlush,
-  });
-  pi.registerTool(surface.inspect);
-  pi.registerTool(surface.communicate);
-  pi.registerTool(surface.wait);
-  pi.registerTool(surface.jobs);
-  pi.registerTool(surface.launch);
-  pi.registerTool(surface.pane);
-  pi.registerTool(surface.tab);
-}
+/**
+ * The Pi extension entrypoint (durable-supervisor §10, C7): Pi registers
+ * NOTHING — no tools, no commands, no session handlers. The three daemon
+ * tools reach Pi through the executor MCP gateway, and the durable daemon
+ * owns supervision, mailboxes, and intents, so this host process holds no
+ * Herdr state at all.
+ */
+export default function herdrToolsExtension(): void {}

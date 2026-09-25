@@ -3,64 +3,37 @@ import { Type } from "typebox";
 import type { TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { describe, expect, it, vi } from "vitest";
-import { HerdrCli, type PiExec } from "../../src/cli.js";
-import { JobRegistry } from "../../src/job-registry.js";
-import { RuntimeOwnership } from "../../src/ownership.js";
-import { createPreflight, createToolSurface, CORE_TOOL_NAMES, type HerdrToolDefinition } from "../../src/tool-surface.js";
+import type { DaemonClient } from "../../src/daemon/client.js";
+import { createToolSurface, CORE_TOOL_NAMES, type HerdrToolDefinition } from "../../src/tool-surface.js";
 import { AdapterContractError, HERDR_DETAILS_LABEL, MCP_RESULT_MAX_BYTES, callTool, describeTools, errorOutcome, publishedInputSchema, type McpCallOutcome } from "../../src/mcp/adapter.js";
 import { HostCapabilityError } from "../../src/mcp/host.js";
-import { SequentialToolQueue } from "../../src/mcp/queue.js";
-import { CommunicateParamsSchema } from "../../src/schemas.js";
 import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE } from "../../src/tools/launch.js";
 import { TOOL_DIAGNOSTIC_MARKER, TOOL_DIAGNOSTIC_RECOVERY } from "../../src/telemetry.js";
-import { stubSupervision } from "./supervision-fixtures.js";
 
-const health = { client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } };
-const snapshot = {
-  type: "session_snapshot",
-  snapshot: {
-    version: "1",
-    protocol: 1,
-    workspaces: [{ workspace_id: "w", label: "w" }],
-    tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
-    panes: [{ pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "caller", agent_name: "caller", agent: "pi", terminal_id: "term-caller", agent_session: { source: "pi", agent: "pi", kind: "id", value: "caller-session" }, agent_status: "idle" }],
-    agents: [{ pane_id: "w:p", name: "caller", agent: "pi", terminal_id: "term-caller", agent_session: { source: "pi", agent: "pi", kind: "id", value: "caller-session" }, agent_status: "idle" }]
-  }
-};
-
-function realSurface() {
-  const exec: PiExec = async (_command, argv) => {
-    if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "current") return { stdout: JSON.stringify({ id: "current", result: { type: "pane_current", pane: snapshot.snapshot.panes[0] } }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "api") return { stdout: JSON.stringify({ id: "snapshot", result: snapshot }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "agent" && argv[1] === "wait") return { stdout: JSON.stringify({ id: "agent-wait", result: { agent: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "agent" && argv[1] === "get") return { stdout: JSON.stringify({ id: "agent-get", result: { agent: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "get") return { stdout: JSON.stringify({ id: "pane", result: { pane: snapshot.snapshot.panes.find((pane) => pane.pane_id === argv[2]) } }), stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "read") return { stdout: "caller output", stderr: "", code: 0, killed: false };
-    return { stdout: JSON.stringify({ id: "other", result: { ok: true } }), stderr: "", code: 0, killed: false };
+/**
+ * The real three-tool surface over a scripted daemon client: every typed call
+ * records its request and returns the canned reply, so adapter assertions can
+ * inspect exactly what crossed the proxy boundary.
+ */
+function realSurface(replies: { launch?: unknown; run?: unknown; status?: unknown } = {}) {
+  const calls: Array<{ method: string; params: unknown }> = [];
+  const client = {
+    launch: async (params: unknown) => { calls.push({ method: "launch", params }); return replies.launch ?? { kind: "launch", state: "completed" }; },
+    run: async (params: unknown) => { calls.push({ method: "run", params }); return replies.run ?? { kind: "run" }; },
+    status: async (params: unknown) => { calls.push({ method: "status", params }); return replies.status ?? { kind: "status", daemon: { status: "running" } }; },
+    close: () => undefined,
   };
-  const cli = new HerdrCli(exec);
-  return createToolSurface({
-    cli,
-    context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" },
-    environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
-    preflight: createPreflight(cli),
-    settingsLoader: async () => ({ reviewCadenceMinutes: 5, reviewerModel: "testmodel", reviewerThinking: "low" }),
-    jobs: new JobRegistry(),
-    profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
-    ownership: new RuntimeOwnership(),
-    supervision: stubSupervision(),
-    cwd: "/project"
-  });
+  const surface = createToolSurface({ connectDaemon: async () => client as unknown as DaemonClient, cwd: "/project" });
+  return { surface, calls };
 }
 
 function stub(definition: Partial<HerdrToolDefinition> & Pick<HerdrToolDefinition, "execute">): { definitions: HerdrToolDefinition[] } {
   return {
     definitions: [{
-      name: "herdr_inspect",
-      label: "Herdr Inspect",
+      name: "herdr_status",
+      label: "Herdr Status",
       description: "stub",
-      parameters: Type.Object({ mode: Type.Optional(Type.String()) }, { additionalProperties: false }),
+      parameters: Type.Object({ eventId: Type.Optional(Type.String()) }, { additionalProperties: false }),
       ...definition
     }]
   };
@@ -68,8 +41,13 @@ function stub(definition: Partial<HerdrToolDefinition> & Pick<HerdrToolDefinitio
 
 const host = { cwd: "/project", signal: new AbortController().signal };
 
-function call(surface: { definitions: HerdrToolDefinition[] }, args: unknown = {}, name = "herdr_inspect"): Promise<McpCallOutcome> {
-  return callTool({ surface, name, args, host, callId: "call-1", queue: new SequentialToolQueue() });
+function call(surface: { definitions: HerdrToolDefinition[] }, args: unknown = {}, name = "herdr_status"): Promise<McpCallOutcome> {
+  return callTool({ surface, name, args, host, callId: "call-1" });
+}
+
+function record(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("schema field is not an object");
+  return value as Record<string, unknown>;
 }
 
 function outcomeBytes(outcome: McpCallOutcome): number {
@@ -102,40 +80,62 @@ describe("MCP input schema publication", () => {
     expect(published.anyOf.every((variant) => variant.additionalProperties === false)).toBe(true);
   });
 
-  it("publishes herdr_launch as the strict flat Task root (ADR-037)", () => {
-    const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
+  it("publishes herdr_launch as the strict {task, idempotencyKey} root", () => {
+    const definition = realSurface().surface.definitions.find((candidate) => candidate.name === "herdr_launch")!;
     const published = publishedInputSchema(definition.parameters) as { type: string; properties: Record<string, unknown>; required?: unknown; anyOf?: unknown; additionalProperties?: unknown };
     expect(published.type).toBe("object");
     expect(published.anyOf).toBeUndefined();
-    // The Task is a single strict object, so the published root carries the
-    // real requireds — the optional-all flattening existed only for the union.
-    expect(published.required).toEqual(expect.arrayContaining(["objective", "scope", "doneWhen"]));
+    expect(published.required).toEqual(expect.arrayContaining(["task", "idempotencyKey"]));
     expect(published.additionalProperties).toBe(false);
+    const task = record(published.properties.task);
+    // The Task is a single strict object with the real requireds.
+    expect(task.required).toEqual(expect.arrayContaining(["objective", "scope", "doneWhen"]));
+    const taskProperties = record(task.properties);
     for (const field of ["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd"]) {
-      expect(published.properties).toHaveProperty(field);
+      expect(taskProperties).toHaveProperty(field);
     }
-    // The deleted caller-authority fields have no alias at the boundary.
+    // The deleted caller-authority fields have no alias at the boundary —
+    // neither on the request root nor inside the Task.
     for (const field of ["name", "specs", "tasks", "instructions", "assignment", "supervisionDigest", "category", "count", "placement", "focus", "assignmentDelivery", "profile", "overrides", "transportBypass"]) {
+      expect(taskProperties).not.toHaveProperty(field);
+    }
+    for (const field of ["identity", "projectRoot", "runId", "runIds", "eventId", "successorPaneId", "incidentId"]) {
       expect(published.properties).not.toHaveProperty(field);
     }
+    // The delegated-mode caller assertion is additive, optional, and strict.
+    const caller = record(published.properties.caller);
+    expect(caller.type).toBe("object");
+    expect(caller.additionalProperties).toBe(false);
+    expect(caller.required).toEqual(expect.arrayContaining(["paneId", "projectRoot"]));
+    expect(published.required).not.toContain("caller");
   });
 
-  // Regression coverage for the incident where the pi harness dropped every
-  // argument of a tool whose declared parameters were a root Type.Union — calls
-  // arrived as {} — so every tool now publishes a flat object root, never a
-  // union. The union schemas remain each tool's internal runtime contract.
-  for (const name of CORE_TOOL_NAMES) {
-    it(`${name} publishes a flat object root, never a union`, () => {
-      const definition = realSurface().definitions.find((candidate) => candidate.name === name)!;
-      const schema = definition.parameters as Record<string, unknown>;
-      expect(schema.type).toBe("object");
-      expect(schema.anyOf).toBeUndefined();
-      expect(schema.oneOf).toBeUndefined();
-      const published = publishedInputSchema(definition.parameters) as Record<string, unknown>;
-      expect(published.anyOf).toBeUndefined();
-      expect(published.oneOf).toBeUndefined();
-    });
-  }
+  it("publishes herdr_run as a strict discriminated-union root and herdr_status as a strict object", () => {
+    const run = realSurface().surface.definitions.find((candidate) => candidate.name === "herdr_run")!;
+    const publishedRun = publishedInputSchema(run.parameters) as { type: string; anyOf: Array<Record<string, unknown>> };
+    // The union gains only the object type MCP requires; each variant stays
+    // strict — the wire contract can never be looser than validation.
+    expect(publishedRun.type).toBe("object");
+    expect(publishedRun.anyOf.map((variant) => record(record(variant.properties).action).const)).toEqual(
+      expect.arrayContaining(["observe", "reconcile", "transfer", "claim", "ack"])
+    );
+    expect(publishedRun.anyOf).toHaveLength(5);
+    expect(publishedRun.anyOf.every((variant) => variant.additionalProperties === false)).toBe(true);
+    // Every action variant admits the optional delegated caller assertion.
+    for (const variant of publishedRun.anyOf) {
+      const caller = record(record(variant.properties).caller);
+      expect(caller.required).toEqual(expect.arrayContaining(["paneId", "projectRoot"]));
+      expect(variant.required as unknown[]).not.toContain("caller");
+    }
+
+    const status = realSurface().surface.definitions.find((candidate) => candidate.name === "herdr_status")!;
+    const publishedStatus = publishedInputSchema(status.parameters) as Record<string, unknown>;
+    expect(publishedStatus.type).toBe("object");
+    expect(publishedStatus.anyOf).toBeUndefined();
+    expect(publishedStatus.additionalProperties).toBe(false);
+    expect(record(publishedStatus.properties)).toHaveProperty("eventId");
+    expect(record(publishedStatus.properties)).toHaveProperty("caller");
+  });
 
   it("refuses any other root shape instead of publishing a permissive schema", () => {
     expect(() => publishedInputSchema(Type.String())).toThrowError(AdapterContractError);
@@ -144,8 +144,8 @@ describe("MCP input schema publication", () => {
     expect(failure).toMatchObject({ code: "ADAPTER_CONTRACT_VIOLATION" });
   });
 
-  it("describes the seven shared tools as structural clones", () => {
-    const surface = realSurface();
+  it("describes the three shared tools as structural clones", () => {
+    const { surface } = realSurface();
     const descriptors = describeTools(surface);
     expect(descriptors.map((descriptor) => descriptor.name)).toEqual([...CORE_TOOL_NAMES]);
     expect(descriptors.map((descriptor) => descriptor.title)).toEqual(surface.definitions.map((definition) => definition.label));
@@ -153,13 +153,12 @@ describe("MCP input schema publication", () => {
     expect(descriptors.every((descriptor) => descriptor.inputSchema.type === "object")).toBe(true);
     expect(descriptors[0]!.inputSchema).not.toBe(surface.definitions[0]!.parameters);
     expect(descriptors[0]!.inputSchema).toMatchObject({ properties: expect.any(Object) as unknown as Record<string, unknown> });
-    expect(descriptors.every((descriptor) => !("anyOf" in descriptor.inputSchema))).toBe(true);
   });
 });
 
 describe("MCP published schema parity", () => {
   it("publishes each shared schema unchanged except for the object root MCP requires", () => {
-    for (const definition of realSurface().definitions) {
+    for (const definition of realSurface().surface.definitions) {
       const source = JSON.parse(JSON.stringify(definition.parameters)) as Record<string, unknown>;
       // Publication may only add the root `type`; it can never drop or loosen a
       // keyword, so the published document cannot accept more than validation.
@@ -167,61 +166,47 @@ describe("MCP published schema parity", () => {
     }
   });
 
-  it("admits every variant-shaped call at the flat root while keeping strict keys and field types", () => {
-    const surface = realSurface();
-    // The flat publication deliberately accepts missing required fields and
-    // cross-variant fields — the tools' runtime validation owns the union
-    // contract now — but it still rejects undeclared keys and mistyped values.
-    // Exception: herdr_launch's Task request is a single strict object, so its
-    // published root carries the real requireds (ADR-035).
-    const taskReq = (overrides: Record<string, unknown> = {}) => ({ objective: "o", scope: "s", doneWhen: ["d"], constraints: ["none"], ...overrides });
+  it("admits every variant-shaped call at the root while keeping strict keys and field types", () => {
+    const { surface } = realSurface();
+    const taskReq = (overrides: Record<string, unknown> = {}) => ({ task: { objective: "o", scope: "s", doneWhen: ["d"], constraints: ["none"], ...overrides }, idempotencyKey: "idem-1" });
     const cases: Array<[string, unknown, boolean]> = [
-      ["herdr_inspect", {}, true],
-      ["herdr_inspect", { mode: "context" }, true],
-      ["herdr_inspect", { mode: "health" }, true],
-      ["herdr_inspect", { mode: "target", target: "w:p2" }, true],
-      ["herdr_inspect", { mode: "collection", collection: "panes" }, true],
-      ["herdr_inspect", { mode: "collection", collection: "profiles" }, true],
-      ["herdr_inspect", { mode: "profile", profile: "worker-pi" }, true],
-      ["herdr_inspect", { mode: "context", collection: "panes" }, true],
-      ["herdr_inspect", { mode: "context", profile: "worker-pi" }, true],
-      ["herdr_inspect", { mode: "context", target: "w:p2" }, true],
-      ["herdr_inspect", { mode: "health", target: "w:p2" }, true],
-      ["herdr_inspect", { mode: "collection", collection: "panes", profile: "worker-pi" }, true],
-      ["herdr_inspect", { mode: "target" }, true],
-      ["herdr_inspect", { mode: "profile" }, true],
-      ["herdr_inspect", { mode: "bogus" }, false],
-      ["herdr_inspect", { collection: "panes" }, true],
-      ["herdr_inspect", { mode: "context", extra: true }, false],
-      ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi" }, true],
-      ["herdr_communicate", { target: "w:p2", operation: "prompt" }, true],
-      ["herdr_communicate", { target: "w:p2", operation: "cancel" }, true],
-      ["herdr_communicate", { target: "w:p2", operation: "interrupt" }, true],
-      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["escape"] }, true],
-      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["not-a-supported-key"] }, false],
-      ["herdr_communicate", { target: "w:p2", operation: "cancel", extra: true }, false],
-      ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi", keys: ["enter"] }, true],
-      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["enter"], text: "hi" }, true],
-      ["herdr_jobs", { operation: "list" }, true],
-      ["herdr_jobs", { operation: "list", jobId: "job_1" }, true],
-      ["herdr_jobs", { operation: "get", jobId: "job_1", status: "running" }, false],
-      ["herdr_pane", { operation: "focus", target: "w:p2" }, true],
-      ["herdr_pane", { operation: "focus", target: "w:p2", label: "worker" }, true],
-      ["herdr_pane", { operation: "split", direction: "left" }, true],
-      ["herdr_tab", { operation: "focus", target: "w:t" }, true],
-      ["herdr_tab", { operation: "focus", target: "w:t", label: "review" }, true],
-      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5 }, true],
-      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: true }, false],
-      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }, false],
-      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }, false],
-      // The flat Task (ADR-037): caller-authored objective/scope/doneWhen, no
-      // identity, routing, placement, or supervision authority.
+      // herdr_status: one optional named-event selector.
+      ["herdr_status", {}, true],
+      ["herdr_status", { eventId: "evt-1" }, true],
+      ["herdr_status", { eventId: 7 }, false],
+      ["herdr_status", { eventId: "bad\nid" }, false],
+      ["herdr_status", { extra: true }, false],
+      // herdr_run: the strict discriminated union — every action's required
+      // fields, strict keys, and the deleted tool names stay unknown fields.
+      ["herdr_run", { action: "observe", runId: "run-1" }, true],
+      ["herdr_run", { action: "observe" }, false],
+      ["herdr_run", { action: "observe", runId: "run-1", extra: true }, false],
+      ["herdr_run", { action: "reconcile", idempotencyKey: "idem-1" }, true],
+      ["herdr_run", { action: "reconcile" }, false],
+      ["herdr_run", { action: "transfer", runIds: ["run-1"], successorPaneId: "w:p2" }, true],
+      ["herdr_run", { action: "transfer", runIds: [] , successorPaneId: "w:p2" }, false],
+      ["herdr_run", { action: "transfer", runIds: ["run-1"] }, false],
+      ["herdr_run", { action: "claim", runIds: ["run-1"], incidentId: "inc-1" }, true],
+      ["herdr_run", { action: "claim", runIds: ["run-1"] }, false],
+      ["herdr_run", { action: "ack", eventId: "evt-1" }, true],
+      ["herdr_run", { action: "ack" }, false],
+      ["herdr_run", { action: "ack", eventId: "bad\nevt" }, false],
+      ["herdr_run", { action: "bogus" }, false],
+      ["herdr_run", { operation: "list" }, false],
+      ["herdr_run", { mode: "context" }, false],
+      // The Task request: caller-authored fields plus the required
+      // idempotency key — no identity, routing, placement, or supervision
+      // authority.
       ["herdr_launch", taskReq(), true],
       ["herdr_launch", taskReq({ tier: "strong", replicas: 2, label: "docs sprint", cwd: "/repo", recoveryOf: "run-1" }), true],
-      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"] }, true],
+      ["herdr_launch", { task: "nope", idempotencyKey: "k" }, false],
       ["herdr_launch", taskReq({ extra: true }), false],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"] }, idempotencyKey: "k", extra: true }, false],
+      // The idempotency key is required and bounded.
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"] } }, false],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"] }, idempotencyKey: "" }, false],
       // The required semantic fields fail at the schema when absent or empty.
-      ["herdr_launch", { objective: "o", scope: "s" }, false],
+      ["herdr_launch", { task: { objective: "o", scope: "s" }, idempotencyKey: "k" }, false],
       ["herdr_launch", taskReq({ objective: "" }), false],
       ["herdr_launch", taskReq({ scope: "" }), false],
       ["herdr_launch", taskReq({ doneWhen: [] }), false],
@@ -265,55 +250,32 @@ describe("MCP published schema parity", () => {
     }
   });
 
-  it("keeps the single Task contract at runtime: every contract-invalid call is INVALID_INPUT", async () => {
-    const surface = realSurface();
-    // Missing required fields, removed profile-era fields, strict-key
-    // violations, and bad value domains fail at the single Task boundary.
+  it("keeps the wire contract at runtime: every contract-invalid call is INVALID_INPUT", async () => {
+    const { surface } = realSurface();
+    // Missing required fields, removed fields, strict-key violations, and bad
+    // value domains fail at the request boundary before the daemon is touched.
     const rejected: Array<[string, unknown]> = [
-      ["herdr_inspect", { mode: "context", collection: "panes" }],
-      ["herdr_inspect", { mode: "context", profile: "worker-pi" }],
-      ["herdr_inspect", { mode: "context", target: "w:p2" }],
-      ["herdr_inspect", { mode: "health", target: "w:p2" }],
-      ["herdr_inspect", { mode: "collection", collection: "panes", profile: "worker-pi" }],
-      ["herdr_inspect", { mode: "target" }],
-      ["herdr_inspect", { mode: "profile" }],
-      ["herdr_inspect", { mode: "bogus" }],
-      ["herdr_inspect", { collection: "panes" }],
-      ["herdr_inspect", { mode: "context", extra: true }],
-      ["herdr_communicate", { target: "w:p2", operation: "prompt" }],
-      ["herdr_communicate", { target: "w:p2", operation: "keys" }],
-      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["not-a-supported-key"] }],
-      ["herdr_communicate", { target: "w:p2", operation: "cancel", text: "x" }],
-      ["herdr_communicate", { target: "w:p2", operation: "cancel", extra: true }],
-      ["herdr_communicate", { target: "w:p2", operation: "prompt", text: "hi", keys: ["enter"] }],
-      ["herdr_communicate", { target: "w:p2", operation: "keys", keys: ["enter"], text: "hi" }],
-      ["herdr_jobs", { operation: "list", jobId: "job_1" }],
-      ["herdr_jobs", { operation: "get", jobId: "job_1", status: "running" }],
-      ["herdr_pane", { operation: "focus", target: "w:p2", label: "worker" }],
-      ["herdr_pane", { operation: "split", direction: "left" }],
-      ["herdr_pane", { operation: "close" }],
-      ["herdr_tab", { operation: "focus", target: "w:t", label: "review" }],
-      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: true }],
-      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, runInBackground: false }],
-      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5, extra: true }],
-      ["herdr_launch", { name: "task" }],
-      ["herdr_launch", { objective: "o", scope: "s" }],
-      ["herdr_launch", { objective: "o", scope: "s", doneWhen: [] }],
-      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], replicas: 0 }],
-      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], tier: "bogus" }],
-      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], label: "a\nb" }],
-      // A valid Task is not a contract-invalid case; it belongs to the cutover
-      // execution tests, not this schema-error table.
-      // The deleted request shapes are rejected outright: specs, digests,
-      // profile, overrides, and request-level assignment are unknown fields.
+      ["herdr_status", { eventId: 7 }],
+      ["herdr_status", { mode: "context" }],
+      ["herdr_run", { action: "observe" }],
+      ["herdr_run", { action: "observe", runId: "run-1", extra: true }],
+      ["herdr_run", { action: "reconcile" }],
+      ["herdr_run", { action: "transfer", runIds: ["r"], successorPaneId: "p", extra: 1 }],
+      ["herdr_run", { action: "claim", runIds: ["r"] }],
+      ["herdr_run", { action: "ack" }],
+      ["herdr_run", { action: "bogus" }],
+      ["herdr_run", { target: "w:p2", operation: "prompt" }],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"] } }],
+      ["herdr_launch", { task: { objective: "o", scope: "s" }, idempotencyKey: "k" }],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: [] }, idempotencyKey: "k" }],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"], replicas: 0 }, idempotencyKey: "k" }],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"], tier: "bogus" }, idempotencyKey: "k" }],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"], label: "a\nb" }, idempotencyKey: "k" }],
       ["herdr_launch", { name: "task", specs: [{ label: "worker", instructions: "i", assignment: { objective: "o", scope: "s", verification: "v" } }], supervisionDigest: { doneWhen: ["d"], constraints: ["none"] } }],
-      ["herdr_launch", { name: "worker", profile: "worker-pi", assignment: { objective: "o", scope: "s", verification: "v" }, supervisionDigest: { doneWhen: ["o done"], constraints: ["none"] } }],
-      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], profile: "worker-pi" }],
-      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], overrides: { model: "m" } }],
-      ["herdr_launch", { objective: "o", scope: "s", doneWhen: ["d"], initialPrompt: "o" }]
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"], profile: "worker-pi" }, idempotencyKey: "k" }],
     ];
     for (const [name, args] of rejected) {
-      const outcome = await callTool({ surface, name, args, host, callId: "c", queue: new SequentialToolQueue() });
+      const outcome = await callTool({ surface, name, args, host, callId: "c" });
       const label = `${name} ${JSON.stringify(args)}`;
       expect(outcome.isError, label).toBe(true);
       expect(payload(outcome).code, label).toBe("INVALID_INPUT");
@@ -323,21 +285,20 @@ describe("MCP published schema parity", () => {
 
 describe("MCP argument validation", () => {
   it("accepts the no-argument form and returns bounded structured schema diagnostics", async () => {
-    const surface = realSurface();
-    const definitions = { definitions: [...surface.definitions] };
-    const absent = await callTool({ surface: definitions, name: "herdr_inspect", args: undefined, host, callId: "c", queue: new SequentialToolQueue() });
-    const nulled = await callTool({ surface: definitions, name: "herdr_inspect", args: null, host, callId: "c", queue: new SequentialToolQueue() });
+    const { surface } = realSurface();
+    const absent = await callTool({ surface, name: "herdr_status", args: undefined, host, callId: "c" });
+    const nulled = await callTool({ surface, name: "herdr_status", args: null, host, callId: "c" });
     expect(absent.isError).toBeUndefined();
     expect(nulled.isError).toBeUndefined();
-    expect(absent.content[0]!.text).toContain("inspect");
+    expect(absent.content[0]!.text).toContain("status");
 
-    const invalid = await callTool({ surface: definitions, name: "herdr_inspect", args: { mode: "health", extra: true }, host, callId: "c", queue: new SequentialToolQueue() });
+    const invalid = await callTool({ surface, name: "herdr_status", args: { eventId: "e", extra: true }, host, callId: "c" });
     expect(invalid.isError).toBe(true);
     const body = payload(invalid);
     expect(body.message).toContain(TOOL_DIAGNOSTIC_MARKER);
     expect(body.details).toMatchObject({
-      tool: "herdr_inspect",
-      schema: "herdr_inspect",
+      tool: "herdr_status",
+      schema: "herdr_status",
       code: "INVALID_INPUT",
       phase: "validate",
       errors: expect.arrayContaining([{ path: "/extra", expected: "property not allowed", received: "boolean" }]) as unknown[],
@@ -345,16 +306,15 @@ describe("MCP argument validation", () => {
       recoveryGuidance: TOOL_DIAGNOSTIC_RECOVERY,
     });
 
-    const invalidTab = await callTool({ surface: definitions, name: "herdr_tab", args: { operation: "create" }, host, callId: "tab", queue: new SequentialToolQueue() });
-    const tabBody = payload(invalidTab);
-    expect(invalidTab.isError).toBe(true);
-    expect(tabBody.message).toContain(TOOL_DIAGNOSTIC_MARKER);
-    expect(tabBody.details).toMatchObject({
-      tool: "herdr_tab",
-      schema: "herdr_tab",
+    const invalidRun = await callTool({ surface, name: "herdr_run", args: { action: "ack" }, host, callId: "run" });
+    const runBody = payload(invalidRun);
+    expect(invalidRun.isError).toBe(true);
+    expect(runBody.message).toContain(TOOL_DIAGNOSTIC_MARKER);
+    expect(runBody.details).toMatchObject({
+      tool: "herdr_run",
+      schema: "herdr_run",
       code: "INVALID_INPUT",
       phase: "validate",
-      errors: expect.arrayContaining([{ path: "/label", expected: "required property", received: "missing" }]) as unknown[],
       effectCertainty: "absent",
       recoveryGuidance: TOOL_DIAGNOSTIC_RECOVERY,
     });
@@ -364,56 +324,58 @@ describe("MCP argument validation", () => {
    * Schema bounds and size bounds are deliberately separate authorities. A
    * per-field `maxLength` in the public schema would fail an oversized field as
    * `INVALID_INPUT` during MCP validation, so Task text stays unbounded there.
-   * An oversized Task is instead refused deterministically by the supervision
-   * assignment-budget preflight (`ASSIGNMENT_OVER_BUDGET`), which runs before
-   * the rendered-payload `MESSAGE_TOO_LARGE` check.
+   * An oversized Task is instead refused deterministically by the daemon's
+   * supervision assignment-budget preflight (`ASSIGNMENT_OVER_BUDGET`), which
+   * runs before the rendered-payload `MESSAGE_TOO_LARGE` check — this layer
+   * only proves the schema admits the oversized text and forwards it.
    */
-  it("splits schema label bounds from assignment preflight bounds", async () => {
-    const definition = realSurface().definitions.find((candidate) => candidate.name === "herdr_launch")!;
-    const multiLineLabel = { objective: "o", scope: "s", doneWhen: ["d"], label: "a\nb" };
+  it("splits schema label bounds from the daemon's assignment-budget refusal", async () => {
+    const { surface, calls } = realSurface();
+    const definition = surface.definitions.find((candidate) => candidate.name === "herdr_launch")!;
+    const multiLineLabel = { task: { objective: "o", scope: "s", doneWhen: ["d"], label: "a\nb" }, idempotencyKey: "k" };
     expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, multiLineLabel)).toBe(false);
     expect(Value.Check(definition.parameters, multiLineLabel)).toBe(false);
-    const labelOutcome = await callTool({ surface: realSurface(), name: "herdr_launch", args: multiLineLabel, host, callId: "c", queue: new SequentialToolQueue() });
+    const labelOutcome = await callTool({ surface, name: "herdr_launch", args: multiLineLabel, host, callId: "c" });
     expect(labelOutcome.isError).toBe(true);
     expect(payload(labelOutcome).code).toBe("INVALID_INPUT");
+    expect(calls).toEqual([]);
 
     const oversizedTask = {
-      objective: "x".repeat(1024 * 1024 + 1),
-      scope: "s",
-      doneWhen: ["The oversized task body is rejected."]
+      task: { objective: "x".repeat(1024 * 1024 + 1), scope: "s", doneWhen: ["The oversized task body is rejected."] },
+      idempotencyKey: "k"
     };
     // Task text remains intentionally unbounded at the schema layer; the
-    // assignment-budget preflight owns this rejection ahead of the
-    // rendered-payload size limit.
+    // daemon-side assignment-budget preflight owns this rejection.
     expect(Value.Check(publishedInputSchema(definition.parameters) as unknown as TSchema, oversizedTask)).toBe(true);
     expect(Value.Check(definition.parameters, oversizedTask)).toBe(true);
-    const outcome = await callTool({ surface: realSurface(), name: "herdr_launch", args: oversizedTask, host, callId: "c", queue: new SequentialToolQueue() });
-    expect(outcome.isError).toBe(true);
-    expect(payload(outcome).code).toBe("ASSIGNMENT_OVER_BUDGET");
+    const outcome = await callTool({ surface, name: "herdr_launch", args: oversizedTask, host, callId: "c" });
+    expect(outcome.isError).toBeUndefined();
+    expect(calls).toEqual([{ method: "launch", params: oversizedTask }]);
   });
 
-  it("rejects invalid arguments for every tool before mutation", async () => {
-    const surface = realSurface();
+  it("rejects invalid arguments for every tool before the daemon is touched", async () => {
+    const { surface, calls } = realSurface();
     const rejected: Array<[string, unknown]> = [
-      ["herdr_communicate", { target: "w:p2", operation: "prompt" }],
-      ["herdr_wait", { targets: [], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1 }],
-      ["herdr_jobs", { operation: "get" }],
-      ["herdr_launch", { name: "worker", specs: [{ label: "worker" }], objective: "o", scope: "s", doneWhen: ["d"] }],
-      ["herdr_pane", { operation: "split" }],
-      ["herdr_tab", { operation: "create" }]
+      ["herdr_status", { eventId: 3 }],
+      ["herdr_run", { action: "observe" }],
+      ["herdr_run", { action: "ack" }],
+      ["herdr_run", { operation: "list" }],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"] } }],
+      ["herdr_launch", { name: "worker", specs: [{ label: "worker" }], idempotencyKey: "k" }],
     ];
     for (const [name, args] of rejected) {
-      const outcome = await callTool({ surface, name, args, host, callId: "c", queue: new SequentialToolQueue() });
+      const outcome = await callTool({ surface, name, args, host, callId: "c" });
       expect(outcome.isError).toBe(true);
       expect(payload(outcome).code).toBe("INVALID_INPUT");
     }
-    const accepted = await callTool({ surface, name: "herdr_jobs", args: { operation: "list" }, host, callId: "c", queue: new SequentialToolQueue() });
+    expect(calls).toEqual([]);
+    const accepted = await callTool({ surface, name: "herdr_status", args: {}, host, callId: "c" });
     expect(accepted.isError).toBeUndefined();
   });
 
   it("raises MethodNotFound for an unknown tool name", async () => {
-    const surface = realSurface();
-    const failure = await callTool({ surface, name: "herdr_admin\nnope", args: {}, host, callId: "c", queue: new SequentialToolQueue() }).catch((error: unknown) => error);
+    const { surface } = realSurface();
+    const failure = await callTool({ surface, name: "herdr_admin\nnope", args: {}, host, callId: "c" }).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(McpError);
     expect(failure).toMatchObject({ code: ErrorCode.MethodNotFound });
     expect((failure as McpError).message).toContain("herdr_admin nope");
@@ -457,12 +419,14 @@ describe("MCP result mapping", () => {
     expect(projection.content).toHaveLength(2);
   });
 
-  it("publishes herdr_jobs evidence exactly once", async () => {
-    const surface = realSurface();
-    const outcome = await callTool({ surface, name: "herdr_jobs", args: { operation: "list" }, host, callId: "c", queue: new SequentialToolQueue() });
+  it("publishes daemon reply evidence exactly once", async () => {
+    // The three tools already publish the daemon's reply as their sole JSON
+    // block, so the adapter appends no second copy.
+    const { surface } = realSurface({ status: { kind: "status", daemon: { status: "running" }, unread: { count: 0, ids: [] } } });
+    const outcome = await callTool({ surface, name: "herdr_status", args: {}, host, callId: "c" });
     expect(outcome.content).toHaveLength(1);
     expect(outcome.content[0]!.text).not.toContain(HERDR_DETAILS_LABEL);
-    expect(JSON.parse(outcome.content[0]!.text)).toMatchObject({ operation: "jobs", view: "list" });
+    expect(JSON.parse(outcome.content[0]!.text)).toMatchObject({ kind: "status", daemon: { status: "running" } });
   });
 
   it("bounds oversized details to a parseable truncation envelope inside the response bound", async () => {
@@ -590,7 +554,7 @@ describe("MCP error mapping", () => {
   });
 
   it("preserves the structured launch diagnostic in model-visible error content", async () => {
-    const diagnostic = { code: "LAUNCH_FAILED", phase: "ready", created: { paneId: "w:p2" }, agentStarted: true, promptSubmitted: false, recipientRegistered: false, effectCertainty: "unknown", recoveryGuidance: "Inspect with herdr_inspect before retrying." };
+    const diagnostic = { code: "LAUNCH_FAILED", phase: "ready", created: { paneId: "w:p2" }, agentStarted: true, promptSubmitted: false, recipientRegistered: false, effectCertainty: "unknown", recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry };
     const message = `Launch did not complete: readiness failed\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`;
     const outcome = await call(stub({ execute: async () => { throw Object.assign(new Error(message), { code: "LAUNCH_FAILED", details: { effectCertainty: "unknown" } }); } }));
     const body = payload(outcome);
@@ -635,6 +599,38 @@ describe("MCP error mapping", () => {
     expect(text).toContain('"created":{"tabId":"w:t2","paneId":"w:p2","agentId":"agent-2"}');
     expect(text).toContain('"effectCertainty":"partial"');
     expect(text).toContain(LAUNCH_RECOVERY_GUIDANCE.inspectBeforeRetry);
+  });
+
+  it("projects a daemon-wire launch failure's certainty and surviving resources from typed details", () => {
+    // The daemon's wire refusal carries only a bounded code — the typed client
+    // (N3.1) projects `effectCertainty` and the surviving-resource handles
+    // into `details`. Those fields publish here whether or not a diagnostic
+    // exists, so a caller never sees a bare failure and relaunches into live
+    // children.
+    const outcome = errorOutcome(
+      "LAUNCH_FAILED",
+      "daemon launch call was refused",
+      { effectCertainty: "unknown", paneId: "w:p9", tabId: "w:t9", supervisorJobId: "job_9", causeMessage: "wire-secret", diagnostic: { garbage: "attached-secret" } },
+      "herdr_launch"
+    );
+    expect(payload(outcome).details).toEqual({
+      tool: "herdr_launch",
+      paneId: "w:p9",
+      tabId: "w:t9",
+      supervisorJobId: "job_9",
+      effectCertainty: "unknown"
+    });
+    const text = outcome.content[0]!.text;
+    expect(text).not.toContain("wire-secret");
+    expect(text).not.toContain("attached-secret");
+  });
+
+  it("keeps the launcher effect certainty visible when no diagnostic record exists", () => {
+    // The fail-closed wire path: a refusal that cannot prove the launch had no
+    // effect must still surface `unknown` — never a bare failure that reads
+    // like a safe retry.
+    const outcome = errorOutcome("LAUNCH_FAILED", "daemon launch call was refused", { effectCertainty: "unknown" }, "herdr_launch");
+    expect(payload(outcome).details).toEqual({ tool: "herdr_launch", effectCertainty: "unknown" });
   });
 
   it("publishes the complete assignment-unconfirmed diagnostic without attached launch evidence", () => {
@@ -834,7 +830,7 @@ describe("MCP error mapping", () => {
       expect(signal).toBe(controller.signal);
       return { content: [{ type: "text" as const, text: "ok" }], details: undefined };
     });
-    await callTool({ surface: stub({ execute }), name: "herdr_inspect", args: {}, host: { cwd: "/project", signal: controller.signal }, callId: "c", queue: new SequentialToolQueue() });
+    await callTool({ surface: stub({ execute }), name: "herdr_status", args: {}, host: { cwd: "/project", signal: controller.signal }, callId: "c" });
     expect(execute).toHaveBeenCalledTimes(1);
   });
 });
@@ -866,77 +862,7 @@ function leakyPane(paneId: string, label: string, status = "idle", withIdentity 
   };
 }
 
-function leakySurface() {
-  const panes = [leakyPane("w:p", "caller", "idle", true), leakyPane("w:p2", "worker", "idle", true)];
-  const live = {
-    type: "session_snapshot",
-    snapshot: {
-      version: "1",
-      protocol: 1,
-      workspaces: [{ workspace_id: "w", label: "w" }],
-      tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
-      panes,
-      agents: [{ pane_id: "w:p", name: "caller", agent: "pi", terminal_id: "term-w:p", agent_session: { source: "pi", agent: "pi", kind: "id", value: "w:p-session" }, agent_status: "idle" }, { pane_id: "w:p2", name: "worker", agent: "pi", terminal_id: "term-w:p2", agent_session: { source: "pi", agent: "pi", kind: "id", value: "w:p2-session" }, agent_status: "idle" }]
-    }
-  };
-  const envelope = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
-  const exec: PiExec = async (_command, argv) => {
-    if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: live.snapshot.panes[0] });
-    if (argv[0] === "api") return envelope("snapshot", live);
-    if (argv[0] === "agent" && argv[1] === "wait") return envelope("agent-wait", { agent: panes.find((pane) => pane.pane_id === argv[2]) ?? leakyPane(argv[2]!, "created") });
-    if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: panes.find((pane) => pane.pane_id === argv[2]) ?? leakyPane(argv[2]!, "created") });
-    if (argv[0] === "pane" && argv[1] === "get") return envelope("pane", { pane: panes.find((pane) => pane.pane_id === argv[2]) ?? leakyPane(argv[2]!, "created") });
-    if (argv[0] === "pane" && argv[1] === "read") return { stdout: "worker output", stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "split") return envelope("split", { pane: leakyPane("w:p3", "created") });
-    return envelope("other", { ok: true });
-  };
-  const cli = new HerdrCli(exec);
-  return createToolSurface({
-    cli,
-    context: { workspaceId: "w", tabId: "w:t", paneId: "w:p" },
-    environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
-    preflight: createPreflight(cli),
-    settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "testmodel", reviewerThinking: "low" }),
-    jobs: new JobRegistry(),
-    profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
-    ownership: new RuntimeOwnership(),
-    supervision: stubSupervision(),
-    cwd: "/project"
-  });
-}
-
 describe("MCP model-boundary redaction", () => {
-  it("strips environment values from inspect, wait, and pane evidence while keeping typed fields", async () => {
-    const surface = leakySurface();
-    const queue = new SequentialToolQueue();
-    const calls: Array<[string, unknown]> = [
-      ["herdr_inspect", { mode: "target", target: "w:p2" }],
-      ["herdr_wait", { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 1_000 }],
-      ["herdr_pane", { operation: "split", target: "w:p2", label: "worker-split", direction: "right", focus: false }]
-    ];
-    for (const [name, args] of calls) {
-      const outcome = await callTool({ surface, name, args, host, callId: "c", queue });
-      expect(outcome.isError, name).toBeUndefined();
-      let text = outcome.content.map((block) => block.text).join("\n");
-      for (const sentinel of SENTINELS) expect(text, `${name} ${sentinel}`).not.toContain(sentinel);
-      // The environment keys themselves are gone, not just their values.
-      expect(text, name).not.toContain("environment_overrides");
-      if (name === "herdr_wait") {
-        const jobId = (detailsOf(outcome) as { jobId: string }).jobId;
-        let job: McpCallOutcome | undefined;
-        await vi.waitFor(async () => {
-          job = await callTool({ surface, name: "herdr_jobs", args: { operation: "get", jobId }, host, callId: "job", queue });
-          expect(job!.content.map((block) => block.text).join("\n")).toContain("agent_status");
-        });
-        text = job!.content.map((block) => block.text).join("\n");
-      }
-      // The typed evidence a manager needs survives the redaction.
-      expect(text, name).toContain("agent_status");
-      expect(text, name).toMatch(/w:p[23]/);
-    }
-  });
-
   it("strips environment values from a raw record nested in an arbitrary details projection", async () => {
     const outcome = await call(stub({
       execute: async () => ({
@@ -972,147 +898,5 @@ describe("MCP turn-control redaction", () => {
     expect(text).not.toContain("turn-secret");
     expect(text).not.toContain("nested-turn-secret");
     expect(text).toContain("agent_status");
-  });
-});
-
-describe("MCP sequential execution", () => {
-  it("keeps cancel and interrupt in the shared FIFO communication lane", async () => {
-    const order: string[] = [];
-    const waiting: Array<() => void> = [];
-    const surface: { definitions: HerdrToolDefinition[] } = { definitions: [{
-      name: "herdr_communicate",
-      label: "Herdr Communicate",
-      description: "turn control",
-      executionMode: "sequential",
-      parameters: CommunicateParamsSchema,
-      async execute(_id, args) {
-        order.push((args as { operation: string }).operation);
-        await new Promise<void>((resolve) => waiting.push(resolve));
-        return { content: [{ type: "text" as const, text: "done" }], details: { operation: (args as { operation: string }).operation } };
-      }
-    }] };
-    const queue = new SequentialToolQueue();
-    const first = callTool({ surface, name: "herdr_communicate", args: { target: "p1", operation: "cancel" }, host, callId: "cancel", queue });
-    await vi.waitFor(() => expect(order).toEqual(["cancel"]));
-    const second = callTool({ surface, name: "herdr_communicate", args: { target: "p1", operation: "interrupt" }, host, callId: "interrupt", queue });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(order).toEqual(["cancel"]);
-    waiting.shift()?.();
-    await vi.waitFor(() => expect(order).toEqual(["cancel", "interrupt"]));
-    waiting.shift()?.();
-    const firstOutcome = await first;
-    const secondOutcome = await second;
-    expect(firstOutcome.isError).toBeUndefined();
-    expect(secondOutcome.isError).toBeUndefined();
-  });
-  function overlapping(name: string, executionMode?: "sequential"): { definitions: HerdrToolDefinition[]; active: () => number; started: () => number; peak: () => number; release: () => void } {
-    let active = 0;
-    let started = 0;
-    let peak = 0;
-    const waiting: Array<() => void> = [];
-    return {
-      active: () => active,
-      started: () => started,
-      peak: () => peak,
-      release: () => { for (const resume of waiting.splice(0)) resume(); },
-      definitions: [{
-        name,
-        label: name,
-        description: "stub",
-        parameters: Type.Object({}, { additionalProperties: false }),
-        ...(executionMode ? { executionMode } : {}),
-        async execute() {
-          active += 1;
-          started += 1;
-          peak = Math.max(peak, active);
-          await new Promise<void>((resume) => waiting.push(resume));
-          active -= 1;
-          return { content: [{ type: "text" as const, text: "done" }], details: undefined };
-        }
-      }]
-    };
-  }
-
-  it("never runs two sequential calls concurrently and keeps other tools concurrent", async () => {
-    const sequential = overlapping("herdr_pane", "sequential");
-    const queue = new SequentialToolQueue();
-    const both = [
-      callTool({ surface: sequential, name: "herdr_pane", args: {}, host, callId: "first", queue }),
-      callTool({ surface: sequential, name: "herdr_pane", args: {}, host, callId: "second", queue })
-    ];
-    await vi.waitFor(() => expect(sequential.started()).toBe(1));
-    // The second call is queued behind the first, so it cannot have started.
-    expect(sequential.peak()).toBe(1);
-    sequential.release();
-    await vi.waitFor(() => expect(sequential.started()).toBe(2));
-    sequential.release();
-    expect((await Promise.all(both)).every((outcome) => outcome.isError === undefined)).toBe(true);
-    expect(sequential.peak()).toBe(1);
-
-    const parallel = overlapping("herdr_inspect");
-    const concurrent = [
-      callTool({ surface: parallel, name: "herdr_inspect", args: {}, host, callId: "first", queue }),
-      callTool({ surface: parallel, name: "herdr_inspect", args: {}, host, callId: "second", queue })
-    ];
-    await vi.waitFor(() => expect(parallel.peak()).toBe(2));
-    parallel.release();
-    await Promise.all(concurrent);
-  });
-
-  it("does not poison the queue when a sequential call fails or is invalid", async () => {
-    const order: string[] = [];
-    const definitions: HerdrToolDefinition[] = [{
-      name: "herdr_pane",
-      label: "Herdr Pane",
-      description: "stub",
-      executionMode: "sequential",
-      parameters: Type.Object({ fail: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
-      async execute(_id, args) {
-        order.push((args as { fail?: boolean }).fail ? "failed" : "ok");
-        if ((args as { fail?: boolean }).fail) throw Object.assign(new Error("CLI_PROTOCOL_ERROR: refused"), { code: "CLI_PROTOCOL_ERROR" });
-        return { content: [{ type: "text" as const, text: "done" }], details: undefined };
-      }
-    }];
-    const surface = { definitions };
-    const queue = new SequentialToolQueue();
-    const [failed, invalid, recovered] = await Promise.all([
-      callTool({ surface, name: "herdr_pane", args: { fail: true }, host, callId: "a", queue }),
-      callTool({ surface, name: "herdr_pane", args: { unknown: true }, host, callId: "b", queue }),
-      callTool({ surface, name: "herdr_pane", args: {}, host, callId: "c", queue })
-    ]);
-    expect(payload(failed!).code).toBe("CLI_PROTOCOL_ERROR");
-    expect(payload(invalid!).code).toBe("INVALID_INPUT");
-    expect(recovered!.isError).toBeUndefined();
-    expect(order).toEqual(["failed", "ok"]);
-  });
-
-  it("refuses queued calls that outlive the host instead of mutating during teardown", async () => {
-    const blocked = overlapping("herdr_pane", "sequential");
-    const queue = new SequentialToolQueue();
-    const holding = callTool({ surface: blocked, name: "herdr_pane", args: {}, host, callId: "holding", queue });
-    await vi.waitFor(() => expect(blocked.started()).toBe(1));
-    const waiting = callTool({ surface: blocked, name: "herdr_pane", args: {}, host, callId: "waiting", queue });
-    queue.close();
-    const afterClose = callTool({ surface: blocked, name: "herdr_pane", args: {}, host, callId: "after", queue });
-    blocked.release();
-    expect((await holding).isError).toBeUndefined();
-    expect(payload(await waiting)).toMatchObject({ code: "ABORTED", details: { tool: "herdr_pane", executionMode: "sequential", reason: "closed" } });
-    expect(payload(await afterClose)).toMatchObject({ code: "ABORTED", details: { reason: "closed" } });
-    // Only the call that had already started ever executed.
-    expect(blocked.peak()).toBe(1);
-  });
-
-  it("refuses a queued call whose request was cancelled before its turn", async () => {
-    const blocked = overlapping("herdr_pane", "sequential");
-    const queue = new SequentialToolQueue();
-    const holding = callTool({ surface: blocked, name: "herdr_pane", args: {}, host, callId: "holding", queue });
-    await vi.waitFor(() => expect(blocked.started()).toBe(1));
-    const controller = new AbortController();
-    const cancelled = callTool({ surface: blocked, name: "herdr_pane", args: {}, host: { cwd: "/project", signal: controller.signal }, callId: "cancelled", queue });
-    controller.abort();
-    blocked.release();
-    await holding;
-    expect(payload(await cancelled)).toMatchObject({ code: "ABORTED", details: { reason: "aborted" } });
-    expect(blocked.peak()).toBe(1);
   });
 });

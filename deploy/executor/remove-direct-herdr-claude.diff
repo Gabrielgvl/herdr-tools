@@ -1,0 +1,10 @@
+--- a/herdr-profiles/role-plugins/manager/mcp-servers.json
++++ b/herdr-profiles/role-plugins/manager/mcp-servers.json
+@@ -1,6 +1 @@
+-{
+-  "herdr": {
+-    "command": "/home/gabriel/.volta/tools/image/node/25.9.0/bin/node",
+-    "args": ["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"]
+-  }
+-}
++{}

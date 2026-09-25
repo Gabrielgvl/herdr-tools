@@ -1,37 +1,24 @@
-import { existsSync } from "node:fs";
+import { existsSync, promises as fsp } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { HerdrCli, type PiExec } from "../cli.js";
-import type { AgentPromptClient } from "../agent-prompt.js";
-import { createAgentPromptClient } from "../agent-prompt.js";
-import { JobRegistry } from "../job-registry.js";
-import { createDevinQueueFlush, type DevinQueueFlush } from "../messages/devin-queue-flush.js";
-import { createPaneWriteGuard, resolvePaneWriteNamespace } from "../pane-write-lock.js";
-import { RecipientRegistry } from "../messages/recipients.js";
-import { defaultAttachmentStore, type AttachmentStore } from "../messages/store.js";
-import { resetOwnership, RuntimeOwnership } from "../ownership.js";
-import { discoverProfiles } from "../profiles/discovery.js";
-import type { ProfileCatalog } from "../profiles/types.js";
-import { createPiModelReviewer } from "../reviewer.js";
-import { createCliTranscriptReader, SupervisionRegistry } from "../supervision/registry.js";
-import { createHandoffGate } from "../handoff-gate.js";
-import { createSelfCloseTracker } from "../supervision/self-close.js";
-import { CLAUDE_CHANNEL_CAPABILITY, createMcpHostWake } from "../supervision/notify.js";
-import { createBuiltinModelRegistry, createBuiltinModels, type BuiltinModelsSeam } from "../supervision/model-service.js";
-import { loadSettings, type Settings } from "../settings.js";
-import type { CurrentContext } from "../targets.js";
-import { createPreflight, createToolSurface, type HerdrToolSurface } from "../tool-surface.js";
+import type { PiExec } from "../cli.js";
+import { HerdrCli } from "../cli.js";
+import { resolveManagerSession } from "../context.js";
+import { connectDaemonClient, DaemonCallError, type DaemonCallerContext, type DaemonClient } from "../daemon/client.js";
+import { resolveDaemonNamespace, type DaemonNamespace } from "../daemon/namespace.js";
+import type { DelegatedCaller } from "../launch-schema.js";
+import { CLAUDE_CHANNEL_CAPABILITY } from "../supervision/notify.js";
+import { parseSnapshotResult, type CurrentContext } from "../targets.js";
+import { createToolSurface, type HerdrToolSurface } from "../tool-surface.js";
 import { callTool, describeTools } from "./adapter.js";
-import { createNodeExec, resolveStartup, StartupRefusal, type DirectoryStat } from "./host.js";
-import { SequentialToolQueue } from "./queue.js";
+import { createNodeExec, resolveStartup, safeDirectory, StartupRefusal, type DirectoryStat } from "./host.js";
 
 export const MCP_SERVER_NAME = "herdr-tools";
 export const MCP_SERVER_VERSION = "1.0.0";
-const BUNDLED_PROFILES_DIRECTORY = "herdr-profiles";
 const MAX_STDERR_LINE_CHARS = 500;
 
 export interface McpRunDependencies {
@@ -39,15 +26,11 @@ export interface McpRunDependencies {
   stat?: (path: string) => Promise<DirectoryStat>;
   cwd?: () => string;
   exec?: PiExec;
-  promptClient?: AgentPromptClient;
-  attachments?: AttachmentStore;
-  recipients?: RecipientRegistry;
   transport?: Transport;
-  profiles?: { load: () => Promise<ProfileCatalog> };
-  settingsLoader?: () => Promise<Settings>;
-  /** The builtin model catalogue both reviewers share; injectable so tests never touch the network or `auth.json`. */
-  models?: BuiltinModelsSeam;
-  fileExists?: (path: string) => boolean;
+  /** The daemon namespace resolver — injectable so tests never touch the endpoint filesystem. */
+  resolveNamespace?: (env: NodeJS.ProcessEnv) => Promise<DaemonNamespace>;
+  /** The daemon socket seam — injectable so tests never open a real socket. */
+  connectDaemon?: (namespace: DaemonNamespace, caller: DaemonCallerContext) => Promise<DaemonClient>;
   writeStderr?: (line: string) => void;
   exit?: (code: number) => void;
   onSignal?: (signal: "SIGINT" | "SIGTERM", handler: () => void) => void;
@@ -56,14 +39,8 @@ export interface McpRunDependencies {
 export interface HerdrMcpServer {
   readonly server: Server;
   readonly surface: HerdrToolSurface;
-  readonly jobs: JobRegistry;
-  readonly supervision: SupervisionRegistry;
-  readonly ownership: RuntimeOwnership;
-  readonly attachments: AttachmentStore;
-  readonly recipients: RecipientRegistry;
   readonly context: CurrentContext;
   readonly projectDir: string;
-  readonly queueFlush: DevinQueueFlush;
   shutdown(): Promise<void>;
 }
 
@@ -118,9 +95,22 @@ export function packageRoot(moduleUrl: string, exists: (path: string) => boolean
 /**
  * Start the stdio Herdr tools server for a manager session on any MCP host.
  *
- * Startup is fail-closed and ordered; a refusal writes one bounded stderr line
- * and exits non-zero with no tool registered, no transport connected, and no
- * Herdr CLI call made.
+ * The server is a stateless daemon proxy (durable-supervisor §10): startup
+ * gates on `resolveStartup`, the three tools each open a fresh daemon
+ * connection per `tools/call`, and the daemon verifies the claimed identity
+ * against its own fresh snapshot (D2a). The host holds no supervision, jobs,
+ * queue, or mailbox state of its own. Startup itself is side-effect free: no
+ * CLI read or socket connection runs before the transport connects.
+ *
+ * The D2a claim's `agentSession` is re-derived per call from the authoritative
+ * snapshot — the same read the daemon repeats to verify — so a pane whose
+ * session changed mid-session claims the live identity rather than a stale
+ * one.
+ *
+ * Under `HERDR_EXECUTOR_DELEGATED=1` (the executor-gateway serve) injected
+ * identity may be absent and each tool call supplies a `caller`
+ * `{paneId, projectRoot}`; the same per-call derivation then claims the
+ * asserted pane's snapshot identity, and the daemon verifies it identically.
  */
 export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<HerdrMcpServer | undefined> {
   const writeStderr = deps.writeStderr ?? ((line: string) => { process.stderr.write(line); });
@@ -135,91 +125,90 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     return undefined;
   }
 
-  const root = packageRoot(import.meta.url, deps.fileExists);
-  const promptClient = deps.promptClient ?? createAgentPromptClient({ env: deps.env ?? process.env });
-  const cli = new HerdrCli(deps.exec ?? createNodeExec({ cwd: startup.projectDir }), 10_000, 50_000, promptClient);
-  const attachments = deps.attachments ?? defaultAttachmentStore;
-  const recipients = deps.recipients ?? new RecipientRegistry();
-  const ownership = new RuntimeOwnership();
-  // The Channels research preview has no delivery acknowledgement, so the
-  // notifier is wired before the transport and every send stays best effort.
-  const channel = { current: undefined as ((notification: { method: string; params: { content: string; meta: Record<string, unknown> } }) => Promise<void>) | undefined };
-  // An in-flight wake queue-flush must not press Enter into a closed session.
-  const wakeShutdown = new AbortController();
-  // One coordinator per host: wake delivery, communicate, and launch all share
-  // its per-pane cycles and the cross-process write lock it wraps them in.
-  const queueFlush = createDevinQueueFlush({ cli, guard: createPaneWriteGuard({ namespace: resolvePaneWriteNamespace.bind(null, deps.env ?? process.env) }) });
-  queueFlush.begin();
-  const hostWake = createMcpHostWake({ cli, context: startup.context, notifyChannel: (notification) => {
-    // The sender exists only once the server below is built; a wake delivered
-    // in that window resolving to `undefined` would read as a successful write,
-    // so the missing sender throws and the pipeline's bounded retry covers it.
-    // c8 ignore next -- construction is synchronous; keep the guard if notification setup ever becomes re-entrant.
-    if (channel.current === undefined) throw new Error("claude channel sender is not installed");
-    return channel.current(notification);
-  }, signal: wakeShutdown.signal, queueFlush });
-  const jobs = new JobRegistry({ onTerminal: (detail) => hostWake.notifyJobTerminal(detail) });
-  // One ledger per host: the pane tool marks the closes this process proved,
-  // and every supervisor this registry creates consults it before waking a
-  // pane_closed. Both directions stay in this process; nothing persists.
-  const selfClose = createSelfCloseTracker();
-  const handoffs = createHandoffGate();
-  // The MCP host has no Pi model registry, and `hostContext` deliberately still
-  // throws for `context.modelRegistry`. The wait reviewer instead resolves
-  // through one host-independent catalogue whose credentials live in the Pi
-  // agent's auth.json — the same login the Pi host uses.
-  const models = deps.models ?? createBuiltinModels();
-  const waitModels = createBuiltinModelRegistry(models);
-  const supervision = new SupervisionRegistry({
-    jobs,
-    settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
-    readTranscript: createCliTranscriptReader(cli),
-    notifier: hostWake.notifier,
-    monitorOptions: { ...(deps.env ? { env: deps.env } : {}) },
-    selfClose,
-    handoffs,
-    repairPrompt: (paneId, text, signal) => cli.prompt(paneId, text, signal),
-  });
-  const surface = createToolSurface({
-    cli,
-    context: startup.context,
-    environment: startup.environment,
-    preflight: createPreflight(cli),
-    settingsLoader: deps.settingsLoader ?? (() => loadSettings()),
-    jobs,
-    profiles: deps.profiles ?? { load: () => discoverProfiles({ bundledDir: join(root, BUNDLED_PROFILES_DIRECTORY), bundledScopeRoot: root, projectCwd: startup.projectDir }) },
-    ownership,
-    cwd: startup.projectDir,
-    attachments,
-    recipients,
-    supervision,
-    selfClose,
-    queueFlush,
-    handoffs,
-    // The same `PiModelReviewer` construction the Pi host reaches through
-    // `context.modelRegistry`, backed here by the shared builtin catalogue so
-    // the wait reviewer never reads the throwing host field.
-    reviewerFactory: (settings) => createPiModelReviewer({ modelRegistry: waitModels }, settings.reviewerModel),
-  });
+  const env = deps.env ?? process.env;
+  const cli = new HerdrCli(deps.exec ?? createNodeExec({ cwd: startup.projectDir }));
+  const delegated = env.HERDR_EXECUTOR_DELEGATED === "1";
+  const stat = deps.stat ?? ((path: string) => fsp.stat(path));
+
+  /**
+   * The delegated caller's project root, canonicalized exactly like the
+   * startup anchor: realpath, then the same single-line/non-root/directory
+   * gates. Anything else is a typed refusal, never a re-anchor on cwd.
+   */
+  const canonicalCallerRoot = async (raw: string): Promise<string> => {
+    try {
+      const resolved = await fsp.realpath(raw);
+      const canonical = dirname(resolved) !== resolved ? safeDirectory(resolved) : undefined;
+      if (canonical === undefined || !(await stat(canonical)).isDirectory()) throw new Error("not a usable directory");
+      return canonical;
+    } catch {
+      throw new DaemonCallError("DELEGATED_CALLER_INVALID", "caller.projectRoot must resolve to an existing directory below the filesystem root");
+    }
+  };
+
+  const connect = async (signal: AbortSignal | undefined, callerArg?: DelegatedCaller): Promise<DaemonClient> => {
+    const requestSignal = signal ?? new AbortController().signal;
+    // The policy gates precede any socket or CLI traffic, so a refused call
+    // leaves no trace on either boundary.
+    if (callerArg !== undefined && !delegated) {
+      throw new DaemonCallError("DELEGATED_CALLER_DISABLED", "the caller argument is only served when this server runs with HERDR_EXECUTOR_DELEGATED=1");
+    }
+    if (callerArg === undefined && delegated && !(startup.environment.currentIdsPresent && startup.environment.currentIdsValid)) {
+      throw new DaemonCallError("DELEGATED_CALLER_REQUIRED", "delegated serves require the caller {paneId, projectRoot} argument when no injected Herdr identity is present");
+    }
+    const envelope = await cli.runJson(["api", "snapshot"], requestSignal);
+    const snapshot = parseSnapshotResult(envelope.result);
+    const paneId = callerArg?.paneId ?? startup.context.paneId!;
+    const session = resolveManagerSession(snapshot, paneId);
+    const namespace = await (deps.resolveNamespace ?? resolveDaemonNamespace)(env);
+    let caller: DaemonCallerContext;
+    if (callerArg === undefined) {
+      caller = {
+        identity: {
+          workspaceId: startup.context.workspaceId!,
+          tabId: startup.context.tabId!,
+          paneId,
+          agentSession: session,
+        },
+        projectRoot: startup.projectDir,
+      };
+    } else {
+      // Delegated caller-asserted identity: cooperative under the same-UID
+      // stance — any process that can reach this connection can claim any
+      // pane — and strictly weaker custody than env injection, which the
+      // harness controls per-spawn. The client derives the claim from the
+      // authoritative snapshot; the daemon's D2a verification stays the
+      // authority and is unchanged. resolveManagerSession proved exactly one
+      // pane record, so the lookup cannot fail.
+      const pane = snapshot.panes.find((entry) => entry.pane_id === paneId)!;
+      caller = {
+        identity: {
+          workspaceId: pane.workspace_id,
+          tabId: pane.tab_id,
+          paneId,
+          agentSession: session,
+        },
+        projectRoot: await canonicalCallerRoot(callerArg.projectRoot),
+      };
+    }
+    return (deps.connectDaemon ?? connectDaemonClient)(namespace, caller);
+  };
+
+  const surface = createToolSurface({ connectDaemon: connect, cwd: startup.projectDir });
 
   let descriptors;
   try {
     descriptors = describeTools(surface);
   } catch (error) {
-    // The tracker was already constructed; refuse with its timers retired.
-    selfClose.clear();
     writeStderr(refusalLine(error));
     exit(1);
     return undefined;
   }
 
-  // The documented Claude Code Channels research-preview capability, advertised
-  // alongside tools by the same server that serves them.
+  // The documented Claude Code Channels research-preview capability is still
+  // advertised alongside tools by the same server that serves them (N5.2 owns
+  // its removal); the daemon now owns every wake path, so nothing here sends.
   const server = new Server({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }, { capabilities: { tools: {}, experimental: { [CLAUDE_CHANNEL_CAPABILITY]: {} } } });
-  channel.current = (notification) => server.notification(notification);
-  // One queue per server, so the sequential tools are serialized across every
-  // concurrent `tools/call` this session issues.
-  const queue = new SequentialToolQueue();
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: descriptors }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const outcome = await callTool({
@@ -228,7 +217,6 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
       args: request.params.arguments,
       host: { cwd: startup.projectDir, signal: extra.signal },
       callId: String(extra.requestId),
-      queue
     });
     return {
       content: outcome.content.map((block) => ({ type: block.type, text: block.text })),
@@ -240,21 +228,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
   const shutdown = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
-    // Wake delivery dies first, so a pending suppression decision resolving to
-    // "wake" during teardown can never produce a post-shutdown send.
-    wakeShutdown.abort();
-    // The flush coordinator aborts before transports close: already-dispatched
-    // PTY bytes cannot be recalled, but no new operation is dispatched after.
-    await queueFlush.shutdown();
-    selfClose.clear();
-    // Closed before the registry and the transport, so a call still waiting for
-    // its turn is refused instead of mutating during teardown.
-    queue.close();
     cli.closePromptTransport();
-    await supervision.shutdown();
-    jobs.shutdown();
-    recipients.reset();
-    resetOwnership(ownership);
     await server.close();
     exit(0);
   };
@@ -271,5 +245,5 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     process.stdin.once("close", onClientDisconnect);
   }
   await server.connect(transport);
-  return { server, surface, jobs, supervision, ownership, attachments, recipients, context: startup.context, projectDir: startup.projectDir, queueFlush, shutdown };
+  return { server, surface, context: startup.context, projectDir: startup.projectDir, shutdown };
 }

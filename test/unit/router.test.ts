@@ -27,7 +27,7 @@ function runner(kind: RunnerKind, models: string[]): RunnerEntry {
     quota: { provider: `${kind}-provider`, billingProduct: kind, account: "primary", scope: "account" },
     defaults,
     plumbing,
-    pools: { tools: kind === "pi" ? ["read", "bash", "write", "extra"] : kind === "claude" ? ["Read", "Bash", "Write", "Extra"] : [], extensions: [], skills: [], plugins: [], mcp: [] },
+    pools: { tools: kind === "pi" ? ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume", "extra"] : kind === "claude" ? ["Read", "Bash", "Write", "Extra"] : [], extensions: [], skills: [], plugins: [], mcp: [] },
   };
 }
 
@@ -137,7 +137,7 @@ describe("tier-chain routing", () => {
       selectedPoint: { id: "pi:s:low", index: 0 },
       evidence: { policyRevision: POLICY_REVISION, intent: { value: "implement" } },
     });
-    expect(seen).toEqual([{ tools: ["read", "bash", "write"] }]);
+    expect(seen).toEqual([{ tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] }]);
   });
 
   it("accepts low tier confidence, keeps the top low-confidence intent, and validates optional distributions", async () => {
@@ -230,13 +230,14 @@ describe("tier-chain routing", () => {
     await expect(routeTask(input({ compile: async () => { throw new Error("bad"); } }))).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "configuration" });
   });
 
-  it("uses only read/bash/write on selectable runners and no selected resources elsewhere", () => {
-    expect(runnerResourceSelection(response(), "pi")).toEqual({ tools: ["read", "bash", "write"] });
+  it("pins pi lanes to the five natives plus the executor trio, filtered by the reviewed pool", () => {
+    expect(runnerResourceSelection(response(), "pi")).toEqual({ tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] });
     expect(runnerResourceSelection(response(), "claude")).toEqual({ tools: ["Read", "Bash", "Write"] });
     expect(runnerResourceSelection(response(), "agy")).toEqual({});
+    // A pool that does not carry the gateway recipe degrades to the natives alone.
     const sparse = runner("pi", ["x"]);
-    sparse.pools = { ...sparse.pools, tools: ["read"] };
-    expect(runnerResourceSelection(response(), "pi", sparse)).toEqual({ tools: ["read"] });
+    sparse.pools = { ...sparse.pools, tools: ["read", "executor_execute"] };
+    expect(runnerResourceSelection(response(), "pi", sparse)).toEqual({ tools: ["read", "executor_execute"] });
   });
 
   it("handles empty recovery candidates, degraded candidates, root/clock options, and default replica count", async () => {

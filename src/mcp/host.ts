@@ -68,7 +68,8 @@ export interface StartupContext {
   readonly projectDir: string;
 }
 
-function safeDirectory(value: string | undefined): string | undefined {
+/** The canonical project-root shape: absolute, nonempty, single-line. Shared by startup anchoring and delegated caller roots. */
+export function safeDirectory(value: string | undefined): string | undefined {
   if (value === undefined || value.length === 0) return undefined;
   if (value.includes(String.fromCharCode(0)) || value.includes("\r") || value.includes("\n")) return undefined;
   return isAbsolute(value) ? value : undefined;
@@ -100,7 +101,13 @@ export async function resolveStartup(deps: StartupDependencies = {}): Promise<St
     throw new StartupRefusal("HERDR_ENV", "HERDR_ENV must be 1; the Herdr tools MCP server refuses to serve outside a Herdr runtime");
   }
   const injected = readInjectedContext(env);
-  if (!injected.idsPresent || !injected.idsValid) {
+  // `HERDR_EXECUTOR_DELEGATED=1` (the executor-gateway serve) relaxes only the
+  // injected-ids gate: the gateway spawns one server per connection with
+  // static env, so the calling pane's identity arrives per call as the
+  // `caller` argument instead. Every other gate is unchanged, and a call that
+  // carries no caller arg is still refused at connect time when no usable
+  // injected identity exists.
+  if ((!injected.idsPresent || !injected.idsValid) && env.HERDR_EXECUTOR_DELEGATED !== "1") {
     throw new StartupRefusal("INJECTED_CONTEXT", "injected Herdr workspace, tab, and pane identifiers are missing or malformed");
   }
   let candidate = env.HERDR_PROJECT_DIR;

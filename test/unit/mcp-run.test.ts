@@ -1,40 +1,19 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CORE_TOOL_NAMES } from "../../src/tool-surface.js";
-import type { BuiltinModelsSeam } from "../../src/supervision/model-service.js";
 import type { PiExec } from "../../src/cli.js";
-import type { AgentPromptClient } from "../../src/agent-prompt.js";
-import { RecipientRegistry } from "../../src/messages/recipients.js";
-import type { AttachmentStore, PublishedAttachment } from "../../src/messages/store.js";
+import type { DaemonCallerContext, DaemonClient } from "../../src/daemon/client.js";
+import type { DaemonNamespace } from "../../src/daemon/namespace.js";
+import { CLAUDE_CHANNEL_CAPABILITY } from "../../src/supervision/notify.js";
 import { AdapterContractError } from "../../src/mcp/adapter.js";
 import type * as AdapterModule from "../../src/mcp/adapter.js";
-import type * as FsPromises from "node:fs/promises";
-import type * as SupervisionRegistryModule from "../../src/supervision/registry.js";
 import { StartupRefusal } from "../../src/mcp/host.js";
-
-const readFileMock = vi.hoisted(() => vi.fn());
-vi.mock("node:fs/promises", async (importOriginal) => ({ ...(await importOriginal<typeof FsPromises>()), readFile: readFileMock }));
-
-/** Capture the options the MCP host composes its supervision registry from. */
-const registryOptions = vi.hoisted(() => ({ last: undefined as Record<string, unknown> | undefined }));
-vi.mock("../../src/supervision/registry.js", async (importOriginal) => {
-  const real = await importOriginal<typeof SupervisionRegistryModule>();
-  return {
-    ...real,
-    SupervisionRegistry: class extends real.SupervisionRegistry {
-      constructor(options: ConstructorParameters<typeof real.SupervisionRegistry>[0]) {
-        super(options);
-        registryOptions.last = options as unknown as Record<string, unknown>;
-      }
-    },
-  };
-});
 
 const describeFailure = vi.hoisted(() => ({ enabled: false }));
 vi.mock("../../src/mcp/adapter.js", async (importOriginal) => {
@@ -47,11 +26,6 @@ vi.mock("../../src/mcp/adapter.js", async (importOriginal) => {
     }
   };
 });
-
-// The wait reviewer's model call stays off the network in unit tests; tests
-// that reach it set their own resolution. The default stays fail-closed.
-const completeMock = vi.hoisted(() => vi.fn());
-vi.mock("@earendil-works/pi-ai/compat", () => ({ complete: completeMock }));
 
 const stdioTransports = vi.hoisted(() => [] as Array<{ started: boolean; closed: boolean }>);
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
@@ -78,11 +52,11 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 
 const { runHerdrMcpServer, packageRoot, refusalLine, fatalLine, MCP_SERVER_NAME } = await import("../../src/mcp/run.js");
 
-const health = {
-  client: { version: "0.9.0", protocol: 22, endpoint_protocol_generation: 1 },
-  server: { status: "running", version: "0.9.0", protocol: 22, compatible: true, endpoint_compatible: true, capabilities: { endpoint_protocol_generation: 1 } }
-};
-const promptSchema = readFileSync(new URL("../fixtures/herdr-0.9-protocol22.json", import.meta.url), "utf8");
+/**
+ * The snapshot the D2a claim is derived from. The hosting pane's
+ * `agent_session` is the verified identity the daemon re-reads, so every
+ * proxied call must claim exactly this record.
+ */
 const snapshot = {
   type: "session_snapshot",
   snapshot: {
@@ -90,11 +64,9 @@ const snapshot = {
     protocol: 1,
     workspaces: [{ workspace_id: "w", label: "w" }],
     tabs: [{ tab_id: "w:t", workspace_id: "w", label: "t" }],
-    // Pane records carry owner-supplied environment values; no model-visible
-    // block this host publishes may echo one.
     panes: [
-      { pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "manager", agent_name: "manager", agent: "pi", terminal_id: "term-manager", agent_session: { source: "pi", agent: "pi", kind: "id", value: "manager-session" }, agent_status: "idle", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] },
-      { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent: "pi", terminal_id: "term-worker", agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" }, agent_status: "working", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] }
+      { pane_id: "w:p", tab_id: "w:t", workspace_id: "w", label: "manager", agent_name: "manager", agent: "pi", terminal_id: "term-manager", agent_session: { source: "pi", agent: "pi", kind: "id", value: "manager-session" }, agent_status: "idle" },
+      { pane_id: "w:p2", tab_id: "w:t", workspace_id: "w", label: "worker", agent_name: "worker", agent: "pi", terminal_id: "term-worker", agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" }, agent_status: "working" }
     ],
     agents: [
       { pane_id: "w:p", name: "manager", agent: "pi", terminal_id: "term-manager", agent_session: { source: "pi", agent: "pi", kind: "id", value: "manager-session" }, agent_status: "idle" },
@@ -103,62 +75,52 @@ const snapshot = {
   }
 };
 
-const reviewerModel = { id: "testmodel", name: "TestModel", provider: "test", api: "openai-completions", baseUrl: "http://test", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_000, maxTokens: 1_000 } as Model<Api>;
-
-function reviewerMessage(text: string): AssistantMessage {
-  return { role: "assistant", content: [{ type: "text", text }], api: reviewerModel.api, provider: reviewerModel.provider, model: reviewerModel.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 };
-}
-
-/** A builtin catalogue where the configured reviewer resolves and authenticates. */
-const authenticatedModels: BuiltinModelsSeam = {
-  getModel: () => reviewerModel,
-  getModels: () => [reviewerModel],
-  getAuth: async () => ({ auth: { apiKey: "k" } }),
-};
-
-/** A builtin catalogue where no reviewer model resolves — failure before auth. */
-const unresolvableModels: BuiltinModelsSeam = {
-  getModel: () => undefined,
-  getModels: () => [],
-  getAuth: async () => undefined,
-};
-
 const projectDir = mkdtempSync(join(tmpdir(), "herdr-mcp-run-"));
 // The served directory is always the canonical path; the raw spelling is only
 // the resolution input.
 const canonicalProjectDir = realpathSync(projectDir);
 const env = { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "w:t", HERDR_PANE_ID: "w:p", HERDR_PROJECT_DIR: projectDir };
-const emptyCatalog = { effective: new Map(), candidates: [], diagnostics: [] } as never;
+const extensionContext = { cwd: projectDir, signal: new AbortController().signal, modelRegistry: { find: () => undefined, getAll: () => [] } } as unknown as ExtensionContext;
+const namespace: DaemonNamespace = { dir: join(canonicalProjectDir, "herdr-tools-daemon"), endpoint: join(canonicalProjectDir, "herdr.sock") };
 
+/**
+ * The only CLI call the proxy host makes: one fresh `api snapshot` per tool
+ * call, to derive the verified agent session for the D2a claim.
+ */
 function fakeExec(): { exec: PiExec; calls: string[][] } {
   const calls: string[][] = [];
-  const live = structuredClone(snapshot);
   const envelope = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
   const exec: PiExec = async (_command, argv) => {
     calls.push(argv);
-    if (argv[0] === "status") return { stdout: JSON.stringify(health), stderr: "", code: 0, killed: false };
-    if (argv[0] === "pane" && argv[1] === "current") return envelope("current", { type: "pane_current", pane: live.snapshot.panes[0] });
-    if (argv[0] === "api" && argv[1] === "schema") return { stdout: promptSchema, stderr: "", code: 0, killed: false };
-    if (argv[0] === "api") return envelope("snapshot", live);
-    if (argv[0] === "agent" && argv[1] === "wait") return envelope("agent-wait", { agent: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
-    if (argv[0] === "agent" && argv[1] === "get") return envelope("agent-get", { agent: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
-    if (argv[0] === "pane" && argv[1] === "get") return envelope("pane", { pane: live.snapshot.panes.find((pane) => pane.pane_id === argv[2]) });
-    if (argv[0] === "pane" && argv[1] === "read") return { stdout: "worker output", stderr: "", code: 0, killed: false };
-    if (argv[0] === "tab" && argv[1] === "create") {
-      live.snapshot.tabs.push({ tab_id: "w:t2", workspace_id: "w", label: argv[argv.indexOf("--label") + 1]! });
-      live.snapshot.panes.push({ pane_id: "w:p9", tab_id: "w:t2", workspace_id: "w", label: "root", agent_name: "root", agent: "pi", terminal_id: "term-root", agent_session: { source: "pi", agent: "pi", kind: "id", value: "root-session" }, agent_status: "idle", environment: { SECRET: "run-secret" }, environment_overrides: { SECRET: "run-secret" }, history: [{ env: { SECRET: "run-secret" } }] });
-      return envelope("create", { tab: { tab_id: "w:t2" }, root_pane: { pane_id: "w:p9" } });
-    }
-    if (argv[0] === "tab" && argv[1] === "get") return envelope("get", { tab: live.snapshot.tabs.find((tab) => tab.tab_id === argv[2]) });
+    if (argv[0] === "api") return envelope("snapshot", snapshot);
     return envelope("other", { ok: true });
   };
   return { exec, calls };
+}
+
+/** A scripted daemon client plus the connect seam that hands it to the host. */
+function fakeDaemon(replies: { launch?: unknown; run?: unknown; status?: unknown } = {}) {
+  const calls: Array<{ method: string; params: unknown }> = [];
+  let closed = 0;
+  const client = {
+    launch: async (params: unknown) => { calls.push({ method: "launch", params }); return replies.launch ?? { kind: "launch", state: "completed" }; },
+    run: async (params: unknown) => { calls.push({ method: "run", params }); return replies.run ?? { kind: "run" }; },
+    status: async (params: unknown) => { calls.push({ method: "status", params }); return replies.status ?? { kind: "status" }; },
+    close: () => { closed += 1; },
+  };
+  const connections: Array<{ namespace: DaemonNamespace; caller: DaemonCallerContext }> = [];
+  const connectDaemon = async (ns: DaemonNamespace, caller: DaemonCallerContext): Promise<DaemonClient> => {
+    connections.push({ namespace: ns, caller });
+    return client as unknown as DaemonClient;
+  };
+  return { calls, connections, connectDaemon, closed: () => closed };
 }
 
 interface Harness {
   handle: NonNullable<Awaited<ReturnType<typeof runHerdrMcpServer>>>;
   client: Client;
   calls: string[][];
+  daemon: ReturnType<typeof fakeDaemon>;
   exits: number[];
   errors: string[];
   signals: string[];
@@ -167,46 +129,37 @@ interface Harness {
 async function start(overrides: Partial<Parameters<typeof runHerdrMcpServer>[0]> = {}): Promise<Harness> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const { exec, calls } = fakeExec();
+  const daemon = fakeDaemon(overridesDaemonReplies);
   const exits: number[] = [];
   const errors: string[] = [];
   const signals: string[] = [];
-  const promptClient: AgentPromptClient = {
-    prompt: vi.fn(async () => ({ id: "request-1", result: { type: "agent_prompted", agent: {} } })),
-    ping: vi.fn(async () => undefined),
-    close: vi.fn()
-  };
   const handle = await runHerdrMcpServer({
     env,
     exec,
     transport: serverTransport,
-    profiles: { load: async () => emptyCatalog },
-    settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "testmodel", reviewerThinking: "low" }),
+    resolveNamespace: async () => namespace,
+    connectDaemon: daemon.connectDaemon,
     writeStderr: (line) => errors.push(line),
     exit: (code) => exits.push(code),
     onSignal: (signal) => signals.push(signal),
-    promptClient,
     ...overrides
   });
   if (!handle) throw new Error("server did not start");
   const client = new Client({ name: "test-client", version: "1.0.0" }, { capabilities: {} });
   await client.connect(clientTransport);
-  return { handle, client, calls, exits, errors, signals };
+  return { handle, client, calls, daemon, exits, errors, signals };
 }
+
+let overridesDaemonReplies: { launch?: unknown; run?: unknown; status?: unknown } = {};
 
 function textOf(result: unknown): string {
   return (result as { content: Array<{ text: string }> }).content.map((block) => block.text).join("\n");
 }
 
-beforeEach(() => {
+afterEach(() => {
   describeFailure.enabled = false;
   stdioTransports.length = 0;
-  readFileMock.mockReset();
-  readFileMock.mockRejectedValue(Object.assign(new Error("missing"), { code: "ENOENT" }));
-  completeMock.mockReset();
-  completeMock.mockRejectedValue(new Error("reviewer model call is not mocked in this test"));
-});
-
-afterEach(() => {
+  overridesDaemonReplies = {};
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -234,7 +187,6 @@ describe("MCP server startup", () => {
           env: refusedEnv,
           exec,
           transport: serverTransport,
-          profiles: { load: async () => emptyCatalog },
           writeStderr: (line) => errors.push(line),
           exit: (code) => exits.push(code)
         });
@@ -264,7 +216,6 @@ describe("MCP server startup", () => {
       env,
       exec: fakeExec().exec,
       transport: serverTransport,
-      profiles: { load: async () => emptyCatalog },
       writeStderr: (line) => errors.push(line),
       exit: (code) => exits.push(code)
     });
@@ -312,7 +263,7 @@ describe("MCP server startup", () => {
     expect(refusalLine(new StartupRefusal("HERDR_ENV", "must be 1"))).toBe(`${MCP_SERVER_NAME} mcp server refused to start: HERDR_ENV: must be 1\n`);
     expect(refusalLine(new Error("plain\nfailure"))).toBe(`${MCP_SERVER_NAME} mcp server refused to start: plain failure\n`);
     expect(refusalLine("string failure")).toContain("string failure");
-    const long = refusalLine(new Error(`${"x".repeat(2_000)}`));
+    const long = refusalLine(new Error(`${"x".repeat(2_000)}`));
     expect(long.endsWith("\n")).toBe(true);
     expect(long.split(": ")[1]).toHaveLength(501);
   });
@@ -326,28 +277,9 @@ describe("MCP server startup", () => {
     expect(fatalLine("not an error object")).toBe(`${MCP_SERVER_NAME} mcp server failed: not an error object\n`);
   });
 
-  it("anchors the bundled profile catalog on the package root", async () => {
+  it("anchors the package root on the manifest beside the bundled catalog", async () => {
     expect(packageRoot(import.meta.url)).toBe(process.cwd());
     expect(packageRoot("file:///a/b/c/run.js", () => false)).toBe("/a/b/c");
-  });
-
-  it("serves the profile collection and the real settings file by default", async () => {
-    vi.useFakeTimers();
-    // An unresolvable catalogue keeps this test hermetic: the real settings
-    // default model would otherwise resolve and reach for the real auth.json.
-    const harness = await start({ profiles: undefined, settingsLoader: undefined, models: unresolvableModels });
-    const profiles = await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "profiles" } });
-    expect(profiles.isError).toBeUndefined();
-    // B10 deleted the bundled profile files: the default loader still runs
-    // and serves whatever user/project scopes contribute.
-    expect(JSON.parse(textOf(profiles).split("herdr-details\n")[0]!)).toMatchObject({ collection: "profiles", items: expect.any(Array) });
-    const beyondDefaultCadence = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 600_000 } });
-    expect(beyondDefaultCadence.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(beyondDefaultCadence).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1);
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED" } }));
-    expect(readFileMock).toHaveBeenCalled();
-    await harness.handle.shutdown();
   });
 
   it("uses the stdio transport and process signal handlers when none are injected", async () => {
@@ -356,8 +288,6 @@ describe("MCP server startup", () => {
     const exits: number[] = [];
     const handle = await runHerdrMcpServer({
       env,
-      profiles: { load: async () => emptyCatalog },
-      settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "testmodel", reviewerThinking: "low" }),
       exit: (code) => exits.push(code)
     });
     expect(handle).toBeDefined();
@@ -372,70 +302,83 @@ describe("MCP server startup", () => {
 });
 
 describe("MCP tool serving", () => {
-  it("lists exactly the seven shared tools with object input schemas", async () => {
+  it("lists exactly the three daemon-proxy tools with object input schemas and keeps the Channels capability", async () => {
     const harness = await start();
     const list = await harness.client.listTools();
     expect(list.tools.map((tool) => tool.name)).toEqual([...CORE_TOOL_NAMES]);
+    expect(list.tools).toHaveLength(3);
     expect(list.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
-    expect(list.tools.map((tool) => tool.title)).toEqual(["Herdr Inspect", "Herdr Communicate", "Herdr Wait", "Herdr Jobs", "Herdr Launch", "Herdr Pane", "Herdr Tab"]);
+    expect(list.tools.map((tool) => tool.title)).toEqual(["Herdr Launch", "Herdr Run", "Herdr Status"]);
+    // N5.2 owns the capability's removal; the advertisement stays until then.
+    expect(harness.client.getServerCapabilities()).toMatchObject({ experimental: { [CLAUDE_CHANNEL_CAPABILITY]: {} } });
     await harness.handle.shutdown();
   });
 
-  it("returns bounded authoritative evidence and typed failures", async () => {
+  it("proxies each tool call through one fresh verified daemon connection", async () => {
+    overridesDaemonReplies = {
+      launch: { kind: "launch", launchId: "l-1", state: "completed" },
+      run: { kind: "run", action: "ack", result: "acked" },
+      status: { kind: "status", daemon: { status: "running" }, unread: { count: 0, ids: [] } }
+    };
     const harness = await start();
-    const context = await harness.client.callTool({ name: "herdr_inspect", arguments: {} });
-    expect(context.isError).toBeUndefined();
-    expect(textOf(context)).toContain("herdr-details");
-    const health = await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "health" } });
-    expect(textOf(health)).toContain("\"socketReachable\":true");
-    const invalid = await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "health", target: "w:p2" } });
+
+    const launch = await harness.client.callTool({ name: "herdr_launch", arguments: { task: { objective: "o", scope: "s", doneWhen: ["done"] }, idempotencyKey: "idem-1" } });
+    expect(launch.isError).toBeUndefined();
+    expect(JSON.parse(textOf(launch))).toMatchObject({ kind: "launch", launchId: "l-1" });
+
+    const run = await harness.client.callTool({ name: "herdr_run", arguments: { action: "ack", eventId: "evt-1" } });
+    expect(run.isError).toBeUndefined();
+    const status = await harness.client.callTool({ name: "herdr_status", arguments: { eventId: "evt-1" } });
+    expect(status.isError).toBeUndefined();
+
+    expect(harness.daemon.calls).toEqual([
+      { method: "launch", params: { task: { objective: "o", scope: "s", doneWhen: ["done"] }, idempotencyKey: "idem-1" } },
+      { method: "run", params: { action: "ack", eventId: "evt-1" } },
+      { method: "status", params: { eventId: "evt-1" } }
+    ]);
+    // Three calls, three fresh connections, every one closed — and each claim
+    // carries the verified identity resolved from the authoritative snapshot.
+    expect(harness.daemon.connections).toHaveLength(3);
+    for (const connection of harness.daemon.connections) {
+      expect(connection.namespace).toEqual(namespace);
+      expect(connection.caller).toEqual({
+        identity: {
+          workspaceId: "w",
+          tabId: "w:t",
+          paneId: "w:p",
+          agentSession: { source: "pi", agent: "pi", kind: "id", value: "manager-session" }
+        },
+        projectRoot: canonicalProjectDir
+      });
+    }
+    expect(harness.daemon.closed()).toBe(3);
+    await harness.handle.shutdown();
+  });
+
+  it("rejects malformed input before any daemon connection opens", async () => {
+    const harness = await start();
+    const invalid = await harness.client.callTool({ name: "herdr_run", arguments: { action: "observe" } });
     expect(invalid.isError).toBe(true);
     expect(textOf(invalid)).toContain("INVALID_INPUT");
-    const selfTarget = await harness.client.callTool({ name: "herdr_communicate", arguments: { target: "current", operation: "prompt", text: "hello" } });
-    expect(selfTarget.isError).toBe(true);
-    expect(textOf(selfTarget)).toContain("SELF_TARGET_REJECTED");
+    expect(harness.daemon.connections).toEqual([]);
+    expect(harness.daemon.calls).toEqual([]);
     await harness.handle.shutdown();
   });
 
-  it("never publishes an environment value in any model-visible block", async () => {
-    const harness = await start();
-    const results = [
-      await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "target", target: "w:p2" } }),
-      await harness.client.callTool({ name: "herdr_inspect", arguments: { mode: "collection", collection: "panes" } }),
-      await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } })
-    ];
-    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
-    const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.operation_phase).toBe("settled"));
-    results.push(detached, await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "get", jobId } }));
-    for (const result of results) {
-      expect(result.isError).toBeUndefined();
-      expect(textOf(result)).not.toContain("run-secret");
-    }
-    // The pane evidence itself still reaches the model.
-    expect(textOf(results[0]!)).toContain("agent_status");
-    await harness.handle.shutdown();
-  });
-
-  it("serializes overlapping sequential tool calls", async () => {
-    const base = fakeExec();
-    const calls = base.calls;
-    // Every CLI step yields to the event loop, so two unserialized herdr_pane
-    // calls would interleave their read/mutate/read sequences here.
-    const exec: PiExec = async (command, argv, options) => {
-      await new Promise((settle) => setTimeout(settle, 2));
-      return base.exec(command, argv, options);
-    };
-    const harness = await start({ exec });
-    const outcomes = await Promise.all([
-      harness.client.callTool({ name: "herdr_pane", arguments: { operation: "rename", target: "w:p2", label: "rename-first" } }),
-      harness.client.callTool({ name: "herdr_pane", arguments: { operation: "rename", target: "w:p2", label: "rename-second" } })
-    ]);
-    expect(outcomes.every((outcome) => outcome.isError === undefined)).toBe(true);
-    const sequence = calls.filter((call) => call[0] === "pane" && (call[1] === "rename" || call[1] === "get")).map((call) => call.slice(1).join(" "));
-    const first = ["rename w:p2 rename-first", "get w:p2", "rename w:p2 rename-second", "get w:p2"];
-    const second = ["rename w:p2 rename-second", "get w:p2", "rename w:p2 rename-first", "get w:p2"];
-    expect([first, second]).toContainEqual(sequence);
+  it("surfaces the daemon's typed failure as a tool error and still closes the client", async () => {
+    let daemonClosed = 0;
+    const harness = await start({
+      connectDaemon: async () => ({
+        launch: async () => { throw Object.assign(new Error("unresolved intent"), { code: "INTENT_UNRESOLVED" }); },
+        run: async () => { throw new Error("unused"); },
+        status: async () => { throw new Error("unused"); },
+        close: () => { daemonClosed += 1; }
+      }) as unknown as DaemonClient
+    });
+    const failure = await harness.client.callTool({ name: "herdr_launch", arguments: { task: { objective: "o", scope: "s", doneWhen: ["done"] }, idempotencyKey: "idem-1" } });
+    expect(failure.isError).toBe(true);
+    expect(textOf(failure)).toContain("INTENT_UNRESOLVED");
+    expect(daemonClosed).toBe(1);
     await harness.handle.shutdown();
   });
 
@@ -446,15 +389,13 @@ describe("MCP tool serving", () => {
     await harness.handle.shutdown();
   });
 
-  it("uses HERDR_PROJECT_DIR as the operational working directory", async () => {
+  it("uses HERDR_PROJECT_DIR as the operational working directory and caller project root", async () => {
     const harness = await start();
     expect(harness.handle.projectDir).toBe(canonicalProjectDir);
     expect(canonicalProjectDir).not.toBe(realpathSync(process.cwd()));
-    const created = await harness.client.callTool({ name: "herdr_tab", arguments: { operation: "create", label: "worker-tab" } });
-    expect(created.isError).toBeUndefined();
-    const create = harness.calls.find((call) => call[0] === "tab" && call[1] === "create");
-    expect(create?.[create.indexOf("--cwd") + 1]).toBe(canonicalProjectDir);
-    expect(harness.handle.ownership.snapshot().map((resource) => resource.kind)).toEqual(["tab", "pane"]);
+    const status = await harness.client.callTool({ name: "herdr_status", arguments: {} });
+    expect(status.isError).toBeUndefined();
+    expect(harness.daemon.connections[0]!.caller.projectRoot).toBe(canonicalProjectDir);
     await harness.handle.shutdown();
   });
 
@@ -465,7 +406,7 @@ describe("MCP tool serving", () => {
     await harness.handle.shutdown();
   });
 
-  it("resolves a symlinked HERDR_PROJECT_DIR and serves the canonical directory to every consumer", async () => {
+  it("resolves a symlinked HERDR_PROJECT_DIR and serves the canonical directory", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdr-mcp-alias-"));
     try {
       const target = join(root, "target");
@@ -476,302 +417,23 @@ describe("MCP tool serving", () => {
       expect(canonical).not.toBe(alias);
       const harness = await start({ env: { ...env, HERDR_PROJECT_DIR: alias } });
       expect(harness.handle.projectDir).toBe(canonical);
-      const created = await harness.client.callTool({ name: "herdr_tab", arguments: { operation: "create", label: "worker-tab" } });
-      expect(created.isError).toBeUndefined();
-      const create = harness.calls.find((call) => call[0] === "tab" && call[1] === "create");
-      expect(create?.[create.indexOf("--cwd") + 1]).toBe(canonical);
+      const status = await harness.client.callTool({ name: "herdr_status", arguments: {} });
+      expect(status.isError).toBeUndefined();
+      expect(harness.daemon.connections[0]!.caller.projectRoot).toBe(canonical);
       await harness.handle.shutdown();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
-
-  it("does not cancel a detached job through the request signal after registration", async () => {
-    const harness = await start();
-    const controller = new AbortController();
-    const result = await harness.client.callTool(
-      { name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } },
-      undefined,
-      { signal: controller.signal }
-    );
-    expect(result.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(result).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    controller.abort(new Error("manager cancelled"));
-    expect(harness.handle.jobs.get(jobId)?.operation_phase).not.toBe("settled");
-    await harness.handle.shutdown();
-  });
-});
-
-describe("MCP wait and job semantics", () => {
-  it("runs the model-backed wait reviewer past the cadence instead of failing closed for being on MCP", async () => {
-    vi.useFakeTimers();
-    completeMock.mockResolvedValue(reviewerMessage(JSON.stringify({ classification: "progress", summary: "still progressing" })));
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }), models: authenticatedModels });
-    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
-    expect(outcome.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.advanceTimersByTimeAsync(120_000 + 1);
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "timed_out" }));
-    expect(completeMock).toHaveBeenCalled();
-    expect(harness.handle.jobs.get(jobId)?.result?.reviewerSummaries).toEqual([expect.objectContaining({ targetId: "w:p2", classification: "progress", summary: "still progressing" })]);
-    await harness.handle.shutdown();
-  });
-
-  it("records a reviewer failure in the detached job beyond the review cadence", async () => {
-    vi.useFakeTimers();
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }), models: unresolvableModels });
-    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
-    expect(outcome.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.advanceTimersByTimeAsync(60_000 + 1);
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("could not be resolved") } }));
-    expect(completeMock).not.toHaveBeenCalled();
-    await harness.handle.shutdown();
-  });
-
-  it("still maps a genuine reviewer model failure to REVIEWER_FAILED", async () => {
-    vi.useFakeTimers();
-    completeMock.mockRejectedValue(new Error("model down"));
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }), models: authenticatedModels });
-    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
-    expect(outcome.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.advanceTimersByTimeAsync(60_000 + 1);
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "failed", error: { code: "REVIEWER_FAILED", message: expect.stringContaining("model call failed") } }));
-    await harness.handle.shutdown();
-  });
-
-  it("registers a detached wait that is polled through herdr_jobs and fails closed beyond the cadence", async () => {
-    vi.useFakeTimers();
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }) });
-    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 120_000 } });
-    expect(detached.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    expect(jobId.startsWith("job_")).toBe(true);
-    const listed = await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "list" } });
-    expect(textOf(listed)).toContain(jobId);
-    await vi.advanceTimersByTimeAsync(60_000 + 1);
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.wait_result).toBe("failed"));
-    const job = await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "get", jobId } });
-    expect(textOf(job)).toContain("REVIEWER_FAILED");
-    const cancelled = await harness.client.callTool({ name: "herdr_jobs", arguments: { operation: "cancel", jobId: "job_missing" } });
-    expect(cancelled.isError).toBe(true);
-    expect(textOf(cancelled)).toContain("JOB_NOT_FOUND");
-    await harness.handle.shutdown();
-  });
-
-  it("detaches a wait within the cadence without starting a reviewer", async () => {
-    const harness = await start({ settingsLoader: async () => ({ reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" }) });
-    const outcome = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
-    expect(outcome.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(outcome).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)).toMatchObject({ operation_phase: "settled", wait_result: "condition_met" }));
-    await harness.handle.shutdown();
-  });
 });
 
 describe("MCP server lifecycle", () => {
-  it("wires attachment delivery capabilities into the host surface and clears the server registry", async () => {
-    const published: PublishedAttachment = {
-      attachmentId: "attachment-test-12345678",
-      path: "/tmp/herdr-mcp-attachment-test/body.txt",
-      bytes: 13,
-      sha256: "a".repeat(64),
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
-      recipientPaneId: "w:p2"
-    };
-    const attachments: AttachmentStore = {
-      root: "/tmp/herdr-mcp-attachment-test",
-      recipientDirectory: (recipientKey) => `/tmp/herdr-mcp-attachment-test/${recipientKey}`,
-      ensureRecipient: vi.fn(async () => ({ path: "/tmp/herdr-mcp-attachment-test/recipient", token: "grant-token", renew: async () => undefined, release: async () => undefined })),
-      publish: vi.fn(async () => published)
-    };
-    const recipients = new RecipientRegistry();
-    recipients.register({
-      paneId: "w:p2",
-      terminalId: "term-worker",
-      agentName: "worker",
-      agentKind: "pi",
-      agentSession: { source: "pi", agent: "pi", kind: "id", value: "worker-session" },
-      recipientKey: "recipient-test-12345678",
-      operatingPointId: "worker-pi",
-      kind: "pi",
-      capable: true,
-      reason: "test capability"
-    });
-    const promptClient: AgentPromptClient = {
-      prompt: vi.fn(async () => ({
-        id: "attachment-request",
-        result: {
-          type: "agent_prompted",
-          agent: {
-            pane_id: "w:p2",
-            terminal_id: "term-worker",
-            agent_name: "worker",
-            agent: "pi",
-            agent_session: { source: "pi", agent: "pi", kind: "id", value: "worker-session" },
-            interactive_ready: true,
-            revision: 1,
-            state_change_seq: 1
-          }
-        }
-      })),
-      ping: vi.fn(async () => undefined),
-      close: vi.fn()
-    };
-    const harness = await start({ attachments, recipients, promptClient });
-    const result = await harness.client.callTool({ name: "herdr_communicate", arguments: { target: "w:p2", operation: "steer", delivery: "attachment", text: "complete body" } });
-    expect(result.isError).toBeUndefined();
-    expect(attachments.publish).toHaveBeenCalledTimes(1);
-    expect(harness.handle.recipients).toBe(recipients);
-    await harness.handle.shutdown();
-    expect(recipients.size).toBe(0);
-  });
-
-  it("cancels an in-flight devin wake flush at shutdown — no Enter after close", async () => {
-    const base = fakeExec();
-    const calls: string[][] = [];
-    const waitSignals: AbortSignal[] = [];
-    let releaseWait!: () => void;
-    const holdWait = new Promise<void>((resolve) => { releaseWait = resolve; });
-    const exec: PiExec = async (command, argv, options) => {
-      calls.push(argv);
-      // The flush's own-pane `agent wait` is the call shutdown must cancel.
-      if (argv[0] === "agent" && argv[1] === "wait" && argv[2] === "w:p") {
-        waitSignals.push(options.signal!);
-        await Promise.race([holdWait, new Promise<never>((_, reject) => {
-          if (options.signal!.aborted) reject(new Error("aborted"));
-          else options.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-        })]);
-      }
-      const result = await base.exec(command, argv, options);
-      // Recast the hosting pane as a working devin pane wherever it surfaces,
-      // so a settled wait job's wake takes the devin queue-flush path.
-      const rewrite = (record: unknown): void => {
-        const pane = record as Record<string, unknown> | undefined;
-        if (pane?.pane_id === "w:p") {
-          pane.agent = "devin";
-          pane.agent_status = "working";
-          pane.agent_session = { source: "devin", agent: "devin", kind: "id", value: "devin-session" };
-        }
-      };
-      if (argv[0] === "pane" && (argv[1] === "get" || argv[1] === "current")) {
-        const parsed = JSON.parse(result.stdout);
-        rewrite(parsed.result?.pane);
-        return { ...result, stdout: JSON.stringify(parsed) };
-      }
-      if (argv[0] === "agent" && argv[1] === "get") {
-        const parsed = JSON.parse(result.stdout);
-        rewrite(parsed.result?.agent);
-        return { ...result, stdout: JSON.stringify(parsed) };
-      }
-      if (argv[0] === "api" && argv[1] !== "schema") {
-        const parsed = JSON.parse(result.stdout);
-        for (const record of parsed.result?.snapshot?.panes ?? []) rewrite(record);
-        for (const record of parsed.result?.snapshot?.agents ?? []) rewrite(record);
-        return { ...result, stdout: JSON.stringify(parsed) };
-      }
-      return result;
-    };
-    const promptClient: AgentPromptClient = {
-      prompt: vi.fn(async () => ({
-        id: "wake-prompt",
-        result: {
-          type: "agent_prompted",
-          agent: {
-            pane_id: "w:p",
-            terminal_id: "term-manager",
-            name: "manager",
-            agent_name: "manager",
-            agent: "devin",
-            agent_session: { source: "devin", agent: "devin", kind: "id", value: "devin-session" },
-            interactive_ready: true,
-            revision: 1,
-            state_change_seq: 1
-          }
-        }
-      })),
-      ping: vi.fn(async () => undefined),
-      close: vi.fn()
-    };
-    // The wake's Devin write and the flush both ride the real pane-write
-    // section, which resolves its lock namespace from the endpoint socket —
-    // the path only needs to exist for canonicalization, never to connect.
-    const socketPath = join(canonicalProjectDir, "herdr-test.sock");
-    writeFileSync(socketPath, "");
-    const harness = await start({ exec, promptClient, env: { ...env, HERDR_SOCKET_PATH: socketPath } });
-    const wait = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
-    expect(wait.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(wait).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.waitFor(() => expect(harness.handle.jobs.get(jobId)?.operation_phase).toBe("settled"));
-    // The settled job's wake self-prompts the working devin pane, then parks in
-    // the queue-flush wait.
-    await vi.waitFor(() => expect(promptClient.prompt).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() => expect(waitSignals).toHaveLength(1));
-    await harness.handle.shutdown();
-    expect(waitSignals[0]!.aborted).toBe(true);
-    releaseWait();
-    await vi.waitFor(() => expect(harness.exits).toEqual([0]));
-    expect(calls.some((argv) => argv[0] === "agent" && argv[1] === "send-keys")).toBe(false);
-  });
-
-  it("delivers a claude wake through the real channel notification wrapper", async () => {
-    const base = fakeExec();
-    const exec: PiExec = async (command, argv, options) => {
-      const result = await base.exec(command, argv, options);
-      // Recast the hosting pane as claude wherever it surfaces, so the settled
-      // wait job's wake takes the channel-notification path. `agent` and
-      // `agent_session.agent` must agree or the identity parse refuses.
-      const rewrite = (record: unknown): void => {
-        const pane = record as Record<string, unknown> | undefined;
-        if (pane?.pane_id === "w:p") {
-          pane.agent = "claude";
-          pane.agent_session = { source: "claude", agent: "claude", kind: "id", value: "claude-session" };
-        }
-      };
-      if (argv[0] === "pane" && (argv[1] === "get" || argv[1] === "current")) {
-        const parsed = JSON.parse(result.stdout);
-        rewrite(parsed.result?.pane);
-        return { ...result, stdout: JSON.stringify(parsed) };
-      }
-      if (argv[0] === "api" && argv[1] !== "schema") {
-        const parsed = JSON.parse(result.stdout);
-        for (const record of parsed.result?.snapshot?.panes ?? []) rewrite(record);
-        for (const record of parsed.result?.snapshot?.agents ?? []) rewrite(record);
-        return { ...result, stdout: JSON.stringify(parsed) };
-      }
-      return result;
-    };
-    const promptClient: AgentPromptClient = {
-      prompt: vi.fn(async () => ({ id: "request-1", result: { type: "agent_prompted", agent: {} } })),
-      ping: vi.fn(async () => undefined),
-      close: vi.fn()
-    };
-    const harness = await start({ exec, promptClient });
-    const notifications: Array<{ method: string; params?: { content?: string } }> = [];
-    harness.client.fallbackNotificationHandler = async (notification) => { notifications.push(notification as never); };
-    const wait = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "working" }, timeoutMs: 1_000 } });
-    expect(wait.isError).toBeUndefined();
-    const jobId = (JSON.parse(textOf(wait).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    await vi.waitFor(() => expect(notifications).toHaveLength(1));
-    expect(notifications[0]!.method).toBe("notifications/claude/channel");
-    expect(notifications[0]!.params?.content).toContain(jobId);
-    expect(promptClient.prompt).not.toHaveBeenCalled();
-    await harness.handle.shutdown();
-  });
-
-  it("marks jobs shut down, resets ownership, and exits zero exactly once", async () => {
+  it("exits zero exactly once and keeps shutdown idempotent", async () => {
     const harness = await start();
-    const detached = await harness.client.callTool({ name: "herdr_wait", arguments: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "done" }, timeoutMs: 60_000 } });
-    const jobId = (JSON.parse(textOf(detached).split("herdr-details\n")[1]!) as { jobId: string }).jobId;
-    harness.handle.ownership.record({ kind: "pane", id: "w:p9" });
     await harness.handle.shutdown();
-    expect(harness.handle.jobs.get(jobId)).toBeUndefined();
-    expect(harness.handle.ownership.snapshot()).toEqual([]);
     expect(harness.exits).toEqual([0]);
     await harness.handle.shutdown();
     expect(harness.exits).toEqual([0]);
-    expect(harness.calls.every((call) => call[0] !== "pane" || call[1] !== "close")).toBe(true);
   });
 
   it("shuts down when the transport closes and when a signal arrives", async () => {
@@ -787,19 +449,138 @@ describe("MCP server lifecycle", () => {
     signalled[1]!();
     expect(harness.exits).toEqual([0]);
   });
-  it("wires the supervision repair transport to the host's own prompt client", async () => {
-    const promptClient: AgentPromptClient = {
-      prompt: vi.fn(async () => ({ id: "repair-prompt", result: { type: "agent_prompted", agent: { pane_id: "w:p2" } } })),
-      ping: vi.fn(async () => undefined),
-      close: vi.fn()
-    };
-    const harness = await start({ promptClient });
-    // The gate's repair prompt must reach the exact child through the same
-    // authenticated prompt transport every other send on this host uses.
-    const repairPrompt = registryOptions.last!.repairPrompt as (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
-    const signal = new AbortController().signal;
-    await expect(repairPrompt("w:p2", "repair the handoff artifact", signal)).resolves.toMatchObject({ id: "repair-prompt" });
-    expect(promptClient.prompt).toHaveBeenCalledWith("w:p2", "repair the handoff artifact", signal);
+
+  it("falls back to process.env and a fresh signal when the host injects neither", async () => {
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+    try {
+      const harness = await start({ env: undefined });
+      // An execute call carrying no signal uses the per-call AbortController seam.
+      const reply = await harness.handle.surface.status.execute("call-1", {}, undefined, undefined, extensionContext);
+      expect(JSON.parse(textOf(reply))).toMatchObject({ kind: "status" });
+      expect(harness.daemon.calls).toEqual([{ method: "status", params: {} }]);
+      expect(harness.daemon.connections[0]?.caller.identity).toMatchObject({ workspaceId: "w", tabId: "w:t", paneId: "w:p" });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe("delegated caller mode (HERDR_EXECUTOR_DELEGATED)", () => {
+  /** Delegated serve: gated in, but no injected per-pane identity is possible. */
+  const delegatedEnv = { HERDR_ENV: "1", HERDR_EXECUTOR_DELEGATED: "1", HERDR_PROJECT_DIR: projectDir };
+  const caller = { paneId: "w:p", projectRoot: projectDir };
+
+  it("starts without injected identity and builds the identical claim an env caller would", async () => {
+    // The env-identity path, under the flag, with no caller argument.
+    const envServer = await start({ env: { ...env, HERDR_EXECUTOR_DELEGATED: "1" } });
+    const envStatus = await envServer.client.callTool({ name: "herdr_status", arguments: {} });
+    expect(envStatus.isError).toBeUndefined();
+    const envClaim = envServer.daemon.connections[0]!.caller;
+    await envServer.handle.shutdown();
+
+    // The delegated path asserts the same pane; the derived claim is identical.
+    const delegated = await start({ env: delegatedEnv });
+    const status = await delegated.client.callTool({ name: "herdr_status", arguments: { caller } });
+    expect(status.isError).toBeUndefined();
+    expect(delegated.daemon.connections).toHaveLength(1);
+    expect(delegated.daemon.connections[0]!.caller).toEqual(envClaim);
+    // One fresh snapshot per call, identical to the env path's derivation.
+    expect(delegated.calls).toEqual([["api", "snapshot"]]);
+    await delegated.handle.shutdown();
+  });
+
+  it("claims the asserted pane's snapshot identity, not another pane's", async () => {
+    const harness = await start({ env: delegatedEnv });
+    const status = await harness.client.callTool({ name: "herdr_status", arguments: { caller: { paneId: "w:p2", projectRoot: projectDir } } });
+    expect(status.isError).toBeUndefined();
+    expect(harness.daemon.connections[0]!.caller).toEqual({
+      identity: {
+        workspaceId: "w",
+        tabId: "w:t",
+        paneId: "w:p2",
+        agentSession: { source: "pi", agent: "pi", kind: "id", value: "worker-session" }
+      },
+      projectRoot: canonicalProjectDir
+    });
     await harness.handle.shutdown();
+  });
+
+  it("refuses a caller argument on a non-delegated server without touching the daemon or the CLI", async () => {
+    const harness = await start();
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["herdr_status", { caller }],
+      ["herdr_run", { action: "ack", eventId: "evt-1", caller }],
+      ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"] }, idempotencyKey: "idem-1", caller }],
+    ];
+    for (const [name, args] of cases) {
+      const result = await harness.client.callTool({ name, arguments: args });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("DELEGATED_CALLER_DISABLED");
+    }
+    expect(harness.daemon.connections).toEqual([]);
+    expect(harness.calls).toEqual([]);
+    await harness.handle.shutdown();
+  });
+
+  it("refuses a caller-less call on a delegated serve with no injected identity", async () => {
+    const harness = await start({ env: delegatedEnv });
+    const result = await harness.client.callTool({ name: "herdr_status", arguments: {} });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("DELEGATED_CALLER_REQUIRED");
+    expect(harness.daemon.connections).toEqual([]);
+    expect(harness.calls).toEqual([]);
+    await harness.handle.shutdown();
+  });
+
+  it("refuses a caller asserting a pane absent from the authoritative snapshot", async () => {
+    const harness = await start({ env: delegatedEnv });
+    const result = await harness.client.callTool({ name: "herdr_status", arguments: { caller: { paneId: "w:p9", projectRoot: projectDir } } });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("CONTEXT_UNAVAILABLE");
+    // The derivation did run one fresh snapshot; no daemon connection opened.
+    expect(harness.calls).toEqual([["api", "snapshot"]]);
+    expect(harness.daemon.connections).toEqual([]);
+    await harness.handle.shutdown();
+  });
+
+  it("rejects a malformed caller at validation before any snapshot or connection", async () => {
+    const harness = await start({ env: delegatedEnv });
+    for (const bad of [{ caller: { projectRoot: projectDir } }, { caller: { paneId: "w:p" } }, { caller: { paneId: "w:p", projectRoot: "relative/dir" } }, { caller: { paneId: "w:p", projectRoot: projectDir, extra: true } }]) {
+      const result = await harness.client.callTool({ name: "herdr_status", arguments: bad });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("INVALID_INPUT");
+    }
+    expect(harness.daemon.connections).toEqual([]);
+    expect(harness.calls).toEqual([]);
+    await harness.handle.shutdown();
+  });
+
+  it("realpaths caller.projectRoot and refuses an unresolvable one", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-mcp-caller-root-"));
+    try {
+      const target = join(root, "target");
+      mkdirSync(target);
+      const alias = join(root, "alias");
+      symlinkSync(target, alias, "dir");
+      const canonical = realpathSync(alias);
+      const harness = await start({ env: delegatedEnv });
+      const status = await harness.client.callTool({ name: "herdr_status", arguments: { caller: { paneId: "w:p", projectRoot: alias } } });
+      expect(status.isError).toBeUndefined();
+      expect(harness.daemon.connections[0]!.caller.projectRoot).toBe(canonical);
+
+      const missing = await harness.client.callTool({ name: "herdr_status", arguments: { caller: { paneId: "w:p", projectRoot: join(root, "missing") } } });
+      expect(missing.isError).toBe(true);
+      expect(textOf(missing)).toContain("DELEGATED_CALLER_INVALID");
+      const file = join(root, "file");
+      writeFileSync(file, "x");
+      const notDir = await harness.client.callTool({ name: "herdr_status", arguments: { caller: { paneId: "w:p", projectRoot: file } } });
+      expect(notDir.isError).toBe(true);
+      expect(textOf(notDir)).toContain("DELEGATED_CALLER_INVALID");
+      // Two successful/failed calls, exactly one connection — the refusals never connect.
+      expect(harness.daemon.connections).toHaveLength(1);
+      await harness.handle.shutdown();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

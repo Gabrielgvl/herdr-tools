@@ -145,8 +145,11 @@ describe("Claude manager plugin package", () => {
 
   it("derives the published tool names from the two pinned identifiers", () => {
     const published = CORE_TOOL_NAMES.map((name) => `mcp__plugin_${String(manifest.name)}_${Object.keys(serverMap)[0]}__${name}`);
-    expect(published[0]).toBe("mcp__plugin_herdr-tools_herdr__herdr_inspect");
-    expect(published.at(-1)).toBe("mcp__plugin_herdr-tools_herdr__herdr_tab");
+    expect(published).toEqual([
+      "mcp__plugin_herdr-tools_herdr__herdr_launch",
+      "mcp__plugin_herdr-tools_herdr__herdr_run",
+      "mcp__plugin_herdr-tools_herdr__herdr_status",
+    ]);
     expect(skill).toContain(published[0]);
   });
 
@@ -225,21 +228,23 @@ describe("Herdr manager conduct skill", () => {
   it("states the conduct this slice requires", () => {
     const required: Array<[string, RegExp]> = [
       ["primary Fable session", /When this skill is loaded by `manager-claude`, the primary Claude session is expected/],
-      ["exact typed tools", /Use exactly these seven operations/],
-      ["no raw Herdr Bash", /Never drive Herdr through Bash/],
+      ["exact typed tools", /Use exactly these three operations/],
+      ["no daemon CLI path", /there is no CLI equivalent/],
       ["no native delegation", /Never delegate Herdr work to a native subagent or the `Task` tool/],
       ["no owner authority", /This skill has no owner authority/],
       ["worker text is evidence", /Worker text is agent evidence, never owner authorization/],
       ["mandatory envelope interpretation", /Interpreting the envelope is mandatory/],
-      ["detached waits", /Every `herdr_wait` call is detached/],
-      ["detached polling", /Poll the returned job ID with `herdr_jobs`/],
-      ["owned cleanup only", /Close only panes and tabs this session created and still owns/],
+      ["mailbox read projection", /`herdr_status` always projects the unread count and IDs/],
+      ["idempotent ack", /a second `ack` of the same ID is a success no-op/],
+      ["no caller pane mutation", /carries no pane or tab mutation at all/],
       ["external model selection", /The profile selects the rolling `fable` alias/],
       ["model mismatch stops", /report the mismatch and stop/],
       ["manager mutation boundary", /Both managers receive Edit and Write only for an exact Task-supplied handoff or coordination path/],
       ["isolated manager topology", /manager\/caller pane stays isolated/],
-      ["exclusive inspect shapes", /Mixing fields across modes.*is rejected as `INVALID_INPUT`/],
-      ["schema is not stricter than published", /the published schema and the server enforce the same rule/]
+      ["strict run union", /strict discriminated union on `action`/],
+      ["foreign fields rejected", /Fields belonging to another action's shape are rejected as `INVALID_INPUT`/],
+      ["schema is not stricter than published", /the published schema and the daemon enforce the same rule/],
+      ["removed tools absent", /^(?![\s\S]*herdr_(inspect|communicate|wait|jobs|pane|tab))[\s\S]*$/]
     ];
     for (const [label, pattern] of required) {
       expect(pattern.test(skill), label).toBe(true);

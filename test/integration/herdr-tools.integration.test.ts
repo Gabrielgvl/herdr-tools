@@ -538,7 +538,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     // disposable session's socket stays set for the life of the suite.
     process.env.HERDR_SOCKET_PATH = state.socketProxy!.path;
     try {
-      extension(pi);
+      extension();
     } finally {
       process.chdir(savedCwd);
       for (const [key, value] of Object.entries({ HERDR_ENV: saved.env, HERDR_WORKSPACE_ID: saved.workspace, HERDR_TAB_ID: saved.tab, HERDR_PANE_ID: saved.pane })) {

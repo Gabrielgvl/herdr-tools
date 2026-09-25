@@ -211,6 +211,22 @@ describe("devin session reader", () => {
     expect(window.events).toEqual([]);
   });
 
+  it("reports an oversized step once and resumes past it", async () => {
+    const document = doc("sess-1", [step({ message: "first" }), step({ message: "x".repeat(40_000) }), step({ message: "third" })]);
+    const trace = source({ [pathOf("sess-1")]: bytes(document) });
+    const first = await trace.read(identity(), undefined, signal());
+    expect(first.events.map((event) => event.offset)).toEqual([1]);
+    const overflow = await trace.read(identity(), first.cursorTo, signal());
+    expect(overflow.typedFailure).toEqual({ kind: "record_exceeds_budget", detail: { step: 2, bytes: expect.any(Number), skipped: true } });
+    expect(overflow.events).toEqual([]);
+    expect(overflow.cursorTo).toMatchObject({ source: "devin-session", position: { session: "sess-1", steps: 2 } });
+    expect(overflow.cursorTo).not.toEqual(overflow.cursorFrom);
+    const resumed = await trace.read(identity(), overflow.cursorTo, signal());
+    expect(resumed.typedFailure).toBeUndefined();
+    expect(resumed.events.map((event) => event.offset)).toEqual([3]);
+    expect(JSON.stringify(overflow)).not.toContain(CANARY_CONTENT);
+  });
+
   it("fails typed before decoding a source document over the file ceiling", async () => {
     const dir = await mkdtemp(join(tmpdir(), "herdr-devin-oversized-"));
     dirs.push(dir);

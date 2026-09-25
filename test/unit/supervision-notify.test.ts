@@ -23,6 +23,12 @@ describe("supervision manager wake delivery", () => {
     expect(content).toContain("job_1");
     expect(content).toContain("worker");
     expect(content).toContain("herdr_jobs get");
+    // The text is what a host replays into later turns, so it carries its own
+    // staleness signal: event time, event id, and the do-nothing rule.
+    expect(content).toContain("sev_1");
+    expect(content).toContain("Delivered once at 1970-01-01T00:00:00.005Z");
+    expect(content).toContain("if this event id is already in your ledger or the job is settled, do nothing");
+    expect(supervisionWakeContent({ ...wake, event: { ...wake.event, atMs: Number.NaN } })).toContain("Delivered once at an unknown time");
     const normal = supervisionWakeContent({ ...wake, event: { ...wake.event, priority: "normal" } });
     expect(normal.startsWith("Herdr supervisor")).toBe(true);
     const oversized = supervisionWakeContent({ ...wake, event: { ...wake.event, summary: "x".repeat(20_000) } });

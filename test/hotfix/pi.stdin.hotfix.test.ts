@@ -4,7 +4,7 @@ import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import extension, { CORE_TOOL_NAMES } from "../../index.js";
 import { HOTFIX_HOST_FILES, HOTFIX_LABEL, HOTFIX_MANDATORY_CASES, REQUIRED_SESSION } from "../../scripts/test-stdin-hotfix.js";
@@ -289,31 +289,6 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     state.rootPaneId = root.pane_id;
     state.rootTabId = root.tab_id;
 
-    const pi = {
-      async exec(command: string, args: string[], options?: { signal?: AbortSignal; timeout?: number }) {
-        if (command !== "herdr") throw new Error(`unexpected Pi command ${command}`);
-        state.cliCalls.push([...args]);
-        try {
-          const result = await execFileAsync(command, ["--session", REQUIRED_SESSION, ...args], {
-            cwd: state.cwd,
-            env: { ...process.env, HERDR_ENV: "1", HERDR_WORKSPACE_ID: state.workspaceId, HERDR_TAB_ID: state.rootTabId, HERDR_PANE_ID: state.rootPaneId },
-            encoding: "utf8", maxBuffer: 4_000_000, signal: options?.signal, timeout: options?.timeout
-          });
-          state.cliExitCodes.push(0);
-          state.commandExitCodes.push(0);
-          return { stdout: String(result.stdout), stderr: String(result.stderr), code: 0, killed: false };
-        } catch (error) {
-          const failed = error as Error & { stdout?: string | Buffer; stderr?: string | Buffer; code?: number; killed?: boolean };
-          state.cliExitCodes.push(failed.code ?? 1);
-          state.commandExitCodes.push(failed.code ?? 1);
-          return { stdout: String(failed.stdout ?? ""), stderr: String(failed.stderr ?? failed.message), code: failed.code ?? 1, killed: failed.killed ?? false };
-        }
-      },
-      registerTool(registered: unknown) { const value = registered as ExecutableTool; state.registered.set(value.name, value); },
-      registerCommand(name: string) { state.commands.push(name); },
-      on(event: string) { state.handlers.push(event); }
-    } as unknown as ExtensionAPI;
-
     const saved = { HERDR_ENV: process.env.HERDR_ENV, HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID, HERDR_TAB_ID: process.env.HERDR_TAB_ID, HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH };
     process.env.HERDR_ENV = "1";
     process.env.HERDR_WORKSPACE_ID = state.workspaceId;
@@ -321,7 +296,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     process.env.HERDR_PANE_ID = state.rootPaneId;
     process.env.HERDR_SOCKET_PATH = state.proxy.path;
     try {
-      extension(pi);
+      extension();
     } finally {
       for (const key of ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"] as const) {
         const value = saved[key];

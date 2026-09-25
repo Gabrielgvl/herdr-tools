@@ -216,8 +216,11 @@ export function createDevinSessionReader(deps: DevinTraceDeps = {}): DevinSessio
     while (emit < steps.length) {
       const bytes = Buffer.byteLength(JSON.stringify(steps[emit]), "utf8");
       if (byteCount + bytes > TRACE_WINDOW_MAX_BYTES) {
+        // A step that alone can never fit is reported once and stepped over
+        // (the anchor still covers it verbatim), so the next window resumes
+        // after it instead of refusing the same step at every cadence.
         if (events.length === 0) {
-          throw new DevinSourceError("record_exceeds_budget", { step: emit + 1, bytes });
+          return { position: { session: sessionId, steps: emit + 1, anchor: hashSteps(steps, emit + 1) }, events, skipped: { step: emit + 1, bytes } };
         }
         break;
       }

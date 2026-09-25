@@ -12,11 +12,11 @@
   "bundles": {
     "herdr-profiles/profile-plugins/manager/skills/manager": {
       "source": "./herdr-profiles/role-plugins/manager/skills/manager",
-      "treeHash": "64f8e4679d88dfcc5d1d06914a4bcd982998781e1322829193c67851ab662c9b"
+      "treeHash": "5802cdd574d86261a909cad1c9e64cd1908d750bf74027223f0df2971c8f4e30"
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",
-      "treeHash": "6c2ce0ffcb4cceaec048649072e27be40ea35b513d7386333e4c9fc7f915db4d"
+      "treeHash": "6975584b7aeeeb3160b7986263095012f2c9691964de49be551518755424f510"
     },
     "herdr-profiles/profile-plugins/manager/skills/decision-batch": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/decision-batch",
@@ -36,11 +36,11 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "e6aa4d134a72d928db72c8d18b1244c8bffacac307742ca1fcfe9dd79c6b6bbd"
+      "treeHash": "8d278b36715aa37b268eda992953cf34b0d783dd5b50927f86aa52c8445ef6e5"
     },
     "herdr-profiles/profile-plugins/manager/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "0e03167bee4a7e6daf4f9ff296fb2a8c03a5990b0a23dc87d1539e3eea44187e"
+      "treeHash": "620895d39c22bdd727aa427005dd1a8a4e65ed085442f37206b6bdefe5b0eea4"
     },
     "herdr-profiles/role-plugins/planner/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -116,11 +116,11 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "e6aa4d134a72d928db72c8d18b1244c8bffacac307742ca1fcfe9dd79c6b6bbd"
+      "treeHash": "8d278b36715aa37b268eda992953cf34b0d783dd5b50927f86aa52c8445ef6e5"
     },
     "herdr-profiles/role-plugins/reviewer/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "0e03167bee4a7e6daf4f9ff296fb2a8c03a5990b0a23dc87d1539e3eea44187e"
+      "treeHash": "620895d39c22bdd727aa427005dd1a8a4e65ed085442f37206b6bdefe5b0eea4"
     },
     "herdr-profiles/role-plugins/reviewer/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",

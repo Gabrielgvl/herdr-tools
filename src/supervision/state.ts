@@ -83,6 +83,12 @@ export interface SupervisionReviewerView {
   thinking?: "max";
   cadenceMinutes: number;
   degraded: boolean;
+  /**
+   * D5: true while the recorded owner session is absent from the authoritative
+   * snapshot — cadence ticks keep firing but no reviewer call is made. Absent
+   * (never `false`) on hosts that record no owner or while the owner is present.
+   */
+  paused?: boolean;
   reviews: SupervisionReviewView[];
   truncatedReviews: number;
   lastReviewAtMs?: number;
@@ -174,6 +180,7 @@ export function isSupervisionJobView(value: unknown): value is SupervisionJobVie
   try {
     if (!record(value) || !["reserved", "provisional", "active", "degraded", "settled"].includes(String(value.state))) return false;
     if (!record(value.monitor) || !record(value.reviewer) || !text(value.reviewer.model) || !Array.isArray(value.reviewer.reviews) || !Array.isArray(value.transitions) || !Array.isArray(value.events)) return false;
+    if (value.reviewer.paused !== undefined && typeof value.reviewer.paused !== "boolean") return false;
     if (!value.reviewer.reviews.every((review) => record(review) && typeof review.summary === "string")) return false;
     if (!value.events.every((event) => record(event) && typeof event.eventId === "string" && typeof event.summary === "string")) return false;
     if (value.settledReason !== undefined && typeof value.settledReason !== "string") return false;

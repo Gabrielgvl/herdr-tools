@@ -48,10 +48,17 @@ function field(value: string): string {
   return boundedText(value, SUPERVISION_WAKE_FIELD_BYTES);
 }
 
+/**
+ * The wake text is the only part a host renders back into the manager's
+ * context on later turns (Pi replays custom messages as user turns), so it
+ * carries its own staleness signal: the event time, the event id, and the
+ * rule that an already-observed id or a settled job is history, not a wake.
+ */
 export function supervisionWakeContent(wake: SupervisionWake): string {
   const prefix = wake.event.priority === "high" ? "HIGH PRIORITY: " : "";
+  const at = Number.isFinite(wake.event.atMs) ? new Date(wake.event.atMs).toISOString() : "an unknown time";
   return boundedText(
-    `${prefix}Herdr supervisor ${field(wake.jobId)} for child ${field(wake.child.agentName)} (${field(wake.child.paneId)}, ${field(wake.child.agentKind)}) reported ${field(wake.event.type)}: ${field(wake.event.summary)}. Read the full event with herdr_jobs get on this job id; returned events are marked observed.`,
+    `${prefix}Herdr supervisor ${field(wake.jobId)} for child ${field(wake.child.agentName)} (${field(wake.child.paneId)}, ${field(wake.child.agentKind)}) reported ${field(wake.event.type)} (event ${field(wake.event.eventId)}): ${field(wake.event.summary)}. Delivered once at ${at}; if this event id is already in your ledger or the job is settled, do nothing. Otherwise read the full event with herdr_jobs get on this job id; returned events are marked observed.`,
     SUPERVISION_WAKE_CONTENT_BYTES,
   );
 }

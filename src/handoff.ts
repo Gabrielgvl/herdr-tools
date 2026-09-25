@@ -233,7 +233,8 @@ export interface HandoffRunIdentity {
 
 /**
  * The canonical Task launch contract a run was persisted under: the normalized
- * caller-authored Task exactly as admitted, every schema default concrete. The
+ * caller-authored Task exactly as admitted, every schema default concrete
+ * except `tier`, which is absent when the caller omitted it. The
  * four semantic fields are what the canonical render — and therefore the child —
  * received; `tier`, `replicas`, `recoveryOf`, `label`, and `cwd` complete the
  * launch contract. Text fields are unbounded caller text by design: the record
@@ -244,7 +245,7 @@ export interface HandoffTaskContract {
   scope: string;
   doneWhen: string[];
   constraints: string[];
-  tier: QualityTier;
+  tier?: QualityTier;
   replicas: number;
   recoveryOf?: string;
   label?: string;
@@ -497,7 +498,7 @@ export function createHandoffAllocator(options: {
           scope: provenance.task.scope,
           doneWhen: [...provenance.task.doneWhen],
           constraints: [...provenance.task.constraints],
-          tier: provenance.task.tier,
+          ...(provenance.task.tier === undefined ? {} : { tier: provenance.task.tier }),
           replicas: provenance.task.replicas,
           ...(provenance.task.recoveryOf === undefined ? {} : { recoveryOf: provenance.task.recoveryOf }),
           ...(provenance.task.label === undefined ? {} : { label: provenance.task.label }),
@@ -775,7 +776,7 @@ function validTaskContract(value: unknown): value is HandoffTaskContract {
     && taskText(value.objective) && taskText(value.scope)
     && Array.isArray(value.doneWhen) && value.doneWhen.length >= 1 && value.doneWhen.length <= 8 && value.doneWhen.every(taskText)
     && Array.isArray(value.constraints) && value.constraints.length <= 8 && value.constraints.every(taskText)
-    && typeof value.tier === "string" && (QUALITY_TIERS as readonly string[]).includes(value.tier)
+    && (value.tier === undefined || (typeof value.tier === "string" && (QUALITY_TIERS as readonly string[]).includes(value.tier)))
     && Number.isSafeInteger(value.replicas) && (value.replicas as number) >= 1 && (value.replicas as number) <= 8
     && (value.recoveryOf === undefined || (typeof value.recoveryOf === "string" && RUN_ID_PATTERN.test(value.recoveryOf)))
     && (value.label === undefined || (safeLine(value.label) && Buffer.byteLength(value.label, "utf8") <= 256))

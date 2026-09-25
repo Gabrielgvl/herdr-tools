@@ -6,12 +6,12 @@
  */
 
 /** Policy revision recorded in decision evidence. */
-export const POLICY_REVISION = "adr-037-p3";
+export const POLICY_REVISION = "adr-037-p5";
 
 /**
  * The caller's requested starting quality and compute posture, in ascending
  * order: `utility < economy < standard < strong < frontier < max`.
- * Omission resolves to `standard`.
+ * Omission lets the workload floor decide (`effectiveStartTier`).
  */
 export const QUALITY_TIERS = ["utility", "economy", "standard", "strong", "frontier", "max"] as const;
 export type QualityTier = (typeof QUALITY_TIERS)[number];
@@ -34,6 +34,18 @@ export function maxTier(a: QualityTier, b: QualityTier): QualityTier {
 /** The next stronger tier; `max` stays `max`. */
 export function nextTier(tier: QualityTier): QualityTier {
   return QUALITY_TIERS[Math.min(tierRank(tier) + 1, QUALITY_TIERS.length - 1)];
+}
+
+/**
+ * Effective start tier (adr-037-p5): Jev's weakest-sufficient floor decides
+ * an omitted request; an explicit request may raise the start by at most one
+ * tier and never lowers it; a recovery minimum is a hard lower bound the
+ * caller cap does not reach.
+ */
+export function effectiveStartTier(floor: QualityTier, requested?: QualityTier, minimum?: QualityTier): QualityTier {
+  const cap = nextTier(floor);
+  const start = requested === undefined ? floor : maxTier(floor, compareTiers(requested, cap) <= 0 ? requested : cap);
+  return minimum === undefined ? start : maxTier(start, minimum);
 }
 
 /** The tier `rank` steps above `utility`, clamped at `max`. */

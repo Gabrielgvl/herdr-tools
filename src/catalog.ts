@@ -493,20 +493,13 @@ function tierChains(value: unknown, generated: readonly GeneratedPoint[]): Reado
   if (value === undefined) return undefined;
   if (!record(value)) fail("tierChains must be a mapping keyed by quality tier");
   exactKeys(value, Object.keys(TIER_ENVELOPES), "tierChains");
-  const pointById = new Map(generated.map((point) => [point.id, point]));
-  const used = new Set<string>();
+  const pointIds = new Set(generated.map((point) => point.id));
   const chains = {} as Record<QualityTier, readonly string[]>;
   for (const tier of Object.keys(TIER_ENVELOPES) as QualityTier[]) {
     const ids = uniqueStrings(value[tier], `tierChains.${tier}`);
     if (ids.length === 0) fail(`tierChains.${tier} must not be empty`, { tier });
-    const providers = new Set<string>();
     for (const id of ids) {
-      const point = pointById.get(id);
-      if (point === undefined) fail(`tierChains.${tier} names a point the catalog does not generate`, { tier, point: id });
-      if (used.has(id)) fail("tierChains must not reuse an operating point", { tier, point: id });
-      if (providers.has(point.provider)) fail(`tierChains.${tier} must use distinct providers`, { tier, provider: point.provider });
-      used.add(id);
-      providers.add(point.provider);
+      if (!pointIds.has(id)) fail(`tierChains.${tier} names a point the catalog does not generate`, { tier, point: id });
     }
     chains[tier] = ids;
   }

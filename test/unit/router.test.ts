@@ -140,11 +140,24 @@ describe("tier-chain routing", () => {
     expect(seen).toEqual([{ tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] }]);
   });
 
+  it("deduplicates operating points repeated across tier segments", async () => {
+    const source = catalog();
+    const repeated: Catalog = {
+      ...source,
+      tierChains: { ...source.tierChains!, max: ["pi:f:low", "claude:m:low"] },
+    };
+    const result = await routeTask(input({
+      catalog: repeated,
+      response: response({ tier: { value: "frontier", confidence: 0.9 } }),
+    }));
+    expect(result).toMatchObject({ kind: "admitted", chain: ["pi:f:low", "claude:m:low"] });
+  });
+
   it("accepts low tier confidence, keeps the top low-confidence intent, and validates optional distributions", async () => {
     const intentProbabilities = { explore: 0, reason: 0, implement: 0, debug: 1, verify: 0, review: 0, coordinate: 0 };
     const tierProbabilities = { utility: 0, economy: 0, standard: 0, strong: 0, frontier: 1, max: 0 };
     const result = await routeTask(input({ response: response({ intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, tier: { value: "frontier", confidence: 0, probabilities: tierProbabilities } }) }));
-    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "frontier", evidence: { policyRevision: "adr-037-p3", intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, workload: { intent: "debug" } } });
+    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "frontier", evidence: { policyRevision: "adr-037-p5", intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, workload: { intent: "debug" } } });
 
     // A persisted historical unknown intent stays readable.
     await expect(routeTask(input({ response: response({ intent: { value: "unknown", confidence: 0.9 } }) }))).resolves.toMatchObject({ kind: "admitted", evidence: { intent: { value: "unknown" }, workload: { intent: "unknown" } } });
@@ -180,18 +193,29 @@ describe("tier-chain routing", () => {
     }
   });
 
+  it("lets Jev's floor decide an omitted tier and caps an explicit request one tier above it", async () => {
+    const omitted = await routeTask(input());
+    expect(omitted).toMatchObject({ kind: "admitted", workloadFloor: "economy", effectiveStartTier: "economy", chain: ["devin:e", "pi:s:low", "claude:s2:low", "agy:h", "pi:f:low", "claude:m:low"] });
+    expect(omitted).not.toHaveProperty("requestedTier");
+    await expect(routeTask(input({ task: { ...TASK, tier: "frontier" } }))).resolves.toMatchObject({ requestedTier: "frontier", workloadFloor: "economy", effectiveStartTier: "standard" });
+    // A recovery minimum is not capped: prior route strong starts recovery at frontier.
+    await expect(routeTask(input({ task: { ...TASK, tier: "economy" }, recovery: { priorOperatingPointId: "claude:m:low", priorRouteTier: "strong" } }))).resolves.toMatchObject({ requestedTier: "economy", effectiveStartTier: "frontier", chain: ["pi:f:low"] });
+  });
+
   it("excludes the failed provider across all stronger tiers during recovery", async () => {
     const repeated = catalog(POINTS.map((entry) => entry.id === "pi:f:low" ? { ...entry, provider: "p-s", quota: { ...entry.quota, provider: "p-s", billingProduct: "p-s" } } : entry));
-    const result = await routeTask(input({ catalog: repeated, recovery: { priorOperatingPointId: "pi:s:low" } }));
-    expect(result).toMatchObject({ kind: "admitted", chain: ["claude:s2:low", "agy:h", "claude:m:low"] });
+    // Prior route economy: recovery starts one tier higher, at standard.
+    const result = await routeTask(input({ catalog: repeated, recovery: { priorOperatingPointId: "pi:s:low", priorRouteTier: "economy" } }));
+    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "standard", chain: ["claude:s2:low", "agy:h", "claude:m:low"] });
     if (result.kind === "admitted") expect(result.evidence.chainExclusions?.map((entry) => entry.id)).toEqual(["pi:s:low", "pi:f:low"]);
-    await expect(routeTask(input({ recovery: { priorOperatingPointId: "missing" } }))).resolves.toMatchObject({ kind: "abstained", component: "recovery" });
+    await expect(routeTask(input({ recovery: { priorOperatingPointId: "missing", priorRouteTier: "economy" } }))).resolves.toMatchObject({ kind: "abstained", component: "recovery" });
   });
 
   it("skips known-unavailable quota domains and local-capacity runners within one admission", async () => {
     const repeated = catalog(POINTS.map((entry) => entry.id === "pi:f:low" ? { ...entry, quota: { ...POINTS[2]!.quota }, provider: POINTS[2]!.provider } : entry));
     const calls: string[] = [];
     const result = await routeTask(input({
+      task: { ...TASK, tier: "standard" },
       catalog: repeated,
       availability: async ({ model }) => {
         calls.push(model);
@@ -244,7 +268,7 @@ describe("tier-chain routing", () => {
     const one = point("pi:s:low", "pi", "s", "p-s");
     const only = catalog([one]);
     only.tierChains = { utility: [], economy: [], standard: [one.id], strong: [], frontier: [], max: [] };
-    await expect(routeTask(input({ catalog: only, recovery: { priorOperatingPointId: one.id } }))).resolves.toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
+    await expect(routeTask(input({ catalog: only, recovery: { priorOperatingPointId: one.id, priorRouteTier: "economy" } }))).resolves.toMatchObject({ kind: "abstained", reason: "no_candidates_at_tier" });
     await expect(routeTask(input({ availability: async () => status("degraded") }))).resolves.toMatchObject({ kind: "admitted" });
     const now = new Date("2026-01-01T00:00:00.000Z");
     const options = vi.fn(async () => status("unknown"));

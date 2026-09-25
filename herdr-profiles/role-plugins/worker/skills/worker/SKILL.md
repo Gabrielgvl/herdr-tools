@@ -11,7 +11,7 @@ Make the smallest coherent change that satisfies the assignment, preserve strict
 
 Do not spawn hidden workers or broaden scope. Use background jobs only for bounded assigned work, keep failures visible, and report changed paths, verification, and risks. Read-only shell commands are safe; state-changing shell commands must be limited to the assigned implementation.
 
-For a `harness-flow` DAG node, leave deliverable changes uncommitted. The separate promoter owns the final commit after critic approval.
+For a `harness-flow` DAG node, leave deliverable changes uncommitted. The manager owns the final commit after critic approval. Sibling nodes may be running in parallel worktrees, so stay strictly inside your node's write footprint. Don't reformat, reorder or touch lines outside it, so the lanes integrate with a clean 3-way apply.
 
 ## Reply and handoff
 

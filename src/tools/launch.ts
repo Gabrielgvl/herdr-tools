@@ -44,7 +44,7 @@ import type { SelfCloseTracker } from "../supervision/self-close.js";
 import { CATALOG_PATH, loadCatalog, type AvailabilitySubject, type Catalog, type RunnerEntry, type RunnerKind } from "../catalog.js";
 import { createWorktreeManager, type WorktreeManager } from "../worktree.js";
 import { compileCandidateContract, contractArgv, type CompiledContract, type ResolvedPoint, type ResourceSelection } from "../compile.js";
-import { deriveWorkspaceState, maxTier, nextTier, POLICY_REVISION, type QualityTier, type WorkloadIntent, type WorkloadProfile, type WorkspaceState } from "../routing-policy.js";
+import { deriveWorkspaceState, POLICY_REVISION, type QualityTier, type WorkloadIntent, type WorkloadProfile, type WorkspaceState } from "../routing-policy.js";
 import { availability as defaultAvailability, classifyLaunchFailure, recordLaunchFailure, type LaunchFailureSignal, type RecordLaunchFailureOptions } from "../availability.js";
 
 export interface LaunchCli {
@@ -155,7 +155,7 @@ export interface LaunchTaskEvidence {
   /** The caller's display-only label, when supplied. */
   label?: string;
   replicas: number;
-  /** The caller's requested tier after defaulting; omission resolved to `standard`. */
+  /** The caller's explicit tier; absent when omitted and Jev's floor decided. */
   requestedTier?: QualityTier;
   workloadFloor?: QualityTier;
   effectiveStartTier?: QualityTier;
@@ -305,7 +305,8 @@ export interface LaunchResult {
   kind: "launch";
   launchId: string;
   outcome: "launched" | "abstained" | "partial" | "failed";
-  requestedTier: QualityTier;
+  /** The caller's explicit tier; absent when omitted. */
+  requestedTier?: QualityTier;
   effectiveTier?: QualityTier;
   children: LaunchResultChild[];
   error?: { code: string; message?: string };
@@ -479,16 +480,15 @@ function validateParams(params: unknown): asserts params is LaunchTask {
   }
 }
 
-/** The caller's Task with every schema default made concrete. */
+/** The caller's Task with every schema default made concrete; `tier` stays the caller's explicit request. */
 interface NormalizedLaunchTask extends LaunchTask {
   constraints: string[];
   replicas: number;
-  tier: QualityTier;
 }
 
 function normalizedParams(params: unknown): NormalizedLaunchTask {
   validateParams(params);
-  return { ...params, constraints: params.constraints ?? [], replicas: params.replicas ?? 1, tier: params.tier ?? "standard" };
+  return { ...params, constraints: params.constraints ?? [], replicas: params.replicas ?? 1 };
 }
 
 /**
@@ -2114,10 +2114,10 @@ function partialError(
   });
 }
 
-function progress(onUpdate: AgentToolUpdateCallback<LaunchResult> | undefined, launchId: string, childTarget: string, phase: LaunchPhase, requestedTier: QualityTier): void {
+function progress(onUpdate: AgentToolUpdateCallback<LaunchResult> | undefined, launchId: string, childTarget: string, phase: LaunchPhase, requestedTier: QualityTier | undefined): void {
   onUpdate?.({
     content: [{ type: "text", text: `Launch ${phase}` }],
-    details: { kind: "launch", launchId, outcome: "partial", requestedTier, children: [{ target: childTarget, state: "not_started" }] }
+    details: { kind: "launch", launchId, outcome: "partial", ...(requestedTier === undefined ? {} : { requestedTier }), children: [{ target: childTarget, state: "not_started" }] }
   });
 }
 
@@ -2172,7 +2172,7 @@ function launchChildError(error: unknown): NonNullable<LaunchResultChild["error"
  * smaller launch.
  */
 function launchManifest(result: LaunchResult): string {
-  const head = `herdr_launch outcome=${result.outcome} launch=${result.launchId} tier=${result.requestedTier}${result.effectiveTier === undefined ? "" : ` effective=${result.effectiveTier}`} children=${result.children.length}${result.error === undefined ? "" : ` error=${result.error.code}`}`;
+  const head = `herdr_launch outcome=${result.outcome} launch=${result.launchId}${result.requestedTier === undefined ? "" : ` tier=${result.requestedTier}`}${result.effectiveTier === undefined ? "" : ` effective=${result.effectiveTier}`} children=${result.children.length}${result.error === undefined ? "" : ` error=${result.error.code}`}`;
   const lines = result.children.map((child) =>
     `- ${child.target} state=${child.state}${child.operatingPointId === undefined ? "" : ` point=${child.operatingPointId}`}${child.supervisorJobId === undefined ? "" : ` supervisor=${child.supervisorJobId}`}${child.worktree === undefined ? "" : ` worktree=${child.worktree}`}${child.paneId === undefined ? "" : ` pane=${child.paneId}`}${child.tabId === undefined ? "" : ` tab=${child.tabId}`}${child.effectCertainty === undefined ? "" : ` effect=${child.effectCertainty}`}${child.error === undefined ? "" : ` error=${child.error.code}`}`
   );
@@ -2296,10 +2296,9 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       };
     }
 
-    // A recovery's start preference lifts one tier over the prior route (max
-    // stays max); the model request still sees the caller's raw Task and tier.
-    const routingTask: RoutingTask = recovery === undefined ? task : { ...task, tier: maxTier(params.tier, nextTier(recovery.priorRouteTier)) };
-    const state = taskRouterState(routingTask, catalog);
+    // The router lifts a recovery's start one tier over the prior route; the
+    // Task, its state digest, and the model request keep the caller's tier.
+    const state = taskRouterState(task, catalog);
     const binding = launchBinding(launchId, state);
     // The compiled contract label is runtime-owned; the caller's label is
     // display metadata that never enters routing contracts or evidence.
@@ -2331,7 +2330,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     if (evaluation.kind === "response") {
       response = evaluation.response;
       try {
-        decision = await routeTask({ task: routingTask, spec, catalog, response: evaluation.response, root, availability: availabilityGate, ...(workspaceState === undefined ? {} : { workspaceState }), ...(recovery === undefined ? {} : { recovery: { priorOperatingPointId: recovery.priorOperatingPointId } }) });
+        decision = await routeTask({ task, spec, catalog, response: evaluation.response, root, availability: availabilityGate, ...(workspaceState === undefined ? {} : { workspaceState }), ...(recovery === undefined ? {} : { recovery: { priorOperatingPointId: recovery.priorOperatingPointId, priorRouteTier: recovery.priorRouteTier } }) });
       } catch {
         decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
       }
@@ -2341,7 +2340,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     return {
       catalog,
       record: {
-        task: routingTask,
+        task,
         decision,
         ...(response === undefined ? {} : { response }),
         state,
@@ -2552,7 +2551,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           scope: params.scope,
           doneWhen: [...params.doneWhen],
           constraints: [...params.constraints],
-          tier: params.tier,
+          ...(params.tier === undefined ? {} : { tier: params.tier }),
           replicas: params.replicas,
           ...(params.recoveryOf === undefined ? {} : { recoveryOf: params.recoveryOf }),
           ...(params.label === undefined ? {} : { label: params.label }),
@@ -3126,13 +3125,10 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     }
     await gate.release();
 
-    const task: RoutingTask = { objective: params.objective, scope: params.scope, doneWhen: params.doneWhen, constraints: params.constraints, tier: params.tier };
+    const requested = params.tier === undefined ? {} : { requestedTier: params.tier };
+    const task: RoutingTask = { objective: params.objective, scope: params.scope, doneWhen: params.doneWhen, constraints: params.constraints, ...(params.tier === undefined ? {} : { tier: params.tier }) };
     const routed = await routeTaskOnce(params, task, launchId, abortSignal, ctx, recovery);
-    // The router consumed the lifted start preference; requestedTier on the
-    // recorded decision keeps its documented meaning — the caller's ask.
-    const routedRecord: TaskRouteRecord = recovery !== undefined && isAdmitted(routed.record.decision)
-      ? { ...routed.record, decision: { ...routed.record.decision, requestedTier: params.tier } }
-      : routed.record;
+    const routedRecord = routed.record;
     // The intent boundary sits between routing and the first durable effect:
     // the hook's `effecting` write lands before the decision log does, so a
     // refusal here still leaves the world untouched. An internal relaunch is
@@ -3148,7 +3144,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     try {
       await routerLog(taskRouteLogEntry(launchId, routedRecord), { root: deps.cwd ?? ctx.cwd });
     } catch {
-      return emit({ kind: "launch", launchId, outcome: "failed", requestedTier: params.tier, children: [], error: { code: "ROUTER_LOG_UNAVAILABLE", message: "Task decision could not be persisted" } });
+      return emit({ kind: "launch", launchId, outcome: "failed", ...requested, children: [], error: { code: "ROUTER_LOG_UNAVAILABLE", message: "Task decision could not be persisted" } });
     }
 
     const decision = routedRecord.decision;
@@ -3159,13 +3155,13 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       const abstention = decision.kind === "abstained"
         ? { reason: decision.reason, ...(decision.component === undefined ? {} : { component: decision.component }) }
         : undefined;
-      return emit({ kind: "launch", launchId, outcome: "abstained", requestedTier: params.tier, children: [], ...(abstention === undefined ? {} : { abstention }) });
+      return emit({ kind: "launch", launchId, outcome: "abstained", ...requested, children: [], ...(abstention === undefined ? {} : { abstention }) });
     }
     const catalog = routed.catalog!;
     const intent = decision.evidence.intent?.value;
     /* c8 ignore next 4 -- admitted decisions always carry the workload classification; the guard keeps a malformed decision from launching blind. */
     if (intent === undefined) {
-      return emit({ kind: "launch", launchId, outcome: "failed", requestedTier: params.tier, effectiveTier: decision.effectiveStartTier, children: [], error: { code: "ROUTER_EVIDENCE_INCOMPLETE", message: "Admitted decision lacks the workload classification" } });
+      return emit({ kind: "launch", launchId, outcome: "failed", ...requested, effectiveTier: decision.effectiveStartTier, children: [], error: { code: "ROUTER_EVIDENCE_INCOMPLETE", message: "Admitted decision lacks the workload classification" } });
     }
     const shared: LaunchShared = {
       launchId,
@@ -3209,7 +3205,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     }
     const launched = children.filter((child) => child.state === "launched").length;
     const outcome: LaunchResult["outcome"] = launched === 0 ? "failed" : launched === children.length ? "launched" : "partial";
-    return emit({ kind: "launch", launchId, outcome, requestedTier: params.tier, effectiveTier: decision.effectiveStartTier, children });
+    return emit({ kind: "launch", launchId, outcome, ...requested, effectiveTier: decision.effectiveStartTier, children });
   };
 
   return {
@@ -3222,9 +3218,9 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     },
     renderCall(args, theme) {
       const label = typeof args.label === "string" ? args.label : "task";
-      const tier = typeof args.tier === "string" ? args.tier : "standard";
+      const tier = typeof args.tier === "string" ? ` · ${args.tier}` : "";
       const replicas = typeof args.replicas === "number" ? args.replicas : 1;
-      return textComponent(formatCall("herdr_launch", `${label} · ${tier}${replicas > 1 ? ` ×${replicas}` : ""}`), theme, "accent");
+      return textComponent(formatCall("herdr_launch", `${label}${tier}${replicas > 1 ? ` ×${replicas}` : ""}`), theme, "accent");
     },
     renderResult(result, options, theme) {
       const details = result.details;

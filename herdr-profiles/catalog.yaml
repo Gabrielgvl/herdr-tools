@@ -89,6 +89,10 @@ runners:
       # provider + billingProduct keep their availability tuples distinct.
       - {model: zai/glm-5.3-flash, provider: zai, quota: {billingProduct: zai-api}, supportedReasoning: [low, high, max]}
       - {model: opencode-go/glm-5.3-flash, provider: opencode-go, quota: {billingProduct: opencode-go-subscription}, supportedReasoning: [low, high, max]}
+      # MiMo currently treats every non-none effort as the same thinking mode;
+      # high is the single canonical enabled point for each model.
+      - {model: xiaomi-token-plan-sgp/mimo-v2.6-flash, provider: xiaomi-token-plan-sgp, quota: {billingProduct: xiaomi-token-plan}, supportedReasoning: [high]}
+      - {model: xiaomi-token-plan-sgp/mimo-v2.6-pro, provider: xiaomi-token-plan-sgp, quota: {billingProduct: xiaomi-token-plan}, supportedReasoning: [high]}
     quota:
       provider: openai-codex
       billingProduct: codex
@@ -285,6 +289,7 @@ tierChains:
     - claude:sonnet:low
   standard:
     - devin:swe-2-high
+    - pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high
     - claude:opus:low
     - pi:zai/glm-5.3-flash:high
     - pi:openai-codex/gpt-6-sol:high
@@ -292,16 +297,19 @@ tierChains:
   strong:
     - devin:swe-2-max
     - claude:opus:xhigh
+    - pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high
     - pi:openai-codex/gpt-6-sol:xhigh
     - pi:zai/glm-5.3-flash:max
     - agy:gemini-3.8-flash-high
   frontier:
     - claude:fable:low
     - pi:openai-codex/gpt-6-astra:high
+    - claude:opus:max
     - devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium
   max:
     - claude:fable:max
     - pi:openai-codex/gpt-6-astra:max
+    - claude:opus:max
     - devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium
 
 # Reviewed operating-point policy (ADR-037) — audited classes from
@@ -361,6 +369,10 @@ pointPolicy:
   pi:opencode-go/glm-5.3-flash:low: {costClass: low, latencyClass: high}
   pi:opencode-go/glm-5.3-flash:high: {costClass: low, latencyClass: high}
   pi:opencode-go/glm-5.3-flash:max: {costClass: low, latencyClass: high}
+  # List-equivalent output prices are below $1.50/M (low); no independent
+  # latency benchmark is available, so high latency is provisional/conservative.
+  pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high: {costClass: low, latencyClass: high}
+  pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high: {costClass: low, latencyClass: high}
   devin:swe-2-medium: {costClass: medium, latencyClass: medium}
   devin:swe-2-high: {costClass: medium, latencyClass: high}
   devin:swe-2-max: {costClass: medium, latencyClass: high}

@@ -8,6 +8,7 @@ import {
   TIER_ENVELOPES,
   compareTiers,
   deriveWorkspaceState,
+  effectiveStartTier,
   maxTier,
   nextTier,
   rankFallbackCandidates,
@@ -51,8 +52,26 @@ function thrown(fn: () => unknown): unknown {
 }
 
 describe("policy revision", () => {
-  it("stamps the ADR-037 p3 revision", () => {
-    expect(POLICY_REVISION).toBe("adr-037-p3");
+  it("stamps the ADR-037 p5 revision", () => {
+    expect(POLICY_REVISION).toBe("adr-037-p5");
+  });
+});
+
+describe("effective start tier (adr-037-p5)", () => {
+  it.each([
+    // floor, requested, recovery minimum, effective start
+    ["economy", undefined, undefined, "economy"],
+    ["economy", "utility", undefined, "economy"],
+    ["economy", "economy", undefined, "economy"],
+    ["economy", "standard", undefined, "standard"],
+    ["economy", "frontier", undefined, "standard"],
+    ["standard", "max", undefined, "strong"],
+    ["max", "max", undefined, "max"],
+    ["economy", "economy", "frontier", "frontier"],
+    ["economy", "max", "strong", "strong"],
+    ["frontier", undefined, "standard", "frontier"],
+  ] as const)("floor %s, request %s, minimum %s starts at %s", (floor, requested, minimum, start) => {
+    expect(effectiveStartTier(floor, requested, minimum)).toBe(start);
   });
 });
 

@@ -12,11 +12,11 @@
   "bundles": {
     "herdr-profiles/profile-plugins/manager/skills/manager": {
       "source": "./herdr-profiles/role-plugins/manager/skills/manager",
-      "treeHash": "8fe3cf4bee37c557f6a41106425392f1c45b0aff9582bfbc92afc7e68252332e"
+      "treeHash": "554f4b85feb4e0e8f2c0635c324b747c8173376d159869b41ee5aa0c168970ab"
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",
-      "treeHash": "12ed2c6c91fe88946f9d076ff5784bdef80e08317c13b7a2ae18778f70fa2779"
+      "treeHash": "a861f9ea02f73dd15fee6218975ac255140a3f81b36b483bd732958020102b08"
     },
     "herdr-profiles/profile-plugins/manager/skills/decision-batch": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/decision-batch",

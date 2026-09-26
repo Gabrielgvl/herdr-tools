@@ -15,10 +15,18 @@ describe("manager three-tool surface policy", () => {
 
     expect(canonical).toContain("Prefer the typed Herdr MCP namespace");
     expect(canonical).toContain("Use exactly these three operations: `herdr_launch`, `herdr_run`, and `herdr_status`.");
-    // The daemon has no CLI caller path; the only sanctioned shell use is the
-    // C8 follow-up recipe, which never touches daemon state.
+    // The daemon has no CLI caller path; pane-level raw CLI is a standing owner
+    // permission under the re-read-before-write rule.
     expect(canonical).toContain("there is no CLI equivalent");
+    expect(canonical).toContain("welcome for pane-level work, as a standing owner permission");
     expect(canonical).toContain("`herdr agent prompt <TARGET> <TEXT>`");
+    expect(canonical).toContain("`herdr agent get|list|read|explain` and `herdr pane get|list`");
+    expect(canonical).toContain("`herdr pane close`");
+    expect(canonical).toContain("`herdr agent send-keys <TARGET> esc` (cancel) or `ctrl+c` (interrupt)");
+    expect(canonical).toContain("unsupervised child");
+    expect(canonical).toContain("Send control keys exactly once");
+    expect(canonical).toContain("never escalate keys blindly");
+    expect(canonical).toContain("Never write into a `blocked` pane");
     expect(canonical).toContain("executor→MCP gateway");
     // No removed tool may be prescribed, and no raw-CLI fallback for daemon
     // operations may remain.

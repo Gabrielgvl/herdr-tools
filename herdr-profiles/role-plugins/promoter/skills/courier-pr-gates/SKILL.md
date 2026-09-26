@@ -69,27 +69,34 @@ or arms a merge.
 
 ## pi-review round ceiling reached (owner decision 2026-09-04)
 
-Three total pi-review rounds is the ceiling. On reaching it:
+Three total pi-review rounds is the ceiling **by owner policy** — the tool no
+longer stops itself: rounds are unbounded, a completed findings round exits 0
+with `verdict: "findings"`, and from round 4 the report carries
+`review.attention: "human-decision"` as advisory data. On reaching the ceiling:
 
-- Apply only the fixes for findings confirmed in round three, then stop reviewing. There is no fourth
-  round to buy: pi-review removed `--override-round-limit`, spends nothing at the ceiling, and returns
-  `BLOCKED`/exit 1 (see `herdr-manager` §6 and `pi-review-pr`).
-- Keep the round-three accounting as it stands: a `BLOCKED` report stays `BLOCKED` in the PR and the
-  handoff. Never restate it as PASS or as a satisfied pi-review gate.
-- Record the remaining pi-review gate as **explicitly owner-waived by this decision** — attributed to
-  the owner, naming the PR, the round-three head, and the confirmed findings fixed — then continue the
-  workflow to the PR's other gates. The waiver is automatic (owner ruling 2026-09-06): do not ask the
-  owner again at the ceiling.
+- Apply only the fixes for findings still `status: "open"` in round three
+  (a finding that survived refutation has `refuter.held: true`), then stop
+  reviewing. There is no fourth round under this policy.
+- Keep the round-three accounting as it stands: a `verdict: "findings"` report
+  stays `findings` in the PR and the handoff. Never restate it as `clean` or
+  as a satisfied pi-review gate.
+- Record the remaining pi-review gate as **explicitly owner-waived by this
+  decision** — attributed to the owner, naming the PR, the round-three head
+  (`review.head`), and the open findings fixed — then continue the workflow to
+  the PR's other gates. The waiver is automatic (owner ruling 2026-09-06): do
+  not ask the owner again at the ceiling.
 
 The waiver is this narrow or it does not hold:
 
-- Only findings confirmed in round three are in scope. Findings surfaced later, unrelated refactors,
-  and other tickets' scope are out — file them as follow-ups.
-- Only the pi-review gate is waived. CI, the current-head `/claude-review`, the orange/red human
-  approval, the `libs/messages` engineering-team gate, and thread resolution all still run on the final
-  head; `/claude-review` is what reviews the round-three fixes.
-- Any branch change beyond those fixes voids the waiver — that surface has been reviewed by nothing, so
-  re-establish the review gate before merging.
+- Only findings open in round three are in scope. Findings surfaced later,
+  unrelated refactors, and other tickets' scope are out — file them as
+  follow-ups.
+- Only the pi-review gate is waived. CI, the current-head `/claude-review`,
+  the orange/red human approval, the `libs/messages` engineering-team gate,
+  and review-thread resolution all still run on the final head;
+  `/claude-review` is what reviews the round-three fixes.
+- Any branch change beyond those fixes voids the waiver — that surface has
+  been reviewed by nothing, so re-establish the review gate before merging.
 
 ## Rebase, approvals, and single-commit branches
 

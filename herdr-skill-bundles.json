@@ -76,7 +76,7 @@
     },
     "herdr-profiles/role-plugins/promoter/skills/courier-pr-gates": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/courier-pr-gates",
-      "treeHash": "0731a7236df92d04771667ebb26394588f4109fc8a6fb1d1a99efdc95aaff54c"
+      "treeHash": "b63a1a183a40609a3ffcf178ba29fc8531d4a94aebd41431b17187482a55cbb3"
     },
     "herdr-profiles/role-plugins/promoter/skills/delivery-assurance": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/delivery-assurance",
@@ -96,7 +96,7 @@
     },
     "herdr-profiles/role-plugins/promoter/skills/services-ci-gates": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/services-ci-gates",
-      "treeHash": "41bdf8a61c9999dbc782b7a6605f0b271f2ab302a99c49e49575357deee02146"
+      "treeHash": "a8fe6aebf8a914efe4da2f0569e32c493840d04a85c644cee253e01e6c7e1fad"
     },
     "herdr-profiles/role-plugins/promoter/skills/shared-dev-deploy": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/shared-dev-deploy",

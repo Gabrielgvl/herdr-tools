@@ -1,0 +1,77 @@
+Executor gateway registration for the Herdr tools MCP server (N3.4 —
+prepared, not installed).
+
+What this is
+------------
+Every harness (Pi, Claude, Devin) reaches Herdr through the Executor MCP
+gateway instead of a direct MCP registration. `herdr-mcp-integration.json`
+holds the two payloads needed to register the local stdio Herdr MCP server on
+the executor daemon, keyed by the exact executor tool path that consumes each.
+Nothing in this directory has been registered anywhere; the daemon's own
+registry (`provider:"file"`, behind the daemon API) is the only live store,
+so there is no declarative file drop — prepared means payload plus runbook.
+
+The registered env carries `HERDR_EXECUTOR_DELEGATED=1`: the gateway spawns
+one server per connection with static env, so injected per-pane identity is
+impossible and callers assert `{ paneId, projectRoot }` per call (the
+`caller` argument on herdr_launch/herdr_run/herdr_status). The thin client
+derives the D2a claim from a fresh `api snapshot` plus the caller assertion;
+the daemon's verification is unchanged and remains the authority. Custody is
+caller-asserted under the same-UID cooperative stance — strictly weaker than
+environment-injected custody — acceptable because every gateway caller is a
+Herdr-launched lane on this host.
+
+Prerequisites for activation (all at the N5.3 cutover)
+------------------------------------------------------
+1. The daemon is installed and running: `systemctl --user enable --now
+   herdr-tools-daemon` with `HERDR_SOCKET_PATH` in
+   `~/.config/herdr-tools/daemon.env` (socket path must match the payload's
+   `HERDR_SOCKET_PATH`).
+2. The build is installed so
+   `/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js`
+   exists at the path the payload's `args` names.
+3. This tree is merged (the delegated `caller` field and the delegated
+   startup gate must exist in the served build).
+
+Pre-activation negative probe
+-----------------------------
+Before registering, prove nothing is live yet. From any executor-capable
+harness (inside `executor_execute`):
+
+    tools.executor.mcp.getServer({ slug: "herdr" })          -> not found
+    tools.search({ namespace: "herdr", query: "status" })    -> no herdr tools
+
+Activation — three executor calls at N5.3
+-----------------------------------------
+1. `tools.executor.mcp.addServer(herdr-mcp-integration.json["tools.executor.mcp.addServer"])`
+   — registers the `herdr` slug (stdio, `spawnPerCall:false`: one shared
+   stateless process, matching the thin client which holds nothing between
+   calls).
+2. `tools.executor.coreTools.connections.create(herdr-mcp-integration.json["tools.executor.coreTools.connections.create"])`
+   — creates the `org`/`default` connection on the `herdr` integration.
+3. `tools.executor.coreTools.connections.refresh(...)` — refreshes the
+   connection so its tools appear.
+
+Post-activation positive probe
+------------------------------
+    tools.executor.mcp.getServer({ slug: "herdr" })
+        -> readback matches the payload (stdio, env trio, spawnPerCall:false)
+    tools.search({ namespace: "herdr", query: "launch" })
+        -> exactly herdr.org.default.herdr_{launch,run,status}
+    tools.herdr.org.default.herdr_status({
+        caller: { paneId: "<this pane>", projectRoot: "<canonical root>" } })
+        -> well-formed reply, or bounded DAEMON_UNAVAILABLE if the daemon is down
+
+Direct-registration removal (prepared diffs — do NOT apply early)
+-----------------------------------------------------------------
+`remove-direct-herdr-claude.diff` empties
+`herdr-profiles/role-plugins/manager/mcp-servers.json` (the Claude manager
+role plugin's direct stdio `herdr` registration).
+`remove-direct-herdr-devin.diff` removes the `herdr` entry from
+`~/.config/devin/mcp_config.json` (the `executor` entry stays — it is the
+gateway itself).
+
+Both diffs ride the N5.3 cutover alongside the skill landing: applying them
+before the gateway is live breaks still-live managers' only Herdr reach.
+Until cutover, live configs keep their direct registrations and this
+directory changes nothing.

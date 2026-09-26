@@ -114,6 +114,12 @@ describe("catalog", () => {
     expect(catalog.quotaSources.some((source) => source.kind === "floor")).toBe(true);
     // Every declared resource pool path must exist inside the package root.
     for (const path of [...catalog.skills, ...catalog.plugins]) await access(path);
+    // The pinned pi lane surface: the five native tools plus the executor
+    // gateway trio, and only the executor server in the reviewed MCP pool —
+    // herdr is not a Pi-facing server.
+    const pi = catalog.runners.get("pi");
+    expect(pi?.pools.tools).toEqual(["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"]);
+    expect(pi?.pools.mcp).toEqual(["executor"]);
   });
 
   it("parses a full catalog: typed defaults, resolved pool paths, quota keys", () => {

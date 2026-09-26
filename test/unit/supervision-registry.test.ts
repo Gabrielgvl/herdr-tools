@@ -105,6 +105,15 @@ describe("the supervision registry", () => {
     await f.supervision.shutdown();
   });
 
+  it("forwards a completion-signal registration onto the bound supervisor", async () => {
+    const f = fixture();
+    const reservation = await f.supervision.reserve({ child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" } });
+    // The delegation itself is the contract: the supervisor keeps or drops the
+    // registration by its own publish state, never the registry's.
+    reservation.onCompletionSignal(async () => ({ cooldownRecorded: true }));
+    await f.supervision.shutdown();
+  });
+
   it("accepts a supervision digest at reservation without changing the public request view", async () => {
     const f = fixture();
     const digest = { doneWhen: ["tests pass"], constraints: ["read-only"] };

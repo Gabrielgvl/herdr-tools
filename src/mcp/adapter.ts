@@ -2,9 +2,8 @@ import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { modelSafeJson } from "../redaction.js";
 import type { HerdrToolDefinition, HerdrToolSurface } from "../tool-surface.js";
 import { hostContext, type HerdrToolHost } from "./host.js";
-import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE } from "../tools/launch.js";
+import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE, type LaunchEffectCertainty } from "../tools/launch.js";
 import { appendToolTelemetry, invalidInputError, monotonicDurationMs, telemetryOperation, type ToolInputError } from "../telemetry.js";
-import type { QueueRefusal, SequentialToolQueue } from "./queue.js";
 
 /** Total response bound for one MCP tool result. */
 export const MCP_RESULT_MAX_BYTES = 60_000;
@@ -21,9 +20,7 @@ const DETAILS_FIELD_BYTES = Buffer.byteLength(",\"details\":", "utf8");
 const MAX_ERROR_MESSAGE_CHARS = 2_000;
 const MAX_CODE_CHARS = 120;
 const MAX_TOOL_NAME_CHARS = 120;
-const LAUNCH_DIAGNOSTIC_PHASES = new Set(["validate", "route", "compile", "handoff", "attachment_publish", "supervision_reserve", "placement", "agent_start", "ready", "prompt_verification", "supervision_bind"]);
-const LAUNCH_EFFECT_CERTAINTIES = new Set(["absent", "partial", "unknown", "confirmed"]);
-const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
+
 
 export class AdapterContractError extends Error {
   readonly code = "ADAPTER_CONTRACT_VIOLATION" as const;
@@ -60,12 +57,6 @@ export interface McpCallRequest {
   readonly args: unknown;
   readonly host: HerdrToolHost;
   readonly callId: string;
-  /**
-   * The session-scoped queue that reproduces the Pi host's sequential
-   * scheduling. It is required, so a sequential tool cannot be served
-   * unserialized by forgetting to pass one.
-   */
-  readonly queue: SequentialToolQueue;
 }
 
 function bytes(value: string): number {
@@ -249,6 +240,10 @@ function errorDetails(error: unknown): unknown {
   return typeof details === "object" && details !== null ? details : undefined;
 }
 
+const LAUNCH_DIAGNOSTIC_PHASES = new Set(["validate", "route", "compile", "handoff", "attachment_publish", "supervision_reserve", "placement", "agent_start", "ready", "prompt_verification", "supervision_bind"]);
+const LAUNCH_EFFECT_CERTAINTIES = new Set<string>(["absent", "partial", "unknown", "confirmed"]);
+const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
+
 function launchDiagnosticId(value: unknown): string | undefined {
   if (typeof value !== "string" || value.length === 0) return undefined;
   const hasControlCharacter = [...value].some((character) => {
@@ -257,6 +252,11 @@ function launchDiagnosticId(value: unknown): string | undefined {
   });
   if (Buffer.byteLength(value, "utf8") > 256 || hasControlCharacter || value.trim() !== value) return undefined;
   return value;
+}
+
+/** The launcher certainty an evidence record asserts, validated against the closed set. */
+function launchEffectCertainty(value: unknown): LaunchEffectCertainty | undefined {
+  return typeof value === "string" && LAUNCH_EFFECT_CERTAINTIES.has(value) ? value as LaunchEffectCertainty : undefined;
 }
 
 function launchDiagnosticPayload(message: string): Record<string, unknown> | undefined {
@@ -275,7 +275,7 @@ function launchDiagnosticPayload(message: string): Record<string, unknown> | und
   const effectCertainty = value.effectCertainty;
   const recoveryGuidance = value.recoveryGuidance;
   if (typeof phase !== "string" || !LAUNCH_DIAGNOSTIC_PHASES.has(phase)) return undefined;
-  if (typeof effectCertainty !== "string" || !LAUNCH_EFFECT_CERTAINTIES.has(effectCertainty)) return undefined;
+  if (launchEffectCertainty(effectCertainty) === undefined) return undefined;
   if (typeof recoveryGuidance !== "string" || !Object.values(LAUNCH_RECOVERY_GUIDANCE).includes(recoveryGuidance as typeof LAUNCH_RECOVERY_GUIDANCE[keyof typeof LAUNCH_RECOVERY_GUIDANCE])) return undefined;
   if (typeof value.agentStarted !== "boolean" || typeof value.promptSubmitted !== "boolean" || typeof value.recipientRegistered !== "boolean") return undefined;
   const createdValue = value.created;
@@ -320,10 +320,15 @@ function promptDispatchPayload(value: unknown): Record<string, unknown> | undefi
 function launchRecoveryDetails(details: unknown): Record<string, unknown> {
   if (!record(details)) return {};
   const recovery: Record<string, unknown> = {};
-  for (const field of ["paneId", "supervisorJobId"] as const) {
+  for (const field of ["paneId", "tabId", "supervisorJobId"] as const) {
     const value = launchDiagnosticId(details[field]);
     if (value !== undefined) recovery[field] = value;
   }
+  // The launcher-computed certainty is a recovery handle in its own right:
+  // without it a caller cannot distinguish a provably absent effect from a
+  // possibly-consumed one.
+  const certainty = launchEffectCertainty(details.effectCertainty);
+  if (certainty !== undefined) recovery.effectCertainty = certainty;
   const dispatch = promptDispatchPayload(details.promptDispatch);
   if (dispatch !== undefined) recovery.promptDispatch = dispatch;
   if (details.attachmentRetained === true) recovery.attachmentRetained = true;
@@ -362,9 +367,12 @@ export function errorOutcome(code: string, message: string, details?: unknown, t
   if (toolName === "herdr_launch") {
     // Launch keeps rich details for Pi/TUI recovery, but its Error.message also
     // carries the sole fixed-shape model diagnostic. Never forward the attached
-    // details: they include raw cause and backend evidence by design.
+    // details: they include raw cause and backend evidence by design. A typed
+    // daemon-call error carries no embedded record, so the recovery handles —
+    // effect certainty and the surviving-resource identifiers — are projected
+    // from `details` whether or not a diagnostic parsed.
     const diagnostic = launchDiagnosticPayload(message);
-    const launchDetails = { tool: toolName, ...(diagnostic === undefined ? {} : { diagnostic, ...launchRecoveryDetails(details) }) };
+    const launchDetails = { tool: toolName, ...(diagnostic === undefined ? {} : { diagnostic }), ...launchRecoveryDetails(details) };
     return { content: [{ type: "text", text: JSON.stringify({ ...head, details: launchDetails }) }], isError: true };
   }
   const safeDetails = modelSafeJson(details);
@@ -382,20 +390,12 @@ function validationError(definition: HerdrToolDefinition, args: unknown): ToolIn
   return invalidInputError(definition.name, definition.validationSchema ?? definition.parameters, args);
 }
 
-const QUEUE_REFUSAL_MESSAGE: Record<QueueRefusal, string> = {
-  aborted: "ABORTED: the queued Herdr tool call was cancelled before it started",
-  closed: "ABORTED: the Herdr tools MCP host shut down before the queued call started"
-};
-
 /**
  * Validate against the shared schema, execute the shared tool with the request's
  * cancellation signal, and map the outcome to bounded MCP content.
  *
- * A tool that declares `executionMode: "sequential"` runs through the
- * session-scoped queue, so the MCP host reproduces the Pi host's one-at-a-time
- * scheduling for the mutating tools. Every other tool stays concurrent.
- * Validation happens before the queue: a rejected argument object touches no
- * state and must not wait behind an unrelated mutation.
+ * There is no host-side serialization: the daemon is the single serialization
+ * boundary (durable-supervisor §10), so every validated call runs directly.
  */
 export async function callTool(request: McpCallRequest): Promise<McpCallOutcome> {
   const startedAt = performance.now();
@@ -415,14 +415,10 @@ export async function callTool(request: McpCallRequest): Promise<McpCallOutcome>
     }, { root: request.host.cwd });
     return toolInputOutcome(invalid);
   }
-  const invoke = async (): Promise<McpCallOutcome> => {
-    try {
-      const result = await definition.execute(request.callId, args, request.host.signal, undefined, hostContext(request.host));
-      return successOutcome(result);
-    } catch (error) {
-      return errorOutcome(errorCode(error), error instanceof Error ? error.message : String(error), errorDetails(error), definition.name);
-    }
-  };
-  if (definition.executionMode !== "sequential") return invoke();
-  return request.queue.serialize(request.host.signal, invoke, (reason) => errorOutcome("ABORTED", QUEUE_REFUSAL_MESSAGE[reason], { tool: definition.name, executionMode: "sequential", reason }));
+  try {
+    const result = await definition.execute(request.callId, args, request.host.signal, undefined, hostContext(request.host));
+    return successOutcome(result);
+  } catch (error) {
+    return errorOutcome(errorCode(error), error instanceof Error ? error.message : String(error), errorDetails(error), definition.name);
+  }
 }

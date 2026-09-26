@@ -227,7 +227,10 @@ export function createHandoffGate(): HandoffGate {
         runId: allocation.runId,
         artifactPath: allocation.artifactPath,
         identity: { ...identity, agentSession: { ...identity.agentSession } },
-        cycleOpen: true,
+        // A reattached run whose artifact was already accepted must not have
+        // that acceptance opened into staleness — the sidecar decides whether
+        // a cycle is outstanding; a fresh launch always starts one.
+        cycleOpen: state.artifact.sha256 === null,
         accepted: null,
         lifecycle: "awaiting_handoff",
         repair: { attempts: 0, fenceVersion: null }

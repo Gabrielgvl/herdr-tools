@@ -150,6 +150,13 @@ export type TraceTerminalReader = (paneId: string, signal: AbortSignal) => Promi
 export interface DevinSessionRead {
   position: unknown;
   events: TraceEvent[];
+  /**
+   * Set when the window's first step alone exceeds the budget: `position` is
+   * already past it and `events` is empty. The seam reports the typed
+   * `record_exceeds_budget` failure with the advanced cursor so the next
+   * cadence resumes after the step instead of refusing it forever.
+   */
+  skipped?: { step: number; bytes: number };
 }
 
 export type DevinSessionReader = (sessionId: string, position: unknown, signal: AbortSignal) => Promise<DevinSessionRead>;
@@ -331,9 +338,20 @@ async function readPi(identity: TraceSourceIdentity, prior: TraceCursor | undefi
     index = newline + 1;
     position += bytes;
   }
-  // A record whose terminator lies beyond a full window can never fit one.
+  // A record whose terminator lies beyond a full window can never fit one, at
+  // this cadence or any later one. Report it once and step the cursor past it,
+  // or every subsequent cadence re-refuses the same offset and reviews stay
+  // dark for the rest of the run. A record still unterminated at EOF is being
+  // written; it keeps the cursor pinned until it lands.
   if (index === 0 && body.length === TRACE_WINDOW_MAX_BYTES) {
-    return failure(source, prior, "record_exceeds_budget", { offset: position, bytes: body.length });
+    const skipped = await skipOversizedPiRecord(reader, path, from.offset + body.length, buffer.subarray(Math.max(0, buffer.length - PI_CURSOR_ANCHOR_BYTES)), signal);
+    if (skipped === "unreadable") return failure(source, prior, "source_unreadable");
+    if (signal.aborted) return failure(source, prior, "aborted");
+    if (skipped === undefined) return failure(source, prior, "record_exceeds_budget", { offset: position, bytes: body.length });
+    return {
+      ...failure(source, prior, "record_exceeds_budget", { offset: position, bytes: skipped.end - position, skipped: true }),
+      cursorTo: { source, offset: skipped.end, anchor: sha256Hex(skipped.tail) },
+    };
   }
 
   const cursorTo: TraceCursor = {
@@ -342,6 +360,51 @@ async function readPi(identity: TraceSourceIdentity, prior: TraceCursor | undefi
     anchor: position === 0 ? "" : sha256Hex(buffer.subarray(Math.max(bufferStart, position - PI_CURSOR_ANCHOR_BYTES) - bufferStart, position - bufferStart)),
   };
   return { source, cursorFrom: prior, cursorTo, events, byteCount: position - from.offset };
+}
+
+/** Forward scan while stepping over an oversized record; larger than a window so a multi-megabyte record costs few reads. */
+const PI_SKIP_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Find the terminator of the oversized record that starts before `scanFrom`.
+ * Returns the offset just past its newline together with the ≤1 KiB of bytes
+ * preceding that offset (the next cursor's anchor), `undefined` when the file
+ * ends first, or `"unreadable"` when the reader refuses.
+ */
+async function skipOversizedPiRecord(
+  reader: TraceFileRangeReader,
+  path: string,
+  scanFrom: number,
+  tail: Uint8Array,
+  signal: AbortSignal,
+): Promise<{ end: number; tail: Uint8Array } | "unreadable" | undefined> {
+  let offset = scanFrom;
+  let recent = tail;
+  for (;;) {
+    if (signal.aborted) return undefined;
+    let chunk: Uint8Array;
+    try {
+      chunk = await reader(path, offset, PI_SKIP_SCAN_CHUNK_BYTES, signal);
+    } catch {
+      return "unreadable";
+    }
+    const newline = chunk.indexOf(NEWLINE);
+    if (newline !== -1) {
+      const joined = concatBytes(recent, chunk.subarray(0, newline + 1));
+      return { end: offset + newline + 1, tail: joined.subarray(Math.max(0, joined.length - PI_CURSOR_ANCHOR_BYTES)) };
+    }
+    if (chunk.length < PI_SKIP_SCAN_CHUNK_BYTES) return undefined;
+    const joined = concatBytes(recent, chunk);
+    recent = joined.subarray(Math.max(0, joined.length - PI_CURSOR_ANCHOR_BYTES));
+    offset += chunk.length;
+  }
+}
+
+function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
+  const out = new Uint8Array(left.length + right.length);
+  out.set(left, 0);
+  out.set(right, left.length);
+  return out;
 }
 
 function validEvent(value: unknown): value is TraceEvent {
@@ -376,6 +439,16 @@ async function readDevin(identity: TraceSourceIdentity, prior: TraceCursor | und
   const byteCount = result.events.reduce((total, event) => total + event.bytes, 0);
   if (byteCount > TRACE_WINDOW_MAX_BYTES) {
     return failure(source, prior, "window_exceeds_budget", { bytes: byteCount });
+  }
+  if (result.skipped !== undefined) {
+    const { step, bytes } = result.skipped;
+    if (result.events.length !== 0 || !Number.isSafeInteger(step) || !Number.isSafeInteger(bytes)) {
+      return failure(source, prior, "source_malformed", { reason: "adapter_window" });
+    }
+    return {
+      ...failure(source, prior, "record_exceeds_budget", { step, bytes, skipped: true }),
+      cursorTo: { source, position: result.position },
+    };
   }
   return {
     source,

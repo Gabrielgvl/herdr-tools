@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { EffectiveContext } from "../../src/context.js";
-import { createHandoffAllocator, updateHandoffState } from "../../src/handoff.js";
+import { createHandoffAllocator, updateHandoffState, handoffOwners, readHandoffProvenance, writeHandoffProvenance } from "../../src/handoff.js";
 import { createHandoffGate } from "../../src/handoff-gate.js";
 import { resumeHandoff } from "../../src/handoff-resume.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
@@ -105,6 +105,18 @@ describe("read-only handoff recovery", () => {
       replayed: false,
       ownershipTransferred: false
     });
+  });
+
+  it("observes v2 through the last open owner, never the immutable original manager", async () => {
+    const { run, caller } = await fixture();
+    const original = await readHandoffProvenance(run);
+    const at = new Date().toISOString();
+    await writeHandoffProvenance(run, { ...original, v: 2, owners: [
+      ...handoffOwners(original).map((entry) => ({ ...entry, to: at })),
+      { session: session("/sessions/successor.jsonl"), from: at, to: null, reason: "transfer" },
+    ] });
+    await expect(resumeHandoff(run, context("w1:p9", "/sessions/successor.jsonl"))).resolves.toMatchObject({ observationOnly: true });
+    await expect(resumeHandoff(run, caller)).rejects.toMatchObject({ code: "HANDOFF_OWNER_MISMATCH" });
   });
 
   it("refuses a missing, different, or duplicate native manager session", async () => {

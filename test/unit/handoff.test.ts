@@ -8,6 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import {
   createHandoffAllocator,
+  currentHandoffOwner,
+  handoffOwners,
+  writeHandoffProvenance,
   HANDOFF_ARTIFACT_NAME,
   HANDOFF_HEADINGS,
   HANDOFF_MAX_BYTES,
@@ -533,6 +536,30 @@ describe("provenance record", () => {
     expect((await readdir(run.toolsDir)).sort()).toEqual(["lock", "provenance.json", "state.json"]);
     // The state record is untouched by the addition.
     expect((await readHandoffState(run)).runId).toBe(run.runId);
+  });
+
+  it("reads strict v1 as single-owner history and wraps it in v2 without changing launch data", async () => {
+    const allocator = allocatorFor(await root());
+    const run = await allocator.allocate();
+    await allocator.persist(run, provenanceIdentity, provenanceInput);
+    const original = await readHandoffProvenance(run);
+    const first = { session: managerSession, from: original.createdAt, to: null, reason: "launch" };
+    expect(handoffOwners(original)).toEqual([first]);
+    expect(currentHandoffOwner(original)).toEqual(managerSession);
+    expect(original).not.toHaveProperty("owners");
+    await writeFile(provenancePathFor(run), JSON.stringify({ ...original, owners: [first] }));
+    await expect(readHandoffProvenance(run)).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED" });
+    const next = { ...managerSession, value: "/successor.jsonl" };
+    const at = new Date().toISOString();
+    const upgraded = { ...original, v: 2 as const, owners: [{ ...first, to: at }, { session: next, from: at, to: null, reason: "transfer" }] };
+    await writeHandoffProvenance(run, upgraded);
+    expect(await readHandoffProvenance(run)).toEqual(upgraded);
+    expect(currentHandoffOwner(await readHandoffProvenance(run))).toEqual(next);
+    expect(upgraded.manager).toEqual(original.manager);
+    expect(upgraded.task).toEqual(original.task);
+    await expect(writeHandoffProvenance(run, { ...upgraded, owners: [{ ...upgraded.owners[0]!, session: next }, upgraded.owners[1]!] })).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED" });
+    await expect(writeHandoffProvenance(run, { ...upgraded, owners: [first, ...upgraded.owners] })).rejects.toMatchObject({ code: "HANDOFF_STORE_FAILED" });
+    expect(await readHandoffProvenance(run)).toEqual(upgraded);
   });
 
   it("records a null session for a caller with no native session", async () => {

@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type * as SupervisionRegistryModule from "../../src/supervision/registry.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -23,7 +23,6 @@ vi.mock("../../src/supervision/registry.js", async (importOriginal) => {
 import extension, { CORE_TOOL_NAMES, createPreflight, createRuntime, notificationForJob, readInjectedContext } from "../../index.js";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
-import { SupervisionRegistry } from "../../src/supervision/registry.js";
 
 const original = {
   env: process.env.HERDR_ENV,
@@ -73,40 +72,23 @@ describe("global extension registration", () => {
   it("is completely inert when HERDR_ENV is not 1", () => {
     delete process.env.HERDR_ENV;
     const { pi, tools, commands, handlers } = fakePi();
-    extension(pi);
+    extension();
     expect(tools).toEqual([]);
     expect(commands).toEqual([]);
     expect(handlers).toEqual([]);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 
-  it("registers exactly the seven core tools and no deferred aliases", () => {
+  it("registers nothing even when enabled — Pi reaches the three daemon tools through the executor MCP gateway (C7)", () => {
     enable();
     const { pi, tools, commands, handlers } = fakePi();
-    extension(pi);
-    expect(tools.map((tool) => (tool as { name: string }).name)).toEqual([...CORE_TOOL_NAMES]);
-    expect(tools).toHaveLength(7);
-    expect(tools.filter((tool) => ["herdr_communicate", "herdr_pane", "herdr_tab"].includes((tool as { name: string }).name)).map((tool) => (tool as { executionMode?: string }).executionMode)).toEqual(["sequential", "sequential", "sequential"]);
-    expect(tools.filter((tool) => !["herdr_communicate", "herdr_pane", "herdr_tab"].includes((tool as { name: string }).name)).some((tool) => "executionMode" in (tool as object))).toBe(false);
-    expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_command");
-    expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_workspace");
-    expect(tools.map((tool) => (tool as { name: string }).name)).not.toContain("herdr_admin");
-    expect(commands.map((command) => command.name)).toEqual(["herdr-waits"]);
-    expect(handlers.map((entry) => entry.event)).toEqual(["session_shutdown", "session_start"]);
-    expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
-  });
-
-  it("registers a read-only active-waits toggle command", async () => {
-    enable();
-    const { pi, commands } = fakePi();
-    extension(pi);
-    const notify = vi.fn();
-    const context = { hasUI: true, ui: { notify, setStatus: vi.fn(), setWidget: vi.fn() } } as unknown as ExtensionContext;
-    const handler = commands[0]?.definition.handler as unknown as (args: string, context: ExtensionContext) => Promise<void>;
-    await handler("", context);
-    expect(notify).toHaveBeenLastCalledWith("Herdr active waits shown", "info");
-    await handler("", context);
-    expect(notify).toHaveBeenLastCalledWith("Herdr active waits hidden", "info");
+    extension();
+    // The universal surface is exactly the three daemon proxies; the Pi
+    // extension itself is a no-op — no tools, commands, or session handlers.
+    expect([...CORE_TOOL_NAMES]).toEqual(["herdr_launch", "herdr_run", "herdr_status"]);
+    expect(tools).toEqual([]);
+    expect(commands).toEqual([]);
+    expect(handlers).toEqual([]);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 
@@ -116,9 +98,9 @@ describe("global extension registration", () => {
     expect(missing).toEqual({ context: {}, idsPresent: false, idsValid: true });
     process.env.HERDR_PANE_ID = "bad\nvalue";
     expect(readInjectedContext()).toMatchObject({ idsPresent: false, idsValid: false, context: {} });
-    const { pi, tools } = fakePi();
-    extension(pi);
-    expect(tools).toHaveLength(7);
+    const { tools } = fakePi();
+    extension();
+    expect(tools).toEqual([]);
   });
 
   it("constructs production runtime dependencies without reading settings or calling Herdr", async () => {
@@ -283,36 +265,13 @@ describe("global extension registration", () => {
     expect((pi.sendMessage as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 
-  it("resets only in-memory ownership on every session transition", async () => {
+  it("registers no session handlers — the daemon owns the lifecycle now (C7)", async () => {
     enable();
-    const reset = vi.spyOn(RuntimeOwnership.prototype, "reset");
     const { pi, handlers } = fakePi();
-    extension(pi);
-    const shutdown = handlers.find((entry) => entry.event === "session_shutdown")?.handler;
-    const start = handlers.find((entry) => entry.event === "session_start")?.handler;
-    expect(shutdown).toBeDefined();
-    expect(start).toBeDefined();
-    await shutdown?.({} as never, {} as never);
-    await start?.({} as never, {} as never);
-    expect(reset).toHaveBeenCalledTimes(2);
+    extension();
+    // The daemon survives client restarts, so there is no per-session Pi state
+    // to reset or monitor: no handler may be registered for either transition.
+    expect(handlers).toEqual([]);
     expect((pi.exec as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
-  });
-
-  it("gives every session a fresh supervision monitor so a later launch can still reserve", async () => {
-    enable();
-    const beginSession = vi.spyOn(SupervisionRegistry.prototype, "beginSession");
-    const shutdownSupervision = vi.spyOn(SupervisionRegistry.prototype, "shutdown");
-    const { pi, handlers } = fakePi();
-    extension(pi);
-    const shutdown = handlers.find((entry) => entry.event === "session_shutdown")?.handler;
-    const start = handlers.find((entry) => entry.event === "session_start")?.handler;
-    await shutdown?.({} as never, {} as never);
-    expect(shutdownSupervision).toHaveBeenCalledTimes(1);
-    // The next session must not inherit the stopped monitor: without this every
-    // later herdr_launch would refuse at supervision reservation.
-    await start?.({} as never, { modelRegistry: { find: () => undefined, getAll: () => [], getApiKeyAndHeaders: async () => ({ ok: false, error: "none" }) } } as never);
-    expect(beginSession).toHaveBeenCalledTimes(1);
-    beginSession.mockRestore();
-    shutdownSupervision.mockRestore();
   });
 });

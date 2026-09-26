@@ -1,0 +1,23 @@
+{
+  "comment": "Prepared-not-installed executor gateway registration for the Herdr tools MCP server (N3.4). Keys are the executor tool paths to call; activation is the N5.3 cutover — see deploy/executor/README. Nothing in this file has been registered anywhere.",
+  "tools.executor.mcp.addServer": {
+    "transport": "stdio",
+    "name": "Herdr Tools",
+    "slug": "herdr",
+    "command": "/home/gabriel/.volta/bin/node",
+    "args": ["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"],
+    "env": {
+      "HERDR_ENV": "1",
+      "HERDR_SOCKET_PATH": "/home/gabriel/.config/herdr/herdr.sock",
+      "HERDR_EXECUTOR_DELEGATED": "1"
+    },
+    "spawnPerCall": false,
+    "authenticationTemplate": [{ "slug": "none", "kind": "none" }]
+  },
+  "tools.executor.coreTools.connections.create": {
+    "owner": "org",
+    "name": "default",
+    "integration": "herdr",
+    "template": "none"
+  }
+}

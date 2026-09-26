@@ -7,6 +7,7 @@
  */
 
 import { createTargetGenerationRef } from "../wait-target-evidence.js";
+import type { AgentSessionIdentity } from "../messages/prompt.js";
 import type { JobGeneration, JobRegistry, SupervisionReservationDigest, SupervisionWorkspaceRoot, SupervisorJobRequestSnapshot } from "../job-registry.js";
 import type { Settings } from "../settings.js";
 import { SessionEventMonitor, type SupervisionMonitorDependencies } from "./monitor.js";
@@ -18,6 +19,8 @@ import { buildWorkspaceView, createNodeWorkspaceRunner, type WorkspaceCommandRun
 import type { SupervisionModelService } from "./model-service.js";
 import type { ProvisionalSupervisionBinding, SupervisedIdentity } from "./identity.js";
 import type { SelfCloseTracker } from "./self-close.js";
+import type { IdleHintSink } from "../daemon/hints.js";
+import type { MailboxEventWriter } from "../daemon/mailbox.js";
 import type { HandoffGate, HandoffRun } from "../handoff-gate.js";
 import { TRACE_FALLBACK_CURSOR_MAX_LINES } from "./trace-source.js";
 import {
@@ -83,6 +86,12 @@ export interface SupervisionRegistryDependencies {
    * without one still gates outcomes but never fences a repair attempt.
    */
   repairPrompt?: (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
+  /**
+   * The daemon's §11 idle-hint sink (N2.5), forwarded to every supervisor it
+   * reserves: fired once per persisted mailbox event against the run's
+   * current owner. Absent hosts emit no hints.
+   */
+  hints?: IdleHintSink;
   clock?: { now(): number };
   scheduler?: SupervisionScheduler;
   /** The reserve-time and cadence workspace command seam. */
@@ -97,6 +106,18 @@ export interface SupervisionReservationSettings {
   supervisionDigest?: SupervisionReservationDigest;
   /** The trusted launch workspace root the workspace evidence reads; never the supervisor's own cwd. */
   workspaceRoot?: SupervisionWorkspaceRoot;
+  /**
+   * The trusted root the review log appends under (D4/N2.3). Reattached runs
+   * pass the verified project root or the endpoint namespace; absent keeps the
+   * host's `HERDR_PROJECT_DIR`/cwd anchor. Never part of the job snapshot —
+   * it is a trusted-path seam, not request evidence.
+   */
+  reviewLogRoot?: string;
+  /**
+   * The N2.2 owner-mailbox writer a reattached run's supervisor persists events
+   * through. Absent hosts never persist.
+   */
+  eventWriter?: MailboxEventWriter;
 }
 
 export interface SupervisionReserveRequest {
@@ -213,6 +234,8 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         child: { ...request.child },
         ...(supervisionDigest === undefined ? {} : { assignmentDigest: supervisionDigest }),
         ...(request.settings?.workspaceRoot === undefined ? {} : { workspaceRoot: request.settings.workspaceRoot }),
+        ...(request.settings?.reviewLogRoot === undefined ? {} : { reviewLogRoot: request.settings.reviewLogRoot }),
+        ...(request.settings?.eventWriter === undefined ? {} : { eventWriter: request.settings.eventWriter }),
         ...(workspaceBase === undefined ? {} : { workspaceBase }),
         workspaceRunner: this.workspaceRunner,
         monitor,
@@ -224,6 +247,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         ...(this.deps.selfClose ? { selfClose: this.deps.selfClose } : {}),
         ...(this.deps.handoffs ? { handoffs: this.deps.handoffs } : {}),
         ...(this.deps.repairPrompt ? { repairPrompt: this.deps.repairPrompt } : {}),
+        ...(this.deps.hints === undefined ? {} : { hints: this.deps.hints }),
         readTranscript: this.deps.readTranscript,
         ...(this.deps.idFactory ? { idFactory: this.deps.idFactory } : {}),
         update,
@@ -298,6 +322,21 @@ export class SupervisionRegistry implements SupervisionCoordinator {
       onCompletionSignal: (signal) => bound.onCompletionSignal(signal),
       release: (reason) => bound.release(reason),
     };
+  }
+
+  /**
+   * N2.5 wiring seam: re-target the hint destination — the recorded owner a
+   * bound supervisor hints and D5-pauses on — of every live supervisor bound
+   * to one of `runIds`. The §8 ownership journal calls this after its durable
+   * steps land, so the next hint lands on the verified successor pane; it is
+   * in-memory only and replay-safe (D4 rebinds the owner from the sidecar).
+   */
+  retargetHintDestinations(runIds: readonly string[], successor: { paneId: string; session: AgentSessionIdentity | null }): void {
+    const wanted = new Set(runIds);
+    for (const supervisor of this.supervisors) {
+      const runId = supervisor.boundRunId();
+      if (runId !== undefined && wanted.has(runId)) supervisor.retargetOwner(successor);
+    }
   }
 
   /** Stop every supervisor and close the connection. Manager-session shutdown only. */

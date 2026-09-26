@@ -1,0 +1,13 @@
+--- a/~/.config/devin/mcp_config.json
++++ b/~/.config/devin/mcp_config.json
+@@ -1,10 +1,5 @@
+ {
+   "mcpServers": {
+-    "herdr": {
+-      "command": "/home/gabriel/.volta/tools/image/node/25.9.0/bin/node",
+-      "args": ["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"],
+-      "transport": "stdio"
+-    },
+     "executor": {
+       "command": "/home/gabriel/.volta/bin/executor",
+       "args": ["mcp", "--scope", "/home/gabriel/.local/share/executor", "--elicitation-mode", "model", "--no-artifacts"],

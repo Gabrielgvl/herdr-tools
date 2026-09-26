@@ -29,6 +29,11 @@ const HOTFIX_CASE_KINDS: Record<string, "pi" | "claude"> = {
 
 type HotfixHost = "pi" | "mcp";
 
+const HOTFIX_TOOL_SMOKE: Record<HotfixHost, readonly string[]> = {
+  pi: ["herdr_inspect", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_launch", "herdr_pane", "herdr_tab"],
+  mcp: ["herdr_launch", "herdr_run", "herdr_status"]
+};
+
 function record(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${label} is not an object`);
   return value as Record<string, unknown>;
@@ -81,10 +86,11 @@ export function validateHotfixReceipt(value: unknown, host: HotfixHost): void {
     throw new Error(`${host} receipt is not a passed ${HOTFIX_LABEL} receipt`);
   }
   exactStrings(receipt.mandatoryCases, HOTFIX_MANDATORY_CASES, `${host} mandatoryCases`);
-  exactStrings(receipt.toolSmoke, ["herdr_inspect", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_launch", "herdr_pane", "herdr_tab"], `${host} toolSmoke`);
+  exactStrings(receipt.toolSmoke, HOTFIX_TOOL_SMOKE[host], `${host} toolSmoke`);
   if (typeof receipt.mcpPollingDifference !== "string" || receipt.mcpPollingDifference.length === 0) throw new Error(`${host} receipt omitted host qualification notes`);
   if (!Array.isArray(receipt.receipts)) throw new Error(`${host} receipt omitted case receipts`);
   const cases = new Set<string>();
+  let receiptSession: string | undefined;
   for (const item of receipt.receipts) {
     const caseReceipt = record(item, `${host} case receipt`);
     if (typeof caseReceipt.case !== "string" || cases.has(caseReceipt.case)) throw new Error(`${host} case receipts are missing or duplicated`);
@@ -92,7 +98,9 @@ export function validateHotfixReceipt(value: unknown, host: HotfixHost): void {
     if (caseReceipt.effect !== "confirmed" || caseReceipt.source !== "recipient-generated" || caseReceipt.requestCount !== 1 || caseReceipt.actualCommandExitCode !== 0) {
       throw new Error(`${host}/${caseReceipt.case} is not an exact confirmed receipt`);
     }
-    if (caseReceipt.observedBodySource !== "recipient-body-file" || caseReceipt.session !== REQUIRED_SESSION) {
+    nonPlaceholder(caseReceipt.session, `${host}/${caseReceipt.case} session`);
+    if (receiptSession === undefined) receiptSession = caseReceipt.session as string;
+    if (caseReceipt.observedBodySource !== "recipient-body-file" || caseReceipt.session !== receiptSession) {
       throw new Error(`${host}/${caseReceipt.case} is missing recipient body/session provenance`);
     }
     nonPlaceholder(caseReceipt.commandExitFilePath, `${host}/${caseReceipt.case} commandExitFilePath`);

@@ -41,7 +41,7 @@ signed-in ChatGPT session, cookies, and browser automation through `oracle serve
 - Keep the remote token only in the mode-`0600` user config or
   `ORACLE_REMOTE_TOKEN`. Never place it in a skill, prompt, `AGENTS.md`, shell
   example, log, repository, or CLI argv.
-- Oracle 0.18.0 resolves remote routing as CLI flags >
+- Oracle 0.21.3 resolves remote routing as CLI flags >
   `config.browser.remoteHost`/`remoteToken` > environment. Merely exporting
   `ORACLE_REMOTE_HOST`/`ORACLE_REMOTE_TOKEN` does not override a conflicting
   `$ORACLE_HOME_DIR/config.json`. For automated runners that load a nonstandard
@@ -56,7 +56,9 @@ signed-in ChatGPT session, cookies, and browser automation through `oracle serve
 - Use `--engine browser` explicitly so an API key in the caller environment
   cannot redirect the run to a billable API path.
 
-The Linux client and Mac service are validated together on Oracle `0.18.0`.
+The Linux client and Mac service are currently validated together on Oracle `0.21.3`.
+Treat that as an observed deployment version, not a permanent pin: before every run,
+require exact client/server equality and update both sides together when upgrading.
 The Mac service uses its own isolated persistent profile at
 `/Users/gabrieldelima/.oracle-authenticated-browser` and exposes the authenticated
 `/health` endpoint on port `9473`. Never point Oracle at
@@ -79,7 +81,10 @@ Preflight is one bounded gate. On failure, report and stop; do not hunt builds, 
 poll inside the review. Repair is separate owner-authorized work, and review resumes only after fresh
 version equality and parser proof.
 
-### macOS passkey and picker regressions
+### macOS passkey, picker, and remote-browser regressions
+
+- A remote service started with `--manual-login` may launch a visible persistent-profile Chrome even when the Linux request asks for `--browser-hide-window`. The Oracle task requires that exact window to remain open until completion; closing it produces `Chrome window closed before oracle finished`. Do not close or repurpose it mid-run. If picker automation fails before submit, retry the same request at most once with the CLI-suggested strategy only when the already-selected model is independently known; never use `current` to bypass required model evidence.
+- In Oracle 0.21.3, `--browser-research search|deep` is a local-browser pilot and is rejected with `--remote-host`. Do not add it to Gabriel's remote bridge commands; attach current official sources instead. Use `--browser-inline-files` for small text-only packets when attachment upload readiness stalls, and keep total inline content comfortably below the CLI's ~60k-character threshold.
 
 - `Entendido` alongside real options (`Recente`, `GPT-5.6 Sol`, etc.) can be the Portuguese request-rate modal, not a coachmark or matcher bug. Inspect the dialog text: `Excesso de solicitações`, `solicitações rápido demais`, or `Limitamos temporariamente o acesso às suas conversas` is a real transient throttle. Detect it as `chatgpt-throttled`, do not dismiss/bypass it, close orphan tabs, wait for cooldown, and retry only a claim proven pre-submit. Keep `Latest`/`Recente`; do not add a model fallback.
 - Hidden macOS runs have three independent focus paths. A Linux-side `--browser-hide-window` is insufficient because the remote service strips client host-control fields. Start the Mac host with `oracle serve --browser-hide-window`, and resolve serve options with Commander's `optsWithGlobals()`—when the same option exists globally and on `serve`, the action's child-only options report `browserHideWindow=false` even though argv contains the flag. Launch headful Chrome through LaunchServices with `open -g -n ... --args` plus the off-screen position; raw Chrome spawn activates the app. Create isolated tabs with browser-level `Target.createTarget({ background: true })`; the `/json/new`/`CDP.New` endpoint activates even an already-running off-screen Chrome. Do not call `Page.bringToFront()` before trusted clicks. Verify with a live frontmost-app monitor spanning both a fresh service/Chrome launch and a complete Oracle request; process argv or off-screen geometry alone is not proof. For batch reviewers, use one active session and keep starts at least 600 seconds apart; 300-second starts empirically triggered the Portuguese rate modal on roughly every third request.

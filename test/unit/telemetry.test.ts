@@ -34,8 +34,8 @@ async function root(): Promise<string> {
 
 function entry(overrides: Partial<ToolTelemetryEntry> = {}): ToolTelemetryEntry {
   return {
-    tool: "herdr_tab",
-    operation: "create",
+    tool: "herdr_run",
+    operation: "observe",
     phases: { validate: "success", execute: "success", persist: "success" },
     durationMs: 7,
     effectCertainty: "confirmed",
@@ -127,7 +127,7 @@ describe("tool operation telemetry", () => {
     const project = await root();
     const dirty = { ...entry(), rawArgs: { token: "raw-secret" }, transcript: "raw-transcript" } as ToolTelemetryEntry;
     await appendToolTelemetry(dirty, { root: project, now: () => new Date("2026-09-20T10:00:00.000Z"), waitMs: 1_000 });
-    await appendToolTelemetry(entry({ operation: "close", phases: { validate: "success", execute: "failure", persist: "success" }, effectCertainty: "unknown" }), { root: project, deadlineMs: 10_000 });
+    await appendToolTelemetry(entry({ operation: "ack", phases: { validate: "success", execute: "failure", persist: "success" }, effectCertainty: "unknown" }), { root: project, deadlineMs: 10_000 });
 
     const paths = toolTelemetryPaths(project);
     const content = await readFile(paths.records, "utf8");
@@ -137,8 +137,8 @@ describe("tool operation telemetry", () => {
     const record = JSON.parse(lines[0]!) as ToolTelemetryRecord;
     expect(record).toEqual({
       timestamp: "2026-09-20T10:00:00.000Z",
-      tool: "herdr_tab",
-      operation: "create",
+      tool: "herdr_run",
+      operation: "observe",
       phases: { validate: "success", execute: "success", persist: "success" },
       durationMs: 7,
       effectCertainty: "confirmed",
@@ -170,14 +170,14 @@ describe("tool operation telemetry", () => {
   });
 
   it("derives only closed operations, durations, and effect certainties", () => {
-    expect(telemetryOperation("herdr_inspect", {}, true)).toBe("context");
-    expect(telemetryOperation("herdr_inspect", { mode: "health" }, true)).toBe("health");
-    expect(telemetryOperation("herdr_wait", {}, true)).toBe("wait");
     expect(telemetryOperation("herdr_launch", {}, true)).toBe("launch");
-    expect(telemetryOperation("herdr_tab", { operation: "close" }, true)).toBe("close");
-    expect(telemetryOperation("herdr_tab", { operation: "raw-secret" }, true)).toBe("unknown");
-    expect(telemetryOperation("herdr_tab", null, true)).toBe("unknown");
-    expect(telemetryOperation("herdr_tab", { operation: "close" }, false)).toBe("invalid");
+    expect(telemetryOperation("herdr_status", {}, true)).toBe("status");
+    expect(telemetryOperation("herdr_status", { eventId: "evt-1" }, true)).toBe("status");
+    expect(telemetryOperation("herdr_run", { action: "ack" }, true)).toBe("ack");
+    expect(telemetryOperation("herdr_run", { action: "observe" }, true)).toBe("observe");
+    expect(telemetryOperation("herdr_run", { action: "raw-secret" }, true)).toBe("unknown");
+    expect(telemetryOperation("herdr_run", null, true)).toBe("unknown");
+    expect(telemetryOperation("herdr_run", { action: "ack" }, false)).toBe("invalid");
     expect(monotonicDurationMs(10, 10)).toBe(0);
     expect(monotonicDurationMs(10, 10.1)).toBe(1);
     expect(monotonicDurationMs(0, Number.MAX_SAFE_INTEGER + 10)).toBe(Number.MAX_SAFE_INTEGER);

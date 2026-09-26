@@ -6,22 +6,27 @@ import { skillTreeDigest } from "../../src/profiles/index.js";
 
 const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
 
-describe("manager raw CLI fallback policy", () => {
-  it("keeps fallback owner-gated, bounded, and pinned across loaded copies", async () => {
+describe("manager three-tool surface policy", () => {
+  it("prescribes only the daemon-proxy surface and pins it across loaded copies", async () => {
     const canonicalPath = join(packageRoot, "herdr-profiles/role-plugins/manager/skills/manager");
     const loadedPath = join(packageRoot, "herdr-profiles/profile-plugins/manager/skills/manager");
     const canonical = await readFile(join(canonicalPath, "SKILL.md"), "utf8");
     expect(await readFile(join(loadedPath, "SKILL.md"), "utf8")).toBe(canonical);
 
     expect(canonical).toContain("Prefer the typed Herdr MCP namespace");
-    expect(canonical).toContain("If typed Herdr capability is unavailable or incompatible, raw `herdr` CLI fallback through the host's owner-gated shell tool is permitted only when the owner directly authorizes it for the current task.");
-    expect(canonical).not.toContain("Use only the typed Herdr MCP namespace");
-    expect(canonical).not.toContain("Never drive Herdr through Bash, a raw `herdr` command");
-    expect(canonical).not.toContain("Communicate only through `herdr_communicate` and `herdr_launch`");
-    expect(canonical).toContain("authorized raw-CLI fallback must preserve that envelope");
-    expect(canonical).toContain("Raw agent start cannot mint a typed supervisor job: disclose missing typed auto-supervisor coverage, use only available native bounded wait/review support, and never claim equivalence with typed supervision.");
+    expect(canonical).toContain("Use exactly these three operations: `herdr_launch`, `herdr_run`, and `herdr_status`.");
+    // The daemon has no CLI caller path; the only sanctioned shell use is the
+    // C8 follow-up recipe, which never touches daemon state.
+    expect(canonical).toContain("there is no CLI equivalent");
+    expect(canonical).toContain("`herdr agent prompt <TARGET> <TEXT>`");
+    expect(canonical).toContain("executor→MCP gateway");
+    // No removed tool may be prescribed, and no raw-CLI fallback for daemon
+    // operations may remain.
+    for (const removed of ["herdr_inspect", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_pane", "herdr_tab"]) {
+      expect(canonical).not.toContain(removed);
+    }
+    expect(canonical).not.toContain("raw `herdr` CLI fallback");
     expect(canonical).toContain("Never delegate Herdr work to a native subagent or the `Task` tool");
-    expect(canonical).toContain("Do not retry, add escalation keys");
     expect(canonical).toContain("PROMPT_UNCONFIRMED");
     expect(canonical).toContain("Do not relaunch, resend the Task, auto-send Enter");
     expect(canonical).not.toContain("--stdin");

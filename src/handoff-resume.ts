@@ -1,6 +1,7 @@
 import { resolveManagerSession, type EffectiveContext } from "./context.js";
 import {
   HandoffError,
+  currentHandoffOwner,
   readHandoffArtifact,
   readHandoffProvenance,
   readHandoffState,
@@ -38,10 +39,11 @@ export async function resumeHandoff(run: HandoffAllocation, caller: EffectiveCon
   if (managerSession === null) refuse("MANAGER_SESSION_UNAVAILABLE", "Native manager session is unavailable");
 
   const provenance = await readHandoffProvenance(run);
-  if (provenance.manager.session === null) {
+  const owner = currentHandoffOwner(provenance);
+  if (owner === null) {
     refuse("HANDOFF_PROVENANCE_MISSING", "This run has no native manager-session provenance");
   }
-  if (!sameSession(managerSession, provenance.manager.session)) {
+  if (!sameSession(managerSession, owner)) {
     refuse("HANDOFF_OWNER_MISMATCH", "A different native manager session owns this run; no takeover occurred");
   }
 

@@ -239,6 +239,44 @@ function provisionalCause(h: Harness): unknown {
   return h.supervisor.view().events.at(-1)?.details?.cause;
 }
 
+describe("daemon ownership seams", () => {
+  it("fails closed on malformed owner sessions, supports pane-only owners, and accepts exact native owners", () => {
+    const h = harness();
+    // The no-owner branch is defensive: production callers short-circuit it.
+    const probe = h.supervisor as unknown as {
+      owner: { paneId: string; session: typeof session | null } | undefined;
+      ownerPresent(snapshot: HerdrSnapshot): boolean;
+    };
+    expect(probe.ownerPresent(snapshot([]))).toBe(true);
+    probe.owner = { paneId: "manager", session: null };
+    expect(probe.ownerPresent(snapshot([]))).toBe(false);
+    expect(probe.ownerPresent(snapshot([paneRecord({ paneId: "manager" })]))).toBe(true);
+    probe.owner = { paneId: "manager", session };
+    expect(probe.ownerPresent(snapshot([paneRecord({ agentSession: { source: "incomplete" } })]))).toBe(false);
+    expect(probe.ownerPresent(snapshot([paneRecord({ agentSession: null })]))).toBe(false);
+    expect(probe.ownerPresent(snapshot([paneRecord({ agentSession: { ...session, value: "/other" } })]))).toBe(false);
+    expect(probe.ownerPresent(snapshot([paneRecord()]))).toBe(true);
+  });
+
+  it("carries the recorded owner through provisional-to-exact strengthening", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "herdr-strengthen-owner-"));
+    const allocation = await createHandoffAllocator({ namespace: { dir, endpoint: "test" } }).allocate();
+    const h = harness({ child: { agentName: "worker", agentKind: "agy", operatingPointId: "researcher-agy" },
+      snapshots: [snapshot([agyPaneRecord()], [agyAgentRecord()]), agyExactSnapshot()],
+    });
+    try {
+      await bindAgy(h);
+      await h.supervisor.strengthen({ identity: exactAgyIdentity, operatingPointId: "researcher-agy",
+        handoff: { allocation, owner: { paneId: "manager", session } },
+      });
+      expect(h.supervisor.view()).toMatchObject({ reviewer: { paused: true } });
+    } finally {
+      h.supervisor.shutdown();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("target-local snapshot evidence", () => {
   it("distinguishes valid uniqueness, absence, and invalid local topology", () => {
     expect(classifySnapshotTarget(snapshot([paneRecord()]), "p1")).toMatchObject({ kind: "unique", occupant: { pane: { paneId: "p1" }, agentPresent: true, agentName: "worker" } });
@@ -330,6 +368,41 @@ describe("supervisor binding", () => {
     expect(h.supervisor.childLive()).toBe(true);
   });
 
+  it("carries the provider reset signal and auto-recovery evidence on the provider_limit event", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord()])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    h.supervisor.onCompletionSignal(async () => ({
+      cooldownRecorded: true,
+      retryNotBefore: "2026-09-24T13:00:00.000Z",
+      autoRecovery: { outcome: "relaunched", launchId: "launch-2", target: "task-abcd-1", operatingPointId: "worker-agy", supervisorJobId: "job-2" }
+    }));
+    await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(true));
+    expect(h.wakes.find((wake) => wake.event.type === "provider_limit")?.event).toMatchObject({
+      priority: "high",
+      details: {
+        code: "PROVIDER_LIMIT",
+        operatingPointId: "worker-pi",
+        retryNotBefore: "2026-09-24T13:00:00.000Z",
+        autoRecovery: "relaunched",
+        recoveryLaunchId: "launch-2",
+        recoveryTarget: "task-abcd-1",
+        recoveryOperatingPointId: "worker-agy",
+        recoverySupervisorJobId: "job-2",
+      }
+    });
+  });
+
+  it("carries a bounded failure code when the auto-recovery attempt did not relaunch", async () => {
+    const h = harness({ snapshots: [snapshot([paneRecord()])] });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    h.supervisor.onCompletionSignal(async () => ({ cooldownRecorded: true, autoRecovery: { outcome: "failed", code: "MUTATION_UNCERTAIN" } }));
+    await vi.waitFor(() => expect(h.wakes.some((wake) => wake.event.type === "provider_limit")).toBe(true));
+    const details = h.wakes.find((wake) => wake.event.type === "provider_limit")?.event.details;
+    expect(details).toMatchObject({ code: "PROVIDER_LIMIT", autoRecovery: "failed", recoveryCode: "MUTATION_UNCERTAIN" });
+    expect(details).not.toHaveProperty("recoveryTarget");
+    expect(details).not.toHaveProperty("retryNotBefore");
+  });
+
   it("surfaces an unreadable completion signal once without inventing a provider limit", async () => {
     const h = harness({ snapshots: [snapshot([paneRecord()])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
@@ -341,6 +414,67 @@ describe("supervisor binding", () => {
     expect(h.supervisor.childLive()).toBe(true);
     await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6 })));
     expect(h.wakes.filter((wake) => wake.event.type === "evidence_gap")).toHaveLength(1);
+  });
+
+  it("exhausts the completion-signal retries when the signal stays negative", async () => {
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    // The armed retry is the only timer whose callback re-schedules the signal.
+    const retryCall = () => timeouts.mock.calls.filter((entry) => String(entry[0]).includes("scheduleCompletionSignal")).at(-1);
+    try {
+      const h = harness({ snapshots: [snapshot([paneRecord()])] });
+      await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+      const signal = vi.fn().mockResolvedValue(false);
+      h.supervisor.onCompletionSignal(signal);
+      // Three attempts, two retries between them — fired directly rather than
+      // waiting 250ms — then the supervisor defers to the handoff-evaluation path.
+      for (const attempt of [1, 2, 3]) {
+        await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(attempt));
+        if (attempt === 3) break;
+        await vi.waitFor(() => expect(retryCall()).toBeDefined());
+        (retryCall()![0] as () => void)();
+      }
+    } finally {
+      timeouts.mockRestore();
+    }
+  });
+
+  it("clears a pending completion retry on settle, shutdown, and release", async () => {
+    const realSetTimeout = globalThis.setTimeout;
+    const timeouts = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: TimerHandler, ms?: number, ...args: unknown[]) =>
+      // The armed retry is the only timer whose callback re-schedules the
+      // signal; keep it pending so every clear path observes a live timer.
+      String(callback).includes("scheduleCompletionSignal")
+        ? ({ unref() {} } as unknown as NodeJS.Timeout)
+        : realSetTimeout(callback, ms, ...args)) as typeof setTimeout);
+    const retryCall = () => timeouts.mock.calls.some((entry) => String(entry[0]).includes("scheduleCompletionSignal"));
+    try {
+      const arm = async (signalValues: boolean[] = [false], extraSnapshots: HerdrSnapshot[] = []): Promise<Harness> => {
+        const h = harness({ snapshots: [snapshot([paneRecord()]), ...extraSnapshots] });
+        await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+        const signal = vi.fn().mockResolvedValue(false);
+        for (const value of signalValues) signal.mockResolvedValueOnce(value);
+        h.supervisor.onCompletionSignal(signal);
+        await vi.waitFor(() => expect(signal).toHaveBeenCalledTimes(1));
+        // The first failed attempt arms the 250ms retry — settle before it fires.
+        await vi.waitFor(() => expect(retryCall()).toBe(true));
+        return h;
+      };
+      // The settlement path clears the armed retry. A close settles without a
+      // status transition (which would clear the retry itself), and the
+      // settle-time record succeeding skips the inline wait so the retry is
+      // still pending when `settle` clears it.
+      const settled = await arm([false, true], [snapshot([], [])]);
+      await settled.supervisor.onEvent(thinEvent("pane_closed"));
+      expect(await settled.supervisor.run()).toMatchObject({ outcome: "released" });
+      // So does shutdown.
+      const stopped = await arm();
+      stopped.supervisor.shutdown();
+      // And release.
+      const released = await arm();
+      released.supervisor.release("test");
+    } finally {
+      timeouts.mockRestore();
+    }
   });
 
   it("checks an immediate terminal status and records a later completion only once", async () => {
@@ -3705,6 +3839,17 @@ describe("managed handoff evaluation", () => {
     const run = await gate.bind(allocation, identity);
     return { gate, h, allocation, run };
   }
+
+  it("still answers the bound run id after the gate drops the settled run", async () => {
+    const { gate, h, run } = await managed();
+    try {
+      expect(h.supervisor.boundRunId()).toBe(run.runId);
+      gate.drop(run);
+      expect(h.supervisor.boundRunId()).toBe(run.runId);
+    } finally {
+      h.supervisor.shutdown();
+    }
+  });
 
   it("wakes on a typed provider limit without re-prompting a live child", async () => {
     const prompts: string[] = [];

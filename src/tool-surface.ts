@@ -1,42 +1,23 @@
 import type { AgentToolResult, ExtensionContext, ToolExecutionMode } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
-import type { HerdrCli } from "./cli.js";
-import type { DevinQueueFlush } from "./messages/devin-queue-flush.js";
 import { preflightCompatibility, type CompatibilityPreflight, type HealthCli } from "./health.js";
-import type { JobRegistry } from "./job-registry.js";
-import type { RecipientRegistry } from "./messages/recipients.js";
-import type { AttachmentStore } from "./messages/store.js";
-import type { RuntimeOwnership } from "./ownership.js";
-import type { ProfileCatalog } from "./profiles/types.js";
-import type { WaitReviewer } from "./reviewer.js";
-import type { Settings } from "./settings.js";
-import type { SupervisionCoordinator } from "./supervision/registry.js";
-import type { SelfCloseTracker } from "./supervision/self-close.js";
-import type { HandoffGate } from "./handoff-gate.js";
 import type { CurrentContext } from "./targets.js";
-import { createContextResolver, type ContextResolver } from "./context.js";
-import { createCommunicateTool } from "./tools/communicate.js";
-import { createInspectTool } from "./tools/inspect.js";
-import { createJobsTool } from "./tools/jobs.js";
-import { createLaunchTool } from "./tools/launch.js";
-import { createPaneTool } from "./tools/pane.js";
-import { createTabTool } from "./tools/tab.js";
-import { createWaitTool } from "./tools/wait.js";
-import { CommunicateParamsSchema, InspectParamsSchema } from "./schemas.js";
-import { JobsParamsSchema } from "./jobs-schema.js";
-import { PublishedLaunchParamsSchema } from "./launch-schema.js";
-import { PaneParamsSchema, TabParamsSchema } from "./topology-schema.js";
-import { WaitParamsSchema } from "./wait-schema.js";
+import type { DaemonClient, DaemonRunInput, DaemonStatusInput } from "./daemon/client.js";
+import { DaemonRunParamsSchema, DaemonStatusParamsSchema } from "./daemon/client.js";
+import { DaemonLaunchRequestSchema, type DaemonLaunchRequest, type DelegatedCaller } from "./launch-schema.js";
 import { appendToolTelemetry, invalidInputError, monotonicDurationMs, telemetryEffectCertainty, telemetryOperation, type ToolTelemetryEntry } from "./telemetry.js";
 
+/**
+ * The universal tool surface (durable-supervisor §10): exactly three tools,
+ * each a stateless proxy over the daemon socket. `herdr_run` carries every
+ * run operation — observe, reconcile, transfer, claim, and the mailbox `ack`
+ * — and `herdr_status` is the read-only projection including the mailbox
+ * list/read surface. There is no CLI path and no in-process fallback.
+ */
 export const CORE_TOOL_NAMES = [
-  "herdr_inspect",
-  "herdr_communicate",
-  "herdr_wait",
-  "herdr_jobs",
   "herdr_launch",
-  "herdr_pane",
-  "herdr_tab",
+  "herdr_run",
+  "herdr_status",
 ] as const;
 
 export type CoreToolName = (typeof CORE_TOOL_NAMES)[number];
@@ -110,57 +91,24 @@ export interface HerdrToolDefinition {
 }
 
 export interface HerdrToolSurfaceDependencies {
-  cli: HerdrCli;
-  context: CurrentContext;
-  contextResolver?: ContextResolver;
-  environment: EnvironmentState;
-  preflight: CompatibilityPreflight;
-  settingsLoader: () => Promise<Settings>;
-  jobs: JobRegistry;
-  profiles: { load: () => Promise<ProfileCatalog> };
-  ownership: RuntimeOwnership;
+  /**
+   * The daemon-connect seam: one fresh connected, identity-bound client per
+   * tool call. The host owns no supervision, jobs, or mailbox state — the
+   * daemon is the serialization boundary — and a missing daemon surfaces as
+   * the typed `DaemonCallError`, never an in-process fallback (§10).
+   * `caller` is the optional delegated-mode assertion (executor gateway);
+   * absent it the implementation claims the environment-injected identity.
+   */
+  connectDaemon(signal: AbortSignal | undefined, caller?: DelegatedCaller): Promise<DaemonClient>;
+  /** The tool-telemetry root — the session's project directory. */
   cwd: string;
-  reviewerFactory?: (settings: Settings, context: ExtensionContext) => WaitReviewer;
-  /**
-   * Large-message delivery is owned by the tools, so a host that cannot own an
-   * attachment cache simply omits these and every attachment delivery is
-   * refused as unverified rather than degraded to an inline send.
-   */
-  attachments?: AttachmentStore;
-  recipients?: RecipientRegistry;
-  /**
-   * The host's shared Devin queue-flush coordinator. Communicate and launch
-   * pass Devin text writes through its short write section, and an
-   * acknowledged busy Devin write schedules the bounded flush.
-   */
-  queueFlush?: DevinQueueFlush;
-  /**
-   * Required. Every successful `herdr_launch` creates supervision, so a host
-   * that cannot supervise cannot construct a launch tool. See ADR-019.
-   */
-  supervision: SupervisionCoordinator;
-  /**
-   * The host's own-close ledger, shared with the supervision registry. A host
-   * that omits it keeps the always-wake behavior for `pane_closed`.
-   */
-  selfClose?: SelfCloseTracker;
-  /**
-   * The host's shared managed-handoff gate. Launch bindings and strict waits
-   * consult the same instance so managed completion is never read off raw
-   * lifecycle alone.
-   */
-  handoffs?: HandoffGate;
 }
 
 export interface HerdrToolSurface {
-  readonly inspect: ReturnType<typeof createInspectTool>;
-  readonly communicate: ReturnType<typeof createCommunicateTool>;
-  readonly wait: ReturnType<typeof createWaitTool>;
-  readonly jobs: ReturnType<typeof createJobsTool>;
-  readonly launch: ReturnType<typeof createLaunchTool>;
-  readonly pane: ReturnType<typeof createPaneTool>;
-  readonly tab: ReturnType<typeof createTabTool>;
-  /** The same seven definitions, in `CORE_TOOL_NAMES` order. */
+  readonly launch: HerdrToolDefinition;
+  readonly run: HerdrToolDefinition;
+  readonly status: HerdrToolDefinition;
+  /** The same three definitions, in `CORE_TOOL_NAMES` order. */
   readonly definitions: readonly HerdrToolDefinition[];
 }
 
@@ -200,67 +148,70 @@ function instrumentTool<T extends HerdrToolDefinition>(tool: T, validationSchema
   } as T;
 }
 
-/** Construct the seven Herdr tools once for every host. */
+/**
+ * One daemon-backed tool definition: validate against the published schema
+ * (instrumentation), connect, issue the one typed call, publish the daemon's
+ * reply as both the text body and the structured details. An aborted call
+ * closes its socket — the caller learns the call did not land, exactly like
+ * a transport failure mid-request.
+ */
+function daemonTool(
+  deps: HerdrToolSurfaceDependencies,
+  options: {
+    name: CoreToolName;
+    label: string;
+    description: string;
+    parameters: TSchema;
+    call(client: DaemonClient, params: never): Promise<unknown>;
+  },
+): HerdrToolDefinition {
+  return instrumentTool({
+    name: options.name,
+    label: options.label,
+    description: options.description,
+    parameters: options.parameters,
+    async execute(_toolCallId, params, signal) {
+      // `caller` selects the delegated claim path on executor-gateway serves;
+      // validation already ran, so a present value is a {paneId, projectRoot} pair.
+      const caller = (params as { caller?: DelegatedCaller }).caller;
+      const client = await deps.connectDaemon(signal, caller);
+      try {
+        signal?.addEventListener("abort", () => client.close(), { once: true });
+        const reply = await options.call(client, params as never);
+        return { content: [{ type: "text", text: JSON.stringify(reply, null, 2) }], details: reply };
+      } finally {
+        client.close();
+      }
+    },
+  }, options.parameters, deps.cwd);
+}
+
+/**
+ * Construct the three daemon-backed tools once for every host. Each call is a
+ * fresh daemon connection — the host holds nothing between calls, so a
+ * client restart can never strand supervision state on this side.
+ */
 export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrToolSurface {
-  const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
-  const inspect = instrumentTool(createInspectTool({ cli: deps.cli, context: deps.context, contextResolver, environment: deps.environment, profiles: deps.profiles, ...(deps.handoffs ? { handoffs: deps.handoffs } : {}) }), InspectParamsSchema, deps.cwd);
-  const communicate = instrumentTool(createCommunicateTool({
-    cli: deps.cli,
-    context: deps.context,
-    contextResolver,
-    preflight: deps.preflight,
-    queueFlush: deps.queueFlush,
-    ...(deps.attachments ? { attachments: deps.attachments } : {}),
-    ...(deps.recipients ? { recipients: deps.recipients } : {}),
-  }), CommunicateParamsSchema, deps.cwd);
-  const wait = instrumentTool(createWaitTool({
-    cli: deps.cli,
-    context: deps.context,
-    contextResolver,
-    settingsLoader: deps.settingsLoader,
-    jobRegistry: deps.jobs,
-    ...(deps.reviewerFactory ? { reviewerFactory: deps.reviewerFactory } : {}),
-    ...(deps.handoffs ? { handoffs: deps.handoffs } : {}),
-  }), WaitParamsSchema, deps.cwd);
-  const jobs = instrumentTool(createJobsTool(deps.jobs), JobsParamsSchema, deps.cwd);
-  const launch = instrumentTool(createLaunchTool({
-    cli: deps.cli,
-    context: deps.context,
-    contextResolver,
-    cwd: deps.cwd,
-    ownership: deps.ownership,
-    preflight: deps.preflight,
-    supervision: deps.supervision,
-    selfClose: deps.selfClose,
-    queueFlush: deps.queueFlush,
-    ...(deps.attachments ? { attachments: deps.attachments } : {}),
-    ...(deps.recipients ? { recipients: deps.recipients } : {}),
-  }), PublishedLaunchParamsSchema, deps.cwd);
-  const pane = instrumentTool(createPaneTool({
-    cli: deps.cli,
-    context: deps.context,
-    contextResolver,
-    cwd: deps.cwd,
-    ownership: deps.ownership,
-    preflight: deps.preflight,
-    ...(deps.selfClose ? { selfClose: deps.selfClose } : {}),
-  }), PaneParamsSchema, deps.cwd);
-  const tab = instrumentTool(createTabTool({
-    cli: deps.cli,
-    context: deps.context,
-    contextResolver,
-    cwd: deps.cwd,
-    ownership: deps.ownership,
-    preflight: deps.preflight,
-  }), TabParamsSchema, deps.cwd);
-  return {
-    inspect,
-    communicate,
-    wait,
-    jobs,
-    launch,
-    pane,
-    tab,
-    definitions: [inspect, communicate, wait, jobs, launch, pane, tab],
-  };
+  const launch = daemonTool(deps, {
+    name: "herdr_launch",
+    label: "Herdr Launch",
+    description: "Launch one supervised Herdr agent run under a durable intent. `task` is the flat Task contract (objective, scope, doneWhen, optional constraints/tier/replicas/recoveryOf/label/cwd); `idempotencyKey` is required and binds this call to at most one effect — retry with the same key after an interrupted attempt instead of launching again.",
+    parameters: DaemonLaunchRequestSchema,
+    call: (client, params: DaemonLaunchRequest) => client.launch(params),
+  });
+  const run = daemonTool(deps, {
+    name: "herdr_run",
+    label: "Herdr Run",
+    description: "Operate on your own runs through the durable daemon. `observe` reads a run's handoff observation plus its unread mailbox event IDs; `reconcile` closes an unresolved launch intent once every recorded child is accounted for; `transfer`/`claim` move run ownership between sessions under the journaled ownership contract; `ack` marks one mailbox event handled (idempotent unread→acked rename).",
+    parameters: DaemonRunParamsSchema,
+    call: (client, params: DaemonRunInput) => client.run(params),
+  });
+  const status = daemonTool(deps, {
+    name: "herdr_status",
+    label: "Herdr Status",
+    description: "Read-only daemon status: daemon health, your runs and intents (unresolved first), your unread mailbox event IDs and the mailbox path, and one event's bounded body when `eventId` is set. It never acks and never mutates — handle an event, then `herdr_run` `ack` it.",
+    parameters: DaemonStatusParamsSchema,
+    call: (client, params: DaemonStatusInput) => client.status(params),
+  });
+  return { launch, run, status, definitions: [launch, run, status] };
 }

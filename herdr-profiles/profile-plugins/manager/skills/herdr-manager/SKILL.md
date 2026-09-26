@@ -186,8 +186,9 @@ send. Non-Devin kinds steer the same write into the running turn.
 
 - The manager runs reviews. Workers never self-arm, never self-approve, and never grant themselves a
   reduced gate. Verify auto-merge actually armed, and never arm before the verdict lands.
-- Route code and ordinary plan reviews to `pi-review`; route critical-plan reviews and other
-  second-model reads to `oracle`.
+- Route code and ordinary plan reviews to `pi-review` (`pi-review <n|url>` or
+  `pi-review <file>`); route critical-plan reviews and other second-model
+  reads to `oracle`.
 - Before any non-trivial design, implementation brief, or remediation that introduces machinery,
   identify the minimum correct design, what can be deleted, and why a smaller shape fails. Brief only
   that boundary. Never spend a review round or implementation lane on avoidable machinery.
@@ -202,13 +203,17 @@ send. Non-Devin kinds steer the same write into the running turn.
 - You judge the findings (owner ruling #89): fix-now = correctness, data loss, security/IAM,
   execution-breaking, and your own regressions; follow-up ticket with AC = defense-in-depth and nits;
   refuted = file:line proof only. Data-integrity libraries stay fix-all (#92). Show the disposition table.
-- One round is the gate; more only for large or IAM/ASL fixes. Before re-fixing a still-open thread,
-  make the lane prove at the reviewed head what the code already does — unchanged thread text is
-  persisted text, not a missed read.
-- **Three rounds is the ceiling; the gate then waives itself** (owner ruling 2026-09-06, no ask). At
-  round three apply only its confirmed fixes, record `BLOCKED` as `BLOCKED`, note that those fixes carry
-  no `pi-review` pass and `/claude-review` reads them, and continue to READY under the PR's standing
-  close-out authority.
+- One round is the gate; more only for large or IAM/ASL fixes. Before
+  re-fixing a still-open finding, make the lane prove at the reviewed head
+  what the code already does — a re-derived finding may quote stale file:line
+  evidence, not a missed read.
+- **Three rounds is the ceiling by owner policy; the gate then waives itself**
+  (owner ruling 2026-09-06, no ask). The tool no longer stops itself — after
+  round three apply only the fixes for findings still `status: "open"`, record
+  `verdict: "findings"` honestly (never restate it as `clean`), note that
+  those fixes carry no `pi-review` pass and `/claude-review` reads them, and
+  continue to READY under the PR's standing close-out authority.
+  `review.attention: "human-decision"` in the report marks the same signal.
 - Babysit a PR from a lane with `gh` reads (`gh pr view --json`, `gh pr checks --required`); there is
   no checked-in babysit or review-watch helper script in this workspace.
 

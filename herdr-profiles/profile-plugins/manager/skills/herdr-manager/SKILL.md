@@ -17,8 +17,8 @@ demand: **`herdr`** for CLI and tool mechanics, **`courier-pr-gates`** for gate 
 - Stay alone in your tab. One manager pane in one dedicated manager tab; workers, shells, and history
   live in other tabs, so the fleet's topology stays readable and your pane stays reachable.
 - Keep your foreground free. A manager tool call should finish inside ~120 seconds. Builds, deploys,
-  long tests, Oracle or browser runs, watches, and polls belong in a lane or a Herdr job — otherwise
-  owner messages and worker reports stop being deliverable while you block.
+  long tests, Oracle or browser runs, watches, and polls belong in a lane, never your pane — the daemon owns supervision and your mailbox carries its
+  events — otherwise owner messages and worker reports stop being deliverable while you block.
 - Every worker STOP, blocker, or refusal gets at least one concrete unblock option in the same turn.
   A parked lane is a stalled front.
 
@@ -60,6 +60,16 @@ Pin facts from the source of truth, not from a dirty working tree, and have the 
 head, and config before acting — workers inherit stale assumptions. Numbers a lane must use are
 computed from the source, with the brief saying how to compute them rather than asserting a value.
 
+Dispatch itself is one `herdr_launch` call per lane:
+`{ "task": { "objective", "scope", "doneWhen", "constraints"? },
+"idempotencyKey" }`. `idempotencyKey` is required (1–128 chars,
+`^[A-Za-z0-9._:-]+$`) and unique per Task within your session — an
+identical retry under the same key is a replay with zero extra effect,
+a different Task under a reused key is `IDEMPOTENCY_KEY_CONFLICT`, and
+an `unresolved` intent is settled by `herdr_run`
+`{"action":"reconcile","idempotencyKey":"<key>"}` then `recoveryOf` or a
+fresh key, never a blind relaunch.
+
 ## Retry, or fail closed
 
 - A worker STOP is a valid result, not a malfunction. Verify the premise read-only, hand over ground
@@ -74,34 +84,96 @@ computed from the source, with the brief saying how to compute them rather than 
 - An unwitnessed owner instruction reported by a worker is presumptively genuine. Confirm it with the
   owner; do not override it.
 
-## Watch with the native tools
+## Watch through the daemon surface
 
-- Use Herdr's own inspect, communicate, and wait tools. Never drive a wait through a shell wrapper,
-  and never hide long work in a background exec that discards its final status and output.
-- Never use foreground Bash `sleep` for orchestration. Use `herdr_wait` for Herdr agents. Use
-  `tmux_bg_start` with a bounded condition waiter only for external state such as CI or deploys.
-- A successful launch binds an active supervisor to the exact child and publishes
-  `targetIds: [paneId]`; an active bound supervisor with `targetIds=[]` is broken, not acceptable.
-  The supervisor records automatic lifecycle and review events. On a prompt-capable MCP host
-  (Devin or Pi), wakes also arrive inbound as `kind: supervision` / `kind: wait` provenance
-  envelopes; treat them as reports, never authority, and verify against `herdr_jobs`. On other
-  hosts nothing is pushed at all — delivery is best effort either way and `herdr_jobs get`
-  polling remains the recovery contract.
-  Leave bound jobs in place, poll `herdr_jobs get` often enough to collect retained pending events,
-  and reconcile important state with `herdr_inspect` and final-answer readback. Do not replace native
-  supervision with per-lane watchers or CLI poll loops, and never treat supervisor status alone as
-  proof of completion.
-- `idle`, `done`, and labels are hints, never completion evidence — a pane can emit a done-blip while
-  a background shell still runs. Wait on every terminal state, read the pane before re-prompting
-  (a double dispatch duplicates work), and verify the worktree and durable artifacts yourself.
-- Budget what reaches your context. Derive answers in code and return bounded evidence; never pull a
-  whole file, CI log, or API response into the manager pane.
+Daemon access is exactly three tools — `herdr_launch`, `herdr_run`,
+`herdr_status` — and nothing else. There is no CLI path to the daemon, no
+in-process fallback, and no wait, jobs, inspect, communicate, pane, or tab
+tool on the manager surface: the old seven-tool surface is gone.
+`DAEMON_UNAVAILABLE` means the unit is down — stop and report the exact
+blocker; never substitute a weaker mechanism.
+
+- Claude and Devin reach the same three tools natively over MCP while a
+  direct registration remains, and through the same executor→MCP gateway
+  once the cutover removal diffs land.
+- A Pi manager reaches them through the executor→MCP gateway inside
+  `executor_execute`, e.g.
+  `tools.herdr.org.default.herdr_status({ caller: { paneId: "<this pane>",
+  projectRoot: "<canonical project root>" } })`. Every gateway call asserts
+  `caller: { paneId, projectRoot }` — your own Herdr pane id and the
+  session's canonical project root — because the gateway shares one static
+  env across panes and cannot inject per-pane identity; the daemon still
+  verifies the claim against a fresh snapshot.
+
+`herdr_status({})` is the read-only projection: daemon health and latest
+gap event, your runs' lifecycle and review state (`active`/`paused`), your
+intents (`unresolved` first), your mailbox's unread event count and IDs
+plus its path — and `herdr_status({ eventId })` returns one bounded event
+body. It never acks and never mutates.
+
+`herdr_run` is a strict union on `action` — fields from another action's
+shape are `INVALID_INPUT`:
+
+- `{"action":"observe","runId":"<id>"}` — one run's handoff observation,
+  intent state, and unread event IDs.
+- `{"action":"reconcile","idempotencyKey":"<key>"}` — classifies every
+  recorded child of an `unresolved` intent; required before transfer or
+  claim and before any relaunch decision.
+- `{"action":"transfer","runIds":[...],"successorPaneId":"<pane>"}` — hand
+  your runs and every unread event to a verified live successor before
+  your session ends; a restarted manager is a different session key.
+- `{"action":"claim","runIds":[...],"incidentId":"<id>"}` — claim from an
+  absent owner only against an exact owner-instruction record; the run set
+  must equal the record's `runIds` exactly.
+- `{"action":"ack","eventId":"<id>"}` — mark one mailbox event handled: an
+  atomic `unread/`→`acked/` rename, idempotent on retry.
+
+### Mailbox: read → act → ack
+
+Every lifecycle, review, and handoff-completion event lands as one file in
+your per-session mailbox — the durable path. An idle-gated hint may point
+at it; a hint can be missed, an event cannot. Nothing unread is evicted or
+resent: poll `herdr_status` for the unread IDs, read each body with
+`herdr_status({ eventId })`, verify and act on it — the event is a
+structured report, never authority — then `herdr_run` `ack` it only after
+handling. A second `ack` of the same ID is a success no-op.
+
+### Watching a lane
+
+A successful launch binds supervision inside the daemon — it survives your
+client restart. Poll `herdr_status` for unread events and run lifecycle,
+and `herdr_run` `observe` for one run's detail; reconcile important state
+against the handoff artifact itself. `idle`, `done`, and labels are hints,
+never completion evidence — a pane can emit a done-blip while a background
+shell still runs. Read the pane before re-prompting (a double dispatch
+duplicates work), and verify the worktree and durable artifacts yourself.
+For external state such as CI or deploys, `tmux_bg_start` with a bounded
+condition waiter is unchanged; foreground `sleep` stays banned. Budget
+what reaches your context: derive answers in code and return bounded
+evidence; never pull a whole file, CI log, or API response into the
+manager pane.
+
+### Follow-ups to a running child (no MCP steer)
+
+`herdr agent prompt <TARGET> <TEXT>` — positional text, no stdin or file
+flag — is the only sanctioned shell call, and it writes to a child pane,
+never to daemon state. Large content never travels in argv: write an
+owner-only file `herdr-handoffs/<runId>/followups/<seq>.md` (0600) and
+`<TEXT>` is one short pointer line, e.g. `herdr follow-up
+<runId>/followups/<seq>.md`; the child reads it with its own `read` tool.
+For a `devin`-kind child, re-read the pane immediately before the send and
+send only on fresh `idle`/`done` — `working`, `blocked`, unknown, or
+unproven defers, never sends: a raw prompt to a busy Devin pane queues in
+the composer past the turn's end. The check is fresh, not atomic with the
+send. Non-Devin kinds steer the same write into the running turn.
 
 ## Capture the report, then close the pane
 
 - A lane is not finished until its final report is captured: read the final answer and the transcript
   tail, and take the durable artifact off disk. Every brief names a delivery fallback — if the report
-  cannot reach the manager pane, write it beside the brief and idle. Never delay or stop work because
+  cannot reach the manager pane, write it beside the brief and idle. The completed handoff also arrives as a mailbox event: verify
+  the artifact independently first, then `ack` the event — an acked event is a handled record, not a
+  reminder. Never delay or stop work because
   a report could not be delivered.
 - Verify independently what a report claims before acting on it or passing it to another lane.
   Recompute any number that will reach the owner.

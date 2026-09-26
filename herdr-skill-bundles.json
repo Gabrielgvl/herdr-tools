@@ -32,15 +32,15 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/herdr-manager": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/herdr-manager",
-      "treeHash": "7d2f976e8b5da72d8e1ba1ca203bb6b3eff2f6ceb103fccca8ae8fdcd0506560"
+      "treeHash": "842112bf60b688f1e8539e920341eebfe424da7656100d21be12e3f74e136aab"
     },
     "herdr-profiles/profile-plugins/manager/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "8d278b36715aa37b268eda992953cf34b0d783dd5b50927f86aa52c8445ef6e5"
+      "treeHash": "39a3b6aa2e407f1fa5eb6c5712558e7ecd4924148fbea9e2a4b0426e7a92f6f3"
     },
     "herdr-profiles/profile-plugins/manager/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "620895d39c22bdd727aa427005dd1a8a4e65ed085442f37206b6bdefe5b0eea4"
+      "treeHash": "04463e1b89bbe1712543a0ecc0745a5c5f056d0cdd008c2da11764d739f2ba8a"
     },
     "herdr-profiles/role-plugins/planner/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -116,11 +116,11 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "8d278b36715aa37b268eda992953cf34b0d783dd5b50927f86aa52c8445ef6e5"
+      "treeHash": "39a3b6aa2e407f1fa5eb6c5712558e7ecd4924148fbea9e2a4b0426e7a92f6f3"
     },
     "herdr-profiles/role-plugins/reviewer/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "620895d39c22bdd727aa427005dd1a8a4e65ed085442f37206b6bdefe5b0eea4"
+      "treeHash": "04463e1b89bbe1712543a0ecc0745a5c5f056d0cdd008c2da11764d739f2ba8a"
     },
     "herdr-profiles/role-plugins/reviewer/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",

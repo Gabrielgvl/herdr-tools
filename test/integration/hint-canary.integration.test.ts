@@ -8,8 +8,9 @@
  * consumes the prompt as a real turn (state working → idle/done, mailbox line
  * in the transcript), a busy owner receives zero prompts, `herdr_run` `ack`
  * renames unread → acked, bursts inside 5 s coalesce to one prompt, agy panes
- * are inert even when configured, and the stock daemon entrypoint writes
- * nothing at all (production default qualified set is EMPTY).
+ * are inert even when configured, and the stock daemon entrypoint ships the
+ * C9-proved {pi, claude, devin} qualified set (N5.2 — it was EMPTY until this
+ * canary passed).
  *
  * Event provenance note: the supervisor's `eventWriter` seam is wired on the
  * D4 reattach path (`src/daemon/reattach.ts` passes `settings.eventWriter`),
@@ -545,19 +546,21 @@ describe.skipIf(!enabled)("idle-hint consumption canary (C9)", () => {
     ).toBeDefined();
   }, 600_000);
 
-  it("stock daemon: the production default qualified set is empty", async () => {
+  it("stock daemon: the production default qualified set is the C9-proved three kinds", async () => {
     const owner = owners.get("pi")!;
-    // Static: the production entrypoint must never read the disposable knob or
-    // pass a hint set — the fixture is the only place `hintKinds` is non-empty.
+    // Static: the production entrypoint must never read the disposable knob —
+    // the fixture's env override is the only place the set is configurable —
+    // and its runtime call ships exactly {pi, claude, devin}, never agy.
     const mainSource = await readFile(join(repoRoot, "src/daemon/main.ts"), "utf8");
     const binSource = await readFile(join(repoRoot, "bin/herdr-tools-daemon.mjs"), "utf8");
     expect(mainSource, "production entrypoint references the disposable hint knob").not.toContain("HERDR_TOOLS_DISPOSABLE_HINT_KINDS");
     expect(binSource, "production launcher references the disposable hint knob").not.toContain("HERDR_TOOLS_DISPOSABLE_HINT_KINDS");
-    expect(mainSource, "production runtime call passes hintKinds").not.toMatch(/createDaemonRuntime\(\{[^}]*hintKinds/su);
+    expect(mainSource, "production runtime call does not pass the proved hint set").toMatch(/hintKinds:\s*\[\s*"pi",\s*"claude",\s*"devin"\s*\]/su);
+    expect(mainSource, "production hint set admits agy").not.toMatch(/hintKinds:[^\n]*agy/su);
 
     // Live: a still-working child survives the swap, the stock daemon's D4
-    // sweep rebinds it with the mailbox writer, and its close still prompts
-    // nothing — the qualified set is empty.
+    // sweep rebinds it with the mailbox writer, and its close now hints the
+    // idle pi owner exactly once — the qualified set is non-empty.
     const child = await launchChild(owner, "N42STOCK1", 90);
     await stopDisposableServer(daemon);
     daemon = undefined;
@@ -576,8 +579,16 @@ describe.skipIf(!enabled)("idle-hint consumption canary (C9)", () => {
     expect(landed, "stock daemon produced no mailbox event for the rebound child").toBeDefined();
     const idle = await waitStatus(owner.paneId, ["idle", "done"], 60_000);
     expect(idle, "pi owner not idle during stock leg").toBeDefined();
+    const prompt = await waitForCondition(
+      async () => mailboxPrompts(proxy!, owner.paneId).slice(promptsBefore),
+      (prompts) => prompts.length >= 1,
+      60_000,
+      250,
+    );
+    expect(prompt, "stock daemon wrote no hint prompt").toBeDefined();
+    expect(prompt![0].text, "stock hint body deviates from the §11 form").toMatch(/^herdr mailbox: \d+ unread \([^)]*\) at \S+; read via your MCP surface \(herdr_status \/ executor → MCP\)$/u);
     await new Promise((settle) => setTimeout(settle, 8_000));
-    expect(mailboxPrompts(proxy!, owner.paneId).slice(promptsBefore), "stock daemon wrote a hint prompt").toHaveLength(0);
-    process.stderr.write(`C9_LEG stock empty-qualified prompts=0\n`);
+    expect(mailboxPrompts(proxy!, owner.paneId).slice(promptsBefore), "stock daemon wrote more than one hint").toHaveLength(1);
+    process.stderr.write(`C9_LEG stock three-kind-qualified prompts=1\n`);
   }, 600_000);
 });

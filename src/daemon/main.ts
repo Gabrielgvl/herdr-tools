@@ -404,7 +404,17 @@ if (process.argv[1] !== undefined) {
     resolveDaemonNamespace(process.env)
       .then(async (namespace) => {
         const env = process.env;
-        const runtime = createDaemonRuntime({ exec: createNodeExec({ cwd: process.cwd() }), env, namespace });
+        const runtime = createDaemonRuntime({
+          exec: createNodeExec({ cwd: process.cwd() }),
+          env,
+          namespace,
+          // §11 (N5.2): the C9 canary proved pi, claude, and devin owners
+          // consume the idle hint as a real turn, so the stock qualified set
+          // is these three. `agy` stays hard-blocked inside hints.ts no
+          // matter what this set contains. A code default only — the N5.3
+          // owner gate still controls activation.
+          hintKinds: ["pi", "claude", "devin"],
+        });
         const runs = await resolveHandoffNamespace(env);
         const signal = new AbortController().signal;
         return runDaemonMain({

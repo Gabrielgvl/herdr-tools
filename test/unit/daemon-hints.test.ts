@@ -6,7 +6,8 @@
  * pane is `idle`/`done`, still carries the recorded owner session, and the
  * kind is qualified. Busy, unknown, unproven, unsupported (`agy`), and
  * non-qualified kinds get zero writes; hints coalesce to one per manager per
- * 5 s and never block persistence. The production qualified set is EMPTY.
+ * 5 s and never block persistence. An unset qualified set is EMPTY; the
+ * stock daemon passes the C9-proved {pi, claude, devin} set (N5.2).
  *
  * Wiring debts: `createOwnership`'s `retarget` reaches live supervisor hint
  * destinations through `SupervisionRegistry.retargetHintDestinations`, and
@@ -346,7 +347,7 @@ async function seedRun(fx: DaemonFixture): Promise<string> {
 }
 
 describe("runtime wiring", () => {
-  it("defaults the qualified set EMPTY — an idle pi owner pane still gets zero writes", async () => {
+  it("leaves the qualified set EMPTY when the option is unset — an idle pi owner pane still gets zero writes", async () => {
     const fx = await daemonFixture();
     await fx.mailbox.writeGapEvent(ownerKey, { from: "a", to: "b", lost: {} });
     fx.runtime.hints(hint());

@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  CLAUDE_CHANNEL_CAPABILITY,
-  CLAUDE_CHANNEL_NOTIFICATION_METHOD,
   createPiSupervisionNotifier,
   inertNotifier,
   supervisionWakeContent,
@@ -55,12 +53,7 @@ describe("supervision manager wake delivery", () => {
     expect(() => createPiSupervisionNotifier(() => { throw new Error("shutting down"); }).wake(wake)).not.toThrow();
   });
 
-  it("pins the documented Claude channel notification method and capability", () => {
-    expect(CLAUDE_CHANNEL_NOTIFICATION_METHOD).toBe("notifications/claude/channel");
-    expect(CLAUDE_CHANNEL_CAPABILITY).toBe("claude/channel");
-  });
-
-  it("keeps recording when a host has no wake channel", () => {
+  it("keeps recording when a host has no wake path", () => {
     expect(() => inertNotifier.wake(wake)).not.toThrow();
   });
 });

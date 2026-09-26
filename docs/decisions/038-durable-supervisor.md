@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. Drafted 2026-09-24 as node N0.1 of the durable-API implementation plan; pending independent pi-review and owner ratification. `docs/specs/durable-supervisor.md` is the normative description and carries the owner-approved contract C1–C9 and durability rules D1–D6 verbatim; this ADR records the decision and its trade-offs without duplicating the spec.
+**Accepted** (2026-09-26). Drafted 2026-09-24 as node N0.1 of the durable-API implementation plan; owner-ratified 2026-09-25, including the post-ratification executor→MCP amendment recorded below. Acceptance rests on the completed N4.x canary evidence — provenance in *Canary evidence (C9) and rollout findings* — under the owner's fix-and-waive ruling: the one defect the canary exposed (the N2.2 launch-path `eventWriter` wiring gap) was fixed and its gate leg rerun green, and the two recorded Devin findings are carried into the rollout as ordered N5.3 work rather than waived silently. `docs/specs/durable-supervisor.md` is the normative description and carries the owner-approved contract C1–C9 and durability rules D1–D6 verbatim; this ADR records the decision and its trade-offs without duplicating the spec.
 
 ## Date
 
@@ -76,3 +76,26 @@ Rejected as a default: the idle-turn canary is the gate. A failed leg stops cuto
 - Steering moves from MCP tools to the `herdr agent prompt` recipe plus an owner-only follow-up file; for a `devin` child the recipe sends only to a freshly verified `idle`/`done` pane — a raw prompt to a busy Devin composer queues with no flush on this path (ADR-029) — and identity binding then rests on the manager following the recipe, not on tool enforcement.
 - Mailbox capacity refusal can block launches during a long absence; events that cannot be persisted are held in memory only and are lost if the daemon stops first — the loss accounting is durable in `daemon.json` and the `downtime_gap` that discloses it is retried until the mailbox has room; payloads refused at cap stay unrecoverable.
 - Operation names (`observe`/`reconcile`/`transfer`/`claim`) and the per-incident claim-record shape are review proposals; the owner contract fixes semantics, not names.
+
+## Canary evidence (C9) and rollout findings
+
+The C9 gate is the idle-turn consumption canary: every qualified kind must prove its pane consumes a mailbox hint as a turn before Channels is disabled or any cutover proceeds, and a failed leg stops cutover outright. The canaries ran on disposable Herdr sessions with the daemon as a plain test child process — never the production unit. Results, copied from the recorded canary runs (provenance below, no aspirational rows):
+
+| Canary leg | Recorded result |
+|---|---|
+| Pi hint consumed | Exactly one `agent.prompt`, body verbatim `herdr mailbox: 2 unread (…) at <path>`; pane `working` → `idle`, the mailbox line in the transcript, `herdr_run` `ack` renamed unread→acked idempotently |
+| Claude hint consumed | Same full chain green — one prompt, exact §11 body, turn consumed, acked |
+| Devin hint consumed | Same chain green; plus the C8 leg — a raw `herdr agent prompt` follow-up to a verified-idle Devin pane was consumed as a turn (`workingSeen=true`), not left queued in the composer |
+| AGY inert | `MANAGER_SESSION_UNAVAILABLE`, `prompts=0` — unsupported kinds are never hinted |
+| Busy owner | The event persisted during the busy window; `prompts=0` (`events=1`) — hints are idle-only |
+| Coalescing | `burst=4` events inside 5 s → `prompts=1` |
+| Stock daemon | Empty qualified-kind set → `prompts=0` — production shipping default stays inert until the owner gate |
+
+The canary also exposed and closed one real defect: a fresh launch-bound supervisor did not persist run-scoped mailbox events — the N2.2 `eventWriter` wiring gap (`src/daemon/runtime.ts`, `src/daemon/handlers/launch.ts`, `src/tools/launch.ts`; minimal additive reuse of the existing `MailboxEventWriter` seam). After the fix the launch-path gate leg passed with no daemon bounce — the green 8/8 run. Sibling canary evidence: restart/reattach/idempotency 7/7 (interrupted `effecting` intent → `unresolved`, closed child → `unresolved(identity_lost)` with sidecar byte-identical, live child rebound, replayed launch zero prompts, `downtime_gap` per restart, no `recovery_pending` for the matched child, owner-absent review pause); transfer/claim 7/7 (journaled transfer completing from its frozen record after a mid-move SIGKILL, complete unread-set move including mailbox-global events, `unresolved` veto, `CLAIM_NOT_INSTRUCTED` for absent/mismatched/subset/superset records, single-use instruction records).
+
+Provenance: the canary run records — N4.1 `ebcba462-b4cf-42ce-bcb0-66288d17a22b`, N4.2 `8f850f05-2ea6-4fb5-9eaa-d1bd1ee78247`, N4.3 `0ddb124a-4fce-4cf9-b432-722eca80c1b7` — plus the owner's fix-and-waive ruling on this date.
+
+Recorded findings (carried into the rollout, not waived silently):
+
+1. **Devin permission posture — required for any `devin` owner.** Devin's default `auto` permission mode stalls forever on the interactive MCP-approval dialog during a mailbox-hint turn — the pane sits `blocked` and never settles. A supervised Devin owner must launch with `--permission-mode dangerous` — the same non-interactive posture AGY already uses — or ship a pre-approval mechanism. The canary's `bringUpOwner` passes it explicitly. This is a rollout requirement, not an option.
+2. **Devin legacy tool surface vs the §11 hint body — an explicit N5.3 ordering note.** The hint body says "read via your MCP surface (herdr_status / executor → MCP)", but a Devin pane today exposes the legacy `herdr_*` MCP names, not `herdr_status`; the Devin leg still consumed the hint by reading the mailbox files directly. The hint text and Devin's actual surface must be reconciled — the body updated to the real surface, or the surface updated so the body is actionable as written — **at the N5.3 owner cutover, not before**: until the direct-registration removal diffs land, still-live Devin managers keep their legacy surface, and rewriting the body early would point them at tools they do not have.

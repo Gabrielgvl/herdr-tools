@@ -11,7 +11,6 @@ import { resolveManagerSession } from "../context.js";
 import { connectDaemonClient, DaemonCallError, type DaemonCallerContext, type DaemonClient } from "../daemon/client.js";
 import { resolveDaemonNamespace, type DaemonNamespace } from "../daemon/namespace.js";
 import type { DelegatedCaller } from "../launch-schema.js";
-import { CLAUDE_CHANNEL_CAPABILITY } from "../supervision/notify.js";
 import { parseSnapshotResult, type CurrentContext } from "../targets.js";
 import { createToolSurface, type HerdrToolSurface } from "../tool-surface.js";
 import { callTool, describeTools } from "./adapter.js";
@@ -205,10 +204,10 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     return undefined;
   }
 
-  // The documented Claude Code Channels research-preview capability is still
-  // advertised alongside tools by the same server that serves them (N5.2 owns
-  // its removal); the daemon now owns every wake path, so nothing here sends.
-  const server = new Server({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }, { capabilities: { tools: {}, experimental: { [CLAUDE_CHANNEL_CAPABILITY]: {} } } });
+  // Tools only: the daemon owns every wake path (hints + mailbox), so the
+  // Channels research-preview advertisement is gone (N5.2) and nothing here
+  // sends.
+  const server = new Server({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: descriptors }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const outcome = await callTool({

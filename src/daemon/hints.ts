@@ -12,9 +12,10 @@
  * logged and dropped, never retried into a busy pane, and never blocks event
  * persistence or ownership operations. No Enter, no key synthesis.
  *
- * The qualified set is a daemon start option whose production default is
- * EMPTY — it becomes non-empty only after the C9 canary passes for all three
- * kinds (N5.2).
+ * The qualified set is a daemon start option. The production default in
+ * src/daemon/main.ts is {pi, claude, devin} — the set the C9 canary proved
+ * consumes the hint as a real turn (N5.2); a daemon started without the
+ * option still writes nothing.
  */
 
 import { join } from "node:path";
@@ -31,6 +32,13 @@ const IDLE_HINT_TIMEOUT_MS = 10_000;
 
 /** Kinds structurally incapable of consuming a pane prompt — never hinted, even if qualified. */
 const UNSUPPORTED_KINDS = new Set(["agy"]);
+
+// C9 finding: a devin owner consumes the hint as a turn only when it was
+// launched with `--permission-mode dangerous` — under the default `auto`
+// mode the mailbox-read turn stalls at the interactive tool-approval dialog
+// (pane state `blocked`, never settles). Supervised devin owners must run
+// non-interactively for hints to be consumed; the hint still lands durably
+// in the mailbox either way.
 
 /** The run's current owner — the supervisor's recorded owner, re-targeted on transfer/claim. */
 export interface IdleHintOwner {
@@ -62,9 +70,10 @@ export interface IdleHintsOptions {
   /** The daemon namespace the mailbox path is rendered from. */
   namespace: DaemonNamespace;
   /**
-   * Kinds proven to consume a pane prompt as a turn. The production default is
-   * EMPTY — a daemon started without this option writes nothing even for idle
-   * panes of candidate kinds (C9 gate, N5.2).
+   * Kinds proven to consume a pane prompt as a turn. Unset means EMPTY — a
+   * daemon started without this option writes nothing even for idle panes of
+   * candidate kinds. The stock daemon passes the C9-proved {pi, claude,
+   * devin} set (N5.2).
    */
   qualifiedKinds?: readonly string[];
   coalesceMs?: number;

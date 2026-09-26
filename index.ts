@@ -66,7 +66,7 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
   const injected = readInjectedContext(env);
   const uiRef: { current?: WaitJobsUi } = {};
   // The Pi host's wiring onto the shared assembly: its wait-job UI refresh,
-  // terminal notifications, and the Pi wake channel.
+  // terminal notifications, and the Pi wake path.
   const shared = createSharedRuntime({
     exec: pi.exec.bind(pi),
     env,

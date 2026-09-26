@@ -2,7 +2,7 @@
  * The one runtime assembly every Herdr tools host shares (durable-supervisor
  * §5): the CLI transport, JobRegistry, the Devin queue-flush coordinator, the
  * managed-handoff gate, the ownership and recipient ledgers, and the
- * SupervisionRegistry wired to the host's wake channel and session-event
+ * SupervisionRegistry wired to the host's wake path and session-event
  * monitor. `createSharedRuntime` is the single construction path the Pi
  * extension, the MCP server, and the daemon all call; `createDaemonRuntime`
  * wraps it with the durable intent store, and the caller-verification helpers
@@ -53,7 +53,7 @@ export interface DaemonCli {
 export interface SharedRuntimeWiring {
   /** A job registry carrying the host's own terminal/change callbacks. */
   jobs?: JobRegistry;
-  /** The host's wake channel for supervisor events; absent means inert. */
+  /** The host's wake path for supervisor events; absent means inert. */
   notifier?: ManagerNotifier;
   /** The host's own-close ledger, forwarded to every reserved supervisor. */
   selfClose?: SelfCloseTracker;
@@ -77,7 +77,7 @@ export interface SharedRuntimeDeps {
   settingsLoader?: () => Promise<Settings>;
   /**
    * Host seam invoked after the CLI and queue flush exist and before the job
-   * registry and supervision registry are built — where a host's wake channel
+   * registry and supervision registry are built — where a host's wake path
    * and job-registry callbacks wire in.
    */
   wire?: (parts: { cli: HerdrCli; queueFlush: DevinQueueFlush }) => SharedRuntimeWiring;
@@ -148,9 +148,9 @@ export interface DaemonRuntimeDeps extends SharedRuntimeDeps {
    */
   mailbox?: Mailbox;
   /**
-   * §11 qualified hint kinds — the production default is EMPTY and stays so
-   * until the C9 owner gate (N5.2). Only the disposable test daemon passes
-   * the candidate set.
+   * §11 qualified hint kinds — unset means EMPTY. The stock daemon passes
+   * the C9-proved {pi, claude, devin} set (N5.2); the disposable test
+   * daemon takes its set from the environment.
    */
   hintKinds?: readonly string[];
   /** Full-sink injection for tests; absent builds the §11 sink over `cli`. */
@@ -223,7 +223,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     wire: (parts) => {
       const host = deps.wire?.(parts) ?? {};
       // §11: the qualified-kind set is empty unless the daemon start option
-      // supplies it — production passes nothing (N5.2 gate).
+      // supplies it — production passes the C9-proved three (N5.2).
       hints = deps.hints ?? createIdleHints({
         cli: parts.cli,
         mailbox: deferredMailbox,

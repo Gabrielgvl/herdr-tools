@@ -10,7 +10,6 @@ import { CORE_TOOL_NAMES } from "../../src/tool-surface.js";
 import type { PiExec } from "../../src/cli.js";
 import type { DaemonCallerContext, DaemonClient } from "../../src/daemon/client.js";
 import type { DaemonNamespace } from "../../src/daemon/namespace.js";
-import { CLAUDE_CHANNEL_CAPABILITY } from "../../src/supervision/notify.js";
 import { AdapterContractError } from "../../src/mcp/adapter.js";
 import type * as AdapterModule from "../../src/mcp/adapter.js";
 import { StartupRefusal } from "../../src/mcp/host.js";
@@ -302,15 +301,15 @@ describe("MCP server startup", () => {
 });
 
 describe("MCP tool serving", () => {
-  it("lists exactly the three daemon-proxy tools with object input schemas and keeps the Channels capability", async () => {
+  it("lists exactly the three daemon-proxy tools with object input schemas and advertises tools only", async () => {
     const harness = await start();
     const list = await harness.client.listTools();
     expect(list.tools.map((tool) => tool.name)).toEqual([...CORE_TOOL_NAMES]);
     expect(list.tools).toHaveLength(3);
     expect(list.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
     expect(list.tools.map((tool) => tool.title)).toEqual(["Herdr Launch", "Herdr Run", "Herdr Status"]);
-    // N5.2 owns the capability's removal; the advertisement stays until then.
-    expect(harness.client.getServerCapabilities()).toMatchObject({ experimental: { [CLAUDE_CHANNEL_CAPABILITY]: {} } });
+    // N5.2: the Channels capability is gone — the daemon owns every wake path.
+    expect(harness.client.getServerCapabilities()).toEqual({ tools: {} });
     await harness.handle.shutdown();
   });
 

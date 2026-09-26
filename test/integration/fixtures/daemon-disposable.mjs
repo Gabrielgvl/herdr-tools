@@ -7,9 +7,14 @@
  * exactly — same namespace, dispatcher, ownership, reattach sweep, and
  * shutdown seams — except the runtime is built with `hintKinds` taken from
  * HERDR_TOOLS_DISPOSABLE_HINT_KINDS (comma-separated, e.g. "pi,claude,devin").
- * The production daemon passes no `hintKinds` and therefore runs with an EMPTY
- * qualified hint set; this fixture is the only place the set may be non-empty,
- * so the C9 idle-hint consumption canary can exercise the hint path end to end.
+ * The stock daemon now ships the C9-proved {pi, claude, devin} set (N5.2);
+ * this fixture keeps the set env-driven so the canary can pin its own list —
+ * including `agy`, which must stay inert even when configured — without
+ * touching the production default.
+ *
+ * C9 finding: the devin leg only consumes the hint when its owner pane runs
+ * with `--permission-mode dangerous` — `auto` stalls at the tool-approval
+ * dialog and never settles (see the canary's bringUpOwner).
  */
 import { createNodeExec } from "../../../dist/src/mcp/host.js";
 import { resolveHandoffNamespace } from "../../../dist/src/handoff.js";

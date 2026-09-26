@@ -1,10 +1,10 @@
 # Implementation spec: durable supervisor daemon and reduced tool surfaces
 
-**Status:** Proposed — pending independent pi-review and owner ratification
+**Status:** Accepted — ADR-038 ratified 2026-09-26 on the completed N4.x canary evidence
 
 **Date:** 2026-09-24
 
-**Decision:** [ADR-038](../decisions/038-durable-supervisor.md) (Proposed)
+**Decision:** [ADR-038](../decisions/038-durable-supervisor.md) (Accepted)
 
 ## 1. Objective
 
@@ -87,8 +87,8 @@ No `cancel`, no `steer` (C8).
 
 ## 11. Idle hints and the consumption canary
 
-- Hints are best-effort only: after writing an event, a fresh `pane get` on the owner pane; if `idle` or `done` and the kind is in the qualified set, one `agent.prompt` with body `herdr mailbox: <n> unread (<ids…>) at <path>; read via your MCP surface (herdr_status / executor → MCP)`, coalesced per manager per 5 s. Busy, unknown, unproven, unsupported (agy), or non-qualified kinds get nothing — the mailbox is the durable path. This idle-only gate is a deliberate deviation from ADR-027's no-busy-gate wake, recorded in the ADR.
-- The production qualified-kind set defaults to **empty**. It becomes non-empty only after the idle-turn consumption canary passes for all three kinds — Pi, Claude, Devin — each proving the pane consumes the hint as a turn. A failed leg stops cutover outright: no Channels disable, no silent permanent alternate path (C9). Channels remain enabled until then. The Devin leg additionally covers the C8 path itself: a raw `herdr agent prompt` follow-up sent to a verified-idle Devin pane is observed consumed as a turn, never left queued in the composer — the mailbox-hint canary does not substitute for the follow-up recipe.
+- Hints are best-effort only: after writing an event, a fresh `pane get` on the owner pane; if `idle` or `done` and the kind is in the qualified set, one `agent.prompt` with body `herdr mailbox: <n> unread (<ids…>) at <path>; read via your MCP surface (herdr_status / executor → MCP)`, coalesced per manager per 5 s. Busy, unknown, unproven, unsupported (agy), or non-qualified kinds get nothing — the mailbox is the durable path. This idle-only gate is a deliberate deviation from ADR-027's no-busy-gate wake, recorded in the ADR. **Recorded caveat (C9 canary, kept visible):** a Devin pane today exposes the legacy `herdr_*` MCP names, not `herdr_status` — the Devin canary leg still consumed the hint by reading the mailbox files directly. The body names the post-cutover surface; the body text and Devin's actual surface are reconciled at the N5.3 owner cutover — the direct-registration removal diffs move Devin onto the same three tools through the executor gateway — not before, while still-live Devin managers keep the legacy surface.
+- The production qualified-kind set defaults to **empty**. The C9 canary has now passed for all three kinds — Pi, Claude, Devin — each proving the pane consumes the hint as a turn (per-kind evidence recorded in ADR-038's canary table, including the AGY-inert, busy-owner, coalescing, and stock-daemon legs); a failed leg would have stopped cutover outright — no Channels disable, no silent permanent alternate path (C9). Enablement is a code flip, not a configuration knob: the production daemon entry passes `hintKinds` naming the qualified kinds (`pi`, `claude`, `devin`) only when N5.2 lands, in the same change that removes the Channels branch and capability; the disposable test daemon remains the only other place a non-empty set may be injected (`HERDR_TOOLS_DISPOSABLE_HINT_KINDS`). Until the flip lands, the shipped default stays empty and hints are inert — the mailbox is the durable path either way. The Devin leg additionally covered the C8 path itself: a raw `herdr agent prompt` follow-up sent to a verified-idle Devin pane was observed consumed as a turn, never left queued in the composer — the mailbox-hint canary did not substitute for the follow-up recipe.
 
 ## 12. Removals gated by this spec
 

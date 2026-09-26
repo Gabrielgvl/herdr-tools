@@ -13,10 +13,11 @@
  * entry is a test-generated replica of `src/daemon/main.ts`'s invoked block
  * (the same wiring the N4.2 disposable fixture uses) with `hintKinds:["pi"]`.
  * `retargetHintDestinations` only rewrites each bound supervisor's in-memory
- * hint owner, and the production entry ships an EMPTY qualified-kind set, so
- * with the stock entry the retarget has no observable effect at all. With Pi
- * qualified, the first run event after the transfer must hint the SUCCESSOR
- * pane, never the still-live prior owner — a discriminating proof.
+ * hint owner; the stock entry now ships the C9-proved {pi, claude, devin} set
+ * (N5.2), but the replica keeps the canary pinned to an explicit Pi-only set
+ * either way. With Pi qualified, the first run event after the transfer must
+ * hint the SUCCESSOR pane, never the still-live prior owner — a
+ * discriminating proof.
  *
  * Crash windows are widened deterministically with mailbox files, never
  * sleeps: each journaled move is a rename plus two directory fsyncs on the

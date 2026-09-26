@@ -20,7 +20,7 @@ import { createLaunchTool, type LaunchResult, type LaunchRouterLog } from "../..
 import { handleDaemonLaunch, type DaemonLaunchReply } from "../../src/daemon/handlers/launch.js";
 import { handleDaemonRun } from "../../src/daemon/handlers/run.js";
 import { handleDaemonStatus } from "../../src/daemon/handlers/status.js";
-import { createIntentStore, DaemonIntentError, managerSessionKey, type IntentStore } from "../../src/daemon/intents.js";
+import { createIntentStore, DaemonIntentError, DAEMON_INTENTS_DIR_NAME, managerSessionKey, type IntentStore } from "../../src/daemon/intents.js";
 import { createMailbox, DaemonMailboxError, DAEMON_MAILBOX_DIR_NAME, mailboxEventId, type Mailbox } from "../../src/daemon/mailbox.js";
 import { daemonRunOwnership, type ClaimRecord } from "../../src/daemon/ownership.js";
 import { resolveDaemonNamespace, type DaemonNamespace } from "../../src/daemon/namespace.js";
@@ -485,6 +485,27 @@ describe("daemon launch handler — mailbox capacity admission (F2)", () => {
     expect(await fx.intents.list(managerKey)).toEqual([]);
     expect(fx.events).toEqual([]);
     expect(fx.prompts).toEqual([]);
+  });
+
+  it("E2: replay and conflict arbitration answer at mailbox capacity — capacity gates only effectful launches", async () => {
+    const fx = await harness();
+    const first = await handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot)) as DaemonLaunchReply;
+    expect(first.state).toBe("completed");
+    fx.runtime.bindMailbox({
+      ...fx.mailbox,
+      checkLaunchCapacity: async () => ({ ok: false, code: "MAILBOX_CAPACITY", at: new Date().toISOString() }),
+    });
+    // The recorded binding replays its state at cap — zero effect, no refusal.
+    const replay = await handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot)) as DaemonLaunchReply;
+    expect(replay.launchId).toBe(first.launchId);
+    expect(replay.state).toBe("completed");
+    // A conflicting task under the same key surfaces the conflict, not capacity.
+    await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { task: { ...task, scope: "a different scope" } })))
+      .rejects.toMatchObject({ daemonCode: "IDEMPOTENCY_KEY_CONFLICT" });
+    // A fresh key still refuses — admission for launches that create effects is unchanged.
+    await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { idempotencyKey: "idem-2" })))
+      .rejects.toMatchObject({ daemonCode: "MAILBOX_CAPACITY" });
+    expect(await fx.intents.list(managerKey)).toHaveLength(1);
   });
 });
 
@@ -1443,6 +1464,31 @@ describe("daemon status handler", () => {
     expect(await sees(claim)).toBe(false);
   });
 
+  it("E3: unreadable provenance resolves owner to null — neither the recorder nor the successor sees the run", async () => {
+    const successorSession: AgentSessionIdentity = { source: "herdr:pi", agent: "pi", kind: "id", value: "succ-session" };
+    const fx = await harness({
+      caller: {
+        panes: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "successor", agent: "pi", terminal_id: "t-succ", agent_session: successorSession, agent_status: "idle" }],
+        agents: [{ pane_id: "w1:p2", name: "successor", agent: "pi", terminal_id: "t-succ", agent_session: successorSession, agent_status: "idle" }],
+      },
+    });
+    const allocation = await boundRun(fx, { terminalId: "t-owned" });
+    const begun = await fx.intents.begin({ managerSessionKey: managerKey, idempotencyKey: "idem-1", task, projectRoot: fx.projectRoot });
+    if (begun.kind !== "launch") throw new Error("expected launch");
+    const effecting = await fx.intents.markEffecting(begun.intent);
+    await fx.intents.recordChildren(effecting, [{ name: "task-aa-1", runId: allocation.runId }]);
+    await fx.intents.complete(effecting, [{ name: "task-aa-1", runId: allocation.runId, disposition: "bound" }]);
+    await handleDaemonRun(fx.runtime, runParams({ action: "transfer", runIds: [allocation.runId], successorPaneId: "w1:p2" }));
+    // Provenance can no longer be read: ownership is unresolvable — the run
+    // must not revert to its recording manager, and the successor cannot
+    // claim it either.
+    await writeFile(join(allocation.toolsDir, "provenance.json"), "corrupt", { mode: 0o600 });
+    const sees = async (identity: Record<string, unknown>) =>
+      (await handleDaemonStatus(fx.runtime, { identity })).runs.some((run) => run.runId === allocation.runId);
+    expect(await sees({ workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p2", agentSession: successorSession })).toBe(false);
+    expect(await sees(claim)).toBe(false);
+  });
+
   it("F5: reports a running supervisor whose D5 owner-absence pause is engaged as `paused`, never `active`", async () => {
     const runPaused = "44444444-5555-6666-7777-888888888888";
     const runActive = "55555555-6666-7777-8888-999999999999";
@@ -1464,6 +1510,36 @@ describe("daemon status handler", () => {
     const status = await handleDaemonStatus(fx.runtime, runParams()) as { runs: Array<{ runId: string; review: string }> };
     expect(status.runs.find((run) => run.runId === runPaused)?.review).toBe("paused");
     expect(status.runs.find((run) => run.runId === runActive)?.review).toBe("active");
+  });
+
+  it("E4: a malformed foreign intent ledger skips with a bounded count — the caller's own status still answers", async () => {
+    const fx = await harness();
+    const begun = await fx.intents.begin({ managerSessionKey: managerKey, idempotencyKey: "idem-1", task, projectRoot: fx.projectRoot });
+    if (begun.kind !== "launch") throw new Error("expected launch");
+    await fx.intents.complete(await fx.intents.markEffecting(begun.intent));
+    const intentsDir = join(fx.namespace.dir, DAEMON_INTENTS_DIR_NAME);
+    // A foreign ledger holding one malformed record sorts first; a second
+    // foreign ledger records a run the caller actually owns.
+    const badKey = "0".repeat(64);
+    await mkdir(join(intentsDir, badKey), { recursive: true, mode: 0o700 });
+    await writeFile(join(intentsDir, badKey, "corrupt.json"), "not json", { mode: 0o600 });
+    const foreignRun = await boundRun(fx, { terminalId: "t-foreign" });
+    const goodKey = "f".repeat(64);
+    await mkdir(join(intentsDir, goodKey), { recursive: true, mode: 0o700 });
+    const record = {
+      v: 1, managerSessionKey: goodKey, idempotencyKey: "foreign-1",
+      taskDigest: "a".repeat(64), launchId: "launch-foreign",
+      projectRoot: fx.projectRoot, state: "completed",
+      recordedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      children: [{ name: "task-aa-1", runId: foreignRun.runId }],
+    };
+    await writeFile(join(intentsDir, goodKey, "foreign-1.json"), JSON.stringify(record), { mode: 0o600 });
+    const status = await handleDaemonStatus(fx.runtime, runParams()) as { intents: unknown[]; runs: Array<{ runId: string }>; skippedLedgers?: number };
+    expect(status.intents).toHaveLength(1);
+    expect(status.skippedLedgers).toBe(1);
+    // The projection continued past the malformed ledger: the run recorded
+    // under a foreign ledger still resolves to its provenance owner — the caller.
+    expect(status.runs.some((run) => run.runId === foreignRun.runId)).toBe(true);
   });
 
   it("projects one mailbox event body for a named eventId — read-only, nothing acked", async () => {

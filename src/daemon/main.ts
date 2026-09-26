@@ -236,6 +236,23 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
     await lease.release().catch(() => undefined);
   };
 
+  // Once the D4 sweep has run — even partially — this start may already own
+  // bound supervisors. A post-sweep failure drains them in the §4 order
+  // (flush → stop → release) so a refused start leaves no orphaned
+  // supervision reviewing or emitting behind the next lease holder.
+  const rollback = async (): Promise<void> => {
+    for (const [name, step] of [
+      ["flushHandoffs", seams.flushHandoffs],
+      ["stopSupervisors", seams.stopSupervisors],
+    ] as const) {
+      log(`herdr-tools-daemon startup rollback step: ${name}`);
+      await step().catch((error: unknown) => {
+        log(`herdr-tools-daemon startup rollback step failed: ${name}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    await teardown();
+  };
+
   // The D4 sweep hook (N1.3): every `effecting` record the last run left is
   // `unresolved(interrupted)` before this start is declared — a live effect
   // is only ever one this process owns.
@@ -291,7 +308,8 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
     try {
       await options.reattach({ mailbox, startedAt, ...(priorHeartbeat === undefined ? {} : { lastHeartbeat: priorHeartbeat }) });
     } catch (error) {
-      await teardown();
+      // A sweep that throws may have bound earlier runs — drain them too.
+      await rollback();
       throw error;
     }
   }
@@ -304,7 +322,9 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
   try {
     server = await startDaemonServer({ namespace, lease, handler: options.handler, probe: options.probe });
   } catch (error) {
-    await teardown();
+    // The reattach sweep already ran: its bound supervisors drain before the
+    // lock goes — a refused start cannot orphan live supervision.
+    await rollback();
     throw error;
   }
 

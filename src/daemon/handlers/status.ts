@@ -67,6 +67,11 @@ export interface DaemonStatusReply {
   /** The caller's own mailbox directory — `mailbox/<managerSessionKey>/` inside the namespace. */
   mailbox: string;
   capacity: unknown;
+  /**
+   * Foreign intent ledgers skipped as unreadable while projecting runs —
+   * bounded by the manager count; present only when at least one was skipped.
+   */
+  skippedLedgers?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -192,12 +197,21 @@ export async function handleDaemonStatus(runtime: DaemonRuntime, params: Record<
   } catch (error) {
     throw daemonRequestError(error);
   }
+  let skippedLedgers = 0;
   for (const manager of managers) {
     let ledger: LaunchIntentRecord[];
-    try {
-      ledger = manager === caller.managerSessionKey ? intents : await runtime.intents.list(manager);
-    } catch (error) {
-      throw daemonRequestError(error);
+    if (manager === caller.managerSessionKey) {
+      ledger = intents;
+    } else {
+      try {
+        ledger = await runtime.intents.list(manager);
+      } catch {
+        // A foreign ledger that cannot be read isolates to zero run
+        // candidates — one malformed record belonging to another manager
+        // must not take down this caller's own status.
+        skippedLedgers += 1;
+        continue;
+      }
     }
     for (const intent of ledger) {
       for (const child of intent.children) {
@@ -213,15 +227,6 @@ export async function handleDaemonStatus(runtime: DaemonRuntime, params: Record<
     } catch {
       run = undefined;
     }
-    let ownerKey = recorder;
-    if (run !== undefined) {
-      const provenance = await readHandoffProvenance(run).catch(() => undefined);
-      const owner = provenance === undefined ? null : currentHandoffOwner(provenance);
-      if (owner !== null) ownerKey = managerSessionKey(owner);
-    }
-    // Only the run's current owner sees it — a transferred run leaves the
-    // recording manager's view and joins its successor's.
-    if (ownerKey !== caller.managerSessionKey) continue;
     let state: HandoffState | undefined;
     if (run !== undefined) {
       try {
@@ -230,6 +235,18 @@ export async function handleDaemonStatus(runtime: DaemonRuntime, params: Record<
         state = undefined;
       }
     }
+    let ownerKey: string | undefined = recorder;
+    if (run !== undefined && state !== undefined) {
+      const provenance = await readHandoffProvenance(run).catch(() => undefined);
+      const owner = provenance === undefined ? null : currentHandoffOwner(provenance);
+      // Unreadable provenance on a run that exists is unresolvable ownership —
+      // never evidence it reverted to its recorder: it projects to no one.
+      ownerKey = owner === null ? undefined : managerSessionKey(owner);
+    }
+    // Only the run's current owner sees it — a transferred run leaves the
+    // recording manager's view and joins its successor's; a recorded run with
+    // nothing on disk stays a recorder-side `unavailable` stub.
+    if (ownerKey !== caller.managerSessionKey) continue;
     const review = reviews.get(runId) ?? "paused";
     if (state === undefined) {
       runs.push({ runId, lifecycle: "unavailable", child: { agentName: "", agentKind: "", presence: "absent" }, review });
@@ -275,5 +292,6 @@ export async function handleDaemonStatus(runtime: DaemonRuntime, params: Record<
     pendingTransfers,
     mailbox: join(runtime.namespace.dir, DAEMON_MAILBOX_DIR_NAME, caller.managerSessionKey),
     capacity: daemon.capacity ?? "ok",
+    ...(skippedLedgers === 0 ? {} : { skippedLedgers }),
   };
 }

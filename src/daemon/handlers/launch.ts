@@ -30,12 +30,13 @@ import {
   type VerifiedDaemonCaller,
 } from "../runtime.js";
 import { DaemonRequestError } from "../protocol.js";
-import type {
-  LaunchIntentChild,
-  LaunchIntentChildDisposition,
-  LaunchIntentRecord,
-  LaunchIntentResolution,
-  LaunchIntentState,
+import {
+  taskDigest,
+  type LaunchIntentChild,
+  type LaunchIntentChildDisposition,
+  type LaunchIntentRecord,
+  type LaunchIntentResolution,
+  type LaunchIntentState,
 } from "../intents.js";
 
 export type DaemonLaunchReply =
@@ -231,16 +232,27 @@ export async function handleDaemonLaunch(runtime: DaemonRuntime, params: Record<
   if (!Value.Check(IdempotencyKeySchema, idempotencyKey)) throw new DaemonRequestError("REQUEST_INVALID");
   const task = params.task;
   if (!Value.Check(LaunchTaskSchema, task)) throw new DaemonRequestError("REQUEST_INVALID");
-  // §7: capacity admission precedes every effect — the intent record's own
-  // `recorded` write included. At cap the launch refuses MAILBOX_CAPACITY and
-  // produces zero child effect.
-  let capacity;
+  // §7: capacity admission gates only a verdict that would create an effect —
+  // a fresh begin or a still-`recorded` resume. Replay/unresolved/conflict
+  // arbitration over an existing binding mints nothing and must answer even
+  // at cap, so peek at the binding first; `begin` re-arbitrates under the
+  // flock, so a binding that changed in between is never trusted here.
+  let binding: LaunchIntentRecord | undefined;
   try {
-    capacity = await requireDaemonMailbox(runtime).checkLaunchCapacity(caller.managerSessionKey);
+    binding = await runtime.intents.get(caller.managerSessionKey, idempotencyKey);
   } catch (error) {
     throw daemonRequestError(error);
   }
-  if (!capacity.ok) throw new DaemonRequestError(capacity.code);
+  if (binding === undefined
+    || (binding.taskDigest === taskDigest(task) && binding.projectRoot === projectRoot && binding.state === "recorded")) {
+    let capacity;
+    try {
+      capacity = await requireDaemonMailbox(runtime).checkLaunchCapacity(caller.managerSessionKey);
+    } catch (error) {
+      throw daemonRequestError(error);
+    }
+    if (!capacity.ok) throw new DaemonRequestError(capacity.code);
+  }
   const flightKey = `${caller.managerSessionKey}/${idempotencyKey}`;
   for (;;) {
     let begun;

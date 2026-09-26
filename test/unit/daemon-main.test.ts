@@ -163,6 +163,34 @@ describe("daemon startup and lifecycle record", () => {
     await expect(lstat(fx.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("E1: a bind failure after a completed reattach drains supervisors before releasing the lock", async () => {
+    const fx = await fixture();
+    const order: string[] = [];
+    const seams: DaemonShutdownSeams = {
+      flushHandoffs: async () => void order.push("flushHandoffs"),
+      stopSupervisors: async () => {
+        order.push("stopSupervisors");
+        // The lock is still held while supervision drains — release comes last.
+        await expect(acquireDaemonInstance(fx.namespace)).rejects.toMatchObject({ code: "DAEMON_INSTANCE_HELD" });
+      },
+    };
+    await expect(
+      startDaemon({
+        env: fx.env,
+        seams,
+        reattach: async () => void order.push("reattach"),
+        probe: async () => {
+          // The probe fails after the sweep — the refused start must roll
+          // back what the sweep already bound before releasing the lock.
+          throw new Error("probe exploded");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "DAEMON_INSTANCE_UNAVAILABLE" });
+    expect(order).toEqual(["reattach", "flushHandoffs", "stopSupervisors"]);
+    await expectLockFree(fx.namespace);
+    await expect(lstat(fx.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("F3: the socket accepts nothing until the restart sweep completes — listen follows the sweep", async () => {
     const fx = await fixture();
     // Hold the D4 reattach sweep open: the daemon is mid-recovery.

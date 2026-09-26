@@ -8,9 +8,6 @@ import type { JobDetail } from "../../src/job-registry.js";
 import { createDevinQueueFlush, type DevinQueueFlush, type DevinQueueFlushCli } from "../../src/messages/devin-queue-flush.js";
 import { createPaneWriteGuard } from "../../src/pane-write-lock.js";
 import {
-  CLAUDE_CHANNEL_NOTIFICATION_METHOD,
-  CLAUDE_WAKE_MAX_ATTEMPTS,
-  CLAUDE_WAKE_RETRY_DELAY_MS,
   createMcpHostWake,
   type McpHostWakeDeps,
   type McpWakeCli,
@@ -112,7 +109,6 @@ interface Harness {
   deps: McpHostWakeDeps;
   calls: string[][];
   prompts: Array<{ target: string; text: string }>;
-  notifications: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }>;
   queueFlush: DevinQueueFlush;
   lockDir: string;
 }
@@ -162,8 +158,6 @@ interface HarnessOptions {
   paneViews?: string[];
   /** Session controller wired as `deps.signal`; aborting it is server shutdown. */
   session?: AbortController;
-  /** Abort after resolving the own-pane kind but before selecting its wake transport. */
-  abortAfterResolution?: boolean;
   /** Shut the coordinator down inside the first `pane get` that follows an `agent wait`. */
   abortBeforeKey?: boolean;
   /** Drop the snapshot agent record entirely (the incomplete own-pane edge). */
@@ -172,14 +166,12 @@ interface HarnessOptions {
   omitSandwichPaneStatus?: boolean;
   /** Replace the `agent get` result payload. */
   agentGetResult?: unknown;
-  notifyChannel?: McpHostWakeDeps["notifyChannel"];
   ctx?: McpHostWakeDeps["context"];
 }
 
 function harness(options: HarnessOptions = {}): Harness {
   const calls: string[][] = [];
   const prompts: Array<{ target: string; text: string }> = [];
-  const notifications: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }> = [];
   // `resolvedKind` present-but-undefined means the pane record carries no kind.
   const resolvedKind = Object.prototype.hasOwnProperty.call(options, "resolvedKind") ? options.resolvedKind : "devin";
   const sandwichKind = options.sandwichKind ?? resolvedKind ?? "devin";
@@ -214,7 +206,6 @@ function harness(options: HarnessOptions = {}): Harness {
               : sequence[Math.min(paneGetSuccesses - 1, sequence.length - 1)]!,
         );
         if (paneGetSuccesses > 1 && options.omitSandwichPaneStatus) delete record.agent_status;
-        if (options.abortAfterResolution && paneGetSuccesses === 1) session.abort();
         if (options.abortBeforeKey && waited) void queueFlush.shutdown();
         return envelope("pane-get", { pane: record });
       }
@@ -265,13 +256,11 @@ function harness(options: HarnessOptions = {}): Harness {
     deps: {
       cli,
       context: options.ctx ?? context,
-      notifyChannel: options.notifyChannel ?? ((notification) => { notifications.push(notification); }),
       signal: session.signal,
       queueFlush,
     },
     calls,
     prompts,
-    notifications,
     queueFlush,
     lockDir,
   };
@@ -286,7 +275,7 @@ async function flush(): Promise<void> {
 
 describe("the MCP host wake router", () => {
   it("self-prompts a devin own pane with the full provenance envelope and validated ack", async () => {
-    const { deps, prompts, notifications } = harness();
+    const { deps, prompts } = harness();
     createMcpHostWake(deps).notifier.wake(wake);
     await vi.waitFor(() => expect(prompts).toHaveLength(1));
     expect(prompts[0]!.target).toBe(ownPaneId);
@@ -295,7 +284,6 @@ describe("the MCP host wake router", () => {
     expect(prompts[0]!.text).toContain("from: manager (w1:p9)");
     expect(prompts[0]!.text).toContain("HIGH PRIORITY: ");
     expect(prompts[0]!.text).toContain("job_sup");
-    expect(notifications).toHaveLength(0);
   });
 
   it("self-prompts a pi own pane the same way", async () => {
@@ -305,101 +293,16 @@ describe("the MCP host wake router", () => {
     expect(prompts[0]!.text).toContain("kind: supervision");
   });
 
-  it("sends a claude own pane the channel notification and never prompts", async () => {
-    const { deps, prompts, notifications } = harness({ resolvedKind: "claude" });
-    const host = createMcpHostWake(deps);
-    host.notifier.wake(wake);
-    await vi.waitFor(() => expect(notifications).toHaveLength(1));
-    expect(notifications[0]!.method).toBe(CLAUDE_CHANNEL_NOTIFICATION_METHOD);
-    expect(notifications[0]!.params.content).toContain("job_sup");
-    expect(notifications[0]!.params.meta).toMatchObject({ jobId: "job_sup", eventType: "blocked" });
-    expect(prompts).toHaveLength(0);
-    // The resolved kind is cached: a second wake pays no resolution read.
-    host.notifier.wake(wake);
-    await vi.waitFor(() => expect(notifications).toHaveLength(2));
-  });
-
-  it("swallows a channel send that throws or rejects", async () => {
-    for (const notifyChannel of [() => { throw new Error("closed"); }, () => Promise.reject(new Error("closed"))] as const) {
-      const { deps, calls } = harness({ resolvedKind: "claude", notifyChannel });
-      expect(() => createMcpHostWake(deps).notifier.wake(wake)).not.toThrow();
-      await vi.waitFor(() => expect(paneGets(calls)).toBe(1));
-      await flush();
-    }
-  });
-
-  it("retries a failed channel send with the identical payload until it lands", async () => {
-    const sent: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }> = [];
-    const notifyChannel: McpHostWakeDeps["notifyChannel"] = (notification) => {
-      sent.push(notification);
-      // A synchronous failure — the same shape as the host's not-yet-installed
-      // sender — must enter the retry, not read as a delivered write.
-      if (sent.length === 1) throw new Error("not connected");
-    };
-    const { deps } = harness({ resolvedKind: "claude", notifyChannel });
-    createMcpHostWake(deps).notifier.wake(wake);
-    await vi.waitFor(() => expect(sent).toHaveLength(2));
-    // The retried write is the identical payload object, not a rebuilt copy.
-    expect(sent[1]).toBe(sent[0]);
-    expect(sent[0]!.method).toBe(CLAUDE_CHANNEL_NOTIFICATION_METHOD);
-    expect(sent[0]!.params.content).toContain("job_sup");
-    await flush();
-    expect(sent).toHaveLength(2);
-  });
-
-  it("drops the wake silently once the channel retry bound is spent", async () => {
-    const attempts: unknown[] = [];
-    const notifyChannel: McpHostWakeDeps["notifyChannel"] = (notification) => {
-      attempts.push(notification);
-      return Promise.reject(new Error("closed"));
-    };
-    const { deps } = harness({ resolvedKind: "claude", notifyChannel });
-    expect(() => createMcpHostWake(deps).notifier.wake(wake)).not.toThrow();
-    await vi.waitFor(() => expect(attempts).toHaveLength(CLAUDE_WAKE_MAX_ATTEMPTS));
-    // The drop is final: a further attempt would fire within one backoff, so
-    // outlasting two with the count still at the cap proves nothing follows.
-    await new Promise((resolve) => setTimeout(resolve, CLAUDE_WAKE_RETRY_DELAY_MS * 2));
-    expect(attempts).toHaveLength(CLAUDE_WAKE_MAX_ATTEMPTS);
-  });
-
-  it("does not send a channel notification when shutdown follows kind resolution", async () => {
-    const attempts: unknown[] = [];
-    const { deps } = harness({
-      resolvedKind: "claude",
-      notifyChannel: (notification) => { attempts.push(notification); },
-      abortAfterResolution: true,
-    });
-    createMcpHostWake(deps).notifier.wake(wake);
-    await flush();
-    expect(attempts).toHaveLength(0);
-  });
-
-  it("stops the channel retry when the session aborts during the backoff", async () => {
-    const session = new AbortController();
-    const attempts: unknown[] = [];
-    const notifyChannel: McpHostWakeDeps["notifyChannel"] = (notification) => {
-      attempts.push(notification);
-      // The abort lands while the pipeline is parked in the retry backoff —
-      // the armed sleep must cancel and no further write may leave.
-      setImmediate(() => session.abort());
-      return Promise.reject(new Error("closed"));
-    };
-    const { deps } = harness({ resolvedKind: "claude", notifyChannel, session });
-    createMcpHostWake(deps).notifier.wake(wake);
-    await vi.waitFor(() => expect(attempts).toHaveLength(1));
-    await new Promise((resolve) => setTimeout(resolve, CLAUDE_WAKE_RETRY_DELAY_MS * 2));
-    expect(attempts).toHaveLength(1);
-  });
-
-  it.each([["agy"], ["codex"], [undefined]] as const)("stays inert for a %s own pane and caches the resolution", async (kind) => {
-    const { deps, calls, prompts, notifications } = harness({ resolvedKind: kind });
+  // N5.2: a claude own pane has no wake path — the Channels send is gone and
+  // the daemon owns every wake, so claude drops like any non-prompt kind.
+  it.each([["claude"], ["agy"], ["codex"], [undefined]] as const)("stays inert for a %s own pane and caches the resolution", async (kind) => {
+    const { deps, calls, prompts } = harness({ resolvedKind: kind });
     const host = createMcpHostWake(deps);
     host.notifier.wake(wake);
     host.notifyJobTerminal(waitDetail());
     await vi.waitFor(() => expect(paneGets(calls)).toBe(1));
     await flush();
     expect(prompts).toHaveLength(0);
-    expect(notifications).toHaveLength(0);
     // A resolved "no usable kind" is cached permanently: no second `pane get`.
     host.notifier.wake(wake);
     await flush();
@@ -418,26 +321,28 @@ describe("the MCP host wake router", () => {
   });
 
   it("resolves the kind lazily: no reads at construction, one `pane get` for a burst, retry after a failure", async () => {
-    const { deps, calls, notifications } = harness({ resolvedKind: "claude" });
+    const { deps, calls, prompts } = harness({ resolvedKind: "claude" });
     const host = createMcpHostWake(deps);
     expect(calls).toHaveLength(0);
     // A synchronous burst shares the single in-flight resolution.
     host.notifier.wake(wake);
     host.notifier.wake(wake);
     host.notifyJobTerminal(waitDetail());
-    await vi.waitFor(() => expect(notifications).toHaveLength(3));
-    expect(paneGets(calls)).toBe(1);
+    await vi.waitFor(() => expect(paneGets(calls)).toBe(1));
+    await flush();
+    expect(prompts).toHaveLength(0);
 
     const failing = harness({ resolvedKind: "claude", paneGetFailures: 1 });
     const failingHost = createMcpHostWake(failing.deps);
     failingHost.notifier.wake(wake);
     await vi.waitFor(() => expect(paneGets(failing.calls)).toBe(1));
     await flush();
-    expect(failing.notifications).toHaveLength(0);
+    expect(failing.prompts).toHaveLength(0);
     // The rejected resolution is not cached: the next wake pays another read.
     failingHost.notifier.wake(wake);
-    await vi.waitFor(() => expect(failing.notifications).toHaveLength(1));
-    expect(paneGets(failing.calls)).toBe(2);
+    await vi.waitFor(() => expect(paneGets(failing.calls)).toBe(2));
+    await flush();
+    expect(failing.prompts).toHaveLength(0);
   });
 
   it("still writes to a working or blocked own pane but skips unknown or unproven state", async () => {
@@ -729,16 +634,15 @@ describe("the MCP host wake router", () => {
   });
 
   it("drops the prompt pipeline itself once the session is closed", async () => {
-    // The combined pipeline signal is already aborted: no identity read, no
-    // `agent prompt` write, no notification — nothing outlives shutdown.
+    // The combined pipeline signal is already aborted: no identity read and
+    // no `agent prompt` write — nothing outlives shutdown.
     const session = new AbortController();
     session.abort();
-    const { deps, calls, prompts, notifications } = harness({ session });
+    const { deps, calls, prompts } = harness({ session });
     createMcpHostWake(deps).notifier.wake(wake);
     await flush();
     expect(calls).toHaveLength(0);
     expect(prompts).toHaveLength(0);
-    expect(notifications).toHaveLength(0);
   });
 
   it("coalesces a burst of queued wakes into one wait and one Enter", async () => {
@@ -900,7 +804,6 @@ describe("lazy self-adoption in the MCP host wake", () => {
     calls: string[][];
     renames: string[];
     prompts: Array<{ target: string; text: string }>;
-    notifications: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }>;
   }
 
   function selfAdoptHarness(options: SelfAdoptOptions = {}): SelfAdoptHarness {
@@ -910,7 +813,6 @@ describe("lazy self-adoption in the MCP host wake", () => {
     const calls: string[][] = [];
     const renames: string[] = [];
     const prompts: Array<{ target: string; text: string }> = [];
-    const notifications: Array<{ method: string; params: { content: string; meta: Record<string, unknown> } }> = [];
     const named = options.named === true || options.lateName === true;
     const pane: Record<string, unknown> = {
       pane_id: paneId, tab_id: "w1:t1", workspace_id: "w1", label: "manager",
@@ -1017,14 +919,12 @@ describe("lazy self-adoption in the MCP host wake", () => {
       deps: {
         cli,
         context: { workspaceId: "w1", tabId: "w1:t1", paneId },
-        notifyChannel: (notification) => { notifications.push(notification); },
         signal: new AbortController().signal,
         queueFlush
       },
       calls,
       renames,
-      prompts,
-      notifications
+      prompts
     };
   }
 
@@ -1068,14 +968,15 @@ describe("lazy self-adoption in the MCP host wake", () => {
     await flush();
     expect(h.renames).toHaveLength(0);
     expect(h.prompts).toHaveLength(0);
-    expect(h.notifications).toHaveLength(0);
   });
 
-  it("mints a name for an unnamed claude pane while the wake still rides the channel", async () => {
+  it("mints a name for an unnamed claude pane even though the wake itself now drops", async () => {
+    // The mint buys the claude pane inbound reachability; the wake send is
+    // gone with the Channels path (N5.2), so no prompt or send follows it.
     const h = selfAdoptHarness({ kind: "claude" });
     createMcpHostWake(h.deps).notifier.wake(wake);
-    await vi.waitFor(() => expect(h.notifications).toHaveLength(1));
-    expect(h.renames).toEqual(["claude-w1p9"]);
+    await vi.waitFor(() => expect(h.renames).toEqual(["claude-w1p9"]));
+    await flush();
     expect(h.prompts).toHaveLength(0);
   });
 

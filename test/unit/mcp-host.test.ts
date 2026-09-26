@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
-import { JobRegistry } from "../../src/job-registry.js";
-import { RuntimeOwnership } from "../../src/ownership.js";
 import { createPreflight, createToolSurface } from "../../src/tool-surface.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import { createLaunchTool } from "../../src/tools/launch.js";
@@ -126,31 +124,24 @@ describe("MCP host capability proxy", () => {
     expect(() => (ctx as unknown as { ui: unknown }).ui).toThrowError(HostCapabilityError);
   });
 
-  it("proves the seven shared tools read no other host field", async () => {
+  it("proves the three shared tools read no other host field", async () => {
     const signal = new AbortController().signal;
     const { host, reads } = recordingHost(signal);
     const cli = fakeCli();
+    const daemon = {
+      launch: async () => { throw new Error("no daemon"); },
+      run: async () => { throw new Error("no daemon"); },
+      status: async () => { throw new Error("no daemon"); },
+      close: () => undefined,
+    };
     const surface = createToolSurface({
-      cli,
-      context,
-      environment: { enabled: true, currentIdsPresent: true, currentIdsValid: true },
-      preflight: createPreflight(cli),
-      settingsLoader: async () => ({ reviewCadenceMinutes: 30, reviewerModel: "testmodel", reviewerThinking: "low" }),
-      jobs: new JobRegistry(),
-      profiles: { load: async () => ({ effective: new Map(), candidates: [], diagnostics: [] }) as never },
-      ownership: new RuntimeOwnership(),
-      supervision: stubSupervision(),
+      connectDaemon: async () => daemon as never,
       cwd: "/project",
-      reviewerFactory: () => { throw new Error("unused"); }
     });
     const args: Record<string, unknown> = {
-      herdr_inspect: { mode: "context" },
-      herdr_communicate: { target: "w:p2", operation: "prompt", text: "hello" },
-      herdr_wait: { targets: ["w:p2"], match: "any", condition: { kind: "state", state: "idle" }, timeoutMs: 5 },
-      herdr_jobs: { operation: "list" },
-      herdr_launch: { objective: "o", scope: "s", doneWhen: ["done"], constraints: ["none"] },
-      herdr_pane: { operation: "focus", target: "w:p2" },
-      herdr_tab: { operation: "focus", target: "w:t" }
+      herdr_launch: { task: { objective: "o", scope: "s", doneWhen: ["done"] }, idempotencyKey: "idem-1" },
+      herdr_run: { action: "observe", runId: "11111111-2222-3333-4444-555555555555" },
+      herdr_status: {},
     };
     for (const definition of surface.definitions) {
       await definition.execute("id", args[definition.name], signal, undefined, hostContext(host)).catch(() => undefined);
@@ -372,6 +363,28 @@ describe("MCP startup gating", () => {
         expect((refusal as Error).message).toBe(projectDirMessage);
       }
     }
+  });
+
+  it("relaxes only the injected-identity gate under HERDR_EXECUTOR_DELEGATED", async () => {
+    // No injected ids: the delegated flag admits the executor-gateway serve.
+    const delegated = await resolveStartup({ env: { HERDR_ENV: "1", HERDR_EXECUTOR_DELEGATED: "1", HERDR_PROJECT_DIR: directory } });
+    expect(delegated.context).toEqual({});
+    expect(delegated.environment.currentIdsPresent).toBe(false);
+    // Malformed injected ids relax identically — the per-call caller arg decides identity.
+    const malformed = await resolveStartup({ env: { HERDR_ENV: "1", HERDR_EXECUTOR_DELEGATED: "1", HERDR_PANE_ID: "bad\npane", HERDR_PROJECT_DIR: directory } });
+    expect(malformed.environment).toMatchObject({ currentIdsPresent: false, currentIdsValid: false });
+    // The other gates are untouched: no HERDR_ENV, no usable project dir.
+    for (const [deps, reason] of [
+      [{ env: { HERDR_EXECUTOR_DELEGATED: "1", HERDR_PROJECT_DIR: directory } }, "HERDR_ENV"],
+      [{ env: { HERDR_ENV: "1", HERDR_EXECUTOR_DELEGATED: "1", HERDR_PROJECT_DIR: join(directory, "missing") } }, "PROJECT_DIR"],
+      [{ env: { HERDR_ENV: "1", HERDR_EXECUTOR_DELEGATED: "1", HERDR_PROJECT_DIR: "relative/project" }, cwd: () => launchDir }, "PROJECT_DIR"],
+    ] as Array<[StartupDependencies, string]>) {
+      const refusal = await resolveStartup(deps).catch((error: unknown) => error);
+      expect(refusal).toMatchObject({ code: "STARTUP_REFUSED", reason });
+    }
+    // Any value other than exactly "1" leaves the gate in force.
+    const refused = await resolveStartup({ env: { HERDR_ENV: "1", HERDR_EXECUTOR_DELEGATED: "true", HERDR_PROJECT_DIR: directory } }).catch((error: unknown) => error);
+    expect(refused).toMatchObject({ code: "STARTUP_REFUSED", reason: "INJECTED_CONTEXT" });
   });
 
   it("reads the ambient environment and a real directory stat by default", async () => {

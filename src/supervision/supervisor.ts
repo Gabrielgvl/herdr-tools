@@ -10,8 +10,11 @@
  */
 
 import { ReviewerFailure, type ReviewClassification } from "../reviewer.js";
+import { optionalSessionCandidate, type AgentSessionIdentity } from "../messages/prompt.js";
 import { renderHandoffContract, type HandoffAllocation } from "../handoff.js";
 import { handoffGateMatches, type HandoffGate, type HandoffInspection, type HandoffRun, type HandoffValidation } from "../handoff-gate.js";
+import type { IdleHintSink } from "../daemon/hints.js";
+import type { MailboxDecision, MailboxEventWriter } from "../daemon/mailbox.js";
 import type { HerdrSnapshot } from "../targets.js";
 import {
   BoundedHistory,
@@ -119,7 +122,40 @@ export const realSupervisionScheduler: SupervisionScheduler = {
   clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
-export type ProviderLimitSignal = false | { readonly cooldownRecorded: boolean };
+/**
+ * What the launch-seam recovery attempt proved on a zero-progress provider
+ * limit, surfaced verbatim inside the `provider_limit` event details. Absent
+ * on the signal means the manual close-then-recovery contract stands.
+ */
+export interface ProviderLimitRecoveryEvidence {
+  outcome: "relaunched" | "abstained" | "failed";
+  /** The recovery launch's minted id and started child, when one started. */
+  launchId?: string;
+  target?: string;
+  operatingPointId?: string;
+  supervisorJobId?: string;
+  /** Bounded reason a non-relaunched outcome reports — never cause prose. */
+  code?: string;
+}
+
+export type ProviderLimitSignal = false | {
+  readonly cooldownRecorded: boolean;
+  /** The provider's own reset instant (ISO), when the typed source supplied one. */
+  readonly retryNotBefore?: string;
+  readonly autoRecovery?: ProviderLimitRecoveryEvidence;
+};
+
+/** The flat event-detail projection of one recovery attempt; details carry scalars only. */
+function autoRecoveryDetails(recovery: ProviderLimitRecoveryEvidence): Record<string, string> {
+  return {
+    autoRecovery: recovery.outcome,
+    ...(recovery.launchId === undefined ? {} : { recoveryLaunchId: recovery.launchId }),
+    ...(recovery.target === undefined ? {} : { recoveryTarget: recovery.target }),
+    ...(recovery.operatingPointId === undefined ? {} : { recoveryOperatingPointId: recovery.operatingPointId }),
+    ...(recovery.supervisorJobId === undefined ? {} : { recoverySupervisorJobId: recovery.supervisorJobId }),
+    ...(recovery.code === undefined ? {} : { recoveryCode: recovery.code }),
+  };
+}
 
 export interface SupervisionChildRequest {
   agentName: string;
@@ -162,7 +198,17 @@ export interface SupervisionBinding {
    * identity. Present on every qualified managed launch; the registry binds it
    * through the shared gate before the child binding is accepted.
    */
-  handoff?: { allocation: HandoffAllocation; agentId?: string };
+  handoff?: {
+    allocation: HandoffAllocation;
+    agentId?: string;
+    /**
+     * The run's recorded owner (D5): while this identity is absent from the
+     * authoritative snapshot, `reviews` pause — lifecycle watching continues —
+     * and resume automatically when the exact session reappears. A `null`
+     * session pauses on the recorded pane's absence instead.
+     */
+    owner?: { paneId: string; session: AgentSessionIdentity | null };
+  };
 }
 
 export interface SupervisorDependencies {
@@ -233,6 +279,21 @@ export interface SupervisorDependencies {
   evidenceScanner?: EvidenceScanner;
   idFactory?: () => string;
   update: (text: string, details?: unknown) => void;
+  /**
+   * The N2.2 owner-mailbox writer seam. Every emitted event of a bound managed
+   * run is persisted through it to the run's CURRENT owner mailbox; a failed
+   * persist is recorded on the job view as `persistenceFailed` with the event
+   * ID and is never claimed as persisted. Absent hosts never persist.
+   */
+  eventWriter?: MailboxEventWriter;
+  /**
+   * The N2.5 best-effort idle-hint sink (§11), fired once per persisted
+   * mailbox event with the run's CURRENT hint destination — the recorded
+   * owner, re-targeted by `retargetOwner` on transfer/claim. The sink alone
+   * gates on a fresh pane read and the qualified-kind set; absent hosts emit
+   * no hints.
+   */
+  hints?: IdleHintSink;
 }
 
 export class SupervisionBindError extends Error {
@@ -406,6 +467,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private stopped = false;
   /** The bound managed run, retained so its evidence still projects after the gate drops a resolved run. */
   private boundHandoff: { gate: HandoffGate; run: HandoffRun } | undefined;
+  /**
+   * The managed run's recorded owner (D5). While it is absent from the
+   * authoritative snapshot `reviewsPaused` holds — reviewer cadence keeps
+   * ticking but no model call fires — and it releases the moment the exact
+   * session reappears. Lifecycle watching never pauses.
+   */
+  private owner: { paneId: string; session: AgentSessionIdentity | null } | undefined;
+  private reviewsPaused = false;
   private readonly abort = new AbortController();
 
   constructor(private readonly deps: SupervisorDependencies) {
@@ -467,6 +536,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.identity = binding.identity;
     this.selectedOperatingPointId = binding.operatingPointId;
     const stateChangeSeq = occupant.stateChangeSeq ?? binding.stateChangeSeq;
+    this.owner = binding.handoff?.owner;
+    this.reviewsPaused = this.owner !== undefined && !this.ownerPresent(snapshot);
     this.anchor = { revision: occupant.pane.revision, status: occupant.pane.agentStatus, ...(stateChangeSeq === undefined ? {} : { stateChangeSeq }) };
     this.status = occupant.pane.agentStatus;
     this.lastRevision = occupant.pane.revision;
@@ -648,6 +719,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       throw this.strengtheningError(binding, "native_identity_mismatch", publication);
     }
     this.provisionalNativeIdentity ??= observedIdentity;
+    if (binding.handoff?.owner !== undefined) this.owner = binding.handoff.owner;
+    this.reviewsPaused = this.owner !== undefined && !this.ownerPresent(snapshot);
 
     this.strengtheningCandidate = {
       binding: {
@@ -808,16 +881,22 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private async recordCompletionSignal(): Promise<void> {
+    /* c8 ignore next -- the schedule/serialize guards check all three conditions; this re-guard only closes the queue window between them. */
     if (this.completionRecorded || this.completionSignal === undefined || this.identity === undefined) return;
     try {
       const result = await this.completionSignal(this.identity);
       if (result === false) return;
       this.completionRecorded = true;
+      /* c8 ignore next -- a published binding always carries its managed run. */
       const runId = this.managedRun()?.run.runId;
       this.emit("provider_limit", "child hit a typed provider limit after start; close it before recovery", {
         code: "PROVIDER_LIMIT",
+        /* c8 ignore next -- a bound supervisor selected its operating point before the signal could register. */
         operatingPointId: this.selectedOperatingPointId ?? this.deps.child.operatingPointId,
+        /* c8 ignore next -- the managed run check above keeps a bound supervisor's runId defined. */
         ...(runId === undefined ? {} : { runId }),
+        ...(result.retryNotBefore === undefined ? {} : { retryNotBefore: result.retryNotBefore }),
+        ...(result.autoRecovery === undefined ? {} : autoRecoveryDetails(result.autoRecovery)),
       });
       if (!result.cooldownRecorded && !this.completionLogDegraded) {
         this.completionLogDegraded = true;
@@ -836,6 +915,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (this.stopped || this.completionRecorded || this.completionSignal === undefined || !this.bindingPublished || this.isSettled()
       || (this.status !== "idle" && this.status !== "done" && this.status !== "blocked")) return;
     void this.serialize(async () => {
+      /* c8 ignore next 2 -- the serialized re-check fires only when the job settles, stops, or loses its binding between scheduling and execution; tests cannot interleave that boundary deterministically. */
       if (this.stopped || !this.bindingPublished || this.isSettled()
         || (this.status !== "idle" && this.status !== "done" && this.status !== "blocked")) return;
       await this.recordCompletionSignal();
@@ -853,7 +933,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         // Claude can normalize done → idle without another transition.
         if (last === this.status || (last === "done" && this.status === "idle")) this.scheduleHandoffEvaluation();
       }
-    }).catch(() => undefined);
+    }).catch(/* c8 ignore next -- a rejection reaches the swallow only on a serialize-queue fault */ () => undefined);
   }
 
   /** Resolve when the supervisor settles. This is the supervisor job's run body. */
@@ -892,6 +972,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.pendingMoveEndpoints.length = 0;
     this.pendingMoveInitialStateChangeSeq = undefined;
     this.selectedOperatingPointId = undefined;
+    this.owner = undefined;
+    this.reviewsPaused = false;
     this.eventStreamDegraded = false;
     this.bindingPublished = false;
     this.provisionalPublished = false;
@@ -1380,7 +1462,41 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.applyStatus(pane.agentStatus, pane.revision, "event");
   }
 
+  /**
+   * D5 owner-absence detection: the recorded owner session counts as present
+   * only when an authoritative pane carries the exact four-field session
+   * identity — pane presence alone is never evidence of a session. Malformed
+   * per-pane evidence skips that pane rather than failing open; a `null`
+   * recorded session falls back to the recorded pane's presence.
+   */
+  private ownerPresent(snapshot: HerdrSnapshot): boolean {
+    const owner = this.owner;
+    if (owner === undefined) return true;
+    if (owner.session === null) return snapshot.panes.some((pane) => pane.pane_id === owner.paneId);
+    const session = owner.session;
+    for (const pane of snapshot.panes) {
+      let candidate: AgentSessionIdentity | undefined;
+      try {
+        candidate = optionalSessionCandidate([pane, ...snapshot.agents.filter((agent) => agent.pane_id === pane.pane_id)]);
+      } catch {
+        continue;
+      }
+      if (candidate !== undefined
+        && candidate.source === session.source
+        && candidate.agent === session.agent
+        && candidate.kind === session.kind
+        && candidate.value === session.value) return true;
+    }
+    return false;
+  }
+
+  /** Recompute the D5 pause flag from one authoritative snapshot; no owner recorded means never paused. */
+  private observeOwner(snapshot: HerdrSnapshot): void {
+    this.reviewsPaused = this.owner !== undefined && !this.ownerPresent(snapshot);
+  }
+
   private async applyAuthoritativeSnapshot(snapshot: HerdrSnapshot, trigger: string, missingOutcome: "identity_lost" | "released"): Promise<void> {
+    this.observeOwner(snapshot);
     // A retained move destination is where the child actually is, so it is the
     // pane every rule below judges. The origin pane's absence is this move's own
     // shadow and proves nothing; only the destination's absence is a closure.
@@ -1491,6 +1607,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private applyProvisionalSnapshot(snapshot: HerdrSnapshot, trigger: string): void {
+    this.observeOwner(snapshot);
     const provisional = this.provisional;
     if (provisional === undefined || this.provisionalFailure !== undefined) return;
     const target = classifyProvisionalSnapshotTarget(snapshot, provisional.identity.paneId);
@@ -1646,13 +1763,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * stays active either way.
    */
   private async review(): Promise<void> {
-    if (this.reviewing || this.pendingMoveDestination !== undefined) {
+    if (this.reviewing || this.pendingMoveDestination !== undefined || this.reviewsPaused) {
       // Either an obsolete review from an earlier run is still settling, or a
       // proven move has left the child's exact pane unresolved. Neither may read
       // a transcript or reach the model: the origin pane no longer holds this
       // child and Herdr reuses pane ids, so its output can already belong to
-      // somebody else. Re-arm so the current run is not starved by a call it
-      // could not make, and resume once exact identity is re-established.
+      // somebody else. A D5 owner absence joins this same hold — paid reviews
+      // never fire while the recorded owner is gone, but cadence re-arms so the
+      // run is not starved and resumes the moment the session reappears.
       if (this.reviewRunLive()) this.armReview(this.deps.cadenceMs);
       return;
     }
@@ -1789,7 +1907,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         cadenceMs: this.deps.cadenceMs,
       });
       if (attention === "wake_manager") {
-        wake = this.emit("reviewer_attention", `supervision review says ${result.classification}: ${result.summary}`, { classification: result.classification });
+        // The mailbox body carries the bounded decision evidence so the
+        // manager can act without a second call (spec §7).
+        wake = this.emit("reviewer_attention", `supervision review says ${result.classification}: ${result.summary}`, { classification: result.classification }, {
+          verdict: result.classification,
+          labels: result.reason === undefined ? [] : [result.reason],
+          evidenceDigest: result.evidence?.traceDigestHash ?? "",
+          reviewerModel: SUPERVISION_REVIEWER_MODEL,
+        });
       } else {
         // Progress stores silently.
         this.publish(`review ${result.classification}: ${result.summary}`);
@@ -2069,9 +2194,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     return { agentName: provisional.identity.agentName, agentKind: provisional.identity.agentKind, paneId: provisional.identity.paneId };
   }
 
-  private emit(type: SupervisionEventType, summary: string, details?: Record<string, string | number | boolean>): SupervisionEvent {
+  private emit(type: SupervisionEventType, summary: string, details?: Record<string, string | number | boolean>, decision?: MailboxDecision): SupervisionEvent {
     const event = this.log.record(type, this.deps.clock.now(), summary, details);
     this.publish(`${type}: ${summary}`);
+    this.persistEmittedEvent(event, decision);
     // The wake payload is fixed at emission: a deferred suppression decision
     // must never re-read an identity the settle in between may have dropped.
     const wake: SupervisionWake = {
@@ -2083,6 +2209,64 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     };
     this.deps.notifier.wake(wake);
     return event;
+  }
+
+  /**
+   * N2.2: persist one emitted event through the owner-mailbox writer, to the
+   * run's current owner (resolved under the run flock inside the writer).
+   * Fire-and-forget: a mailbox refusal must never delay or fail supervision,
+   * so existing supervision continues at cap while the refusal is recorded.
+   * The payload is kept in memory only and a failed persist is never claimed
+   * as persisted — it surfaces `persistenceFailed` with the event ID on the
+   * job view (progress details) for `herdr_status` to aggregate.
+   */
+  private persistEmittedEvent(event: SupervisionEvent, decision?: MailboxDecision): void {
+    const writer = this.deps.eventWriter;
+    if (writer === undefined) return;
+    const managed = this.managedRun();
+    if (managed === undefined) return;
+    const child = this.childRef();
+    void Promise.resolve(writer.writeRunEvent({
+      kind: event.type,
+      runId: managed.run.runId,
+      jobId: this.deps.jobId,
+      childIdentity: { agentName: child.agentName, agentKind: child.agentKind, paneId: child.paneId },
+      handoff: { state: managed.run.lifecycle },
+      ...(decision === undefined ? {} : { decision }),
+      actions: [],
+    })).then(
+      (result) => {
+        if (!result.persisted) {
+          this.recordPersistenceFailure(event, result.reason);
+          return;
+        }
+        const hints = this.deps.hints;
+        const owner = this.owner;
+        if (hints === undefined || owner === undefined) return;
+        try {
+          hints({ runId: managed.run.runId, eventId: result.eventId, owner });
+        } catch {
+          // The sink is fire-and-forget; a throwing one must never disturb supervision.
+        }
+      },
+      () => this.recordPersistenceFailure(event, "unavailable"),
+    );
+  }
+
+  private recordPersistenceFailure(event: SupervisionEvent, reason: string): void {
+    try {
+      this.deps.update("mailbox event was not persisted", {
+        operation: "supervision",
+        jobId: this.deps.jobId,
+        state: this.state,
+        status: this.status,
+        persistenceFailed: true,
+        eventId: event.eventId,
+        reason,
+      });
+    } catch {
+      // Job progress is best effort and cannot affect supervision state.
+    }
   }
 
   private publish(text: string): void {
@@ -2235,6 +2419,25 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   // ----------------------------------------------------------------- job port
 
   /**
+   * The managed run this supervisor gates — the registry's ownership-retarget
+   * seam matches on it. The retained binding still answers after the gate
+   * drops a resolved run.
+   */
+  boundRunId(): string | undefined {
+    return (this.managedRun() ?? this.boundHandoff)?.run.runId;
+  }
+
+  /**
+   * N2.5: re-target the recorded owner — the hint destination AND the D5 pause
+   * basis — to a verified transfer/claim successor. In-memory only and
+   * replay-safe: the durable provenance v2 rewrite is the journal's step and
+   * a restart rebinds the owner from the sidecar.
+   */
+  retargetOwner(owner: { paneId: string; session: AgentSessionIdentity | null }): void {
+    this.owner = owner;
+  }
+
+  /**
    * The bound managed run's bounded evidence for `herdr_jobs get`. The gate
    * drops a resolved run once the supervisor settles it, so the retained
    * binding keeps the terminal evidence projectable; an absent binding reports
@@ -2279,6 +2482,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         model: SUPERVISION_REVIEWER_MODEL,
         cadenceMinutes: Math.round(this.deps.cadenceMs / 60_000),
         degraded: this.reviewerDegraded,
+        ...(this.reviewsPaused ? { paused: true } : {}),
         reviews: this.reviews.entries(),
         truncatedReviews: this.reviews.truncated(),
         ...(this.lastReviewAtMs === undefined ? {} : { lastReviewAtMs: this.lastReviewAtMs }),

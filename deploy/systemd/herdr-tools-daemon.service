@@ -1,0 +1,16 @@
+# Durable supervisor daemon (spec: durable-supervisor §4). Committed inert —
+# activation is a separate owner gate: write daemon.env with HERDR_SOCKET_PATH
+# (and PATH if node is not on the unit's default), then enable --now. This
+# work never enables or starts it; clients refuse DAEMON_UNAVAILABLE until then.
+[Unit]
+Description=herdr-tools durable supervisor daemon
+
+[Service]
+Type=simple
+Restart=on-failure
+Environment=HERDR_ENV=1
+EnvironmentFile=%h/.config/herdr-tools/daemon.env
+ExecStart=/usr/bin/env node %h/.pi/agent/extensions/herdr-tools/dist/src/daemon/main.js
+
+[Install]
+WantedBy=default.target

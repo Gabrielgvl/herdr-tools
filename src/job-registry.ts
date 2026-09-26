@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import { WAIT_LABEL_MAX_BYTES } from "./wait-schema.js";
 import type { HandoffInspection, HandoffUngatedReason, HandoffValidationState } from "./handoff-gate.js";
+import type { MailboxEventWriter } from "./daemon/mailbox.js";
 import type { HandoffLifecycleState, HandoffStatus } from "./handoff.js";
 import { isTargetEvidence, type TargetEvidence } from "./wait-target-evidence.js";
 import type { SupervisionEvent } from "./supervision/events.js";
@@ -384,6 +385,13 @@ export interface JobRegistryOptions {
   idFactory?: () => string;
   clock?: JobClock;
   onTerminal?: (detail: JobDetail) => void | Promise<void>;
+  /**
+   * The N2.2 owner-mailbox writer seam: every terminal settlement of a job
+   * bound to a managed run persists one `job_terminal` event through it. The
+   * destination resolves from the run's current owner inside the writer; a
+   * failed persist is accounted there and never claimed as persisted.
+   */
+  eventWriter?: MailboxEventWriter;
   onChange?: () => void | Promise<void>;
   /** Maximum time allowed to observe runner/callback quiescence after cancellation. */
   quiescenceMs?: number;
@@ -724,6 +732,7 @@ function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation)
       degraded: view.reviewer.degraded,
       reviews,
       truncatedReviews: view.reviewer.truncatedReviews + omittedReviews,
+      ...(view.reviewer.paused === true ? { paused: true } : {}),
       ...(view.reviewer.lastReviewAtMs === undefined ? {} : { lastReviewAtMs: view.reviewer.lastReviewAtMs })
     },
     transitions,
@@ -1199,6 +1208,7 @@ export class JobRegistry {
   private readonly idFactory: () => string;
   private readonly clock: JobClock;
   private readonly onTerminal?: (detail: JobDetail) => void | Promise<void>;
+  private readonly eventWriter?: MailboxEventWriter;
   private readonly onChange?: () => void | Promise<void>;
   private readonly quiescenceMs: number;
   private sequence = 0;
@@ -1209,6 +1219,7 @@ export class JobRegistry {
     this.idFactory = options.idFactory ?? (() => `job_${randomUUID()}`);
     this.clock = options.clock ?? { now: () => Date.now() };
     this.onTerminal = options.onTerminal;
+    this.eventWriter = options.eventWriter;
     this.onChange = options.onChange;
     const quiescenceMs = options.quiescenceMs;
     this.quiescenceMs = typeof quiescenceMs === "number" && Number.isFinite(quiescenceMs) && quiescenceMs >= 0 ? quiescenceMs : 1_000;
@@ -1260,6 +1271,9 @@ export class JobRegistry {
     return this.settleOnce(record, () => {
       record.detail.supervision_result = outcome;
       if (reason !== undefined) record.detail.supervision_reason = reason;
+      // Inside the apply: exactly one terminal event per settle, never one per
+      // attempt at an already-settled record.
+      this.persistTerminalEvent(record, outcome);
     }, error);
   }
 
@@ -1302,11 +1316,32 @@ export class JobRegistry {
         : { wait_result: waitResult, matched: false, reason: error?.code ?? "unknown" };
     }, error);
     if (!settled) return false;
-    if (record.detail.cancelReason === undefined && waitResult !== "cancelled") this.notifyTerminal(record);
+    if (record.detail.cancelReason === undefined && waitResult !== "cancelled") this.notifyTerminal(record, waitResult);
     return true;
   }
 
-  private notifyTerminal(record: JobRecord): void {
+  /**
+   * N2.2: one `job_terminal` event through the owner-mailbox writer for a job
+   * bound to a managed run; jobs without a bound run have no owner mailbox to
+   * resolve. Fire-and-forget exactly like `onTerminal`: the writer accounts
+   * any failed persist durably and this seam never claims persistence.
+   */
+  private persistTerminalEvent(record: JobRecord, outcome: string): void {
+    const writer = this.eventWriter;
+    if (writer === undefined) return;
+    const handoff = record.supervision?.handoffEvidence?.();
+    if (handoff === undefined || !handoff.gated) return;
+    void Promise.resolve(writer.writeRunEvent({
+      kind: "job_terminal",
+      runId: handoff.runId,
+      jobId: record.detail.jobId,
+      handoff: { state: handoff.state },
+      actions: [outcome],
+    })).catch(() => undefined);
+  }
+
+  private notifyTerminal(record: JobRecord, outcome: string): void {
+    this.persistTerminalEvent(record, outcome);
     if (!this.onTerminal) return;
     try {
       void Promise.resolve(this.onTerminal(publicDetail(record.detail))).catch(() => undefined);

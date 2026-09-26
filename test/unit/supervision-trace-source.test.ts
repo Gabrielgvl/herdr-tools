@@ -160,11 +160,42 @@ describe("pi-jsonl adapter", () => {
     expect(window.events).toEqual([]);
   });
 
+  it.each([
+    ["one window", 40_000],
+    ["several scan chunks", 2_500_000],
+  ])("reports an oversized record once and resumes past it (%s)", async (_name, size) => {
+    const records = [
+      { type: "session", id: "s" },
+      { type: "custom", data: "x".repeat(size) },
+      { type: "message", id: "m", message: { role: "assistant" } },
+    ];
+    const data = jsonl(records);
+    const head = jsonl(records.slice(0, 1)).length;
+    const big = jsonl(records.slice(1, 2)).length;
+    const source = createTraceSource({ readFileRange: files({ [CANARY_PATH]: data }) });
+    const first = await source.read(piPath(), undefined, new AbortController().signal);
+    expect(first.events.map((event) => event.kind)).toEqual(["session"]);
+    // The refusal is typed once, with the record's true size, and the cursor
+    // lands just past it instead of pinning every later cadence to it.
+    const overflow = await source.read(piPath(), first.cursorTo, new AbortController().signal);
+    expect(overflow.typedFailure).toEqual({ kind: "record_exceeds_budget", detail: { offset: head, bytes: big, skipped: true } });
+    expect(overflow.events).toEqual([]);
+    expect(overflow.cursorTo).toMatchObject({ source: "pi-jsonl", offset: head + big });
+    expect(overflow.cursorTo).not.toEqual(overflow.cursorFrom);
+    const resumed = await source.read(piPath(), overflow.cursorTo, new AbortController().signal);
+    expect(resumed.typedFailure).toBeUndefined();
+    expect(resumed.events.map((event) => event.kind)).toEqual(["message"]);
+    expect(resumed.cursorTo).toMatchObject({ offset: data.length });
+    expect(JSON.stringify(overflow)).not.toContain(CANARY_PATH);
+  });
+
   it("fails closed on an unterminated record wider than the window", async () => {
     const data = new TextEncoder().encode(`{"type":"custom","data":"${"x".repeat(TRACE_WINDOW_MAX_BYTES)}`); // no \n
     const source = createTraceSource({ readFileRange: files({ [CANARY_PATH]: data }) });
     const window = await source.read(piPath(), undefined, new AbortController().signal);
     expect(window.typedFailure).toMatchObject({ kind: "record_exceeds_budget" });
+    // Still being written: nothing to skip yet, so the cursor stays put.
+    expect(window.cursorTo).toBeUndefined();
   });
 
   it("leaves an in-flight unterminated tail for the next read", async () => {

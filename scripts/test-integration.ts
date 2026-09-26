@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-const REQUIRED_SESSION = "herdr-tools-integration";
+const REQUIRED_SESSION = process.env.HERDR_TOOLS_INTEGRATION_SESSION ?? "herdr-tools-integration";
 
 function parseSession(argv: string[]): string {
   let session = REQUIRED_SESSION;

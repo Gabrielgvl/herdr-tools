@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { CATALOG_PATH, loadCatalog, parseCatalog, type Catalog, type McpServer, type RunnerPools } from "../../src/catalog.js";
 import { compileCandidateContract, CompileError, contractArgv, type ResolvedPoint } from "../../src/compile.js";
+import { runnerResourceSelection } from "../../src/router.js";
 
 const PACKAGE_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
@@ -42,7 +43,7 @@ runners:
     defaults: {thinking: high, timeoutMinutes: 30, sessionPersistence: true}
     plumbing: {sessionPersistence: optional, promptDelivery: file, skillSelection: exact, toolSelection: allowlist}
     pools:
-      tools: [read, bash, write, mcp, ask_user_question]
+      tools: [read, bash, edit, write, ask_user_question, mcp, executor_execute, executor_skills, executor_resume]
       extensions: [ext/host.ts]
       skills: [skills/adr, skills/tdd, skills/linked]
       mcp: [herdr, executor]
@@ -108,7 +109,7 @@ describe("compile", () => {
     expect(claude.quota).toEqual({ provider: "anthropic", billingProduct: "claude", account: "primary", scope: "account" });
     expect(pi.plumbing.toolSelection).toBe("allowlist");
     expect(agy.plumbing.promptDelivery).toBe("bootstrap");
-    expect(pi.resources.tools!.permitted).toEqual(["read", "bash", "write"]);
+    expect(pi.resources.tools!.permitted).toEqual(["read", "bash", "edit", "write", "ask_user_question"]);
     expect(pi.resources.mcp!.permitted).toEqual([]);
     expect(pi.resources.skills!.installed).toHaveLength(3);
   });
@@ -149,14 +150,14 @@ describe("compile", () => {
     expect(withSkill.resources.tools!.permitted).toEqual(["Read", "Bash", "Write", "Skill"]);
     const pi = await compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), { tools: ["read"], mcp: ["herdr"] });
     expect(pi.resources.tools!.selected).toEqual(["read"]);
-    expect(pi.resources.tools!.permitted).toEqual(["read", "bash", "write"]);
+    expect(pi.resources.tools!.permitted).toEqual(["read", "bash", "edit", "write", "ask_user_question"]);
     expect(pi.resources.mcp!.selected).toEqual(["herdr"]);
     expect(pi.resources.mcp!.exposed).toEqual([]);
     expect(pi.resources.mcp!.permitted).toEqual([]);
     expect(pi.derivations).toContainEqual({ action: "incompatible", field: "mcp", name: "herdr", reason: "Pi cannot scope ambient MCP servers to the reviewed selection" });
     const piDirect = await compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), { tools: ["read", "mcp"], mcp: ["herdr"] });
     expect(piDirect.resources.tools!.selected).toEqual(["read", "mcp"]);
-    expect(piDirect.resources.tools!.permitted).toEqual(["read", "bash", "write"]);
+    expect(piDirect.resources.tools!.permitted).toEqual(["read", "bash", "edit", "write", "ask_user_question"]);
     expect(piDirect.derivations).toContainEqual({ action: "incompatible", field: "tools", name: "mcp", reason: "Pi cannot scope ambient MCP servers to the reviewed selection" });
   });
 
@@ -186,7 +187,7 @@ describe("compile", () => {
     expect(dropped.derivations).toContainEqual(expect.objectContaining({ action: "incompatible", field: "mcp", name: "herdr", reason: "provider plugin is undeclared in the catalog" }));
     // Same fate on pi when the mcp client tool is not in the pool.
     const piPools = catalogAt(scope());
-    (piPools.runners.get("pi")!.pools as { -readonly [K in keyof RunnerPools]: RunnerPools[K] }).tools = ["read", "bash", "write"];
+    (piPools.runners.get("pi")!.pools as { -readonly [K in keyof RunnerPools]: RunnerPools[K] }).tools = ["read", "bash", "edit", "write", "ask_user_question"];
     const piRemoved = await compileCandidateContract(piPools, SPEC, point(piPools, "pi", "high"), { tools: ["read"], mcp: ["herdr"] });
     expect(piRemoved.resources.mcp!.permitted).toEqual([]);
     expect(piRemoved.derivations).toContainEqual(expect.objectContaining({ action: "incompatible", field: "mcp", name: "herdr" }));
@@ -233,7 +234,7 @@ describe("compile", () => {
     const catalog = catalogAt(scope());
     const root = catalog.source.scopeRoot;
     const pi = await compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), { tools: ["read", "bash"], skills: [`${root}/skills/adr`, "skills/tdd"], extensions: ["ext/host.ts"] });
-    expect(contractArgv(pi, "/tmp/prompt.md")).toEqual(["--model", "openai/pi-pro", "--thinking", "high", "--tools", "read,bash,write", "--extension", `${root}/ext/host.ts`, "--no-skills", "--skill", `${root}/skills/adr`, "--skill", `${root}/skills/tdd`, "--append-system-prompt", "/tmp/prompt.md"]);
+    expect(contractArgv(pi, "/tmp/prompt.md")).toEqual(["--model", "openai/pi-pro", "--thinking", "high", "--tools", "read,bash,edit,write,ask_user_question", "--extension", `${root}/ext/host.ts`, "--no-skills", "--skill", `${root}/skills/adr`, "--skill", `${root}/skills/tdd`, "--append-system-prompt", "/tmp/prompt.md"]);
     // Reasoning comes from the point, never the runner default: `low` wins
     // over the runner's declared `effort: high`.
     const low = await compileCandidateContract(catalog, SPEC, point(catalog, "claude", "low"), { tools: ["Read"] });
@@ -284,7 +285,7 @@ describe("compile", () => {
 
   it("keeps the unconditional base permit set when Jev selects no tools", async () => {
     const catalog = catalogAt(scope());
-    await expect(compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), {})).resolves.toMatchObject({ runtime: { tools: ["read", "bash", "write"] } });
+    await expect(compileCandidateContract(catalog, SPEC, point(catalog, "pi", "high"), {})).resolves.toMatchObject({ runtime: { tools: ["read", "bash", "edit", "write", "ask_user_question"] } });
     await expect(compileCandidateContract(catalog, SPEC, point(catalog, "claude", "high"), {})).resolves.toMatchObject({ runtime: { allowedTools: ["Read", "Bash", "Write"] } });
     // Ambient runners carry no permit set at all, so the rule does not apply...
     await expect(compileCandidateContract(catalog, SPEC, point(catalog, "agy"), {})).resolves.toMatchObject({ runtime: { kind: "agy" } });
@@ -294,7 +295,7 @@ describe("compile", () => {
     await expect(compileCandidateContract(mutated, SPEC, point(mutated, "agy"), {})).rejects.toMatchObject({ code: "EMPTY_PERMIT_SET", details: { runner: "agy" } });
     const missingPiBase = catalogAt(scope());
     (missingPiBase.runners.get("pi")!.pools as { -readonly [K in keyof RunnerPools]: RunnerPools[K] }).tools = ["read", "bash"];
-    await expect(compileCandidateContract(missingPiBase, SPEC, point(missingPiBase, "pi", "high"), {})).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED", details: { runner: "pi", names: ["write"] } });
+    await expect(compileCandidateContract(missingPiBase, SPEC, point(missingPiBase, "pi", "high"), {})).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED", details: { runner: "pi", names: ["edit", "write", "ask_user_question"] } });
     const missingClaudeBase = catalogAt(scope());
     (missingClaudeBase.runners.get("claude")!.pools as { -readonly [K in keyof RunnerPools]: RunnerPools[K] }).tools = ["Read", "Bash"];
     await expect(compileCandidateContract(missingClaudeBase, SPEC, point(missingClaudeBase, "claude", "high"), {})).rejects.toMatchObject({ code: "CANDIDATE_NOT_REVIEWED", details: { runner: "claude", names: ["Write"] } });
@@ -326,7 +327,7 @@ describe("compile", () => {
     for (const [index, operatingPoint] of points.entries()) {
       const resolved: ResolvedPoint = { index, point: operatingPoint, runner: catalog.runners.get(operatingPoint.runner)! };
       const selection = operatingPoint.runner === "pi"
-        ? { tools: ["read", "herdr_inspect"], skills: [catalog.skills[0]!], mcp: ["herdr"] }
+        ? { tools: ["read", "executor_execute"], skills: [catalog.skills[0]!], mcp: ["executor"] }
         : operatingPoint.runner === "claude"
           ? { tools: ["Read", "Bash"], mcp: ["executor"] }
           : {};
@@ -345,5 +346,24 @@ describe("compile", () => {
     // the reviewed plugin set — the pair is removed as incompatible, recorded.
     const unprovidable = await compileCandidateContract(catalog, SPEC, claudePoint, { tools: ["Read"], mcp: ["herdr"] });
     expect(unprovidable.derivations).toContainEqual(expect.objectContaining({ action: "incompatible", field: "mcp", name: "herdr" }));
+  });
+
+  it("pins a gateway pi lane's argv tool set to the five natives plus the executor trio exactly", async () => {
+    const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
+    const runner = catalog.runners.get("pi")!;
+    const index = (catalog.points ?? []).findIndex((entry) => entry.runner === "pi");
+    const resolved: ResolvedPoint = { index, point: catalog.points![index]!, runner };
+    // The production selection path: runnerResourceSelection is what routeTask
+    // hands the compiler for every pi lane.
+    const selection = runnerResourceSelection({}, "pi", runner);
+    expect(selection.tools).toEqual(["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"]);
+    const contract = await compileCandidateContract(catalog, SPEC, resolved, selection);
+    const argv = contractArgv(contract, "/tmp/prompt.md");
+    expect(argv[argv.indexOf("--tools") + 1]).toBe("read,bash,edit,write,ask_user_question,executor_execute,executor_skills,executor_resume");
+    expect(contract.runtime).toMatchObject({ kind: "pi", tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] });
+    // A pool that drops the trio still compiles, to the five natives alone.
+    const thinned = { ...runner, pools: { ...runner.pools, tools: ["read", "bash", "edit", "write", "ask_user_question"] } };
+    const noGateway = await compileCandidateContract(catalog, SPEC, { ...resolved, runner: thinned }, runnerResourceSelection({}, "pi", thinned));
+    expect(noGateway.runtime).toMatchObject({ kind: "pi", tools: ["read", "bash", "edit", "write", "ask_user_question"] });
   });
 });

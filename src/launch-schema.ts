@@ -69,6 +69,51 @@ export const PublishedLaunchParamsSchema = LaunchTaskSchema;
 export type LaunchTask = Static<typeof LaunchTaskSchema>;
 
 /**
+ * The launch idempotency key (spec: durable-supervisor §6 D2): required on the
+ * daemon's launch request, 1–128 chars of `^[A-Za-z0-9._:-]+$`. The charset is
+ * filename-safe — no separator, NUL, or whitespace can reach the intent path —
+ * while `.` and `..` stay harmless because the record name is always
+ * `<key>.json`, never the bare key.
+ */
+export const IdempotencyKeySchema = Type.String({
+  minLength: 1,
+  maxLength: 128,
+  pattern: "^[A-Za-z0-9._:-]+$",
+  description: "Manager-scoped launch idempotency key binding one launch attempt to at most one durable effect."
+});
+export type IdempotencyKey = Static<typeof IdempotencyKeySchema>;
+
+/**
+ * The delegated caller assertion for executor-gateway serves
+ * (`HERDR_EXECUTOR_DELEGATED=1`): the calling pane's id and canonical project
+ * root, so a connection that shares one static env across panes can still
+ * derive the per-call D2a claim. Both fields are required when `caller` is
+ * present; absent `caller` selects the environment-identity path.
+ */
+export const DelegatedCallerSchema = Type.Object({
+  paneId: Identifier,
+  projectRoot: Type.String({ minLength: 1, pattern: "^/[^\\u0000\\r\\n]*$" })
+}, { additionalProperties: false });
+export type DelegatedCaller = Static<typeof DelegatedCallerSchema>;
+
+/**
+ * The daemon-boundary launch request (spec §5–§6): the unchanged Task contract
+ * plus the required idempotency key. Chosen over an optional `idempotencyKey`
+ * on `LaunchTaskSchema` so the live `herdr_launch` surface stays byte-identical
+ * — an accepted-but-ignored key would silently promise idempotency the
+ * daemon-less path cannot deliver. The daemon's claimed-identity and verified
+ * project-root fields (D2a) ride on the request envelope, not on the Task.
+ * `caller` is the additive delegated-mode assertion; it never reaches the
+ * daemon wire — the thin client derives the claim and the daemon verifies it.
+ */
+export const DaemonLaunchRequestSchema = Type.Object({
+  task: LaunchTaskSchema,
+  idempotencyKey: IdempotencyKeySchema,
+  caller: Type.Optional(DelegatedCallerSchema)
+}, { additionalProperties: false });
+export type DaemonLaunchRequest = Static<typeof DaemonLaunchRequestSchema>;
+
+/**
  * The single deterministic rendering of a Task's four semantic fields into the
  * payload the provenance envelope carries. Fixed order, fixed labels, no caller
  * control over layout, so the same Task always renders byte-identically. This

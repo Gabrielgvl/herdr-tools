@@ -1,4 +1,4 @@
-import type { JsonEnvelope, HerdrCli } from "./cli.js";
+import type { JsonEnvelope } from "./cli.js";
 
 const MAX_EVIDENCE_CHARS = 2_000;
 const MAX_OBJECT_KEYS = 24;
@@ -50,8 +50,13 @@ export interface CloseReadbackResult<TSnapshot> {
   reconciled: boolean;
 }
 
+/** The readback close needs only the JSON runner surface; the launch CLI satisfies it. */
+export interface CloseReadbackCli {
+  runJson(argv: string[], signal: AbortSignal, preserveCompletedMutation?: boolean): Promise<JsonEnvelope>;
+}
+
 export interface CloseReadbackOptions<TSnapshot> {
-  cli: HerdrCli;
+  cli: CloseReadbackCli;
   argv: string[];
   signal: AbortSignal;
   targetId: string;

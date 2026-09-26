@@ -271,13 +271,42 @@ export interface HandoffProvenanceInput {
  * read. Runs persisted before provenance existed stay readable as state but
  * can never satisfy this contract, so they never authorize recovery.
  */
-export interface HandoffProvenance {
+export interface HandoffProvenanceV1 {
   v: 1;
   runId: string;
   endpoint: string;
   createdAt: string;
   manager: { paneId: string; display: string; source: string; session: AgentSessionIdentity | null };
   task: HandoffTaskContract;
+}
+
+/** Ownership history is separate from the immutable original launch manager. */
+export interface HandoffOwnerEntry {
+  session: AgentSessionIdentity | null;
+  from: string;
+  to: string | null;
+  reason: string;
+}
+export interface HandoffProvenanceV2 extends Omit<HandoffProvenanceV1, "v"> {
+  v: 2;
+  owners: HandoffOwnerEntry[];
+}
+export type HandoffProvenance = HandoffProvenanceV1 | HandoffProvenanceV2;
+
+export function handoffOwners(provenance: HandoffProvenance): HandoffOwnerEntry[] {
+  return provenance.v === 2 ? provenance.owners : [{ session: provenance.manager.session, from: provenance.createdAt, to: null, reason: "launch" }];
+}
+
+export function currentHandoffOwner(provenance: HandoffProvenance): AgentSessionIdentity | null {
+  return [...handoffOwners(provenance)].reverse().find((entry) => entry.to === null)!.session;
+}
+
+/** Caller holds the run flock; replacing the frozen v2 document is replay-safe. */
+export async function writeHandoffProvenance(run: HandoffAllocation, provenance: HandoffProvenanceV2): Promise<void> {
+  const data = JSON.stringify(provenance);
+  parseHandoffProvenance(data, run);
+  if (Buffer.byteLength(data) > HANDOFF_PROVENANCE_MAX_BYTES) throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance exceeds the accepted bound");
+  await writeFileAtomic(provenancePath(run), data);
 }
 
 /** The exact run-directory layout a run id derives under one namespace. */
@@ -351,7 +380,7 @@ async function assertTrustedDirectory(path: string, subject: string): Promise<vo
 }
 
 /** Same-directory temp + fsync + rename + directory fsync, 0600 throughout. */
-async function writeFileAtomic(path: string, data: string): Promise<void> {
+export async function writeFileAtomic(path: string, data: string): Promise<void> {
   const directory = dirname(path);
   const temporary = join(directory, `.${randomUUID()}.tmp`);
   /* c8 ignore next -- O_NOFOLLOW is defined on every POSIX platform the flock sidecar runs on; the `?? 0` is a non-POSIX guard. */
@@ -758,6 +787,16 @@ function validProvenanceInput(input: HandoffProvenanceInput): boolean {
   return (input.managerSession === null || validSessionRecord(input.managerSession)) && validTaskContract(input.task);
 }
 
+export function validHandoffOwners(value: unknown): value is HandoffOwnerEntry[] {
+  return Array.isArray(value) && value.length > 0 && value.every((entry, index) =>
+    stateRecord(entry) && Object.keys(entry).every((key) => ["session", "from", "to", "reason"].includes(key))
+    && (entry.session === null || validSessionRecord(entry.session))
+    && typeof entry.from === "string" && PROVENANCE_CREATED_AT.test(entry.from)
+    && (index === value.length - 1 ? entry.to === null : typeof entry.to === "string" && PROVENANCE_CREATED_AT.test(entry.to))
+    && safeLine(entry.reason)
+    && (index === 0 || (value[index - 1] as HandoffOwnerEntry).to === entry.from));
+}
+
 function parseHandoffProvenance(content: string, run: HandoffAllocation): HandoffProvenance {
   let value: unknown;
   try {
@@ -766,13 +805,21 @@ function parseHandoffProvenance(content: string, run: HandoffAllocation): Handof
     throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is malformed", { path: safePath(provenancePath(run)), reason: "malformed" });
   }
   const provenance = value as HandoffProvenance;
-  // v1 records only, pinned to this run and endpoint: anything else — including
-  // a run predating provenance — is never reinterpreted into recovery lineage.
-  if (!stateRecord(provenance) || !Object.keys(provenance).every((key) => PROVENANCE_KEYS.has(key))
-    || provenance.v !== 1 || provenance.runId !== run.runId || provenance.endpoint !== run.endpoint
+  // Both versions remain strict; v1 never accepts an appended owners key.
+  if (!stateRecord(provenance) || !Object.keys(provenance).every((key) => PROVENANCE_KEYS.has(key) || (provenance.v === 2 && key === "owners"))
+    || (provenance.v !== 1 && provenance.v !== 2)
+    || (provenance.v === 2 && !validHandoffOwners(provenance.owners)) || provenance.runId !== run.runId || provenance.endpoint !== run.endpoint
     || typeof provenance.createdAt !== "string" || !PROVENANCE_CREATED_AT.test(provenance.createdAt)
     || !validProvenanceManager(provenance.manager) || !validTaskContract(provenance.task)) {
     throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is malformed", { path: safePath(provenancePath(run)), reason: "malformed" });
+  }
+  if (provenance.v === 2) {
+    const first = provenance.owners[0]!;
+    const original = provenance.manager.session;
+    if (first.from !== provenance.createdAt || (first.session === null ? original !== null : original === null
+      || (["source", "agent", "kind", "value"] as const).some((key) => first.session![key] !== original[key]))) {
+      throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff owner history does not preserve the original manager", { reason: "malformed" });
+    }
   }
   return provenance;
 }

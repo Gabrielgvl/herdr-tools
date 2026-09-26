@@ -2,13 +2,11 @@
  * Manager wake delivery. Report-only and best effort.
  *
  * A dropped wake is recovered by asking — `herdr_jobs get` returns the pending
- * unobserved events and marks exactly those observed — so the only resend here
- * is the Claude channel write's small bounded retry; nothing else escalates or
- * waits for an acknowledgement. Delivery failure must never affect supervision
- * state.
+ * unobserved events and marks exactly those observed — so nothing here
+ * resends, escalates, or waits for an acknowledgement. Delivery failure must
+ * never affect supervision state.
  */
 
-import { setTimeout as sleep } from "node:timers/promises";
 import { boundedText, type JobDetail } from "../job-registry.js";
 import { notificationForJob } from "../job-notification.js";
 import { resolveEffectiveContext } from "../context.js";
@@ -23,10 +21,6 @@ import type { SupervisionEvent } from "./events.js";
 
 export const SUPERVISION_WAKE_CONTENT_BYTES = 4_000;
 export const SUPERVISION_WAKE_FIELD_BYTES = 256;
-/** The Claude Code Channels research-preview notification method. */
-export const CLAUDE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel";
-/** The experimental capability key a Channels-capable MCP server advertises. */
-export const CLAUDE_CHANNEL_CAPABILITY = "claude/channel";
 
 export interface SupervisionChildRef {
   agentName: string;
@@ -48,10 +42,17 @@ function field(value: string): string {
   return boundedText(value, SUPERVISION_WAKE_FIELD_BYTES);
 }
 
+/**
+ * The wake text is the only part a host renders back into the manager's
+ * context on later turns (Pi replays custom messages as user turns), so it
+ * carries its own staleness signal: the event time, the event id, and the
+ * rule that an already-observed id or a settled job is history, not a wake.
+ */
 export function supervisionWakeContent(wake: SupervisionWake): string {
   const prefix = wake.event.priority === "high" ? "HIGH PRIORITY: " : "";
+  const at = Number.isFinite(wake.event.atMs) ? new Date(wake.event.atMs).toISOString() : "an unknown time";
   return boundedText(
-    `${prefix}Herdr supervisor ${field(wake.jobId)} for child ${field(wake.child.agentName)} (${field(wake.child.paneId)}, ${field(wake.child.agentKind)}) reported ${field(wake.event.type)}: ${field(wake.event.summary)}. Read the full event with herdr_jobs get on this job id; returned events are marked observed.`,
+    `${prefix}Herdr supervisor ${field(wake.jobId)} for child ${field(wake.child.agentName)} (${field(wake.child.paneId)}, ${field(wake.child.agentKind)}) reported ${field(wake.event.type)} (event ${field(wake.event.eventId)}): ${field(wake.event.summary)}. Delivered once at ${at}; if this event id is already in your ledger or the job is settled, do nothing. Otherwise read the full event with herdr_jobs get on this job id; returned events are marked observed.`,
     SUPERVISION_WAKE_CONTENT_BYTES,
   );
 }
@@ -92,9 +93,7 @@ export function createPiSupervisionNotifier(sendMessage: PiSendMessage): Manager
   };
 }
 
-export type ChannelNotify = (notification: { method: string; params: { content: string; meta: Record<string, unknown> } }) => unknown;
-
-/** A notifier for a host with no wake channel at all. Supervision still records everything. */
+/** A notifier for a host with no wake path at all. Supervision still records everything. */
 export const inertNotifier: ManagerNotifier = { wake: () => undefined };
 
 /** The narrow CLI surface the MCP host wake router needs — `HerdrCli` satisfies it. */
@@ -106,7 +105,6 @@ export interface McpWakeCli {
 export interface McpHostWakeDeps {
   cli: McpWakeCli;
   context: CurrentContext;
-  notifyChannel: ChannelNotify;
   /** Aborted by the host at shutdown: an in-flight pipeline must not send after close. */
   signal: AbortSignal;
   /**
@@ -120,9 +118,8 @@ export interface McpHostWakeDeps {
  * The MCP host's one wake surface. The supervisor path feeds `notifier`; the
  * job registry's `onTerminal` feeds `notifyJobTerminal`. Both converge on a
  * single `deliver` that routes by the hosting pane's lazily resolved agent
- * kind, so every wake stays best effort: only the Claude channel write retries,
- * on a short bound, and a failure past that is a silent drop — `herdr_jobs get`
- * remains the recovery contract.
+ * kind, so every wake stays best effort: a send failure is a silent drop —
+ * `herdr_jobs get` remains the recovery contract.
  */
 export interface McpHostWake {
   readonly notifier: ManagerNotifier;
@@ -143,15 +140,6 @@ const PROMPT_WAKE_KINDS = new Set(["devin", "pi"]);
  */
 const SELF_ADOPT_KINDS = LAZY_ADOPT_KINDS;
 const WAKE_PIPELINE_TIMEOUT_MS = 15_000;
-/**
- * The Claude channel write is the one wake send that retries: the identical
- * payload at most this many times, with a short fixed backoff armed on the
- * pipeline's combined timeout/shutdown signal. The Channels preview has no
- * delivery acknowledgement, so transport write resolution is the ack;
- * exhaustion or abort stays the same silent drop as any other wake failure.
- */
-export const CLAUDE_WAKE_MAX_ATTEMPTS = 3;
-export const CLAUDE_WAKE_RETRY_DELAY_MS = 200;
 
 export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
   const ownPaneId = deps.context.paneId;
@@ -231,36 +219,15 @@ export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
     // showed no name and the kind may adopt, mint one derived name once —
     // memoized for the session and inert on agent_name_taken — so this and
     // every later wake join on a real identity. A pane already named by hand
-    // is untouched. For Claude the name buys inbound reachability only; the
-    // channel notification below never depends on it.
+    // is untouched. For Claude the name buys inbound reachability only — the
+    // wake itself still drops below because Claude is not a prompt-wake kind.
     if (resolution !== undefined && SELF_ADOPT_KINDS.has(resolution.kind) && paneSuppliesNoName(resolution.pane)) {
       await ensureOwnName(resolution.paneId, resolution.kind, signal);
     }
     const resolved = resolution?.kind;
-    if (resolved === "claude") {
-      // Channels-only for Claude (owner decision): even though targeted prompt
-      // delivery to Claude panes is qualified for tool calls, a self-wake is
-      // the server prompting its own hosting pane — a deliberately different
-      // boundary. The write retries the identical payload on the pipeline's
-      // signal, so a wake in the transport's connect window lands while a
-      // genuine drop still costs nothing past the bound.
-      const notification = { method: CLAUDE_CHANNEL_NOTIFICATION_METHOD, params: { content, meta } };
-      for (let attempt = 1; attempt <= CLAUDE_WAKE_MAX_ATTEMPTS; attempt += 1) {
-        // No write may leave once shutdown landed; the backoff is armed on the
-        // same signal, so an abort mid-wait also ends the pipeline at this
-        // check before any further send.
-        if (signal.aborted) return;
-        try {
-          await Promise.resolve(deps.notifyChannel(notification));
-          return;
-        } catch {
-          if (attempt === CLAUDE_WAKE_MAX_ATTEMPTS) return;
-          await sleep(CLAUDE_WAKE_RETRY_DELAY_MS, undefined, { signal });
-        }
-      }
-      // c8 ignore next -- every loop path returns or aborts; retained as an explicit branch boundary.
-      return;
-    }
+    // Claude has no wake path at all (N5.2): the Channels research-preview
+    // send is gone and the daemon owns every wake (hints + mailbox), so a
+    // claude own pane drops here exactly like any other non-prompt kind.
     if (resolved === undefined || !PROMPT_WAKE_KINDS.has(resolved)) return;
 
     // Self-prompt: the target is the server's own hosting pane. The

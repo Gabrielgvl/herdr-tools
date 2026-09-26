@@ -12,7 +12,7 @@ import type { CompatibilityPreflight } from "../health.js";
 import { contextRebindingDetails, createContextResolver, resolveManagerSession, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
-import { createHandoffAllocator, HandoffError, readHandoffProvenance, readHandoffState, renderHandoffContract, RUN_ID_PATTERN, type HandoffAllocation, type HandoffAllocator, type HandoffState } from "../handoff.js";
+import { createHandoffAllocator, HandoffError, readHandoffProvenance, readHandoffState, renderHandoffContract, RUN_ID_PATTERN, updateHandoffState, type HandoffAllocation, type HandoffAllocator, type HandoffState } from "../handoff.js";
 import { assertDeliverySize, assertMessageText, utf8Bytes, ATTACHMENT_MAX_BYTES, MESSAGE_INLINE_MAX_BYTES, type MessageDelivery } from "../messages/limits.js";
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type AgentSessionIdentity, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
@@ -33,9 +33,12 @@ import { modelSafeJson } from "../redaction.js";
 import { boundedDiagnosticMessage } from "../telemetry.js";
 import type { SupervisionWorkspaceRoot } from "../job-registry.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
-import type { ProvisionalSupervisedIdentity } from "../supervision/identity.js";
-import { SupervisionBindError } from "../supervision/supervisor.js";
-import { claudeQuotaSignal } from "../supervision/claude-quota.js";
+import type { ProvisionalSupervisedIdentity, SupervisedIdentity } from "../supervision/identity.js";
+import { SupervisionBindError, type ProviderLimitRecoveryEvidence } from "../supervision/supervisor.js";
+import { claudeQuotaSignal, type ClaudeQuotaEvidence } from "../supervision/claude-quota.js";
+import { topologySummary } from "../close.js";
+import { closeWithReadback } from "../mutations.js";
+import type { MailboxEventWriter } from "../daemon/mailbox.js";
 import { EVIDENCE_ASSIGNMENT_MAX_BYTES, normalizedAssignmentBytes } from "../supervision/evidence.js";
 import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
 import type { SelfCloseTracker } from "../supervision/self-close.js";
@@ -89,6 +92,13 @@ export interface LaunchDependencies {
    * cannot supervise cannot launch. See ADR-019.
    */
   supervision: SupervisionCoordinator;
+  /**
+   * The N2.2 owner-mailbox writer the launched supervisor persists run events
+   * through (durable-supervisor §7). Hosts without a mailbox leave it absent
+   * and the reservation persists nothing — same semantics as a reattach that
+   * supplies `deps.mailbox`.
+   */
+  eventWriter?: MailboxEventWriter;
   /** The host's shared close ledger, forwarded to per-replica worktree managers. */
   selfClose?: SelfCloseTracker;
   /** Compatibility-only host field; the cutover never reads a profile catalog. */
@@ -108,6 +118,14 @@ export interface LaunchDependencies {
    * trusted host working directory — never the caller-controlled child `cwd`.
    */
   routerLog?: LaunchRouterLog;
+  /**
+   * The durable launch-intent boundary (durable-supervisor §6 D3), wired only
+   * by the daemon: `launchId` is the runtime-minted intent identity this
+   * launch adopts, and `hook` runs once after routing decided the first
+   * durable effect may proceed and before the decision-log append — the
+   * caller's `effecting` write. A hook refusal fails the launch untouched.
+   */
+  beforeFirstEffect?: { launchId: string; hook: () => void | Promise<void> };
 }
 
 /** The ADR-037 decision-log append seam; `appendRouterDecision` satisfies it. */
@@ -279,14 +297,16 @@ export interface LaunchResultChild {
   /** The exact operating-point id that started this child, when one did. */
   operatingPointId?: string;
   supervisorJobId?: string;
+  paneId?: string;
+  tabId?: string;
+  effectCertainty?: LaunchEffectCertainty;
   worktree?: string;
   /**
    * Bounded, redacted failure fact — never cause prose. `causeCode`,
-   * `paneId`, and `supervisorJobId` carry the recovery handles when the
-   * child's work may already have been consumed (PROMPT_UNCONFIRMED), so the
-   * caller inspects the live child instead of relaunching a duplicate.
+   * `paneId`, `tabId`, `supervisorJobId`, and `effectCertainty` retain recovery
+   * handles even when only a labelled bare shell survived the failed launch.
    */
-  error?: { code: string; message?: string; causeCode?: string; paneId?: string; supervisorJobId?: string };
+  error?: { code: string; message?: string; causeCode?: string; paneId?: string; tabId?: string; supervisorJobId?: string; effectCertainty?: LaunchEffectCertainty };
 }
 
 export interface LaunchResult {
@@ -302,6 +322,7 @@ export interface LaunchResult {
   abstention?: { reason: string; component?: string; requestSize?: { questions: number; bytes: number } };
 }
 
+const SHELL_READINESS_TIMEOUT_MS = 5_000;
 const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
 const PROMPT_CONFIRMATION_TIMEOUT_MS = 5_000;
 const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
@@ -327,10 +348,10 @@ const realLaunchClock: LaunchClock = { now: () => performance.now() };
 let defaultHandoffs: HandoffAllocator | undefined;
 
 export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
-  inspectBeforeRetry: "Inspect the affected pane and agent with herdr_inspect before retrying; do not assume that no agent started.",
-  preserveUnconfirmed: "Inspect the existing child with herdr_inspect and its active supervisor with herdr_jobs get; do not relaunch, resend, close or reuse the pane, register a recipient, or continue dependent work while assignment consumption is unconfirmed.",
+  inspectBeforeRetry: "Inspect the run and your intents with herdr_status and herdr_run observe before retrying; do not assume that no agent started.",
+  preserveUnconfirmed: "Inspect the intent and the run with herdr_status and herdr_run observe; do not relaunch, resend, close or reuse the pane, register a recipient, or continue dependent work while assignment consumption is unconfirmed.",
   noEffect: "No launch mutation was dispatched; correct the failure and retry only after validating the request.",
-  unknownEffect: "Inspect the affected pane and agent with herdr_inspect before any retry; the launch effect is unknown and must not be assumed absent."
+  unknownEffect: "Inspect the run and your intents with herdr_status and herdr_run observe before any retry; the launch effect is unknown and must not be assumed absent."
 } as const);
 
 type LaunchPhase = NonNullable<LaunchDetails["phase"]>;
@@ -1286,6 +1307,35 @@ async function readWithinWindow(cli: LaunchCli, argv: string[], window: ReadWind
   }
 }
 
+/** A one-shot probe: a startup reader may eat it, but never the agent command. */
+async function waitForShellReadiness(cli: LaunchCli, paneId: string, signal: AbortSignal): Promise<void> {
+  const nonce = randomUUID();
+  const marker = `HERDR_SHELL_READY_${nonce}`;
+  const window = createReadWindow(signal, realLaunchClock.now() + SHELL_READINESS_TIMEOUT_MS, realLaunchClock);
+  try {
+    // Split the marker so terminal input echo cannot satisfy the output proof.
+    // Literal command text only: no send-keys/Enter nudges or startup-file assumptions.
+    // `pane send-text` returns exit 0 with empty stdout (no envelope) on herdr 0.9.1,
+    // so a strict envelope parse rejects a successful probe write. The write's result
+    // is disposable — the wait-output marker proof below is the gate — so treat an
+    // empty-stdout protocol rejection as delivered and let the marker decide.
+    const writeProbe = ["pane", "send-text", paneId, `printf '%s%s\\n' 'HERDR_SHELL_READY_' '${nonce}'\n`];
+    try {
+      await readWithinWindow(cli, writeProbe, window);
+    } catch (error) {
+      if (!(error instanceof CliProtocolError && error.code === "CLI_PROTOCOL_ERROR" && error.details.stdout === "")) throw error;
+    }
+    const matched = await readWithinWindow(cli, ["pane", "wait-output", paneId, "--match", marker, "--source", "recent-unwrapped", "--timeout", String(SHELL_READINESS_TIMEOUT_MS)], window);
+    if (!record(matched) || matched.type !== "output_matched" || matched.pane_id !== paneId || typeof matched.matched_line !== "string" || !matched.matched_line.includes(marker)) {
+      throw new LaunchError("SHELL_NOT_READY", "Shell readiness marker was not observed");
+    }
+  } catch {
+    throw new LaunchError(signal.aborted ? "ABORTED" : "SHELL_NOT_READY", "Shell input readiness could not be proven; agent command was not sent");
+  } finally {
+    window.cleanup();
+  }
+}
+
 function waitForReadPoll(window: ReadWindow, intervalMs: number): Promise<void> {
   window.assertActive();
   return new Promise<void>((resolve, reject) => {
@@ -2000,7 +2050,7 @@ function partialError(
   created: LaunchResourceIds,
   phase: LaunchPhase,
   grant: RecipientGrant,
-  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; promptDispatch?: PromptDispatchEvidence; assignmentState?: "confirmed" | "unconfirmed"; initialPromptSubmission?: AgyPromptSubmissionEvidence; readiness?: LaunchReadinessEvidence; supervision?: NonNullable<LaunchDetails["supervision"]>; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
+  effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; promptDispatch?: PromptDispatchEvidence; assignmentState?: "confirmed" | "unconfirmed"; initialPromptSubmission?: AgyPromptSubmissionEvidence; readiness?: LaunchReadinessEvidence; supervisorJobId?: string; supervision?: NonNullable<LaunchDetails["supervision"]>; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
   delivery?: MessageDelivery,
   published?: PublishedAttachment,
   reconciliation?: LaunchReconciliationEvidence
@@ -2015,8 +2065,8 @@ function partialError(
     ? "POSTSTATE_UNAVAILABLE"
     : transportCode === "ABORTED"
       ? "ABORTED"
-      : error instanceof LaunchError && error.code === "READY_TIMEOUT"
-        ? "READY_TIMEOUT"
+      : error instanceof LaunchError && (error.code === "READY_TIMEOUT" || error.code === "SHELL_NOT_READY")
+        ? error.code
         // PROMPT_UNCONFIRMED stays distinguishable: the work may already be
         // consumed, so a relaunch must never look like an ordinary failure.
         : error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED"
@@ -2041,6 +2091,8 @@ function partialError(
     ...supplementalDetails,
     phase,
     created: { ...created },
+    ...created,
+    ...(effects.supervisorJobId === undefined ? {} : { supervisorJobId: effects.supervisorJobId }),
     causeCode,
     ...(message === undefined ? {} : { causeMessage: message }),
     agentStarted: effects.agentStarted,
@@ -2110,7 +2162,7 @@ async function runPrompt(cli: LaunchCli, paneId: string, envelope: string, signa
  * code, the pane, and the retained supervisor job — are bounded identifiers
  * the caller needs to inspect a possibly-consumed child instead of relaunching.
  */
-function launchChildError(error: unknown): LaunchResultChild["error"] {
+function launchChildError(error: unknown): NonNullable<LaunchResultChild["error"]> {
   const message = error instanceof LaunchError
     ? safeDiagnosticString(error.message.split(`\n${LAUNCH_DIAGNOSTIC_MARKER}`)[0], 256)
     : undefined;
@@ -2118,11 +2170,15 @@ function launchChildError(error: unknown): LaunchResultChild["error"] {
   const causeCode = safeDiagnosticString(details?.causeCode, 64);
   const paneId = safeDiagnosticString(details?.paneId, 128);
   const supervisorJobId = safeDiagnosticString(details?.supervisorJobId, 128);
+  const tabId = safeDiagnosticString(details?.tabId, 128);
+  const effectCertainty = details?.effectCertainty as LaunchEffectCertainty | undefined;
   return {
     code: safeLaunchCode(launchTransportCode(error)),
     ...(message === undefined ? {} : { message }),
     ...(causeCode === undefined ? {} : { causeCode }),
     ...(paneId === undefined ? {} : { paneId }),
+    ...(tabId === undefined ? {} : { tabId }),
+    ...(effectCertainty === undefined ? {} : { effectCertainty }),
     ...(supervisorJobId === undefined ? {} : { supervisorJobId })
   };
 }
@@ -2135,7 +2191,7 @@ function launchChildError(error: unknown): LaunchResultChild["error"] {
 function launchManifest(result: LaunchResult): string {
   const head = `herdr_launch outcome=${result.outcome} launch=${result.launchId}${result.requestedTier === undefined ? "" : ` tier=${result.requestedTier}`}${result.effectiveTier === undefined ? "" : ` effective=${result.effectiveTier}`} children=${result.children.length}${result.error === undefined ? "" : ` error=${result.error.code}`}`;
   const lines = result.children.map((child) =>
-    `- ${child.target} state=${child.state}${child.operatingPointId === undefined ? "" : ` point=${child.operatingPointId}`}${child.supervisorJobId === undefined ? "" : ` supervisor=${child.supervisorJobId}`}${child.worktree === undefined ? "" : ` worktree=${child.worktree}`}${child.error === undefined ? "" : ` error=${child.error.code}`}`
+    `- ${child.target} state=${child.state}${child.operatingPointId === undefined ? "" : ` point=${child.operatingPointId}`}${child.supervisorJobId === undefined ? "" : ` supervisor=${child.supervisorJobId}`}${child.worktree === undefined ? "" : ` worktree=${child.worktree}`}${child.paneId === undefined ? "" : ` pane=${child.paneId}`}${child.tabId === undefined ? "" : ` tab=${child.tabId}`}${child.effectCertainty === undefined ? "" : ` effect=${child.effectCertainty}`}${child.error === undefined ? "" : ` error=${child.error.code}`}`
   );
   return [head, ...lines].join("\n");
 }
@@ -2340,6 +2396,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     const abortSignal = signal;
     let launchGate: LaunchGateLease | undefined;
     try {
+      /* c8 ignore next -- the default lease takes a real filesystem lock under the host root; the injected lease is the fixture seam. */
       launchGate = await (deps.launchGate ?? (() => acquireLaunchGate()))();
       await launchGate.check();
     } catch {
@@ -2360,6 +2417,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     let grant: RecipientGrant | undefined;
     let published: PublishedAttachment | undefined;
     let sender: SenderIdentity | undefined;
+    let managerSession: AgentSessionIdentity | null | undefined;
     let contextDiagnostics: ContextResolutionDiagnostics | undefined;
     let effectiveContext: CurrentContext | undefined;
     let topologyBaseline: HerdrSnapshot | undefined;
@@ -2462,7 +2520,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       // Native-session provenance: the manager's own session is read from the
       // same authoritative snapshot as the sender identity — never a
       // caller-overridable field — and rides the pre-effect persist below.
-      const managerSession = resolveManagerSession(snapshot, effective.context.paneId);
+      managerSession = resolveManagerSession(snapshot, effective.context.paneId);
       if (mintedNameTaken(snapshot, childName)) {
         throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Minted child identity collides with an existing pane or agent", { childName });
       }
@@ -2544,7 +2602,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           child: { agentName: childName, agentKind: initialRuntime.kind, operatingPointId: initialContract.candidate.id },
           settings: {
             supervisionDigest,
-            workspaceRoot: supervisionWorkspaceRoot(launchCwd)
+            workspaceRoot: supervisionWorkspaceRoot(launchCwd),
+            ...(deps.eventWriter === undefined ? {} : { eventWriter: deps.eventWriter })
           }
         });
       } catch (error) {
@@ -2625,6 +2684,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
 
       phase = "agent_start";
       tick(phase);
+      await dispatchMutation(() => waitForShellReadiness(deps.cli, resolvedPaneId, abortSignal));
       // The pre-mutation compile loop retained each usable contract for the
       // attempt machinery; no candidate is rebuilt or duplicated here.
       const attemptCandidates = [...contracts.keys()];
@@ -2749,7 +2809,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           boundSupervision = { jobId: reservation!.jobId, state: "provisional", provisional: { ...provisionalIdentity, operatingPointId: chosenContract.candidate.id, baseline: provisionalBaseline } };
         } else {
           const exactIdentity = capturedIdentity as PromptTargetIdentity;
-          await reservation!.bind({ identity: exactIdentity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
+          await reservation!.bind({ identity: exactIdentity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}), owner: { paneId: sender!.paneId, session: managerSession! } } });
           boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: exactIdentity.agentName, agentKind: exactIdentity.agentKind, paneId: resolvedPaneId, terminalId: exactIdentity.terminalId, operatingPointId: chosenContract.candidate.id } };
         }
       } catch (error) {
@@ -2778,15 +2838,98 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       // that failure before it settles, without replaying the prompt.
       if (chosenRuntime.kind === "claude") {
         const selectedRunner = chainCandidates.find((entry) => entry.point.id === chosenContract!.candidate.id)!.runner;
+        /**
+         * The typed provider source proves the limit and — for a child that
+         * died on its first turn — that no task activity ever happened. Only
+         * then does the runtime close the dead pane and re-issue the same task
+         * through the ordinary `recoveryOf` path (which excludes the failed
+         * provider itself). Anything unprovable returns `undefined` and the
+         * manual close-then-recovery contract stands.
+         */
+        const providerLimitRecovery = async (identity: SupervisedIdentity, quota: ClaudeQuotaEvidence): Promise<ProviderLimitRecoveryEvidence | undefined> => {
+          if (!quota.zeroProgressProven || shared.replicas !== 1 || handoffRun === undefined) return undefined;
+          const recoverySignal = ctx.signal ?? new AbortController().signal;
+          // The dead pane is provably closed before anything new may start —
+          // a close whose effect stays uncertain never reaches the relaunch.
+          const finish = deps.selfClose?.begin(identity.paneId);
+          try {
+            const closed = await closeWithReadback({
+              cli: deps.cli,
+              argv: ["pane", "close", identity.paneId],
+              signal: recoverySignal,
+              targetId: identity.paneId,
+              readback: async (readbackSignal) => snapshotOf(await run(deps.cli, ["api", "snapshot"], readbackSignal)),
+              targetPresent: (snapshot) => snapshot.panes.some((pane) => pane.pane_id === identity.paneId),
+              summarize: topologySummary
+            });
+            finish?.(closed.reconciled === false);
+          } catch (error) {
+            finish?.(false);
+            /* c8 ignore next -- every close failure path carries a bounded code; the fallback is defensive. */
+            return { outcome: "failed", code: safeLaunchCode(record(error) && typeof error.code === "string" ? error.code : undefined) };
+          }
+          // `recoveryOf` resolves only terminal lineage, and the dead
+          // supervisor's own terminal mark lands only after this signal
+          // returns — the failed run is marked here so the relaunch can open
+          // it. The settle's `cancelled` remains compatible.
+          try {
+            await updateHandoffState(handoffRun, (state) => {
+              state.lifecycle.state = "failed";
+              state.lifecycle.detail = "provider_limit_zero_progress";
+            });
+          } catch {
+            return { outcome: "failed", code: "RUN_STATE_UNAVAILABLE" };
+          }
+          try {
+            const recovered = await executeRequest({
+              objective: params.objective,
+              scope: params.scope,
+              doneWhen: [...params.doneWhen],
+              constraints: [...params.constraints],
+              tier: params.tier,
+              ...(params.label === undefined ? {} : { label: params.label }),
+              recoveryOf: handoffRun.runId
+            }, recoverySignal, undefined, ctx, randomUUID());
+            /* c8 ignore next -- executeRequest always emits a details record. */
+            if (recovered.details === undefined) return { outcome: "failed", code: "RECOVERY_RESULT_UNREADABLE" };
+            const result = recovered.details;
+            if (result.outcome === "launched") {
+              /* c8 ignore next -- a launched outcome always carries its child record. */
+              const child = result.children[0]!;
+              return {
+                outcome: "relaunched",
+                launchId: result.launchId,
+                target: child.target,
+                operatingPointId: child.operatingPointId,
+                supervisorJobId: child.supervisorJobId
+              };
+            }
+            /* c8 ignore next -- an abstained outcome always carries its abstention record. */
+            if (result.outcome === "abstained") return { outcome: "abstained", code: result.abstention?.reason };
+            /* c8 ignore next -- a failed outcome always carries the request error or the child error. */
+            return { outcome: "failed", code: result.error?.code ?? result.children[0]?.error?.code };
+          } catch (error) {
+            /* c8 ignore next -- executeRequest rejections are bounded LaunchErrors; a foreign throw still cannot become a crash. */
+            return { outcome: "failed", code: error instanceof LaunchError ? error.code : "RECOVERY_FAILED" };
+          }
+        };
         reservation!.onCompletionSignal(async (identity) => {
-          if (!await (deps.claudeQuotaReader ?? claudeQuotaSignal)(identity.agentSession, launchCwd!, promptSubmissionWallMs)) return false;
+          const quota = await (deps.claudeQuotaReader ?? claudeQuotaSignal)(identity.agentSession, launchCwd!, promptSubmissionWallMs);
+          if (quota === false) return false;
+          let cooldownRecorded: boolean;
           try {
             await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(chosenContract!.candidate, selectedRunner,
-              { code: "CLAUDE_API_ERROR", causeCode: "rate_limit" }, { root: deps.cwd ?? ctx.cwd });
-            return { cooldownRecorded: true };
+              { code: "CLAUDE_API_ERROR", causeCode: "rate_limit", retryNotBefore: quota.retryNotBefore }, { root: deps.cwd ?? ctx.cwd });
+            cooldownRecorded = true;
           } catch {
-            return { cooldownRecorded: false };
+            cooldownRecorded = false;
           }
+          const autoRecovery = await providerLimitRecovery(identity, quota).catch((): ProviderLimitRecoveryEvidence => ({ outcome: "failed", code: "RECOVERY_FAILED" }));
+          return {
+            cooldownRecorded,
+            ...(quota.retryNotBefore === null ? {} : { retryNotBefore: quota.retryNotBefore }),
+            ...(autoRecovery === undefined ? {} : { autoRecovery })
+          };
         });
       }
       try {
@@ -2836,7 +2979,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
           phase = "supervision_bind";
           tick(phase);
-          await reservation!.strengthen({ identity: confirmed.identity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}) } });
+          await reservation!.strengthen({ identity: confirmed.identity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}), owner: { paneId: sender!.paneId, session: managerSession! } } });
           boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, operatingPointId: chosenContract.candidate.id } };
           provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, confirmed.identity.agentSession, abortSignal);
           phase = "prompt_verification";
@@ -2925,7 +3068,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       if (!supervisionBound) reservation?.release(`launch_failed_${phase}`);
       if (prepared !== undefined && !worktreeBound) await worktrees?.release(childName);
       withDeliveryFailureEvidence(error, { handoffRunId: handoffRun!.runId });
-      throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, mutationDispatched: topologyMutationDispatched, ...(assignmentState === undefined ? {} : { assignmentState }), ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }), ...(promptDispatch === undefined ? {} : { promptDispatch }), ...(readiness === undefined ? {} : { readiness }), ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }), timing, attempts }, delivery, published, reconciliation);
+      throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, supervisorJobId: reservation!.jobId, mutationDispatched: topologyMutationDispatched, ...(assignmentState === undefined ? {} : { assignmentState }), ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }), ...(promptDispatch === undefined ? {} : { promptDispatch }), ...(readiness === undefined ? {} : { readiness }), ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }), timing, attempts }, delivery, published, reconciliation);
     } finally {
       try { await grant?.release(); } finally { await launchGate?.release(); }
     }
@@ -2935,9 +3078,15 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     rawParams: unknown,
     signal: AbortSignal | undefined,
     onUpdate: AgentToolUpdateCallback<LaunchResult> | undefined,
-    ctx: ExtensionContext
+    ctx: ExtensionContext,
+    /**
+     * Runtime-initiated relaunches (provider-limit auto-recovery) mint their
+     * own launch identity here; the caller's intent boundary does not apply to
+     * an internal re-issue, so the daemon's `beforeFirstEffect` hook is skipped.
+     */
+    internalLaunchId?: string
   ): Promise<AgentToolResult<LaunchResult>> => {
-    const launchId = randomUUID();
+    const launchId = internalLaunchId ?? deps.beforeFirstEffect?.launchId ?? randomUUID();
     const emit = (result: LaunchResult): AgentToolResult<LaunchResult> => ({ content: [{ type: "text", text: launchManifest(result) }], details: result });
     // Fail-closed preconditions run before the gate: they are pure reads and
     // must reject without any launch effect.
@@ -2998,6 +3147,17 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     const task: RoutingTask = { objective: params.objective, scope: params.scope, doneWhen: params.doneWhen, constraints: params.constraints, ...(params.tier === undefined ? {} : { tier: params.tier }) };
     const routed = await routeTaskOnce(params, task, launchId, abortSignal, ctx, recovery);
     const routedRecord = routed.record;
+    // The intent boundary sits between routing and the first durable effect:
+    // the hook's `effecting` write lands before the decision log does, so a
+    // refusal here still leaves the world untouched. An internal relaunch is
+    // not the caller's intent — the boundary does not see it.
+    if (deps.beforeFirstEffect !== undefined && internalLaunchId === undefined) {
+      try {
+        await deps.beforeFirstEffect.hook();
+      } catch {
+        return emit({ kind: "launch", launchId, outcome: "failed", requestedTier: params.tier, children: [], error: { code: "LAUNCH_INTENT_REFUSED", message: "The launch intent boundary refused this launch" } });
+      }
+    }
     const routerLog = deps.routerLog ?? appendRouterDecision;
     try {
       await routerLog(taskRouteLogEntry(launchId, routedRecord), { root: deps.cwd ?? ctx.cwd });
@@ -3051,10 +3211,14 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           ...(details.worktree === undefined ? {} : { worktree: details.worktree })
         });
       } catch (error) {
-        /* c8 ignore next -- executeChild throws only LaunchError; the fallback keeps a foreign throw fail-closed. */
-        const failureDetails = error instanceof LaunchError ? error.details : undefined;
-        const retainedJobId = safeDiagnosticString(failureDetails?.supervisorJobId, 128);
-        children.push({ target: childName, state: "failed", error: launchChildError(error), ...(retainedJobId === undefined ? {} : { supervisorJobId: retainedJobId }) });
+        const failure = launchChildError(error);
+        children.push({
+          target: childName, state: "failed", error: failure,
+          ...(failure.paneId === undefined ? {} : { paneId: failure.paneId }),
+          ...(failure.tabId === undefined ? {} : { tabId: failure.tabId }),
+          ...(failure.supervisorJobId === undefined ? {} : { supervisorJobId: failure.supervisorJobId }),
+          ...(failure.effectCertainty === undefined ? {} : { effectCertainty: failure.effectCertainty })
+        });
       }
     }
     const launched = children.filter((child) => child.state === "launched").length;

@@ -23,13 +23,9 @@ const TYPEBOX_ERROR_BUFFER_MAX = 256;
 const EFFECT_CERTAINTIES = new Set(["absent", "partial", "unknown", "confirmed"]);
 const PHASE_OUTCOMES = new Set(["success", "failure", "skipped"]);
 const TOOL_OPERATIONS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
-  herdr_inspect: new Set(["context", "target", "collection", "health"]),
-  herdr_communicate: new Set(["prompt", "steer", "keys", "cancel", "interrupt"]),
-  herdr_wait: new Set(["wait"]),
-  herdr_jobs: new Set(["list", "get", "cancel"]),
   herdr_launch: new Set(["launch"]),
-  herdr_pane: new Set(["split", "move", "rename", "focus", "resize", "swap", "zoom", "adopt", "close"]),
-  herdr_tab: new Set(["create", "rename", "focus", "close"]),
+  herdr_run: new Set(["observe", "reconcile", "transfer", "claim", "ack"]),
+  herdr_status: new Set(["status"]),
 });
 
 export type ToolEffectCertainty = "absent" | "partial" | "unknown" | "confirmed";
@@ -238,13 +234,11 @@ export function invalidInputError(tool: string, schema: TSchema, value: unknown)
 export function telemetryOperation(tool: string, value: unknown, valid: boolean): string {
   if (!valid) return "invalid";
   const input = record(value) ? value : {};
-  const candidate = tool === "herdr_inspect"
-    ? input.mode ?? "context"
-    : tool === "herdr_wait"
-      ? "wait"
-      : tool === "herdr_launch"
-        ? "launch"
-        : input.operation;
+  const candidate = tool === "herdr_launch"
+    ? "launch"
+    : tool === "herdr_status"
+      ? "status"
+      : input.action;
   return typeof candidate === "string" && TOOL_OPERATIONS[tool]?.has(candidate) ? candidate : "unknown";
 }
 

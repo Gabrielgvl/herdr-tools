@@ -27,6 +27,7 @@ describe("herdr_jobs", () => {
     const cancelled = await tool.execute("id", { operation: "cancel", jobId: handle.jobId } as never, undefined, undefined, {} as never);
     expect(cancelled.details).toMatchObject({ jobId: handle.jobId, operation_phase: "settled", wait_result: "unknown" });
     await expect(tool.execute("id", { operation: "get", jobId: "job_unknown" } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "JOB_NOT_FOUND" });
+    await expect(tool.execute("id", { operation: "cancel", jobId: "job_unknown" } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "JOB_NOT_FOUND" });
     await expect(tool.execute("id", { operation: "list", limit: 101 } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(tool.execute("id", { operation: "list", snake_case: true } as never, undefined, undefined, {} as never)).rejects.toMatchObject({ code: "INVALID_INPUT" });
     const hostile = new Proxy({ operation: "list" }, { get: () => { throw "malformed jobs input"; } });

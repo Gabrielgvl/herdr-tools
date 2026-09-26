@@ -25,20 +25,20 @@ export function resolveProjectBank(config, cwd) {
     throw new Error("Hindsight path-to-bank mapping is invalid");
   }
 
-  const matches = [];
+  const roots = [];
   for (const [root, bankId] of Object.entries(mappings)) {
     if (typeof root !== "string" || typeof bankId !== "string" || !bankId) continue;
-    let canonical;
     try {
-      canonical = realpathSync(root);
+      roots.push({ bankId, projectRoot: realpathSync(root) });
     } catch {
       continue;
     }
-    const rel = relative(canonical, current);
-    if (rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !rel.startsWith(sep))) {
-      matches.push({ bankId, projectRoot: canonical });
-    }
   }
+
+  const matches = roots.filter(({ projectRoot }) => {
+    const rel = relative(projectRoot, current);
+    return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !rel.startsWith(sep));
+  });
 
   matches.sort((left, right) => right.projectRoot.length - left.projectRoot.length);
   if (!matches[0]) throw new Error("No Hindsight bank is mapped for this project");
@@ -47,7 +47,13 @@ export function resolveProjectBank(config, cwd) {
     matches.filter(({ projectRoot }) => projectRoot === selected.projectRoot).map(({ bankId }) => bankId),
   );
   if (selectedBanks.size !== 1) throw new Error("Ambiguous Hindsight bank mapping for this project");
-  return selected;
+  const projectRoot = roots
+    .filter(({ bankId }) => bankId === selected.bankId)
+    .sort((left, right) => {
+      const depth = left.projectRoot.split(sep).length - right.projectRoot.split(sep).length;
+      return depth || left.projectRoot.localeCompare(right.projectRoot);
+    })[0].projectRoot;
+  return { bankId: selected.bankId, projectRoot };
 }
 
 export function bankSlugs(bankId) {

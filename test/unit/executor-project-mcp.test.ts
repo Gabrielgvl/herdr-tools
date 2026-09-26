@@ -55,6 +55,27 @@ describe("executor project MCP routing", () => {
     ).toThrow("Ambiguous Hindsight bank mapping for this project");
   });
 
+  it("uses one stable integration root for every path sharing a bank", async () => {
+    const { resolveProjectBank } = await load();
+    const root = mkdtempSync(join(tmpdir(), "executor-project-mcp-"));
+    const repo = join(root, "product");
+    const clone = join(root, "product-mobile");
+    const worktree = join(root, "worktrees", "product", "feature");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(clone, { recursive: true });
+    mkdirSync(worktree, { recursive: true });
+    const config = {
+      mapPathToBank: {
+        [worktree]: "product-bank",
+        [clone]: "product-bank",
+        [repo]: "product-bank",
+      },
+    };
+
+    expect(resolveProjectBank(config, clone)).toEqual({ bankId: "product-bank", projectRoot: realpathSync(repo) });
+    expect(resolveProjectBank(config, worktree)).toEqual({ bankId: "product-bank", projectRoot: realpathSync(repo) });
+  });
+
   it("builds stable bank slugs without exposing the bank id", async () => {
     const { bankSlugs } = await load();
     const first = bankSlugs("coding-agent::nlp");

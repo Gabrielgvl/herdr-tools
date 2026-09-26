@@ -270,10 +270,16 @@ A **findings-summary** bot's `APPROVED` review (e.g. the `<!-- backend-claude-re
 
 ## pi-review: review the GitHub PR, never a stale local base
 
-`pi-review diff --base <ref>` diffs against the **local** ref. If local `staging` lags `origin/staging` (checkouts drift; observed ~155 commits behind), that diff sweeps in hundreds of already-merged files and the reviewer emits phantom "critical" findings on files the PR never touched (C-19296/PR #1376 cited `apps/llm-executor`; C-19186/PR #1373 cited send-pipeline/terraform). A hard review gate then BLOCKs a clean PR.
+- **Always use `pi-review <number|#N|url>`** (a PR target) — the diff's base
+  comes from GitHub PR metadata, so there is no local base to go stale. The
+  stale-local-base failure mode behind C-19296/PR #1376 and C-19186/PR #1373
+  belonged to a local-diff mode that no longer exists; the `linear-execute`
+  cross-model lens uses a PR target for this reason (C-19319).
+- A bare `pi-review` branch run resolves its own base — open PR via `gh`,
+  else `origin/<default>` — and discloses the fallback as a `base-fallback`
+  entry in the report's `gaps[]`. Check `gaps[]` before trusting the scope of
+  a branch-mode run.
 
-- **Always use `pi-review pr <number|url>`** (GitHub-PR mode) — it pulls the authoritative diff from GitHub (same source as `gh pr diff`), so there is no local base to go stale. The `linear-execute` cross-model lens uses `pr` mode for this reason (C-19319).
-- If you must run local-diff mode, `git fetch origin <default-branch>` first and pass a fresh ref.
 - **The scope oracle is `gh pr diff <n> --name-only`** — never `git diff origin/staging..HEAD` locally (a stale local `origin/staging` ref inflates it with already-merged files). Use it to verify PR scope after a force-push, and as a *tell* when triaging findings.
 - **Triage findings by causality, not by whether the cited file is in the diff.** A finding citing zero in-diff files is a *signal* of stale-base contamination, not proof of it: a PR can break a contract whose strongest evidence is an **unchanged** caller (e.g. an API/type signature change that breaks a consumer outside the diff). Before dismissing, ask "is this defect *caused by this PR's change*?" — if yes, it is in-scope and must be fixed even though the cited file is unchanged. Only dismiss (document in the PR body, don't fix) when there is no causal link to the change — the true stale-base case, where the finding is about pre-existing/already-merged code the PR never touches.
 

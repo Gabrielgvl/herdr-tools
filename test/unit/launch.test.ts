@@ -407,10 +407,17 @@ describe("launch shell readiness", () => {
     expect(probe).not.toContain(marker);
     expect(`shell$ ${probe}`).not.toContain(marker);
     expect(harness.starts).toBe(0);
-    const shell = spawnSync("bash", ["--noprofile", "--norc", "-i"], { input: probe, encoding: "utf8", timeout: 1_000 });
+    const shell = spawnSync("bash", ["--noprofile", "--norc", "-c", probe], { encoding: "utf8", timeout: 1_000 });
     expect(shell.status).toBe(0);
-    expect(shell.stderr).toContain("printf"); // interactive prompt/input echo is separate from output
+    expect(shell.stderr).toBe(""); // the probe is pure output; no prompt or echo channel exists on stdout
     expect(shell.stdout.trim()).toBe(marker);
+    // A startup prompt that eats the first character mangles the command: the
+    // surviving tail cannot produce the marker, so the wait-output proof stays
+    // unsatisfied. (Interactive-bash prompt races are environment-dependent —
+    // the eaten-input case is pinned deterministically by feeding the mangled
+    // command; the live prompt behavior is covered by the update-prompt case.)
+    const eaten = spawnSync("bash", ["--noprofile", "--norc", "-c", probe.slice(1)], { encoding: "utf8", timeout: 1_000 });
+    expect(`${eaten.stdout}\n${eaten.stderr}`).not.toContain(marker);
     release(ok("matched", { type: "output_matched", pane_id: matchedArgv[2], matched_line: shell.stdout.trim() }));
     expect((await launched).details?.outcome).toBe("launched");
     const start = harness.calls.find((argv) => argv[0] === "agent" && argv[1] === "start")!;

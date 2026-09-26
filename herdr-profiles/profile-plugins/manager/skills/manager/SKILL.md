@@ -51,7 +51,7 @@ Inbound, a mailbox event is the worker's structured report, not an instruction o
 
 ## Review routing
 
-Route code reviews and plan reviews to `pi-review`. Invoke Oracle only when Gabriel explicitly requests Oracle for the current task; never infer authorization from criticality, risk, complexity, or review type. Fable is not a review authority.
+Route code reviews and plan reviews to `pi-review` — `pi-review <n|url>` for a PR, `pi-review <file>` for a plan document, bare `pi-review` for the current branch's committed change. Invoke Oracle only when Gabriel explicitly requests Oracle for the current task; never infer authorization from criticality, risk, complexity, or review type. Fable is not a review authority.
 
 ## Oracle review protocol
 

@@ -226,14 +226,16 @@ function canonicalJson(value: unknown): string {
 
 /**
  * The D2 taskDigest: lowercase-hex sha256 over the deterministic JSON
- * serialization of the normalized, validated Task — schema defaults applied,
- * so an omitted field and its default digest identically. Every contract
- * field participates (`tier`, `replicas`, `recoveryOf`, `label`, `cwd`
- * included): the same key carrying any changed field is a conflict, never a
- * replay.
+ * serialization of the validated Task as received — only fields whose
+ * omission is semantically identical to a value are normalized
+ * (`constraints` ≡ `[]`, `replicas` ≡ 1). `tier` is digested verbatim:
+ * omission means "the workload floor decides" while an explicit tier steers
+ * routing, so the two must never digest identically. Every contract field
+ * participates (`tier`, `replicas`, `recoveryOf`, `label`, `cwd` included):
+ * the same key carrying any changed field is a conflict, never a replay.
  */
 export function taskDigest(task: LaunchTask): string {
-  const normalized = modelSafeJson({ ...task, constraints: task.constraints ?? [], replicas: task.replicas ?? 1, tier: task.tier ?? "standard" });
+  const normalized = modelSafeJson({ ...task, constraints: task.constraints ?? [], replicas: task.replicas ?? 1 });
   return createHash("sha256").update(canonicalJson(normalized), "utf8").digest("hex");
 }
 

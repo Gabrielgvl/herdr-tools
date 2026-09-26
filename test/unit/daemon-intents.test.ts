@@ -411,14 +411,24 @@ describe("D2 binding derivations", () => {
     expect(managerSessionKey({ ...sessionA, kind: "other" })).not.toBe(mgrA);
   });
 
-  it("digests the normalized task: schema defaults are invisible, every field counts", () => {
+  it("digests the received task: only semantically-defaulted optionals are invisible, every field counts", () => {
     expect(taskDigest(task)).toMatch(/^[0-9a-f]{64}$/);
-    // Omitted and defaulted digest identically.
-    expect(taskDigest({ ...task, tier: "standard", replicas: 1, constraints: [] })).toBe(taskDigest(task));
+    // Omitted and semantically-defaulted digest identically (`constraints` ≡ [], `replicas` ≡ 1).
+    expect(taskDigest({ ...task, replicas: 1, constraints: [] })).toBe(taskDigest(task));
     // Key order in the caller's object is irrelevant — canonical form is sorted.
     expect(taskDigest({ doneWhen: task.doneWhen, scope: task.scope, objective: task.objective })).toBe(taskDigest(task));
     // Any real change is a different digest.
     expect(taskDigest({ ...task, replicas: 2 })).not.toBe(taskDigest(task));
     expect(taskDigest({ ...task, label: "x" })).not.toBe(taskDigest(task));
+  });
+
+  it("F1: digests an omitted tier differently from an explicit `standard` — the request as received, before default substitution", () => {
+    // Omission lets the workload floor decide; `standard` pins it — the router
+    // treats them differently, so the idempotency digest must too.
+    expect(taskDigest({ ...task, tier: "standard" })).not.toBe(taskDigest(task));
+    expect(taskDigest({ ...task, tier: "economy" })).not.toBe(taskDigest({ ...task, tier: "standard" }));
+    // Byte-identical replay still digests identically.
+    expect(taskDigest({ ...task })).toBe(taskDigest(task));
+    expect(taskDigest({ ...task, tier: "standard" })).toBe(taskDigest({ ...task, tier: "standard" }));
   });
 });

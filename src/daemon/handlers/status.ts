@@ -9,11 +9,11 @@
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { readHandoffState, type HandoffState } from "../../handoff.js";
+import { currentHandoffOwner, readHandoffProvenance, readHandoffState, type HandoffAllocation, type HandoffState } from "../../handoff.js";
 import { requirePromptTargetIdentity } from "../../messages/prompt.js";
 import { snapshotIdentityRecords } from "../../messages/prompt-target.js";
 import { daemonRequestError, parseCallerClaim, requireDaemonMailbox, verifyDaemonCaller, type DaemonOwnership, type DaemonRuntime, type VerifiedDaemonCaller } from "../runtime.js";
-import type { LaunchIntentChild, LaunchIntentRecord, LaunchIntentState } from "../intents.js";
+import { managerSessionKey, type LaunchIntentChild, type LaunchIntentRecord, type LaunchIntentState } from "../intents.js";
 import { DAEMON_MAILBOX_DIR_NAME, type MailboxEvent } from "../mailbox.js";
 import { DaemonRequestError } from "../protocol.js";
 
@@ -42,7 +42,7 @@ export interface DaemonStatusRun {
     paneId?: string;
     agentStatus?: unknown;
   };
-  /** `active` while a live supervisor job is bound to the run in this daemon. */
+  /** `active` while a live, unpaused supervisor job is bound to the run in this daemon. */
   review: "active" | "paused";
 }
 
@@ -156,7 +156,9 @@ async function runReviews(runtime: DaemonRuntime): Promise<Map<string, DaemonSta
     if (detail === undefined) continue;
     const handoff = detail.handoff;
     if (handoff === undefined || handoff.gated !== true) continue;
-    if (detail.operation_phase !== "settled") reviews.set(handoff.runId, "active");
+    // A non-settled supervisor whose D5 owner-absence pause is engaged runs no
+    // reviewer calls — it reports `paused`, never `active`.
+    if (detail.operation_phase !== "settled" && detail.supervision?.reviewer?.paused !== true) reviews.set(handoff.runId, "active");
     else if (!reviews.has(handoff.runId)) reviews.set(handoff.runId, "paused");
   }
   return reviews;
@@ -179,24 +181,60 @@ export async function handleDaemonStatus(runtime: DaemonRuntime, params: Record<
     ...projected.filter((intent) => intent.state !== "unresolved"),
   ];
   const reviews = await runReviews(runtime);
-  const runIds = new Set<string>();
-  for (const intent of intents) {
-    for (const child of intent.children) {
-      if (child.runId !== undefined) runIds.add(child.runId);
+  // A run projects to its v2 current owner, never to whichever manager's
+  // ledger recorded it — intents are never migrated on transfer/claim, so the
+  // candidate set comes from every manager's ledger and each run's provenance
+  // decides whether this caller sees it.
+  const candidates = new Map<string, string>();
+  let managers: string[];
+  try {
+    managers = await runtime.intents.listManagers();
+  } catch (error) {
+    throw daemonRequestError(error);
+  }
+  for (const manager of managers) {
+    let ledger: LaunchIntentRecord[];
+    try {
+      ledger = manager === caller.managerSessionKey ? intents : await runtime.intents.list(manager);
+    } catch (error) {
+      throw daemonRequestError(error);
+    }
+    for (const intent of ledger) {
+      for (const child of intent.children) {
+        if (child.runId !== undefined) candidates.set(child.runId, manager);
+      }
     }
   }
   const runs: DaemonStatusRun[] = [];
-  for (const runId of runIds) {
+  for (const [runId, recorder] of candidates) {
+    let run: HandoffAllocation | undefined;
     try {
-      const state = await readHandoffState(await runtime.allocator.open(runId));
-      runs.push({
-        runId,
-        lifecycle: state.lifecycle.state,
-        child: childPresence(state, caller.snapshot),
-        review: reviews.get(runId) ?? "paused",
-      });
+      run = await runtime.allocator.open(runId);
     } catch {
-      runs.push({ runId, lifecycle: "unavailable", child: { agentName: "", agentKind: "", presence: "absent" }, review: reviews.get(runId) ?? "paused" });
+      run = undefined;
+    }
+    let ownerKey = recorder;
+    if (run !== undefined) {
+      const provenance = await readHandoffProvenance(run).catch(() => undefined);
+      const owner = provenance === undefined ? null : currentHandoffOwner(provenance);
+      if (owner !== null) ownerKey = managerSessionKey(owner);
+    }
+    // Only the run's current owner sees it — a transferred run leaves the
+    // recording manager's view and joins its successor's.
+    if (ownerKey !== caller.managerSessionKey) continue;
+    let state: HandoffState | undefined;
+    if (run !== undefined) {
+      try {
+        state = await readHandoffState(run);
+      } catch {
+        state = undefined;
+      }
+    }
+    const review = reviews.get(runId) ?? "paused";
+    if (state === undefined) {
+      runs.push({ runId, lifecycle: "unavailable", child: { agentName: "", agentKind: "", presence: "absent" }, review });
+    } else {
+      runs.push({ runId, lifecycle: state.lifecycle.state, child: childPresence(state, caller.snapshot), review });
     }
   }
   // §7 mailbox projection — `list`/`read` are pure reads: no mkdir, no flock,

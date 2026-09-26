@@ -470,6 +470,24 @@ describe("daemon launch handler — verified identity (D2a)", () => {
   });
 });
 
+describe("daemon launch handler — mailbox capacity admission (F2)", () => {
+  it("F2: refuses MAILBOX_CAPACITY before any effect — no intent record, no child, no mutation", async () => {
+    const fx = await harness();
+    fx.runtime.bindMailbox({
+      ...fx.mailbox,
+      checkLaunchCapacity: async () => ({ ok: false, code: "MAILBOX_CAPACITY", at: new Date().toISOString() }),
+    });
+    await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot)))
+      .rejects.toMatchObject({ daemonCode: "MAILBOX_CAPACITY" });
+    // Zero child effect: the only CLI call is the one fresh caller snapshot —
+    // the intent record itself was never written and the pipeline never ran.
+    expect(fx.calls).toEqual([["api", "snapshot"]]);
+    expect(await fx.intents.list(managerKey)).toEqual([]);
+    expect(fx.events).toEqual([]);
+    expect(fx.prompts).toEqual([]);
+  });
+});
+
 describe("daemon launch handler — intent-gated execution", () => {
   it("launches end to end: runtime-minted launchId, ordered boundary writes, herdr-run marker, completed intent", async () => {
     const fx = await harness();
@@ -1399,6 +1417,53 @@ describe("daemon status handler", () => {
     // still comes from the live job registry.
     expect(status.runs.find((run) => run.runId === runActive)?.review).toBe("active");
     expect(status.runs.find((run) => run.runId === runPaused)?.review).toBe("paused");
+  });
+
+  it("F4: a transferred run projects to its v2 current owner — the successor sees it, the recording owner does not", async () => {
+    const successorSession: AgentSessionIdentity = { source: "herdr:pi", agent: "pi", kind: "id", value: "succ-session" };
+    const fx = await harness({
+      caller: {
+        panes: [{ pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_name: "successor", agent: "pi", terminal_id: "t-succ", agent_session: successorSession, agent_status: "idle" }],
+        agents: [{ pane_id: "w1:p2", name: "successor", agent: "pi", terminal_id: "t-succ", agent_session: successorSession, agent_status: "idle" }],
+      },
+    });
+    const allocation = await boundRun(fx, { terminalId: "t-owned" });
+    // The run is recorded under the launching manager's intent — intents never migrate.
+    const begun = await fx.intents.begin({ managerSessionKey: managerKey, idempotencyKey: "idem-1", task, projectRoot: fx.projectRoot });
+    if (begun.kind !== "launch") throw new Error("expected launch");
+    const effecting = await fx.intents.markEffecting(begun.intent);
+    await fx.intents.recordChildren(effecting, [{ name: "task-aa-1", runId: allocation.runId }]);
+    await fx.intents.complete(effecting, [{ name: "task-aa-1", runId: allocation.runId, disposition: "bound" }]);
+    await handleDaemonRun(fx.runtime, runParams({ action: "transfer", runIds: [allocation.runId], successorPaneId: "w1:p2" }));
+
+    const sees = async (identity: Record<string, unknown>) =>
+      (await handleDaemonStatus(fx.runtime, { identity })).runs.some((run) => run.runId === allocation.runId);
+    // Both directions: the successor sees the run; the prior owner does not.
+    expect(await sees({ workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p2", agentSession: successorSession })).toBe(true);
+    expect(await sees(claim)).toBe(false);
+  });
+
+  it("F5: reports a running supervisor whose D5 owner-absence pause is engaged as `paused`, never `active`", async () => {
+    const runPaused = "44444444-5555-6666-7777-888888888888";
+    const runActive = "55555555-6666-7777-8888-999999999999";
+    const jobs: Record<string, Record<string, unknown> | undefined> = {
+      j1: { operation_phase: "running", handoff: { gated: true, runId: runPaused }, supervision: { reviewer: { paused: true } } },
+      j2: { operation_phase: "running", handoff: { gated: true, runId: runActive }, supervision: { reviewer: {} } },
+    };
+    const fx = await harness({
+      jobs: {
+        list: (() => ({ jobs: Object.keys(jobs).map((jobId) => ({ jobId })) })) as never,
+        get: ((jobId: string) => jobs[jobId]) as never,
+        shutdown: () => undefined,
+      },
+    });
+    const begun = await fx.intents.begin({ managerSessionKey: managerKey, idempotencyKey: "idem-1", task, projectRoot: fx.projectRoot });
+    if (begun.kind !== "launch") throw new Error("expected launch");
+    const effecting = await fx.intents.markEffecting(begun.intent);
+    await fx.intents.recordChildren(effecting, [{ name: "c-p", runId: runPaused }, { name: "c-a", runId: runActive }]);
+    const status = await handleDaemonStatus(fx.runtime, runParams()) as { runs: Array<{ runId: string; review: string }> };
+    expect(status.runs.find((run) => run.runId === runPaused)?.review).toBe("paused");
+    expect(status.runs.find((run) => run.runId === runActive)?.review).toBe("active");
   });
 
   it("projects one mailbox event body for a named eventId — read-only, nothing acked", async () => {

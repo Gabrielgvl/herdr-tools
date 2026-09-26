@@ -163,6 +163,33 @@ describe("daemon startup and lifecycle record", () => {
     await expect(lstat(fx.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("F3: the socket accepts nothing until the restart sweep completes — listen follows the sweep", async () => {
+    const fx = await fixture();
+    // Hold the D4 reattach sweep open: the daemon is mid-recovery.
+    let releaseSweep: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { releaseSweep = resolve; });
+    let sweepEntered = false;
+    const starting = startDaemon({
+      env: fx.env,
+      reattach: async () => {
+        sweepEntered = true;
+        await gate;
+      },
+    });
+    await vi.waitFor(() => expect(sweepEntered).toBe(true));
+    // Mid-sweep the lifecycle record already carries startedAt + heartbeat —
+    // the daemon.json write order is unchanged — but no socket exists yet, so
+    // no request can reach the dispatcher against a half-swept intent ledger.
+    expect((await readStatus(fx)).startedAt).toEqual(expect.any(String));
+    expect(await createDaemonSocketProbe()(fx.socketPath)).not.toBe("answered");
+    await expect(connectDaemon(fx.namespace)).rejects.toThrow();
+    releaseSweep();
+    const daemon = await starting;
+    daemons.push(daemon);
+    const client = await connect(fx);
+    await expect(client.request("echo", { alive: true })).resolves.toEqual({ alive: true });
+  });
+
   it("runs the N1.3 restart sweep: an interrupted effecting intent becomes unresolved before serving", async () => {
     const fx = await fixture();
     const store = createIntentStore({ namespace: fx.namespace });

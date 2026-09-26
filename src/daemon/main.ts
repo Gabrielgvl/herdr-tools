@@ -2,9 +2,10 @@
  * The daemon entrypoint (spec: durable-supervisor §4, §9 D4).
  *
  * Startup: resolve the endpoint namespace (N1.1) → take the single-instance
- * lock → probe and bind `daemon.sock` under it (N1.2) → run the D3/D4 restart
- * sweep (`recoverInterrupted`, N1.3) → record `startedAt` and the first
- * `heartbeat` in `daemon.json` → heartbeat every 30 s.
+ * lock → run the N1.3 `recoverInterrupted` sweep → record `startedAt` and the
+ * first `heartbeat` in `daemon.json` → create the mailbox and run the D4
+ * reattach sweep → only then probe and bind `daemon.sock` (N1.2) → heartbeat
+ * every 30 s. The socket accepts nothing before recovery completes.
  *
  * Shutdown (SIGTERM/SIGINT) runs the fixed §4 order — flush handoffs → stop
  * supervisors → record `lastStoppedAt` → close the server → release the
@@ -96,8 +97,9 @@ export interface DaemonMainOptions {
   ownership?: MailboxRunOwnership;
   /**
    * The D4 restart-reattach sweep (N2.3): runs once after `startedAt` lands and
-   * the mailbox exists, before the heartbeat starts. A throw aborts startup —
-   * a daemon that cannot classify its recorded children does not run.
+   * the mailbox exists, before the socket binds or the heartbeat starts. A
+   * throw aborts startup — a daemon that cannot classify its recorded
+   * children does not run.
    */
   reattach?: (context: { mailbox: Mailbox; startedAt: string; lastHeartbeat?: string }) => Promise<unknown>;
   heartbeatMs?: number;
@@ -228,16 +230,9 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
   const namespace = options.namespace ?? (await resolveDaemonNamespace(options.env ?? process.env));
   const lease = await acquireDaemonInstance(namespace);
 
-  let server: DaemonServer;
-  try {
-    server = await startDaemonServer({ namespace, lease, handler: options.handler, probe: options.probe });
-  } catch (error) {
-    await lease.release().catch(() => undefined);
-    throw error;
-  }
+  // Every failure before the socket binds has no listener to close — the
+  // teardown is the instance lock alone.
   const teardown = async (): Promise<void> => {
-    /* c8 ignore next -- close() only rejects on a listener fault tests cannot force. */
-    await server.close().catch(() => undefined);
     await lease.release().catch(() => undefined);
   };
 
@@ -291,7 +286,7 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
   // The D4 reattach sweep rides this start: classify every recorded child of
   // every `awaiting_handoff`/`recovery_pending` run, reattach the exact
   // matches, and land one `downtime_gap` per affected mailbox before the
-  // heartbeat cadence begins.
+  // socket accepts a request.
   if (options.reattach !== undefined) {
     try {
       await options.reattach({ mailbox, startedAt, ...(priorHeartbeat === undefined ? {} : { lastHeartbeat: priorHeartbeat }) });
@@ -299,6 +294,18 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
       await teardown();
       throw error;
     }
+  }
+
+  // The socket is the last thing bound: no request may reach the dispatcher
+  // before the restart sweep has classified every `effecting` intent and the
+  // runtime has bound its mailbox — a launch observed mid-sweep could be
+  // rewritten to `unresolved(interrupted)` out from under its own effects.
+  let server: DaemonServer;
+  try {
+    server = await startDaemonServer({ namespace, lease, handler: options.handler, probe: options.probe });
+  } catch (error) {
+    await teardown();
+    throw error;
   }
 
   const heartbeat = setInterval(() => {

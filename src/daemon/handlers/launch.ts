@@ -24,6 +24,7 @@ import {
   daemonContextResolver,
   daemonRequestError,
   parseCallerClaim,
+  requireDaemonMailbox,
   verifyDaemonCaller,
   type DaemonRuntime,
   type VerifiedDaemonCaller,
@@ -216,10 +217,11 @@ async function executeDaemonLaunch(
 
 /**
  * The `launch` request: `{identity, projectRoot, task, idempotencyKey}`. One
- * fresh snapshot verifies the caller (D2a) before the intent store arbitrates
- * begin / replay / conflict; a still-`recorded` intent resumes under its
- * original launch ID, and a concurrent executor for the same binding waits it
- * out rather than launching a duplicate.
+ * fresh snapshot verifies the caller (D2a) and the mailbox admits the launch
+ * (§7 capacity) before the intent store arbitrates begin / replay / conflict;
+ * a still-`recorded` intent resumes under its original launch ID, and a
+ * concurrent executor for the same binding waits it out rather than
+ * launching a duplicate.
  */
 export async function handleDaemonLaunch(runtime: DaemonRuntime, params: Record<string, unknown>): Promise<DaemonLaunchReply> {
   const signal = new AbortController().signal;
@@ -229,6 +231,16 @@ export async function handleDaemonLaunch(runtime: DaemonRuntime, params: Record<
   if (!Value.Check(IdempotencyKeySchema, idempotencyKey)) throw new DaemonRequestError("REQUEST_INVALID");
   const task = params.task;
   if (!Value.Check(LaunchTaskSchema, task)) throw new DaemonRequestError("REQUEST_INVALID");
+  // §7: capacity admission precedes every effect — the intent record's own
+  // `recorded` write included. At cap the launch refuses MAILBOX_CAPACITY and
+  // produces zero child effect.
+  let capacity;
+  try {
+    capacity = await requireDaemonMailbox(runtime).checkLaunchCapacity(caller.managerSessionKey);
+  } catch (error) {
+    throw daemonRequestError(error);
+  }
+  if (!capacity.ok) throw new DaemonRequestError(capacity.code);
   const flightKey = `${caller.managerSessionKey}/${idempotencyKey}`;
   for (;;) {
     let begun;

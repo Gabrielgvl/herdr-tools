@@ -19,8 +19,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createHandoffAllocator,
   HandoffError,
+  readHandoffProvenance,
   readHandoffState,
   updateHandoffState,
+  writeHandoffProvenance,
   type HandoffAllocator,
   type HandoffAllocation,
   type HandoffNamespace,
@@ -324,6 +326,52 @@ describe("daemon restart reattach (D4)", () => {
     expect(unread).toHaveLength(1);
     const event = await fx.mailbox.read(ownerKey, unread[0]!);
     expect(event).toMatchObject({ kind: "downtime_gap", from: "2026-09-25T00:59:00.000Z", to: "2026-09-25T01:00:00.000Z", lost: {} });
+  });
+
+  it("F6: reattach binds the v2 current owner's pane for hints — never the launch record's pane", async () => {
+    const fx = await fixture();
+    const { allocation, runId } = await seedRun(fx.allocator);
+    const successorSession: AgentSessionIdentity = { source: "herdr", agent: "pi", kind: "pi", value: "successor-session" };
+    // The run was transferred before the restart: v2 provenance closes the
+    // launch owner's entry and opens the successor's — the launch record's
+    // `manager.paneId` ("p-owner") is stale for a transferred run.
+    const prior = await readHandoffProvenance(allocation);
+    await writeHandoffProvenance(allocation, {
+      ...prior,
+      v: 2,
+      owners: [
+        { session: ownerSession, from: prior.createdAt, to: "2026-09-25T00:00:00.000Z", reason: "transfer" },
+        { session: successorSession, from: "2026-09-25T00:00:00.000Z", to: null, reason: "transfer" },
+      ],
+    });
+    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-1", task: { ...task }, projectRoot: fx.projectRoot });
+    if (begun.kind !== "launch") throw new Error("expected launch");
+    await fx.intents.markEffecting(begun.intent);
+    await fx.intents.recordChildren(begun.intent, [{ name: "worker", runId }]);
+    await fx.intents.fail(begun.intent, { effectCertainty: "partial" });
+
+    // The fresh snapshot proves the child on p-child and the successor on
+    // p-successor — the original owner pane is absent entirely.
+    const supervision = fakeSupervision();
+    const snap = snapshot(
+      [
+        paneRecord({ paneId: "p-child", terminalId: "t1" }),
+        paneRecord({ paneId: "p-successor", terminalId: "t-succ", agentName: "successor", session: { ...successorSession } }),
+      ],
+      [
+        agentRecord({ paneId: "p-child" }),
+        agentRecord({ paneId: "p-successor", agentName: "successor", session: { ...successorSession } }),
+      ],
+    );
+    const report = await reattachDaemonRuns(deps(fx, { supervision: supervision.coordinator, snapshot: async () => snap }));
+
+    expect(report.runs).toEqual([expect.objectContaining({ runId, disposition: "bound" })]);
+    // The bound supervisor's hint destination and D5 owner both ride the
+    // current owner: its session and the pane the snapshot proves carries it.
+    expect(supervision.reservations[0]!.binding?.handoff?.owner).toEqual({ paneId: "p-successor", session: successorSession });
+    // The downtime gap lands in the successor's mailbox, not the recorder's.
+    expect(report.gaps).toEqual([expect.objectContaining({ managerSessionKey: managerSessionKey(successorSession), persisted: true })]);
+    expect(await fx.mailbox.list(managerSessionKey(successorSession))).toHaveLength(1);
   });
 
   it("records identity_lost for a provably absent child and writes no terminal state", async () => {

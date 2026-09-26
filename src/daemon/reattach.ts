@@ -40,7 +40,7 @@ import {
   type HandoffState,
 } from "../handoff.js";
 import type { JobRegistry, SupervisionWorkspaceRoot } from "../job-registry.js";
-import { requirePromptTargetIdentity, type AgentSessionIdentity } from "../messages/prompt.js";
+import { optionalSessionCandidate, requirePromptTargetIdentity, type AgentSessionIdentity } from "../messages/prompt.js";
 import { snapshotIdentityRecords } from "../messages/prompt-target.js";
 import { modelSafeJson } from "../redaction.js";
 import type { SupervisedIdentity } from "../supervision/identity.js";
@@ -264,13 +264,40 @@ export interface MatchedRunBindDeps {
 }
 
 /**
+ * The v2 current owner's hint destination: the live pane the fresh snapshot
+ * proves carries that session — never the launch record's manager pane, which
+ * a transfer or claim leaves behind. An owner absent from the snapshot keeps
+ * the recorded pane as the binding destination; the hint sink re-verifies the
+ * pane's session before every prompt, and D5 pauses on the session either way.
+ */
+function ownerDestination(provenance: HandoffProvenance, snapshot: HerdrSnapshot | undefined): { paneId: string; session: AgentSessionIdentity | null } {
+  const session = currentHandoffOwner(provenance);
+  if (session !== null && snapshot !== undefined) {
+    for (const pane of snapshot.panes) {
+      let candidate: AgentSessionIdentity | undefined;
+      try {
+        candidate = optionalSessionCandidate([pane, ...snapshot.agents.filter((agent) => agent.pane_id === pane.pane_id)]);
+      } catch {
+        // A pane whose records prove nothing is skipped, never counted.
+        continue;
+      }
+      if (candidate !== undefined && sameSession(candidate, session)) {
+        return { paneId: pane.pane_id, session };
+      }
+    }
+  }
+  return { paneId: provenance.manager.paneId, session };
+}
+
+/**
  * The live-bind sequence the D4 restart sweep and the §8 reconcile share: a
  * `recovery_pending` run resets to `awaiting_handoff` on exact-match proof,
  * supervision reserves with the run's recorded digest, workspace root, and
- * review-log root, and the supervisor binds carrying the run's recorded owner
- * so D5 review pausing follows the session, never the pane. Returns the
- * reservation job ID. A failed bind releases the reservation and rethrows —
- * the caller classifies the child `ambiguous`, never absent.
+ * review-log root, and the supervisor binds carrying the v2 current owner —
+ * session and hint-destination pane — so D5 review pausing follows the
+ * session, never the pane. Returns the reservation job ID. A failed bind
+ * releases the reservation and rethrows — the caller classifies the child
+ * `ambiguous`, never absent.
  */
 export async function bindMatchedRun(
   deps: MatchedRunBindDeps,
@@ -279,6 +306,7 @@ export async function bindMatchedRun(
   provenance: HandoffProvenance | undefined,
   identity: SupervisedIdentity,
   reviewLogRoot: string,
+  snapshot?: HerdrSnapshot,
 ): Promise<string> {
   // A prior host left this run recovery_pending at shutdown; the exact match
   // is proof enough to supervise it again, so the run returns to
@@ -310,7 +338,7 @@ export async function bindMatchedRun(
       handoff: {
         allocation: run,
         ...(state.child.agentId === null ? {} : { agentId: state.child.agentId }),
-        ...(provenance === undefined ? {} : { owner: { paneId: provenance.manager.paneId, session: currentHandoffOwner(provenance) } }),
+        ...(provenance === undefined ? {} : { owner: ownerDestination(provenance, snapshot) }),
       },
     });
   } catch (error) {
@@ -446,7 +474,7 @@ export async function reattachDaemonRuns(deps: ReattachDeps): Promise<ReattachRe
       continue;
     }
     try {
-      report.jobId = await bindMatchedRun(deps, run, state, provenance, identity, reviewLogRoot);
+      report.jobId = await bindMatchedRun(deps, run, state, provenance, identity, reviewLogRoot, snapshot);
       report.disposition = "bound";
       if (ownerKey !== undefined) affected.add(ownerKey);
     } catch (error) {

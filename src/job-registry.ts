@@ -732,6 +732,7 @@ function boundedSupervision(view: SupervisionJobView, truncation: JobTruncation)
       degraded: view.reviewer.degraded,
       reviews,
       truncatedReviews: view.reviewer.truncatedReviews + omittedReviews,
+      ...(view.reviewer.paused === true ? { paused: true } : {}),
       ...(view.reviewer.lastReviewAtMs === undefined ? {} : { lastReviewAtMs: view.reviewer.lastReviewAtMs })
     },
     transitions,

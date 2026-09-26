@@ -39,7 +39,7 @@ import { handleDaemonStatus } from "./handlers/status.js";
 import { createIdleHints, type IdleHintSink } from "./hints.js";
 import { createIntentStore, managerSessionKey, type IntentStore } from "./intents.js";
 import { createOwnership } from "./ownership.js";
-import type { Mailbox } from "./mailbox.js";
+import type { Mailbox, MailboxEventWriter } from "./mailbox.js";
 import type { DaemonNamespace } from "./namespace.js";
 import { DaemonRequestError } from "./protocol.js";
 import type { DaemonRequestHandler } from "./server.js";
@@ -180,6 +180,8 @@ export interface DaemonRuntime extends SharedRuntime {
   daemonOwnership: DaemonOwnership;
   /** The §11 idle-hint sink the runtime forwarded to its supervision registry. */
   hints: IdleHintSink;
+  /** The N2.2 run-event writer — the bound mailbox, resolved lazily per call. */
+  readonly eventWriter: MailboxEventWriter;
   /**
    * In-flight launch executions keyed `<managerSessionKey>/<idempotencyKey>`:
    * a second caller that `begin`s a still-`recorded` intent waits for the live
@@ -206,6 +208,11 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     list: (key) => mailbox().list(key),
     withMailboxes: (keys, section) => mailbox().withMailboxes(keys, section),
   };
+  // The N2.2 writer launch reservations and job terminals persist through —
+  // the same bound mailbox the reattach path injects, resolved at call time.
+  const deferredEventWriter: MailboxEventWriter = {
+    writeRunEvent: (input) => mailbox().writeRunEvent(input),
+  };
   // The wire seam runs synchronously inside `createSharedRuntime` and always
   // reassigns `hints` before `sink` below can be invoked; the initializer only
   // satisfies definite assignment.
@@ -223,7 +230,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
         namespace: deps.namespace,
         qualifiedKinds: deps.hintKinds,
       });
-      return { ...host, hints };
+      return { ...host, jobs: host.jobs ?? new JobRegistry({ eventWriter: deferredEventWriter }), hints };
     },
   });
   const intents = deps.intents ?? createIntentStore({ namespace: deps.namespace });
@@ -254,6 +261,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     },
     daemonOwnership: ownership,
     hints: sink,
+    eventWriter: deferredEventWriter,
     ...(deps.launchDeps === undefined ? {} : { launchDeps: deps.launchDeps }),
     inflight: new Map(),
   };

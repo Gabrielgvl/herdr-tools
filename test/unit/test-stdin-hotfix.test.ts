@@ -33,7 +33,7 @@ function validReceipt(): Record<string, unknown> {
     status: "passed",
     actualExitCode: 0,
     mandatoryCases: [...HOTFIX_MANDATORY_CASES],
-    toolSmoke: ["herdr_inspect", "herdr_communicate", "herdr_wait", "herdr_jobs", "herdr_launch", "herdr_pane", "herdr_tab"],
+    toolSmoke: ["herdr_launch", "herdr_run", "herdr_status"],
     mcpPollingDifference: "bounded polling",
     receipts
   };

@@ -1,14 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import extension, { CORE_TOOL_NAMES } from "../../index.js";
+import extension, { createPreflight, createRuntime, type ExtensionRuntime } from "../../index.js";
+import { createContextResolver } from "../../src/context.js";
+import { createCommunicateTool } from "../../src/tools/communicate.js";
+import { createInspectTool } from "../../src/tools/inspect.js";
+import { createJobsTool } from "../../src/tools/jobs.js";
+import { createLaunchTool } from "../../src/tools/launch.js";
+import { createPaneTool } from "../../src/tools/pane.js";
+import { createTabTool } from "../../src/tools/tab.js";
+import { createWaitTool } from "../../src/tools/wait.js";
 import { HOTFIX_HOST_FILES, HOTFIX_LABEL, HOTFIX_MANDATORY_CASES, REQUIRED_SESSION } from "../../scripts/test-stdin-hotfix.js";
-import { startDisposableSocketProxy, stopDisposableServer, waitForCondition, type DisposableSocketProxy, type PromptSocketRequest } from "../integration/disposable-session.js";
+import { createDisposableGitWorkspace, startDisposableSocketProxy, stopDisposableServer, waitForCondition, type DisposableSocketProxy, type PromptSocketRequest } from "../integration/disposable-session.js";
 
 interface ExecutableTool {
   name: string;
@@ -60,6 +67,10 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     proxy?: DisposableSocketProxy;
     baseline?: { workspaces: string[]; tabs: string[]; panes: string[] };
     registered: Map<string, ExecutableTool>;
+    /** The harness-composed tool surface: built in beforeAll, never through the Pi host (C7). */
+    harnessTools: Map<string, ExecutableTool>;
+    /** The harness runtime the composed tools bind to; torn down in afterAll. */
+    runtime?: ExtensionRuntime;
     commands: string[];
     handlers: string[];
     cliCalls: string[][];
@@ -75,7 +86,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     preserve: boolean;
     savedSocket?: string;
   } = {
-    cwd: "", serverStarted: false, sessionCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], cliExitCodes: [], commandExitCodes: [], toolCalls: [], confirmedPanes: [], attachmentPaths: [], provenReceipts: [], preserve: false
+    cwd: "", serverStarted: false, sessionCreated: false, registered: new Map(), harnessTools: new Map(), commands: [], handlers: [], cliCalls: [], cliExitCodes: [], commandExitCodes: [], toolCalls: [], confirmedPanes: [], attachmentPaths: [], provenReceipts: [], preserve: false
   };
 
   const signal = () => new AbortController().signal;
@@ -88,8 +99,8 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
   const runNamed = (args: string[]) => run("--session", REQUIRED_SESSION, ...args);
 
   const tool = (name: string): ExecutableTool => {
-    const found = state.registered.get(name);
-    if (!found) throw new Error(`Pi hotfix harness did not register ${name}`);
+    const found = state.harnessTools.get(name);
+    if (!found) throw new Error(`Pi hotfix harness did not compose ${name}`);
     return {
       name,
       execute(id, params, abortSignal, onUpdate, toolContext) {
@@ -256,7 +267,9 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     if (requestedSession !== REQUIRED_SESSION) throw new Error(`hotfix session must be ${REQUIRED_SESSION}`);
     if (process.env.HERDR_ENV !== "1") throw new Error("Pi hotfix requires HERDR_ENV=1");
     if (![process.env.HERDR_WORKSPACE_ID, process.env.HERDR_TAB_ID, process.env.HERDR_PANE_ID].every(Boolean)) throw new Error("Pi hotfix requires an injected caller identity");
-    state.cwd = await mkdtemp(join(tmpdir(), `herdr-tools-hotfix-pi-${process.pid}-`));
+    // The durable supervisor pins a git workspace base at launch, so the
+    // disposable cwd must be a repository with a resolvable HEAD.
+    state.cwd = await createDisposableGitWorkspace("herdr-tools-hotfix-pi-");
     const sessions = record(await run("session", "list", "--json"));
     if (Array.isArray(sessions.sessions) && sessions.sessions.some((item) => record(item).name === REQUIRED_SESSION)) throw new Error(`refusing to reuse existing session ${REQUIRED_SESSION}`);
 
@@ -289,7 +302,40 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     state.rootPaneId = root.pane_id;
     state.rootTabId = root.tab_id;
 
+    const pi = {
+      async exec(command: string, args: string[], options?: { signal?: AbortSignal; timeout?: number }) {
+        if (command !== "herdr") throw new Error(`unexpected Pi command ${command}`);
+        state.cliCalls.push([...args]);
+        try {
+          const result = await execFileAsync(command, ["--session", REQUIRED_SESSION, ...args], {
+            cwd: state.cwd,
+            env: { ...process.env, HERDR_ENV: "1", HERDR_WORKSPACE_ID: state.workspaceId, HERDR_TAB_ID: state.rootTabId, HERDR_PANE_ID: state.rootPaneId },
+            encoding: "utf8", maxBuffer: 4_000_000, signal: options?.signal, timeout: options?.timeout
+          });
+          state.cliExitCodes.push(0);
+          state.commandExitCodes.push(0);
+          return { stdout: String(result.stdout), stderr: String(result.stderr), code: 0, killed: false };
+        } catch (error) {
+          const failed = error as Error & { stdout?: string | Buffer; stderr?: string | Buffer; code?: number | string; killed?: boolean };
+          // An aborted exec has no exit code (execFile reports ABORT_ERR);
+          // the durable supervisor's bounded read windows abort by design.
+          // The ledgers count real process exits only — the call itself is
+          // still recorded in cliCalls for the --stdin check.
+          if (typeof failed.code === "number") {
+            state.cliExitCodes.push(failed.code);
+            state.commandExitCodes.push(failed.code);
+          }
+          return { stdout: String(failed.stdout ?? ""), stderr: String(failed.stderr ?? failed.message), code: typeof failed.code === "number" ? failed.code : 1, killed: failed.killed ?? false };
+        }
+      },
+      registerTool(registered: unknown) { const value = registered as ExecutableTool; state.registered.set(value.name, value); },
+      registerCommand(name: string) { state.commands.push(name); },
+      on(event: string) { state.handlers.push(event); }
+    } as unknown as ExtensionAPI;
+
     const saved = { HERDR_ENV: process.env.HERDR_ENV, HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID, HERDR_TAB_ID: process.env.HERDR_TAB_ID, HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH };
+    const savedCwd = process.cwd();
+    process.chdir(state.cwd);
     process.env.HERDR_ENV = "1";
     process.env.HERDR_WORKSPACE_ID = state.workspaceId;
     process.env.HERDR_TAB_ID = state.rootTabId;
@@ -297,7 +343,30 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     process.env.HERDR_SOCKET_PATH = state.proxy.path;
     try {
       extension();
+      // The extension is a no-op by contract (C7 + the executor→MCP
+      // amendment): Pi registers nothing and reaches the three daemon tools
+      // through the executor gateway. This suite is a harness, not the Pi
+      // host — it composes the same shared runtime the daemon serves and
+      // builds its tool surface directly, so every assertion below exercises
+      // the production launch/supervision pipeline without Pi registration.
+      const runtime = createRuntime(pi);
+      state.runtime = runtime;
+      const contextResolver = createContextResolver(runtime.cli, runtime.context);
+      const preflight = createPreflight(runtime.cli);
+      const environment = { enabled: true, currentIdsPresent: runtime.idsPresent, currentIdsValid: runtime.idsValid };
+      for (const definition of [
+        createInspectTool({ cli: runtime.cli, context: runtime.context, contextResolver, environment, profiles: runtime.profiles, handoffs: runtime.handoffs }),
+        createCommunicateTool({ cli: runtime.cli, context: runtime.context, contextResolver, preflight, queueFlush: runtime.queueFlush, attachments: runtime.attachments, recipients: runtime.recipients }),
+        createWaitTool({ cli: runtime.cli, context: runtime.context, contextResolver, settingsLoader: runtime.settings.load, jobRegistry: runtime.jobs, handoffs: runtime.handoffs }),
+        createJobsTool(runtime.jobs),
+        createLaunchTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight, supervision: runtime.supervision, queueFlush: runtime.queueFlush, attachments: runtime.attachments, recipients: runtime.recipients }),
+        createPaneTool({ cli: runtime.cli, context: runtime.context, contextResolver, preflight, cwd: state.cwd, ownership: runtime.ownership }),
+        createTabTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight }),
+      ]) {
+        state.harnessTools.set(definition.name, definition as unknown as ExecutableTool);
+      }
     } finally {
+      process.chdir(savedCwd);
       for (const key of ["HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"] as const) {
         const value = saved[key];
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -308,6 +377,12 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
 
   afterAll(async () => {
     if (state.savedSocket === undefined) delete process.env.HERDR_SOCKET_PATH; else process.env.HERDR_SOCKET_PATH = state.savedSocket;
+    if (state.runtime !== undefined) {
+      await state.runtime.supervision.shutdown();
+      state.runtime.jobs.shutdown();
+      await state.runtime.queueFlush.shutdown();
+      state.runtime.cli.closePromptTransport();
+    }
     if (state.preserve) {
       process.stderr.write(`${HOTFIX_LABEL} Pi host failure retained session=${REQUIRED_SESSION} evidence=${EVIDENCE_DIR ?? "unset"}\n`);
       state.server?.stderr?.removeAllListeners();
@@ -345,9 +420,15 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
 
   it(`${HOTFIX_LABEL} executes the Pi host matrix with exact socket receipts`, async () => {
     try {
-      expect([...state.registered.keys()]).toEqual([...CORE_TOOL_NAMES]);
-      expect(state.commands).toEqual(["herdr-waits"]);
-      expect(state.handlers).toEqual(["session_shutdown", "session_start"]);
+      // C7 + the executor→MCP amendment (durable-supervisor §10): the Pi
+      // extension registers nothing — no tools, no commands, no session
+      // handlers. The three daemon tools reach Pi through the executor
+      // gateway; the tools this suite exercises are the harness-composed
+      // surface built from the same shared runtime the daemon serves.
+      expect([...state.registered.keys()]).toEqual([]);
+      expect(state.commands).toEqual([]);
+      expect(state.handlers).toEqual([]);
+      expect([...state.harnessTools.values()].every((composed) => typeof composed.execute === "function")).toBe(true);
       expect(HOTFIX_HOST_FILES).toHaveLength(2);
 
       await call("herdr_inspect", { mode: "health" });
@@ -403,7 +484,10 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       const steer = await call("herdr_launch", {
         objective: `Use Bash to run the bounded condition command timeout 90s bash -c 'IFS= read -r gate < ${steerGatePath} && test "$gate" = "${steerGateToken}"' in the foreground. Do not use sleep. Remain in this turn until that condition exits, then remain ready for the subsequent steer instruction. Do not write a body or send a final response before the steer.`,
         scope: `Read only ${steerGatePath}; write only ${steerPath} and ${steerPath}.exit; do not change any other resource.`,
-        doneWhen: ["The bounded gate remains pending until the subsequent steer instruction."],
+        // ADR-037 quality gate: doneWhen must name falsifiable evidence —
+        // "stays pending" is rejected as unverifiable, so name the checkable
+        // facts (no reply sent, no body file) instead.
+        doneWhen: [`The turn stays open on the bounded gate: the recipient sends no reply and ${steerPath} does not exist before the follow-up steer instruction.`],
         constraints: ["none"],
         label: `hotfix-pi-steer-${process.pid}`
       });
@@ -523,7 +607,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
         status: "passed",
         actualExitCode: 0,
         mandatoryCases: [...HOTFIX_MANDATORY_CASES],
-        toolSmoke: [...CORE_TOOL_NAMES],
+        toolSmoke: [...state.harnessTools.keys()],
         mcpPollingDifference: "Pi uses the extension's wait-job notification/UI path; this gate still polls herdr_jobs for a deterministic receipt.",
         receipts,
         socketRequests: state.proxy!.requests.length,

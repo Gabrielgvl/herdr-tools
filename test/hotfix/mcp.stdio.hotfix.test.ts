@@ -1,27 +1,31 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createAgentPromptClient, type AgentPromptClient } from "../../src/agent-prompt.js";
 import { CORE_TOOL_NAMES } from "../../src/tool-surface.js";
 import { HOTFIX_HOST_FILES, HOTFIX_LABEL, HOTFIX_MANDATORY_CASES, REQUIRED_SESSION } from "../../scripts/test-stdin-hotfix.js";
-import { startDisposableSocketProxy, stopDisposableServer, waitForCondition, type DisposableSocketProxy, type PromptSocketRequest } from "../integration/disposable-session.js";
+import { createDisposableGitWorkspace, startDisposableSocketProxy, stopDisposableServer, waitForCondition, type DisposableSocketProxy, type PromptSocketRequest } from "../integration/disposable-session.js";
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
 
 const execFileAsync = promisify(execFile);
 const enabled = process.env.HERDR_TOOLS_HOTFIX === "1";
+// The env-selected disposable session (HERDR_TOOLS_INTEGRATION_SESSION) keeps
+// parallel hotfix runs isolated; unset falls back to the contract default.
 const requestedSession = process.env.HERDR_TOOLS_INTEGRATION_SESSION ?? REQUIRED_SESSION;
 const EVIDENCE_DIR = process.env.HERDR_TOOLS_HOTFIX_EVIDENCE_DIR;
 const LIVE_TIMEOUT_MS = 120_000;
+const CALL_TIMEOUT_MS = 600_000;
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const serverEntry = join(repoRoot, "dist/src/mcp-server.js");
+const daemonEntry = join(repoRoot, "dist/src/daemon/main.js");
 
 function record(value: unknown, label = "value"): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${label} is not an object`);
@@ -61,6 +65,8 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     cwd: string;
     server?: ChildProcess;
     serverStarted: boolean;
+    daemon?: ChildProcess;
+    daemonStderr: string;
     workspaceId?: string;
     rootPaneId?: string;
     rootTabId?: string;
@@ -68,6 +74,8 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     proxy?: DisposableSocketProxy;
     client?: Client;
     transport?: StdioClientTransport;
+    /** The C8 follow-up transport (the `herdr agent prompt` socket write), routed through the recording proxy. */
+    prompts?: AgentPromptClient;
     commandExitCodes: number[];
     confirmedPanes: string[];
     attachmentPaths: string[];
@@ -76,7 +84,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     lastJoinedIdentity?: Record<string, unknown>;
     receipt?: Record<string, unknown>;
     preserve: boolean;
-  } = { cwd: "", serverStarted: false, commandExitCodes: [], confirmedPanes: [], attachmentPaths: [], provenReceipts: [], preserve: false };
+  } = { cwd: "", serverStarted: false, daemonStderr: "", commandExitCodes: [], confirmedPanes: [], attachmentPaths: [], provenReceipts: [], preserve: false };
 
   const run = async (...args: string[]): Promise<unknown> => {
     try {
@@ -84,16 +92,32 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
       state.commandExitCodes.push(0);
       return JSON.parse(String(result.stdout));
     } catch (error) {
-      const failed = error as Error & { code?: number };
-      state.commandExitCodes.push(typeof failed.code === "number" ? failed.code : 1);
+      const failed = error as Error & { code?: unknown };
+      // An aborted exec has no exit code (execFile reports ABORT_ERR, not a
+      // number); the ledgers count real process exits only.
+      if (typeof failed.code === "number") state.commandExitCodes.push(failed.code);
       throw error;
     }
   };
-  const runNamed = (args: string[]) => run("--session", REQUIRED_SESSION, ...args);
+  const runNamed = (args: string[]) => run("--session", requestedSession, ...args);
+
+  const runText = async (args: string[]): Promise<string> => {
+    try {
+      const result = await execFileAsync("herdr", args, { cwd: state.cwd, env: envWithoutInjected(), maxBuffer: 4_000_000 });
+      state.commandExitCodes.push(0);
+      return String(result.stdout);
+    } catch (error) {
+      const failed = error as Error & { code?: unknown };
+      if (typeof failed.code === "number") state.commandExitCodes.push(failed.code);
+      throw error;
+    }
+  };
+  const runTextNamed = (args: string[]) => runText(["--session", requestedSession, ...args]);
+  const paneRead = (paneId: string) => runTextNamed(["pane", "read", "--lines", "400", paneId]);
 
   const rawCall = async (name: string, args: Record<string, unknown>): Promise<ToolResult> => {
     if (!state.client) throw new Error("MCP client is not connected");
-    const result = await state.client.callTool({ name, arguments: args }) as ToolResult;
+    const result = await state.client.callTool({ name, arguments: args }, undefined, { timeout: CALL_TIMEOUT_MS, maxTotalTimeout: CALL_TIMEOUT_MS }) as ToolResult;
     return result;
   };
   const call = async (name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
@@ -102,25 +126,77 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     return evidence(result);
   };
 
-  /** The launched child of a uniform `herdr_launch` result, or a hard failure. */
+  /** The launched child of an intent-gated `herdr_launch` reply, or a hard failure. */
   const launchedChildOf = (launch: Record<string, unknown>, label: string): Record<string, unknown> => {
-    const children = Array.isArray(launch.children) ? launch.children : [];
-    if (launch.kind !== "launch" || launch.outcome !== "launched" || children.length !== 1) throw new Error(`${label} did not return one launched child`);
-    const child = record(children[0], `${label} child`);
+    if (launch.kind !== "launch" || launch.state !== "completed") throw new Error(`${label} launch intent did not complete`);
+    const result = record(launch.result, `${label} result`);
+    const launched = Array.isArray(result.children) ? result.children : [];
+    const recorded = Array.isArray(launch.children) ? launch.children : [];
+    if (result.outcome !== "launched" || launched.length !== 1 || recorded.length !== 1) throw new Error(`${label} did not return one launched child`);
+    const child = record(launched[0], `${label} child`);
     if (child.state !== "launched" || typeof child.supervisorJobId !== "string" || typeof child.operatingPointId !== "string") throw new Error(`${label} child was not launched under supervision`);
+    const intent = record(recorded[0], `${label} intent child`);
+    if (typeof intent.runId !== "string" || intent.runId.length === 0) throw new Error(`${label} intent omitted the child run ID`);
+    return { ...child, runId: intent.runId };
+  };
+
+  /**
+   * The caller's read-only status projection: `runs[]` carries each run's
+   * presence-verified child pane and live agent status. This is the surface's
+   * live-state read — `herdr_run` `observe` additionally verifies the retained
+   * artifact digest, so it legitimately refuses while a child rewrites its
+   * own handoff mid-turn.
+   */
+  const statusChild = async (runId: string, label: string): Promise<Record<string, unknown>> => {
+    const status = await call("herdr_status", {});
+    const run = (Array.isArray(status.runs) ? status.runs : []).map((item) => record(item)).find((item) => item.runId === runId);
+    if (!run) throw new Error(`${label} run is absent from the status projection`);
+    const child = record(run.child ?? {}, `${label} status child`);
+    if (child.presence !== "present" || typeof child.paneId !== "string") throw new Error(`${label} child is not present in the status projection`);
     return child;
   };
 
-  /** The runtime-minted child target resolves to its pane only through the supervisor job. */
-  const supervisedPaneId = async (supervisorJobId: string, label: string): Promise<string> => {
-    const job = await call("herdr_jobs", { operation: "get", jobId: supervisorJobId });
-    const supervision = record(job.supervision ?? {}, `${label} supervision`);
-    for (const slot of ["child", "provisional"]) {
-      const candidate = supervision[slot];
-      const paneId = typeof candidate === "object" && candidate !== null ? record(candidate, `${label} ${slot}`).paneId : undefined;
-      if (typeof paneId === "string" && paneId.length > 0) return paneId;
-    }
-    throw new Error(`${label} supervisor carried no child pane identity`);
+  const waitStatusChild = async (runId: string, label: string): Promise<Record<string, unknown>> => {
+    const found = await waitForCondition(
+      async () => statusChild(runId, label).catch(() => undefined),
+      (value) => value !== undefined,
+      30_000,
+      250
+    );
+    if (!found) throw new Error(`${label} child never appeared in the status projection`);
+    return found;
+  };
+
+  const waitStatusState = async (runId: string, states: readonly string[], timeoutMs: number, label: string): Promise<Record<string, unknown>> => {
+    const found = await waitForCondition(
+      async () => statusChild(runId, label).then((child) => (states.includes(String(child.agentStatus)) ? child : undefined)).catch(() => undefined),
+      (value) => value !== undefined,
+      timeoutMs,
+      250
+    );
+    if (!found) throw new Error(`${label} child never reached ${states.join("/")}`);
+    return found;
+  };
+
+  /**
+   * `herdr_run` `observe` on a settled run: the artifact digest is stable once
+   * the child's own write has been recorded, so the provenance-verified
+   * observation is read after completion rather than raced against mid-turn
+   * artifact rewrites.
+   */
+  const observeChild = async (runId: string, label: string): Promise<Record<string, unknown>> => {
+    const reply = await call("herdr_run", { action: "observe", runId });
+    const observation = record(reply.observation, `${label} observation`);
+    if (observation.observationOnly !== true || observation.supervisionRestored !== false || observation.replayed !== false || observation.ownershipTransferred !== false) throw new Error(`${label} observation reported mutation`);
+    const child = record(observation.currentChild ?? {}, `${label} current child`);
+    if (child.presence !== "present" || typeof child.paneId !== "string") throw new Error(`${label} child is not present in the run observation`);
+    return child;
+  };
+
+  /** The recipient's authoritative joined identity at delivery time. */
+  const expectedIdentityOf = async (paneId: string, expectedKind: string, label: string): Promise<Record<string, unknown>> => {
+    const live = record(record(await runNamed(["agent", "get", paneId])).result);
+    return joinedIdentity(record(live.agent ?? live), paneId, expectedKind, `${label} expected identity`);
   };
 
   /** The runner the router actually selected for a launched child. */
@@ -168,19 +244,19 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     return joinedIdentity(completed, paneId, expectedKind, label, expected);
   };
 
+  /**
+   * The retired detached-wait surface has no daemon-proxy operation, so the
+   * reply proof polls the pane's rendered output for the literal body, then
+   * the authoritative `agent get` completion.
+   */
   const waitForBody = async (paneId: string, body: string, expectedKind: string, expected: Record<string, unknown>, label: string): Promise<Record<string, unknown>> => {
-    const waiting = await call("herdr_wait", {
-      targets: [paneId], match: "any", condition: { kind: "output", match: { kind: "literal", value: body } }, timeoutMs: LIVE_TIMEOUT_MS, label
-    });
-    const jobId = waiting.jobId;
-    if (typeof jobId !== "string") throw new Error(`${label} omitted its wait job ID`);
-    const settled = await waitForCondition(
-      async () => call("herdr_jobs", { operation: "get", jobId }),
-      (job) => job?.operation_phase === "settled",
+    const rendered = await waitForCondition(
+      async () => paneRead(paneId).catch(() => ""),
+      (text) => text.includes(body),
       LIVE_TIMEOUT_MS,
-      100
+      500
     );
-    expect(settled).toMatchObject({ operation_phase: "settled", wait_result: "condition_met", result: { matched: true } });
+    if (rendered === undefined || !rendered.includes(body)) throw new Error(`${label} reply body never appeared in pane output`);
     return waitForRecipientCompletion(paneId, expectedKind, expected, label);
   };
 
@@ -205,8 +281,9 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
 
   const receipt = (caseName: string, details: Record<string, unknown>, request: PromptSocketRequest, completion: Record<string, unknown>, expected: string, observed: string, actualCommandExitCode: number, extra: Record<string, unknown> = {}): Record<string, unknown> => {
     if (request.method !== "agent.prompt" || typeof request.id !== "string") throw new Error(`${caseName} did not produce exactly one socket request`);
-    // The uniform launch result publishes no dispatch block; where a surface
-    // still publishes one (communicate), the socket request must match it.
+    // The daemon launch reply publishes no dispatch block; where a surface
+    // still carries one (the prompt transport's correlated id), the socket
+    // request must match it.
     if (details.promptDispatch !== undefined) {
       const dispatch = record(details.promptDispatch, `${caseName} prompt dispatch`);
       if (dispatch.requestId !== request.id) throw new Error(`${caseName} socket request does not match the tool request ID`);
@@ -216,7 +293,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
       effect: "confirmed",
       source: "recipient-generated",
       observedBodySource: "recipient-body-file",
-      session: REQUIRED_SESSION,
+      session: requestedSession,
       expectedBodyBytes: Buffer.byteLength(expected, "utf8"),
       observedBodyBytes: Buffer.byteLength(observed, "utf8"),
       expectedBodySha256: digest(expected),
@@ -231,7 +308,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
 
   const saveProvenReceipt = async (proven: Record<string, unknown>): Promise<void> => {
     state.provenReceipts.push(proven);
-    if (EVIDENCE_DIR) await writeFile(join(EVIDENCE_DIR, "mcp.partial.json"), `${JSON.stringify({ label: HOTFIX_LABEL, host: "mcp", status: "blocked", actualExitCode: 1, session: REQUIRED_SESSION, receipts: state.provenReceipts }, null, 2)}\n`);
+    if (EVIDENCE_DIR) await writeFile(join(EVIDENCE_DIR, "mcp.partial.json"), `${JSON.stringify({ label: HOTFIX_LABEL, host: "mcp", status: "blocked", actualExitCode: 1, session: requestedSession, receipts: state.provenReceipts }, null, 2)}\n`);
   };
 
   const assertOneRequest = (before: number, label: string): PromptSocketRequest => {
@@ -242,22 +319,46 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     return request;
   };
 
+  /**
+   * Follow-up delivery on the new contract is the `agent prompt` recipe, not a
+   * tool call: the same `agent.prompt` socket write the CLI issues, sent here
+   * through the prompt transport the daemon itself uses so the disposable
+   * proxy still proves exactly one request.
+   */
+  const prompt = async (paneId: string, text: string, label: string): Promise<{ request: PromptSocketRequest; details: Record<string, unknown> }> => {
+    const before = state.proxy!.requests.length;
+    const envelope = await state.prompts!.prompt(paneId, text, new AbortController().signal);
+    const result = record(envelope.result ?? {}, `${label} prompt result`);
+    if (result.type !== "agent_prompted") throw new Error(`${label} prompt was not acknowledged`);
+    const request = assertOneRequest(before, label);
+    if (request.id !== envelope.id) throw new Error(`${label} socket request does not match the prompt request ID`);
+    return { request, details: { promptDispatch: { state: "acknowledged", requestId: envelope.id } } };
+  };
+
+  const closePane = async (paneId: string, label: string): Promise<void> => {
+    if (typeof paneId !== "string" || paneId.length === 0) throw new Error(`${label} omitted pane ID`);
+    await runNamed(["pane", "close", paneId]);
+    state.confirmedPanes = state.confirmedPanes.filter((value) => value !== paneId);
+  };
+
   beforeAll(async () => {
-    if (requestedSession !== REQUIRED_SESSION) throw new Error(`hotfix session must be ${REQUIRED_SESSION}`);
     if (process.env.HERDR_ENV !== "1") throw new Error("MCP hotfix requires HERDR_ENV=1");
     if (![process.env.HERDR_WORKSPACE_ID, process.env.HERDR_TAB_ID, process.env.HERDR_PANE_ID].every(Boolean)) throw new Error("MCP hotfix requires an injected caller identity");
     if (!existsSync(serverEntry)) throw new Error(`built MCP entry is missing: ${serverEntry}`);
-    state.cwd = await mkdtemp(join(tmpdir(), `herdr-tools-hotfix-mcp-${process.pid}-`));
+    if (!existsSync(daemonEntry)) throw new Error(`built daemon entry is missing: ${daemonEntry}`);
+    // The durable supervisor pins a git workspace base at launch, so the
+    // disposable cwd must be a repository with a resolvable HEAD.
+    state.cwd = await createDisposableGitWorkspace("herdr-tools-hotfix-mcp-");
     const sessions = record(await run("session", "list", "--json"));
-    if (Array.isArray(sessions.sessions) && sessions.sessions.some((item) => record(item).name === REQUIRED_SESSION)) throw new Error(`refusing to reuse existing session ${REQUIRED_SESSION}`);
-    state.server = spawn("herdr", ["--session", REQUIRED_SESSION, "server"], { cwd: state.cwd, stdio: ["ignore", "ignore", "pipe"] });
+    if (Array.isArray(sessions.sessions) && sessions.sessions.some((item) => record(item).name === requestedSession)) throw new Error(`refusing to reuse existing session ${requestedSession}`);
+    state.server = spawn("herdr", ["--session", requestedSession, "server"], { cwd: state.cwd, stdio: ["ignore", "ignore", "pipe"] });
     let startupError = "";
     state.server.stderr?.on("data", (chunk: Buffer) => { startupError = (startupError + chunk.toString()).slice(-2_000); });
     const started = await waitForCondition(
       async () => {
         if (state.server?.exitCode !== null) throw new Error(`named Herdr server exited during startup: ${startupError}`);
         const listed = record(await run("session", "list", "--json"));
-        return Array.isArray(listed.sessions) ? listed.sessions.map((item) => record(item)).find((item) => item.name === REQUIRED_SESSION && item.running === true) : undefined;
+        return Array.isArray(listed.sessions) ? listed.sessions.map((item) => record(item)).find((item) => item.name === requestedSession && item.running === true) : undefined;
       },
       (value) => value !== undefined,
       10_000,
@@ -268,6 +369,33 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     state.socketPath = started.socket_path;
     state.proxy = await startDisposableSocketProxy(state.socketPath, join(state.cwd, "herdr-prompt.sock"));
 
+    // The three tools are stateless daemon proxies: a bare `herdr server`
+    // does not serve them, so the suite runs the stock daemon entrypoint
+    // against the same endpoint (the canary disposable-daemon pattern — the
+    // production wiring, no hint kinds). Its traffic rides the proxy so
+    // launch prompt deliveries stay countable.
+    state.daemon = spawn(process.execPath, [daemonEntry], {
+      cwd: state.cwd,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+        HERDR_ENV: "1",
+        HERDR_SOCKET_PATH: state.proxy.path
+      },
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+    state.daemon.stderr?.on("data", (chunk: Buffer) => { state.daemonStderr = (state.daemonStderr + chunk.toString()).slice(-8_000); });
+    const listening = await waitForCondition(
+      async () => {
+        if (state.daemon !== undefined && state.daemon.exitCode !== null) throw new Error(`disposable daemon exited during startup: ${state.daemonStderr}`);
+        return state.daemonStderr.includes("listening on") ? true : undefined;
+      },
+      (value) => value === true,
+      30_000,
+      100
+    );
+    if (!listening) throw new Error(`disposable daemon did not bind: ${state.daemonStderr}`);
+
     const created = record(record(await runNamed(["workspace", "create", "--cwd", state.cwd, "--label", `hotfix-mcp-${process.pid}`, "--no-focus"])).result);
     state.workspaceId = String(record(created.workspace ?? created).workspace_id);
     const fixture = record(record(record(await runNamed(["api", "snapshot"])).result).snapshot);
@@ -275,6 +403,17 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     if (!root || typeof root.pane_id !== "string" || typeof root.tab_id !== "string") throw new Error("hotfix fixture omitted its root pane context");
     state.rootPaneId = root.pane_id;
     state.rootTabId = root.tab_id;
+
+    // The daemon's D2a gate requires the claimed caller pane to carry a live
+    // agent session, so the fixture pane runs a real agent as the manager.
+    await runNamed(["agent", "start", "hotfix-mcp-owner", "--kind", "pi", "--pane", state.rootPaneId, "--timeout", "120000"]);
+    const ownerReady = await waitForCondition(
+      async () => record(record(record(await runNamed(["agent", "get", state.rootPaneId!])).result).agent ?? {}),
+      (agent) => (agent.agent_status === "idle" || agent.agent_status === "done") && agent.agent_session != null,
+      120_000,
+      1_000
+    );
+    if (!ownerReady) throw new Error("owner pane never reported a live agent session");
 
     state.transport = new StdioClientTransport({
       command: process.execPath,
@@ -293,22 +432,26 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     });
     state.client = new Client({ name: HOTFIX_LABEL, version: "1.0.0" }, { capabilities: {} });
     await state.client.connect(state.transport);
-  }, 120_000);
+    state.prompts = createAgentPromptClient({ env: { HERDR_SOCKET_PATH: state.proxy.path } });
+  }, 300_000);
 
   afterAll(async () => {
     await state.client?.close().catch(() => undefined);
+    state.prompts?.close?.();
     if (state.preserve) {
-      process.stderr.write(`${HOTFIX_LABEL} MCP host failure retained session=${REQUIRED_SESSION} evidence=${EVIDENCE_DIR ?? "unset"}\n`);
+      process.stderr.write(`${HOTFIX_LABEL} MCP host failure retained session=${requestedSession} evidence=${EVIDENCE_DIR ?? "unset"}\n`);
       await state.proxy?.close();
       state.server?.stderr?.removeAllListeners();
       state.server?.unref();
+      state.daemon?.unref();
     } else {
       for (const paneId of [...state.confirmedPanes]) await runNamed(["pane", "close", paneId]).catch(() => undefined);
       if (state.workspaceId) await runNamed(["workspace", "close", state.workspaceId]).catch(() => undefined);
-      if (state.serverStarted) await run("session", "stop", REQUIRED_SESSION, "--json").catch(() => undefined);
+      await stopDisposableServer(state.daemon);
+      if (state.serverStarted) await run("session", "stop", requestedSession, "--json").catch(() => undefined);
       await stopDisposableServer(state.server);
       await state.proxy?.close();
-      if (state.serverStarted) await run("session", "delete", REQUIRED_SESSION, "--json").catch(() => undefined);
+      if (state.serverStarted) await run("session", "delete", requestedSession, "--json").catch(() => undefined);
       if (state.cwd) await rm(state.cwd, { recursive: true, force: true });
     }
     if (state.preserve && EVIDENCE_DIR) {
@@ -317,14 +460,15 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
         host: "mcp",
         status: "blocked",
         actualExitCode: 1,
-        session: REQUIRED_SESSION,
+        session: requestedSession,
         requests: state.proxy?.requests ?? [],
         receipts: state.provenReceipts,
         ...(state.lastJoinedIdentity ? { lastJoinedIdentity: state.lastJoinedIdentity } : {}),
         confirmedPanes: state.confirmedPanes,
         workspaceId: state.workspaceId,
         rootPaneId: state.rootPaneId,
-        socketPath: state.socketPath
+        socketPath: state.socketPath,
+        daemonStderr: state.daemonStderr.slice(-2_000)
       }, null, 2)}\n`);
     }
     if (state.receipt && EVIDENCE_DIR) await writeFile(join(EVIDENCE_DIR, "mcp.json"), `${JSON.stringify(state.receipt, null, 2)}\n`);
@@ -337,51 +481,73 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
       expect(listed.tools.every((item) => typeof item.inputSchema === "object" && item.inputSchema !== null && (item.inputSchema as { type?: unknown }).type === "object")).toBe(true);
       expect(HOTFIX_HOST_FILES).toHaveLength(2);
 
-      await call("herdr_inspect", { mode: "health" });
-      await call("herdr_inspect", { mode: "collection", collection: "profiles" });
-      const tab = await call("herdr_tab", { operation: "create", label: `${HOTFIX_LABEL}-tab` });
-      expect(typeof tab.tabId).toBe("string");
-      await call("herdr_tab", { operation: "close", target: String(tab.tabId) });
-      const pane = await call("herdr_pane", { operation: "split", target: state.rootPaneId!, direction: "right", label: `${HOTFIX_LABEL}-pane`, focus: false });
-      expect(typeof pane.paneId).toBe("string");
-      await call("herdr_pane", { operation: "close", target: String(pane.paneId) });
-      const invalidKeys = await rawCall("herdr_communicate", { target: state.rootPaneId!, operation: "keys", keys: ["not-a-supported-key"] });
-      expect(invalidKeys.isError).toBe(true);
-       expect(textOf(invalidKeys)).toContain("INVALID_INPUT");
+      // The read-only projection replaces the retired inspect surface:
+      // daemon health, the caller's runs and intents, and the mailbox.
+      const status = await call("herdr_status", {});
+      expect(status.kind).toBe("status");
+      expect(record(status.daemon, "status daemon").status).toBe("running");
+      expect(Array.isArray(status.runs)).toBe(true);
+      expect(Array.isArray(status.intents)).toBe(true);
+      expect(typeof record(status.unread, "status unread").count).toBe("number");
+      expect(typeof status.mailbox).toBe("string");
+
+      // Schema enforcement on the proxy surface replaces the retired keys
+      // rejection: both an unknown run action and a launch missing its
+      // required idempotency key refuse before any daemon call.
+      const invalidRun = await rawCall("herdr_run", { action: "not-a-run-action" });
+      expect(invalidRun.isError).toBe(true);
+      expect(textOf(invalidRun)).toContain("INVALID_INPUT");
+      const missingKey = await rawCall("herdr_launch", { task: { objective: "noop", scope: "noop", doneWhen: ["noop"] } });
+      expect(missingKey.isError).toBe(true);
+      expect(textOf(missingKey)).toContain("INVALID_INPUT");
 
       const piNonce = randomUUID();
       const piBody = `HOTFIX PI COMPLETE BODY ${piNonce}`;
       const piBodyPath = join(state.cwd, `pi-inline-${piNonce}.txt`);
       const piBefore = state.proxy!.requests.length;
-      const pi = await call("herdr_launch", {
-        objective: `Use Bash to write exactly ${piBody} to ${piBodyPath} with no trailing newline, capture that command's exit code, and write the decimal code to ${piBodyPath}.exit before replying with exactly ${piBody}. Remain ready for subsequent normal and attachment prompts.`,
+      const piTask = {
+        objective: `Use Bash to write exactly ${piBody} to ${piBodyPath} with no trailing newline, capture that command's exit code, and write the decimal code to ${piBodyPath}.exit before replying with exactly ${piBody}. Remain ready for subsequent normal prompts.`,
         scope: `Write only ${piBodyPath} and ${piBodyPath}.exit; do not change any other resource.`,
         doneWhen: [`The recipient-generated file ${piBodyPath} contains exactly ${piBody}.`],
         constraints: ["none"],
         label: `hotfix-mcp-pi-inline-${process.pid}`
-      });
+      };
+      const piKey = `mcp-inline-${piNonce}`;
+      const pi = await call("herdr_launch", { task: piTask, idempotencyKey: piKey });
       const piChild = launchedChildOf(pi, "MCP Pi inline launch");
       const piKind = routedKind(piChild);
-      const piPaneId = await supervisedPaneId(String(piChild.supervisorJobId), "MCP Pi inline launch");
+      const piRunId = String(piChild.runId);
+      const piStatus = await waitStatusChild(piRunId, "MCP Pi inline launch");
+      const piPaneId = String(piStatus.paneId);
       state.confirmedPanes.push(piPaneId);
       const piRequest = assertOneRequest(piBefore, "MCP Pi inline launch");
       expect(piRequest.text).toContain("delivery: inline");
-      const piAgent = record(record(record(await runNamed(["agent", "get", piPaneId])).result).agent ?? {}, "MCP Pi inline agent");
-      const piExpectedIdentity = joinedIdentity(piAgent, piPaneId, piKind, "MCP Pi inline expected identity");
+      expect(piRequest.text).toContain("[HERDR AGENT MESSAGE v1]");
+      const piExpectedIdentity = await expectedIdentityOf(piPaneId, piKind, "MCP Pi inline");
+
+      // The idempotency binding replays with zero new effect: same launch ID
+      // and children, and no second prompt reaches the socket.
+      const replayBefore = state.proxy!.requests.length;
+      const replay = await call("herdr_launch", { task: piTask, idempotencyKey: piKey });
+      expect(replay).toMatchObject({ kind: "launch", launchId: pi.launchId, state: "completed", replayed: false });
+      expect(state.proxy!.requests.length).toBe(replayBefore);
+
+      // The intent and run now project into the caller's read-only status.
+      const projected = await call("herdr_status", {});
+      const ownIntent = (Array.isArray(projected.intents) ? projected.intents : []).map((item) => record(item)).find((item) => item.idempotencyKey === piKey);
+      expect(ownIntent?.state).toBe("completed");
+      expect((Array.isArray(projected.runs) ? projected.runs : []).map((item) => record(item)).some((item) => item.runId === piRunId)).toBe(true);
+
       const piGenerated = await generatedBody(piBodyPath, piBody, `${piBodyPath}.exit`);
-      const wait = await call("herdr_wait", { targets: [piPaneId], match: "any", condition: { kind: "output", match: { kind: "literal", value: `hotfix-impossible-${randomUUID()}` } }, timeoutMs: 30_000, label: `${HOTFIX_LABEL} smoke wait` });
-      const waitJobId = wait.jobId;
-      if (typeof waitJobId !== "string") throw new Error("smoke wait omitted its job ID");
-      await call("herdr_jobs", { operation: "list" });
-      const acceptedWait = await call("herdr_jobs", { operation: "get", jobId: waitJobId });
-      expect(acceptedWait).toMatchObject({ jobId: waitJobId });
-      const cancelledWait = await call("herdr_jobs", { operation: "cancel", jobId: waitJobId });
-      expect(cancelledWait).toMatchObject({ jobId: waitJobId, operation_phase: "settled", wait_result: "cancelled" });
-      const settledWait = await call("herdr_jobs", { operation: "get", jobId: waitJobId });
-      expect(settledWait).toMatchObject({ jobId: waitJobId, operation_phase: "settled", wait_result: "cancelled" });
       const piCompletion = await waitForBody(piPaneId, piBody, piKind, piExpectedIdentity, "MCP Pi inline launch");
+      // `herdr_run` observe coverage on the settled run: the
+      // provenance-verified observation cross-checks the status-projected
+      // pane and asserts the read-only flags the daemon surface guarantees.
+      const piObserved = await observeChild(piRunId, "MCP Pi inline run observation");
+      expect(piObserved.paneId).toBe(piPaneId);
       const piReceipt = receipt("pi-inline-launch", pi, piRequest, piCompletion, piBody, piGenerated.body, piGenerated.commandExitCode, { bodyFilePath: piBodyPath, commandExitFilePath: `${piBodyPath}.exit`, generatedBodySha256: piGenerated.sha256 });
       await saveProvenReceipt(piReceipt);
+
       const steerNonce = randomUUID();
       const steerBody = `HOTFIX STEER COMPLETE BODY ${steerNonce}`;
       const steerPath = join(state.cwd, `mcp-steer-${steerNonce}.txt`);
@@ -389,108 +555,126 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
       const steerGateToken = `HOTFIX STEER GATE ${steerNonce}`;
       await execFileAsync("mkfifo", [steerGatePath]);
       const steer = await call("herdr_launch", {
-        objective: `Use Bash to run the bounded condition command timeout 90s bash -c 'IFS= read -r gate < ${steerGatePath} && test "$gate" = "${steerGateToken}"' in the foreground. Do not use sleep. Remain in this turn until that condition exits, then remain ready for the subsequent steer instruction. Do not write a body or send a final response before the steer.`,
-        scope: `Read only ${steerGatePath}; write only ${steerPath} and ${steerPath}.exit; do not change any other resource.`,
-        doneWhen: ["The bounded gate remains pending until the subsequent steer instruction."],
-        constraints: ["none"],
-        label: `hotfix-mcp-steer-${process.pid}`
+        task: {
+          objective: `Use Bash to run the bounded condition command timeout 90s bash -c 'IFS= read -r gate < ${steerGatePath} && test "$gate" = "${steerGateToken}"' in the foreground. Do not use sleep. Remain in this turn until that condition exits, then remain ready for the subsequent steer instruction. Do not write a body or send a final response before the steer.`,
+          scope: `Read only ${steerGatePath}; write only ${steerPath} and ${steerPath}.exit; do not change any other resource.`,
+          // ADR-037 quality gate: doneWhen must name falsifiable evidence —
+          // "stays pending" is rejected as unverifiable, so name the checkable
+          // facts (no reply sent, no body file) instead.
+          doneWhen: [`The turn stays open on the bounded gate: the recipient sends no reply and ${steerPath} does not exist before the follow-up steer instruction.`],
+          constraints: ["none"],
+          label: `hotfix-mcp-steer-${process.pid}`
+        },
+        idempotencyKey: `mcp-steer-${steerNonce}`
       });
       const steerChild = launchedChildOf(steer, "MCP steer launch");
       const steerKind = routedKind(steerChild);
-      const steerPaneId = await supervisedPaneId(String(steerChild.supervisorJobId), "MCP steer launch");
+      const steerRunId = String(steerChild.runId);
+      const steerStatus = await waitStatusChild(steerRunId, "MCP steer launch");
+      const steerPaneId = String(steerStatus.paneId);
       state.confirmedPanes.push(steerPaneId);
-      const steerWorking = await waitForCondition(
-        async () => {
-          const live = await call("herdr_inspect", { mode: "target", target: steerPaneId });
-          const metadata = record(live.metadata ?? {});
-          return metadata.agent_status;
-        },
-        (value) => value === "working",
-        30_000,
-        100
-      );
-      expect(steerWorking).toBe("working");
-      const steerBefore = state.proxy!.requests.length;
-      const steerDetails = await call("herdr_communicate", { target: steerPaneId, operation: "steer", text: `After the current Bash condition completes, use Bash to write exactly ${steerBody} to ${steerPath} with no trailing newline, capture that command's exit code, write the decimal code to ${steerPath}.exit, then reply exactly ${steerBody}.`, delivery: "inline" });
-      const steerRequest = assertOneRequest(steerBefore, "MCP steer while working");
-      expect(steerRequest.text).toContain("delivery: inline");
-      const steerExpectedIdentity = joinedIdentity(record(steerDetails.submission ?? steerDetails.initialPromptSubmission, "MCP steer submission"), steerPaneId, steerKind, "MCP steer expected identity");
+      const steerExpectedIdentity = await expectedIdentityOf(steerPaneId, steerKind, "MCP steer");
+      // The working state is observed through the status projection the
+      // retired inspect call used to provide.
+      await waitStatusState(steerRunId, ["working"], 30_000, "MCP steer while working");
+      const steerText = `After the current Bash condition completes, use Bash to write exactly ${steerBody} to ${steerPath} with no trailing newline, capture that command's exit code, write the decimal code to ${steerPath}.exit, then reply exactly ${steerBody}.`;
+      const steered = await prompt(steerPaneId, steerText, "MCP steer while working");
+      const steerRequest = steered.request;
+      expect(steerRequest.text).toBe(steerText);
       await appendFile(steerGatePath, `${steerGateToken}\n`);
       const steerGenerated = await generatedBody(steerPath, steerBody, `${steerPath}.exit`);
       const steerCompletion = await waitForBody(steerPaneId, steerBody, steerKind, steerExpectedIdentity, "MCP steer while working");
-      const steerReceipt = receipt("steer-working", steerDetails, steerRequest, steerCompletion, steerBody, steerGenerated.body, steerGenerated.commandExitCode, { bodyFilePath: steerPath, commandExitFilePath: `${steerPath}.exit`, generatedBodySha256: steerGenerated.sha256 });
+      const steerReceipt = receipt("steer-working", steered.details, steerRequest, steerCompletion, steerBody, steerGenerated.body, steerGenerated.commandExitCode, { bodyFilePath: steerPath, commandExitFilePath: `${steerPath}.exit`, generatedBodySha256: steerGenerated.sha256 });
       await saveProvenReceipt(steerReceipt);
-      await rawCall("herdr_pane", { operation: "close", target: steerPaneId });
-      state.confirmedPanes = state.confirmedPanes.filter((value) => value !== steerPaneId);
+      await closePane(steerPaneId, "MCP steer recipient");
 
       const smokeNonce = randomUUID();
       const smokeBody = `HOTFIX SEVEN TOOL SMOKE BODY ${smokeNonce}`;
       const smokePath = join(state.cwd, `mcp-smoke-${smokeNonce}.txt`);
-      const smokeBefore = state.proxy!.requests.length;
-      const smokeDetails = await call("herdr_communicate", { target: piPaneId, operation: "prompt", text: `For this normal follow-up, use Bash to write exactly ${smokeBody} to ${smokePath} with no trailing newline, capture that command's exit code, write the decimal code to ${smokePath}.exit, then reply exactly ${smokeBody}. Do not reply before both files are exact.`, delivery: "inline" });
-      const smokeRequest = assertOneRequest(smokeBefore, "MCP normal prompt smoke");
-      expect(smokeRequest.text).toContain("delivery: inline");
-      const smokeExpectedIdentity = joinedIdentity(record(smokeDetails.submission ?? smokeDetails.initialPromptSubmission, "MCP Pi smoke submission"), piPaneId, piKind, "MCP Pi smoke expected identity");
+      const smokeText = `For this normal follow-up, use Bash to write exactly ${smokeBody} to ${smokePath} with no trailing newline, capture that command's exit code, write the decimal code to ${smokePath}.exit, then reply exactly ${smokeBody}. Do not reply before both files are exact.`;
+      const smoked = await prompt(piPaneId, smokeText, "MCP normal prompt smoke");
+      const smokeRequest = smoked.request;
+      expect(smokeRequest.text).toBe(smokeText);
       const smokeGenerated = await generatedBody(smokePath, smokeBody, `${smokePath}.exit`);
-      const smokeCompletion = await waitForBody(piPaneId, smokeBody, piKind, smokeExpectedIdentity, "MCP Pi seven-tool normal prompt");
-      const smokeReceipt = receipt("seven-tool-smoke", smokeDetails, smokeRequest, smokeCompletion, smokeBody, smokeGenerated.body, smokeGenerated.commandExitCode, { bodyFilePath: smokePath, commandExitFilePath: `${smokePath}.exit`, generatedBodySha256: smokeGenerated.sha256 });
+      const smokeCompletion = await waitForBody(piPaneId, smokeBody, piKind, piExpectedIdentity, "MCP Pi three-tool normal prompt");
+      const smokeReceipt = receipt("seven-tool-smoke", smoked.details, smokeRequest, smokeCompletion, smokeBody, smokeGenerated.body, smokeGenerated.commandExitCode, { bodyFilePath: smokePath, commandExitFilePath: `${smokePath}.exit`, generatedBodySha256: smokeGenerated.sha256 });
       await saveProvenReceipt(smokeReceipt);
 
       const normalNonce = randomUUID();
       const normalBody = `HOTFIX NORMAL COMPLETE BODY ${normalNonce}`;
       const normalPath = join(state.cwd, `mcp-normal-${normalNonce}.txt`);
-      const normalBefore = state.proxy!.requests.length;
-      const normalDetails = await call("herdr_communicate", { target: piPaneId, operation: "prompt", text: `For this normal follow-up, use Bash to write exactly ${normalBody} to ${normalPath} with no trailing newline, capture that command's exit code, write the decimal code to ${normalPath}.exit, then reply exactly ${normalBody}. Do not reply before both files are exact.`, delivery: "inline" });
-      const normalRequest = assertOneRequest(normalBefore, "MCP normal prompt");
-      const normalExpectedIdentity = joinedIdentity(record(normalDetails.submission ?? normalDetails.initialPromptSubmission, "MCP Pi normal submission"), piPaneId, piKind, "MCP Pi normal expected identity");
+      const normalText = `For this normal follow-up, use Bash to write exactly ${normalBody} to ${normalPath} with no trailing newline, capture that command's exit code, write the decimal code to ${normalPath}.exit, then reply exactly ${normalBody}. Do not reply before both files are exact.`;
+      const normal = await prompt(piPaneId, normalText, "MCP normal prompt");
+      const normalRequest = normal.request;
+      expect(normalRequest.text).toBe(normalText);
       const normalGenerated = await generatedBody(normalPath, normalBody, `${normalPath}.exit`);
-      const normalCompletion = await waitForBody(piPaneId, normalBody, piKind, normalExpectedIdentity, "MCP Pi normal prompt");
-      const normalReceipt = receipt("normal-prompt", normalDetails, normalRequest, normalCompletion, normalBody, normalGenerated.body, normalGenerated.commandExitCode, { bodyFilePath: normalPath, commandExitFilePath: `${normalPath}.exit`, generatedBodySha256: normalGenerated.sha256 });
+      const normalCompletion = await waitForBody(piPaneId, normalBody, piKind, piExpectedIdentity, "MCP Pi normal prompt");
+      const normalReceipt = receipt("normal-prompt", normal.details, normalRequest, normalCompletion, normalBody, normalGenerated.body, normalGenerated.commandExitCode, { bodyFilePath: normalPath, commandExitFilePath: `${normalPath}.exit`, generatedBodySha256: normalGenerated.sha256 });
       await saveProvenReceipt(normalReceipt);
 
+      // Attachment delivery is runtime-owned on the new surface: a Task whose
+      // rendered assignment exceeds the inline bound publishes an attachment
+      // and the prompt carries only the envelope reference.
       const attachmentNonce = randomUUID();
-      const generatedAttachmentPath = join(state.cwd, `mcp-pi-attachment-readback-${attachmentNonce}.txt`);
-      const attachmentBody = [
-        `HOTFIX ATTACHMENT COMPLETE BODY ${attachmentNonce}`,
-        "Read the entire attachment from its envelope using attachment-path; do not use a summary, nonce, or partial body.",
-        `Use Bash to copy the attachment bytes exactly to the private expected output file ${generatedAttachmentPath}; do not add or remove a trailing newline.`,
-        `Verify the copied file SHA-256 equals the independent expected attachment-sha256 from the envelope, capture that copy-and-verify command's exit code, and write the decimal code to ${generatedAttachmentPath}.exit.`,
-        "Then reply with exactly attachment-sha256: <that hash> and no other text."
-      ].join("\n");
+      const generatedAttachmentPath = join(state.cwd, `mcp-attachment-readback-${attachmentNonce}.txt`);
+      const attachmentPad = `PADDING ${attachmentNonce}\n${"attachment-delivery-fixture\n".repeat(700)}`;
+      const attachmentTask = {
+        objective: [
+          `The assignment arrives as an attachment. Read the entire attachment file named by attachment-path in your message envelope using Bash; do not use a summary, nonce, or partial body.`,
+          `Use Bash to copy the attachment bytes exactly to the private expected output file ${generatedAttachmentPath}; do not add or remove a trailing newline.`,
+          `Verify the copied file SHA-256 equals the independent expected attachment-sha256 from the envelope, capture that copy-and-verify command's exit code, and write the decimal code to ${generatedAttachmentPath}.exit.`,
+          `Then reply with exactly attachment-sha256: <that hash> and no other text.`,
+          `The block below exists only to push this assignment past the inline delivery bound; ignore its content entirely.`,
+          attachmentPad
+        ].join("\n"),
+        scope: `Read the published attachment and write only ${generatedAttachmentPath} and ${generatedAttachmentPath}.exit; do not change any other resource.`,
+        doneWhen: [`The recipient-generated file ${generatedAttachmentPath} contains exactly the bytes of the published attachment.`],
+        constraints: ["none"],
+        label: `hotfix-mcp-attachment-${process.pid}`
+      };
       const attachmentBefore = state.proxy!.requests.length;
-      const attachmentDetails = await call("herdr_communicate", { target: piPaneId, operation: "prompt", delivery: "attachment", text: attachmentBody });
-      const attachmentRequest = assertOneRequest(attachmentBefore, "MCP attachment prompt");
-      const attachment = record(attachmentDetails.attachment, "MCP attachment receipt");
-      if (typeof attachment.path !== "string") throw new Error("MCP attachment omitted body path");
-      if (typeof attachment.bytes !== "number" || typeof attachment.sha256 !== "string") throw new Error("MCP attachment omitted byte/hash metadata");
-      state.attachmentPaths.push(attachment.path);
-      const attachmentBytes = await readFile(attachment.path);
-      const expectedAttachmentBytes = Buffer.from(attachmentBody, "utf8");
-      expect(Buffer.compare(attachmentBytes, expectedAttachmentBytes)).toBe(0);
-      expect(attachmentRequest.text).toContain("delivery: attachment");
-      expect(attachmentRequest.text).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
-      expect(attachmentRequest.text).not.toContain(attachmentBody);
-      const attachmentExpectedIdentity = joinedIdentity(record(attachmentDetails.submission ?? attachmentDetails.initialPromptSubmission, "MCP Pi attachment submission"), piPaneId, piKind, "MCP Pi attachment expected identity");
-      const generatedAttachment = await generatedBody(generatedAttachmentPath, attachmentBody, `${generatedAttachmentPath}.exit`);
-      expect(Buffer.compare(Buffer.from(generatedAttachment.body, "utf8"), expectedAttachmentBytes)).toBe(0);
-      expect(generatedAttachment.bytes).toBe(expectedAttachmentBytes.byteLength);
-      expect(generatedAttachment.sha256).toBe(digest(expectedAttachmentBytes));
-      expect(generatedAttachment.sha256).toBe(attachment.sha256);
-      expect(attachmentBytes.byteLength).toBe(expectedAttachmentBytes.byteLength);
-      expect(attachment.bytes).toBe(expectedAttachmentBytes.byteLength);
-      const attachmentCompletion = await waitForRecipientCompletion(piPaneId, piKind, attachmentExpectedIdentity, "MCP Pi attachment readback");
-      const attachmentReceipt = receipt("attachment-complete-body", attachmentDetails, attachmentRequest, attachmentCompletion, attachmentBody, generatedAttachment.body, generatedAttachment.commandExitCode, {
-        bodyFilePath: attachment.path,
+      const attachmentReply = await call("herdr_launch", { task: attachmentTask, idempotencyKey: `mcp-attachment-${attachmentNonce}` });
+      const attachmentChild = launchedChildOf(attachmentReply, "MCP attachment launch");
+      const attachmentKind = routedKind(attachmentChild);
+      const attachmentRunId = String(attachmentChild.runId);
+      const attachmentStatus = await waitStatusChild(attachmentRunId, "MCP attachment launch");
+      const attachmentPaneId = String(attachmentStatus.paneId);
+      state.confirmedPanes.push(attachmentPaneId);
+      const attachmentRequest = assertOneRequest(attachmentBefore, "MCP attachment launch");
+      // The attachment fields ride the delivered envelope — the wire contract
+      // itself — since the uniform launch reply deliberately omits them.
+      const attachmentText = attachmentRequest.text ?? "";
+      const attachmentField = (name: string): string => {
+        const found = attachmentText.match(new RegExp(`^attachment-${name}: (.+)$`, "m"));
+        if (!found) throw new Error(`MCP attachment envelope omitted attachment-${name}`);
+        return found[1]!.trim();
+      };
+      const attachmentPath = attachmentField("path");
+      const attachmentSha256 = attachmentField("sha256");
+      const attachmentBytesDeclared = Number(attachmentField("bytes"));
+      state.attachmentPaths.push(attachmentPath);
+      const attachmentBytes = await readFile(attachmentPath);
+      const expectedAttachmentBody = attachmentBytes.toString("utf8");
+      expect(attachmentText).toContain("delivery: attachment");
+      expect(attachmentText).not.toContain(attachmentNonce);
+      expect(attachmentBytes.byteLength).toBe(attachmentBytesDeclared);
+      expect(digest(attachmentBytes)).toBe(attachmentSha256);
+      const attachmentExpectedIdentity = await expectedIdentityOf(attachmentPaneId, attachmentKind, "MCP attachment");
+      const generatedAttachment = await generatedBody(generatedAttachmentPath, expectedAttachmentBody, `${generatedAttachmentPath}.exit`);
+      expect(generatedAttachment.bytes).toBe(attachmentBytes.byteLength);
+      expect(generatedAttachment.sha256).toBe(digest(attachmentBytes));
+      expect(generatedAttachment.sha256).toBe(attachmentSha256);
+      const attachmentCompletion = await waitForRecipientCompletion(attachmentPaneId, attachmentKind, attachmentExpectedIdentity, "MCP attachment readback");
+      const attachmentReceipt = receipt("attachment-complete-body", attachmentReply, attachmentRequest, attachmentCompletion, expectedAttachmentBody, generatedAttachment.body, generatedAttachment.commandExitCode, {
+        bodyFilePath: attachmentPath,
         generatedBodyFilePath: generatedAttachmentPath,
         commandExitFilePath: `${generatedAttachmentPath}.exit`,
         generatedBodySha256: generatedAttachment.sha256,
         attachmentSha256: digest(attachmentBytes)
       });
       await saveProvenReceipt(attachmentReceipt);
-      const piKeys = await call("herdr_communicate", { target: piPaneId, operation: "keys", keys: ["escape"] });
-      expect(piKeys).toMatchObject({ operation: "keys" });
-      await rawCall("herdr_pane", { operation: "close", target: piPaneId });
-      state.confirmedPanes = state.confirmedPanes.filter((value) => value !== piPaneId);
+      await closePane(attachmentPaneId, "MCP attachment recipient");
+      await closePane(piPaneId, "MCP Pi recipient");
 
       const receipts = [smokeReceipt, piReceipt, normalReceipt, steerReceipt, attachmentReceipt];
       expect(new Set(receipts.map((item) => item.case))).toEqual(new Set(HOTFIX_MANDATORY_CASES));
@@ -503,7 +687,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
         actualExitCode: 0,
         mandatoryCases: [...HOTFIX_MANDATORY_CASES],
         toolSmoke: [...CORE_TOOL_NAMES],
-        mcpPollingDifference: "MCP has no Pi push footer or model-backed explicit-wait reviewer; this gate polls herdr_jobs and uses active supervision coverage for the bounded wait.",
+        mcpPollingDifference: "MCP serves only the daemon-proxy surface (herdr_launch/herdr_run/herdr_status); this gate reads run state through herdr_run observe and herdr_status, and delivers follow-up prompts through the session-socket agent.prompt transport (the C8 agent prompt recipe), which the disposable proxy records.",
         receipts,
         socketRequests: state.proxy!.requests.length,
         literalStdin: false,

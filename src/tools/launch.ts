@@ -38,6 +38,7 @@ import { SupervisionBindError, type ProviderLimitRecoveryEvidence } from "../sup
 import { claudeQuotaSignal, type ClaudeQuotaEvidence } from "../supervision/claude-quota.js";
 import { topologySummary } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
+import type { MailboxEventWriter } from "../daemon/mailbox.js";
 import { EVIDENCE_ASSIGNMENT_MAX_BYTES, normalizedAssignmentBytes } from "../supervision/evidence.js";
 import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
 import type { SelfCloseTracker } from "../supervision/self-close.js";
@@ -91,6 +92,13 @@ export interface LaunchDependencies {
    * cannot supervise cannot launch. See ADR-019.
    */
   supervision: SupervisionCoordinator;
+  /**
+   * The N2.2 owner-mailbox writer the launched supervisor persists run events
+   * through (durable-supervisor §7). Hosts without a mailbox leave it absent
+   * and the reservation persists nothing — same semantics as a reattach that
+   * supplies `deps.mailbox`.
+   */
+  eventWriter?: MailboxEventWriter;
   /** The host's shared close ledger, forwarded to per-replica worktree managers. */
   selfClose?: SelfCloseTracker;
   /** Compatibility-only host field; the cutover never reads a profile catalog. */
@@ -2594,7 +2602,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           child: { agentName: childName, agentKind: initialRuntime.kind, operatingPointId: initialContract.candidate.id },
           settings: {
             supervisionDigest,
-            workspaceRoot: supervisionWorkspaceRoot(launchCwd)
+            workspaceRoot: supervisionWorkspaceRoot(launchCwd),
+            ...(deps.eventWriter === undefined ? {} : { eventWriter: deps.eventWriter })
           }
         });
       } catch (error) {

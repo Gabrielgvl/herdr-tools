@@ -5,8 +5,14 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import extension, { CORE_TOOL_NAMES, createRuntime, type ExtensionRuntime } from "../../index.js";
+import extension, { createPreflight, createRuntime, type ExtensionRuntime } from "../../index.js";
+import { createContextResolver } from "../../src/context.js";
+import { createCommunicateTool } from "../../src/tools/communicate.js";
+import { createInspectTool } from "../../src/tools/inspect.js";
+import { createJobsTool } from "../../src/tools/jobs.js";
 import { createLaunchTool } from "../../src/tools/launch.js";
+import { createTabTool } from "../../src/tools/tab.js";
+import { createWaitTool } from "../../src/tools/wait.js";
 import type { TaskEvaluation, TaskEvaluationInput, TypeSafeSpecClient } from "../../src/typesafe-spec.js";
 import { renderTask } from "../../src/launch-schema.js";
 import { renderHandoffContract, type HandoffAllocation } from "../../src/handoff.js";
@@ -66,6 +72,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     fixtureCreated: boolean;
     baseline?: { workspaces: string[]; tabs: string[]; panes: string[] };
     registered: Map<string, ExecutableTool>;
+    /** The harness-composed tool surface: built in beforeAll, never through the Pi host (C7). */
+    harnessTools: Map<string, ExecutableTool>;
+    /** The harness runtime the composed tools bind to; torn down in afterAll. */
+    runtime?: ExtensionRuntime;
     commands: string[];
     handlers: string[];
     cliCalls: string[][];
@@ -85,7 +95,7 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     agyPrePromptAgent?: Record<string, unknown>;
     agyPrePromptRecipientFailureCode?: string;
     unconfirmedRecoveries: Array<{ paneId: string; supervisorJobId: string }>;
-  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), commands: [], handlers: [], cliCalls: [], toolCalls: [], attachmentPaths: [], forceNextPromptConfirmationFailure: false, forceNextAgyStartFailure: false, unconfirmedRecoveries: [] };
+  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), harnessTools: new Map(), commands: [], handlers: [], cliCalls: [], toolCalls: [], attachmentPaths: [], forceNextPromptConfirmationFailure: false, forceNextAgyStartFailure: false, unconfirmedRecoveries: [] };
 
   const run = async (...args: string[]): Promise<unknown> => {
     // The suite sets HERDR_SOCKET_PATH so the extension's supervision monitor
@@ -377,8 +387,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   };
 
   const tool = (name: string): ExecutableTool => {
-    const found = state.registered.get(name);
-    if (!found) throw new Error(`integration harness did not register ${name}`);
+    const found = state.harnessTools.get(name);
+    if (!found) throw new Error(`integration harness did not compose ${name}`);
     return {
       name: found.name,
       execute(id, params, abortSignal, onUpdate, context) {
@@ -539,6 +549,27 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     process.env.HERDR_SOCKET_PATH = state.socketProxy!.path;
     try {
       extension();
+      // The extension is a no-op by contract (C7 + the executor→MCP
+      // amendment): Pi registers nothing and reaches the three daemon tools
+      // through the executor gateway. This suite is a harness, not the Pi
+      // host — it composes the same shared runtime the daemon serves and
+      // builds its tool surface directly, so every assertion below exercises
+      // the production launch/supervision pipeline without Pi registration.
+      const runtime = createRuntime(pi);
+      state.runtime = runtime;
+      const contextResolver = createContextResolver(runtime.cli, runtime.context);
+      const preflight = createPreflight(runtime.cli);
+      const environment = { enabled: true, currentIdsPresent: runtime.idsPresent, currentIdsValid: runtime.idsValid };
+      for (const definition of [
+        createInspectTool({ cli: runtime.cli, context: runtime.context, contextResolver, environment, profiles: runtime.profiles, handoffs: runtime.handoffs }),
+        createCommunicateTool({ cli: runtime.cli, context: runtime.context, contextResolver, preflight, queueFlush: runtime.queueFlush, attachments: runtime.attachments, recipients: runtime.recipients }),
+        createWaitTool({ cli: runtime.cli, context: runtime.context, contextResolver, settingsLoader: runtime.settings.load, jobRegistry: runtime.jobs, handoffs: runtime.handoffs }),
+        createJobsTool(runtime.jobs),
+        createLaunchTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight, supervision: runtime.supervision, queueFlush: runtime.queueFlush, attachments: runtime.attachments, recipients: runtime.recipients }),
+        createTabTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight }),
+      ]) {
+        state.harnessTools.set(definition.name, definition as unknown as ExecutableTool);
+      }
     } finally {
       process.chdir(savedCwd);
       for (const [key, value] of Object.entries({ HERDR_ENV: saved.env, HERDR_WORKSPACE_ID: saved.workspace, HERDR_TAB_ID: saved.tab, HERDR_PANE_ID: saved.pane })) {
@@ -561,6 +592,12 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         expect(panes).toEqual(expect.arrayContaining([expect.objectContaining({ pane_id: recovery.paneId })]));
       }
       process.stderr.write(`INTEGRATION_UNCONFIRMED_RETAINED_UNTIL_HARNESS_TEARDOWN ${JSON.stringify(state.unconfirmedRecoveries)}\n`);
+    }
+    if (state.runtime !== undefined) {
+      await state.runtime.supervision.shutdown();
+      state.runtime.jobs.shutdown();
+      await state.runtime.queueFlush.shutdown();
+      state.runtime.cli.closePromptTransport();
     }
     if (state.agyRuntime !== undefined) {
       await state.agyRuntime.supervision.shutdown();
@@ -586,11 +623,16 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     if (state.cwd) await rm(state.cwd, { recursive: true, force: true });
   }, 120_000);
 
-  it("registers the extension surface and mutates only the disposable session", async () => {
-    expect([...state.registered.keys()]).toEqual([...CORE_TOOL_NAMES]);
-    expect([...state.registered.values()].every((registered) => typeof registered.execute === "function")).toBe(true);
-    expect(state.commands).toEqual(["herdr-waits"]);
-    expect(state.handlers).toEqual(["session_shutdown", "session_start"]);
+  it("registers no Pi surface and mutates only the disposable session", async () => {
+    // C7 + the executor→MCP amendment (durable-supervisor §10): the Pi
+    // extension registers nothing — no tools, no commands, no session
+    // handlers. The three daemon tools reach Pi through the executor gateway
+    // and non-Pi harnesses through the MCP server; the tools this suite
+    // exercises are the harness-composed surface, never a Pi registration.
+    expect([...state.registered.keys()]).toEqual([]);
+    expect(state.commands).toEqual([]);
+    expect(state.handlers).toEqual([]);
+    expect([...state.harnessTools.values()].every((composed) => typeof composed.execute === "function")).toBe(true);
 
     const inspected = await tool("herdr_inspect").execute("inspect", { mode: "collection", collection: "panes" }, signal(), undefined, toolContext());
     expect(resultObject(inspected.details).items).toEqual(expect.arrayContaining([expect.objectContaining({ workspace_id: state.workspaceId })]));

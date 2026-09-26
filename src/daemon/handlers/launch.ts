@@ -158,6 +158,7 @@ async function executeDaemonLaunch(
     attachments: runtime.attachments,
     recipients: runtime.recipients,
     preflight: createPreflight(runtime.cli),
+    eventWriter: runtime.eventWriter,
     ...(runtime.launchDeps ?? {}),
     cli: runtime.cli,
     context: caller.context,

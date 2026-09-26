@@ -1307,7 +1307,16 @@ async function waitForShellReadiness(cli: LaunchCli, paneId: string, signal: Abo
   try {
     // Split the marker so terminal input echo cannot satisfy the output proof.
     // Literal command text only: no send-keys/Enter nudges or startup-file assumptions.
-    await readWithinWindow(cli, ["pane", "send-text", paneId, `printf '%s%s\\n' 'HERDR_SHELL_READY_' '${nonce}'\n`], window);
+    // `pane send-text` returns exit 0 with empty stdout (no envelope) on herdr 0.9.1,
+    // so a strict envelope parse rejects a successful probe write. The write's result
+    // is disposable — the wait-output marker proof below is the gate — so treat an
+    // empty-stdout protocol rejection as delivered and let the marker decide.
+    const writeProbe = ["pane", "send-text", paneId, `printf '%s%s\\n' 'HERDR_SHELL_READY_' '${nonce}'\n`];
+    try {
+      await readWithinWindow(cli, writeProbe, window);
+    } catch (error) {
+      if (!(error instanceof CliProtocolError && error.code === "CLI_PROTOCOL_ERROR" && error.details.stdout === "")) throw error;
+    }
     const matched = await readWithinWindow(cli, ["pane", "wait-output", paneId, "--match", marker, "--source", "recent-unwrapped", "--timeout", String(SHELL_READINESS_TIMEOUT_MS)], window);
     if (!record(matched) || matched.type !== "output_matched" || matched.pane_id !== paneId || typeof matched.matched_line !== "string" || !matched.matched_line.includes(marker)) {
       throw new LaunchError("SHELL_NOT_READY", "Shell readiness marker was not observed");

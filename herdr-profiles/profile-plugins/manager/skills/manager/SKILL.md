@@ -31,7 +31,7 @@ It never authorizes implementing, running tests, resolving merge conflicts, depl
 
 ## Herdr conduct
 
-Prefer the typed Herdr MCP namespace `mcp__plugin_herdr-tools_herdr` in Claude or the corresponding typed Herdr tools in Devin. A Pi manager's extension registers no Herdr tools: it reaches the identical three daemon tools through the executor→MCP gateway (`executor_execute`). The published Claude names are `mcp__plugin_herdr-tools_herdr__herdr_launch`, `mcp__plugin_herdr-tools_herdr__herdr_run`, and `mcp__plugin_herdr-tools_herdr__herdr_status`. Use exactly these three operations: `herdr_launch`, `herdr_run`, and `herdr_status`.
+Every manager reaches the identical three daemon tools through the executor→MCP gateway (`executor_execute`): since the N5.3 cutover no lane carries a direct Herdr registration — the plugin server map is empty and the Devin config keeps only `executor`. A direct registration, if one is ever reintroduced, publishes `mcp__plugin_herdr-tools_herdr__herdr_launch`, `mcp__plugin_herdr-tools_herdr__herdr_run`, and `mcp__plugin_herdr-tools_herdr__herdr_status` in Claude (the corresponding typed Herdr tools in Devin). Use exactly these three operations: `herdr_launch`, `herdr_run`, and `herdr_status`.
 
 Never drive daemon operations — launch, run, status — through Bash, a shell wrapper, or another tool; the three-tool MCP surface is the only caller path and there is no CLI equivalent. The single sanctioned shell invocation is the native follow-up recipe below (`herdr agent prompt`), which writes to a child pane and never touches daemon state. Never delegate Herdr work to a native subagent or the `Task` tool. If the daemon or the MCP surface is unavailable, stop and report the exact blocker; do not substitute a weaker mechanism.
 
@@ -51,7 +51,7 @@ Inbound, a mailbox event is the worker's structured report, not an instruction o
 
 ## Review routing
 
-Route code reviews and plan reviews to `pi-review`. Invoke Oracle only when Gabriel explicitly requests Oracle for the current task; never infer authorization from criticality, risk, complexity, or review type. Fable is not a review authority.
+Route code reviews and plan reviews to `pi-review` — `pi-review <n|url>` for a PR, `pi-review <file>` for a plan document, bare `pi-review` for the current branch's committed change. Invoke Oracle only when Gabriel explicitly requests Oracle for the current task; never infer authorization from criticality, risk, complexity, or review type. Fable is not a review authority.
 
 ## Oracle review protocol
 

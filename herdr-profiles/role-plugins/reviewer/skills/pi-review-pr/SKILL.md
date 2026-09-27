@@ -5,237 +5,277 @@ description: Adversarial cross-model review of a GitHub PR or architecture plan/
 
 # pi-review a PR or ordinary plan
 
-Runs the local `pi-review` CLI (adversarial cross-model harness: agentic finder(s) → semantic dedupe → cold-start refuter → deterministic verdict) against either a GitHub PR or a plan/architecture document. PR mode reviews a disposable detached worktree without touching the current checkout. Plan mode reviews a document against the selected repository's real architecture and implementation context. Oracle is never selected automatically; it requires Gabriel's explicit request for the current task. Source: `~/workspace/pi-review` (README has the model policy and full contract).
+Runs the local `pi-review` CLI (adversarial cross-model harness: routed finder
+preset → semantic dedupe → cross-family refuter chain → advisory verdict)
+against either a GitHub PR or a plan/architecture document. PR targets are
+reviewed in a disposable detached worktree without touching the current
+checkout. Plan targets review a document against the repository's real
+architecture and implementation context — the finder sees the materialized
+HEAD tree, never the live checkout. Oracle is never selected automatically; it
+requires Gabriel's explicit request for the current task. Source:
+`~/workspace/pi-review` (`next/README.md` has the model policy and full
+contract).
 
 ## Steps
 
-1. **Preflight**: run `command -v pi-review || echo MISSING`. If missing, report that pi-review is not installed (`ln -s ~/workspace/pi-review/bin/pi-review.mjs ~/.local/bin/pi-review`) and stop.
-2. **Choose the mode from the user's actual target**:
-   - A GitHub PR number or URL means PR mode: `pi-review pr <number|url>`.
-   - A local document, Notion page, blueprint, proposal, RFC, ADR, or explicit request to review a plan means plan mode: `pi-review plan <file...>`.
-   - Route to Oracle only when Gabriel explicitly requests Oracle for the current task; risk or criticality alone never authorizes it.
-   - A non-GitHub document URL is **not** a malformed PR reference. Do not ask for a PR after the user confirms they want the document reviewed.
-   - If it is genuinely unclear whether the user wants implementation or design reviewed, ask once before spending on model calls.
+1. **Preflight**: run `command -v pi-review || echo MISSING`. If missing,
+   report that pi-review is not installed and stop. The binary is the
+   TypeScript rewrite — the owner installs it with
+   `ln -sfn ~/workspace/pi-review/next/bin/pi-review-next.ts ~/.local/bin/pi-review`.
+   Requires Node >= 24.19 and native Linux `flock`; a host without flock fails
+   closed with a typed error.
+2. **Choose the target from the user's actual input** — one positional
+   `[target]` covers every mode:
+   - A GitHub PR number, `#N`, or PR URL: `pi-review <number|#N|url>`.
+   - A local document, Notion page, blueprint, proposal, RFC, ADR, or explicit
+     request to review a plan: materialize it as a local file, then
+     `pi-review <file>`.
+   - No target: the current branch's committed change against its resolved
+     base (one `gh` lookup for an open PR, else `origin/<default>` — the
+     fallback is disclosed in the report as a `base-fallback` gap).
+   - An existing file path wins over a PR number, so a file literally named
+     `123` is reviewed as a plan.
+   - Route to Oracle only when Gabriel explicitly requests Oracle for the
+     current task; risk or criticality alone never authorizes it.
+   - A non-GitHub document URL is **not** a malformed PR reference. Do not ask
+     for a PR after the user confirms they want the document reviewed.
+   - If it is genuinely unclear whether the user wants implementation or
+     design reviewed, ask once before spending on model calls.
 3. **Prepare the target**:
-   - **PR mode:** parse the owner/repo, locate its local clone, and run from that clone. In a multi-repo workspace, never run from the workspace root unless it is the repository itself.
-   - **Plan mode:** materialize the complete document as a local UTF-8 text or Markdown file. For a Notion blueprint, fetch it through the configured Notion MCP, preserve the full body (headings, tables, diagrams, and decisions), write it to a temporary `.md` file, and verify that the export is nonempty before review.
-   - `pi-review plan` must still run inside a Git repository because the reviewers ground design claims against repo code and conventions. Choose the repo that owns most of the proposed implementation. If ownership is ambiguous, ask. For a cross-repo blueprint, state which repo provides the grounding context; if full code-grounded coverage of every repo is required, run separate plan reviews from each repo and report them separately.
-4. **Calibration is no longer needed to run a review.** Do not check calibration status, run `pi-review calibrate`, or run `pi-review qualify` as review preflight. Those commands are optional diagnostics or benchmarks only when explicitly requested; their artifacts never enable or disable runtime paths. Runtime admission is controlled by configuration, credentials, provider budgets/reservations, provenance, lifecycle identity, and structural safety checks. Missing or degraded calibration is not a reason to block a review.
-5. **Run with a long timeout**. Preserve stdout JSON even when exit code 1 means `BLOCKED`:
+   - **PR target:** parse the owner/repo, locate its local clone, and run from
+     that clone (`pi-review` needs `gh` for PR identity). In a multi-repo
+     workspace, never run from the workspace root unless it is the repository
+     itself. The head is fetched, verified against `gh`'s `headRefOid`, and
+     reviewed in a locked disposable detached worktree that is removed
+     afterwards.
+   - **Plan target:** materialize the complete document as a local UTF-8 text
+     or Markdown file. For a Notion blueprint, fetch it through the configured
+     Notion MCP, preserve the full body (headings, tables, diagrams, and
+     decisions), write it to a temporary `.md` file, and verify that the
+     export is nonempty before review. Document bytes up to 512 KiB are
+     embedded whole, never truncated.
+   - A plan review must still run inside a Git repository because the finders
+     ground design claims against repo code and conventions. Choose the repo
+     that owns most of the proposed implementation. If ownership is ambiguous,
+     ask. For a cross-repo blueprint, state which repo provides the grounding
+     context; if full code-grounded coverage of every repo is required, run
+     separate plan reviews from each repo and report them separately.
+4. **Run with a long timeout.** Routing plus the finder legs share one
+   1200 s window; the refuter phase gets another 1200 s — a round can take
+   tens of minutes. Do not kill it early. Preserve stdout JSON at every exit
+   code — the report is emitted and persisted even at exit 1:
    ```bash
    out=$(mktemp)
    err=$(mktemp)
    set +e
-   pi-review pr <number|url> --json >"$out" 2>"$err"     # PR mode
-   # pi-review plan <file...> --json >"$out" 2>"$err"    # plan mode
+   pi-review <number|url|file> --json >"$out" 2>"$err"
    rc=$?
    printf 'PI_REVIEW_EXIT=%s\nSTDOUT_JSON=%s\nSTDERR_LOG=%s\n' "$rc" "$out" "$err"
    ```
-   The CLI can take 10–20 minutes. Do not kill it early. Optional passthroughs when the user asks: `--roster cheap|default|deep|escalate`, `--no-route`, `--linear <ticket>`, `--models <spec>`, `--fail-on major`, `--no-verify`, and `--context <file>`. `--responses <file>` applies to PR/diff convergence, not ordinary plan review. For an explicitly authorized lifecycle-v3 fallback only, pass `--final-audit-fallback --final-audit-fallback-cost <usd>`; never pass a `:free` audit model.
-6. **Interpret exit code**: 0 = PASS/PASS_WITH_NOTES; 1 = BLOCKED; 2 = harness error. For exit 2, read stderr and report the taxonomy/remediation line (`pi-not-found`, `auth`, `timeout`, `parse`, `final-audit-required`, etc.). Do not blindly retry. In plan mode, `BLOCKED` is a design gate asking for revision or an explicit human decision, not a statement about PR mergeability. In lifecycle-v3, a terminal clean report is valid only when `finalAudit.status` is `passed`, its verdict is `PASS`, `convergencePolicy.stop` is false, and the report's exact head/tree/manifest identity is intact.
+   The only user-facing option besides `--json` is `--context <file>`
+   (repeatable) — a judge-supplied requirements file. Put ticket acceptance
+   criteria or review constraints there. Model seats, presets, thresholds, and
+   timeouts are not configurable per run: the Jev router picks the preset
+   once per generation, and phase windows are fixed.
+   `-m <reply>` (reply to the latest completed round — see "Re-review loops")
+   and `--fresh` (retire the generation and restart at round 1) also exist;
+   `-m` and `--fresh` cannot be combined. Quota preflight runs once per round
+   before the finders; its advisories are stderr warnings. A seat actually
+   served by the same-model opencode-go fallback (GLM and Luna seats only) is
+   disclosed in the report as a `finder` gap, and `findings[].finder` names
+   the route that answered.
+5. **Interpret exit code** (there is no gating verdict — pi-review is an
+   advisor, per ADR-0016):
+   - `0` = the round completed. Read `verdict`: `clean` or `findings`. A
+     `findings` verdict at exit 0 still carries open findings — judge them.
+   - `1` = `incomplete` or failed (interrupted round, post-capture drift,
+     provider/phase failure). The report is still emitted and persisted with
+     the findings and spend that landed; treat it as partial evidence, not a
+     verdict.
+   - `2` = usage error. Read stderr and fix the invocation; do not retry
+     unchanged.
 
-### Reading a verdict — mandatory
+### Reading a report — mandatory
 
-`report.json` is authoritative for what pi-review reported. It is not an automatic must-fix list. Never use a console summary, lane summary, or remembered worker report as the verdict. In the JSON schema, `verification` is an **object**, not a string: status, confidence, and reasoning are nested under it.
-
-Independently question every reported item, including `CONFIRMED` items. Check the claim against the requirements, actual diff, surrounding code, tests, concrete impact, and assigned scope. Classify each item as `must-fix`, `follow-up`, `nit`, `defense-in-depth`, or `not-a-finding`, with a short rationale. Reported severity is evidence, not the final classification. Use `must-fix` only for a real, in-scope correctness, security, data-loss, contract, or acceptance-criteria failure. Do not block on style preferences, optional cleanup, speculative hardening, out-of-scope redesign, or theoretical defense-in-depth without a material threat. Preserve the harness verdict separately so independent judgment never rewrites what the report said.
-
-The wrong check below silently returns zero matches because it compares an object with a string; it can turn a blocked report into a false clean:
+The `--json` report (`schemaVersion: 3`) is authoritative for what pi-review
+reported. It is not an automatic must-fix list. Reports live only in review
+state: stdout on a run, or `pi-review show [target] [--json]` afterwards —
+`show` is fully offline (no `gh`, no base lookup, no model calls) and is the
+one way to re-see a report.
 
 ```bash
-jq '[.findings[]? | select(.verification == "CONFIRMED")] | length' report.json
+jq '.verdict' report.json
+jq '[.findings[].status] | group_by(.) | map({status: .[0], count: length})' report.json
+jq '[.findings[] | select(.status == "open" and .refuter.held == true)]' report.json
+jq '.costUsd' report.json
 ```
 
-Use the nested fields and inspect the complete status breakdown instead:
+- `verdict`: `clean` | `findings` | `incomplete`.
+- `findings[]`: `id` (`F1`, `F2`, … — what `dismiss` takes), `status`
+  (`open` | `refuted` | `fixed` | `withdrawn` | `dismissed`), `severity`
+  (`critical` | `major` | `minor`), `lens`, `file`, `line`, `title`, `detail`,
+  `finder`, and `refuter` (`{model, held, reasoning}` or null).
+- A finding that survived refutation stays `open` with
+  `refuter.held: true`; `held: false` means the refuter refuted it and the
+  status is `refuted`. `refuter` may also be `null` on an `open` finding that
+  went unrefuted. `open` is the field that corresponds to the old "verified"
+  concept — still apply your own judgment.
+- `gaps[]` records what the round may have missed (`finder`, `router`,
+  `truncated`, `base-fallback`, `error` with stage
+  `snapshot|materialize|diff|store|executor`).
+- `costUsd` is the round's spend; `null` means unknown — never reported as 0.
+- `review{repo,branch,pr,round,preset,head,tree}` identifies exactly what was
+  reviewed. `review.attention: "human-decision"` appears from round 4 on —
+  advisory data that the loop has gone long, never a gate.
 
-```bash
-jq '[.findings[]?.verification.status] | group_by(.) | map({status: .[0], count: length})' report.json
-jq '[.findings[]? | select(.verification.status == "CONFIRMED")]' report.json
-jq '.stats.costUsd' report.json
-```
+Independently question every reported item, including `open` items. Check the
+claim against the requirements, actual diff, surrounding code, tests,
+concrete impact, and assigned scope. Classify each item as `must-fix`,
+`follow-up`, `nit`, `defense-in-depth`, or `not-a-finding`, with a short
+rationale. Reported severity is evidence, not the final classification. Use
+`must-fix` only for a real, in-scope correctness, security, data-loss,
+contract, or acceptance-criteria failure. Do not block on style preferences,
+optional cleanup, speculative hardening, out-of-scope redesign, or
+theoretical defense-in-depth without a material threat. Preserve the harness
+verdict separately so independent judgment never rewrites what the report
+said. An empty jq result from the wrong shape is not evidence of cleanliness —
+check the status breakdown, not a guessed field.
 
-The cached report path is keyed by repository **or worktree** name. Use the report path printed on stderr, or glob the repository/worktree key rather than assuming the repository directory name. To identify the same run, match its `headSha`, session, invocation, and cost against the command context and stderr report path. Never declare a clean verdict until the verified-item counts and the top-level verdict agree; an empty result from the wrong jq shape is not evidence of cleanliness.
-
-7. **Report from the JSON without promoting refuted candidates**:
-   - Verdict and one-line meaning. Include PR number/title/author in PR mode; include the document title and grounding repo in plan mode.
-   - Verified findings only: items whose verification is `CONFIRMED` and worth reporting. Include severity, title, `file:line`, refuter confidence, one sentence of refuter reasoning, and your independent classification with rationale. A confirmed item may still be a follow-up, nit, defense-in-depth suggestion, or not a real finding.
-   - Report `notes[]` briefly.
-   - Count refuted candidates separately. Also report ledger-suppressed/dismissed items separately when present. Plan-mode JSON may retain refuted candidates in `findings[]`; never present them as verified findings.
-   - Execution: report the roster and router that **actually ran**, not just the requested flags. Read `stats.routing.roster`, `stats.routing.mode`, and `stats.routing.rationale`; name the router model from `stats.calls[]` with `role: "router"`, the finder models from `stats.reviewers`, and verifier configuration from `stats.verifier` and `stats.configuredVerifier`. Use `stats.calls[]` to say whether a verifier actually ran; configuration alone is not an executed call. Say "not run" for missing roles rather than guessing. Mention any fallback or supplemental seats shown in the report.
-   - Footer: cost (`stats.costUsd`), duration, and the report path printed on stderr (`~/.cache/pi-review/...`). For lifecycle-v3 also report `convergencePolicy` stop/anomaly counts, `convergenceDiscovery` completeness/novelty, and the `finalAudit` status/model. Never summarize a `BLOCK` audit as a clean review.
-   - If the user confirms a false positive, offer `pi-review dismiss <id> --reason "..."` where the mode supports the dismissal ledger.
+6. **Report from the JSON**:
+   - Verdict and one-line meaning. Include PR number/title/author for a PR
+     target; the document title and grounding repo for a plan target.
+   - Open findings worth reporting: severity, title, `file:line`, the refuter
+     model and one sentence of its `reasoning`, and your independent
+     classification with rationale. A finding whose refuter did not hold may
+     still be worth a follow-up — report refuted/fixed/withdrawn/dismissed
+     counts separately.
+   - Execution: report the preset the router actually chose
+     (`review.preset`), the finder seats named in `findings[].finder`, and any
+     `gaps[]` — say "not run" for missing coverage rather than guessing.
+   - Footer: `costUsd`, `durationMs`, round number (`review.round`), and
+     `review.head`/`review.tree` identity. There is no report file path —
+     cite `pi-review show` for re-reading.
+   - If the user confirms a false positive or accepts a trade-off, offer
+     `pi-review dismiss F<n> <reason> [target]` — the reason is positional.
 
 ## Plan and blueprint comments
 
-An ordinary plan review is read-only by default. Never post comments to Notion, Google Docs, Linear, GitHub, or another source unless the user explicitly asks in the current session.
+An ordinary plan review is read-only by default. Never post comments to
+Notion, Google Docs, Linear, GitHub, or another source unless the user
+explicitly asks in the current session.
 
 When the user asks to post inline comments on a Notion blueprint:
 
 1. Fetch existing discussions first so you do not duplicate an open thread.
-2. Post only confirmed, worth-reporting findings and useful notes. Do not post refuted candidates.
-3. Rewrite harness language into short, natural engineering feedback while preserving the exact technical claim. State the failure mode and ask for the missing decision or mitigation.
-4. Anchor each comment to the most relevant sentence or reply to an existing discussion on that sentence. Do not dump the whole report into a page-level comment.
-5. Report which comments were posted and which candidates were intentionally omitted.
+2. Post only confirmed, worth-reporting findings and useful notes. Do not
+   post refuted candidates.
+3. Rewrite harness language into short, natural engineering feedback while
+   preserving the exact technical claim. State the failure mode and ask for
+   the missing decision or mitigation.
+4. Anchor each comment to the most relevant sentence or reply to an existing
+   discussion on that sentence. Do not dump the whole report into a
+   page-level comment.
+5. Report which comments were posted and which candidates were intentionally
+   omitted.
 
 ## Hard rules
 
-- **Never post PR comments, reviews, approvals, or plan-document comments unless the user explicitly asks in the current session.** Reading is fine; writing to GitHub, Notion, or another source is a separate user-initiated action. For a GitHub PR comment, use `gh pr comment <n> --body-file <outdir>/comment.md` with the artifact written next to `report.md`.
-- Never modify the PR branch or local checkout. `pi-review pr` works in a disposable worktree by design; `pi-review plan` is also review-only and must not rewrite the source document.
-- Findings come from the report verbatim. Do not add your own findings to the pi-review findings list. If asked for your own opinion, separate it clearly.
-- Serialize `pi-review` runs within one repository. The repository-wide `protocol.lock` can reject contention during any journal transaction, including after model work, so same-repository concurrency can waste spend and abort a review. Reviews in different repositories may run concurrently.
+- **Never post PR comments, reviews, approvals, or plan-document comments
+  unless the user explicitly asks in the current session.** Reading is fine;
+  writing to GitHub, Notion, or another source is a separate user-initiated
+  action. For a GitHub PR comment, use `gh pr comment <n> --body-file
+  <outdir>/comment.md` with the artifact written next to your captured report.
+- Never modify the PR branch or local checkout. PR targets are reviewed in a
+  disposable locked worktree by design; plan targets are review-only and must
+  not rewrite the source document.
+- Findings come from the report verbatim. Do not add your own findings to the
+  pi-review findings list. If asked for your own opinion, separate it clearly.
+- Serialize `pi-review` runs within one repository: every run takes the
+  per-review `review.lock` flock, and a second concurrent run is rejected.
+  Reviews in different repositories may run concurrently. `show` takes no
+  lock.
 
 ## Re-review loops (fix → re-run → repeat)
 
-This section and the convergence protocol below apply to PR/diff sessions, not ordinary plan mode. A plan review is a soft design gate: revise the document or record the human decision, then run another plan review only when the user asks.
+Reviews are multi-round and rounds work by rerunning the same command: a
+pending round resumes, a completed round's successor rechecks. A recheck
+diffs the last completed reviewed tree → the current tree — never merge-base
+or ancestry, so a rebase keeps the delta — and the routing outcome is fixed
+for the generation, so later rounds spend no router call. There is no
+per-finding response or adjudication protocol: a finding stays `open` until
+the code change refutes or fixes it on a recheck (`status: fixed`/`refuted`),
+the finder withdraws it, or a human dismisses it.
 
-When the user wants iterative PR hardening ("fix all issues before merge-ready"), you run pi-review, fix, push, and re-review across rounds. Three lessons from doing this badly (C-19094, 8 rounds):
+- **Reply with `-m <reply>`**: sends your text into the next round's recheck
+  prompt for every finder — this is how you rebut a finding, explain intent,
+  or point at evidence. A reply before any completed round is a usage error.
+- **Dismiss what you will not act on** — including user-ACCEPTED trade-offs,
+  not just false positives. Once the user accepts a finding as out-of-scope /
+  won't-fix / a documented trade-off, run `pi-review dismiss F<n> <reason>`
+  immediately (C-19094: one accepted finding was re-litigated across 3 rounds
+  for want of a dismiss). Dismissal binds the finding to the reviewed blob
+  fingerprint of its file (for a plan target, the document's sha256): the
+  claim stays suppressed while the fingerprint is unchanged — and while the
+  file is deleted — and re-raises under its own id only when that blob
+  changes. Repeating the same dismissal with the same reason is idempotent.
+  Each new dismissal is also ingested into the repository's resolved
+  Hindsight bank; a missing bank or failed ingest is a stderr note only — the
+  local dismissal still applies and the stored report is never mutated.
+- **Codify a STOP rule up front.** "Fix all issues" is not "loop until
+  clean" — adversarial review on complex infra keeps surfacing progressively
+  marginal items. Agree a stop rule with the user early: stop when the only
+  remaining `open` findings are minor-style, an accepted trade-off, or
+  another ticket's scope — then file the residuals as follow-up tickets.
+- **The soft round limit is data, not a flag.** From round 4 the report
+  carries `review.attention: "human-decision"`. The standing owner policy is
+  three rounds then stop (see `courier-pr-gates`): apply the round-three
+  fixes, keep the recorded `verdict` honest, and continue under the owner's
+  fix-and-waive decision.
+- **Freeze the branch while a run is in flight.** Amending, rebasing, or
+  force-pushing the reviewed branch mid-run is drift after capture and ends
+  the round `incomplete` at exit 1 with its spend lost. Land every commit
+  BEFORE launching, and queue further edits until the report returns.
+- **`--fresh` is the reset.** It finalizes any pending round `incomplete`
+  and starts a new generation at round 1 — new routing outcome, new
+  per-finder sessions, F-numbering reset; the retired generation's data is
+  untouched. Use it when the review's premise changed, not to retry a round.
+- **Interrupted rounds resume.** A killed or interrupted round re-dispatches
+  only unfinished work; finished legs replay, never re-spend.
 
-- **Dismiss user-ACCEPTED trade-offs, don't just false positives.** Once the user accepts a finding as out-of-scope / won't-fix / a documented trade-off (e.g. an atomicity trade-off they chose), run `pi-review dismiss <id> --reason "…"` immediately. Otherwise the finder re-derives it from the diff and re-reports it as "confirmed critical" every round — C-19094 re-litigated one accepted finding across 3 rounds for want of a dismiss. Dismiss is for anything you will not act on, not only refuted items.
-- **Codify a STOP rule up front.** "Fix all issues" is not "loop until PASS" — adversarial review on complex infra keeps surfacing progressively marginal/defensive/other-ticket-scope items and never terminates. Agree a stop rule with the user early (AskUserQuestion): **stop when the only remaining confirmed findings are refuted, minor-style, an accepted trade-off, or another ticket's scope** — then file the residuals as follow-up tickets. Fix genuine in-scope correctness/security; don't chase the tail.
-- **Pin the roster on the deep route to avoid a flaky reviewer.** The `deep` route can add a diff-only reviewer that crashes the harness (`RangeError: Invalid string length`, unbounded stdout) or a reviewer that exceeds the per-reviewer cap (`[timeout]`), both yielding no verdict. For a clean re-review, pin the currently admitted Codex finder: `--models "openai-codex/gpt-5.6-sol:high"`. Luna is reserved for correctness roles and must not be used as a finder. Terra is retired and must not be reintroduced. The reserved GLM final-audit candidate is not a finder override. (Background Bash runs are not killed at the foreground `timeout`, so a multi-minute run completes even with a 600000ms tool timeout.)
+## Capability losses to know about
 
-## Lifecycle-v3 convergence and terminal audit
+The rewrite deliberately dropped the old tool's per-finding conversation
+protocol and seat control. Workflow replacements:
 
-Lifecycle-v3 reports carry three bounded evidence fields: `convergenceDiscovery`,
-`convergencePolicy`, and (on terminal full reviews) `finalAudit`. Treat
-`convergencePolicy.stop: true` and any anomaly as an immediate stop; do not retry to
-make the warning disappear. The policy stops on: incomplete, truncated, or uncovered
-discovery coverage; a missing manifest; an unresolved critical/major thread (judged on
-the immutable `sourceSeverity`, so a downgrade to minor does not clear it); a round
-whose net closure is non-positive while work is still unresolved; a thread that took
-two or more evidence-changing responses without closing; the same evidence judged
-unresolved twice; a disposition reversal on identical evidence; and a conflict between
-a thread's immutable provenance and its projected severity or population. The last
-four mean the loop is not converging — file the residual and stop, do not re-run. A clean terminal report must have
-`finalAudit.status: "passed"`, `finalAudit.verdict: "PASS"`, zero audit anomalies,
-`convergencePolicy.stop: false`, and exact matching `headSha`, reviewed tree, and
-coverage-manifest identity. `PASS` with an anomaly is invalid and is converted to
-`BLOCKED`/`needsUser`.
+- Rebutting or appealing a finding → `-m <reply>` (goes to all finders next
+  round) or `dismiss` for items you will not act on. There is no per-finding
+  response channel.
+- "Cheap final sweep" → `pi-review show [--json]` re-reads the last report
+  for free, but there is no free re-adjudication: any new evidence requires a
+  real round.
+- Seat/preset selection → none exists. The Jev router picks the preset once
+  per generation; if a finder seat misbehaves there is no pin to exclude it —
+  record the gap and flag it to the owner.
+- Reviewing uncommitted work → gone. The finder only ever sees a
+  materialized committed tree; commit first.
+- Choosing a base ref → gone. Branch reviews resolve the base themselves
+  (open PR via `gh`, else `origin/<default>` with a `base-fallback` gap); PR
+  targets always use the PR's real base from GitHub metadata, which also
+  covers stacked PRs.
 
-The final-audit seat is selected by the validated `finalAudit.model` configuration
-from the closed audit shortlist. An unset model takes the existing self-route degraded
-path; no calibration or qualification artifact selects or enables an auditor. Provider
-credentials, budgets/reservations, exact route binding, and participant-based
-independence remain authoritative. A paid route still requires current operator
-authorization and an explicit positive reservation. Never substitute a `:free` alias
-and never use `--models` to select the audit.
-Activation of lifecycle-v3 invalidates active sessions that predate policy version 1;
-it does not migrate their evidence. That activation stops the run that triggered it:
-an unbound admission reports `lifecycle-v3-new-session-required` naming the invalidated
-session. Do not retry to make it go away and do not invent a new session — report the
-invalidated session id to the operator. Only with their explicit instruction, rerun with
-`--new-session-after-invalidation <that-session-id>`; the previous session's evidence is
-abandoned, not carried over. If the CLI reports `final-audit-required`, preserve the
-report/diagnostic and stop for operator action: the harness has already written a
-blocked diagnostic report (verdict `BLOCKED`, the `finalAudit` record, the attempted
-calls, the stage duration, and the spend) and a `runs.jsonl` entry, so read those and
-report the audit status and failure code rather than re-running the review.
+## Carried-over lessons
 
-## Convergence protocol: closing threads
-
-pi-review runs a **convergence protocol**: every finding becomes a durable *thread* that is re-listed and re-gates the verdict on EVERY subsequent invocation until it is explicitly terminated. Fixing the code and re-running `pi-review pr` is **not** enough — the finder just re-derives the same defect (or a ledger artifact of it) and the verdict stays `BLOCKED`. A thread terminates only via one of: (a) an implementer **bundle response** (`fixed`/`rebut`) that the adjudicator accepts; (b) the verifier refuting a matched candidate; (c) a matched ledger `pi-review dismiss <id> --reason`.
-
-**After you fix findings and push, submit responses — do not just re-run.** This is the leg the fix→re-run loop is missing when threads never close.
-
-- **`dismiss` vs bundle response — pick by intent.** `pi-review dismiss <id> --reason` is for items you will **not act on**: false positives, accepted trade-offs, out-of-scope. Responses are submitted through a `schemaVersion: 2` `--responses <file>` bundle and are for items you **did act on**: `fixed` (you changed the code) or `rebut` (you argue it's a non-issue with rationale). Close a genuinely fixed finding with a `fixed` bundle response, **not** a dismiss — dismiss suppresses the finding in the ledger, so a future real regression on that code would be masked.
-
-- **Submit responses with `--responses <file>`** (from a checkout of the PR branch whose HEAD is the fix commit):
-  ```
-  pi-review diff --responses responses.json
-  # or: pi-review pr <number> --responses responses.json
-  ```
-  - The envelope is `schemaVersion: 2` and contains one or more coherent bundles. Each bundle declares `bundleId`, `kind` (`fixed` or `rebut`), `threadKeys`, root cause, intended invariant, expected changed dependencies, validation evidence, and per-thread `responses[]`.
-  - Every report footer prints a skeleton with the exact session, invocation, head, thread keys, and revisions. Validation runs before any model call, so malformed input costs ~$0 and appends nothing.
-  - `fixed` responses require a clean checkout and a commit descending from the reviewed head unless `--rebased` explicitly acknowledges rewritten history. A `rebut` response declares no changed dependencies.
-  - Re-run the review once to adjudicate the recorded responses. Recording is cheap; only the adjudication run costs model calls.
-
-- **Lineage / descent gate.** A `fixed` response requires the checked-out HEAD to equal `commit`, and by default `commit` must **descend from** the reviewed head. **If the branch was rebased/force-pushed after the reviewed round**, the strict check rejects (`fixed response commit must descend from envelope headSha`) — pass `--rebased` to acknowledge the rewrite explicitly (HEAD==commit and clean-tree anchors still apply). Prefer responding before rebasing; `--rebased` is the operator escape hatch. A `--wontfix`/rebut response anchors to the **reviewed** head — issue it from a detached worktree at that commit (`git worktree add --detach <tmp> <reviewedHead>`) if the branch has moved.
-
-- **Closed threads stay closed.** A re-derived finding that matches an already-terminal thread no longer reopens it or gates the verdict — it appears under a non-gating `## Reopen candidates` heading with a copy-pasteable command. Reopening is a deliberate human act: `pi-review threads reopen <key> --session <id> --expected-revision <n> --reason "..."`. Same-session rematches of closed themes are suppressed (`session-closed-thread`) so late rounds stop re-litigating.
-
-- **Disputes terminate via escalation.** If the adjudicator keeps countering a response the user has accepted as a trade-off (a `wontfix` it won't agree to), don't loop: `pi-review threads escalate --session <id> --invocation <id> --thread <key> --expected-revision <n> --reason "..."`, then `pi-review threads resolve <key> --session <id> --expected-revision <n+1> --outcome wontfix --reason "..."` — human authority ends the thread as `agreed-wontfix`.
-
-- **Freeze the branch while a run is in flight.** Amending, rebasing, or force-pushing the reviewed branch mid-run kills the run with `ERROR: reconcile headSha mismatch` and its model spend is lost (aicodeflow 2026-07-23: an amend during round 5 wasted the whole round). Land every commit BEFORE launching, and queue further edits until the report returns.
-
-- **Ops notes.** Serialize all `pi-review` operations within one repository; different repositories may run concurrently. Calibration status is diagnostic-only: degraded or missing artifacts may be reported, but they do not gate matcher, adjudicator, finder, verifier, audit, or routing execution. Do not spend on calibration as a prerequisite for a review.
-
-- **Failure mode observed 2026-07-16 (why this section exists).** Two PRs were fixed and re-run without ever submitting responses. Every following invocation re-listed the same threads and stayed `BLOCKED` — the verdict was gated on stale thread artifacts, not live code findings, and a post-fix rebase then blocked the responses path too (this predated `--rebased`).
-
-- **The clean-tree anchor rejects untracked AND ignored files, not just tracked changes (C-19381).** A `fixed` bundle response fails on build outputs, caches, or unrelated untracked files because the check wants a PRISTINE tree. Local agent-state dirs (`.aicodeflow/`, `.claude/`, `.codex/`, `.pi/`, `.pi-review/`, `.worktrees/`) are exempt. For everything else, **submit `--responses` from a throwaway pristine checkout:** `git worktree add --detach <tmp> <fixCommit>` (a fresh checkout has no `node_modules`/caches), run the bundle response there, then remove it. This composes with `--rebased` when the branch was force-pushed.
-
-- **The response-ledger adjudication can crash the run — recognize the floor, don't loop (C-19381).** A batched `fixed`-response adjudication (15 threads) died mid-run with `ERROR: agreed-wontfix accepted only for a rebut response` after processing ~8 threads, leaving no report. This is the convergence protocol diverging into a tooling fault, not a code signal — and by then the finders had already dropped from 10→5, i.e. the code had converged. **When the protocol crashes or keeps re-listing after genuine fixes, stop looping pi-review to a green PASS.** Finalize via the PR's actual required gate instead (for a trycourier/services yellow-risk PR that is a Claude approval: post `/claude-review` as a PR comment, which independently reviews the final code). Escalate/resolve stuck threads with `pi-review threads resolve … --outcome …` only if you must keep the session; otherwise the required gate is the authoritative convergence check.
-
-## Lessons 2026-08-27
-
-- Run `pi-review check` before closing threads by human authority. Escalating or resolving first stales
-  pending `fixed` responses and makes `check` exit 2 with `stale revision`.
-- `threads escalate` requires the full invocation id, not an abbreviated id.
-- Run `check` in the background with a timeout of at least 10 minutes; valid checks can take more than
-  five minutes.
-- Never use `pkill -f` with a pattern that matches the command line running `pkill` itself.
-
-## Lessons 2026-08-25
-
-- In zsh, capture the review process result as `rc=$?`; `status` is read-only and can make a valid
-  review wrapper fail before it records the report.
-- Before every paid round, run `git fetch origin` in the runner clone; a stale base checkout can turn
-  unrelated base changes into out-of-scope findings.
-- `threads escalate` must bind to the invocation that **exposed** the thread, never a later `check`
-  invocation (which is stale for escalation).
-- `check` costs $0 but cannot adjudicate `fixed` responses. Close those through a paid round, or after
-  escalation use human `threads resolve --outcome fixed|wontfix` as appropriate.
-- **Three rounds is the ceiling and there is no override.** `--override-round-limit` was removed; at
-  the ceiling the CLI spends nothing and returns `BLOCKED`/exit 1 with the unresolved threads. Apply
-  only the round-three confirmed fixes, run no fourth review, keep the `BLOCKED` verdict as recorded,
-  and continue under the owner's fix-and-waive decision (`courier-pr-gates`, "pi-review round ceiling
-  reached"). The model-free `verify`/`check` paths and human `threads escalate|resolve` are the only
-  ceiling moves; `--override-abandoned-attempts` lifts a different limit and charges no round.
-- When a finding is re-derived, dismiss it by the current candidate id printed in the report warnings,
-  not by a stale thread or id-only reference. For out-of-scope work, use reason `tracked as <ticket>`.
-- After the substantive review, when no response needs adjudication, run `pi-review check pr <n>` as
-  the cheap `$0` final sweep and take the verdict only from that run's authoritative `report.json`.
-- Never close, retire, or replace a pane while its `pi-review` process is running. Read the transcript,
-  confirm the process has produced `report.json`, and only then perform cleanup.
-
-## Lessons 2026-09-03 (MV4 front: B/C/D rounds, human closure, qualification)
-
-- **`--responses <bundle>` records AND immediately starts a paid round.** Recording is not separable from adjudication; a fix lane told to "record only" must NOT invoke it — validate the bundle from a pristine detached checkout and hand the path to the manager, who runs `pi-review pr <n> --responses <bundle>` as the next round.
-- **Response/bundle ids must be unique per repo.** Generic `thread-N` ids from the footer skeleton collided across PRs (`responseId already used with different content: thread-1-1`). Prefix `<ticket>-r<n>-…`. (Upstream fix: ids namespaced by session/invocation/thread/index since pi-review main `001127f`.)
-- **`threads escalate --invocation` = the invocation that produced the thread's CURRENT revision** (the latest review round that re-listed it), not the round that first exposed it — the earlier invocation is rejected as `stale invocation for escalation`.
-- **Human-closure sequence (owner-authorized closure without a paid round):** `pi-review check pr <n>` ($0) → for each gating thread `threads escalate … --expected-revision <current>` then `threads resolve <key> --expected-revision <current+1> --outcome fixed|wontfix` (never call a refuted claim "fixed" — use `wontfix` with "refuted by test <spec>") → final `check`. `NEEDS_SWEEP` with zero gating threads is the protocol tail; a "reopened-pending-verification" thread still gates until resolved.
-- **Stacked PRs need no flag:** `pi-review pr <n>` diffs against the PR's own base branch (`Mode: diff (base: <branch>)`), so a PR based on another PR branch is already scoped.
-- **Pristine checkout means no node_modules either**; use `git worktree add --detach /tmp/<x> <sha>`; the report cache is keyed by that checkout's directory name but the session follows the PR — the same session id continues.
-- **A closed-by-human session has zero "responded" threads** — it cannot feed `qualify --role batch-verifier --record`.
-- **The batch verifier IS the adjudicator seat** (`cfg.adjudicator`): re-seating it changes production single-thread adjudication and must preserve the configured provenance/self-check policy. Calibration and qualification artifacts are diagnostic-only and do not enable the seat. Structural no-self-verification and exact-seat checks remain authoritative.
-- **Advisory seats can kill a paid run**: `remediation-bundle-advisor … parser-failure` aborted a round before report.json (fixed in `001127f`: fails open). Until the fixed binary is what PATH resolves (`~/.local/bin/pi-review` → main), `remediationBundles.mode="off"` is the workaround.
-- **Round cap with a non-converging finder** (6→3→4, 12→4→8, 13→5→7 confirmed across three rounds while every prior thread resolved): the cap is a signal about the defect population, not the review. No extra round is purchasable, so the option set is: fix-and-waive (the owner's standing 2026-09-04 decision — round-three confirmed fixes only, `BLOCKED` kept as recorded, the pi-review gate owner-waived, `/claude-review` on the final head as the reading gate); fix-and-human-close via `threads escalate|resolve`; a design-level hardening pass on a fresh session; or hold. Bring it with costs and the residual risk named.
-- **Companion gate quirks:** the reusable `claude-pr-review` workflow skips DRAFT PRs silently (run "success", zero objects) — mark ready first; it produced no review body twice on a 16.7k-line single-commit diff (C-20484) — a yellow-tier PR then needs an owner-decided substitute gate.
-
-## Lessons 2026-09-03 (SQS front: stale base refs, admitted models, quota)
-
-- **Before every round, sync the LOCAL base branch.** `pi-review pr` grounds the diff against the clone's local `staging`, not `origin/staging`. In the runner clone (and in the parent clone of any pristine worktree you use for `--responses`): `git fetch origin staging:staging` then verify `git rev-parse staging` equals `git rev-parse origin/staging`. Stale refs admitted merged-sibling hunks as CONFIRMED findings on two PRs and burned a round each; dismiss such artifacts by their current candidate id with reason "not in PR diff; stale local staging grounding".
-- **Admitted models are configuration.** `--models` ids must be active in pi-review's configuration (`~/workspace/pi-review/src/config.mjs`; "invalid reviewer[0] model (… is not active in any configuration)" is a pre-spend rejection). Verified 2026-09-03: `opencode-go/deepseek-v4-flash` works as a full-diff finder (~$0.06/round); `opencode-go/glm-5.3-flash` is the reserved independent final-audit model (ADR-0010) and must NOT be seated as a finder; the Cursor Opus route (`cursor/claude-4.6-opus[-thinking]`) emits output the strict finder parser rejects; matcher and adjudicator are calibrated on `openai-codex/gpt-5.6-luna:high` — changing their id decalibrates them (a Codex quota hit there needs an owner decision, not a config edit).
-- **Codex usage limits surface as parse errors.** A finder trace ending in `"stopReason":"error","errorMessage":"Codex error: The usage limit has been reached"` produces `[parse:<model>] unparseable reviewer output after retry` (exit 2). Read the trace dir before retrying.
-- **Abandoned-attempt ceiling.** After three aborted attempts in a session the CLI requires `--override-abandoned-attempts "<reason>"`; the reason must state the real attempt count and any spend — do not reuse a reason written before a paid attempt.
-- **Concurrent runs.** Never run concurrent operations within the same repository. The repository-wide lock may contend after model work, so serialize PR, plan, and session operations rather than relying on retry. Different repositories may run concurrently.
-
-## Lessons 2026-09-06 (fixed bundles)
-
-- `responses.rN.json`: `headSha` = the reviewed round's head; every `bundles[].commit` = the current PR head; `expectedRevision` from the last report. Mix-ups fail pre-spend: `response headSha mismatch`, `fixed response commit must descend from envelope headSha`. Write the bundle after the last amend.
-- Copy `reviewSessionId` and `reviewInvocationId` byte-for-byte from the authoritative previous `report.json`. `reviewInvocationId` must be the full UUID, never the 8-character display prefix. A prefix passes casual inspection but fails pre-spend with `response session/invocation mismatch`. Before invoking, compare both fields for exact equality against the previous report, not with `startswith`.
-- Each bundle's `rootCause`, `intendedInvariant`, and `validationEvidence` is capped at 2,000 characters. Validate those lengths before invoking. A larger field fails pre-spend, so do not rely on JSON/schema shape alone.
-- Rebased since the last round → `--rebased`. The session is keyed per PR number, so a retargeted stacked PR keeps its rounds.
-- Unchanged thread text across rounds is persisted text, not a missed read (`traces/adjudicator-*.jsonl`). Before re-fixing a still-open thread, get file:line proof at the reviewed head.
-- Runner clone with `staging` checked out: `git pull --ff-only origin staging` before each run.
-
-## Lessons 2026-09-09 (multi-repo, response rounds, closure state)
-- The pinned CLI has NO `--repo` flag; the repository is inferred from the cwd's git remote — run from a clean checkout of the target repo (e.g. a `services-review-runner` clone), never from an author worktree. Two lanes lost a run each to `--repo`.
-- Response bundles use the ROUND-1 review session + invocation ids (the round that opened the thread), not a later round's; thread escalate/resolve commands fail with `session/invocation mismatch` on the wrong pair. `pi-review check` is attach-only.
-- `NEEDS_SWEEP` with zero findings after a response round is the expected closure state under ruling #89 (one round is the gate for config PRs) — record it, do not run a paid sweep.
-- Serialize `pi-review` runs only within the same repository — the lock is repository-scoped, and reviews in different repositories may run concurrently. Check `ps` for a live `pi-review` against the same repository before starting; a queued lane sitting `done`/idle between waits is not stale.
-- Standing brief clauses: author/fix lanes never run `pi-review`; review lanes never push; a confirmed finding on a file the PR does not touch is dismissed as out of scope and filed as a follow-up ticket with AC.
-
-## Lessons 2026-09-10
-- `check` (the `$0 check`) is **attach-only and its session store is per runner clone**: run it from `backend-review-runner` / `services-review-runner` after `git fetch origin staging:staging`; from a worktree it reports "requested session does not exist in this repository".
-- Exit 2 with `Post https://api.github.com/graphql … i/o timeout` is a network fault, not a harness or PR problem: probe `curl -s -m 8 https://api.github.com/`, wait ~5 min, retry once; do not burn the harness re-run on it.
-- A response-first round can keep round-1 threads **still-open on stale evidence** even when the fixed head no longer has the cited code (its re-verification quotes round-1 file:line). Do not spend a third round: human-close with file:line proof at the final head + `$0 check` (`--rebased` after an amend).
+- In zsh, capture the review process result as `rc=$?`; `status` is
+  read-only and can make a valid review wrapper fail before it records the
+  report.
+- Never use `pkill -f` with a pattern that matches the command line running
+  `pkill` itself.
+- A GitHub API/network fault (e.g. an `api.github.com` i/o timeout) is not a
+  harness or PR problem: probe connectivity, wait, retry once; do not burn
+  re-runs on it.
+- Never close, retire, or replace a pane while its `pi-review` process is
+  running — the run holds `review.lock` and interrupting it ends the round
+  `incomplete`.
+- The pinned CLI has no `--repo` flag; the repository is inferred from the
+  cwd's git remote — run from a checkout of the target repo, never from an
+  author worktree with mixed state.

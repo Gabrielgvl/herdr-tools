@@ -78,7 +78,7 @@ Persist the DAG with hflow for parallel or multi-flow runs. Write each flow's `p
 
 Include required documentation, changelog, artifact-path setup, and delivery files in the DAG. Work Tasks may not leave those for promotion.
 
-Use `pi-review plan` when the plan has material architectural risk or uncertainty. For irreversible or high-blast-radius plans (architecture, security/IAM, infrastructure/deployment, production, data migration), use Oracle only when the owner has requested Oracle for the current task, as the manager skill's review routing requires; otherwise use `pi-review plan` and flag the risk to the owner. Continue automatically for reversible in-scope work; pause only at an escalation gate.
+Use `pi-review <file>` (a plan-document target) when the plan has material architectural risk or uncertainty. For irreversible or high-blast-radius plans (architecture, security/IAM, infrastructure/deployment, production, data migration), use Oracle only when the owner has requested Oracle for the current task, as the manager skill's review routing requires; otherwise use `pi-review <file>` and flag the risk to the owner. Continue automatically for reversible in-scope work; pause only at an escalation gate.
 
 ### 3. Work
 
@@ -106,17 +106,22 @@ A worker is complete only when its gate passes and it reports changed paths plus
 
 After every DAG node is complete, launch a fresh `critic`-labeled Task whose `constraints` require read-only review. The critic must review requirements, actual diff, surrounding code, tests, and deliberate simplifications.
 
-The critic always uses `pi-review pr|diff` as auxiliary evidence for implementation review:
+The critic always uses `pi-review` as auxiliary evidence for implementation review
+(`pi-review <n>` for a PR target, bare `pi-review` on the reviewed branch):
 
-1. preflight and calibrate according to the `pi-review-pr` skill;
-2. take the verdict only from the authoritative `report.json`;
-3. consider only confirmed findings, never refuted candidates;
-4. independently classify each confirmed finding as `pertinent` or `followup`;
+1. preflight according to the `pi-review-pr` skill (`command -v pi-review`);
+2. take the verdict only from the authoritative `--json` report (`verdict`;
+   re-read it later with `pi-review show --json` — there is no report file);
+3. consider only findings with `status: "open"` — `refuted`, `fixed`,
+   `withdrawn`, and `dismissed` findings are not gates;
+4. independently classify each open finding as `pertinent` or `followup`;
 5. normalize a pi-review `major` finding to `Important` for this gate.
 
 `pertinent` means reachable, in scope, and necessary for the stated contract. `followup` means valid but outside the current contract or a deliberately deferred improvement. Pertinent Critical or Important findings block promotion and return to a fresh worker. Minor and follow-up findings are recorded but do not block.
 
-Allow at most three critic rounds. Stop earlier on pi-review non-convergence, harness error, or a repeated finding without new evidence. A fourth round requires direct owner authorization.
+Allow at most three critic rounds. Stop earlier on pi-review non-convergence, an `incomplete`/failed round
+(exit 1), or a repeated finding without new evidence. A fourth round requires
+direct owner authorization.
 
 Before approval, the critic records the exact base commit, attached branch, reviewed path set, and complete reviewed Git tree OID. Work from `git rev-parse --show-toplevel`. Compute the OID without writing inside the repository: create temporary object and index directories outside it; point `GIT_OBJECT_DIRECTORY` at the temporary object directory and `GIT_ALTERNATE_OBJECT_DIRECTORIES` at the repository's common object directory; then run `GIT_INDEX_FILE=<temp-index> git read-tree HEAD`, `GIT_INDEX_FILE=<temp-index> git add -A -- .`, and `GIT_INDEX_FILE=<temp-index> git write-tree` from the repository root under those object variables. Clean the temporary directory. The tree OID binds every path, byte, symlink, executable mode, addition, and deletion. Record `git status --porcelain=v1` for diagnostics. Use an isolated worktree containing only deliverable changes; ignored harness receipts remain outside the tree.
 
@@ -138,7 +143,8 @@ The manager reports completion only with:
 
 - selected operating point and supervisor job identity for every delegated phase;
 - DAG nodes and gate results;
-- critic verdict, pi-review report path, and `pertinent`/`followup` dispositions;
+- critic verdict, the pi-review report (captured `--json` stdout — re-readable
+  via `pi-review show --json`), and `pertinent`/`followup` dispositions;
 - reviewed manifest identity;
 - final commit SHA, parent, subject, changed paths, and clean tracked status;
 - promotion artifacts and verified external receipts, or explicit drafts;

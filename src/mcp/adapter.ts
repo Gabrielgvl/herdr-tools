@@ -240,7 +240,7 @@ function errorDetails(error: unknown): unknown {
   return typeof details === "object" && details !== null ? details : undefined;
 }
 
-const LAUNCH_DIAGNOSTIC_PHASES = new Set(["validate", "route", "compile", "handoff", "attachment_publish", "supervision_reserve", "placement", "agent_start", "ready", "prompt_verification", "supervision_bind"]);
+const LAUNCH_DIAGNOSTIC_PHASES = new Set(["validate", "route", "compile", "handoff", "supervision_reserve", "placement", "agent_start", "ready", "prompt_verification", "supervision_bind"]);
 const LAUNCH_EFFECT_CERTAINTIES = new Set<string>(["absent", "partial", "unknown", "confirmed"]);
 const LAUNCH_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 
@@ -331,25 +331,6 @@ function launchRecoveryDetails(details: unknown): Record<string, unknown> {
   if (certainty !== undefined) recovery.effectCertainty = certainty;
   const dispatch = promptDispatchPayload(details.promptDispatch);
   if (dispatch !== undefined) recovery.promptDispatch = dispatch;
-  if (details.attachmentRetained === true) recovery.attachmentRetained = true;
-  if (record(details.attachment)) {
-    const attachment = details.attachment;
-    const attachmentId = launchDiagnosticId(attachment.attachmentId);
-    const path = launchDiagnosticId(attachment.path);
-    const size = attachment.bytes;
-    const sha256 = attachment.sha256;
-    const expiresAt = launchDiagnosticId(attachment.expiresAt);
-    if (attachmentId !== undefined && path !== undefined && typeof size === "number" && Number.isSafeInteger(size) && size >= 1 && typeof sha256 === "string" && /^[0-9a-f]{64}$/u.test(sha256) && expiresAt !== undefined) {
-      recovery.attachment = {
-        attachmentId,
-        path,
-        bytes: size,
-        sha256,
-        expiresAt,
-        ...(launchDiagnosticId(attachment.recipientPaneId) === undefined ? {} : { recipientPaneId: launchDiagnosticId(attachment.recipientPaneId) })
-      };
-    }
-  }
   return recovery;
 }
 

@@ -31,9 +31,8 @@ runtime:
 - `sessionPersistence: true` is required. AGY has no non-persistent flag.
 - The fixed argv is `--model <model> --mode <profile.mode> --dangerously-skip-permissions`,
   where the required fixed mode is exactly `plan` or `accept-edits`, followed by
-  scope-normalized `--add-dir` values and the tools-owned recipient attachment
-  directory. No `--agent`, prompt file, arbitrary argv/env, or hidden profile-body
-  input is accepted, and mode is not launch-overrideable.
+  scope-normalized `--add-dir` values. No `--agent`, prompt file, arbitrary argv/env,
+  or hidden profile-body input is accepted, and mode is not launch-overrideable.
 - Only typed primary overrides `model` and `addDirs` are allowed. Overrides never leak
   into fallbacks; fallback profiles keep their own defaults.
 - `researcher-agy` uses `plan` and falls back to `researcher-claude`, yielding exactly
@@ -69,8 +68,8 @@ The AGY provisional publication is a real job-registry publication, not an inter
   cancel` therefore refuses it with `SUPERVISION_ACTIVE`, and session shutdown remains
   the only manager-controlled cancellation path.
 - Provisional state never counts as exact coverage. The registry keeps
-  `request.targetIds: []`, `activeSupervisorFor` and semantic-review ownership ignore it,
-  and no recipient or attachment capability is registered from it. A pane or terminal
+  `request.targetIds: []`; `activeSupervisorFor` and semantic-review ownership ignore
+  it. A pane or terminal
   shown in the provisional view is evidence for inspection, not an exact identity claim.
 - The registry uses a provisional `commit` and `publish` operation on the same mutation
   control as exact binding. `commit` changes the private job/request state, `publish`
@@ -80,14 +79,14 @@ The AGY provisional publication is a real job-registry publication, not an inter
 
 A failed AGY launch after provisional publication leaves this running, non-cancellable
 provisional job and its recovery evidence in place. Launch failure does not call
-reservation release, settle the supervisor, clean up the child, or register a recipient.
+reservation release, settle the supervisor, or clean up the child.
 The supervisor may settle later only from its own authoritative lifecycle or manager
 session shutdown.
 
 ## AGY launch state machine
 
-The normal profile-only launch, 120-second selected-attempt budget, attachment
-publication, and reservation-before-topology-mutation rules remain in force. AGY then
+The normal profile-only launch, 120-second selected-attempt budget, and
+reservation-before-topology-mutation rules remain in force. AGY then
 uses this reduced-assurance sequence:
 
 1. **Pre-prompt readiness.** A fresh coherent readiness sample must prove the exact pane,
@@ -112,7 +111,7 @@ uses this reduced-assurance sequence:
 5. **Atomic strengthen.** Run the observer-backed strengthening transaction defined
    below. Only after its exact-session commit may the job registry publish exact coverage,
    and only after that commit plus semantic assignment confirmation may launch report
-   success or register the exact recipient and attachment capability.
+   success.
 6. **Steady state.** Once strengthened, the existing exact-session supervision,
    identity-preserving move, reconciliation, notification, and session-lifetime rules
    apply unchanged.
@@ -138,16 +137,15 @@ one observer-backed task on the existing supervisor mutation chain:
    full native-session identity. The existing job-registry publication then atomically
    commits the exact child request and publishes the matching `active` or `degraded`
    state, exact `targetIds: [paneId]`, and exact-identity coverage. No observer sees a
-   half-strengthened supervisor. Recipient and attachment registration occur only after
-   this publication and semantic assignment confirmation.
+   half-strengthened supervisor.
 5. If any step fails, rollback only uncommitted exact-publication changes. Retain the
    provisional supervisor, its running non-cancellable job, evidence, and recovery
    handles. Do not settle or release the reservation, retry or fall back, clean up the
-   child, submit another prompt, or register a recipient.
+   child, or submit another prompt.
 
 A contradiction, timeout, move before strengthening, failed/ambiguous read, or missing
 native session is a visible partial-effect failure. It does not retry, fall back, clean
-up, release the child or provisional recovery handle, register a recipient, or continue
+up, release the child or provisional recovery handle, or continue
 dependent work. Preserve the child, evidence, and recovery handles for inspection.
 
 The sole fallback exception remains the existing exact, non-killed,
@@ -161,19 +159,19 @@ select a fallback.
 ## Deterministic safety matrix
 
 This matrix is normative for the launch unit tests and the disposable integration. Tests
-must count prompt, start, fallback, cleanup, reservation-release, and recipient-registration
+must count prompt, start, fallback, cleanup, and reservation-release
 calls, and must inspect the published job state rather than infer it from an error string.
 
 For every AGY failure row that occurs after provisional publication, `P` means all of the
 following are asserted: launch does not report success, there is no second stdin
-submission, no retry, no fallback start, no cleanup, no reservation release, no recipient
-or attachment registration, and the same provisional supervisor remains published as
+submission, no retry, no fallback start, no cleanup, no reservation release, and the
+same provisional supervisor remains published as
 `operation_phase: "running"`, `state: "provisional"`, live, and non-cancellable. The
 provisional job is not exact coverage.
 
 | Scenario | Required deterministic result |
 | --- | --- |
-| AGY launch with a missing or malformed `assignment` | Reject before mutation. Start, focus, prompt, reservation, cleanup, fallback, and recipient calls are all zero. |
+| AGY launch with a missing or malformed `assignment` | Reject before mutation. Start, focus, prompt, reservation, cleanup, and fallback calls are all zero. |
 | Missing pre-session `agent_session` for AGY | Accept only the AGY readiness sample and publish provisional state. No exact coverage is exposed before strengthening. |
 | Missing pre-session `agent_session` for Pi or Claude | Preserve their current strict readiness requirement. Reject before assignment and never enter the AGY provisional path. |
 | Assignment submission | Dispatch exactly one `herdr agent prompt <pane> --stdin` submission. Never send a second prompt, separate Enter, wait, or recovery submission. |
@@ -192,8 +190,8 @@ provisional job is not exact coverage.
 
 The final row is the only exception to `P`. Every acknowledgement, transport, identity,
 duplicate, move, read, timeout, session, sequence, revision, or strengthening failure
-must retain the provisional supervisor and must not retry, fall back, clean up, release
-its reservation, or register a recipient.
+must retain the provisional supervisor and must not retry, fall back, clean up, or release
+its reservation.
 
 ## Residual risk accepted for AGY only
 
@@ -211,8 +209,6 @@ assignment and are not weakened.
 - The visible v1 sender envelope and `authority: agent; not user/owner` remain mandatory.
 - Prompt injection is single-submit and non-idempotent; unknown or possible effects stay
   visible and terminal.
-- Recipients and attachments are identity-bound and unavailable until AGY strengthening
-  and semantic confirmation succeed.
 - Pi and Claude retain their current complete pre-prompt native-session readiness and
   exact-session supervision with no behavior change.
 - No generic fallback, legacy parser, hidden prompt channel, automatic cleanup, or
@@ -229,7 +225,7 @@ Files: `src/profiles/types.ts`, `src/profiles/parser.ts`,
 `src/profiles/adapters.ts`, `src/profiles/capability.ts`.
 
 Add the discriminated AGY runtime, exact fields, fixed argv, normalized `addDirs`,
-required persistence, attachment capability, and prompt-source rejection. Preserve
+required persistence, and prompt-source rejection. Preserve
 Pi/Claude behavior and reject unsupported fields.
 
 ### Slice 2: provisional state and job publication
@@ -268,19 +264,16 @@ Files: `src/tools/launch.ts`, `src/tools/inspect.ts`, `src/launch-schema.ts`,
 
 Require the typed `assignment`; implement the pre-prompt reduced-assurance baseline, one
 submission, 5-second native-session/lifecycle confirmation, strengthen-before-success,
-recipient ordering, and exact zero-effect fallback. Implement every row of the
+and exact zero-effect fallback. Implement every row of the
 deterministic safety matrix above as call-count and published-state assertions. Keep
 Pi/Claude readiness unchanged.
 
-### Slice 6: recipients and attachments
+### Slice 6: recipients and attachments (superseded)
 
-Files: `src/tools/communicate.ts`, `src/messages/recipients.ts`,
-`src/messages/store.ts`, `test/unit/messages.test.ts`,
-`test/unit/communicate.test.ts`.
-
-Reuse the existing identity-bound registry and attachment store. Test that AGY
-registration and attachment delivery require the strengthened exact identity and that
-replacement, missing capability, and directory mismatch fail closed.
+Superseded 2026-09-27 (herdr-governor rewrite, Phase 0): the identity-bound recipient
+registry and tools-owned attachment store this slice introduced were superseded and
+deleted, along with `src/messages/recipients.ts` and `src/messages/store.ts`. Retained
+for historical context only.
 
 ### Slice 7: bundled profile and catalog guidance
 
@@ -301,7 +294,7 @@ Files: `README.md`, `SPEC.md`, `docs/specs/profile-backed-delegation.md`,
 `docs/specs/manager-profile-capabilities.md`,
 `docs/specs/large-agent-communications.md`.
 
-Update current catalog/runtime/attachment statements to include AGY without rewriting
+Update current catalog/runtime statements to include AGY without rewriting
 historical ADRs.
 
 ### Slice 9: disposable AGY integration
@@ -312,7 +305,7 @@ Files: `test/integration/disposable-session.ts`,
 
 Use the existing condition-based integration helpers in a disposable named session.
 Exercise successful provisional-to-native strengthening, exact identity supervision,
-attachment access, the single prompt, and only the proven pre-interactive AGY-to-Pi
+the single prompt, and only the proven pre-interactive AGY-to-Pi
 fallback. A skipped AGY run is not a pass; the active user session is never mutated.
 
 ## Qualification
@@ -332,7 +325,7 @@ git diff --check
 
 The AGY integration must prove the native-session confirmation and provisional supervisor
 transition. The launch unit tests must execute every safety-matrix row and assert the
-no-retry, no-fallback, no-cleanup, no-release, and no-recipient invariants. Any missing,
+no-retry, no-fallback, no-cleanup, and no-release invariants. Any missing,
 contradictory, moved, timed-out, or ambiguous evidence blocks release; it is not a reason
 to retry, clean up, release the provisional job, or weaken Pi/Claude.
 

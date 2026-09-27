@@ -481,7 +481,7 @@ unobserved counts. Event history is bounded to `SUPERVISION_MAX_EVENTS = 48` wit
 follows:
 
 1. `supervision_reserve` runs **before any topology mutation**, immediately after the
-   pre-flight/attachment block. It ensures the session monitor is connected,
+   pre-flight block. It ensures the session monitor is connected,
    bootstrapped, and subscribed, and registers the supervisor job in `accepted`, returning a
    stable job ID. A failure here is an ordinary early failure with `effectCertainty:
    "absent"` and code `SUPERVISION_UNAVAILABLE`.
@@ -494,7 +494,7 @@ follows:
 
 Queued closure, release, replacement, or identity-loss evidence during bind makes the bind
 reject. Any bind failure throws `SUPERVISION_UNCONFIRMED` as a partial-effect failure, sends
-no focus or prompt, registers no recipient, performs no retry or child cleanup, and releases
+no focus or prompt, performs no retry or child cleanup, and releases
 only the unbound reservation. A failed bind rolls any provisional request fields back to the
 reserved snapshot with `targetIds: []`. The real child and failed binding evidence remain
 available for manual inspection.
@@ -509,7 +509,7 @@ most once. An acknowledged prompt whose semantic consumption is not proven throw
 `LAUNCH_FAILED` with `causeCode: "PROMPT_UNCONFIRMED"`, `assignmentState: "unconfirmed"`,
 `promptSubmitted: true`, the exact pane ID, the retained active supervisor job ID, and bounded
 recovery evidence. The confirmation path never auto-sends Enter, retries prompt or start,
-focuses again, closes or reuses the pane, registers a recipient, or authorizes dependent work.
+focuses again, closes or reuses the pane, or authorizes dependent work.
 The fixed recovery instruction tells the manager to inspect the existing child with
 `herdr_inspect` and the supervisor with `herdr_jobs get`.
 

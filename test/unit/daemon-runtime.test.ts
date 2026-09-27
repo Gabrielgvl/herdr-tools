@@ -9,7 +9,6 @@ import { createHandoffAllocator } from "../../src/handoff.js";
 import { createRuntime } from "../../index.js";
 import { JobRegistry } from "../../src/job-registry.js";
 import type { LaunchTask } from "../../src/launch-schema.js";
-import { RecipientRegistry } from "../../src/messages/recipients.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
 import { SupervisionRegistry } from "../../src/supervision/registry.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
@@ -271,7 +270,6 @@ describe("createSharedRuntime", () => {
     expect(runtime.jobs).toBe(jobs);
     expect(runtime.supervision).toBeInstanceOf(SupervisionRegistry);
     expect(runtime.ownership).toBeInstanceOf(RuntimeOwnership);
-    expect(runtime.recipients).toBeInstanceOf(RecipientRegistry);
     expect(typeof runtime.handoffs.bind).toBe("function");
     expect(typeof runtime.queueFlush.writeSection).toBe("function");
     await runtime.supervision.shutdown();
@@ -337,19 +335,15 @@ describe("daemonDispatcher", () => {
 });
 
 describe("createRuntime (Pi host)", () => {
-  it("accepts host-injected prompt client, attachments, and recipients onto the shared assembly", async () => {
+  it("accepts a host-injected prompt client onto the shared assembly", async () => {
     const stub = execStub();
-    const recipients = new RecipientRegistry();
+    const promptClient = { prompt: async () => ok({}), ping: async () => undefined };
     const runtime = createRuntime(
       { exec: stub.exec },
       {},
-      {
-        promptClient: { prompt: async () => ok({}), ping: async () => undefined },
-        attachments: { root: "/tmp", recipientDirectory: (key: string) => `/tmp/${key}`, ensureRecipient: async () => { throw new Error("unused"); }, publish: async () => { throw new Error("unused"); } },
-        recipients,
-      },
+      { promptClient },
     );
-    expect(runtime.recipients).toBe(recipients);
+    expect(runtime.cli).toBeDefined();
     await runtime.supervision.shutdown();
     runtime.jobs.shutdown();
     await runtime.queueFlush.shutdown();

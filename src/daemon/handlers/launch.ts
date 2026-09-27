@@ -157,8 +157,6 @@ async function executeDaemonLaunch(
     ownership: runtime.ownership,
     supervision: runtime.supervision,
     queueFlush: runtime.queueFlush,
-    attachments: runtime.attachments,
-    recipients: runtime.recipients,
     preflight: createPreflight(runtime.cli),
     eventWriter: runtime.eventWriter,
     ...(runtime.launchDeps ?? {}),

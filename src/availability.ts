@@ -12,9 +12,7 @@
  * unsupported-config / permission-prompt / transport / task-failure — and
  * only `quota` cools a key down. An unrecognized code classifies
  * `task-failure`: unknown evidence is never quota evidence, so no cooldown is
- * ever invented from an unfamiliar string. `ATTACHMENT_QUOTA_EXCEEDED` is the
- * local attachment store's bound, not a provider account, and never cools a
- * key down either.
+ * ever invented from an unfamiliar string.
  *
  * Cooldowns key on provider + billingProduct + account + scope via the B1
  * `quotaKeyFor` derivation — the runner name is never part of the key, so two
@@ -136,7 +134,6 @@ const FAILURE_CLASS_BY_CODE: Readonly<Record<string, LaunchFailureClass>> = {
   unsupported_capability: "unsupported-config",
   capability_unsupported: "unsupported-config",
   unsupported_operation: "unsupported-config",
-  ATTACHMENT_TARGET_UNVERIFIED: "unsupported-config",
   HANDOFF_TARGET_UNVERIFIED: "unsupported-config",
   INVALID_PROFILE: "unsupported-config",
   INVALID_PROFILE_OVERRIDE: "unsupported-config",
@@ -205,8 +202,6 @@ const FAILURE_CLASS_BY_CODE: Readonly<Record<string, LaunchFailureClass>> = {
   TARGET_BLOCKED: "task-failure",
   AGENT_NAME_TAKEN: "task-failure",
   ADOPT_TARGET_UNQUALIFIED: "task-failure",
-  ATTACHMENT_QUOTA_EXCEEDED: "task-failure",
-  ATTACHMENT_STORE_FAILED: "task-failure",
   PAYLOAD_TOO_LARGE: "task-failure",
   PAYLOAD_TOO_LARGE_FOR_INLINE: "task-failure",
   BATCH_NAME_COLLISION: "task-failure",

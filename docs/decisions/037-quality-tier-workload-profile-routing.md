@@ -4,6 +4,8 @@
 
 Accepted. Ratified 2026-09-24 against the shipped implementation at policy revision `adr-037-p3`: the originally migrated speculative design (six workload choices, resource Nouls, per-point fitness Nouls, intent-interval tier policy, four-attempt same-tier chain) was simplified to three questions, a direct weakest-sufficient-tier answer, and catalog-authored chains. Amended 2026-09-24 at policy revision `adr-037-p5`: the caller tier became a bounded override (see Workload tier policy). The sections below describe the shipped behavior; the superseded design is marked historical where it remains for context.
 
+Amended 2026-09-27 (herdr-governor rewrite, Phase 0): replicas were removed — the `replicas` Task field, the isolated `.herdr/worktrees` replica worktrees, and the per-child `worktree` result field no longer exist; every launch is exactly one child and the router still records `count`, always `1`. The `### Replicas` section and the other replica and worktree mentions below are historical.
+
 ## Date
 
 2026-09-21

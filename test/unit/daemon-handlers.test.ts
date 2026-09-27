@@ -11,7 +11,6 @@ import { createHandoffGate } from "../../src/handoff-gate.js";
 import type { JobRegistry } from "../../src/job-registry.js";
 import type { LaunchTask } from "../../src/launch-schema.js";
 import type { AgentSessionIdentity } from "../../src/messages/prompt.js";
-import type { AttachmentStore } from "../../src/messages/store.js";
 import type { TaskModelDecision } from "../../src/router.js";
 import type { SupervisedIdentity } from "../../src/supervision/identity.js";
 import type { ClaudeQuotaSignal } from "../../src/supervision/claude-quota.js";
@@ -188,16 +187,6 @@ function responseFor(catalog: Catalog): TaskModelDecision {
   };
 }
 
-function fakeAttachments(): AttachmentStore {
-  const grant = { path: "/tmp/recipient", token: "grant", renew: vi.fn(async () => undefined), release: vi.fn(async () => undefined) };
-  return {
-    root: "/tmp",
-    recipientDirectory: (key) => `/tmp/${key}`,
-    ensureRecipient: vi.fn(async () => grant),
-    publish: vi.fn(async () => ({ attachmentId: "attachment", path: "/tmp/recipient/body.txt", bytes: 1, sha256: "a".repeat(64), expiresAt: "2026-09-19T00:00:00.000Z" })),
-  };
-}
-
 const openLaunchGate = async () => ({ check: async () => undefined, release: async () => undefined });
 
 /** A persisted-but-unbound run: durable identity, no bound child record yet. */
@@ -209,7 +198,7 @@ async function persistRun(fx: Harness, agentName = "task-aa-1"): Promise<Awaited
   };
   const provenance: HandoffProvenanceInput = {
     managerSession,
-    task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: [], tier: "standard", replicas: 1 },
+    task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: [], tier: "standard" },
   };
   await fx.allocator.persist(allocation, identity, provenance);
   return allocation;
@@ -379,16 +368,10 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
         supervision,
         specClient: { evaluate: vi.fn(async () => { if (options.specError !== undefined) throw options.specError; return { kind: "response" as const, response: responseFor(catalog) }; }) },
         catalog: { load: async () => catalog },
-        attachments: fakeAttachments(),
         routerLog,
         launchGate,
         availabilityFailureRecorder: failureRecorder,
         ...(options.claudeQuotaReader === undefined ? {} : { claudeQuotaReader: options.claudeQuotaReader }),
-        worktrees: {
-          prepare: vi.fn(async ({ cwd }: { cwd: string }) => ({ cwd, worktreePath: cwd })),
-          bindPane: vi.fn(),
-          release: vi.fn(async () => undefined),
-        } as never,
       },
     }),
   });
@@ -619,16 +602,16 @@ describe("daemon launch handler — intent-gated execution", () => {
   });
 
   it("lands partial launch effect certainty as unresolved — never a fabricated completion", async () => {
-    const fx = await harness({ startErrors: { 1: Object.assign(new Error("start refused"), { code: "CLI_PROTOCOL_ERROR" }) } });
-    const reply = await handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { task: { ...task, replicas: 2 } })) as DaemonLaunchReply & { result: LaunchResult };
-    expect(reply.result.outcome).toBe("partial");
+    const fx = await harness({ startErrors: { 0: Object.assign(new Error("start refused"), { code: "CLI_PROTOCOL_ERROR" }) } });
+    const reply = await handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot)) as DaemonLaunchReply & { result: LaunchResult };
+    expect(reply.result.outcome).toBe("failed");
     expect(reply.state).toBe("unresolved");
     const intent = (await fx.intents.list(managerKey))[0]!;
     expect(intent.state).toBe("unresolved");
     expect(intent.effectCertainty).toBe("partial");
     expect(intent.resolution).toBe("effect_uncertain");
-    // Both runs were durably recorded — the failed child's persist is itself evidence.
-    expect(intent.children).toHaveLength(2);
+    // The failed child's run was durably recorded — the persist is itself evidence.
+    expect(intent.children).toHaveLength(1);
   });
 
   it("lands unknown thrown-effect certainty as unresolved, and propagates the typed failure", async () => {
@@ -832,33 +815,42 @@ describe("daemon launch handler — intent-gated execution", () => {
   });
 
   it("reaches the pipeline's injected-dependency fallbacks on a bare launch tool", async () => {
-    // A launch tool built like the host surfaces build it: no attachments,
-    // handoffs, or clock injected — the production `??` defaults engage inside
-    // executeChild. A throwing context resolver stops the child after those
-    // defaults bind but before the default allocator can touch disk.
+    // A launch tool built like the host surfaces build it: no handoffs or
+    // clock injected — the production `??` defaults engage inside executeChild.
+    // Validate mints the run before the child starts, so the ambient allocator
+    // needs a hermetic endpoint namespace; the throwing context resolver still
+    // stops the child before the minted run is persisted.
     const fx = await harness();
-    const catalog = catalogOf(["pi-model"]);
-    const tool = createLaunchTool({
-      cli: { runJson: async () => ok("cli", {}), prompt: async () => ok("cli", {}) },
-      context: { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" },
-      contextResolver: async () => { throw new Error("unproven"); },
-      preflight: async () => undefined,
-      supervision: fx.supervision,
-      specClient: { evaluate: async () => ({ kind: "response" as const, response: responseFor(catalog) }) },
-      catalog: { load: async () => catalog },
-      routerLog: vi.fn(async () => undefined),
-      launchGate: openLaunchGate,
-    });
-    const signal = new AbortController().signal;
-    const result = await tool.execute("bare", task, signal, undefined, { cwd: fx.projectRoot, signal } as never);
-    const launched = result.details as LaunchResult;
-    // The admitted route resolved with the default stores engaged; the child
-    // failed closed at context resolution — no run was allocated anywhere.
-    expect(launched.outcome).toBe("failed");
-    expect(launched.children[0]?.state).toBe("failed");
-    // A second execute reuses the module-level default allocator (`??=` left side).
-    const second = await tool.execute("bare2", task, signal, undefined, { cwd: fx.projectRoot, signal } as never);
-    expect((second.details as LaunchResult).children[0]?.state).toBe("failed");
+    const endpointRoot = await mkdtemp(join(tmpdir(), "herdr-daemon-n21-endpoint-"));
+    dirs.push(endpointRoot);
+    await writeFile(join(endpointRoot, "herdr.sock"), "");
+    vi.stubEnv("HERDR_SOCKET_PATH", join(endpointRoot, "herdr.sock"));
+    try {
+      const catalog = catalogOf(["pi-model"]);
+      const tool = createLaunchTool({
+        cli: { runJson: async () => ok("cli", {}), prompt: async () => ok("cli", {}) },
+        context: { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" },
+        contextResolver: async () => { throw new Error("unproven"); },
+        preflight: async () => undefined,
+        supervision: fx.supervision,
+        specClient: { evaluate: async () => ({ kind: "response" as const, response: responseFor(catalog) }) },
+        catalog: { load: async () => catalog },
+        routerLog: vi.fn(async () => undefined),
+        launchGate: openLaunchGate,
+      });
+      const signal = new AbortController().signal;
+      const result = await tool.execute("bare", task, signal, undefined, { cwd: fx.projectRoot, signal } as never);
+      const launched = result.details as LaunchResult;
+      // The admitted route resolved with the default stores engaged; the child
+      // failed closed at context resolution — the minted run was never persisted.
+      expect(launched.outcome).toBe("failed");
+      expect(launched.children[0]?.state).toBe("failed");
+      // A second execute reuses the module-level default allocator (`??=` left side).
+      const second = await tool.execute("bare2", task, signal, undefined, { cwd: fx.projectRoot, signal } as never);
+      expect((second.details as LaunchResult).children[0]?.state).toBe("failed");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("registers the claude completion-signal callback on a claude runner", async () => {
@@ -897,7 +889,6 @@ describe("daemon launch handler — intent-gated execution", () => {
       ownership: fx.runtime.ownership,
       supervision: fx.supervision,
       queueFlush: fx.runtime.queueFlush,
-      recipients: fx.runtime.recipients,
       preflight: async () => undefined,
       ...launchDeps,
       cli: fx.runtime.cli,

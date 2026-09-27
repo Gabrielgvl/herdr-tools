@@ -21,10 +21,9 @@ const TaskItem = Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" });
  *
  * `tier` is an optional bounded override (adr-037-p5): omission lets Jev's
  * weakest-sufficient floor decide; an explicit tier raises the start by at
- * most one tier and never lowers it. `replicas` repeats one Task over isolated
- * runtime worktrees. `recoveryOf` names the failed child's managed handoff
- * run UUID (not its child target or launch ID). Recovery requires one replica
- * and forbids `cwd`; it resumes the recorded workspace.
+ * most one tier and never lowers it. `recoveryOf` names the failed child's
+ * managed handoff run UUID (not its child target or launch ID). Recovery
+ * forbids `cwd`; it resumes the recorded workspace.
  * `label` is display metadata bounded at 256 UTF-8 bytes that never affects
  * routing, Jev state, Task revision, machine identity, pane naming, tab
  * selection, or target resolution. `cwd` is any accessible directory,
@@ -48,13 +47,7 @@ export const LaunchTaskSchema = Type.Object({
   tier: Type.Optional(StringEnum(QUALITY_TIERS, {
     description: "Optional; usually omit it. Omitted, routing starts at the weakest sufficient tier it judges from the Task text. Set, it raises that start by at most one tier and never lowers it; if the Task text hides the real difficulty, describe the difficulty instead. utility: mechanical read-only lookup or listing. economy: one local low-risk change or bounded explanation. standard: bounded work within one subsystem, including read-only review of a diff or named files. strong: sustained reasoning across components, repo-wide checklist review, or orchestrating other agents. frontier: one exceptional risk such as an unknown root cause, a race or locking, a trust boundary, or a state migration. max: two or more frontier risks together. Importance, phase labels such as scout or critic, file count, and reply, PII, or read-only rules do not raise a tier."
   })),
-  replicas: Type.Optional(Type.Integer({
-    minimum: 1,
-    maximum: 8,
-    default: 1,
-    description: "Identical Task replicas over provably isolated Git worktrees; values above one fail closed without isolation."
-  })),
-  recoveryOf: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$", description: "Managed handoff run UUID from the failed child's Herdr supervision receipt, not a child target or launch ID. Recovery requires one replica and no cwd; close the failed child first." })),
+  recoveryOf: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$", description: "Managed handoff run UUID from the failed child's Herdr supervision receipt, not a child target or launch ID. Recovery forbids cwd; close the failed child first." })),
   label: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$", maxByteLength: 256, description: "Display-only metadata; never enters routing contracts, pane identity, or decision evidence. Bounded at 256 UTF-8 bytes." })),
   cwd: Type.Optional(Identifier)
 }, { additionalProperties: false });

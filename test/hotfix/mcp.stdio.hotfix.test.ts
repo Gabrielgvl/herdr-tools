@@ -78,13 +78,12 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
     prompts?: AgentPromptClient;
     commandExitCodes: number[];
     confirmedPanes: string[];
-    attachmentPaths: string[];
     provenReceipts: Record<string, unknown>[];
     /** The most recent joined recipient identity, retained for a failing case. */
     lastJoinedIdentity?: Record<string, unknown>;
     receipt?: Record<string, unknown>;
     preserve: boolean;
-  } = { cwd: "", serverStarted: false, daemonStderr: "", commandExitCodes: [], confirmedPanes: [], attachmentPaths: [], provenReceipts: [], preserve: false };
+  } = { cwd: "", serverStarted: false, daemonStderr: "", commandExitCodes: [], confirmedPanes: [], provenReceipts: [], preserve: false };
 
   const run = async (...args: string[]): Promise<unknown> => {
     try {
@@ -612,71 +611,9 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} MCP stdio host`, () => {
       const normalReceipt = receipt("normal-prompt", normal.details, normalRequest, normalCompletion, normalBody, normalGenerated.body, normalGenerated.commandExitCode, { bodyFilePath: normalPath, commandExitFilePath: `${normalPath}.exit`, generatedBodySha256: normalGenerated.sha256 });
       await saveProvenReceipt(normalReceipt);
 
-      // Attachment delivery is runtime-owned on the new surface: a Task whose
-      // rendered assignment exceeds the inline bound publishes an attachment
-      // and the prompt carries only the envelope reference.
-      const attachmentNonce = randomUUID();
-      const generatedAttachmentPath = join(state.cwd, `mcp-attachment-readback-${attachmentNonce}.txt`);
-      const attachmentPad = `PADDING ${attachmentNonce}\n${"attachment-delivery-fixture\n".repeat(700)}`;
-      const attachmentTask = {
-        objective: [
-          `The assignment arrives as an attachment. Read the entire attachment file named by attachment-path in your message envelope using Bash; do not use a summary, nonce, or partial body.`,
-          `Use Bash to copy the attachment bytes exactly to the private expected output file ${generatedAttachmentPath}; do not add or remove a trailing newline.`,
-          `Verify the copied file SHA-256 equals the independent expected attachment-sha256 from the envelope, capture that copy-and-verify command's exit code, and write the decimal code to ${generatedAttachmentPath}.exit.`,
-          `Then reply with exactly attachment-sha256: <that hash> and no other text.`,
-          `The block below exists only to push this assignment past the inline delivery bound; ignore its content entirely.`,
-          attachmentPad
-        ].join("\n"),
-        scope: `Read the published attachment and write only ${generatedAttachmentPath} and ${generatedAttachmentPath}.exit; do not change any other resource.`,
-        doneWhen: [`The recipient-generated file ${generatedAttachmentPath} contains exactly the bytes of the published attachment.`],
-        constraints: ["none"],
-        label: `hotfix-mcp-attachment-${process.pid}`
-      };
-      const attachmentBefore = state.proxy!.requests.length;
-      const attachmentReply = await call("herdr_launch", { task: attachmentTask, idempotencyKey: `mcp-attachment-${attachmentNonce}` });
-      const attachmentChild = launchedChildOf(attachmentReply, "MCP attachment launch");
-      const attachmentKind = routedKind(attachmentChild);
-      const attachmentRunId = String(attachmentChild.runId);
-      const attachmentStatus = await waitStatusChild(attachmentRunId, "MCP attachment launch");
-      const attachmentPaneId = String(attachmentStatus.paneId);
-      state.confirmedPanes.push(attachmentPaneId);
-      const attachmentRequest = assertOneRequest(attachmentBefore, "MCP attachment launch");
-      // The attachment fields ride the delivered envelope — the wire contract
-      // itself — since the uniform launch reply deliberately omits them.
-      const attachmentText = attachmentRequest.text ?? "";
-      const attachmentField = (name: string): string => {
-        const found = attachmentText.match(new RegExp(`^attachment-${name}: (.+)$`, "m"));
-        if (!found) throw new Error(`MCP attachment envelope omitted attachment-${name}`);
-        return found[1]!.trim();
-      };
-      const attachmentPath = attachmentField("path");
-      const attachmentSha256 = attachmentField("sha256");
-      const attachmentBytesDeclared = Number(attachmentField("bytes"));
-      state.attachmentPaths.push(attachmentPath);
-      const attachmentBytes = await readFile(attachmentPath);
-      const expectedAttachmentBody = attachmentBytes.toString("utf8");
-      expect(attachmentText).toContain("delivery: attachment");
-      expect(attachmentText).not.toContain(attachmentNonce);
-      expect(attachmentBytes.byteLength).toBe(attachmentBytesDeclared);
-      expect(digest(attachmentBytes)).toBe(attachmentSha256);
-      const attachmentExpectedIdentity = await expectedIdentityOf(attachmentPaneId, attachmentKind, "MCP attachment");
-      const generatedAttachment = await generatedBody(generatedAttachmentPath, expectedAttachmentBody, `${generatedAttachmentPath}.exit`);
-      expect(generatedAttachment.bytes).toBe(attachmentBytes.byteLength);
-      expect(generatedAttachment.sha256).toBe(digest(attachmentBytes));
-      expect(generatedAttachment.sha256).toBe(attachmentSha256);
-      const attachmentCompletion = await waitForRecipientCompletion(attachmentPaneId, attachmentKind, attachmentExpectedIdentity, "MCP attachment readback");
-      const attachmentReceipt = receipt("attachment-complete-body", attachmentReply, attachmentRequest, attachmentCompletion, expectedAttachmentBody, generatedAttachment.body, generatedAttachment.commandExitCode, {
-        bodyFilePath: attachmentPath,
-        generatedBodyFilePath: generatedAttachmentPath,
-        commandExitFilePath: `${generatedAttachmentPath}.exit`,
-        generatedBodySha256: generatedAttachment.sha256,
-        attachmentSha256: digest(attachmentBytes)
-      });
-      await saveProvenReceipt(attachmentReceipt);
-      await closePane(attachmentPaneId, "MCP attachment recipient");
       await closePane(piPaneId, "MCP Pi recipient");
 
-      const receipts = [smokeReceipt, piReceipt, normalReceipt, steerReceipt, attachmentReceipt];
+      const receipts = [smokeReceipt, piReceipt, normalReceipt, steerReceipt];
       expect(new Set(receipts.map((item) => item.case))).toEqual(new Set(HOTFIX_MANDATORY_CASES));
       expect(state.commandExitCodes.length).toBeGreaterThan(0);
       expect(state.commandExitCodes.every((code) => code === 0)).toBe(true);

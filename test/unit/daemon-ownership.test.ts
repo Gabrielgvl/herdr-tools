@@ -27,7 +27,7 @@ const pane = (id: string, native = session(`/${id}.jsonl`)) => ({
 const snapshot = (panes = [pane(owner.paneId, owner.session), pane(successor.paneId, successor.session)]) => parseSnapshotResult({
   type: "session_snapshot", snapshot: { version: "test", protocol: 22, workspaces: [], tabs: [], panes, agents: panes.map((entry) => ({ ...entry, name: entry.agent_name })) },
 });
-const task = { objective: "test", scope: "test", doneWhen: ["test"], constraints: [], tier: "standard" as const, replicas: 1 };
+const task = { objective: "test", scope: "test", doneWhen: ["test"], constraints: [], tier: "standard" as const };
 async function fixture(count = 1) {
   const root = await mkdtemp(join(tmpdir(), "ownership-")); roots.push(root);
   const namespace = { dir: join(root, "daemon"), endpoint: join(root, "socket") };
@@ -286,7 +286,7 @@ describe("journaled ownership", () => {
     expect(await readdir(join(f.namespace.dir, "transfers", "done"))).toEqual([`${plan.transferId}.json`]);
   });
 
-  it("reconciles EVERY replica: exact bind + absent disposition cannot close while any child is ambiguous", async () => {
+  it("reconciles EVERY child: exact bind + absent disposition cannot close while any child is ambiguous", async () => {
     const f = await fixture(3); const intent = await interruptedIntent(f);
     const before = await readHandoffState(f.runs[1]!);
     const bind = vi.fn(async () => undefined);

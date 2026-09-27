@@ -54,7 +54,7 @@ const ownerSession: AgentSessionIdentity = { source: "herdr:pi", agent: "pi", ki
 const successorSession: AgentSessionIdentity = { source: "herdr:pi", agent: "pi", kind: "id", value: "mgr-successor" };
 const ownerKey = managerSessionKey(ownerSession);
 const childSession: AgentSessionIdentity = { source: "herdr:pi", agent: "pi", kind: "path", value: "/pi/child.jsonl" };
-const task: HandoffTaskContract = { objective: "do the thing", scope: "repo", doneWhen: ["it works"], constraints: [], tier: "standard", replicas: 1 };
+const task: HandoffTaskContract = { objective: "do the thing", scope: "repo", doneWhen: ["it works"], constraints: [], tier: "standard" };
 
 const ok = (result: unknown): JsonEnvelope => ({ id: "op", result });
 

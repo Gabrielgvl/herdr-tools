@@ -43,7 +43,7 @@ describe("DaemonLaunchRequestSchema", () => {
     expect(Value.Check(DaemonLaunchRequestSchema, { task: { ...task, replicas: 9 }, idempotencyKey: "k" })).toBe(false);
     expect(Value.Check(DaemonLaunchRequestSchema, { task: "not-a-task", idempotencyKey: "k" })).toBe(false);
     expect(Value.Check(DaemonLaunchRequestSchema, {
-      task: { ...task, tier: "frontier", replicas: 2, label: "x", constraints: ["c"], cwd: "/tmp" },
+      task: { ...task, tier: "frontier", label: "x", constraints: ["c"], cwd: "/tmp" },
       idempotencyKey: "k",
     })).toBe(true);
   });
@@ -53,6 +53,8 @@ describe("live launch surface (zero-impact guard)", () => {
   it("keeps LaunchTaskSchema byte-identical: idempotencyKey is an unknown field", () => {
     expect(Value.Check(LaunchTaskSchema, task)).toBe(true);
     expect(Value.Check(LaunchTaskSchema, { ...task, idempotencyKey: "k" })).toBe(false);
+    // The removed `replicas` field is now an undeclared key and rejects.
+    expect(Value.Check(LaunchTaskSchema, { ...task, replicas: 1 })).toBe(false);
     expect(PublishedLaunchParamsSchema).toBe(LaunchTaskSchema);
   });
 });

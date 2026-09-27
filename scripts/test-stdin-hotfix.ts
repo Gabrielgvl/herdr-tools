@@ -15,16 +15,14 @@ export const HOTFIX_MANDATORY_CASES = [
   "seven-tool-smoke",
   "pi-inline-launch",
   "normal-prompt",
-  "steer-working",
-  "attachment-complete-body"
+  "steer-working"
 ] as const;
 
 const HOTFIX_CASE_KINDS: Record<string, "pi" | "claude"> = {
   "seven-tool-smoke": "pi",
   "pi-inline-launch": "pi",
   "normal-prompt": "pi",
-  "steer-working": "pi",
-  "attachment-complete-body": "pi"
+  "steer-working": "pi"
 };
 
 type HotfixHost = "pi" | "mcp";

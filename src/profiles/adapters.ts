@@ -185,13 +185,13 @@ export function buildPiArgv(profile: Extract<Profile["runtime"], { kind: "pi" }>
  * deliberately weaker than the Pi allowlist and must not be described as
  * isolation.
  */
-export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string, attachmentDirectory?: string, handoffDirectory?: string): string[] {
+export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "claude" }>, sessionPersistence: boolean, overrides: ClaudeRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string, handoffDirectory?: string): string[] {
   if (!sessionPersistence) throw new ProfileAdapterError("Claude profiles must set sessionPersistence to true for interactive launches");
   const effective = resolveClaudeRuntime(profile, overrides, scopeRoot);
-  // The run handoff directory is granted like the recipient attachment
-  // directory: without it the exact artifact path sits outside every working
-  // directory the session may write. An unreasoned point emits no `--effort`.
-  const args = ["--model", effective.model, ...(effective.effort === undefined ? [] : ["--effort", effective.effort]), ...permissionArgs(effective.permissionMode), ...repeated("--allowed-tools", effective.allowedTools), ...repeated("--disallowed-tools", effective.disallowedTools), ...repeated("--add-dir", effective.addDirs), ...repeated("--plugin-dir", effective.pluginDirs), ...channelArgs(effective.developmentChannels), ...grantedDirectoryArg(attachmentDirectory, "attachment directory"), ...grantedDirectoryArg(handoffDirectory, "handoff directory")];
+  // The run handoff directory is granted explicitly: without it the exact
+  // artifact path sits outside every working directory the session may write.
+  // An unreasoned point emits no `--effort`.
+  const args = ["--model", effective.model, ...(effective.effort === undefined ? [] : ["--effort", effective.effort]), ...permissionArgs(effective.permissionMode), ...repeated("--allowed-tools", effective.allowedTools), ...repeated("--disallowed-tools", effective.disallowedTools), ...repeated("--add-dir", effective.addDirs), ...repeated("--plugin-dir", effective.pluginDirs), ...channelArgs(effective.developmentChannels), ...grantedDirectoryArg(handoffDirectory, "handoff directory")];
   return [...args, ...promptFileArg("--append-system-prompt-file", promptFilePath)];
 }
 
@@ -201,11 +201,11 @@ export function buildClaudeArgv(profile: Extract<Profile["runtime"], { kind: "cl
  * never mutates global or project skill/plugin state and never substitutes a
  * synthetic workspace root to fake selection.
  */
-export function buildAgyArgv(profile: Extract<Profile["runtime"], { kind: "agy" }>, sessionPersistence: boolean, overrides: AgyRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string, attachmentDirectory?: string): string[] {
+export function buildAgyArgv(profile: Extract<Profile["runtime"], { kind: "agy" }>, sessionPersistence: boolean, overrides: AgyRuntimeOverrides = {}, promptFilePath?: string, scopeRoot?: string): string[] {
   if (!sessionPersistence) throw new ProfileAdapterError("AGY profiles must set sessionPersistence to true for interactive launches");
   if (promptFilePath !== undefined) throw new ProfileAdapterError("AGY profiles do not accept prompt source files");
   const effective = resolveAgyRuntime(profile, overrides, scopeRoot);
-  return ["--model", effective.model, "--mode", effective.mode, "--dangerously-skip-permissions", ...repeated("--add-dir", effective.addDirs), ...grantedDirectoryArg(attachmentDirectory, "attachment directory"), "--prompt-interactive", AGY_BOOTSTRAP_PROMPT];
+  return ["--model", effective.model, "--mode", effective.mode, "--dangerously-skip-permissions", ...repeated("--add-dir", effective.addDirs), "--prompt-interactive", AGY_BOOTSTRAP_PROMPT];
 }
 
 /**
@@ -215,8 +215,7 @@ export function buildAgyArgv(profile: Extract<Profile["runtime"], { kind: "agy" 
  * launch readiness. Reasoning depth rides on the model tier (for example
  * `swe-2-max`), there is no system-prompt or `--add-dir` channel, and
  * sessions always persist. The Markdown body is catalog metadata that Herdr
- * never delivers, exactly like AGY; the granted attachment directory is read
- * ambiently by absolute path.
+ * never delivers, exactly like AGY.
  */
 export function buildDevinArgv(profile: Extract<Profile["runtime"], { kind: "devin" }>, sessionPersistence: boolean, overrides: DevinRuntimeOverrides = {}, promptFilePath?: string): string[] {
   if (!sessionPersistence) throw new ProfileAdapterError("Devin profiles must set sessionPersistence to true for interactive launches");
@@ -236,13 +235,13 @@ export interface RuntimeArgvContext {
   source?: { scopeRoot?: string };
 }
 
-export function buildRuntimeArgv(context: RuntimeArgvContext, runtime: Profile["runtime"], promptFilePath?: string, attachmentDirectory?: string, handoffDirectory?: string): string[] {
+export function buildRuntimeArgv(context: RuntimeArgvContext, runtime: Profile["runtime"], promptFilePath?: string, handoffDirectory?: string): string[] {
   if (runtime.kind === "pi") return buildPiArgv(runtime, context.sessionPersistence, {}, promptFilePath);
-  if (runtime.kind === "claude") return buildClaudeArgv(runtime, context.sessionPersistence, {}, promptFilePath, undefined, attachmentDirectory, handoffDirectory);
-  if (runtime.kind === "agy") return buildAgyArgv(runtime, context.sessionPersistence, {}, promptFilePath, context.source?.scopeRoot, attachmentDirectory);
+  if (runtime.kind === "claude") return buildClaudeArgv(runtime, context.sessionPersistence, {}, promptFilePath, undefined, handoffDirectory);
+  if (runtime.kind === "agy") return buildAgyArgv(runtime, context.sessionPersistence, {}, promptFilePath, context.source?.scopeRoot);
   return buildDevinArgv(runtime, context.sessionPersistence, {}, promptFilePath);
 }
 
-export function buildProfileArgv(profile: Profile, overrides: RuntimeOverrides = {}, promptFilePath?: string, attachmentDirectory?: string, handoffDirectory?: string): string[] {
-  return buildRuntimeArgv(profile, resolveProfileRuntime(profile, overrides), promptFilePath, attachmentDirectory, handoffDirectory);
+export function buildProfileArgv(profile: Profile, overrides: RuntimeOverrides = {}, promptFilePath?: string, handoffDirectory?: string): string[] {
+  return buildRuntimeArgv(profile, resolveProfileRuntime(profile, overrides), promptFilePath, handoffDirectory);
 }

@@ -64,8 +64,7 @@ async function fixture() {
     scope: "Observation only",
     doneWhen: ["Evidence is reported"],
     constraints: ["No replay"],
-    tier: "standard" as const,
-    replicas: 1
+    tier: "standard" as const
   };
   await allocator.persist(run, {
     manager: { paneId: caller.context.paneId, display: "manager", source: "agent_name" },

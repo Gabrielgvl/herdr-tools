@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderTask } from "../../src/launch-schema.js";
-import type { AttachmentEnvelopeReference, SenderIdentity } from "../../src/provenance.js";
+import type { SenderIdentity } from "../../src/provenance.js";
 import { renderTaskInstructions, SPEC_BASELINE } from "../../src/spec-baseline.js";
 
 const sender: SenderIdentity = { paneId: "w1:p1", display: "caller", source: "agent_name", from: "caller (w1:p1)" };
@@ -13,14 +13,6 @@ const task = {
 };
 
 const body = () => renderTask(task);
-
-const attachment: AttachmentEnvelopeReference = {
-  path: "/cache/recipient/attachment-1/body.txt",
-  bytes: 17,
-  sha256: "a".repeat(64),
-  expiresAt: "2026-08-21T12:00:00.000Z",
-  encoding: "utf-8"
-};
 
 describe("spec baseline", () => {
   it("carries exactly the five platform obligations as system text", () => {
@@ -62,17 +54,7 @@ describe("spec baseline", () => {
     expect(rendered).toContain("sender-authored");
   });
 
-  it("supports attachment delivery, keeping the baseline inline while the caller text moves to the attachment", () => {
-    const rendered = renderTaskInstructions(sender, body(), "attachment", attachment);
-    expect(rendered.startsWith(SPEC_BASELINE)).toBe(true);
-    expect(rendered).toContain("delivery: attachment");
-    expect(rendered).toContain(`attachment-path: ${attachment.path}`);
-    expect(rendered).toContain(`attachment-sha256: ${attachment.sha256}`);
-    expect(rendered).not.toContain(task.objective);
-  });
-
   it("propagates the envelope's own failures instead of swallowing them", () => {
     expect(() => renderTaskInstructions(sender, "has \0 nul")).toThrowError(expect.objectContaining({ code: "INVALID_INPUT" }));
-    expect(() => renderTaskInstructions(sender, body(), "attachment")).toThrowError(expect.objectContaining({ code: "ATTACHMENT_STORE_FAILED" }));
   });
 });

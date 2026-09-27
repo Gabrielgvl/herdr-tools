@@ -7,17 +7,14 @@ import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import { writeIdentityProvenance } from "../agent-identity.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
-import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope, type PiExec } from "../cli.js";
+import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
 import { contextRebindingDetails, createContextResolver, resolveManagerSession, type ContextResolutionDiagnostics, type ContextResolver } from "../context.js";
 import type { DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { createHandoffAllocator, HandoffError, readHandoffProvenance, readHandoffState, renderHandoffContract, RUN_ID_PATTERN, updateHandoffState, type HandoffAllocation, type HandoffAllocator, type HandoffState } from "../handoff.js";
-import { assertDeliverySize, assertMessageText, utf8Bytes, ATTACHMENT_MAX_BYTES, MESSAGE_INLINE_MAX_BYTES, type MessageDelivery } from "../messages/limits.js";
+import { assertDeliverySize, assertMessageText, utf8Bytes, MESSAGE_INLINE_MAX_BYTES } from "../messages/limits.js";
 import { boundAgentSessionStrings, classifyPromptObservation, compactPromptSubmission, parsePromptSubmission, parsePromptTargetIdentityFields, type AgentSessionIdentity, type PromptConsumption, type PromptIdentityError, type PromptObservation, type PromptObservationBaseline, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
-import { defaultAttachmentStore, type AttachmentStore, type PublishedAttachment, type RecipientGrant } from "../messages/store.js";
-import { mintRecipientKey, type RecipientRegistry } from "../messages/recipients.js";
-import type { AttachmentCapability } from "../profiles/capability.js";
 import { resolveSender, type SenderIdentity } from "../provenance.js";
 import type { CurrentContext, HerdrSnapshot } from "../targets.js";
 import { parseSnapshotResult } from "../targets.js";
@@ -28,7 +25,6 @@ import { routeTask, runnerResourceSelection, type AvailabilityGate, type RouterB
 import { appendRouterDecision, routerStateDigest, type AppendRouterLogOptions, type SpecRouterLogEntry } from "../router-log.js";
 import { TypeSafeSpecClient } from "../typesafe-spec.js";
 import { defaultPromptSourceStore, type PromptSourceStore } from "../profiles/index.js";
-import type { ProfileKind } from "../profiles/types.js";
 import { modelSafeJson } from "../redaction.js";
 import { boundedDiagnosticMessage } from "../telemetry.js";
 import type { SupervisionWorkspaceRoot } from "../job-registry.js";
@@ -42,8 +38,7 @@ import type { MailboxEventWriter } from "../daemon/mailbox.js";
 import { EVIDENCE_ASSIGNMENT_MAX_BYTES, normalizedAssignmentBytes } from "../supervision/evidence.js";
 import { acquireLaunchGate, type LaunchGateLease } from "./launch-freeze.js";
 import type { SelfCloseTracker } from "../supervision/self-close.js";
-import { CATALOG_PATH, loadCatalog, type AvailabilitySubject, type Catalog, type RunnerEntry, type RunnerKind } from "../catalog.js";
-import { createWorktreeManager, type WorktreeManager } from "../worktree.js";
+import { CATALOG_PATH, loadCatalog, type AvailabilitySubject, type Catalog, type RunnerEntry } from "../catalog.js";
 import { compileCandidateContract, contractArgv, type CompiledContract, type ResolvedPoint, type ResourceSelection } from "../compile.js";
 import { deriveWorkspaceState, POLICY_REVISION, type QualityTier, type WorkloadIntent, type WorkloadProfile, type WorkspaceState } from "../routing-policy.js";
 import { availability as defaultAvailability, classifyLaunchFailure, recordLaunchFailure, type LaunchFailureSignal, type RecordLaunchFailureOptions } from "../availability.js";
@@ -71,13 +66,11 @@ export interface LaunchDependencies {
   cwd?: string;
   ownership?: LaunchResourceRegistry;
   promptSources?: PromptSourceStore;
-  attachments?: AttachmentStore;
   /**
    * Tools-owned handoff allocation for the run. Every managed launch gets one
    * generated run directory; the caller cannot supply or select its path.
    */
   handoffs?: HandoffAllocator;
-  recipients?: RecipientRegistry;
   clock?: LaunchClock;
   /** Test hosts may provide the same fail-closed gate with disposable paths. */
   launchGate?: () => Promise<LaunchGateLease>;
@@ -99,7 +92,7 @@ export interface LaunchDependencies {
    * supplies `deps.mailbox`.
    */
   eventWriter?: MailboxEventWriter;
-  /** The host's shared close ledger, forwarded to per-replica worktree managers. */
+  /** The host's shared close ledger, consulted when provider-limit recovery closes the dead pane. */
   selfClose?: SelfCloseTracker;
   /** Compatibility-only host field; the cutover never reads a profile catalog. */
   profiles?: unknown;
@@ -107,7 +100,6 @@ export interface LaunchDependencies {
   catalog?: { load: () => Promise<Catalog> };
   specClient?: Pick<TypeSafeSpecClient, "evaluate">;
   availability?: AvailabilityGate;
-  worktrees?: WorktreeManager;
   /** B2 failure recorder seam; production uses the durable cooldown log. */
   availabilityFailureRecorder?: (candidate: AvailabilitySubject, runner: RunnerEntry, failure: LaunchFailureSignal, options: RecordLaunchFailureOptions) => Promise<unknown>;
   /** Native Claude session reader; injectable for bounded post-start evidence checks. */
@@ -162,7 +154,6 @@ export type LaunchResolvedModel =
 export interface LaunchTaskEvidence {
   /** The caller's display-only label, when supplied. */
   label?: string;
-  replicas: number;
   /** The caller's explicit tier; absent when omitted and Jev's floor decided. */
   requestedTier?: QualityTier;
   workloadFloor?: QualityTier;
@@ -251,8 +242,6 @@ export interface LaunchDetails extends LaunchResourceIds {
   name?: string;
   kind?: string;
   topology?: LaunchTopologyEvidence;
-  /** The provable replica worktree this child runs in, when replicas > 1. */
-  worktree?: string;
   postState?: Record<string, unknown>;
   agentStarted?: boolean;
   initialPromptSent?: boolean;
@@ -261,7 +250,6 @@ export interface LaunchDetails extends LaunchResourceIds {
   promptConsumption?: PromptConsumption;
   promptDispatch?: PromptDispatchEvidence;
   assignmentState?: "confirmed" | "unconfirmed";
-  initialPromptDelivery?: MessageDelivery;
   initialPromptSubmission?: PromptSubmissionEvidence;
   initialPromptObservation?: PromptObservation;
   readiness?: LaunchReadinessEvidence;
@@ -270,18 +258,16 @@ export interface LaunchDetails extends LaunchResourceIds {
   /** Advisory identity provenance tokens were written; `provenanceWarning` is set when that write failed. */
   identityProvenance?: "launched";
   provenanceWarning?: string;
-  phase?: "validate" | "route" | "compile" | "handoff" | "attachment_publish" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "prompt_verification" | "supervision_bind";
+  phase?: "validate" | "route" | "compile" | "handoff" | "supervision_reserve" | "placement" | "agent_start" | "ready" | "prompt_verification" | "supervision_bind";
   supervision?:
     | { jobId: string; state: "active"; child: { agentName: string; agentKind: string; paneId: string; terminalId: string; operatingPointId: string } }
     | { jobId: string; state: "provisional"; provisional: { agentName: string; agentKind: "agy"; paneId: string; terminalId: string; operatingPointId: string; baseline: PromptObservationBaseline } };
   created?: LaunchResourceIds;
   causeCode?: string;
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
-  envelope?: { version: "v1"; kind: "assignment"; delivery: MessageDelivery };
-  attachment?: PublishedAttachment;
+  envelope?: { version: "v1"; kind: "assignment"; delivery: "inline" };
   /** The generated Tools-owned run and its agent-writable artifact path. */
   handoff?: { runId: string; path: string };
-  recipient?: { recipientKey: string; paneId: string; agentName: string; agentId?: string; operatingPointId: string; kind: ProfileKind; capable: boolean; reason: string };
   task?: LaunchTaskEvidence;
 }
 
@@ -300,7 +286,6 @@ export interface LaunchResultChild {
   paneId?: string;
   tabId?: string;
   effectCertainty?: LaunchEffectCertainty;
-  worktree?: string;
   /**
    * Bounded, redacted failure fact — never cause prose. `causeCode`,
    * `paneId`, `tabId`, `supervisorJobId`, and `effectCertainty` retain recovery
@@ -349,7 +334,7 @@ let defaultHandoffs: HandoffAllocator | undefined;
 
 export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
   inspectBeforeRetry: "Inspect the run and your intents with herdr_status and herdr_run observe before retrying; do not assume that no agent started.",
-  preserveUnconfirmed: "Inspect the intent and the run with herdr_status and herdr_run observe; do not relaunch, resend, close or reuse the pane, register a recipient, or continue dependent work while assignment consumption is unconfirmed.",
+  preserveUnconfirmed: "Inspect the intent and the run with herdr_status and herdr_run observe; do not relaunch, resend, close or reuse the pane, or continue dependent work while assignment consumption is unconfirmed.",
   noEffect: "No launch mutation was dispatched; correct the failure and retry only after validating the request.",
   unknownEffect: "Inspect the run and your intents with herdr_status and herdr_run observe before any retry; the launch effect is unknown and must not be assumed absent."
 } as const);
@@ -481,22 +466,21 @@ function validateParams(params: unknown): asserts params is LaunchTask {
   if (params.label !== undefined && Buffer.byteLength(params.label, "utf8") > 256) {
     throw new LaunchError("INVALID_INPUT", "label exceeds the 256-byte bound");
   }
-  // ADR-037 recovery contract: exactly one replica and no caller cwd — the
-  // runtime resumes the prior run's managed workspace itself.
-  if (params.recoveryOf !== undefined && (params.cwd !== undefined || (params.replicas ?? 1) !== 1)) {
-    throw new LaunchError("INVALID_INPUT", "a recovery launch forbids cwd and requires exactly one replica");
+  // ADR-037 recovery contract: no caller cwd — the runtime resumes the prior
+  // run's managed workspace itself.
+  if (params.recoveryOf !== undefined && params.cwd !== undefined) {
+    throw new LaunchError("INVALID_INPUT", "a recovery launch forbids cwd");
   }
 }
 
 /** The caller's Task with every schema default made concrete; `tier` stays the caller's explicit request. */
 interface NormalizedLaunchTask extends LaunchTask {
   constraints: string[];
-  replicas: number;
 }
 
 function normalizedParams(params: unknown): NormalizedLaunchTask {
   validateParams(params);
-  return { ...params, constraints: params.constraints ?? [], replicas: params.replicas ?? 1 };
+  return { ...params, constraints: params.constraints ?? [] };
 }
 
 /**
@@ -510,7 +494,7 @@ function supervisionAssignmentDigest(task: { objective: string; doneWhen: readon
 
 /**
  * Grammar-valid runtime child identity (D11): a launchId segment plus the
- * replica ordinal. Callers never name children; no `{name}-{label}-{N}`
+ * child ordinal. Callers never name children; no `{name}-{label}-{N}`
  * derivation or collision reservation exists anymore.
  */
 function mintChildName(launchId: string, ordinal: number): string {
@@ -554,8 +538,6 @@ interface RecoveryContext {
   workspaceState: WorkspaceState;
   /** The prior run's managed workspace, re-canonicalized and proven accessible. */
   resumedWorkspace: string;
-  /** The persisted worktree root when the prior child ran inside one. */
-  resumedWorktree?: string;
   priorRouteTier: QualityTier;
   priorOperatingPointId: string;
   priorPolicyRevision: string;
@@ -574,8 +556,8 @@ async function resolveRecoveryOf(params: NormalizedLaunchTask, handoffs: Handoff
   const unresolvable = (reason: string): LaunchError =>
     new LaunchError("RECOVERY_UNRESOLVABLE", "recoveryOf cannot be resolved by this runtime", { recoveryOf, reason });
   /* c8 ignore next 3 -- validateParams already enforces the recovery contract; the re-assertion keeps a validation bypass fail-closed. */
-  if (recoveryOf === undefined || params.replicas !== 1 || params.cwd !== undefined) {
-    throw new LaunchError("INVALID_INPUT", "a recovery launch forbids cwd and requires exactly one replica");
+  if (recoveryOf === undefined || params.cwd !== undefined) {
+    throw new LaunchError("INVALID_INPUT", "a recovery launch forbids cwd");
   }
   if (!RUN_ID_PATTERN.test(recoveryOf)) throw unresolvable("run_id_malformed");
   let allocation: HandoffAllocation;
@@ -634,7 +616,6 @@ async function resolveRecoveryOf(params: NormalizedLaunchTask, handoffs: Handoff
     runId: recoveryOf,
     workspaceState,
     resumedWorkspace,
-    ...(workspace.worktree === undefined ? {} : { resumedWorktree: workspace.worktree }),
     priorRouteTier: route.tier,
     priorOperatingPointId: route.operatingPointId,
     priorPolicyRevision: route.policyRevision,
@@ -2049,10 +2030,7 @@ function partialError(
   error: unknown,
   created: LaunchResourceIds,
   phase: LaunchPhase,
-  grant: RecipientGrant,
   effects: { agentStarted: boolean; promptSubmitted: boolean; recipientRegistered: boolean; mutationDispatched: boolean; promptDispatch?: PromptDispatchEvidence; assignmentState?: "confirmed" | "unconfirmed"; initialPromptSubmission?: AgyPromptSubmissionEvidence; readiness?: LaunchReadinessEvidence; supervisorJobId?: string; supervision?: NonNullable<LaunchDetails["supervision"]>; timing: LaunchTimingEvidence; attempts: LaunchAttemptEvidence[] },
-  delivery?: MessageDelivery,
-  published?: PublishedAttachment,
   reconciliation?: LaunchReconciliationEvidence
 ): LaunchError {
   const transportCode = launchTransportCode(error);
@@ -2106,9 +2084,6 @@ function partialError(
     ...(Object.keys(effects.timing).length === 0 ? {} : { timing: effects.timing }),
     ...(effects.attempts.length === 0 ? {} : { attempts: effects.attempts }),
     ...(cliFailure ? { cliFailure } : {}),
-    ...(delivery ? { delivery, initialPromptDelivery: delivery } : /* c8 ignore next -- partialError runs only after the delivery route is fixed at precondition time. */ {}),
-    recipientGrant: { path: grant.path },
-    ...(published ? { attachmentRetained: true, attachment: { ...published } } : {}),
     ...(readiness === undefined ? {} : { readiness }),
     ...(reconciliation === undefined ? {} : { reconciliation })
   };
@@ -2191,7 +2166,7 @@ function launchChildError(error: unknown): NonNullable<LaunchResultChild["error"
 function launchManifest(result: LaunchResult): string {
   const head = `herdr_launch outcome=${result.outcome} launch=${result.launchId}${result.requestedTier === undefined ? "" : ` tier=${result.requestedTier}`}${result.effectiveTier === undefined ? "" : ` effective=${result.effectiveTier}`} children=${result.children.length}${result.error === undefined ? "" : ` error=${result.error.code}`}`;
   const lines = result.children.map((child) =>
-    `- ${child.target} state=${child.state}${child.operatingPointId === undefined ? "" : ` point=${child.operatingPointId}`}${child.supervisorJobId === undefined ? "" : ` supervisor=${child.supervisorJobId}`}${child.worktree === undefined ? "" : ` worktree=${child.worktree}`}${child.paneId === undefined ? "" : ` pane=${child.paneId}`}${child.tabId === undefined ? "" : ` tab=${child.tabId}`}${child.effectCertainty === undefined ? "" : ` effect=${child.effectCertainty}`}${child.error === undefined ? "" : ` error=${child.error.code}`}`
+    `- ${child.target} state=${child.state}${child.operatingPointId === undefined ? "" : ` point=${child.operatingPointId}`}${child.supervisorJobId === undefined ? "" : ` supervisor=${child.supervisorJobId}`}${child.paneId === undefined ? "" : ` pane=${child.paneId}`}${child.tabId === undefined ? "" : ` tab=${child.tabId}`}${child.effectCertainty === undefined ? "" : ` effect=${child.effectCertainty}`}${child.error === undefined ? "" : ` error=${child.error.code}`}`
   );
   return [head, ...lines].join("\n");
 }
@@ -2249,10 +2224,6 @@ function allReviewedResources(resolved: ResolvedPoint): ResourceSelection {
       : {};
 }
 
-function recipientCapability(kind: RunnerKind): AttachmentCapability & { kind: ProfileKind } {
-  return { kind: kind as ProfileKind, capable: true, reason: "compiled task contract grants the launch runtime" };
-}
-
 /** The Task plus the ordered operating-point projection that the binding digest covers. */
 function taskRouterState(task: RoutingTask, catalog: Catalog): TaskRouterState {
   return {
@@ -2284,10 +2255,6 @@ function taskRouteLogEntry(launchId: string, record: TaskRouteRecord): SpecRoute
 export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDefinition<typeof LaunchTaskSchema, LaunchResult> {
   const contextResolver = deps.contextResolver ?? createContextResolver(deps.cli, deps.context);
   const specClient = deps.specClient ?? new TypeSafeSpecClient();
-  const worktrees = deps.worktrees ?? (() => {
-    const exec = (deps.cli as unknown as { exec?: PiExec }).exec;
-    return exec === undefined ? undefined : createWorktreeManager({ exec, ...(deps.selfClose === undefined ? {} : { selfClose: deps.selfClose }) });
-  })();
   const availabilityGate = deps.availability ?? defaultAvailability;
 
   let packageRoot = dirname(fileURLToPath(import.meta.url));
@@ -2319,7 +2286,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     const binding = launchBinding(launchId, state);
     // The compiled contract label is runtime-owned; the caller's label is
     // display metadata that never enters routing contracts or evidence.
-    const spec = { label: "task", count: params.replicas };
+    const spec = { label: "task" };
     const workspaceState = recovery?.workspaceState;
     let evaluation: Awaited<ReturnType<TypeSafeSpecClient["evaluate"]>>;
     const timeoutController = new AbortController();
@@ -2378,7 +2345,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     catalog: Catalog;
     resolvedCwd: string;
     intent: WorkloadIntent;
-    replicas: number;
     specLabel: string;
     /** Prior-run lineage when this launch is a recovery (ADR-037). */
     recovery?: RecoveryContext;
@@ -2389,6 +2355,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     routed: TaskRouteRecord & { decision: AdmittedSpecDecision },
     shared: LaunchShared,
     childName: string,
+    /** The run minted at validate — the allocation the delivered-payload gate measured. */
+    handoffRun: HandoffAllocation,
     signal: AbortSignal,
     onUpdate: AgentToolUpdateCallback<LaunchResult> | undefined,
     ctx: ExtensionContext
@@ -2404,7 +2372,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       throw new LaunchError("LAUNCH_FROZEN", "Launch is frozen");
     }
 
-    const attachmentStore = deps.attachments ?? defaultAttachmentStore;
     const handoffs = deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({}));
     const clock = deps.clock ?? realLaunchClock;
     const decision = routed.decision;
@@ -2413,9 +2380,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     let promptText: string | undefined;
     let launchCwd: string | undefined;
     let topology: LaunchTopologyEvidence | undefined;
-    let recipientKey: string | undefined;
-    let grant: RecipientGrant | undefined;
-    let published: PublishedAttachment | undefined;
     let sender: SenderIdentity | undefined;
     let managerSession: AgentSessionIdentity | null | undefined;
     let contextDiagnostics: ContextResolutionDiagnostics | undefined;
@@ -2423,10 +2387,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     let topologyBaseline: HerdrSnapshot | undefined;
     let topologyMutationDispatched = false;
     let reservation: SupervisionReservation | undefined;
-    let handoffRun: HandoffAllocation | undefined;
     let phase: LaunchPhase = "validate";
-    let prepared: Awaited<ReturnType<WorktreeManager["prepare"]>> | undefined;
-    let worktreeBound = false;
     let chainCandidates: ResolvedPoint[] = [];
     const created: LaunchResourceIds = {};
     const attempts: LaunchAttemptEvidence[] = [];
@@ -2438,8 +2399,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     };
     const tick = (next: LaunchPhase): void => progress(onUpdate, shared.launchId, childName, next, params.tier);
 
-    // The delivery the runtime selected for this child's rendered payload.
-    let delivery: MessageDelivery | undefined;
     try {
       phase = "compile";
       const catalog = shared.catalog;
@@ -2477,9 +2436,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         return compiled;
       };
 
-      // Compile and prepare before handoff, topology, or agent start. A typed
-      // pre-spawn refusal records exactly one candidate and moves to the next.
-      let replicaPrepared = shared.replicas <= 1;
+      // Compile every candidate before handoff, topology, or agent start. A
+      // typed pre-spawn refusal records exactly one candidate and moves on.
       for (const candidate of chainCandidates) {
         const identity = resolvedPointIdentity(candidate);
         let contract: CompiledContract;
@@ -2491,19 +2449,9 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           /* c8 ignore next -- admitted launch fixtures cannot make contractFor reject. */
           continue;
         }
-        if (!replicaPrepared) {
-          try {
-            prepared = await worktrees!.prepare({ childName, cwd: shared.resolvedCwd, count: shared.replicas, signal: abortSignal });
-            replicaPrepared = true;
-          } catch (error) {
-            contracts.delete(resolvedPointKey(candidate));
-            attempts.push({ point: identity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
-            continue;
-          }
-        }
         contracts.set(resolvedPointKey(candidate), contract);
-        launchCwd = prepared?.cwd ?? shared.resolvedCwd;
       }
+      launchCwd = shared.resolvedCwd;
       const initialCandidate = chainCandidates.find((candidate) => contracts.has(resolvedPointKey(candidate)));
       const initialContract = initialCandidate === undefined ? undefined : contracts.get(resolvedPointKey(initialCandidate));
       if (initialCandidate === undefined || initialContract === undefined) {
@@ -2525,23 +2473,18 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         throw new LaunchError("TARGET_IDENTITY_UNAVAILABLE", "Minted child identity collides with an existing pane or agent", { childName });
       }
 
-      handoffRun = await handoffs.allocate();
       assignmentText += renderHandoffContract(handoffRun);
       assertMessageText(assignmentText);
       // Delivery is runtime-owned (D14): the rendered Task plus contract is
-      // measured once; inline up to 16 KiB, attachment to 1 MiB, else reject.
-      delivery = utf8Bytes(assignmentText) <= MESSAGE_INLINE_MAX_BYTES ? "inline" : "attachment";
-      assertDeliverySize(assignmentText, delivery);
-      if (delivery === "inline") {
-        promptText = renderTaskInstructions(sender, assignmentText, "inline");
-        assertMessageText(promptText);
-      }
+      // measured once against the single inline bound; anything larger fails.
+      assertDeliverySize(assignmentText, "inline");
+      promptText = renderTaskInstructions(sender, assignmentText, "inline");
+      assertMessageText(promptText);
 
       phase = "handoff";
       tick(phase);
       // The run's route and managed workspace are the lineage a later
       // recovery resolves against this record.
-      const recordWorktree = prepared?.worktreePath ?? shared.recovery?.resumedWorktree;
       await handoffs.persist(handoffRun, {
         manager: { paneId: sender.paneId, display: sender.display, source: sender.source },
         child: {
@@ -2556,10 +2499,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
             policyRevision: POLICY_REVISION,
             workload: decision.evidence.workload!
           },
-          workspace: {
-            resolvedCwd: launchCwd!,
-            ...(recordWorktree === undefined ? {} : { worktree: recordWorktree })
-          }
+          workspace: { resolvedCwd: launchCwd! }
         }
       }, {
         managerSession,
@@ -2569,28 +2509,11 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           doneWhen: [...params.doneWhen],
           constraints: [...params.constraints],
           ...(params.tier === undefined ? {} : { tier: params.tier }),
-          replicas: params.replicas,
           ...(params.recoveryOf === undefined ? {} : { recoveryOf: params.recoveryOf }),
           ...(params.label === undefined ? {} : { label: params.label }),
           ...(params.cwd === undefined ? {} : { cwd: params.cwd })
         }
       });
-      recipientKey = mintRecipientKey();
-      grant = await attachmentStore.ensureRecipient(recipientKey);
-      if (delivery === "attachment") {
-        phase = "attachment_publish";
-        tick(phase);
-        published = await attachmentStore.publish({
-          body: assignmentText,
-          recipientKey,
-          recipientAgentName: childName,
-          senderPaneId: sender.paneId,
-          senderDisplay: sender.display,
-          operation: "assignment"
-        });
-        promptText = renderTaskInstructions(sender, assignmentText, "attachment", { ...published, encoding: "utf-8" });
-        assertMessageText(promptText);
-      }
 
       // Keep this reservation allowlist and serialization unchanged from R3,
       // now built from the canonical Task rather than a caller digest.
@@ -2612,11 +2535,9 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         });
       }
     } catch (error) {
-      const failure = withDeliveryFailureEvidence(error, { delivery, phase, published, handoffRunId: handoffRun?.runId });
+      const failure = withDeliveryFailureEvidence(error, { phase, handoffRunId: handoffRun.runId });
       try {
-        await grant?.release();
         reservation?.release("launch_precondition_failed");
-        if (prepared !== undefined && !worktreeBound) await worktrees?.release(childName);
       } finally {
         await launchGate?.release();
       }
@@ -2631,7 +2552,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     let assignmentState: "confirmed" | "unconfirmed" | undefined;
     let agyAcknowledgement: AgyPromptAcknowledgement | undefined;
     let agyInitialPromptSubmission: AgyPromptSubmissionEvidence | undefined;
-    let recipientRegistered = false;
     let supervisionBound = false;
     let provenanceWarning: string | undefined;
     let boundSupervision: LaunchDetails["supervision"] | undefined;
@@ -2674,10 +2594,6 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         topology = { intent: shared.intent, tabId: tabId!, tabLabel, reused: false };
       }
       const resolvedPaneId = paneId!;
-      if (prepared !== undefined && shared.replicas > 1) {
-        worktrees!.bindPane(childName, resolvedPaneId);
-        worktreeBound = true;
-      }
       // Pane identity stays runtime-minted: the caller's label is
       // display-only metadata and never renames the pane.
       await dispatchMutation(() => run(deps.cli, ["pane", "rename", resolvedPaneId, childName], abortSignal));
@@ -2715,7 +2631,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           if (contract.runtime.kind !== "agy" && contract.runtime.kind !== "devin") {
             promptPath = (await (deps.promptSources ?? defaultPromptSourceStore).create(promptText!)).path;
           }
-          startArgs = ["agent", "start", childName, "--kind", contract.runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...contractArgv(contract, promptPath, grant!.path, handoffRun!.directory)];
+          startArgs = ["agent", "start", childName, "--kind", contract.runtime.kind, "--pane", resolvedPaneId, "--timeout", String(HERDR_AGENT_START_TIMEOUT_MS), "--", ...contractArgv(contract, promptPath, undefined, handoffRun.directory)];
         } catch (error) {
           attempts.push({ point: attemptIdentity, outcome: "agent_start_failed", errorCode: launchTransportCode(error), message: causeMessage(error) });
           continue;
@@ -2786,13 +2702,12 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       // launch evidence below. No post-start readback carries a model field,
       // so the degraded fact is recorded — never a fabricated id.
       const resolvedModel: LaunchResolvedModel = { available: false, reason: "no-readback-seam", ...(shared.catalog.catalogRevision === undefined ? {} : { catalogRevision: shared.catalog.catalogRevision }) };
-      await handoffs.selectCandidate(handoffRun!, chosenContract.candidate.id, chosenRuntime.kind, resolvedModel);
+      await handoffs.selectCandidate(handoffRun, chosenContract.candidate.id, chosenRuntime.kind, resolvedModel);
       const chosenAgent = startedAgent;
       let agentId = chosenAgent.agentId;
       if (agentId) created.agentId = agentId;
       phase = "ready";
       tick(phase);
-      await grant?.renew();
       const ready = await waitForLaunchReadiness(deps.cli, resolvedPaneId, abortSignal, childName, chosenRuntime.kind, chosenAgent, selectedAttemptStartedAt, true, clock, chosenRuntime.kind === "agy");
       readiness = ready.evidence;
       timing.selectedStartReadinessMs = readiness.elapsedMs;
@@ -2809,7 +2724,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           boundSupervision = { jobId: reservation!.jobId, state: "provisional", provisional: { ...provisionalIdentity, operatingPointId: chosenContract.candidate.id, baseline: provisionalBaseline } };
         } else {
           const exactIdentity = capturedIdentity as PromptTargetIdentity;
-          await reservation!.bind({ identity: exactIdentity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}), owner: { paneId: sender!.paneId, session: managerSession! } } });
+          await reservation!.bind({ identity: exactIdentity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: ready.baseline!.stateChangeSeq, handoff: { allocation: handoffRun, ...(agentId ? { agentId } : {}), owner: { paneId: sender!.paneId, session: managerSession! } } });
           boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: exactIdentity.agentName, agentKind: exactIdentity.agentKind, paneId: resolvedPaneId, terminalId: exactIdentity.terminalId, operatingPointId: chosenContract.candidate.id } };
         }
       } catch (error) {
@@ -2847,7 +2762,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
          * manual close-then-recovery contract stands.
          */
         const providerLimitRecovery = async (identity: SupervisedIdentity, quota: ClaudeQuotaEvidence): Promise<ProviderLimitRecoveryEvidence | undefined> => {
-          if (!quota.zeroProgressProven || shared.replicas !== 1 || handoffRun === undefined) return undefined;
+          if (!quota.zeroProgressProven) return undefined;
           const recoverySignal = ctx.signal ?? new AbortController().signal;
           // The dead pane is provably closed before anything new may start —
           // a close whose effect stays uncertain never reaches the relaunch.
@@ -2979,7 +2894,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           agentId ??= idFrom(confirmed.agent, "agent_id") ?? idFrom(confirmed.agent, "id") ?? idFrom(confirmed.pane, "agent_id");
           phase = "supervision_bind";
           tick(phase);
-          await reservation!.strengthen({ identity: confirmed.identity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun!, ...(agentId ? { agentId } : {}), owner: { paneId: sender!.paneId, session: managerSession! } } });
+          await reservation!.strengthen({ identity: confirmed.identity, operatingPointId: chosenContract.candidate.id, stateChangeSeq: confirmed.observation.stateChangeSeq, handoff: { allocation: handoffRun, ...(agentId ? { agentId } : {}), owner: { paneId: sender!.paneId, session: managerSession! } } });
           boundSupervision = { jobId: reservation!.jobId, state: "active", child: { agentName: confirmed.identity.agentName, agentKind: confirmed.identity.agentKind, paneId: resolvedPaneId, terminalId: confirmed.identity.terminalId, operatingPointId: chosenContract.candidate.id } };
           provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, confirmed.identity.agentSession, abortSignal);
           phase = "prompt_verification";
@@ -3003,30 +2918,23 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       assignmentState = "confirmed";
       if (agentId) created.agentId = agentId;
       const exactIdentity = capturedIdentity as PromptTargetIdentity;
-      const capability = recipientCapability(chosenRuntime.kind);
-      const recipient = { recipientKey: recipientKey!, paneId: resolvedPaneId, agentName: exactIdentity.agentName, ...(agentId ? { agentId } : {}), operatingPointId: chosenContract.candidate.id, kind: capability.kind, capable: capability.capable, reason: capability.reason };
-      deps.recipients?.recordFor(chosenContract.candidate.id, resolvedPaneId, recipient.recipientKey, capability, { ...exactIdentity, ...(agentId ? { agentId } : {}) }, chosenRuntime.kind === "agy" ? { agyStrengthened: true, attachmentDirectory: grant!.path } : undefined);
-      recipientRegistered = deps.recipients !== undefined;
       const launchDetails: LaunchDetails = {
         operation: "launch", outcome: "launched", launchId: shared.launchId, name: exactIdentity.agentName, kind: chosenRuntime.kind, topology, tabId, paneId: resolvedPaneId,
-        ...(prepared?.worktreePath === undefined ? {} : { worktree: prepared.worktreePath }),
         ...contextRebindingDetails(contextDiagnostics!),
         ...(agentId ? { agentId } : {}),
         postState: boundAgentSessionStrings(modelSafeJson(postState)) as Record<string, unknown>,
-        agentStarted, initialPromptSent: true, promptSubmitted, recipientRegistered, readiness,
-        promptConsumption: "confirmed", promptDispatch: promptDispatch!, assignmentState: assignmentState!, initialPromptDelivery: delivery,
+        agentStarted, initialPromptSent: true, promptSubmitted, recipientRegistered: false, readiness,
+        promptConsumption: "confirmed", promptDispatch: promptDispatch!, assignmentState: assignmentState!,
         initialPromptSubmission: compactPromptSubmission(initialPromptSubmission!),
         initialPromptObservation: initialPromptObservation!,
         promptConfirmation: promptConfirmation!,
         timing, identityProvenance: "launched", ...(provenanceWarning === undefined ? {} : { provenanceWarning }),
         sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
-        envelope: { version: "v1" as const, kind: "assignment" as const, delivery: delivery! },
-        ...(published ? { attachment: published } : {}),
-        handoff: { runId: handoffRun!.runId, path: handoffRun!.artifactPath }, recipient, effectCertainty: "confirmed",
+        envelope: { version: "v1" as const, kind: "assignment" as const, delivery: "inline" },
+        handoff: { runId: handoffRun.runId, path: handoffRun.artifactPath }, effectCertainty: "confirmed",
         supervision: boundSupervision!,
         task: {
           ...(params.label === undefined ? {} : { label: params.label }),
-          replicas: shared.replicas,
           quality: decision.quality,
           requestedTier: decision.requestedTier,
           workloadFloor: decision.workloadFloor,
@@ -3066,11 +2974,10 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         if (reconciliation?.agentId !== undefined && created.agentId === undefined) created.agentId = reconciliation.agentId;
       }
       if (!supervisionBound) reservation?.release(`launch_failed_${phase}`);
-      if (prepared !== undefined && !worktreeBound) await worktrees?.release(childName);
-      withDeliveryFailureEvidence(error, { handoffRunId: handoffRun!.runId });
-      throw partialError(error, created, phase, grant!, { agentStarted, promptSubmitted, recipientRegistered, supervisorJobId: reservation!.jobId, mutationDispatched: topologyMutationDispatched, ...(assignmentState === undefined ? {} : { assignmentState }), ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }), ...(promptDispatch === undefined ? {} : { promptDispatch }), ...(readiness === undefined ? {} : { readiness }), ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }), timing, attempts }, delivery, published, reconciliation);
+      withDeliveryFailureEvidence(error, { handoffRunId: handoffRun.runId });
+      throw partialError(error, created, phase, { agentStarted, promptSubmitted, recipientRegistered: false, supervisorJobId: reservation!.jobId, mutationDispatched: topologyMutationDispatched, ...(assignmentState === undefined ? {} : { assignmentState }), ...(agyInitialPromptSubmission === undefined ? {} : { initialPromptSubmission: agyInitialPromptSubmission }), ...(promptDispatch === undefined ? {} : { promptDispatch }), ...(readiness === undefined ? {} : { readiness }), ...(boundSupervision === undefined ? {} : { supervision: boundSupervision }), timing, attempts }, reconciliation);
     } finally {
-      try { await grant?.release(); } finally { await launchGate?.release(); }
+      await launchGate?.release();
     }
   };
 
@@ -3092,6 +2999,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     // must reject without any launch effect.
     let params: NormalizedLaunchTask;
     let recovery: RecoveryContext | undefined;
+    const handoffs = deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({}));
     try {
       params = normalizedParams(rawParams);
       // The assignment evidence section is never truncated, so a Task whose
@@ -3105,10 +3013,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       // A recovery resolves the prior run's managed lineage — namespace, v2
       // record, route and workspace evidence — before any launch effect.
       if (params.recoveryOf !== undefined) {
-        recovery = await resolveRecoveryOf(params, deps.handoffs ?? (defaultHandoffs ??= createHandoffAllocator({})), deps.cwd ?? ctx.cwd);
-      }
-      if (params.replicas > 1 && worktrees === undefined) {
-        throw new LaunchError("WORKTREE_UNAVAILABLE", "Replica isolation requires a worktree manager");
+        recovery = await resolveRecoveryOf(params, handoffs, deps.cwd ?? ctx.cwd);
       }
     } catch (error) {
       throw earlyLaunchFailure(error, "validate");
@@ -3123,14 +3028,25 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       throw new LaunchError("LAUNCH_FROZEN", "Launch is frozen");
     }
     let resolvedCwd: string;
+    let handoffRun: HandoffAllocation;
     try {
       // Early size gate on the caller-authored Task body alone — a pure check
-      // that rejects before any filesystem or CLI touch; the child's full
-      // payload (Task plus contract) is measured again after compile.
+      // that rejects before any filesystem or CLI touch.
       const body = renderTask(params);
       assertMessageText(body);
-      if (utf8Bytes(body) > ATTACHMENT_MAX_BYTES) {
-        throw new LaunchError("MESSAGE_TOO_LARGE", "Rendered task exceeds the attachment delivery bound");
+      if (utf8Bytes(body) > MESSAGE_INLINE_MAX_BYTES) {
+        throw new LaunchError("MESSAGE_TOO_LARGE", "Rendered task exceeds the inline delivery bound");
+      }
+      // The delivered payload is that body plus the generated handoff
+      // contract, so the same inline bound applies to the combined text. The
+      // run is minted now — reused at handoff, durable only once persisted —
+      // letting this gate measure the exact bytes that will be delivered: a
+      // Task that only fits without the contract refuses with the same code,
+      // before any evaluation, intent write, or router decision. The
+      // compile-time assertDeliverySize stays the authoritative recheck.
+      handoffRun = await handoffs.allocate();
+      if (utf8Bytes(body + renderHandoffContract(handoffRun)) > MESSAGE_INLINE_MAX_BYTES) {
+        throw new LaunchError("MESSAGE_TOO_LARGE", "Rendered task exceeds the inline delivery bound");
       }
       // The canonical cwd is resolved and recorded before any effect (D13); a
       // recovery resumes the prior run's managed workspace instead.
@@ -3186,29 +3102,23 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       catalog,
       resolvedCwd,
       intent,
-      replicas: params.replicas,
       specLabel: "task",
       ...(recovery === undefined ? {} : { recovery })
     };
 
     const children: LaunchResultChild[] = [];
-    let halted = false;
-    for (let ordinal = 1; ordinal <= params.replicas; ordinal += 1) {
-      const childName = mintChildName(launchId, ordinal);
-      if (halted || abortSignal.aborted) {
-        halted = true;
-        children.push({ target: childName, state: "not_started", error: { code: "ABORTED", message: "Launch aborted before this child started" } });
-        continue;
-      }
+    const childName = mintChildName(launchId, 1);
+    if (abortSignal.aborted) {
+      children.push({ target: childName, state: "not_started", error: { code: "ABORTED", message: "Launch aborted before this child started" } });
+    } else {
       const childUpdate: AgentToolUpdateCallback<LaunchResult> | undefined = onUpdate === undefined ? undefined : (update) => onUpdate({ ...update, content: [{ type: "text", text: `[${childName}]` }, ...update.content] });
       try {
-        const details = await executeChild(params, { ...routedRecord, decision }, shared, childName, abortSignal, childUpdate, ctx);
+        const details = await executeChild(params, { ...routedRecord, decision }, shared, childName, handoffRun, abortSignal, childUpdate, ctx);
         children.push({
           target: childName,
           state: "launched",
           operatingPointId: details.task?.selected.id,
-          supervisorJobId: details.supervision?.jobId,
-          ...(details.worktree === undefined ? {} : { worktree: details.worktree })
+          supervisorJobId: details.supervision?.jobId
         });
       } catch (error) {
         const failure = launchChildError(error);
@@ -3237,8 +3147,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     renderCall(args, theme) {
       const label = typeof args.label === "string" ? args.label : "task";
       const tier = typeof args.tier === "string" ? ` · ${args.tier}` : "";
-      const replicas = typeof args.replicas === "number" ? args.replicas : 1;
-      return textComponent(formatCall("herdr_launch", `${label}${tier}${replicas > 1 ? ` ×${replicas}` : ""}`), theme, "accent");
+      return textComponent(formatCall("herdr_launch", `${label}${tier}`), theme, "accent");
     },
     renderResult(result, options, theme) {
       const details = result.details;
@@ -3342,7 +3251,6 @@ export const launchTestInternals = {
   resolvedPointIdentity,
   resolvedPointKey,
   isAdmitted,
-  recipientCapability,
   taskRouterState,
   taskRouteLogEntry
 } as const;

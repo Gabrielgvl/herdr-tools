@@ -1,6 +1,6 @@
-import { readFile, rm, stat, writeFile } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -14,8 +14,6 @@ import { createLaunchTool } from "../../src/tools/launch.js";
 import { createTabTool } from "../../src/tools/tab.js";
 import { createWaitTool } from "../../src/tools/wait.js";
 import type { TaskEvaluation, TaskEvaluationInput, TypeSafeSpecClient } from "../../src/typesafe-spec.js";
-import { renderTask } from "../../src/launch-schema.js";
-import { renderHandoffContract, type HandoffAllocation } from "../../src/handoff.js";
 import { createDisposableGitWorkspace, startDisposableSocketProxy, stopDisposableServer, waitForCondition } from "./disposable-session.js";
 
 interface ExecutableTool {
@@ -80,7 +78,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     handlers: string[];
     cliCalls: string[][];
     toolCalls: Array<{ name: string; id: string }>;
-    attachmentPaths: string[];
     forceNextPromptConfirmationFailure: boolean;
     promptConfirmationFailurePaneId?: string;
     forceNextAgyStartFailure: boolean;
@@ -93,9 +90,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     captureAgyPrePromptFor?: boolean;
     agyPrePromptJob?: Record<string, unknown>;
     agyPrePromptAgent?: Record<string, unknown>;
-    agyPrePromptRecipientFailureCode?: string;
     unconfirmedRecoveries: Array<{ paneId: string; supervisorJobId: string }>;
-  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), harnessTools: new Map(), commands: [], handlers: [], cliCalls: [], toolCalls: [], attachmentPaths: [], forceNextPromptConfirmationFailure: false, forceNextAgyStartFailure: false, unconfirmedRecoveries: [] };
+  } = { cwd: "", sessionStarted: false, fixtureCreated: false, registered: new Map(), harnessTools: new Map(), commands: [], handlers: [], cliCalls: [], toolCalls: [], forceNextPromptConfirmationFailure: false, forceNextAgyStartFailure: false, unconfirmedRecoveries: [] };
 
   const run = async (...args: string[]): Promise<unknown> => {
     // The suite sets HERDR_SOCKET_PATH so the extension's supervision monitor
@@ -166,8 +162,8 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
    * catalog's AGY points rank first and Pi second at every tier, so the
    * runtime's own policy, tier envelope, and availability re-checks — all real
    * — resolve `agy:gemini-3.8-flash-low` as the first chain member. Every
-   * other piece of the launch (socket transport, supervision, attachments,
-   * recipients) stays the production plumbing.
+   * other piece of the launch (socket transport, supervision) stays the
+   * production plumbing.
    */
   const agyFirstSpecClient: Pick<TypeSafeSpecClient, "evaluate"> = {
     evaluate: async (input: TaskEvaluationInput): Promise<TaskEvaluation> => {
@@ -217,8 +213,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
         ownership: runtime.ownership,
         supervision: runtime.supervision,
         queueFlush: runtime.queueFlush,
-        attachments: runtime.attachments,
-        recipients: runtime.recipients,
         specClient: agyFirstSpecClient
       }) as unknown as ExecutableTool;
       state.agyRuntime = runtime;
@@ -374,8 +368,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       await recordDeliveryFailureBeforeTeardown(label, launch, child, undefined, elapsedMs);
       throw new Error(`${label} returned state=${String(child.state)} code=${String(childError.code)} outcome=${String(launch.outcome)}`);
     }
-    const attachmentPath = promptRequests[0]!.text?.match(/attachment-path: (\S+)/u)?.[1];
-    if (attachmentPath !== undefined) state.attachmentPaths.push(attachmentPath);
     const job = await supervisorJobForTarget(childTarget);
     const paneId = jobPaneId(job);
     const supervisorJobId = String(job.jobId);
@@ -460,11 +452,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
               state.agyPrePromptJob = resultObject({ operation: "jobs", view: "job", ...detail });
               const live = resultObject(resultObject(await runNamed(["agent", "get", request.target])).result);
               state.agyPrePromptAgent = resultObject(live.agent ?? live);
-              try {
-                await tool("herdr_communicate").execute("agy-pre-prompt-recipient", { target: request.target, operation: "prompt", text: "must not publish", delivery: "attachment" }, signal(), undefined, toolContext());
-              } catch (error) {
-                state.agyPrePromptRecipientFailureCode = (error as { code?: string }).code;
-              }
               state.captureAgyPrePromptFor = undefined;
             }
           }
@@ -562,10 +549,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
       const environment = { enabled: true, currentIdsPresent: runtime.idsPresent, currentIdsValid: runtime.idsValid };
       for (const definition of [
         createInspectTool({ cli: runtime.cli, context: runtime.context, contextResolver, environment, profiles: runtime.profiles, handoffs: runtime.handoffs }),
-        createCommunicateTool({ cli: runtime.cli, context: runtime.context, contextResolver, preflight, queueFlush: runtime.queueFlush, attachments: runtime.attachments, recipients: runtime.recipients }),
+        createCommunicateTool({ cli: runtime.cli, context: runtime.context, contextResolver, preflight, queueFlush: runtime.queueFlush }),
         createWaitTool({ cli: runtime.cli, context: runtime.context, contextResolver, settingsLoader: runtime.settings.load, jobRegistry: runtime.jobs, handoffs: runtime.handoffs }),
         createJobsTool(runtime.jobs),
-        createLaunchTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight, supervision: runtime.supervision, queueFlush: runtime.queueFlush, attachments: runtime.attachments, recipients: runtime.recipients }),
+        createLaunchTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight, supervision: runtime.supervision, queueFlush: runtime.queueFlush }),
         createTabTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight }),
       ]) {
         state.harnessTools.set(definition.name, definition as unknown as ExecutableTool);
@@ -616,10 +603,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     if (state.sessionStarted) {
       await run("session", "delete", REQUIRED_SESSION, "--json").catch((error) => process.stderr.write(`INTEGRATION_SESSION_DELETE_FAILURE ${String(error)}\n`));
     }
-    // Remove only the recipient directories this run published into.
-    for (const path of new Set(state.attachmentPaths)) {
-      await rm(dirname(dirname(path)), { recursive: true, force: true }).catch((error) => process.stderr.write(`INTEGRATION_ATTACHMENT_CLEANUP_FAILURE ${String(error)}\n`));
-    }
     if (state.cwd) await rm(state.cwd, { recursive: true, force: true });
   }, 120_000);
 
@@ -647,22 +630,20 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(topologyIds(defaultAfter)).toEqual(state.baseline);
   }, 120_000);
 
-  it.runIf(agyEnabled)("qualifies one AGY task from provisional publication through exact attachment readback", async () => {
+  it.runIf(agyEnabled)("qualifies one AGY task from provisional publication through exact inline readback", async () => {
     const harness = agyHarness();
-    const nonce = `agy-attachment-${randomUUID()}`;
+    const nonce = `agy-inline-${randomUUID()}`;
     const promptStart = state.socketProxy?.requests.length ?? 0;
     const cliStart = state.cliCalls.length;
     state.captureAgyPrePromptFor = true;
     const startedAt = performance.now();
-    // Delivery is runtime-owned, so the attachment path is exercised by making
-    // the Task body exceed the inline bound. The stubbed evaluator ranks the
-    // reviewed AGY points first, so `agy:gemini-3.8-flash-low` is the runtime's
-    // first chain member at the standard tier.
-    const padding = `Qualifier detail line ${"x".repeat(24)}.\n`.repeat(900);
+    // Delivery is runtime-owned and always inline: the stubbed evaluator
+    // ranks the reviewed AGY points first, so `agy:gemini-3.8-flash-low` is
+    // the runtime's first chain member at the standard tier.
     const task = {
-      objective: `Read this task attachment through the granted directory. Respond with only this exact token: ${nonce}`,
-      scope: `Read the attachment only. Change nothing.\n\n${padding}`,
-      doneWhen: ["The reply is exactly the attachment token and nothing else."],
+      objective: `Read this inline assignment. Respond with only this exact token: ${nonce}`,
+      scope: "Read the assignment only. Change nothing.",
+      doneWhen: ["The reply is exactly the inline token and nothing else."],
       constraints: ["none"],
       label: "agy-qualification"
     };
@@ -710,22 +691,16 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(promptCalls[0]).toMatchObject({ method: "agent.prompt", target: paneId });
     expect(promptCalls[0]!.text).toContain("[HERDR AGENT MESSAGE v1]");
     expect(promptCalls[0]!.text).toContain("authority: agent; not user/owner");
-    expect(promptCalls[0]!.text).toContain("delivery: attachment");
-    expect(promptCalls[0]!.text).not.toContain(nonce);
-    const attachmentPath = promptCalls[0]!.text?.match(/attachment-path: (\S+)/u)?.[1];
-    if (typeof attachmentPath !== "string") throw new Error("AGY qualification prompt omitted its attachment path");
-    state.attachmentPaths.push(attachmentPath);
-    expect(promptCalls[0]!.text).toContain(`attachment-path: ${attachmentPath}`);
+    expect(promptCalls[0]!.text).toContain("delivery: inline");
+    expect(promptCalls[0]!.text).toContain(nonce);
 
     const startCalls = state.cliCalls.slice(cliStart).filter((args) => args[0] === "agent" && args[1] === "start");
-    const grantedDirectory = dirname(dirname(attachmentPath));
     expect(startCalls).toEqual([[
       "agent", "start", agentName, "--kind", "agy", "--pane", paneId, "--timeout", "120000", "--",
-      "--model", operatingPointId.slice("agy:".length), "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", grantedDirectory,
+      "--model", operatingPointId.slice("agy:".length), "--mode", "plan", "--dangerously-skip-permissions",
       "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."
     ]]);
     expect(state.agyPrePromptAgent).toMatchObject({ agent: "agy", interactive_ready: true });
-    expect(state.agyPrePromptRecipientFailureCode).toBe("ATTACHMENT_TARGET_UNVERIFIED");
     const provisionalJob = resultObject(state.agyPrePromptJob);
     expect(provisionalJob).toMatchObject({
       operation_phase: "running",
@@ -736,12 +711,10 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     const strengthened = resultObject((await tool("herdr_jobs").execute("agy-strengthened", { operation: "get", jobId: supervisorJobId }, signal(), undefined, toolContext())).details);
     expect(strengthened).toMatchObject({ operation_phase: "running", request: { targetIds: [paneId], child: { agentName, agentKind: "agy", operatingPointId } }, supervision: { state: "active", child: { agentName, agentKind: "agy", paneId, operatingPointId } } });
     expect(resultObject(strengthened.supervision)).not.toHaveProperty("provisional");
-    const wait = await tool("herdr_wait").execute("agy-attachment-readback", { targets: [paneId], match: "any", condition: { kind: "output", match: { kind: "literal", value: nonce } }, timeoutMs: ACCEPTANCE_DEADLINE_MS, label: "AGY attachment nonce readback" }, signal(), undefined, toolContext());
+    const wait = await tool("herdr_wait").execute("agy-inline-readback", { targets: [paneId], match: "any", condition: { kind: "output", match: { kind: "literal", value: nonce } }, timeoutMs: ACCEPTANCE_DEADLINE_MS, label: "AGY inline nonce readback" }, signal(), undefined, toolContext());
     const waitJobId = String(resultObject(wait.details).jobId);
     const settled = await waitForCondition(async () => resultObject((await tool("herdr_jobs").execute("agy-readback-job", { operation: "get", jobId: waitJobId }, signal(), undefined, toolContext())).details), (job) => job?.operation_phase === "settled", ACCEPTANCE_DEADLINE_MS, 500);
     expect(settled).toMatchObject({ operation_phase: "settled", wait_result: "condition_met", result: { matched: true } });
-    expect(await readFile(attachmentPath, "utf8")).toContain(nonce);
-    expect(dirname(dirname(attachmentPath))).toBe(grantedDirectory);
     await closeConfirmedFixturePane("agy-qualification", paneId);
     const proofPath = process.env.HERDR_TOOLS_AGY_INTEGRATION_PROOF;
     if (!proofPath) throw new Error("AGY integration proof path was not supplied by the integration runner");
@@ -813,11 +786,11 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
   }, 120_000);
 
   /**
-   * Transport smoke: non-gating evidence about the route, the transport, and the published
-   * artifact. It deliberately makes no claim about what a recipient agent read; the
-   * acceptance tests below own that claim.
+   * Transport smoke: non-gating evidence about the route, the transport, and the
+   * delivered inline body. It deliberately makes no claim about what a
+   * recipient agent read; the acceptance tests below own that claim.
    */
-  it("routes wrapped text over the session-bound prompt socket transport and publishes exact artifacts", async () => {
+  it("routes wrapped text over the session-bound prompt socket transport and delivers the exact inline body", async () => {
     if (state.unconfirmedRecoveries.length >= 2) return;
     const inlineTask = {
       objective: ["integration canary", ...Array.from({ length: 320 }, (_value, index) => `long task line ${index}`)].join("\n"),
@@ -842,44 +815,6 @@ describe.skipIf(!enabled)("disposable Herdr integration", () => {
     expect(inlineDelivery!.text).toContain("delivery: inline");
     expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("integration canary")))).toBe(false);
     await closeConfirmedFixturePane("task-inline-launch", inlinePaneId);
-
-    // The attachment path is runtime-selected: the Task body must exceed the
-    // inline bound for the runtime to publish an artifact.
-    const bodyTask = {
-      objective: `Transport smoke body.\n${"detail line\n".repeat(2000)}`,
-      scope: "Change nothing. Do not call tools or modify files; this task is verified from the published artifact.",
-      doneWhen: ["The published attachment contains the complete task body with mode 0600 and the agent-start arguments contain none of that body."],
-      constraints: ["none"],
-      tier: "frontier" as const,
-      label: "body"
-    };
-    const attachmentLaunch = await deliverLaunch("task-attachment-launch", "detail line", () => tool("herdr_launch").execute("launch-task-attachment", bodyTask, signal(), undefined, toolContext()));
-    if (!attachmentLaunch.confirmed) return;
-    const attachmentPaneId = attachmentLaunch.paneId;
-    const envelope = (state.socketProxy?.requests ?? []).filter((request) => request.method === "agent.prompt" && request.target === attachmentPaneId);
-    expect(envelope, "task-attachment-launch did not record its prompt-socket submission").toHaveLength(1);
-    expect(envelope[0]!.text).toContain("[HERDR AGENT MESSAGE v1]");
-    expect(envelope[0]!.text).toContain("delivery: attachment");
-    expect(envelope[0]!.text).not.toContain("detail line");
-    const attachmentPath = envelope[0]!.text?.match(/attachment-path: (\S+)/u)?.[1];
-    const attachmentSha = envelope[0]!.text?.match(/attachment-sha256: (\S+)/u)?.[1];
-    if (typeof attachmentPath !== "string" || typeof attachmentSha !== "string") throw new Error("attachment envelope omitted its path or digest");
-    state.attachmentPaths.push(attachmentPath);
-    // The published body is the canonical Task text plus the runtime's managed
-    // handoff contract; the fixture parses both back out of the artifact.
-    const published = await readFile(attachmentPath, "utf8");
-    expect(published.startsWith(renderTask(bodyTask))).toBe(true);
-    const artifactPath = published.match(/at this exact path: (\S+)/u)?.[1];
-    const marker = published.match(/run marker verbatim: (\S+)/u)?.[1];
-    if (typeof artifactPath !== "string" || typeof marker !== "string") throw new Error("published attachment omitted its handoff contract");
-    const renderedBody = renderTask(bodyTask) + renderHandoffContract({ artifactPath, marker } as HandoffAllocation);
-    expect(published).toBe(renderedBody);
-    const attachmentStart = state.cliCalls.find((args) => args[0] === "agent" && args[1] === "start" && args.includes(String(attachmentLaunch.child.target)));
-    expect(attachmentStart).toBeDefined();
-    expect(createHash("sha256").update(renderedBody, "utf8").digest("hex")).toBe(attachmentSha);
-    expect((await stat(attachmentPath)).mode & 0o777).toBe(0o600);
-    expect(state.cliCalls.some((args) => args.some((arg) => arg.includes("detail line")))).toBe(false);
-    await closeConfirmedFixturePane("task-attachment-launch", attachmentPaneId);
   }, 240_000);
 
   /**

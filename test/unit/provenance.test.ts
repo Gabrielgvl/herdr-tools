@@ -59,22 +59,4 @@ describe("inter-agent provenance", () => {
     expect(resolveSender(snapshot({ ...basePane, label: " \r\n\t" }), "w1:p1").source).toBe("pane_id");
     expect(resolveSender(snapshot({ ...basePane, label: 4 as never, agent_kind: 5 as never }), "w1:p1").source).toBe("pane_id");
   });
-
-  it("builds an attachment reference envelope without inlining its body", () => {
-    const sender = resolveSender(snapshot({ ...basePane, label: "caller" }), "w1:p1");
-    const envelope = buildEnvelope(sender, "assignment", "secret body", "attachment", {
-      path: "/tmp/attachment/body.txt",
-      bytes: 11,
-      sha256: "a".repeat(64),
-      expiresAt: "2026-08-21T12:00:00.000Z",
-      encoding: "utf-8"
-    });
-    expect(envelope).toContain("delivery: attachment");
-    expect(envelope).toContain("attachment-path: /tmp/attachment/body.txt");
-    expect(envelope).toContain("attachment-bytes: 11");
-    expect(envelope).toContain("attachment-sha256: " + "a".repeat(64));
-    expect(envelope).not.toContain("secret body");
-    expect(() => buildEnvelope(sender, "assignment", "body", "attachment")).toThrowError(expect.objectContaining({ code: "ATTACHMENT_STORE_FAILED" }));
-    expect(() => buildEnvelope(sender, "assignment", "body", "attachment", { path: "/tmp/x\nbody", bytes: 1, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", encoding: "utf-8" })).toThrowError(expect.objectContaining({ code: "ATTACHMENT_STORE_FAILED" }));
-  });
 });

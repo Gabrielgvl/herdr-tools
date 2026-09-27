@@ -187,7 +187,6 @@ const taskContract: HandoffProvenanceInput["task"] = {
   doneWhen: ["tests pass", "lint clean"],
   constraints: ["no new dependencies"],
   tier: "standard",
-  replicas: 1,
   recoveryOf: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
   label: "feature work",
   cwd: "/repo"
@@ -586,8 +585,8 @@ describe("provenance record", () => {
       { managerSession, task: { ...taskContract, doneWhen: ["ok", ""] } },
       { managerSession, task: { ...taskContract, constraints: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] } },
       { managerSession, task: { ...taskContract, tier: "bogus" as never } },
-      { managerSession, task: { ...taskContract, replicas: 9 } },
-      { managerSession, task: { ...taskContract, replicas: 1.5 } },
+      { managerSession, task: { ...taskContract, replicas: 9 } as never },
+      { managerSession, task: { ...taskContract, replicas: 1.5 } as never },
       { managerSession, task: { ...taskContract, recoveryOf: "not-a-run-id" } },
       { managerSession, task: { ...taskContract, label: "x".repeat(300) } },
       { managerSession, task: { ...taskContract, cwd: "a\nb" } },
@@ -716,6 +715,28 @@ describe("provenance record", () => {
     // The unmutated record still parses — the matrix proved field-level strictness.
     await writeFile(path, JSON.stringify(original), { mode: 0o600 });
     expect((await readHandoffProvenance(run)).task.tier).toBe("standard");
+  });
+
+  it("still loads an old record carrying the removed replicas and worktree fields", async () => {
+    // Records written before the replica removal carry `task.replicas` and a
+    // `workspace.worktree` root; both readers must tolerate them.
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const run = await allocator.allocate();
+    await allocator.persist(run, provenanceIdentity, provenanceInput);
+
+    const provenance = JSON.parse(await readFile(provenancePathFor(run), "utf8")) as Record<string, unknown>;
+    (provenance.task as Record<string, unknown>).replicas = 2;
+    await writeFile(provenancePathFor(run), JSON.stringify(provenance), { mode: 0o600 });
+    const state = JSON.parse(await readFile(run.statePath, "utf8")) as Record<string, unknown>;
+    (state.child as Record<string, unknown>).workspace = { resolvedCwd: "/repo", worktree: "/repo/.herdr/worktrees/worker" };
+    await writeFile(run.statePath, JSON.stringify(state), { mode: 0o600 });
+
+    const record = await readHandoffProvenance(run);
+    expect(record.task.objective).toBe(taskContract.objective);
+    // The parsed contract drops the removed field so nothing carries it forward.
+    expect(record.task).not.toHaveProperty("replicas");
+    expect((await readHandoffState(run)).child.workspace?.worktree).toBe("/repo/.herdr/worktrees/worker");
   });
 });
 

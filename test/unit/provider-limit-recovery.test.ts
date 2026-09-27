@@ -9,7 +9,6 @@ import type { LaunchTask } from "../../src/launch-schema.js";
 import { createLaunchTool, type LaunchCli, type LaunchDependencies, type LaunchResult } from "../../src/tools/launch.js";
 import type { TaskModelDecision } from "../../src/router.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
-import type { AttachmentStore } from "../../src/messages/store.js";
 import { createHandoffAllocator, readHandoffProvenance, readHandoffState, type HandoffAllocator } from "../../src/handoff.js";
 import { availability, recordLaunchFailure } from "../../src/availability.js";
 import type { SelfCloseTracker } from "../../src/supervision/self-close.js";
@@ -121,16 +120,6 @@ function responseFor(catalog: Catalog): TaskModelDecision {
     resources,
     fitness,
     uncertainDimensions: [],
-  };
-}
-
-function fakeAttachments(): AttachmentStore {
-  const grant = { path: "/tmp/recipient", token: "grant", renew: vi.fn(async () => undefined), release: vi.fn(async () => undefined) };
-  return {
-    root: "/tmp",
-    recipientDirectory: (key) => `/tmp/${key}`,
-    ensureRecipient: vi.fn(async () => grant),
-    publish: vi.fn(async () => ({ attachmentId: "attachment", path: "/tmp/recipient/body.txt", bytes: 1, sha256: "a".repeat(64), expiresAt: "2026-09-19T00:00:00.000Z" })),
   };
 }
 
@@ -259,7 +248,6 @@ function toolFor(options: {
     supervision: options.supervision ?? stubSupervision(),
     specClient: options.specClient ?? { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(options.catalog) })) },
     catalog: { load: async () => options.catalog },
-    attachments: fakeAttachments(),
     ...(options.handoffs === undefined ? {} : { handoffs: options.handoffs }),
     availabilityFailureRecorder: options.availabilityFailureRecorder ?? vi.fn(async () => undefined),
     ...(options.claudeQuotaReader === undefined ? {} : { claudeQuotaReader: options.claudeQuotaReader }),
@@ -366,42 +354,6 @@ describe("provider-limit auto-recovery", () => {
     expect(harness.starts()).toBe(1);
     expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "close")).toEqual([]);
     expect(harness.live()).toHaveLength(1);
-  });
-
-  it("never auto-recovers a multi-replica launch", async () => {
-    const harness = makeCli();
-    const supervision = stubSupervision();
-    const quota = vi.fn(async (): Promise<ClaudeQuotaSignal> => ({ retryNotBefore: null, zeroProgressProven: true }));
-    const worktrees = {
-      prepare: vi.fn(async ({ childName, cwd }: { childName: string; cwd: string }) => ({ cwd: join(cwd, ".herdr", "worktrees", childName), worktreePath: join(cwd, ".herdr", "worktrees", childName) })),
-      bindPane: vi.fn(),
-      release: vi.fn(async () => undefined),
-    };
-    const tool = createLaunchTool({
-      cli: harness.cli,
-      context,
-      cwd: repoRoot,
-      preflight: async () => undefined,
-      supervision,
-      specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(twoProviderCatalog()) })) },
-      catalog: { load: async () => twoProviderCatalog() },
-      attachments: fakeAttachments(),
-      handoffs: allocator(),
-      availabilityFailureRecorder: vi.fn(async () => undefined),
-      claudeQuotaReader: quota,
-      routerLog: vi.fn(async () => undefined),
-      launchGate: openLaunchGate,
-      worktrees: worktrees as never,
-    });
-    const result = await tool.execute("call", { ...TASK, replicas: 2 } as never, new AbortController().signal, undefined, extensionContext);
-    expect((result.details as LaunchResult).outcome).toBe("launched");
-    // Every claude replica registers a signal; the replicas guard keeps all
-    // of them on the manual contract.
-    for (const [index, signal] of supervision.completionSignals.entries()) {
-      expect(await signal(supervision.bound[index]!.identity)).toEqual({ cooldownRecorded: true });
-    }
-    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "close")).toEqual([]);
-    expect(harness.live()).toHaveLength(2);
   });
 
   it("reports an unproven close without launching a second child", async () => {

@@ -7,7 +7,7 @@ A Pi extension that turns the Herdr terminal multiplexer into a supervised multi
 ### Delegation
 
 **Task**:
-The one caller-authored unit passed to `herdr_launch`: an objective, scope, completion evidence, caller constraints, and optional routing or recovery policy. One call launches one Task, with optional isolated replicas.
+The one caller-authored unit passed to `herdr_launch`: an objective, scope, completion evidence, caller constraints, and optional routing or recovery policy. One call launches one Task and exactly one child.
 _Avoid_: spec, assignment, profile, role, preset, template
 
 **Task contract**:
@@ -33,10 +33,6 @@ _Avoid_: profile, model pick, runner choice
 **Recovery lineage**:
 The `recoveryOf` link from a new Task to a prior managed handoff run. Runtime resolves the prior run's workspace, state, and route evidence; recovery is not fallback or a workload intent.
 _Avoid_: retry, recovery role, failed profile
-
-**Replica**:
-One of the `replicas` children created from a Task. Replicas share one routing contract and use isolated Git worktrees.
-_Avoid_: fan-out, copy, clone
 
 **Launch ID**:
 The runtime-generated identity of one `herdr_launch` operation. Callers do not author launch or child machine names.

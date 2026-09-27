@@ -241,9 +241,9 @@ describe("compile", () => {
     const lowArgv = contractArgv(low, "/tmp/prompt.md");
     expect(lowArgv.slice(lowArgv.indexOf("--effort"), lowArgv.indexOf("--effort") + 2)).toEqual(["--effort", "low"]);
     const claude = await compileCandidateContract(catalog, SPEC, point(catalog, "claude", "high"), { tools: ["Read"], plugins: ["plugins/worker"] });
-    expect(contractArgv(claude, "/tmp/prompt.md", "/tmp/att", "/tmp/handoff")).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "dontAsk", ...["Read", "Bash", "Write"].flatMap((tool) => ["--allowed-tools", tool]), ...["Skill", "NotebookEdit"].flatMap((tool) => ["--disallowed-tools", tool]), "--plugin-dir", `${root}/plugins/worker`, "--add-dir", "/tmp/att", "--add-dir", "/tmp/handoff", "--append-system-prompt-file", "/tmp/prompt.md"]);
+    expect(contractArgv(claude, "/tmp/prompt.md", undefined, "/tmp/handoff")).toEqual(["--model", "claude-opus-5", "--effort", "high", "--permission-mode", "dontAsk", ...["Read", "Bash", "Write"].flatMap((tool) => ["--allowed-tools", tool]), ...["Skill", "NotebookEdit"].flatMap((tool) => ["--disallowed-tools", tool]), "--plugin-dir", `${root}/plugins/worker`, "--add-dir", "/tmp/handoff", "--append-system-prompt-file", "/tmp/prompt.md"]);
     const agy = await compileCandidateContract(catalog, SPEC, point(catalog, "agy"), {});
-    expect(contractArgv(agy, undefined, "/tmp/att")).toEqual(["--model", "gemini-low", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", "/tmp/att", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
+    expect(contractArgv(agy)).toEqual(["--model", "gemini-low", "--mode", "plan", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     const devin = await compileCandidateContract(catalog, SPEC, point(catalog, "devin"), {});
     expect(contractArgv(devin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous", "--respect-workspace-trust", "false"]);
   });

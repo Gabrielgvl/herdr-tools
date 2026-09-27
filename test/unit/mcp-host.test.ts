@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
+import { createHandoffAllocator } from "../../src/handoff.js";
 import { createPreflight, createToolSurface } from "../../src/tool-surface.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import { createLaunchTool } from "../../src/tools/launch.js";
@@ -151,8 +152,16 @@ describe("MCP host capability proxy", () => {
     // The proxy must still serve both fields when a tool falls back to the host.
     const fallbackCommunicate = createCommunicateTool({ cli, context, preflight: createPreflight(cli) });
     await fallbackCommunicate.execute("id", { target: "w:p2", operation: "keys", keys: ["enter"] } as never, undefined, undefined, hostContext(host));
-    const fallbackLaunch = createLaunchTool({ cli, context, preflight: async () => undefined, supervision: stubSupervision(), launchGate: async () => ({ check: async () => undefined, release: async () => undefined }) });
-    await fallbackLaunch.execute("id", { objective: "o", scope: "s", doneWhen: ["o done"], constraints: ["none"] } as never, signal, undefined, hostContext(host)).catch(() => undefined);
+    const runRoot = mkdtempSync(join(tmpdir(), "herdr-mcp-host-runs-"));
+    try {
+      // A fixed namespace lets the real allocator mint the validate-phase run
+      // without resolving the ambient endpoint — no HERDR_SOCKET_PATH needed.
+      const handoffs = createHandoffAllocator({ namespace: { dir: join(runRoot, "herdr-handoffs"), endpoint: "test-endpoint" } });
+      const fallbackLaunch = createLaunchTool({ cli, context, preflight: async () => undefined, supervision: stubSupervision(), launchGate: async () => ({ check: async () => undefined, release: async () => undefined }), handoffs });
+      await fallbackLaunch.execute("id", { objective: "o", scope: "s", doneWhen: ["o done"], constraints: ["none"] } as never, signal, undefined, hostContext(host)).catch(() => undefined);
+    } finally {
+      rmSync(runRoot, { recursive: true, force: true });
+    }
     expect([...new Set(reads)].sort()).toEqual(["cwd", "signal"]);
   });
 });

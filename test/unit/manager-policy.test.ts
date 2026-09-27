@@ -13,7 +13,7 @@ describe("manager three-tool surface policy", () => {
     const canonical = await readFile(join(canonicalPath, "SKILL.md"), "utf8");
     expect(await readFile(join(loadedPath, "SKILL.md"), "utf8")).toBe(canonical);
 
-    expect(canonical).toContain("Prefer the typed Herdr MCP namespace");
+    expect(canonical).toContain("since the N5.3 cutover no lane carries a direct Herdr registration");
     expect(canonical).toContain("Use exactly these three operations: `herdr_launch`, `herdr_run`, and `herdr_status`.");
     // The daemon has no CLI caller path; the only sanctioned shell use is the
     // C8 follow-up recipe, which never touches daemon state.

@@ -116,27 +116,27 @@ describe("Claude manager plugin package", () => {
     });
   });
 
-  it("registers exactly one stdio server under the pinned key", () => {
-    expect(Object.keys(serverMap)).toEqual(["herdr"]);
-    const entry = serverMap.herdr!;
-    // The entry carries nothing but the command and its args: no `env`, no
-    // transport override, no working directory.
-    expect(Object.keys(entry).sort()).toEqual(["args", "command"]);
-    expect(entry.args).toEqual(["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"]);
-    // The command is asserted semantically, not literally: the tracked map pins
-    // `node`, while a locally installed copy may pin the absolute Node binary a
-    // version manager selected. Both run the same entry; nothing else may.
-    expect(isSupportedNodeCommand(entry.command), `unsupported stdio command ${JSON.stringify(entry.command)}`).toBe(true);
-    // The server anchors its project directory on its launch directory, which
-    // Claude Code spawns as the session project directory — verified live
-    // against a loaded plugin — so no explicit `env` mapping is carried.
-    // `HERDR_PROJECT_DIR` remains an explicit override for hosts that need one.
-    expect(entry.env).toBeUndefined();
+  it("registers no direct stdio server — lanes resolve the tools through the executor gateway", () => {
+    // N5.3 cutover (deploy/executor/remove-direct-herdr-claude.diff): the
+    // plugin's server map is deliberately empty. Claude and Devin reach
+    // herdr_launch/herdr_run/herdr_status through the executor→MCP gateway
+    // (the profile-scoped executor plugin), never a direct registration.
+    expect(serverMap).toEqual({});
   });
 
-  it("resolves its command to the installed main build entry", () => {
-    const entry = serverMap.herdr!.args![0]!;
+  it("resolves the gateway payload command to the installed main build entry", () => {
+    // The registration the cutover kept lives in the executor payload: the
+    // same pinned entry the direct map used to carry, plus the static env trio
+    // (HERDR_ENV/HERDR_SOCKET_PATH/HERDR_EXECUTOR_DELEGATED) the delegated
+    // caller contract requires — which is why, unlike the old bare map entry,
+    // this one carries `env` by design.
+    const payload = JSON.parse(readFileSync(join(repoRoot, "deploy/executor/herdr-mcp-integration.json"), "utf8")) as Record<string, { command?: string; args?: string[]; env?: Record<string, string> }>;
+    const registration = payload["tools.executor.mcp.addServer"]!;
+    const entry = registration.args![0]!;
     expect(resolve(entry)).toBe("/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js");
+    // The command discipline is unchanged: a real Node binary, nothing else.
+    expect(isSupportedNodeCommand(registration.command), `unsupported stdio command ${JSON.stringify(registration.command)}`).toBe(true);
+    expect(Object.keys(registration.env ?? {}).sort()).toEqual(["HERDR_ENV", "HERDR_EXECUTOR_DELEGATED", "HERDR_SOCKET_PATH"]);
     const build = JSON.parse(readFileSync(join(repoRoot, "tsconfig.build.json"), "utf8")) as { compilerOptions: { rootDir: string; outDir: string }; include: string[] };
     expect(build.compilerOptions).toMatchObject({ rootDir: ".", outDir: "dist" });
     expect(build.include).toContain("src/**/*.ts");
@@ -144,7 +144,11 @@ describe("Claude manager plugin package", () => {
   });
 
   it("derives the published tool names from the two pinned identifiers", () => {
-    const published = CORE_TOOL_NAMES.map((name) => `mcp__plugin_${String(manifest.name)}_${Object.keys(serverMap)[0]}__${name}`);
+    // The server key stays pinned even though the direct map is empty: the
+    // published names are contractual — the skill text and any reintroduced
+    // direct registration must agree on them.
+    const pinnedServerKey = "herdr";
+    const published = CORE_TOOL_NAMES.map((name) => `mcp__plugin_${String(manifest.name)}_${pinnedServerKey}__${name}`);
     expect(published).toEqual([
       "mcp__plugin_herdr-tools_herdr__herdr_launch",
       "mcp__plugin_herdr-tools_herdr__herdr_run",

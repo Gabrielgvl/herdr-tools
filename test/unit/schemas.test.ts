@@ -18,7 +18,7 @@ describe("public schemas", () => {
 
   it("accepts kind result only on the text-send variants", () => {
     expect(Value.Check(CommunicateParamsSchema, { operation: "prompt", target: "x", text: "hi", kind: "result" })).toBe(true);
-    expect(Value.Check(CommunicateParamsSchema, { operation: "steer", target: "x", text: "hi", kind: "result", delivery: "attachment" })).toBe(true);
+    expect(Value.Check(CommunicateParamsSchema, { operation: "steer", target: "x", text: "hi", kind: "result", delivery: "inline" })).toBe(true);
     for (const control of [
       { operation: "keys", target: "x", keys: ["esc"], kind: "result" },
       { operation: "cancel", target: "x", kind: "result" },

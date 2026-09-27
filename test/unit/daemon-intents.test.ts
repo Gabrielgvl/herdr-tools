@@ -191,7 +191,6 @@ describe("conflict rules", () => {
       ["doneWhen", { doneWhen: ["other evidence"] }],
       ["constraints", { constraints: ["c1"] }],
       ["tier", { tier: "frontier" }],
-      ["replicas", { replicas: 2 }],
       ["label", { label: "renamed" }],
       ["cwd", { cwd: "/elsewhere" }],
       ["recoveryOf", { recoveryOf: "run-uuid-1" }],
@@ -296,7 +295,7 @@ describe("reconcile (§8)", () => {
     expect(await store.begin(begin(mgrA, "k1"))).toMatchObject({ kind: "replay", intent: { state: "completed" } });
   });
 
-  it("stays unresolved while any replica is ambiguous or unclassified", async () => {
+  it("stays unresolved while any child is ambiguous or unclassified", async () => {
     const { store } = await fixture();
     const intent = await unresolvedIntent(store, "k1");
 
@@ -413,12 +412,11 @@ describe("D2 binding derivations", () => {
 
   it("digests the received task: only semantically-defaulted optionals are invisible, every field counts", () => {
     expect(taskDigest(task)).toMatch(/^[0-9a-f]{64}$/);
-    // Omitted and semantically-defaulted digest identically (`constraints` ≡ [], `replicas` ≡ 1).
-    expect(taskDigest({ ...task, replicas: 1, constraints: [] })).toBe(taskDigest(task));
+    // Omitted and semantically-defaulted digest identically (`constraints` ≡ []).
+    expect(taskDigest({ ...task, constraints: [] })).toBe(taskDigest(task));
     // Key order in the caller's object is irrelevant — canonical form is sorted.
     expect(taskDigest({ doneWhen: task.doneWhen, scope: task.scope, objective: task.objective })).toBe(taskDigest(task));
     // Any real change is a different digest.
-    expect(taskDigest({ ...task, replicas: 2 })).not.toBe(taskDigest(task));
     expect(taskDigest({ ...task, label: "x" })).not.toBe(taskDigest(task));
   });
 

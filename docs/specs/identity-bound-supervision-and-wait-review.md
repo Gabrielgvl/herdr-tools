@@ -126,14 +126,13 @@ If bind preparation, queued-evidence drain, request publication, or active-state
 
 The successful path is ordered as follows:
 
-1. Validate input, resolve the profile graph, prepare prompt sources and attachment capability, and resolve live caller context.
+1. Validate input, resolve the profile graph, prepare prompt sources, and resolve live caller context.
 2. Reserve supervision in `supervision_reserve` before the first topology mutation.
 3. Place the pane, start the selected profile, and complete exact readiness in the existing absolute startup budget.
 4. Bind the supervisor in `supervision_bind` immediately after readiness returns the exact captured identity and lifecycle anchor. Bind preparation validates an authoritative snapshot and drains all queued pre-bind evidence without publishing `active` or `degraded`; the public view remains `reserved` unless that evidence settles it. The operation succeeds only if the exact child is still live and the supervisor remains non-settled after the drain; its commit then publishes the selected profile, selected kind, and `request.targetIds: [capturedIdentity.paneId]` before bound state.
 5. Apply optional focus only after that committed bind returns successfully.
 6. If requested, submit the provenance-wrapped assignment exactly once and run the existing bounded semantic confirmation loop.
-7. Register the recipient only after assignment confirmation.
-8. Return launch success only after all required gates complete.
+7. Return launch success only after all required gates complete.
 
 `supervision_bind` moves before `focus` and `prompt_verification`. No second bind phase remains after prompt confirmation.
 
@@ -142,7 +141,7 @@ The successful path is ordered as follows:
 If supervisor binding fails:
 
 - The launch throws the existing `SUPERVISION_UNCONFIRMED` partial-effect failure.
-- No focus command, prompt bytes, recipient registration, fallback, retry, or child cleanup occurs after the failed bind.
+- No focus command, prompt bytes, fallback, retry, or child cleanup occurs after the failed bind.
 - The unbound reservation is released so the reserved job does not leak.
 - No job is published as bound with `request.targetIds: []`.
 - Any provisional request update is rolled back, so the failed unbound request again has `targetIds: []` and its original reserved child fields.
@@ -159,7 +158,7 @@ Launch tracks whether binding completed. Once it did:
 - The launch catch path must not call `release`, `cancel`, `shutdown`, or any equivalent supervisor settlement operation.
 - The supervisor remains session-scoped and follows only its own exact-child lifecycle settlement rules.
 - Read-only launch reconciliation may still run under its independent bound, but reconciliation cannot release or replace supervision.
-- Any later focus, prompt transport, acknowledgement parsing, prompt confirmation, recipient registration, caller-abort, or rendering failure retains the supervisor job ID in rich error details.
+- Any later focus, prompt transport, acknowledgement parsing, prompt confirmation, caller-abort, or rendering failure retains the supervisor job ID in rich error details.
 
 The failure handler releases only an unbound reservation. This is one branch, not a compatibility mode.
 
@@ -170,7 +169,6 @@ The prompt contract from ADR-015 remains fail-closed:
 - The assignment is submitted at most once.
 - No prompt, start, Enter, focus, fallback, or recovery mutation is retried after dispatch.
 - `PROMPT_UNCONFIRMED` still means consumption was not proven and the prompt may have been consumed.
-- Recipient registration remains forbidden.
 - Launch must not return success or permit a dependent assertion to treat the assignment as accepted.
 
 For an acknowledged prompt whose semantic confirmation fails, the thrown error remains:
@@ -207,7 +205,6 @@ interface LaunchModelDiagnostic {
   assignmentState?: "unconfirmed";
   agentStarted: boolean;
   promptSubmitted: boolean;
-  recipientRegistered: boolean;
   effectCertainty: LaunchEffectCertainty;
   recoveryGuidance: LaunchRecoveryGuidance;
 }
@@ -219,7 +216,7 @@ The diagnostic remains inside the single `HERDR_LAUNCH_DIAGNOSTIC` record in `Er
 
 The assignment-unconfirmed recovery guidance is one fixed Tools-authored string:
 
-> Inspect the existing child with herdr_inspect and its active supervisor with herdr_jobs get; do not relaunch, resend, close or reuse the pane, register a recipient, or continue dependent work while assignment consumption is unconfirmed.
+> Inspect the existing child with herdr_inspect and its active supervisor with herdr_jobs get; do not relaunch, resend, close or reuse the pane, or continue dependent work while assignment consumption is unconfirmed.
 
 This guidance replaces the obsolete unconfirmed-prompt guidance. There is no old-key alias.
 
@@ -497,7 +494,7 @@ The shared manager role skill and README must say:
 - Record both pane ID and supervisor job ID as soon as launch reports them.
 - `PROMPT_UNCONFIRMED` after a successful bind means assignment state is unconfirmed, not that the child is unwatched.
 - Inspect the exact pane with `herdr_inspect` and the supervisor with `herdr_jobs get`.
-- Do not relaunch, resend, close or reuse the pane, register it as an assignment-capable recipient, or continue dependent success assertions.
+- Do not relaunch, resend, close or reuse the pane, or continue dependent success assertions.
 - Continue recovery through the existing child and supervisor evidence.
 - `SUPERVISION_UNCONFIRMED` from the bind phase remains the distinct case where binding itself was not proven and no assignment was sent.
 - A healthy event subscription is not sufficient currency evidence by itself. `herdr_jobs get` exposes the last periodic reconciliation, reconciliation health, and any `evidence_gap`.
@@ -546,16 +543,16 @@ The existing redaction and bounding rules remain mandatory.
 
 - **AC-L1:** Supervision reservation still completes before the first topology mutation.
 - **AC-L2:** After exact readiness, `reservation.bind(...)` is called exactly once before optional focus and before any `agent prompt` dispatch, and launch treats it as successful only after queued-evidence drain and transactional bind commit complete.
-- **AC-L3:** A bind failure sends no focus or prompt mutation, registers no recipient, performs no retry or child cleanup, releases only the unbound reservation, and exposes no provisional target ID.
+- **AC-L3:** A bind failure sends no focus or prompt mutation, performs no retry or child cleanup, releases only the unbound reservation, and exposes no provisional target ID.
 - **AC-L4:** After bind succeeds, no later launch failure calls reservation release, supervisor cancel, or supervisor shutdown.
 - **AC-L5:** An assignment-unconfirmed launch sends exactly one prompt and starts exactly one selected agent. It sends no Enter or second prompt.
-- **AC-L6:** The assignment-unconfirmed error remains a thrown `LAUNCH_FAILED` with rich `causeCode: "PROMPT_UNCONFIRMED"`, `phase: "prompt_verification"`, `assignmentState: "unconfirmed"`, `recipientRegistered: false`, exact pane ID, and retained active supervisor details.
+- **AC-L6:** The assignment-unconfirmed error remains a thrown `LAUNCH_FAILED` with rich `causeCode: "PROMPT_UNCONFIRMED"`, `phase: "prompt_verification"`, `assignmentState: "unconfirmed"`, exact pane ID, and retained active supervisor details.
 - **AC-L7:** The fixed model diagnostic for AC-L6 contains the exact pane ID, supervisor job ID, `assignmentState: "unconfirmed"`, and fixed recovery guidance.
 - **AC-L8:** The diagnostic remains parseable and within 8,192 bytes. It contains no prompt body, environment value, cause text, backend text, output, profile body, or agent-session value.
 - **AC-L9:** The MCP adapter publishes the fixed fields and no attached launch details. Malformed conditional fields suppress the diagnostic rather than weakening validation.
 - **AC-L10:** Pi renders the exact compact assignment-unconfirmed row and does not render a success or generic unsupervised state.
-- **AC-L11:** Recipient registration and launch success occur only after semantic confirmation. Integration code performs no marker, wait, communicate, or other dependent assertion after an unconfirmed assignment.
-- **AC-L12:** A launch missing the mandatory typed `assignment`, or supplying an empty, NUL-bearing, extra, or legacy `initialPrompt`/`initialPromptDelivery` field, is rejected before any mutation, reservation, or attachment publication.
+- **AC-L11:** Launch success occurs only after semantic confirmation. Integration code performs no marker, wait, communicate, or other dependent assertion after an unconfirmed assignment.
+- **AC-L12:** A launch missing the mandatory typed `assignment`, or supplying an empty, NUL-bearing, extra, or legacy `initialPrompt`/`initialPromptDelivery` field, is rejected before any mutation or reservation.
 - **AC-L13:** Queued pane closure, release, proven replacement, or identity-loss evidence that settles during bind makes bind reject. Launch emits `SUPERVISION_UNCONFIRMED`, dispatches no prompt, and cannot report or retain a successful bound state.
 
 ### Wait review ownership
@@ -588,11 +585,11 @@ Update `test/unit/launch.test.ts` to cover:
 
 - Bind call order before focus and prompt.
 - Queued pane closure, release, replacement, and identity-loss settlement during bind drain; each case rejects binding and dispatches no focus or prompt.
-- Prompt timeout, post-ack read failure, caller abort, acknowledgement parse failure, focus failure, and recipient failure after binding.
+- Prompt timeout, post-ack read failure, caller abort, acknowledgement parse failure, and focus failure after binding.
 - No release after a successful bind on every later failure path.
 - Release only when reservation never bound, with no provisional target ID left on the failed request.
 - Exactly one start, one prompt stdin call, and no Enter, close, kill, retry, or fallback after prompt dispatch.
-- Recipient absence and no success result for unconfirmed assignment.
+- No success result for unconfirmed assignment.
 - Rich details and fixed diagnostic fields for same-tab, new-tab, and existing-pane placement.
 - Prompt body, environment, backend, output, and session canaries absent from `Error.message` and serialized results.
 
@@ -828,7 +825,7 @@ Never:
 - Treat reservation or bind preparation as active coverage.
 - Infer coverage from pane ID or name.
 - Retry or clean up an uncertain prompt launch.
-- Register a recipient or report dependent success before assignment confirmation.
+- Report dependent success before assignment confirmation.
 - Publish rich launch error details at the MCP boundary.
 - Start a wait reviewer for a supervisor-covered target.
 - Hide review ownership only inside truncatable progress details.

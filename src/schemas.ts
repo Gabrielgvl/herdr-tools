@@ -28,7 +28,7 @@ export const PublishedInspectParamsSchema = Type.Object({
 
 export const SUPPORTED_NAMED_KEYS = ["esc", "escape", "enter", "tab", "space", "backspace", "delete", "up", "down", "left", "right", "home", "end", "pageup", "pagedown", "ctrl+c", "ctrl+d", "ctrl+z"] as const;
 const NamedKey = StringEnum(SUPPORTED_NAMED_KEYS);
-const Delivery = StringEnum(["inline", "attachment"] as const);
+const Delivery = StringEnum(["inline"] as const);
 const MessageText = Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" });
 
 export const CommunicateParamsSchema = Type.Union([

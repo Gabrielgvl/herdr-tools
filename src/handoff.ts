@@ -18,7 +18,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { ATTACHMENT_MAX_BYTES } from "./messages/limits.js";
 import type { AgentSessionIdentity } from "./messages/prompt.js";
 import { acquireFlockHolder, assertOwnerOnlyDirectory } from "./pane-write-lock.js";
 import { QUALITY_TIERS, type QualityTier, type WorkloadProfile } from "./routing-policy.js";
@@ -57,13 +56,12 @@ export const HANDOFF_PROVENANCE_NAME = "provenance.json";
 export const HANDOFF_LOCK_NAME = "lock";
 export const HANDOFF_MAX_BYTES = 64 * 1024;
 /**
- * The provenance record carries the caller-authored Task verbatim; the
- * delivery bound caps a canonical render at one attachment, and JSON escaping
- * can expand that text several-fold, so the file bound sits well above it —
- * every admissible Task fits, and anything larger is not a record this runtime
- * wrote.
+ * The provenance record carries the caller-authored Task verbatim, and JSON
+ * escaping can expand that text several-fold, so the file bound sits well
+ * above it — every admissible Task fits, and anything larger is not a record
+ * this runtime wrote.
  */
-export const HANDOFF_PROVENANCE_MAX_BYTES = 8 * ATTACHMENT_MAX_BYTES;
+export const HANDOFF_PROVENANCE_MAX_BYTES = 8 * 1024 * 1024;
 const HANDOFF_LOCK_READY = "HERDR_HANDOFF_LOCK_READY";
 export const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -174,8 +172,9 @@ export interface HandoffRouteRecord {
 
 /**
  * The managed workspace a run's child worked in (ADR-037): the canonical
- * resolved cwd, plus the provable replica worktree root when the child ran
- * inside one. A recovery resumes the worktree when present, else resolvedCwd.
+ * resolved cwd; old records may also carry `worktree` — the isolated replica
+ * root the child ran inside — which a recovery still resumes when present,
+ * else resolvedCwd.
  */
 export interface HandoffWorkspaceRecord {
   resolvedCwd: string;
@@ -236,7 +235,7 @@ export interface HandoffRunIdentity {
  * caller-authored Task exactly as admitted, every schema default concrete
  * except `tier`, which is absent when the caller omitted it. The
  * four semantic fields are what the canonical render — and therefore the child —
- * received; `tier`, `replicas`, `recoveryOf`, `label`, and `cwd` complete the
+ * received; `tier`, `recoveryOf`, `label`, and `cwd` complete the
  * launch contract. Text fields are unbounded caller text by design: the record
  * bound, not per-field limits, is the size authority.
  */
@@ -246,7 +245,6 @@ export interface HandoffTaskContract {
   doneWhen: string[];
   constraints: string[];
   tier?: QualityTier;
-  replicas: number;
   recoveryOf?: string;
   label?: string;
   cwd?: string;
@@ -304,9 +302,11 @@ export function currentHandoffOwner(provenance: HandoffProvenance): AgentSession
 /** Caller holds the run flock; replacing the frozen v2 document is replay-safe. */
 export async function writeHandoffProvenance(run: HandoffAllocation, provenance: HandoffProvenanceV2): Promise<void> {
   const data = JSON.stringify(provenance);
-  parseHandoffProvenance(data, run);
-  if (Buffer.byteLength(data) > HANDOFF_PROVENANCE_MAX_BYTES) throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance exceeds the accepted bound");
-  await writeFileAtomic(provenancePath(run), data);
+  // Persist the normalized record, not the caller's bytes, so a tolerated
+  // `replicas` key on an old record can never be re-emitted by a v2 rewrite.
+  const normalized = JSON.stringify(parseHandoffProvenance(data, run));
+  if (Buffer.byteLength(normalized) > HANDOFF_PROVENANCE_MAX_BYTES) throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance exceeds the accepted bound");
+  await writeFileAtomic(provenancePath(run), normalized);
 }
 
 /** The exact run-directory layout a run id derives under one namespace. */
@@ -499,7 +499,6 @@ export function createHandoffAllocator(options: {
           doneWhen: [...provenance.task.doneWhen],
           constraints: [...provenance.task.constraints],
           ...(provenance.task.tier === undefined ? {} : { tier: provenance.task.tier }),
-          replicas: provenance.task.replicas,
           ...(provenance.task.recoveryOf === undefined ? {} : { recoveryOf: provenance.task.recoveryOf }),
           ...(provenance.task.label === undefined ? {} : { label: provenance.task.label }),
           ...(provenance.task.cwd === undefined ? {} : { cwd: provenance.task.cwd })
@@ -633,7 +632,7 @@ const WORKLOAD_MEMBERS: Readonly<Record<keyof WorkloadProfile, ReadonlySet<strin
 
 const CHILD_KEYS = new Set(["agentName", "agentKind", "operatingPointId", "specLabel", "fallbackCandidates", "paneId", "terminalId", "agentId", "resolvedModel", "route", "workspace"]);
 const ROUTE_KEYS = new Set(["tier", "operatingPointId", "policyRevision", "workload"]);
-const WORKSPACE_KEYS = new Set(["resolvedCwd", "worktree"]);
+const WORKSPACE_KEYS = new Set(["resolvedCwd", "worktree"]); // `worktree` stays accepted for old records; new launches never supply it
 const RESOLVED_MODEL_KEYS = new Set(["available", "model", "reason", "catalogRevision"]);
 
 function validWorkload(value: unknown): value is WorkloadProfile {
@@ -732,7 +731,7 @@ export async function readHandoffState(run: HandoffAllocation): Promise<HandoffS
 const SESSION_KEYS = new Set(["source", "agent", "kind", "value"]);
 const PROVENANCE_KEYS = new Set(["v", "runId", "endpoint", "createdAt", "manager", "task"]);
 const PROVENANCE_MANAGER_KEYS = new Set(["paneId", "display", "source", "session"]);
-const PROVENANCE_TASK_KEYS = new Set(["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd"]);
+const PROVENANCE_TASK_KEYS = new Set(["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd"]); // `replicas` stays accepted for old records; nothing writes it
 /** The display-source values `resolveSender` can emit for a manager record. */
 const MANAGER_SOURCES = new Set(["agent_name", "pane_agent_name", "label", "agent_kind", "pane_id"]);
 const PROVENANCE_CREATED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -777,7 +776,7 @@ function validTaskContract(value: unknown): value is HandoffTaskContract {
     && Array.isArray(value.doneWhen) && value.doneWhen.length >= 1 && value.doneWhen.length <= 8 && value.doneWhen.every(taskText)
     && Array.isArray(value.constraints) && value.constraints.length <= 8 && value.constraints.every(taskText)
     && (value.tier === undefined || (typeof value.tier === "string" && (QUALITY_TIERS as readonly string[]).includes(value.tier)))
-    && Number.isSafeInteger(value.replicas) && (value.replicas as number) >= 1 && (value.replicas as number) <= 8
+    && (value.replicas === undefined || (Number.isSafeInteger(value.replicas) && (value.replicas as number) >= 1 && (value.replicas as number) <= 8)) // an old record's replica count still must be shape-valid
     && (value.recoveryOf === undefined || (typeof value.recoveryOf === "string" && RUN_ID_PATTERN.test(value.recoveryOf)))
     && (value.label === undefined || (safeLine(value.label) && Buffer.byteLength(value.label, "utf8") <= 256))
     && (value.cwd === undefined || safeLine(value.cwd));
@@ -813,6 +812,9 @@ function parseHandoffProvenance(content: string, run: HandoffAllocation): Handof
     || !validProvenanceManager(provenance.manager) || !validTaskContract(provenance.task)) {
     throw new HandoffError("HANDOFF_STORE_FAILED", "Handoff provenance is malformed", { path: safePath(provenancePath(run)), reason: "malformed" });
   }
+  // Tolerated on read for old records, then dropped: the parsed contract — and
+  // any v2 rewrite of it — never carries the removed field forward.
+  Reflect.deleteProperty(provenance.task, "replicas"); // tolerated key from old records, never re-emitted
   if (provenance.v === 2) {
     const first = provenance.owners[0]!;
     const original = provenance.manager.session;

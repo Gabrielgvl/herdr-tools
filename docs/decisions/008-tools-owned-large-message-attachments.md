@@ -4,6 +4,8 @@
 
 Accepted
 
+Status note: superseded 2026-09-27 (herdr-governor rewrite, Phase 0) — the `attachment` delivery route, tools-owned attachment store, recipient grants, and the recipient-capability registry were removed; delivery is always `inline`. The body below is the historical record.
+
 ## Date
 
 2026-08-20

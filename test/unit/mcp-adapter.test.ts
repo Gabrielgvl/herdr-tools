@@ -91,7 +91,7 @@ describe("MCP input schema publication", () => {
     // The Task is a single strict object with the real requireds.
     expect(task.required).toEqual(expect.arrayContaining(["objective", "scope", "doneWhen"]));
     const taskProperties = record(task.properties);
-    for (const field of ["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd"]) {
+    for (const field of ["objective", "scope", "doneWhen", "constraints", "tier", "recoveryOf", "label", "cwd"]) {
       expect(taskProperties).toHaveProperty(field);
     }
     // The deleted caller-authority fields have no alias at the boundary —
@@ -198,7 +198,7 @@ describe("MCP published schema parity", () => {
       // idempotency key — no identity, routing, placement, or supervision
       // authority.
       ["herdr_launch", taskReq(), true],
-      ["herdr_launch", taskReq({ tier: "strong", replicas: 2, label: "docs sprint", cwd: "/repo", recoveryOf: "run-1" }), true],
+      ["herdr_launch", taskReq({ tier: "strong", label: "docs sprint", cwd: "/repo", recoveryOf: "run-1" }), true],
       ["herdr_launch", { task: "nope", idempotencyKey: "k" }, false],
       ["herdr_launch", taskReq({ extra: true }), false],
       ["herdr_launch", { task: { objective: "o", scope: "s", doneWhen: ["d"] }, idempotencyKey: "k", extra: true }, false],
@@ -215,14 +215,10 @@ describe("MCP published schema parity", () => {
       ["herdr_launch", taskReq({ constraints: [] }), true],
       ["herdr_launch", taskReq({ objective: "a\0b" }), false],
       ["herdr_launch", taskReq({ label: "a\nb" }), false],
-      // Tier is the reviewed enum; replicas is a bounded integer.
+      // Tier is the reviewed enum; the removed `replicas` field is an unknown key now.
       ["herdr_launch", taskReq({ tier: "bogus" }), false],
       ["herdr_launch", taskReq({ tier: "standard" }), true],
-      ["herdr_launch", taskReq({ replicas: 0 }), false],
-      ["herdr_launch", taskReq({ replicas: 9 }), false],
-      ["herdr_launch", taskReq({ replicas: 1.5 }), false],
-      ["herdr_launch", taskReq({ replicas: "2" }), false],
-      ["herdr_launch", taskReq({ replicas: 8 }), true],
+      ["herdr_launch", taskReq({ replicas: 2 }), false],
       // The deleted caller-authority fields are unknown keys — no alias survives.
       ["herdr_launch", taskReq({ name: "worker" }), false],
       ["herdr_launch", taskReq({ specs: [{ label: "worker" }] }), false],
@@ -674,7 +670,6 @@ describe("MCP error mapping", () => {
       effectCertainty: "unknown",
       recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
     };
-    const attachment = { attachmentId: "attachment-1", path: "/cache/recipient/attachment-1/body.txt", bytes: 17, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w:p2" };
     const outcome = errorOutcome(
       "LAUNCH_FAILED",
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`,
@@ -682,8 +677,6 @@ describe("MCP error mapping", () => {
         paneId: "w:p2",
         supervisorJobId: "job_supervisor_2",
         promptDispatch: { state: "unknown", requestId: "request-17" },
-        attachmentRetained: true,
-        attachment,
         causeMessage: "private prompt body",
         recipientGrant: { path: "/cache/recipient" }
       },
@@ -694,9 +687,7 @@ describe("MCP error mapping", () => {
       diagnostic,
       paneId: "w:p2",
       supervisorJobId: "job_supervisor_2",
-      promptDispatch: { state: "unknown", requestId: "request-17" },
-      attachmentRetained: true,
-      attachment
+      promptDispatch: { state: "unknown", requestId: "request-17" }
     });
     expect(outcome.content[0]!.text).not.toContain("private prompt body");
     expect(outcome.content[0]!.text).not.toContain("recipientGrant");
@@ -713,22 +704,13 @@ describe("MCP error mapping", () => {
       effectCertainty: "unknown",
       recoveryGuidance: LAUNCH_RECOVERY_GUIDANCE.preserveUnconfirmed
     };
-    const attachment = { attachmentId: "attachment-1", path: "/cache/body.txt", bytes: 1, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z" };
     const outcome = errorOutcome(
       "LAUNCH_FAILED",
       `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`,
-      { promptDispatch: { state: "acknowledged" }, attachmentRetained: true, attachment },
+      { promptDispatch: { state: "acknowledged" } },
       "herdr_launch"
     );
-    expect(payload(outcome).details).toEqual({ tool: "herdr_launch", diagnostic, promptDispatch: { state: "acknowledged" }, attachmentRetained: true, attachment });
-
-    const invalidAttachment = errorOutcome(
-      "LAUNCH_FAILED",
-      `failure\n${LAUNCH_DIAGNOSTIC_MARKER} ${JSON.stringify(diagnostic)}`,
-      { attachment: { ...attachment, bytes: 0 } },
-      "herdr_launch"
-    );
-    expect(payload(invalidAttachment).details).toEqual({ tool: "herdr_launch", diagnostic });
+    expect(payload(outcome).details).toEqual({ tool: "herdr_launch", diagnostic, promptDispatch: { state: "acknowledged" } });
   });
 
   it("rejects malformed launch diagnostics instead of publishing arbitrary attached data", () => {

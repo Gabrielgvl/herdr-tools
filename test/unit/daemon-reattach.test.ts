@@ -5,7 +5,7 @@
  * rebinds a supervisor, provable absence records `identity_lost` with the
  * sidecar untouched and no terminal state written, ambiguity leaves the run
  * `recovery_pending` with evidence — plus a prior-host `recovery_pending` run
- * re-matched and rebound, a multi-replica intent with mixed dispositions, one
+ * re-matched and rebound, a multi-child intent with mixed dispositions, one
  * `downtime_gap` per affected mailbox, and D5: reviews pause while the
  * recorded owner session is absent and resume when it reappears, while
  * lifecycle observation never stops.
@@ -71,7 +71,6 @@ const task: HandoffTaskContract = {
   doneWhen: ["it works"],
   constraints: [],
   tier: "standard",
-  replicas: 1,
 };
 
 const identityFields = (agentName: string): HandoffRunIdentity => ({
@@ -295,7 +294,7 @@ describe("daemon restart reattach (D4)", () => {
     const fx = await fixture();
     const { runId } = await seedRun(fx.allocator, { artifact: true });
     const supervision = fakeSupervision();
-    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-1", task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: task.constraints, tier: task.tier, replicas: 1 }, projectRoot: fx.projectRoot });
+    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-1", task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: task.constraints, tier: task.tier }, projectRoot: fx.projectRoot });
     if (begun.kind !== "launch") throw new Error("expected launch");
     await fx.intents.markEffecting(begun.intent);
     await fx.intents.recordChildren(begun.intent, [{ name: "worker", runId }]);
@@ -437,11 +436,11 @@ describe("daemon restart reattach (D4)", () => {
     expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
   });
 
-  it("classifies every child of a multi-replica intent — a matched sibling never clears an absent one", async () => {
+  it("classifies every child of a multi-child intent — a matched sibling never clears an absent one", async () => {
     const fx = await fixture();
     const one = await seedRun(fx.allocator, { name: "worker-a", terminalId: "ta", paneId: "pa", session: childSession });
     const two = await seedRun(fx.allocator, { name: "worker-b", terminalId: "tb", paneId: "pb", session: siblingSession });
-    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-3", task: { ...task, replicas: 2 }, projectRoot: fx.projectRoot });
+    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-3", task: { ...task }, projectRoot: fx.projectRoot });
     if (begun.kind !== "launch") throw new Error("expected launch");
     await fx.intents.markEffecting(begun.intent);
     await fx.intents.recordChildren(begun.intent, [{ name: "worker-a", runId: one.runId }, { name: "worker-b", runId: two.runId }]);
@@ -464,7 +463,7 @@ describe("daemon restart reattach (D4)", () => {
     const fx = await fixture();
     const one = await seedRun(fx.allocator, { name: "worker-a", terminalId: "ta", paneId: "pa", session: childSession });
     const two = await seedRun(fx.allocator, { name: "worker-b", terminalId: "tb", paneId: "pb", session: siblingSession });
-    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-4", task: { ...task, replicas: 2 }, projectRoot: fx.projectRoot });
+    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-4", task: { ...task }, projectRoot: fx.projectRoot });
     if (begun.kind !== "launch") throw new Error("expected launch");
     await fx.intents.markEffecting(begun.intent);
     await fx.intents.recordChildren(begun.intent, [{ name: "worker-a", runId: one.runId }, { name: "worker-b", runId: two.runId }]);
@@ -899,7 +898,7 @@ describe("daemon restart reattach — sweep edge cases", () => {
     // A recorded child whose run directory is gone entirely: no classification
     // exists, so the intent stays unresolved rather than closing on the sibling.
     await seedRun(fx.allocator);
-    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-1", task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: task.constraints, tier: task.tier, replicas: 1 }, projectRoot: fx.projectRoot });
+    const begun = await fx.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-1", task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: task.constraints, tier: task.tier }, projectRoot: fx.projectRoot });
     if (begun.kind !== "launch") throw new Error("expected launch");
     const effecting = await fx.intents.markEffecting(begun.intent);
     await fx.intents.recordChildren(effecting, [{ name: "ghost", runId: randomUUID() }, { name: "unseen" }]);
@@ -921,7 +920,7 @@ describe("daemon restart reattach — sweep edge cases", () => {
     // A failing reconcile is logged, never thrown into the sweep.
     const fx2 = await fixture();
     const seeded = await seedRun(fx2.allocator);
-    const begun = await fx2.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-1", task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: task.constraints, tier: task.tier, replicas: 1 }, projectRoot: fx2.projectRoot });
+    const begun = await fx2.intents.begin({ managerSessionKey: ownerKey, idempotencyKey: "key-1", task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: task.constraints, tier: task.tier }, projectRoot: fx2.projectRoot });
     if (begun.kind !== "launch") throw new Error("expected launch");
     const effecting = await fx2.intents.markEffecting(begun.intent);
     await fx2.intents.recordChildren(effecting, [{ name: "worker", runId: seeded.runId }]);

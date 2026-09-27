@@ -195,7 +195,7 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
   const launch = daemonTool(deps, {
     name: "herdr_launch",
     label: "Herdr Launch",
-    description: "Launch one supervised Herdr agent run under a durable intent. `task` is the flat Task contract (objective, scope, doneWhen, optional constraints/tier/replicas/recoveryOf/label/cwd); `idempotencyKey` is required and binds this call to at most one effect — retry with the same key after an interrupted attempt instead of launching again.",
+    description: "Launch one supervised Herdr agent run under a durable intent. `task` is the flat Task contract (objective, scope, doneWhen, optional constraints/tier/recoveryOf/label/cwd); `idempotencyKey` is required and binds this call to at most one effect — retry with the same key after an interrupted attempt instead of launching again.",
     parameters: DaemonLaunchRequestSchema,
     call: (client, params: DaemonLaunchRequest) => client.launch(params),
   });

@@ -2,7 +2,7 @@ import { access, mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { AGY_MODES, attachmentCapability, buildClaudeArgv, buildPiArgv, buildProfileArgv, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileNameFromPath, profileSource, readProfileText, resolveClaudeRuntime, ProfileAdapterError, ProfileParseError, MAX_PROFILE_BYTES, type DevinPermissionMode, type Profile, type ProfileReadIo } from "../../src/profiles/index.js";
+import { AGY_MODES, buildClaudeArgv, buildPiArgv, buildProfileArgv, discoverProfiles, normalizeScopedResourcePath, parseProfile, profileNameFromPath, profileSource, readProfileText, resolveClaudeRuntime, ProfileAdapterError, ProfileParseError, MAX_PROFILE_BYTES, type DevinPermissionMode, type Profile, type ProfileReadIo } from "../../src/profiles/index.js";
 import { createInspectTool, fitInspectionValue } from "../../src/tools/inspect.js";
 import { createRuntime } from "../../index.js";
 
@@ -73,7 +73,7 @@ describe("profile catalog", () => {
     expect(buildProfileArgv(resources, {}, "/tmp/prompt")).toEqual(["--model", "test/model", "--thinking", "low", "--tools", "read", "--extension", join(root, "ext.ts"), "--no-skills", "--skill", join(root, "skills"), "--no-session", "--append-system-prompt", "/tmp/prompt"]);
     const claudeResources = parseProfile(profileText("claude-resource", "claude").replace("effort: medium", "effort: medium\n  permissionMode: acceptEdits\n  allowedTools: [Read]\n  disallowedTools: [Bash]\n  addDirs: [./docs]\n  pluginDirs: [./plugin]"), source(root, "claude-resource"));
     expect(buildProfileArgv(claudeResources, {}, "/tmp/prompt")).toEqual(["--model", "claude-test", "--effort", "medium", "--permission-mode", "acceptEdits", "--allowed-tools", "Read", "--disallowed-tools", "Bash", "--add-dir", join(root, "docs"), "--plugin-dir", join(root, "plugin"), "--append-system-prompt-file", "/tmp/prompt"]);
-    expect(buildProfileArgv(claudeResources, {}, undefined, "/tmp/message-attachments/key")).toContain("/tmp/message-attachments/key");
+    expect(buildProfileArgv(claudeResources, {}, undefined, "/tmp/handoff/run-1")).toContain("/tmp/handoff/run-1");
     expect(() => buildProfileArgv(claudeResources, {}, undefined, "relative/key")).toThrow(/absolute/);
     expect(() => buildProfileArgv(claudeResources, {}, undefined, "/tmp/bad\npath")).toThrow(/absolute/);
   });
@@ -297,7 +297,6 @@ describe("profile catalog", () => {
     expect(agy.sessionPersistence).toBe(true);
     expect(buildProfileArgv(agy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs"), "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     expect(buildProfileArgv(agy, { model: "gemini-override", addDirs: ["./override"] })).toEqual(["--model", "gemini-override", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "override"), "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
-    expect(buildProfileArgv(agy, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", join(root, "docs"), "--add-dir", "/tmp/message-attachments/key", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     const workerAgy = parseProfile(profileText("worker-agy", "agy", "", "[worker-claude]", "accept-edits"), source(root, "worker-agy"));
     expect(workerAgy.runtime).toMatchObject({ kind: "agy", model: "gemini-3.8-flash-high", mode: "accept-edits" });
     expect(buildProfileArgv(workerAgy)).toEqual(["--model", "gemini-3.8-flash-high", "--mode", "accept-edits", "--dangerously-skip-permissions", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
@@ -309,7 +308,6 @@ describe("profile catalog", () => {
     expect(() => parseProfile(profileText("researcher", "agy").replace("  addDirs: []", "  addDirs: []\n  mode: plan"), source(root, "researcher"))).toThrow(ProfileParseError);
     expect([...AGY_MODES]).toEqual(["plan", "accept-edits"]);
     expect(() => parseProfile(profileText("researcher", "agy").replace("sessionPersistence: true", "sessionPersistence: false"), source(root, "researcher"))).toThrow(/AGY profiles must set sessionPersistence/);
-    expect(attachmentCapability(agy)).toEqual({ kind: "agy", capable: true, reason: "AGY profile can read its granted attachment directory" });
   });
 
   it("parses and adapts strict Devin profiles", () => {
@@ -322,9 +320,8 @@ describe("profile catalog", () => {
     expect(devin.fallbackProfiles).toEqual(["worker-agy"]);
     expect(buildProfileArgv(devin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous", "--respect-workspace-trust", "false"]);
     expect(buildProfileArgv(devin, { model: "swe-2", permissionMode: "normal" })).toEqual(["--model", "swe-2", "--permission-mode", "normal", "--respect-workspace-trust", "false"]);
-    expect(buildProfileArgv(devin, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous", "--respect-workspace-trust", "false"]);
-    // The Devin body is catalog metadata and its granted attachment directory
-    // is read ambiently, so neither produces argv.
+    expect(buildProfileArgv(devin, {}, undefined, "/tmp/handoff/run-1")).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous", "--respect-workspace-trust", "false"]);
+    // The Devin body is catalog metadata, so no prompt file path rides argv.
     expect(() => buildProfileArgv(devin, {}, "/tmp/prompt-source")).toThrow(/prompt source/);
     expect(() => buildProfileArgv({ ...devin, sessionPersistence: false })).toThrow(/sessionPersistence/);
     for (const key of ["thinking", "tools", "effort", "allowedTools", "disallowedTools", "addDirs", "pluginDirs", "extensions", "skills", "mode"] as const) {
@@ -335,7 +332,6 @@ describe("profile catalog", () => {
     expect(() => parseProfile(profileText("worker-devin", "devin").replace("permissionMode: dangerous", "permissionMode: autonomous"), source(root, "worker-devin"))).toThrow(ProfileParseError);
     expect(() => parseProfile(profileText("worker-devin", "devin").replace("permissionMode: dangerous", "permissionMode: dangerous\n  addDirs: [./docs]"), source(root, "worker-devin"))).toThrow(ProfileParseError);
     expect(() => parseProfile(profileText("worker-devin", "devin").replace("sessionPersistence: true", "sessionPersistence: false"), source(root, "worker-devin"))).toThrow(/Devin profiles must set sessionPersistence/);
-    expect(attachmentCapability(devin)).toEqual({ kind: "devin", capable: true, reason: "Devin profile can read its granted attachment directory" });
   });
 
   it("preserves AGY mode and permission metadata in model-visible profile inspection", async () => {

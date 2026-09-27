@@ -2,8 +2,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { HerdrCli } from "./src/cli.js";
 import { type AgentPromptClient } from "./src/agent-prompt.js";
 import { type DevinQueueFlush } from "./src/messages/devin-queue-flush.js";
-import { type AttachmentStore } from "./src/messages/store.js";
-import type { RecipientRegistry } from "./src/messages/recipients.js";
 import { JobRegistry } from "./src/job-registry.js";
 import { notificationForJob } from "./src/job-notification.js";
 import type { SupervisionRegistry } from "./src/supervision/registry.js";
@@ -42,8 +40,6 @@ export interface ExtensionRuntime {
   /** The host's shared managed-handoff gate: one registry for launch binding and wait gating. */
   handoffs: HandoffGate;
   waitJobsUi: WaitJobsUi;
-  attachments: AttachmentStore;
-  recipients: RecipientRegistry;
   /**
    * The Pi host's shared Devin queue-flush coordinator. `session_start` arms a
    * fresh controller and `session_shutdown` aborts the old one, so pending
@@ -58,8 +54,6 @@ export interface ExtensionRuntime {
 
 export interface RuntimeOptions {
   promptClient?: AgentPromptClient;
-  attachments?: AttachmentStore;
-  recipients?: RecipientRegistry;
 }
 
 export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<ExtensionAPI, "sendMessage">>, env: NodeJS.ProcessEnv = process.env, options: RuntimeOptions = {}): ExtensionRuntime {
@@ -71,8 +65,6 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
     exec: pi.exec.bind(pi),
     env,
     ...(options.promptClient === undefined ? {} : { promptClient: options.promptClient }),
-    ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
-    ...(options.recipients === undefined ? {} : { recipients: options.recipients }),
     wire: () => ({
       jobs: new JobRegistry({
         onChange: () => uiRef.current?.refresh(),
@@ -99,8 +91,6 @@ export function createRuntime(pi: Pick<ExtensionAPI, "exec"> & Partial<Pick<Exte
     supervision: shared.supervision,
     handoffs: shared.handoffs,
     waitJobsUi,
-    attachments: shared.attachments,
-    recipients: shared.recipients,
     queueFlush: shared.queueFlush,
     settings: { load: () => loadSettings() },
     profiles: { load: () => discoverProfiles({ bundledDir: resolve(dirname(fileURLToPath(import.meta.url)), "herdr-profiles"), bundledScopeRoot: dirname(fileURLToPath(import.meta.url)), projectCwd: process.cwd() }) },

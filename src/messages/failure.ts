@@ -1,12 +1,10 @@
 import type { MessageDelivery } from "./limits.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
-import type { PublishedAttachment } from "./store.js";
 
 export interface DeliveryFailureContext {
   delivery?: MessageDelivery;
   route?: string;
   phase?: string;
-  published?: PublishedAttachment;
   promptDispatch?: PromptDispatchEvidence;
   /** Generated run id, so a failed launch still names its durable handoff. */
   handoffRunId?: string;
@@ -23,8 +21,7 @@ function safePromptDispatch(value: unknown): PromptDispatchEvidence | undefined 
 
 /**
  * Keep a delivery failure's typed code and message while adding route, phase, and
- * body-free retained-attachment evidence. A published attachment stays on disk until it
- * expires, so a failed send must still name it.
+ * dispatch evidence.
  */
 export function withDeliveryFailureEvidence(error: unknown, context: DeliveryFailureContext): unknown {
   if (typeof error !== "object" || error === null) return error;
@@ -37,8 +34,7 @@ export function withDeliveryFailureEvidence(error: unknown, context: DeliveryFai
     ...(context.route ? { route: context.route } : {}),
     ...(context.phase ? { phase: context.phase } : {}),
     ...(promptDispatch === undefined ? {} : { promptDispatch }),
-    ...(context.handoffRunId === undefined ? {} : { handoffRunId: context.handoffRunId }),
-    ...(context.published ? { attachmentRetained: true, attachment: { ...context.published } } : {})
+    ...(context.handoffRunId === undefined ? {} : { handoffRunId: context.handoffRunId })
   };
   return error;
 }

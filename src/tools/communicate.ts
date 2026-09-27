@@ -11,8 +11,6 @@ import { withDeliveryFailureEvidence } from "../messages/failure.js";
 import { assertDeliverySize, assertMessageText, type MessageDelivery } from "../messages/limits.js";
 import { classifyPromptObservation, compactPromptSubmission, requirePromptTargetIdentity, parsePromptSubmission, parsePromptTargetIdentityFields, samePromptTargetIdentity, unavailablePromptObservation, type PromptObservation, type PromptSubmissionEvidence, type PromptTargetIdentity } from "../messages/prompt.js";
 import { agentFrom, assertSendableState, compactPane, paneFrom, snapshotIdentityRecords, stateOf, type CommunicateState } from "../messages/prompt-target.js";
-import { publishedAttachmentMatchesDirectory, type AttachmentStore, type PublishedAttachment } from "../messages/store.js";
-import { verifyRecipient, type RecipientRegistry } from "../messages/recipients.js";
 import { buildEnvelope, resolveSender, type SenderIdentity } from "../provenance.js";
 import { CommunicateParamsSchema, isNamedKey, PublishedCommunicateParamsSchema, type CommunicateParams } from "../schemas.js";
 import { resolveTarget, type CurrentContext } from "../targets.js";
@@ -22,7 +20,7 @@ import { formatCall, formatResult, renderResultComponent, textComponent } from "
 export type CommunicateRoute = "prompt_direct" | "steer_direct";
 export type { CommunicateState };
 export { compactPane, paneFrom };
-export type CommunicatePhase = "validate" | "resolve_target" | "caller_policy" | "verify_recipient" | "pre_state" | "publish" | "send" | "post_state";
+export type CommunicatePhase = "validate" | "resolve_target" | "caller_policy" | "pre_state" | "send" | "post_state";
 
 export interface LegacyCommunicateDetails {
   operation: "prompt" | "steer" | "keys";
@@ -47,7 +45,6 @@ export interface LegacyCommunicateDetails {
   sender?: { paneId: string; display: string; source: SenderIdentity["source"] };
   envelope?: { version: "v1"; kind: "prompt" | "steer" | "result"; delivery: MessageDelivery };
   contextRebinding?: ContextResolutionDiagnostics;
-  attachment?: { attachmentId: string; path: string; bytes: number; sha256: string; expiresAt: string; recipientPaneId?: string };
 }
 
 export type CommunicateDetails = LegacyCommunicateDetails | TurnControlDetails;
@@ -57,8 +54,6 @@ export interface CommunicateDependencies {
   context: CurrentContext;
   contextResolver?: ContextResolver;
   preflight: CompatibilityPreflight;
-  attachments?: AttachmentStore;
-  recipients?: RecipientRegistry;
   /**
    * The host's shared Devin queue-flush coordinator. A Devin-kind send rides
    * its short write section and an acknowledged busy write schedules the
@@ -96,11 +91,10 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
       }
       // Establish the route before any precondition so every refusal names it.
       const legacyParams = params as Exclude<CommunicateParams, { operation: "cancel" | "interrupt" }>;
-      const delivery: MessageDelivery | undefined = legacyParams.operation === "keys" ? undefined : (legacyParams.delivery === "attachment" ? "attachment" : "inline");
+      const delivery: MessageDelivery | undefined = legacyParams.operation === "keys" ? undefined : "inline";
       const route: CommunicateRoute | undefined = legacyParams.operation === "keys" ? undefined : (legacyParams.operation === "steer" ? "steer_direct" : "prompt_direct");
       let prompt: JsonEnvelope | undefined;
       let keys: JsonEnvelope | undefined;
-      let published: PublishedAttachment | undefined;
       let phase: CommunicatePhase = "validate";
       let snapshotOperationId: string | undefined;
       let target: ReturnType<typeof resolveTarget>;
@@ -126,7 +120,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           }
         } else {
           assertMessageText(legacyParams.text);
-          if (legacyParams.delivery !== undefined && legacyParams.delivery !== "inline" && legacyParams.delivery !== "attachment") throw Object.assign(new Error("delivery must be inline or attachment"), { code: "INVALID_INPUT", details: { field: "delivery" } });
+          if (legacyParams.delivery !== undefined && legacyParams.delivery !== "inline") throw Object.assign(new Error("delivery must be inline"), { code: "INVALID_INPUT", details: { field: "delivery" } });
           if (legacyParams.kind !== undefined && legacyParams.kind !== "result") throw Object.assign(new Error("kind must be result"), { code: "INVALID_INPUT", details: { field: "kind" } });
           assertDeliverySize(legacyParams.text, delivery!);
         }
@@ -149,41 +143,12 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         }
         // Cooperative worker/manager routing (ADR-030): classify the effective
         // caller after exact target resolution so an alias for the bound
-        // manager pane compares equal, and before any recipient lookup,
-        // fresh-state read, or dispatch so a denied call performs no sends.
+        // manager pane compares equal, and before any fresh-state read or
+        // dispatch so a denied call performs no sends.
         phase = "caller_policy";
         const callerPolicy = classifyCaller(snapshot, effective.context.paneId);
         if (legacyParams.operation === "keys") assertControlScope(callerPolicy, "keys");
         else assertSendScope(callerPolicy, legacyParams.operation, target.paneId);
-        let recipientKey: string | undefined;
-        let recipientAgentName: string | undefined;
-        let recipientAttachmentDirectory: string | undefined;
-        let recipientRecord: ReturnType<RecipientRegistry["get"]>;
-        if (delivery === "attachment") {
-          phase = "verify_recipient";
-          if (!deps.attachments || !deps.recipients || !target.paneId) {
-            throw Object.assign(new Error("Attachment target capability is unavailable"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId } });
-          }
-          recipientRecord = deps.recipients.get(target.paneId);
-          const verification = verifyRecipient(snapshot, recipientRecord);
-          if (!verification.verified) {
-            throw Object.assign(new Error("Attachment target capability is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: verification.reason } });
-          }
-          recipientKey = recipientRecord!.recipientKey;
-          recipientAgentName = verification.identity.agentName;
-          if (recipientRecord!.kind === "agy") {
-            recipientAttachmentDirectory = recipientRecord!.attachmentDirectory;
-            let currentDirectory: string | undefined;
-            try {
-              currentDirectory = deps.attachments.recipientDirectory(recipientKey);
-            } catch {
-              // Report every store/key disagreement as an unavailable capability.
-            }
-            if (currentDirectory !== recipientAttachmentDirectory) {
-              throw Object.assign(new Error("Attachment target directory is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: "recipient attachment directory does not match the current store" } });
-            }
-          }
-        }
         phase = "pre_state";
         if (params.operation !== "keys") {
           preAgentEnvelope = await deps.cli.runJson(["agent", "get", target.paneId!], activeSignal);
@@ -235,26 +200,6 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             const identity = requirePromptTargetIdentity(finalIdentityRecords, target.paneId!);
             return { identity, state: finalState };
           };
-          // Check the fresh occupant before attachment publication as well as
-          // immediately before the prompt. This keeps an AGY replacement from
-          // receiving a published body while still retaining any race evidence.
-          if (delivery === "attachment") {
-            promptIdentity = (await verifyFreshPromptTarget()).identity;
-            phase = "publish";
-            published = await deps.attachments!.publish({
-              body: legacyParams.text,
-              recipientKey: recipientKey!,
-              ...(recipientAttachmentDirectory ? { expectedRecipientDirectory: recipientAttachmentDirectory } : {}),
-              recipientPaneId: target.paneId,
-              recipientAgentName,
-              senderPaneId: sender!.paneId,
-              senderDisplay: sender!.display,
-              operation: legacyParams.operation
-            });
-            if (recipientAttachmentDirectory && !publishedAttachmentMatchesDirectory(published, recipientAttachmentDirectory)) {
-              throw Object.assign(new Error("Published attachment directory is not verified"), { code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: target.paneId, reason: "published attachment does not match the registered recipient directory" } });
-            }
-          }
           phase = "send";
           let sentState: CommunicateState | undefined;
           const sendPrompt = async (): Promise<void> => {
@@ -262,9 +207,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
             promptIdentity = fresh.identity;
             sentState = fresh.state;
             phase = "send";
-            const envelope = delivery === "attachment"
-              ? buildEnvelope(sender!, envelopeKind, legacyParams.text, "attachment", { ...published!, encoding: "utf-8" })
-              : buildEnvelope(sender!, envelopeKind, legacyParams.text, "inline");
+            const envelope = buildEnvelope(sender!, envelopeKind, legacyParams.text, "inline");
             prompt = await deps.cli.prompt(target.paneId!, envelope, activeSignal);
             const requestId = prompt.id;
             try {
@@ -340,7 +283,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
           observation = unavailablePromptObservation(error);
         }
       } catch (error) {
-        throw withDeliveryFailureEvidence(error, { delivery, route, phase, published, promptDispatch });
+        throw withDeliveryFailureEvidence(error, { delivery, route, phase, promptDispatch });
       }
 
       const details: CommunicateDetails = {
@@ -366,8 +309,7 @@ export function createCommunicateTool(deps: CommunicateDependencies): ToolDefini
         },
         ...(legacyParams.operation !== "keys" ? {
           sender: { paneId: sender!.paneId, display: sender!.display, source: sender!.source },
-          envelope: { version: "v1" as const, kind: legacyParams.kind ?? legacyParams.operation, delivery: delivery! },
-          ...(published ? { attachment: published } : {})
+          envelope: { version: "v1" as const, kind: legacyParams.kind ?? legacyParams.operation, delivery: delivery! }
         } : {})
       };
       return { content: [{ type: "text", text: formatResult({ operation: "communicate", outcome: "success", targetId: target.paneId, delivery, ...(afterState === undefined ? {} : { postState: { agent_status: afterState } }) }) }], details };

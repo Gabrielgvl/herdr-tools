@@ -401,7 +401,7 @@ export async function compileCandidateContract(catalog: Catalog, spec: CompileSp
   };
 }
 
-/** The contract's argv, through the existing per-runner builders. */
-export function contractArgv(contract: CompiledContract, promptFilePath?: string, attachmentDirectory?: string, handoffDirectory?: string): string[] {
-  return buildRuntimeArgv({ sessionPersistence: contract.sessionPersistence, source: { scopeRoot: contract.scopeRoot } }, contract.runtime, promptFilePath, attachmentDirectory, handoffDirectory);
+/** The contract's argv, through the existing per-runner builders. The third positional slot is held for the launch call site while its sibling lane retires the argument; it accepts only `undefined`. */
+export function contractArgv(contract: CompiledContract, promptFilePath?: string, retiredDirectoryGrant?: undefined, handoffDirectory?: string): string[] {
+  return buildRuntimeArgv({ sessionPersistence: contract.sessionPersistence, source: { scopeRoot: contract.scopeRoot } }, contract.runtime, promptFilePath, handoffDirectory);
 }

@@ -15,16 +15,13 @@ import { routeTask } from "../../src/router.js";
 import type { RoutingTask, TaskModelDecision } from "../../src/router.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { parsePromptTargetIdentityFields } from "../../src/messages/prompt.js";
-import type { AttachmentStore } from "../../src/messages/store.js";
 import { createHandoffAllocator, HANDOFF_PROVENANCE_NAME, readHandoffState, updateHandoffState, type HandoffAllocation, type HandoffAllocator, type HandoffRunIdentity, type HandoffState, type HandoffStatus } from "../../src/handoff.js";
 import { POLICY_REVISION, type QualityTier, type WorkspaceState } from "../../src/routing-policy.js";
 import type { TypeSafeSpecClient } from "../../src/typesafe-spec.js";
 import type { SupervisionReserveRequest } from "../../src/supervision/registry.js";
 import { SupervisionBindError } from "../../src/supervision/supervisor.js";
 import { canonicalJson, EVIDENCE_ASSIGNMENT_MAX_BYTES } from "../../src/supervision/evidence.js";
-import type { WorktreeManager } from "../../src/worktree.js";
-import { RecipientRegistry } from "../../src/messages/recipients.js";
-import { attachmentCapability, handoffWriteCapability } from "../../src/profiles/capability.js";
+import { handoffWriteCapability } from "../../src/profiles/capability.js";
 import { parseProfile, profileSource, refreshBundledProfileResourceSelection, SKILL_BUNDLE_REGISTRY_FILE, skillTreeDigest, validateProfileResourceSelection } from "../../src/profiles/index.js";
 import { stubSupervision, type StubSupervision } from "./supervision-fixtures.js";
 
@@ -153,16 +150,6 @@ function responseFor(catalog: Catalog, quality: { done_when_verifiable?: number 
     resources,
     fitness,
     uncertainDimensions: [],
-  };
-}
-
-function fakeAttachments(): AttachmentStore {
-  const grant = { path: "/tmp/recipient", token: "grant", renew: vi.fn(async () => undefined), release: vi.fn(async () => undefined) };
-  return {
-    root: "/tmp",
-    recipientDirectory: (key) => `/tmp/${key}`,
-    ensureRecipient: vi.fn(async () => grant),
-    publish: vi.fn(async () => ({ attachmentId: "attachment", path: "/tmp/recipient/body.txt", bytes: 1, sha256: "a".repeat(64), expiresAt: "2026-09-19T00:00:00.000Z" })),
   };
 }
 
@@ -307,13 +294,6 @@ function paneRecord(child: Child): Record<string, unknown> {
   return { pane_id: child.paneId, tab_id: child.tabId, workspace_id: "w1", agent_name: child.name, agent: child.kind, terminal_id: child.terminalId, agent_session: child.session, agent_status: child.prompt ? "working" : "idle", state_change_seq: child.prompt ? 8 : 7, revision: child.prompt ? 4 : 3, interactive_ready: true, ...(child.agentId === undefined ? {} : { agent_id: child.agentId }) };
 }
 
-function worktrees(): { manager: WorktreeManager; prepare: ReturnType<typeof vi.fn>; bindPane: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> } {
-  const prepare = vi.fn(async ({ childName, cwd }: { childName: string; cwd: string }) => ({ cwd: join(cwd, ".herdr", "worktrees", childName), worktreePath: join(cwd, ".herdr", "worktrees", childName) }));
-  const bindPane = vi.fn();
-  const release = vi.fn(async () => undefined);
-  return { manager: { prepare, bindPane, release } as unknown as WorktreeManager, prepare, bindPane, release };
-}
-
 // Unit fixtures inject an always-open lease; the real fail-closed gate is
 // covered by launch-freeze.test.ts.
 const openLaunchGate: NonNullable<LaunchDependencies["launchGate"]> = async () => ({ check: async () => undefined, release: async () => undefined });
@@ -323,10 +303,8 @@ function toolFor(options: {
   cli: LaunchCli;
   specClient?: LaunchDependencies["specClient"];
   supervision?: StubSupervision;
-  attachments?: AttachmentStore;
   ownership?: LaunchDependencies["ownership"];
   launchGate?: LaunchDependencies["launchGate"];
-  worktrees?: WorktreeManager;
   routerLog?: LaunchRouterLog | null;
   catalogLoad?: () => Promise<Catalog>;
   preflight?: LaunchDependencies["preflight"];
@@ -351,20 +329,17 @@ function toolFor(options: {
     supervision,
     specClient,
     catalog: { load: options.catalogLoad ?? (async () => options.catalog) },
-    attachments: options.attachments ?? fakeAttachments(),
     ...(options.handoffs === null ? {} : { handoffs: options.handoffs ?? fakeHandoffs() }),
     ...(options.useDefaultFailureRecorder ? {} : { availabilityFailureRecorder: options.availabilityFailureRecorder ?? vi.fn(async () => undefined) }),
     ...(options.availability === undefined ? {} : { availability: options.availability }),
     ...(options.claudeQuotaReader === undefined ? {} : { claudeQuotaReader: options.claudeQuotaReader }),
     ...(options.ownership === undefined ? {} : { ownership: options.ownership }),
-    recipients: new RecipientRegistry(),
     ...(options.routerLog === null ? {} : { routerLog: options.routerLog ?? (vi.fn(async () => undefined) as LaunchRouterLog) }),
     ...(options.contextResolver === undefined ? {} : { contextResolver: options.contextResolver }),
     ...(options.promptSources === undefined ? {} : { promptSources: options.promptSources }),
     ...(options.queueFlush === undefined ? {} : { queueFlush: options.queueFlush }),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
     launchGate: options.launchGate ?? openLaunchGate,
-    ...(options.worktrees === undefined ? {} : { worktrees: options.worktrees }),
   });
 }
 
@@ -517,7 +492,7 @@ describe("herdr_launch task cutover", () => {
     expect(Value.Check(PublishedLaunchParamsSchema, valid)).toBe(true);
     expect(() => validateLaunchParams(valid)).not.toThrow();
     // The deleted caller-authority fields are unknown properties now: no alias survives.
-    for (const deleted of ["name", "specs", "tasks", "instructions", "assignment", "supervisionDigest", "category", "count", "placement", "focus", "assignmentDelivery", "transportBypass", "profile"]) {
+    for (const deleted of ["name", "specs", "tasks", "instructions", "assignment", "supervisionDigest", "category", "count", "placement", "focus", "assignmentDelivery", "transportBypass", "profile", "replicas"]) {
       expect(Value.Check(LaunchTaskSchema, { ...valid, [deleted]: "x" }), deleted).toBe(false);
       expect(() => validateLaunchParams({ ...valid, [deleted]: "x" } as never)).toThrow();
     }
@@ -526,10 +501,6 @@ describe("herdr_launch task cutover", () => {
     expect(Value.Check(LaunchTaskSchema, { ...valid, doneWhen: Array.from({ length: 8 }, (_, index) => `d${index}`) })).toBe(true);
     expect(Value.Check(LaunchTaskSchema, { ...valid, constraints: Array.from({ length: 9 }, (_, index) => `c${index}`) })).toBe(false);
     expect(Value.Check(LaunchTaskSchema, { ...valid, constraints: [] })).toBe(true);
-    expect(Value.Check(LaunchTaskSchema, { ...valid, replicas: 0 })).toBe(false);
-    expect(Value.Check(LaunchTaskSchema, { ...valid, replicas: 9 })).toBe(false);
-    expect(Value.Check(LaunchTaskSchema, { ...valid, replicas: 8 })).toBe(true);
-    expect(Value.Check(LaunchTaskSchema, { ...valid, replicas: 1.5 })).toBe(false);
     expect(Value.Check(LaunchTaskSchema, task({ tier: "frontier" }))).toBe(true);
     expect(Value.Check(LaunchTaskSchema, { ...valid, tier: "bogus" })).toBe(false);
     expect(Value.Check(LaunchTaskSchema, task({ objective: "" }))).toBe(false);
@@ -694,21 +665,19 @@ describe("herdr_launch task cutover", () => {
     });
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const handoffs = fakeHandoffs();
-    const attachments = fakeAttachments();
     const supervision = stubSupervision();
     const order: string[] = [];
     let callsAtPersist: string[][] = [];
     (handoffs.persist as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("persist"); callsAtPersist = [...harness.calls]; });
-    (attachments.ensureRecipient as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("recipient"); return { path: "/tmp/recipient", token: "grant", renew: vi.fn(async () => undefined), release: vi.fn(async () => undefined) }; });
     const reserve = supervision.reserve;
     supervision.reserve = vi.fn(async (value) => { order.push("reserve"); return reserve(value); });
 
-    const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs, attachments, supervision }), task({ label: "docs sprint", cwd: repoRoot }));
+    const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs, supervision }), task({ label: "docs sprint", cwd: repoRoot }));
     expect(result.details).toMatchObject({ outcome: "launched" });
 
-    // The provenance write precedes the first recipient and supervision effect,
-    // and every CLI call it observed was a read.
-    expect(order.slice(0, 3)).toEqual(["persist", "recipient", "reserve"]);
+    // The provenance write precedes the supervision effect, and every CLI
+    // call it observed was a read.
+    expect(order.slice(0, 2)).toEqual(["persist", "reserve"]);
     expect(callsAtPersist.every((argv) => (argv[0] === "pane" && argv[1] === "current") || argv[0] === "api")).toBe(true);
     expect(handoffs.persist).toHaveBeenCalledTimes(1);
     const [runArg, identityArg, provenanceArg] = (handoffs.persist as ReturnType<typeof vi.fn>).mock.calls[0]! as [HandoffAllocation, HandoffRunIdentity, unknown];
@@ -718,7 +687,7 @@ describe("herdr_launch task cutover", () => {
     expect(identityArg.manager).toEqual({ paneId: "w1:p1", display: "manager", source: "agent_name" });
     expect(provenanceArg).toEqual({
       managerSession,
-      task: { ...TASK, replicas: 1, label: "docs sprint", cwd: repoRoot }
+      task: { ...TASK, label: "docs sprint", cwd: repoRoot }
     });
     // D5: the fresh-launch binding records the same owner the reattach path
     // derives from this provenance — the manager pane plus its native session.
@@ -811,7 +780,7 @@ describe("herdr_launch task cutover", () => {
         }
       }, options.omitProvenance ? undefined : {
         managerSession: { source: "herdr:pi", agent: "pi", kind: "id", value: "prior-manager-session" },
-        task: { objective: "prior objective", scope: "prior scope", doneWhen: ["prior done"], constraints: [], tier: "standard", replicas: 1 }
+        task: { objective: "prior objective", scope: "prior scope", doneWhen: ["prior done"], constraints: [], tier: "standard" }
       });
       await updateHandoffState(run, (state) => {
         state.lifecycle.state = options.lifecycle ?? "handed_off";
@@ -852,7 +821,7 @@ describe("herdr_launch task cutover", () => {
       const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
       const harness = makeCli();
       const evaluate = vi.fn<TypeSafeSpecClient["evaluate"]>(async () => ({ kind: "response" as const, response: responseFor(catalog) }));
-      const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId, replicas: 1 }));
+      const result = await execute(toolFor({ catalog, cli: harness.cli, specClient: { evaluate }, handoffs: allocator }), task({ recoveryOf: run.runId }));
 
       // nextTier(standard) lifts the start to strong; the caller asked for no tier.
       expect(result.details).toMatchObject({ outcome: "launched", effectiveTier: "strong" });
@@ -884,7 +853,9 @@ describe("herdr_launch task cutover", () => {
       expect(result.details).toMatchObject({ outcome: "launched" });
       expect(placementCwd(harness)).toBe(worktreeDir);
       const newState = await readHandoffState(await allocator.open(launchedRunId(harness)));
-      expect(newState.child.workspace).toEqual({ resolvedCwd: worktreeDir, worktree: worktreeDir });
+      // The new record carries only the resolved managed cwd — a replica-era
+      // worktree read still resumes, but nothing writes the field anymore.
+      expect(newState.child.workspace).toEqual({ resolvedCwd: worktreeDir });
     });
 
     it("computes the effective start as max(requested, workload floor, next tier after the prior route)", async () => {
@@ -1082,18 +1053,16 @@ describe("herdr_launch task cutover", () => {
       expect(specClient.evaluate).not.toHaveBeenCalled();
     });
 
-    it("rejects a recovery request carrying cwd or replicas > 1 before any effect", async () => {
+    it("rejects a recovery request carrying cwd before any effect", async () => {
       const { run, allocator } = await seedRecoveryRun();
       const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
-      for (const overrides of [{ cwd: repoRoot }, { replicas: 2 }, { cwd: repoRoot, replicas: 2 }]) {
-        const harness = makeCli();
-        const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
-        const params = task({ recoveryOf: run.runId, ...overrides });
-        expect(() => validateLaunchParams(params)).toThrowError(expect.objectContaining({ code: "INVALID_INPUT" }));
-        await expect(toolFor({ catalog, cli: harness.cli, specClient, handoffs: allocator }).execute("call", params, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
-        expect(harness.calls).toEqual([]);
-        expect(specClient.evaluate).not.toHaveBeenCalled();
-      }
+      const harness = makeCli();
+      const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+      const params = task({ recoveryOf: run.runId, cwd: repoRoot });
+      expect(() => validateLaunchParams(params)).toThrowError(expect.objectContaining({ code: "INVALID_INPUT" }));
+      await expect(toolFor({ catalog, cli: harness.cli, specClient, handoffs: allocator }).execute("call", params, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(harness.calls).toEqual([]);
+      expect(specClient.evaluate).not.toHaveBeenCalled();
     });
   });
 
@@ -1394,33 +1363,19 @@ describe("herdr_launch task cutover", () => {
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
   });
 
-  it("prepares and binds one isolated worktree per replica", async () => {
+  it("rejects a task carrying the removed replicas field before any effect", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const harness = makeCli();
-    const isolated = worktrees();
     const handoffs = fakeHandoffs();
-    const result = await toolFor({ catalog, cli: harness.cli, worktrees: isolated.manager, handoffs }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
-    expect(result.details).toMatchObject({ outcome: "launched" });
-    const children = result.details!.children;
-    expect(children).toHaveLength(2);
-    expect(children.every((child) => child.state === "launched")).toBe(true);
-    expect(children.every((child) => typeof child.worktree === "string")).toBe(true);
-    expect(new Set(children.map((child) => child.worktree)).size).toBe(2);
-    expect(isolated.prepare).toHaveBeenCalledTimes(2);
-    expect(isolated.prepare.mock.calls.map(([value]) => value.childName)).toEqual(children.map((child) => child.target));
-    expect(isolated.prepare.mock.calls.every(([value]) => value.cwd === repoRoot && value.count === 2)).toBe(true);
-    expect(harness.prompts).toHaveLength(2);
-    expect(harness.prompts.every((prompt) => prompt.includes(SPEC_BASELINE))).toBe(true);
-    expect(isolated.bindPane).toHaveBeenCalledTimes(2);
-    expect(isolated.bindPane.mock.calls.map(([name]) => name)).toEqual(children.map((child) => child.target));
-    const runs = (handoffs.persist as ReturnType<typeof vi.fn>).mock.calls.map(([run]) => (run as { runId: string }).runId);
-    expect(new Set(runs).size).toBe(2);
+    await expect(toolFor({ catalog, cli: harness.cli, handoffs }).execute("call", { ...task(), replicas: 2 } as never, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(harness.calls).toEqual([]);
+    expect(handoffs.persist).not.toHaveBeenCalled();
   });
 
-  it("retains child failures, partial children, and aborted tails", async () => {
+  it("retains child failures and the aborted single child", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
 
-    // A minted-name collision fails that child only; the sibling still launches.
+    // A minted-name collision fails the one child closed.
     let launchId: string | undefined;
     const routerLog = vi.fn(async (entry: { caller?: string }) => { launchId = entry.caller; }) as unknown as LaunchRouterLog;
     const occupiedResolver = async () => {
@@ -1432,25 +1387,22 @@ describe("herdr_launch task cutover", () => {
       } as HerdrSnapshot;
       return { snapshot: occupied, context, diagnostics: baseDiagnostics, operationIds: baseOperationIds };
     };
-    const collision = await toolFor({ catalog, cli: makeCli().cli, contextResolver: occupiedResolver, worktrees: worktrees().manager, routerLog }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
-    expect(collision.details).toMatchObject({ outcome: "partial", children: [{ state: "failed", error: { code: "TARGET_IDENTITY_UNAVAILABLE" } }, { state: "launched" }] });
+    const collision = await toolFor({ catalog, cli: makeCli().cli, contextResolver: occupiedResolver, routerLog }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(collision.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "TARGET_IDENTITY_UNAVAILABLE" } }] });
 
-    // A failed second child keeps the launched sibling.
+    // A failed start is the single failed child.
     const failedHarness = makeCli({
-      failedPane: { pane_id: "w1:p3", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
-      start: (argv, attempt) => {
-        if (attempt === 1) throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } });
-        return ok("start", { agent: { name: String(argv[2]), pane_id: "w1:p2", agent: "pi", terminal_id: "terminal-w1:p2", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-0" } } });
-      }
+      failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
+      start: () => { throw new CliProtocolError("CLI_PROTOCOL_ERROR", "start failed", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "agent process exited before becoming interactive" } } }); }
     });
-    const partial = await toolFor({ catalog, cli: failedHarness.cli, worktrees: worktrees().manager }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
-    expect(partial.details).toMatchObject({ outcome: "partial", children: [{ state: "launched" }, { state: "failed", error: { code: "LAUNCH_FAILED" } }] });
+    const failed = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }]), cli: failedHarness.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(failed.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "LAUNCH_FAILED" } }] });
 
-    // An abort between routing and the first child leaves every tail not_started.
+    // An abort between routing and the child leaves the tail not_started.
     const abort = new AbortController();
     const abortLog = vi.fn(async () => { abort.abort(); }) as unknown as LaunchRouterLog;
-    const abortedLaunch = await toolFor({ catalog, cli: makeCli().cli, worktrees: worktrees().manager, routerLog: abortLog }).execute("call", task({ replicas: 2 }), abort.signal, undefined, extensionContext);
-    expect(abortedLaunch.details).toMatchObject({ outcome: "failed", children: [{ state: "not_started", error: { code: "ABORTED" } }, { state: "not_started", error: { code: "ABORTED" } }] });
+    const abortedLaunch = await toolFor({ catalog, cli: makeCli().cli, routerLog: abortLog }).execute("call", task(), abort.signal, undefined, extensionContext);
+    expect(abortedLaunch.details).toMatchObject({ outcome: "failed", children: [{ state: "not_started", error: { code: "ABORTED" } }] });
   });
 
   it("reuses a matching workload tab under the pane cap and creates the next label past it", async () => {
@@ -1525,18 +1477,12 @@ describe("herdr_launch task cutover", () => {
     expect(harness.calls.some((call) => call[0] === "tab" && call.slice(1).includes("workload:unknown"))).toBe(false);
   });
 
-  it("covers replica preconditions, reserve failures, and start recovery", async () => {
+  it("covers reserve failures and start recovery", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
 
-    // Replicas require the worktree manager before any effect.
-    await expect(toolFor({ catalog, cli: makeCli().cli }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "WORKTREE_UNAVAILABLE" });
-
-    // A reserve failure fails each child closed and releases its worktree.
-    const prepared = worktrees();
-    const reserveFailure = await toolFor({ catalog, cli: makeCli().cli, worktrees: prepared.manager, supervision: stubSupervision({ reserveError: new Error("reserve") }) }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
-    expect(reserveFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "SUPERVISION_UNAVAILABLE" } }, { state: "failed", error: { code: "SUPERVISION_UNAVAILABLE" } }] });
-    expect(prepared.release).toHaveBeenCalledTimes(2);
-    expect(prepared.release).toHaveBeenCalledWith(reserveFailure.details!.children[0]!.target);
+    // A reserve failure fails the child closed.
+    const reserveFailure = await toolFor({ catalog, cli: makeCli().cli, supervision: stubSupervision({ reserveError: new Error("reserve") }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(reserveFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "SUPERVISION_UNAVAILABLE" } }] });
 
     const genericStart = makeCli({ start: () => { throw new Error("start exploded"); } });
     const failed = await toolFor({ catalog, cli: genericStart.cli }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
@@ -1620,12 +1566,10 @@ describe("herdr_launch task cutover", () => {
     const noWorkspace = await toolFor({ catalog, cli: makeCli().cli, contextResolver: async () => ({ snapshot, context: { workspaceId: "", tabId: "w1:t1", paneId: "w1:p1" }, diagnostics: baseDiagnostics, operationIds: baseOperationIds }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
     expect(noWorkspace.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
 
-    // A failed topology mutation releases the child's prepared worktree.
+    // A failed topology mutation fails the child closed.
     const workloadSnapshot = { ...snapshot, tabs: [...snapshot.tabs, { tab_id: "w1:t9", workspace_id: "w1", label: "workload:implement" }], panes: [...snapshot.panes, { pane_id: "w1:p9", tab_id: "w1:t9", workspace_id: "w1", label: "worker", agent_status: "idle" }] } as HerdrSnapshot;
-    const isolated = worktrees();
-    const splitFailure = await toolFor({ catalog, cli: makeCli({ splitError: new Error("split") }).cli, contextResolver: resolverFor(workloadSnapshot), worktrees: isolated.manager }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
-    expect(splitFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }, { state: "failed" }] });
-    expect(isolated.release).toHaveBeenCalledWith(splitFailure.details!.children[0]!.target);
+    const splitFailure = await toolFor({ catalog, cli: makeCli({ splitError: new Error("split") }).cli, contextResolver: resolverFor(workloadSnapshot) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
+    expect(splitFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
   });
 
   it("covers pre-spawn compile/source fallback and reconciliation", async () => {
@@ -1690,7 +1634,7 @@ describe("herdr_launch task cutover", () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const updates = vi.fn();
     const labeledTool = toolFor({ catalog, cli: makeCli().cli });
-    const call = labeledTool.renderCall?.(task({ label: "sprint", replicas: 2, tier: "strong" }), {} as never, {} as never);
+    const call = labeledTool.renderCall?.(task({ label: "sprint", tier: "strong" }), {} as never, {} as never);
     expect(call).toBeDefined();
     const labeled = await labeledTool.execute("call", task({ label: "sprint" }), new AbortController().signal, updates, extensionContext);
     expect(labeled.details).toMatchObject({ outcome: "launched", children: [{ state: "launched" }] });
@@ -1700,7 +1644,7 @@ describe("herdr_launch task cutover", () => {
     expect(rendered).toBeDefined();
     // renderCall tolerates absent or mistyped display fields.
     expect(labeledTool.renderCall?.({} as never, {} as never, {} as never)).toBeDefined();
-    expect(labeledTool.renderCall?.({ label: 7, tier: 3, replicas: "x" } as never, {} as never, {} as never)).toBeDefined();
+    expect(labeledTool.renderCall?.({ label: 7, tier: 3 } as never, {} as never, {} as never)).toBeDefined();
     expect(labeledTool.renderResult?.({ details: undefined } as never, {} as never, {} as never, {} as never)).toBeDefined();
     expect(labeledTool.renderResult?.({ details: { kind: "other" } } as never, {} as never, {} as never, {} as never)).toBeDefined();
   });
@@ -1821,41 +1765,36 @@ tierChains:
     const preflight = await toolFor({ catalog, cli: makeCli().cli, preflight: async () => { throw Object.assign(new Error("preflight"), { code: "PREFLIGHT_FAILED" }); } }).execute("call", task(), new AbortController().signal, undefined, extensionContext).catch((error) => error);
     expect(preflight).toMatchObject({ code: "PREFLIGHT_FAILED", details: { phase: "validate" } });
 
-    // Delivery is runtime-owned: a rendered payload over the inline bound moves
-    // to the attachment, and one over the attachment bound fails closed.
-    const attachments = fakeAttachments();
+    // Delivery is runtime-owned (D14): a rendered payload over the single
+    // inline bound fails closed at validation — no larger route exists.
     const harness = makeCli();
-    const big = await execute(toolFor({ catalog, cli: harness.cli, attachments }), task({ objective: `Ship ${"x".repeat(20_000)}` }));
-    expect(big.details).toMatchObject({ outcome: "launched" });
-    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining("Objective:") }));
-    expect(harness.prompts[0]).toContain("delivery: attachment");
-    expect(harness.prompts[0]).toContain("attachment-path: /tmp/recipient/body.txt");
-    expect(harness.prompts[0]).not.toContain("x".repeat(1_000));
+    await expect(toolFor({ catalog, cli: harness.cli }).execute("call", task({ objective: `Ship ${"x".repeat(20_000)}` }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "MESSAGE_TOO_LARGE" });
+    expect(harness.calls).toEqual([]);
     // `scope` stays out of the supervision digest, so it still reaches the
     // delivery bound — an oversized objective is refused earlier by the
     // assignment budget preflight.
     await expect(toolFor({ catalog, cli: makeCli().cli }).execute("call", task({ scope: "x".repeat(1_100_000) }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "MESSAGE_TOO_LARGE" });
   });
 
-  it("admits an assignment at the evidence cap and rejects one byte over before any effect", async () => {
+  it("rejects an assignment over the inline bound or the evidence cap before any effect", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     // The exact normalized canonical bytes the evidence builder measures:
     // {constraints, doneWhen, objective, progressMarkers} in canonical order.
     const wrapBytes = Buffer.byteLength(canonicalJson({ constraints: TASK.constraints, doneWhen: TASK.doneWhen, objective: "", progressMarkers: [] }), "utf8");
     const objective = "x".repeat(EVIDENCE_ASSIGNMENT_MAX_BYTES - wrapBytes);
 
-    // At the boundary the Task launches and the reservation gets the digest.
+    // At the supervision-evidence boundary the Task still exceeds the inline
+    // delivery bound — with no larger delivery route it fails closed at
+    // validate.
     const harness = makeCli();
-    const supervision = stubSupervision();
-    const requests: SupervisionReserveRequest[] = [];
-    const reserve = supervision.reserve;
-    supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
-    const result = await execute(toolFor({ catalog, cli: harness.cli, supervision }), task({ objective }));
-    expect(result.details).toMatchObject({ outcome: "launched" });
-    expect(requests[0]!.settings!.supervisionDigest).toMatchObject({ objective });
+    await expect(
+      toolFor({ catalog, cli: harness.cli }).execute("call", task({ objective }), new AbortController().signal, undefined, extensionContext),
+    ).rejects.toMatchObject({ code: "MESSAGE_TOO_LARGE", details: { phase: "validate" } });
+    expect(harness.calls).toEqual([]);
 
-    // One byte over is a validate-phase refusal with count-only diagnostics —
-    // before the gate, evaluation, routing persistence, or any child effect.
+    // One byte over the evidence cap is a validate-phase refusal with
+    // count-only diagnostics — before the gate, evaluation, routing
+    // persistence, or any child effect.
     const over = makeCli();
     const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
     const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
@@ -1947,7 +1886,7 @@ tierChains:
     expect(gate.release).toHaveBeenCalled();
   });
 
-  it("retains precondition failures, worktree failures, and provenance warnings", async () => {
+  it("retains precondition failures and provenance warnings", async () => {
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const reservation = stubSupervision({ reserveError: new Error("reserve failed") });
     const reserveHarness = makeCli();
@@ -1957,33 +1896,13 @@ tierChains:
     expect(reserveHarness.calls.some((call) => call[0] === "tab" && call[1] === "create")).toBe(false);
     const coded = await toolFor({ catalog, cli: makeCli().cli, supervision: stubSupervision({ reserveError: Object.assign(new Error("coded reserve"), { code: "RESERVE_CODE" }) }) }).execute("call", task(), new AbortController().signal, undefined, extensionContext);
     expect(coded.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "SUPERVISION_UNAVAILABLE" } }] });
-    const release = vi.fn(async () => undefined);
-    const grant = { path: "/tmp/grant", token: "token", renew: vi.fn(async () => undefined), release };
-    const publishFailure: AttachmentStore = { ...fakeAttachments(), ensureRecipient: vi.fn(async () => grant), publish: vi.fn(async () => { throw new Error("publish failed"); }) };
-    const unpublished = await toolFor({ catalog, cli: makeCli().cli, attachments: publishFailure }).execute("call", task({ objective: `x${"y".repeat(20_000)}` }), new AbortController().signal, undefined, extensionContext);
-    expect(unpublished.details).toMatchObject({ outcome: "failed", children: [{ state: "failed" }] });
-    expect(release).toHaveBeenCalled();
     const metadataHarness = makeCli({ metadataError: new Error("metadata failed") });
     const warned = await execute(toolFor({ catalog, cli: metadataHarness.cli }), task());
     expect(warned.details).toMatchObject({ outcome: "launched" });
-    const failingWorktrees = worktrees();
-    failingWorktrees.prepare.mockImplementation(async () => { throw new Error("prepare failed"); });
-    const worktreeFailure = await toolFor({ catalog, cli: makeCli().cli, worktrees: failingWorktrees.manager }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
-    expect(failingWorktrees.prepare).toHaveBeenCalledTimes(2);
-    expect(worktreeFailure.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "SPEC_NO_USABLE_CANDIDATE" } }, { state: "failed", error: { code: "SPEC_NO_USABLE_CANDIDATE" } }] });
-    const retryWorktrees = worktrees();
-    retryWorktrees.prepare.mockImplementationOnce(async () => { throw new Error("first worktree failed"); });
-    const retryHarness = makeCli();
-    const retryResult = await toolFor({ catalog: catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]), cli: retryHarness.cli, worktrees: retryWorktrees.manager }).execute("call", task({ replicas: 2 }), new AbortController().signal, undefined, extensionContext);
-    expect(retryResult.details).toMatchObject({ outcome: "launched", children: [{ state: "launched", operatingPointId: "pi:fallback:low" }, { state: "launched", operatingPointId: "pi:primary:low" }] });
   });
 
   it("covers runner capability and empty skill-selection branches", async () => {
     const profile = (kind: string, runtime: Record<string, unknown>) => ({ name: kind, description: kind, timeoutMinutes: 1, sessionPersistence: false, runtime: { kind, model: kind, ...runtime }, source: { kind: "bundled", path: `/tmp/${kind}.md`, scopeRoot: "/tmp" } });
-    expect(attachmentCapability(profile("pi", { tools: [] }) as never)).toMatchObject({ kind: "pi", capable: true });
-    expect(attachmentCapability(profile("claude", { allowedTools: [], disallowedTools: [] }) as never)).toMatchObject({ kind: "claude", capable: true });
-    expect(attachmentCapability(profile("agy", { addDirs: [] }) as never)).toMatchObject({ kind: "agy", capable: true });
-    expect(attachmentCapability(profile("devin", { permissionMode: "dangerous" }) as never)).toMatchObject({ kind: "devin", capable: true });
     expect(handoffWriteCapability(profile("pi", { tools: [] }) as never)).toMatchObject({ kind: "pi", capable: true });
     expect(handoffWriteCapability(profile("claude", { allowedTools: [], disallowedTools: [] }) as never)).toMatchObject({ kind: "claude", capable: true });
     expect(handoffWriteCapability(profile("agy", { addDirs: [] }) as never)).toMatchObject({ kind: "agy", capable: true });
@@ -2430,9 +2349,9 @@ tierChains:
     expect(i.record([])).toBe(false);
     expect(() => i.identifier("", "name")).toThrow();
     expect(() => i.identifier("ok", "name")).not.toThrow();
-    expect(i.normalizedParams(task())).toMatchObject({ replicas: 1, constraints: TASK.constraints });
+    expect(i.normalizedParams(task())).toMatchObject({ constraints: TASK.constraints });
     expect(i.normalizedParams({ objective: "o", scope: "s", doneWhen: ["d"] })).not.toHaveProperty("tier");
-    expect(i.normalizedParams({ objective: "o", scope: "s", doneWhen: ["d"], tier: "strong" })).toMatchObject({ replicas: 1, tier: "strong", constraints: [] });
+    expect(i.normalizedParams({ objective: "o", scope: "s", doneWhen: ["d"], tier: "strong" })).toMatchObject({ tier: "strong", constraints: [] });
     expect(renderTask(task())).toContain("Reduce the latency");
     expect(renderTask({ objective: "o", scope: "s", doneWhen: ["d"] })).toContain("Constraints: (none)");
     expect(i.mintChildName("abcdef12-3456-7890-abcd-ef1234567890", 2)).toBe("task-abcdef12-2");
@@ -2547,8 +2466,6 @@ tierChains:
     expect(i.resolvedPointKey({ index: 1, point: { id: "pt:m", runner: "pi", model: "m" } })).toBe("pt:m");
     expect(i.isAdmitted({ kind: "admitted" })).toBe(true);
     expect(i.isAdmitted({ kind: "abstained" })).toBe(false);
-    expect(i.recipientCapability("pi")).toMatchObject({ kind: "pi", capable: true });
-    expect(i.recipientCapability("devin")).toMatchObject({ kind: "devin", capable: true });
     const routedTask: RoutingTask = { objective: "o", scope: "s", doneWhen: ["d"], constraints: [] };
     expect(i.taskRouterState(routedTask, catalogOf([{ runner: "pi", model: "pi-model" }])).points).toHaveLength(1);
     expect(i.taskRouteLogEntry("launch-1", { task: routedTask, decision: { kind: "abstained", reason: "x", component: "y" } })).toMatchObject({ caller: "launch-1", result: { kind: "abstained" } });
@@ -2564,9 +2481,8 @@ tierChains:
     await expect(i.run(runCli, ["api"], abortedRun.signal)).rejects.toMatchObject({ code: "ABORTED" });
     const failedRunCli = { runJson: vi.fn(async () => { throw new Error("run failed"); }), prompt: vi.fn() } as LaunchCli;
     await expect(i.run(failedRunCli, ["api"], new AbortController().signal)).rejects.toThrow("run failed");
-    const grant = { path: "/tmp/grant", token: "token", renew: vi.fn(), release: vi.fn() };
-    expect(i.partialError(new Error("partial"), { paneId: "p" }, "ready", grant, { agentStarted: true, promptSubmitted: true, recipientRegistered: false, mutationDispatched: true, assignmentState: "unconfirmed", timing: {}, attempts: [] }, "inline")).toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "ready" } });
-    expect(i.partialError(new Error("\0"), {}, "placement", grant, { agentStarted: false, promptSubmitted: false, recipientRegistered: false, mutationDispatched: false, timing: {}, attempts: [] })).toMatchObject({ code: "LAUNCH_FAILED" });
+    expect(i.partialError(new Error("partial"), { paneId: "p" }, "ready", { agentStarted: true, promptSubmitted: true, recipientRegistered: false, mutationDispatched: true, assignmentState: "unconfirmed", timing: {}, attempts: [] })).toMatchObject({ code: "LAUNCH_FAILED", details: { phase: "ready" } });
+    expect(i.partialError(new Error("\0"), {}, "placement", { agentStarted: false, promptSubmitted: false, recipientRegistered: false, mutationDispatched: false, timing: {}, attempts: [] })).toMatchObject({ code: "LAUNCH_FAILED" });
   });
 
   it("covers prompt confirmation reason variants", async () => {
@@ -2658,7 +2574,6 @@ tierChains:
 
   it("covers diagnostic, manifest, and route-state projections", () => {
     const i = launchTestInternals as unknown as UnsafeLaunchInternals;
-    const grant = { path: "/tmp/grant", token: "token", renew: vi.fn(), release: vi.fn() };
     const cliError = new CliProtocolError("CLI_PROTOCOL_ERROR", "cli failure", { exitCode: 1, killed: false, errorStream: "stderr", stderrTruncated: false, errorEnvelope: { id: "cli:agent:start", error: { code: "agent_start_failed", message: "failed" } } });
     expect(i.cliFailureEvidence({ code: "PLAIN", details: { stderr: "stderr" } })).toMatchObject({ code: "PLAIN" });
     expect(i.earlyLaunchFailure(Object.assign(new Error("cause"), { code: "CUSTOM", details: { causeCode: "ORIGINAL", cliFailure: { code: "CLI" } } }), "validate")).toMatchObject({ details: { causeCode: "ORIGINAL" } });
@@ -2666,11 +2581,11 @@ tierChains:
     const activeSupervision = { state: "active", jobId: "job", child: { paneId: "p" } };
     const provisionalSupervision = { state: "provisional", jobId: "job", provisional: { paneId: "p" } };
     const effects = { agentStarted: true, promptSubmitted: true, recipientRegistered: true, mutationDispatched: true, promptDispatch: { state: "acknowledged", requestId: "req" }, assignmentState: "confirmed", initialPromptSubmission: { confirmed: true }, readiness: { elapsedMs: 1 }, supervision: activeSupervision, timing: { selectedStartReadinessMs: 1 }, attempts: [{ point: { index: 0, id: "pt:m", runner: "pi", model: "m" }, outcome: "selected" }] };
-    expect(i.partialError(cliError, { paneId: "p" }, "agent_start", grant, effects, "attachment", { attachmentId: "a" }, { effectCertainty: "partial", pane: "present", agent: "present", snapshot: "present" })).toMatchObject({ code: "LAUNCH_FAILED", details: { attachmentRetained: true, supervision: activeSupervision } });
+    expect(i.partialError(cliError, { paneId: "p" }, "agent_start", effects, { effectCertainty: "partial", pane: "present", agent: "present", snapshot: "present" })).toMatchObject({ code: "LAUNCH_FAILED", details: { supervision: activeSupervision } });
     const readyTimeout = i.earlyLaunchFailure(Object.assign(new Error("timeout"), { code: "READY_TIMEOUT" }), "ready");
     readyTimeout.details.readiness = { elapsedMs: 1 } as unknown as UnsafeTestValue;
-    expect(i.partialError(readyTimeout, {}, "ready", grant, { ...effects, supervision: provisionalSupervision, readiness: undefined, assignmentState: undefined, initialPromptSubmission: undefined, promptDispatch: undefined, timing: {}, attempts: [] }, undefined, undefined, undefined)).toMatchObject({ code: "READY_TIMEOUT", details: { readiness: expect.any(Object) } });
-    expect(i.partialError(Object.assign(new Error("aborted"), { code: "ABORTED" }), {}, "placement", grant, { agentStarted: false, promptSubmitted: false, recipientRegistered: false, mutationDispatched: false, timing: {}, attempts: [] })).toMatchObject({ code: "ABORTED" });
+    expect(i.partialError(readyTimeout, {}, "ready", { ...effects, supervision: provisionalSupervision, readiness: undefined, assignmentState: undefined, initialPromptSubmission: undefined, promptDispatch: undefined, timing: {}, attempts: [] }, undefined)).toMatchObject({ code: "READY_TIMEOUT", details: { readiness: expect.any(Object) } });
+    expect(i.partialError(Object.assign(new Error("aborted"), { code: "ABORTED" }), {}, "placement", { agentStarted: false, promptSubmitted: false, recipientRegistered: false, mutationDispatched: false, timing: {}, attempts: [] })).toMatchObject({ code: "ABORTED" });
     expect(i.launchManifest({ kind: "launch", launchId: "l1", outcome: "failed", requestedTier: "standard", children: [], error: { code: "FAILED", message: "failed" } })).toContain("children=0");
     const missingRunnerCatalog = { ...catalogOf([{ runner: "pi", model: "m" }]), runners: new Map() };
     expect(i.taskRouterState({ objective: "o", scope: "s", doneWhen: ["d"], constraints: [] }, missingRunnerCatalog).points[0]).toMatchObject({ timeout: 0 });

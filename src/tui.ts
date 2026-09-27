@@ -147,14 +147,14 @@ export function resultForRender(
   }
   if (result.isError) {
     const code = typeof details?.code === "string" ? details.code : "UNKNOWN";
-    const delivery = details?.delivery === "inline" || details?.delivery === "attachment" ? details.delivery : undefined;
+    const delivery = details?.delivery === "inline" ? details.delivery : undefined;
     return { text: formatResult({ operation, outcome: "error", code, delivery, targetId }), tone: "error" };
   }
   if (!details || typeof details.outcome !== "string") return { text: formatResult({ operation, outcome: "error", code: "UNKNOWN", targetId }), tone: "error" };
   if (details.outcome === "cancelled" || details.outcome === "interrupted" || details.outcome === "agent_exited") {
     return { text: formatResult({ operation, outcome: details.outcome, targetId, postState: details.postState ?? details.finalState }), tone: details.outcome === "agent_exited" ? "warning" : "success" };
   }
-  const delivery = details.delivery === "inline" || details.delivery === "attachment" ? details.delivery : undefined;
+  const delivery = details.delivery === "inline" ? details.delivery : undefined;
   return { text: formatResult({ operation, outcome: "success", delivery, targetId, postState: details.postState }), tone: "success" };
 }
 

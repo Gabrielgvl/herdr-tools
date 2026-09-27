@@ -1,8 +1,8 @@
 /**
  * The one runtime assembly every Herdr tools host shares (durable-supervisor
  * §5): the CLI transport, JobRegistry, the Devin queue-flush coordinator, the
- * managed-handoff gate, the ownership and recipient ledgers, and the
- * SupervisionRegistry wired to the host's wake path and session-event
+ * managed-handoff gate, the ownership ledger, and the SupervisionRegistry
+ * wired to the host's wake path and session-event
  * monitor. `createSharedRuntime` is the single construction path the Pi
  * extension, the MCP server, and the daemon all call; `createDaemonRuntime`
  * wraps it with the durable intent store, and the caller-verification helpers
@@ -23,8 +23,6 @@ import { createHandoffGate, type HandoffGate } from "../handoff-gate.js";
 import { JobRegistry } from "../job-registry.js";
 import { createDevinQueueFlush, type DevinQueueFlush } from "../messages/devin-queue-flush.js";
 import type { AgentSessionIdentity } from "../messages/prompt.js";
-import { RecipientRegistry } from "../messages/recipients.js";
-import { defaultAttachmentStore, type AttachmentStore } from "../messages/store.js";
 import { RuntimeOwnership } from "../ownership.js";
 import { createPaneWriteGuard, resolvePaneWriteNamespace } from "../pane-write-lock.js";
 import { loadSettings, type Settings } from "../settings.js";
@@ -72,8 +70,6 @@ export interface SharedRuntimeDeps {
    */
   env?: NodeJS.ProcessEnv;
   promptClient?: AgentPromptClient;
-  attachments?: AttachmentStore;
-  recipients?: RecipientRegistry;
   settingsLoader?: () => Promise<Settings>;
   /**
    * Host seam invoked after the CLI and queue flush exist and before the job
@@ -88,8 +84,6 @@ export interface SharedRuntime {
   queueFlush: DevinQueueFlush;
   jobs: JobRegistry;
   ownership: RuntimeOwnership;
-  recipients: RecipientRegistry;
-  attachments: AttachmentStore;
   /** The shared managed-handoff gate launch bindings and strict waits consult. */
   handoffs: HandoffGate;
   supervision: SupervisionRegistry;
@@ -103,8 +97,6 @@ export interface SharedRuntime {
 export function createSharedRuntime(deps: SharedRuntimeDeps): SharedRuntime {
   const env = deps.env ?? process.env;
   const cli = new HerdrCli(deps.exec, 10_000, 50_000, deps.promptClient ?? createAgentPromptClient({ env }));
-  const attachments = deps.attachments ?? defaultAttachmentStore;
-  const recipients = deps.recipients ?? new RecipientRegistry();
   const ownership = new RuntimeOwnership();
   // The coordinator's namespace resolves lazily on first use, so constructing
   // the runtime still performs no filesystem or Herdr calls.
@@ -124,7 +116,7 @@ export function createSharedRuntime(deps: SharedRuntimeDeps): SharedRuntime {
     handoffs,
     repairPrompt: (paneId, text, signal) => cli.prompt(paneId, text, signal),
   });
-  return { cli, queueFlush, jobs, ownership, recipients, attachments, handoffs, supervision };
+  return { cli, queueFlush, jobs, ownership, handoffs, supervision };
 }
 
 export interface DaemonRuntimeDeps extends SharedRuntimeDeps {

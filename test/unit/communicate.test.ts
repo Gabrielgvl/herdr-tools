@@ -2,8 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentPromptError, type AgentPromptClient } from "../../src/agent-prompt.js";
 import { CliProtocolError, HerdrCli, type PiExec } from "../../src/cli.js";
-import { RecipientRegistry } from "../../src/messages/recipients.js";
-import type { AttachmentStore } from "../../src/messages/store.js";
 import type { DevinQueueFlush } from "../../src/messages/devin-queue-flush.js";
 import { compactPane, createCommunicateTool as createCommunicateToolImplementation, paneFrom, type CommunicateDependencies } from "../../src/tools/communicate.js";
 import { CommunicateParamsSchema } from "../../src/schemas.js";
@@ -23,7 +21,6 @@ const baseSnapshot: HerdrSnapshot = {
   agents: [{ pane_id: "w1:p1", agent_id: "agent-caller", name: "caller", agent_status: "idle" }, { pane_id: "w1:p2", agent_id: "agent-7", name: "reviewer", agent_status: "idle", agent: "pi", ...targetIdentity }]
 };
 const testPreflight = async () => undefined;
-const fakeGrant = (key: string) => ({ path: `/cache/${key}`, token: `grant-${key}`, renew: async () => undefined, release: async () => undefined });
 
 const createCommunicateTool = (deps: Omit<CommunicateDependencies, "preflight"> & Partial<Pick<CommunicateDependencies, "preflight">>) => createCommunicateToolImplementation({ ...deps, preflight: deps.preflight ?? testPreflight });
 
@@ -565,133 +562,12 @@ describe("herdr_communicate", () => {
     await expect(tool.execute("id", { target: "reviewer", operation: "prompt", text: "hello" }, undefined, undefined, extensionContext)).resolves.toMatchObject({ details: { operation: "prompt" } });
   });
 
-  it("publishes explicit attachments only for a verified profile recipient", async () => {
-    const harness = makeCli();
-    const recipients = new RecipientRegistry();
-    recipients.register({ paneId: "w1:p2", terminalId: "term-reviewer", agentName: "reviewer", agentKind: "pi", agentSession: targetIdentity.agent_session, recipientKey: "recipient-key", operatingPointId: "worker-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-7" });
-    const attachments: AttachmentStore = {
-      root: "/cache",
-      recipientDirectory: (key) => `/cache/${key}`,
-      ensureRecipient: async (key: string) => fakeGrant(key),
-      publish: vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/recipient-key/attachment-1/body.txt", bytes: 15, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }))
-    };
-    const tool = createCommunicateTool({ cli: harness.cli, context, attachments, recipients });
-    const result = await tool.execute("id", { target: "reviewer", operation: "prompt", text: "attachment body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
-    expect(attachments.publish).toHaveBeenCalledWith(expect.objectContaining({ body: "attachment body", recipientKey: "recipient-key", recipientPaneId: "w1:p2" }));
-    expect(harness.promptInputs[0]).toContain("delivery: attachment");
-    expect(harness.promptInputs[0]).not.toContain("attachment body");
-    expect(result.details).toMatchObject({ delivery: "attachment", attachment: { attachmentId: "attachment-1", bytes: 15 } });
-
-    const unverifiedStore = { ...attachments, publish: vi.fn() } as unknown as AttachmentStore;
-    await expect(createCommunicateTool({ cli: harness.cli, context, attachments: unverifiedStore }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED" });
-    expect(unverifiedStore.publish).not.toHaveBeenCalled();
-  });
-
   it.each(["prompt", "steer"] as const)("delivers %s to a qualified Claude recipient", async (operation) => {
     const harness = makeClaudeCli();
     const result = await execute(harness.cli, { target: "reviewer", operation, text: "claude body" });
     expect(harness.prompt).toHaveBeenCalledWith("w1:p2", expect.stringContaining("claude body"), expect.anything());
     expect(harness.promptInputs[0]).toContain(`kind: ${operation}`);
     expect(result.details).toMatchObject({ route: `${operation}_direct`, promptDispatch: { state: "acknowledged", requestId: "cli:agent:prompt" }, submission: { confirmed: true, agentSession: claudeIdentity.agent_session } });
-  });
-
-  it("publishes attachments for a verified Claude recipient", async () => {
-    const harness = makeClaudeCli();
-    const recipients = new RecipientRegistry();
-    recipients.register({ paneId: "w1:p2", terminalId: "term-claude", agentName: "reviewer", agentKind: "claude", agentSession: claudeIdentity.agent_session, recipientKey: "claude-recipient-key", operatingPointId: "worker-claude", kind: "claude", capable: true, reason: "read", agentId: "agent-7" });
-    const publish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/claude-recipient-key/attachment-1/body.txt", bytes: 15, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
-    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
-    const result = await createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "attachment body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
-    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ body: "attachment body", recipientKey: "claude-recipient-key", recipientPaneId: "w1:p2" }));
-    expect(harness.promptInputs[0]).toContain("delivery: attachment");
-    expect(harness.promptInputs[0]).not.toContain("attachment body");
-    expect(result.details).toMatchObject({ delivery: "attachment", attachment: { attachmentId: "attachment-1" } });
-  });
-
-  it.each(["prompt", "steer"] as const)("delivers an AGY %s attachment to a strengthened recipient", async (operation) => {
-    const harness = makeCli();
-    const agySession = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-agy" };
-    const targetPane = { ...basePane, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
-    const targetAgent = { ...baseSnapshot.agents[1]!, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
-    const baseExec = harness.exec.getMockImplementation()!;
-    harness.exec.mockImplementation(async (_command, argv, options) => {
-      if (argv[0] === "api") return execResponse("snapshot-agy", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
-      if (argv[0] === "agent" && argv[1] === "get") return execResponse("agent-get", { agent: targetAgent });
-      if (argv[0] === "pane" && argv[1] === "get") return execResponse("pane-agy", { pane: targetPane });
-      return baseExec(_command, argv, options);
-    });
-    harness.prompt.mockImplementation(async (_target, input) => {
-      harness.promptInputs.push(input);
-      return { id: "cli:agent:prompt", result: { type: "agent_prompted", agent: { ...targetAgent, name: "reviewer", agent_status: "working", interactive_ready: true, revision: 3, state_change_seq: 1, screen_detection_skipped: true } } };
-    });
-    const publish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/recipient-key/attachment-1/body.txt", bytes: 7, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
-    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
-    const recipients = new RecipientRegistry();
-    recipients.register({ paneId: "w1:p2", terminalId: "term-agy", agentName: "reviewer", agentKind: "agy", agentSession: agySession, recipientKey: "recipient-key", operatingPointId: "worker-agy", kind: "agy", capable: true, reason: "read", agentId: "agent-7", agyStrengthened: true, attachmentDirectory: "/cache/recipient-key" });
-
-    const result = await createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation, text: "agy body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
-
-    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ body: "agy body", recipientKey: "recipient-key", expectedRecipientDirectory: "/cache/recipient-key" }));
-    expect(harness.promptInputs[0]).toContain("delivery: attachment");
-    expect(harness.promptInputs[0]).not.toContain("agy body");
-    expect(result.details).toMatchObject({ delivery: "attachment", attachment: { attachmentId: "attachment-1" }, submission: { confirmed: true } });
-  });
-
-  it("rejects AGY attachment sends whose registered or published directory is unverified", async () => {
-    const agySession = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-agy" };
-    const targetPane = { ...basePane, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
-    const targetAgent = { ...baseSnapshot.agents[1]!, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
-    const agyHarness = () => {
-      const harness = makeCli();
-      const baseExec = harness.exec.getMockImplementation()!;
-      harness.exec.mockImplementation(async (_command, argv, options) => {
-        if (argv[0] === "api") return execResponse("snapshot-agy", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
-        if (argv[0] === "agent" && argv[1] === "get") return execResponse("agent-get", { agent: targetAgent });
-        if (argv[0] === "pane" && argv[1] === "get") return execResponse("pane-agy", { pane: targetPane });
-        return baseExec(_command, argv, options);
-      });
-      return harness;
-    };
-    const agyRecipient = (attachmentDirectory: string) => ({ paneId: "w1:p2", terminalId: "term-agy", agentName: "reviewer", agentKind: "agy", agentSession: agySession, recipientKey: "recipient-key", operatingPointId: "worker-agy", kind: "agy" as const, capable: true, reason: "read", agentId: "agent-7", agyStrengthened: true as const, attachmentDirectory });
-    const store = (publish: AttachmentStore["publish"]): AttachmentStore => ({ root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish });
-
-    // The registered directory must agree with the store's current directory.
-    const stale = agyHarness();
-    const staleRecipients = new RecipientRegistry();
-    staleRecipients.register(agyRecipient("/cache/elsewhere"));
-    const stalePublish = vi.fn();
-    await expect(createCommunicateTool({ cli: stale.cli, context, attachments: store(stalePublish), recipients: staleRecipients }).execute("id", { target: "reviewer", operation: "prompt", text: "blocked", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "recipient attachment directory does not match the current store" } });
-    expect(stalePublish).not.toHaveBeenCalled();
-    expect(stale.prompt).not.toHaveBeenCalled();
-
-    // A published body outside the verified directory is rejected after publication.
-    const moved = agyHarness();
-    const movedRecipients = new RecipientRegistry();
-    movedRecipients.register(agyRecipient("/cache/recipient-key"));
-    const movedPublish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/other/body.txt", bytes: 7, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
-    await expect(createCommunicateTool({ cli: moved.cli, context, attachments: store(movedPublish), recipients: movedRecipients }).execute("id", { target: "reviewer", operation: "prompt", text: "blocked", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "published attachment does not match the registered recipient directory" } });
-    expect(moved.prompt).not.toHaveBeenCalled();
-  });
-
-  it.each(["prompt", "steer"] as const)("rejects an unstrengthened AGY recipient before %s attachment publication", async (operation) => {
-    const harness = makeCli();
-    const agySession = { source: "herdr:agy", agent: "agy", kind: "id", value: "session-agy" };
-    const targetPane = { ...basePane, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
-    const targetAgent = { ...baseSnapshot.agents[1]!, agent: "agy", terminal_id: "term-agy", agent_session: agySession };
-    const baseExec = harness.exec.getMockImplementation()!;
-    harness.exec.mockImplementation(async (_command, argv, options) => {
-      if (argv[0] === "api") return execResponse("snapshot-agy", { type: "session_snapshot", snapshot: { ...baseSnapshot, panes: [callerPane, targetPane], agents: [baseSnapshot.agents[0]!, targetAgent] } });
-      return baseExec(_command, argv, options);
-    });
-    const publish = vi.fn();
-    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
-    const recipients = new RecipientRegistry();
-    await expect(createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation, text: "blocked", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { delivery: "attachment", route: `${operation}_direct` } });
-    expect(publish).not.toHaveBeenCalled();
-    expect(harness.prompt).not.toHaveBeenCalled();
   });
 
   it("rejects a partial Claude identity at the strict join before any send", async () => {
@@ -722,11 +598,9 @@ describe("herdr_communicate", () => {
   });
 
   it.each([
-    ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "prompt", "inline"], ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "prompt", "attachment"],
-    ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "steer", "inline"], ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "steer", "attachment"],
-    ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "prompt", "inline"], ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "prompt", "attachment"],
-    ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "steer", "inline"], ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "steer", "attachment"]
-  ] as const)("rejects a %s final-read replacement before %s %s delivery", async (_label, kind, code, operation, delivery) => {
+    ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "prompt"], ["AGY", "agy", "TARGET_IDENTITY_CHANGED", "steer"],
+    ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "prompt"], ["Claude", "claude", "TARGET_IDENTITY_CHANGED", "steer"]
+  ] as const)("rejects a %s final-read replacement before %s", async (_label, kind, code, operation) => {
     const harness = makeCli();
     const baseRun = harness.cli.runJson;
     let agentReads = 0;
@@ -736,69 +610,25 @@ describe("herdr_communicate", () => {
       }
       return baseRun.call(harness.cli, argv, signal, preserve);
     });
-    const publish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/recipient-key/body.txt", bytes: 7, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" }));
-    const attachments: AttachmentStore = { root: "/cache", recipientDirectory: (key) => `/cache/${key}`, ensureRecipient: async (key) => fakeGrant(key), publish };
-    const recipients = new RecipientRegistry();
-    if (delivery === "attachment") recipients.register({ paneId: "w1:p2", terminalId: "term-reviewer", agentName: "reviewer", agentKind: "pi", agentSession: targetIdentity.agent_session, recipientKey: "recipient-key", operatingPointId: "worker-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-7" });
-    const tool = createCommunicateTool({ cli: harness.cli, context, attachments, recipients });
-    await expect(tool.execute("id", { target: "reviewer", operation, text: "blocked", ...(delivery === "attachment" ? { delivery } : {}) }, new AbortController().signal, undefined, extensionContext))
+    const tool = createCommunicateTool({ cli: harness.cli, context });
+    await expect(tool.execute("id", { target: "reviewer", operation, text: "blocked" }, new AbortController().signal, undefined, extensionContext))
       .rejects.toMatchObject({ code, details: { phase: "pre_state" } });
     expect(harness.prompt).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
   });
 
-  it("refuses attachment delivery for unregistered, incapable, and identity-mismatched recipients", async () => {
-    const attachments = (publish = vi.fn()): AttachmentStore => ({
-      root: "/cache",
-      recipientDirectory: (key: string) => `/cache/${key}`,
-      ensureRecipient: async (key: string) => fakeGrant(key),
-      publish
-    } as unknown as AttachmentStore);
-    const attachment = { target: "reviewer", operation: "prompt" as const, text: "body", delivery: "attachment" as const };
-
-    const unregistered = makeCli();
-    const unregisteredStore = attachments();
-    await expect(createCommunicateTool({ cli: unregistered.cli, context, attachments: unregisteredStore, recipients: new RecipientRegistry() }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { target: "w1:p2", delivery: "attachment", reason: "recipient capability is not registered in this runtime" } });
-    expect(unregisteredStore.publish).not.toHaveBeenCalled();
-
-    const incapable = new RecipientRegistry();
-    incapable.register({ paneId: "w1:p2", terminalId: "term-reviewer", agentName: "reviewer", agentKind: "pi", agentSession: targetIdentity.agent_session, recipientKey: "recipient-key", operatingPointId: "restricted", kind: "pi", capable: false, reason: "Pi profile excludes the local read tool", agentId: "agent-7" });
-    const incapableStore = attachments();
-    await expect(createCommunicateTool({ cli: makeCli().cli, context, attachments: incapableStore, recipients: incapable }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "Pi profile excludes the local read tool" } });
-    expect(incapableStore.publish).not.toHaveBeenCalled();
-
-    const mismatched = new RecipientRegistry();
-    mismatched.register({ paneId: "w1:p2", terminalId: "term-reviewer", agentName: "reviewer", agentKind: "pi", agentSession: { ...targetIdentity.agent_session, value: "session-replaced" }, recipientKey: "recipient-key", operatingPointId: "worker-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-replaced" });
-    const mismatchedStore = attachments();
-    await expect(createCommunicateTool({ cli: makeCli().cli, context, attachments: mismatchedStore, recipients: mismatched }).execute("id", attachment, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "ATTACHMENT_TARGET_UNVERIFIED", details: { reason: "recipient identity no longer matches the authoritative snapshot" } });
-    expect(mismatchedStore.publish).not.toHaveBeenCalled();
-  });
-
-  it("keeps typed codes and reports retained attachments when a send or post-read fails", async () => {
-    const published = { attachmentId: "attachment-1", path: "/cache/recipient-key/attachment-1/body.txt", bytes: 4, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:p2" };
-    const recipients = new RecipientRegistry();
-    recipients.register({ paneId: "w1:p2", terminalId: "term-reviewer", agentName: "reviewer", agentKind: "pi", agentSession: targetIdentity.agent_session, recipientKey: "recipient-key", operatingPointId: "worker-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-7" });
-    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish: async () => published } as unknown as AttachmentStore;
-
+  it("keeps typed codes when a send or post-read fails", async () => {
     const sendFailure = makeCli();
     sendFailure.prompt.mockRejectedValue(Object.assign(new Error("submission refused"), { code: "CLI_PROTOCOL_ERROR", details: { promptDispatch: { state: "unknown", requestId: "request-unknown" } } }));
-    const sendError = await createCommunicateTool({ cli: sendFailure.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext).catch((error: { code?: string; details?: Record<string, unknown> }) => error);
+    const sendError = await createCommunicateTool({ cli: sendFailure.cli, context }).execute("id", { target: "reviewer", operation: "prompt", text: "body" }, new AbortController().signal, undefined, extensionContext).catch((error: { code?: string; details?: Record<string, unknown> }) => error);
     expect(sendError).toMatchObject({
       code: "CLI_PROTOCOL_ERROR",
-      details: { promptDispatch: { state: "unknown", requestId: "request-unknown" }, delivery: "attachment", route: "prompt_direct", phase: "send", attachmentRetained: true, attachment: { attachmentId: "attachment-1", path: published.path } }
+      details: { promptDispatch: { state: "unknown", requestId: "request-unknown" }, delivery: "inline", route: "prompt_direct", phase: "send" }
     });
     expect(JSON.stringify(sendError)).not.toContain("submission refused");
 
     const postFailure = makeCli("idle", { postState: "idle" });
-    await expect(createCommunicateTool({ cli: postFailure.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
-      .resolves.toMatchObject({ details: { delivery: "attachment", observation: { status: "not_working", state: "idle", screenDetectionSkipped: true }, attachment: { attachmentId: "attachment-1" } } });
-
-    const publishFailure = { ...attachments, publish: async () => { throw Object.assign(new Error("store"), { code: "ATTACHMENT_STORE_FAILED", details: { operation: "publish" } }); } } as unknown as AttachmentStore;
-    await expect(createCommunicateTool({ cli: makeCli().cli, context, attachments: publishFailure, recipients }).execute("id", { target: "reviewer", operation: "prompt", text: "body", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "ATTACHMENT_STORE_FAILED", details: { operation: "publish", delivery: "attachment", phase: "publish" } });
+    await expect(createCommunicateTool({ cli: postFailure.cli, context }).execute("id", { target: "reviewer", operation: "prompt", text: "body" }, new AbortController().signal, undefined, extensionContext))
+      .resolves.toMatchObject({ details: { delivery: "inline", observation: { status: "not_working", state: "idle", screenDetectionSkipped: true } } });
 
     const keysFailure = makeCli();
     keysFailure.exec.mockImplementation(async (_command, argv) => {
@@ -1020,18 +850,6 @@ describe("caller policy", () => {
     }
   });
 
-  it("denies a leaf worker attachment send before any recipient lookup or publication", async () => {
-    const harness = makeWorkerCli();
-    const recipients = new RecipientRegistry();
-    recipients.register({ paneId: "w1:p2", terminalId: "term-reviewer", agentName: "reviewer", agentKind: "pi", agentSession: targetIdentity.agent_session, recipientKey: "recipient-key", operatingPointId: "worker-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-7" });
-    const publish = vi.fn(async () => { throw new Error("unreachable"); });
-    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
-    await expect(createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "reviewer", operation: "steer", kind: "result", text: "peer result", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext))
-      .rejects.toMatchObject({ code: "TARGET_SCOPE_REJECTED", details: { phase: "caller_policy", delivery: "attachment", route: "steer_direct", targetPaneId: "w1:p2", parentPaneId: "w1:pM" } });
-    expect(publish).not.toHaveBeenCalled();
-    expect(harness.calls).toEqual([["api", "snapshot"]]);
-  });
-
   it("denies a leaf worker keys and turn control regardless of binding", async () => {
     const harness = makeWorkerCli();
     await expect(execute(harness.cli, { target: "manager", operation: "keys", keys: ["enter"] })).rejects.toMatchObject({ code: "TARGET_SCOPE_REJECTED", details: { phase: "caller_policy", operation: "keys", callerPaneId: "w1:p1", parentPaneId: "w1:pM" } });
@@ -1060,18 +878,5 @@ describe("caller policy", () => {
   it("leaves a launched caller unrestricted once it manages children", async () => {
     const harness = makeWorkerCli({ callerChildren: 1 });
     await expect(execute(harness.cli, { target: "reviewer", operation: "steer", text: "manager can reach anyone" })).resolves.toMatchObject({ details: { target: { paneId: "w1:p2" } } });
-  });
-
-  it("publishes a result attachment with kind result while the store keeps the operation", async () => {
-    const harness = makeWorkerCli();
-    const recipients = new RecipientRegistry();
-    recipients.register({ paneId: "w1:pM", terminalId: "term-manager", agentName: "manager", agentKind: "pi", agentSession: managerIdentity.agent_session, recipientKey: "manager-key", operatingPointId: "manager-pi", kind: "pi", capable: true, reason: "read", agentId: "agent-m" });
-    const publish = vi.fn(async () => ({ attachmentId: "attachment-1", path: "/cache/manager-key/attachment-1/body.txt", bytes: 20, sha256: "a".repeat(64), expiresAt: "2026-08-21T12:00:00.000Z", recipientPaneId: "w1:pM" }));
-    const attachments = { root: "/cache", recipientDirectory: (key: string) => `/cache/${key}`, ensureRecipient: async (key: string) => fakeGrant(key), publish } as unknown as AttachmentStore;
-    const result = await createCommunicateTool({ cli: harness.cli, context, attachments, recipients }).execute("id", { target: "manager", operation: "steer", kind: "result", text: "Status: completed", delivery: "attachment" }, new AbortController().signal, undefined, extensionContext);
-    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ operation: "steer" }));
-    expect(harness.promptInputs[0]).toContain("kind: result");
-    expect(harness.promptInputs[0]).toContain("delivery: attachment");
-    expect(result.details).toMatchObject({ envelope: { version: "v1", kind: "result", delivery: "attachment" } });
   });
 });

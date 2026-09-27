@@ -1,5 +1,5 @@
 import type { MessageDelivery } from "./messages/limits.js";
-import type { AttachmentEnvelopeReference, SenderIdentity } from "./provenance.js";
+import type { SenderIdentity } from "./provenance.js";
 import { buildEnvelope } from "./provenance.js";
 
 /**
@@ -29,6 +29,6 @@ export const SPEC_BASELINE = [
  * masquerade as platform text (ADR-035: caller text is provenance-marked, not
  * filtered). Deterministic: identical input renders byte-identically.
  */
-export function renderTaskInstructions(sender: SenderIdentity, body: string, delivery: MessageDelivery = "inline", attachment?: AttachmentEnvelopeReference): string {
-  return `${SPEC_BASELINE}\n\n${buildEnvelope(sender, "assignment", body, delivery, attachment)}`;
+export function renderTaskInstructions(sender: SenderIdentity, body: string, delivery: MessageDelivery = "inline"): string {
+  return `${SPEC_BASELINE}\n\n${buildEnvelope(sender, "assignment", body, delivery)}`;
 }

@@ -78,7 +78,6 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     commandExitCodes: number[];
     toolCalls: string[];
     confirmedPanes: string[];
-    attachmentPaths: string[];
     provenReceipts: Record<string, unknown>[];
     /** The most recent joined recipient identity, retained for a failing case. */
     lastJoinedIdentity?: Record<string, unknown>;
@@ -86,7 +85,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
     preserve: boolean;
     savedSocket?: string;
   } = {
-    cwd: "", serverStarted: false, sessionCreated: false, registered: new Map(), harnessTools: new Map(), commands: [], handlers: [], cliCalls: [], cliExitCodes: [], commandExitCodes: [], toolCalls: [], confirmedPanes: [], attachmentPaths: [], provenReceipts: [], preserve: false
+    cwd: "", serverStarted: false, sessionCreated: false, registered: new Map(), harnessTools: new Map(), commands: [], handlers: [], cliCalls: [], cliExitCodes: [], commandExitCodes: [], toolCalls: [], confirmedPanes: [], provenReceipts: [], preserve: false
   };
 
   const signal = () => new AbortController().signal;
@@ -356,10 +355,10 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       const environment = { enabled: true, currentIdsPresent: runtime.idsPresent, currentIdsValid: runtime.idsValid };
       for (const definition of [
         createInspectTool({ cli: runtime.cli, context: runtime.context, contextResolver, environment, profiles: runtime.profiles, handoffs: runtime.handoffs }),
-        createCommunicateTool({ cli: runtime.cli, context: runtime.context, contextResolver, preflight, queueFlush: runtime.queueFlush, attachments: runtime.attachments, recipients: runtime.recipients }),
+        createCommunicateTool({ cli: runtime.cli, context: runtime.context, contextResolver, preflight, queueFlush: runtime.queueFlush }),
         createWaitTool({ cli: runtime.cli, context: runtime.context, contextResolver, settingsLoader: runtime.settings.load, jobRegistry: runtime.jobs, handoffs: runtime.handoffs }),
         createJobsTool(runtime.jobs),
-        createLaunchTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight, supervision: runtime.supervision, queueFlush: runtime.queueFlush, attachments: runtime.attachments, recipients: runtime.recipients }),
+        createLaunchTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight, supervision: runtime.supervision, queueFlush: runtime.queueFlush }),
         createPaneTool({ cli: runtime.cli, context: runtime.context, contextResolver, preflight, cwd: state.cwd, ownership: runtime.ownership }),
         createTabTool({ cli: runtime.cli, context: runtime.context, contextResolver, cwd: state.cwd, ownership: runtime.ownership, preflight }),
       ]) {
@@ -446,7 +445,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       const piBodyPath = join(state.cwd, `pi-inline-${piNonce}.txt`);
       const piBefore = state.proxy!.requests.length;
       const pi = await call("herdr_launch", {
-        objective: `Use Bash to write exactly ${piBody} to ${piBodyPath} with no trailing newline, capture that command's exit code, and write the decimal code to ${piBodyPath}.exit before replying with exactly ${piBody}. Remain ready for subsequent normal and attachment prompts.`,
+        objective: `Use Bash to write exactly ${piBody} to ${piBodyPath} with no trailing newline, capture that command's exit code, and write the decimal code to ${piBodyPath}.exit before replying with exactly ${piBody}. Remain ready for subsequent normal prompts.`,
         scope: `Write only ${piBodyPath} and ${piBodyPath}.exit; do not change any other resource.`,
         doneWhen: [`The recipient-generated file ${piBodyPath} contains exactly ${piBody}.`],
         constraints: ["none"],
@@ -545,53 +544,9 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       const normalReceipt = receipt("normal-prompt", normalDetails, normalRequest, normalCompletion, normalBody, normalGenerated.body, normalGenerated.commandExitCode, { bodyFilePath: normalPath, commandExitFilePath: `${normalPath}.exit`, generatedBodySha256: normalGenerated.sha256 });
       await saveProvenReceipt(normalReceipt);
 
-      const attachmentNonce = randomUUID();
-      const generatedAttachmentPath = join(state.cwd, `pi-attachment-readback-${attachmentNonce}.txt`);
-      const attachmentBody = [
-        `HOTFIX ATTACHMENT COMPLETE BODY ${attachmentNonce}`,
-        "Read the entire attachment from its envelope using attachment-path; do not use a summary, nonce, or partial body.",
-        `Use Bash to copy the attachment bytes exactly to the private expected output file ${generatedAttachmentPath}; do not add or remove a trailing newline.`,
-        `Verify the copied file SHA-256 equals the independent expected attachment-sha256 from the envelope, capture that copy-and-verify command's exit code, and write the decimal code to ${generatedAttachmentPath}.exit.`,
-        "Then reply with exactly attachment-sha256: <that hash> and no other text."
-      ].join("\n");
-      const attachmentBefore = state.proxy!.requests.length;
-      const attachmentDetails = await call("herdr_communicate", {
-        target: piPaneId,
-        operation: "prompt",
-        delivery: "attachment",
-        text: attachmentBody
-      });
-      const attachmentRequest = assertOneRequest(attachmentBefore, "attachment prompt");
-      const attachment = record(attachmentDetails.attachment, "attachment receipt");
-      expect(typeof attachment.path).toBe("string");
-      if (typeof attachment.bytes !== "number" || typeof attachment.sha256 !== "string") throw new Error("attachment omitted byte/hash metadata");
-      state.attachmentPaths.push(String(attachment.path));
-      const attachmentBytes = await readFile(String(attachment.path));
-      const expectedAttachmentBytes = Buffer.from(attachmentBody, "utf8");
-      expect(Buffer.compare(attachmentBytes, expectedAttachmentBytes)).toBe(0);
-      expect(attachmentRequest.text).toContain("delivery: attachment");
-      expect(attachmentRequest.text).toContain(`attachment-sha256: ${String(attachment.sha256)}`);
-      expect(attachmentRequest.text).not.toContain(attachmentBody);
-      const attachmentExpectedIdentity = joinedIdentity(record(attachmentDetails.submission ?? attachmentDetails.initialPromptSubmission, "Pi attachment submission"), piPaneId, piKind, "Pi attachment expected identity");
-      const generatedAttachment = await generatedBody(generatedAttachmentPath, attachmentBody, `${generatedAttachmentPath}.exit`);
-      expect(Buffer.compare(Buffer.from(generatedAttachment.body, "utf8"), expectedAttachmentBytes)).toBe(0);
-      expect(generatedAttachment.bytes).toBe(expectedAttachmentBytes.byteLength);
-      expect(generatedAttachment.sha256).toBe(digest(expectedAttachmentBytes));
-      expect(generatedAttachment.sha256).toBe(attachment.sha256);
-      expect(attachmentBytes.byteLength).toBe(expectedAttachmentBytes.byteLength);
-      expect(attachment.bytes).toBe(expectedAttachmentBytes.byteLength);
-      const attachmentCompletion = await waitForRecipientCompletion(piPaneId, piKind, attachmentExpectedIdentity, "Pi attachment readback");
-      const attachmentReceipt = receipt("attachment-complete-body", attachmentDetails, attachmentRequest, attachmentCompletion, attachmentBody, generatedAttachment.body, generatedAttachment.commandExitCode, {
-        bodyFilePath: String(attachment.path),
-        generatedBodyFilePath: generatedAttachmentPath,
-        commandExitFilePath: `${generatedAttachmentPath}.exit`,
-        generatedBodySha256: generatedAttachment.sha256,
-        attachmentSha256: digest(attachmentBytes)
-      });
-      await saveProvenReceipt(attachmentReceipt);
       const piKeys = await call("herdr_communicate", { target: piPaneId, operation: "keys", keys: ["escape"] });
       expect(piKeys).toMatchObject({ operation: "keys" });
-      await closePane(piPaneId, "Pi attachment recipient");
+      await closePane(piPaneId, "Pi prompt recipient");
 
       const finalDefault = record(record(record(await run("api", "snapshot")).result).snapshot);
       expect(topology(finalDefault)).toEqual(state.baseline);
@@ -599,7 +554,7 @@ describe.skipIf(!enabled)(`${HOTFIX_LABEL} Pi host`, () => {
       expect(state.cliExitCodes.every((code) => code === 0)).toBe(true);
       expect(state.commandExitCodes.length).toBeGreaterThan(0);
       expect(state.commandExitCodes.every((code) => code === 0)).toBe(true);
-      const receipts = [smokeReceipt, piReceipt, normalReceipt, steerReceipt, attachmentReceipt];
+      const receipts = [smokeReceipt, piReceipt, normalReceipt, steerReceipt];
       expect(new Set(receipts.map((item) => item.case))).toEqual(new Set(HOTFIX_MANDATORY_CASES));
       state.receipt = {
         label: HOTFIX_LABEL,

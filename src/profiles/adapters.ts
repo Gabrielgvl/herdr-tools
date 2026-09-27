@@ -209,17 +209,20 @@ export function buildAgyArgv(profile: Extract<Profile["runtime"], { kind: "agy" 
 }
 
 /**
- * Devin's only launch flags are `--model` and `--permission-mode`. Reasoning
- * depth rides on the model tier (for example `swe-2-max`), there is no
- * system-prompt or `--add-dir` channel, and sessions always persist. The
- * Markdown body is catalog metadata that Herdr never delivers, exactly like
- * AGY; the granted attachment directory is read ambiently by absolute path.
+ * Devin's launch flags are `--model`, `--permission-mode`, and
+ * `--respect-workspace-trust false`: workspace trust protection is off for
+ * every launch so the first-run "trust this directory?" dialog cannot block
+ * launch readiness. Reasoning depth rides on the model tier (for example
+ * `swe-2-max`), there is no system-prompt or `--add-dir` channel, and
+ * sessions always persist. The Markdown body is catalog metadata that Herdr
+ * never delivers, exactly like AGY; the granted attachment directory is read
+ * ambiently by absolute path.
  */
 export function buildDevinArgv(profile: Extract<Profile["runtime"], { kind: "devin" }>, sessionPersistence: boolean, overrides: DevinRuntimeOverrides = {}, promptFilePath?: string): string[] {
   if (!sessionPersistence) throw new ProfileAdapterError("Devin profiles must set sessionPersistence to true for interactive launches");
   if (promptFilePath !== undefined) throw new ProfileAdapterError("Devin profiles do not accept prompt source files");
   const effective = resolveDevinRuntime(profile, overrides);
-  return ["--model", effective.model, "--permission-mode", effective.permissionMode];
+  return ["--model", effective.model, "--permission-mode", effective.permissionMode, "--respect-workspace-trust", "false"];
 }
 
 /**

@@ -320,9 +320,9 @@ describe("profile catalog", () => {
     expect(parseProfile(profileText("worker-devin", "devin").replace("\n  permissionMode: dangerous", ""), source(root, "worker-devin")).runtime).toMatchObject({ kind: "devin", permissionMode: "normal" });
     expect(devin.sessionPersistence).toBe(true);
     expect(devin.fallbackProfiles).toEqual(["worker-agy"]);
-    expect(buildProfileArgv(devin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);
-    expect(buildProfileArgv(devin, { model: "swe-2", permissionMode: "normal" })).toEqual(["--model", "swe-2", "--permission-mode", "normal"]);
-    expect(buildProfileArgv(devin, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);
+    expect(buildProfileArgv(devin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous", "--respect-workspace-trust", "false"]);
+    expect(buildProfileArgv(devin, { model: "swe-2", permissionMode: "normal" })).toEqual(["--model", "swe-2", "--permission-mode", "normal", "--respect-workspace-trust", "false"]);
+    expect(buildProfileArgv(devin, {}, undefined, "/tmp/message-attachments/key")).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous", "--respect-workspace-trust", "false"]);
     // The Devin body is catalog metadata and its granted attachment directory
     // is read ambiently, so neither produces argv.
     expect(() => buildProfileArgv(devin, {}, "/tmp/prompt-source")).toThrow(/prompt source/);

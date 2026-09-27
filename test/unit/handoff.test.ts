@@ -585,6 +585,8 @@ describe("provenance record", () => {
       { managerSession, task: { ...taskContract, doneWhen: ["ok", ""] } },
       { managerSession, task: { ...taskContract, constraints: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] } },
       { managerSession, task: { ...taskContract, tier: "bogus" as never } },
+      { managerSession, task: { ...taskContract, replicas: 9 } as never },
+      { managerSession, task: { ...taskContract, replicas: 1.5 } as never },
       { managerSession, task: { ...taskContract, recoveryOf: "not-a-run-id" } },
       { managerSession, task: { ...taskContract, label: "x".repeat(300) } },
       { managerSession, task: { ...taskContract, cwd: "a\nb" } },

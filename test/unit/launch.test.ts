@@ -15,7 +15,8 @@ import { routeTask } from "../../src/router.js";
 import type { RoutingTask, TaskModelDecision } from "../../src/router.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { parsePromptTargetIdentityFields } from "../../src/messages/prompt.js";
-import { createHandoffAllocator, HANDOFF_PROVENANCE_NAME, readHandoffState, updateHandoffState, type HandoffAllocation, type HandoffAllocator, type HandoffRunIdentity, type HandoffState, type HandoffStatus } from "../../src/handoff.js";
+import { createHandoffAllocator, HANDOFF_PROVENANCE_NAME, readHandoffState, renderHandoffContract, updateHandoffState, type HandoffAllocation, type HandoffAllocator, type HandoffRunIdentity, type HandoffState, type HandoffStatus } from "../../src/handoff.js";
+import { MESSAGE_INLINE_MAX_BYTES, utf8Bytes } from "../../src/messages/limits.js";
 import { POLICY_REVISION, type QualityTier, type WorkspaceState } from "../../src/routing-policy.js";
 import type { TypeSafeSpecClient } from "../../src/typesafe-spec.js";
 import type { SupervisionReserveRequest } from "../../src/supervision/registry.js";
@@ -1817,6 +1818,54 @@ tierChains:
     expect(specClient.evaluate).not.toHaveBeenCalled();
     expect(routerLog).not.toHaveBeenCalled();
     expect(overSupervision.reserved).toEqual([]);
+  });
+
+  it("rejects a Task that only fits the inline bound without the handoff contract", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const harness = makeCli();
+    const handoffs = fakeHandoffs();
+    const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+    const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
+    const supervision = stubSupervision();
+    // The contract the launch appends, rendered by the same allocator, so the
+    // boundary sizes are exact for this fixture's run paths.
+    const contractBytes = utf8Bytes(renderHandoffContract(await handoffs.allocate()));
+    const fixedBytes = utf8Bytes(renderTask(task({ scope: "" })));
+    // `scope` stays out of the supervision digest, so this reaches the inline
+    // gate: the body alone fits, but the delivered Task-plus-contract is one
+    // byte over — the same refusal a self-over-bound body gets, before any
+    // evaluation, intent write, or router decision.
+    const scope = "x".repeat(MESSAGE_INLINE_MAX_BYTES - contractBytes - fixedBytes + 1);
+    await expect(
+      toolFor({ catalog, cli: harness.cli, specClient, routerLog, handoffs, supervision })
+        .execute("call", task({ scope }), new AbortController().signal, undefined, extensionContext),
+    ).rejects.toMatchObject({ code: "MESSAGE_TOO_LARGE", details: { phase: "validate", effectCertainty: "absent" } });
+    expect(harness.calls).toEqual([]);
+    expect(specClient.evaluate).not.toHaveBeenCalled();
+    expect(routerLog).not.toHaveBeenCalled();
+    expect(handoffs.persist).not.toHaveBeenCalled();
+    expect(supervision.reserved).toEqual([]);
+  });
+
+  it("admits a Task whose body plus the handoff contract just fits the inline bound", async () => {
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const harness = makeCli();
+    const handoffs = fakeHandoffs();
+    const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
+    const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
+    const supervision = stubSupervision();
+    const contractBytes = utf8Bytes(renderHandoffContract(await handoffs.allocate()));
+    const fixedBytes = utf8Bytes(renderTask(task({ scope: "" })));
+    // Delivered payload is exactly at the bound — assertDeliverySize admits it.
+    const scope = "x".repeat(MESSAGE_INLINE_MAX_BYTES - contractBytes - fixedBytes);
+    const result = await execute(
+      toolFor({ catalog, cli: harness.cli, specClient, routerLog, handoffs, supervision }),
+      task({ scope }),
+    );
+    expect(result.details).toMatchObject({ outcome: "launched", children: [{ state: "launched" }] });
+    expect(specClient.evaluate).toHaveBeenCalledTimes(1);
+    expect(routerLog).toHaveBeenCalledTimes(1);
+    expect(handoffs.persist).toHaveBeenCalledTimes(1);
   });
 
   it("times out and logs a hung task evaluation without starting a child", async () => {

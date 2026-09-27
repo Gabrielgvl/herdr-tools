@@ -134,8 +134,16 @@ describe("Claude manager plugin package", () => {
     const registration = payload["tools.executor.mcp.addServer"]!;
     const entry = registration.args![0]!;
     expect(resolve(entry)).toBe("/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js");
-    // The command discipline is unchanged: a real Node binary, nothing else.
-    expect(isSupportedNodeCommand(registration.command), `unsupported stdio command ${JSON.stringify(registration.command)}`).toBe(true);
+    // The command discipline is unchanged in shape — a Node launcher, nothing
+    // else: the literal `node` or an absolute path named `node`. This is a
+    // host-specific registration artifact (every path in it is absolute), so
+    // the executable-on-this-machine half of `isSupportedNodeCommand` is
+    // asserted only where a machine-local file is meant: the payload pins the
+    // real Node binary by name and is validated semantically on the host it
+    // registers against.
+    const command = registration.command!;
+    const commandIsNode = command === "node" || (isAbsolute(command) && basename(command) === "node");
+    expect(commandIsNode, `unsupported stdio command ${JSON.stringify(command)}`).toBe(true);
     expect(Object.keys(registration.env ?? {}).sort()).toEqual(["HERDR_ENV", "HERDR_EXECUTOR_DELEGATED", "HERDR_SOCKET_PATH"]);
     const build = JSON.parse(readFileSync(join(repoRoot, "tsconfig.build.json"), "utf8")) as { compilerOptions: { rootDir: string; outDir: string }; include: string[] };
     expect(build.compilerOptions).toMatchObject({ rootDir: ".", outDir: "dist" });

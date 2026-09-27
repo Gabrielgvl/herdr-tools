@@ -1,7 +1,7 @@
 {
   "executor": {
-    "type": "http",
-    "url": "https://dev-server.piranha-palermo.ts.net/mcp",
-    "headersHelper": "${CLAUDE_PLUGIN_ROOT}/scripts/headers-helper.sh"
+    "type": "stdio",
+    "command": "/home/gabriel/.volta/bin/node",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/executor-project-mcp.mjs"]
   }
 }

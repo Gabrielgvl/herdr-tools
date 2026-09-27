@@ -1045,13 +1045,21 @@ describe("herdr_launch task cutover", () => {
       const harness = makeCli();
       const specClient = { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) };
       const tool = toolFor({ catalog, cli: harness.cli, specClient, cwd: null, handoffs: null });
-      // open() only reads, so an unknown run id fails closed whether or not the
-      // ambient endpoint namespace resolves on this machine.
-      await expect(tool.execute("call", task({ recoveryOf: randomUUID() }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE" });
-      // A second ambient recovery reuses the memoized default allocator.
-      await expect(tool.execute("call", task({ recoveryOf: randomUUID() }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE" });
-      expect(harness.calls).toEqual([]);
-      expect(specClient.evaluate).not.toHaveBeenCalled();
+      // open() only reads, so an unknown run id fails closed — and a hermetic
+      // endpoint keeps the ambient allocator off the host's real namespace.
+      const endpointRoot = mkdtempSync(join(tmpdir(), "herdr-launch-endpoint-"));
+      try {
+        writeFileSync(join(endpointRoot, "herdr.sock"), "");
+        vi.stubEnv("HERDR_SOCKET_PATH", join(endpointRoot, "herdr.sock"));
+        await expect(tool.execute("call", task({ recoveryOf: randomUUID() }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE" });
+        // A second ambient recovery reuses the memoized default allocator.
+        await expect(tool.execute("call", task({ recoveryOf: randomUUID() }), new AbortController().signal, undefined, extensionContext)).rejects.toMatchObject({ code: "RECOVERY_UNRESOLVABLE" });
+        expect(harness.calls).toEqual([]);
+        expect(specClient.evaluate).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(endpointRoot, { recursive: true, force: true });
+      }
     });
 
     it("rejects a recovery request carrying cwd before any effect", async () => {
@@ -1898,6 +1906,7 @@ tierChains:
       preflight: async () => undefined,
       supervision: stubSupervision(),
       launchGate: openLaunchGate,
+      handoffs: fakeHandoffs(),
       specClient: {
         evaluate: vi.fn(async (input: { catalog: Catalog }) => {
           loaded = input.catalog;

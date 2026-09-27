@@ -817,31 +817,40 @@ describe("daemon launch handler — intent-gated execution", () => {
   it("reaches the pipeline's injected-dependency fallbacks on a bare launch tool", async () => {
     // A launch tool built like the host surfaces build it: no handoffs or
     // clock injected — the production `??` defaults engage inside executeChild.
-    // A throwing context resolver stops the child after those defaults bind
-    // but before the default allocator can touch disk.
+    // Validate mints the run before the child starts, so the ambient allocator
+    // needs a hermetic endpoint namespace; the throwing context resolver still
+    // stops the child before the minted run is persisted.
     const fx = await harness();
-    const catalog = catalogOf(["pi-model"]);
-    const tool = createLaunchTool({
-      cli: { runJson: async () => ok("cli", {}), prompt: async () => ok("cli", {}) },
-      context: { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" },
-      contextResolver: async () => { throw new Error("unproven"); },
-      preflight: async () => undefined,
-      supervision: fx.supervision,
-      specClient: { evaluate: async () => ({ kind: "response" as const, response: responseFor(catalog) }) },
-      catalog: { load: async () => catalog },
-      routerLog: vi.fn(async () => undefined),
-      launchGate: openLaunchGate,
-    });
-    const signal = new AbortController().signal;
-    const result = await tool.execute("bare", task, signal, undefined, { cwd: fx.projectRoot, signal } as never);
-    const launched = result.details as LaunchResult;
-    // The admitted route resolved with the default stores engaged; the child
-    // failed closed at context resolution — no run was allocated anywhere.
-    expect(launched.outcome).toBe("failed");
-    expect(launched.children[0]?.state).toBe("failed");
-    // A second execute reuses the module-level default allocator (`??=` left side).
-    const second = await tool.execute("bare2", task, signal, undefined, { cwd: fx.projectRoot, signal } as never);
-    expect((second.details as LaunchResult).children[0]?.state).toBe("failed");
+    const endpointRoot = await mkdtemp(join(tmpdir(), "herdr-daemon-n21-endpoint-"));
+    dirs.push(endpointRoot);
+    await writeFile(join(endpointRoot, "herdr.sock"), "");
+    vi.stubEnv("HERDR_SOCKET_PATH", join(endpointRoot, "herdr.sock"));
+    try {
+      const catalog = catalogOf(["pi-model"]);
+      const tool = createLaunchTool({
+        cli: { runJson: async () => ok("cli", {}), prompt: async () => ok("cli", {}) },
+        context: { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" },
+        contextResolver: async () => { throw new Error("unproven"); },
+        preflight: async () => undefined,
+        supervision: fx.supervision,
+        specClient: { evaluate: async () => ({ kind: "response" as const, response: responseFor(catalog) }) },
+        catalog: { load: async () => catalog },
+        routerLog: vi.fn(async () => undefined),
+        launchGate: openLaunchGate,
+      });
+      const signal = new AbortController().signal;
+      const result = await tool.execute("bare", task, signal, undefined, { cwd: fx.projectRoot, signal } as never);
+      const launched = result.details as LaunchResult;
+      // The admitted route resolved with the default stores engaged; the child
+      // failed closed at context resolution — the minted run was never persisted.
+      expect(launched.outcome).toBe("failed");
+      expect(launched.children[0]?.state).toBe("failed");
+      // A second execute reuses the module-level default allocator (`??=` left side).
+      const second = await tool.execute("bare2", task, signal, undefined, { cwd: fx.projectRoot, signal } as never);
+      expect((second.details as LaunchResult).children[0]?.state).toBe("failed");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("registers the claude completion-signal callback on a claude runner", async () => {

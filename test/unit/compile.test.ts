@@ -245,7 +245,7 @@ describe("compile", () => {
     const agy = await compileCandidateContract(catalog, SPEC, point(catalog, "agy"), {});
     expect(contractArgv(agy, undefined, "/tmp/att")).toEqual(["--model", "gemini-low", "--mode", "plan", "--dangerously-skip-permissions", "--add-dir", "/tmp/att", "--prompt-interactive", "Initialize this interactive session and reply with exactly AGY_READY."]);
     const devin = await compileCandidateContract(catalog, SPEC, point(catalog, "devin"), {});
-    expect(contractArgv(devin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous"]);
+    expect(contractArgv(devin)).toEqual(["--model", "swe-2-max", "--permission-mode", "dangerous", "--respect-workspace-trust", "false"]);
   });
 
   it("binds the reviewed point's quota tuple and identity, never a recomputed candidate", async () => {

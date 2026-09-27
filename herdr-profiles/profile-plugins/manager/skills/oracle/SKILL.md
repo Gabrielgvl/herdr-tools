@@ -10,7 +10,9 @@ description: "Use only when Gabriel explicitly requests an Oracle review or remo
 Invoke Oracle only when Gabriel explicitly requests Oracle for the current
 task. Never infer authorization from criticality, risk, complexity, or review
 type. Without an explicit Oracle request, use `pi-review` for code and plan
-reviews.
+reviews: `pi-review <number|#N|url>` reviews a PR, `pi-review <file>` reviews
+a plan document, and bare `pi-review` reviews the current branch's committed
+change.
 
 ## Mandatory two-track solution instruction
 

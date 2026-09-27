@@ -1,18 +1,25 @@
 {
-  "comment": "Prepared-not-installed executor gateway registration for the Herdr tools MCP server (N3.4). Keys are the executor tool paths to call; activation is the N5.3 cutover — see deploy/executor/README. Nothing in this file has been registered anywhere.",
+  "comment": "Executor gateway registration for the Herdr tools MCP server (N3.4 artifact, registered live at the N5.3 cutover \u2014 see deploy/executor/README). Keys are the executor tool paths to call. `command` pins the real Node binary, not the Volta shim (~/.volta/bin/node): under the executor daemon spawn the shim resolves a different Node ABI and the server refuses to load native addons (re2.node) \u2014 discovered at activation and fixed in the live registration.",
   "tools.executor.mcp.addServer": {
     "transport": "stdio",
     "name": "Herdr Tools",
     "slug": "herdr",
-    "command": "/home/gabriel/.volta/bin/node",
-    "args": ["/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"],
+    "command": "/home/gabriel/.volta/tools/image/node/25.9.0/bin/node",
+    "args": [
+      "/home/gabriel/.pi/agent/extensions/herdr-tools/dist/src/mcp-server.js"
+    ],
     "env": {
       "HERDR_ENV": "1",
       "HERDR_SOCKET_PATH": "/home/gabriel/.config/herdr/herdr.sock",
       "HERDR_EXECUTOR_DELEGATED": "1"
     },
     "spawnPerCall": false,
-    "authenticationTemplate": [{ "slug": "none", "kind": "none" }]
+    "authenticationTemplate": [
+      {
+        "slug": "none",
+        "kind": "none"
+      }
+    ]
   },
   "tools.executor.coreTools.connections.create": {
     "owner": "org",

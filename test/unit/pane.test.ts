@@ -1,4 +1,4 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { resetOwnership, runtimeOwnership } from "../../src/ownership.js";
@@ -31,7 +31,7 @@ interface Harness {
   calls: string[][];
   snapshot: HerdrSnapshot;
   confirm: ReturnType<typeof vi.fn>;
-  ctx: ExtensionContext;
+  ctx: ExtensionToolContext;
 }
 
 function makeHarness(): Harness {
@@ -105,13 +105,13 @@ function makeHarness(): Harness {
     throw new Error(`unexpected argv ${argv.join(" ")}`);
   });
   const cli = new HerdrCli(exec);
-  const ctx = { hasUI: true, cwd: "/repo", signal: undefined, ui: { confirm } } as unknown as ExtensionContext;
+  const ctx = { hasUI: true, cwd: "/repo", signal: undefined, ui: { confirm } } as unknown as ExtensionToolContext;
   return { cli, calls, snapshot, confirm, ctx };
 }
 
-function execute(harness: Harness, params: Record<string, unknown>, overrides: Partial<ExtensionContext> = {}, signal: AbortSignal = new AbortController().signal, selfClose?: PaneDependencies["selfClose"]) {
+function execute(harness: Harness, params: Record<string, unknown>, overrides: Partial<ExtensionToolContext> = {}, signal: AbortSignal = new AbortController().signal, selfClose?: PaneDependencies["selfClose"]) {
   const tool = createPaneTool({ cli: harness.cli, context, cwd: "/cwd", ...(selfClose ? { selfClose } : {}) });
-  return tool.execute("call", params as never, signal, undefined, { ...harness.ctx, ...overrides } as ExtensionContext);
+  return tool.execute("call", params as never, signal, undefined, { ...harness.ctx, ...overrides } as ExtensionToolContext);
 }
 
 afterEach(() => resetOwnership());

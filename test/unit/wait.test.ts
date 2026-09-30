@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { CliProtocolError } from "../../src/cli.js";
 import { ReviewerFailure, type ReviewerRequest, type WaitReviewer } from "../../src/reviewer.js";
@@ -105,7 +105,7 @@ function nativeCli(options: { statuses?: Record<string, string>; currentStatuses
 }
 
 const context = { workspaceId: "w", tabId: "w:t", paneId: "p1" };
-const extensionContext = { modelRegistry: {} } as ExtensionContext;
+const extensionContext = { modelRegistry: {} } as ExtensionToolContext;
 const settings = { reviewCadenceMinutes: 1, reviewerModel: "testmodel", reviewerThinking: "low" as const };
 
 function nativePredicateTimeout(): CliProtocolError {

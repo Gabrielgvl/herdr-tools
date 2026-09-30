@@ -229,15 +229,14 @@ function tierJudgment(value: unknown): TierEvidence | undefined {
 
 /**
  * Deterministic tool surface; skill/plugin/MCP selection remains disabled.
- * Pi lanes pin the five native tools plus the executor-gateway trio — the
- * `--tools` allowlist is the only channel that can reach executor_* tools, so
- * a lane whose reviewed pool carries the gateway recipe gets the trio, and a
- * pool without it degrades to the natives alone.
+ * Pi lanes use exact native MCP tool names. Claude grants the reviewed
+ * Executor and direct-memory servers through their providing plugin.
  */
 export function runnerResourceSelection(_response: TaskModelDecision, runner: RunnerKind, entry?: RunnerEntry): ResourceSelection {
-  const desired = runner === "pi" ? ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] : runner === "claude" ? ["Read", "Bash", "Write"] : [];
+  const desired = runner === "pi" ? ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume", "mcp__hindsight__hindsight_sync_status", "mcp__hindsight__hindsight_diagnose", "mcp__hindsight__hindsight_search_knowledge_pages", "mcp__hindsight__hindsight_list_knowledge_pages", "mcp__hindsight__hindsight_read_knowledge_page", "mcp__hindsight__hindsight_reflect", "mcp__hindsight__hindsight_capture_initiative", "mcp__hindsight__hindsight_ingest_document"] : runner === "claude" ? ["Read", "Bash", "Write"] : [];
   const tools = entry === undefined ? desired : desired.filter((tool) => entry.pools.tools.includes(tool));
-  return tools.length === 0 ? {} : { tools };
+  const mcp = runner === "claude" ? ["executor", "hindsight"].filter(server => entry === undefined || entry.pools.mcp.includes(server)) : [];
+  return { ...(tools.length === 0 ? {} : { tools }), ...(mcp.length === 0 ? {} : { mcp }) };
 }
 
 function availabilityEvidence(statuses: Map<string, CandidateAvailability>): RouterEvidence["availability"] {

@@ -124,7 +124,7 @@ function runnerEntry(modelIds: readonly string[]): RunnerEntry {
     quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
     defaults: { timeoutMinutes: 30, sessionPersistence: false, thinking: "low" },
     plumbing: { sessionPersistence: "optional", promptDelivery: "file", skillSelection: "exact", toolSelection: "allowlist" },
-    pools: { tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"], extensions: [], skills: [], plugins: [], mcp: [] },
+    pools: { tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume"], extensions: [], skills: [], plugins: [], mcp: [] },
   };
 }
 

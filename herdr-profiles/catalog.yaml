@@ -74,16 +74,18 @@ mcp:
     plugin: herdr-tools
   executor:
     plugin: herdr-executor
+  hindsight:
+    plugin: herdr-executor
 
 runners:
   pi:
     # Per-model declared reasoning axes (ADR-037 audit). GPT-6 Luna and Sol
-    # support six settings; Pi `minimal` is a runner-level alias of provider
+    # 6.1 support six settings; Pi `minimal` is a runner-level alias of provider
     # `low` and is never a canonical point. GPT-6 Astra has no `off`
     # operating point.
     models:
       - {model: openai-codex/gpt-6-luna, supportedReasoning: [off, low, medium, high, xhigh, max]}
-      - {model: openai-codex/gpt-6-sol, supportedReasoning: [off, low, medium, high, xhigh, max]}
+      - {model: openai-codex/gpt-6.1-sol, supportedReasoning: [off, low, medium, high, xhigh, max]}
       - {model: openai-codex/gpt-6-astra, supportedReasoning: [low, medium, high, xhigh, max]}
       # GLM-5.3-Flash routes are billed outside the runner's codex domain:
       # provider + billingProduct keep their availability tuples distinct.
@@ -108,19 +110,25 @@ runners:
       skillSelection: exact
       toolSelection: allowlist
     pools:
-      # The pinned lane surface (owner decision): the five native tools plus
-      # the executor-gateway trio. `--tools` is a hard allowlist over extension
-      # tools, so the trio must be pool members to stay reachable; ambient MCP
-      # is unscopable on pi, and `mcp` itself is deliberately absent.
+      # Exact native MCP tool names keep Executor and direct project memory
+      # reachable without granting an unrestricted codemode tool.
       tools:
         - read
         - bash
         - edit
         - write
         - ask_user_question
-        - executor_execute
-        - executor_skills
-        - executor_resume
+        - mcp__executor__execute
+        - mcp__executor__skills
+        - mcp__executor__resume
+        - mcp__hindsight__hindsight_sync_status
+        - mcp__hindsight__hindsight_diagnose
+        - mcp__hindsight__hindsight_search_knowledge_pages
+        - mcp__hindsight__hindsight_list_knowledge_pages
+        - mcp__hindsight__hindsight_read_knowledge_page
+        - mcp__hindsight__hindsight_reflect
+        - mcp__hindsight__hindsight_capture_initiative
+        - mcp__hindsight__hindsight_ingest_document
       # The reviewed Pi extension set is empty today.
       extensions: []
       skills:
@@ -171,8 +179,8 @@ runners:
         - herdr-profiles/role-plugins/worker/skills/tdd
         - herdr-profiles/role-plugins/worker/skills/typescript
         - herdr-profiles/role-plugins/worker/skills/worker
-      # herdr is not a Pi-facing server: pi lanes reach it through the
-      # executor gateway trio, so only executor is a reviewed pi MCP server.
+      # Herdr remains behind Executor. Direct memory is granted by exact
+      # tool names above, not by an unrestricted ambient MCP selector.
       mcp:
         - executor
   claude:
@@ -227,6 +235,7 @@ runners:
       mcp:
         - herdr
         - executor
+        - hindsight
   agy:
     # Reasoning is encoded in the model id — one bare point per model.
     models:
@@ -292,13 +301,13 @@ tierChains:
     - pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high
     - claude:opus:low
     - pi:zai/glm-5.3-flash:high
-    - pi:openai-codex/gpt-6-sol:high
+    - pi:openai-codex/gpt-6.1-sol:high
     - agy:gemini-3.8-flash-low
   strong:
     - devin:swe-2-max
     - claude:opus:xhigh
     - pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high
-    - pi:openai-codex/gpt-6-sol:xhigh
+    - pi:openai-codex/gpt-6.1-sol:xhigh
     - pi:zai/glm-5.3-flash:max
     - agy:gemini-3.8-flash-high
   frontier:
@@ -324,6 +333,8 @@ tierChains:
 # GPT-6 migration (2026-09-22): GPT-6 Luna and Sol inherit their audited classes
 # by reasoning setting. Those inherited classes are PROVISIONAL pending fresh
 # calibration, not newly benchmarked.
+# Sol 6.1 cutover (2026-09-29): gpt-6.1-sol replaces gpt-6-sol and inherits its
+# provisional classes unchanged pending fresh calibration.
 # Evidence limitation, recorded per the audit: the OpenCode Go GLM route has
 # no independent latency measurement and is classed conservatively high;
 # Devin classes rest on published task economics, not wall-clock latency.
@@ -334,12 +345,12 @@ pointPolicy:
   pi:openai-codex/gpt-6-luna:high: {costClass: low, latencyClass: medium}
   pi:openai-codex/gpt-6-luna:xhigh: {costClass: low, latencyClass: medium}
   pi:openai-codex/gpt-6-luna:max: {costClass: low, latencyClass: medium}
-  pi:openai-codex/gpt-6-sol:off: {costClass: high, latencyClass: medium}
-  pi:openai-codex/gpt-6-sol:low: {costClass: high, latencyClass: medium}
-  pi:openai-codex/gpt-6-sol:medium: {costClass: high, latencyClass: medium}
-  pi:openai-codex/gpt-6-sol:high: {costClass: high, latencyClass: high}
-  pi:openai-codex/gpt-6-sol:xhigh: {costClass: high, latencyClass: high}
-  pi:openai-codex/gpt-6-sol:max: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-6.1-sol:off: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-6.1-sol:low: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-6.1-sol:medium: {costClass: high, latencyClass: medium}
+  pi:openai-codex/gpt-6.1-sol:high: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-6.1-sol:xhigh: {costClass: high, latencyClass: high}
+  pi:openai-codex/gpt-6.1-sol:max: {costClass: high, latencyClass: high}
   pi:openai-codex/gpt-6-astra:low: {costClass: extreme, latencyClass: high}
   pi:openai-codex/gpt-6-astra:medium: {costClass: extreme, latencyClass: high}
   pi:openai-codex/gpt-6-astra:high: {costClass: extreme, latencyClass: extreme}

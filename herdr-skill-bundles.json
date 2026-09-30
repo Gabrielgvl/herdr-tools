@@ -12,11 +12,11 @@
   "bundles": {
     "herdr-profiles/profile-plugins/manager/skills/manager": {
       "source": "./herdr-profiles/role-plugins/manager/skills/manager",
-      "treeHash": "5039639bc8ca5ad8e673aecb8e73ec6f643572231e27146681831793522b3d36"
+      "treeHash": "02a727cd11d8e6225317dcc29432ab57e63f46aa06d87c4744e770ece2942f59"
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",
-      "treeHash": "9a3d2dfe2bc47892540dcb63b89208268b924787664f01911b21e511af5acc43"
+      "treeHash": "13bb3a703603c5058103c021168d42763b3355877aaee7729b3a95e820ab18d2"
     },
     "herdr-profiles/profile-plugins/manager/skills/decision-batch": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/decision-batch",
@@ -36,11 +36,11 @@
     },
     "herdr-profiles/profile-plugins/manager/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "39a3b6aa2e407f1fa5eb6c5712558e7ecd4924148fbea9e2a4b0426e7a92f6f3"
+      "treeHash": "36d76c4551ec6ab350b7fa584287fd61d89aee699dda5b11ceb12bfbbda3b4e8"
     },
     "herdr-profiles/profile-plugins/manager/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "04463e1b89bbe1712543a0ecc0745a5c5f056d0cdd008c2da11764d739f2ba8a"
+      "treeHash": "c9ef698f0d40aefb990041c8867307bf10592e72ed8004729d4c76ef4f141981"
     },
     "herdr-profiles/role-plugins/planner/skills/adr": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/adr",
@@ -116,11 +116,11 @@
     },
     "herdr-profiles/role-plugins/reviewer/skills/oracle": {
       "source": "/home/gabriel/.codex/skills/oracle",
-      "treeHash": "39a3b6aa2e407f1fa5eb6c5712558e7ecd4924148fbea9e2a4b0426e7a92f6f3"
+      "treeHash": "36d76c4551ec6ab350b7fa584287fd61d89aee699dda5b11ceb12bfbbda3b4e8"
     },
     "herdr-profiles/role-plugins/reviewer/skills/pi-review-pr": {
       "source": "/home/gabriel/.codex/skills/pi-review-pr",
-      "treeHash": "04463e1b89bbe1712543a0ecc0745a5c5f056d0cdd008c2da11764d739f2ba8a"
+      "treeHash": "c9ef698f0d40aefb990041c8867307bf10592e72ed8004729d4c76ef4f141981"
     },
     "herdr-profiles/role-plugins/reviewer/skills/typescript": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/typescript",
@@ -156,7 +156,7 @@
     },
     "herdr-profiles/profile-plugins/executor/skills/executor": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/executor",
-      "treeHash": "866be4521bf4d5656ffc9c543b42611902e5b3d94a14e7c7b293462bd98b3411"
+      "treeHash": "c8e84724381b264bb51513be45b0f8052fcc8ceb7865bcb21008f55952dbc131"
     },
     "herdr-profiles/pi-skills/context-mode": {
       "source": "/home/gabriel/workspace/context-mode-pi-runtime/skills/context-mode",

@@ -43,7 +43,7 @@ runners:
     defaults: {thinking: high, timeoutMinutes: 30, sessionPersistence: true}
     plumbing: {sessionPersistence: optional, promptDelivery: file, skillSelection: exact, toolSelection: allowlist}
     pools:
-      tools: [read, bash, edit, write, ask_user_question, mcp, executor_execute, executor_skills, executor_resume]
+      tools: [read, bash, edit, write, ask_user_question, mcp, mcp__executor__execute, mcp__executor__skills, mcp__executor__resume, mcp__hindsight__hindsight_sync_status, mcp__hindsight__hindsight_diagnose, mcp__hindsight__hindsight_search_knowledge_pages, mcp__hindsight__hindsight_list_knowledge_pages, mcp__hindsight__hindsight_read_knowledge_page, mcp__hindsight__hindsight_reflect, mcp__hindsight__hindsight_capture_initiative, mcp__hindsight__hindsight_ingest_document]
       extensions: [ext/host.ts]
       skills: [skills/adr, skills/tdd, skills/linked]
       mcp: [herdr, executor]
@@ -327,7 +327,7 @@ describe("compile", () => {
     for (const [index, operatingPoint] of points.entries()) {
       const resolved: ResolvedPoint = { index, point: operatingPoint, runner: catalog.runners.get(operatingPoint.runner)! };
       const selection = operatingPoint.runner === "pi"
-        ? { tools: ["read", "executor_execute"], skills: [catalog.skills[0]!], mcp: ["executor"] }
+        ? { tools: ["read", "mcp__executor__execute"], skills: [catalog.skills[0]!], mcp: ["executor"] }
         : operatingPoint.runner === "claude"
           ? { tools: ["Read", "Bash"], mcp: ["executor"] }
           : {};
@@ -339,8 +339,10 @@ describe("compile", () => {
     // The real plugin manifests make `executor`'s provider resolvable: the dependency lands inside the pool.
     const claudeIndex = points.findIndex((entry) => entry.runner === "claude");
     const claudePoint: ResolvedPoint = { index: claudeIndex, point: points[claudeIndex]!, runner: catalog.runners.get("claude")! };
-    const contract = await compileCandidateContract(catalog, SPEC, claudePoint, { tools: ["Read"], mcp: ["executor"] });
+    const contract = await compileCandidateContract(catalog, SPEC, claudePoint, runnerResourceSelection({}, "claude", claudePoint.runner));
     expect(contract.resources.plugins!.exposed).toEqual([`${root}/herdr-profiles/profile-plugins/executor`]);
+    expect(contractArgv(contract)).toContain("mcp__plugin_herdr-executor_hindsight");
+    expect(contract.resources.mcp!.permitted).toEqual(["executor", "hindsight"]);
     expect(contract.derivations).toContainEqual(expect.objectContaining({ action: "dependency", field: "plugins", name: `${root}/herdr-profiles/profile-plugins/executor` }));
     // The `herdr` server's declared provider `herdr-tools` has no directory in
     // the reviewed plugin set — the pair is removed as incompatible, recorded.
@@ -348,7 +350,7 @@ describe("compile", () => {
     expect(unprovidable.derivations).toContainEqual(expect.objectContaining({ action: "incompatible", field: "mcp", name: "herdr" }));
   });
 
-  it("pins a gateway pi lane's argv tool set to the five natives plus the executor trio exactly", async () => {
+  it("pins a pi lane's argv to native tools, Executor, and direct memory exactly", async () => {
     const catalog = await loadCatalog(join(PACKAGE_ROOT, CATALOG_PATH));
     const runner = catalog.runners.get("pi")!;
     const index = (catalog.points ?? []).findIndex((entry) => entry.runner === "pi");
@@ -356,11 +358,11 @@ describe("compile", () => {
     // The production selection path: runnerResourceSelection is what routeTask
     // hands the compiler for every pi lane.
     const selection = runnerResourceSelection({}, "pi", runner);
-    expect(selection.tools).toEqual(["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"]);
+    expect(selection.tools).toEqual(["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume", "mcp__hindsight__hindsight_sync_status", "mcp__hindsight__hindsight_diagnose", "mcp__hindsight__hindsight_search_knowledge_pages", "mcp__hindsight__hindsight_list_knowledge_pages", "mcp__hindsight__hindsight_read_knowledge_page", "mcp__hindsight__hindsight_reflect", "mcp__hindsight__hindsight_capture_initiative", "mcp__hindsight__hindsight_ingest_document"]);
     const contract = await compileCandidateContract(catalog, SPEC, resolved, selection);
     const argv = contractArgv(contract, "/tmp/prompt.md");
-    expect(argv[argv.indexOf("--tools") + 1]).toBe("read,bash,edit,write,ask_user_question,executor_execute,executor_skills,executor_resume");
-    expect(contract.runtime).toMatchObject({ kind: "pi", tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] });
+    expect(argv[argv.indexOf("--tools") + 1]).toBe("read,bash,edit,write,ask_user_question,mcp__executor__execute,mcp__executor__skills,mcp__executor__resume,mcp__hindsight__hindsight_sync_status,mcp__hindsight__hindsight_diagnose,mcp__hindsight__hindsight_search_knowledge_pages,mcp__hindsight__hindsight_list_knowledge_pages,mcp__hindsight__hindsight_read_knowledge_page,mcp__hindsight__hindsight_reflect,mcp__hindsight__hindsight_capture_initiative,mcp__hindsight__hindsight_ingest_document");
+    expect(contract.runtime).toMatchObject({ kind: "pi", tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume", "mcp__hindsight__hindsight_sync_status", "mcp__hindsight__hindsight_diagnose", "mcp__hindsight__hindsight_search_knowledge_pages", "mcp__hindsight__hindsight_list_knowledge_pages", "mcp__hindsight__hindsight_read_knowledge_page", "mcp__hindsight__hindsight_reflect", "mcp__hindsight__hindsight_capture_initiative", "mcp__hindsight__hindsight_ingest_document"] });
     // A pool that drops the trio still compiles, to the five natives alone.
     const thinned = { ...runner, pools: { ...runner.pools, tools: ["read", "bash", "edit", "write", "ask_user_question"] } };
     const noGateway = await compileCandidateContract(catalog, SPEC, { ...resolved, runner: thinned }, runnerResourceSelection({}, "pi", thinned));

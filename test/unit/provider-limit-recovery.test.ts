@@ -2,7 +2,7 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi, afterEach } from "vitest";
-import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import type { JsonEnvelope } from "../../src/cli.js";
 import type { AvailabilitySubject, Catalog, OperatingPoint, RunnerEntry, RunnerKind } from "../../src/catalog.js";
 import type { LaunchTask } from "../../src/launch-schema.js";
@@ -23,7 +23,7 @@ import { stubSupervision } from "./supervision-fixtures.js";
 
 const repoRoot = realpathSync(process.cwd());
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
-const extensionContext = { cwd: repoRoot, signal: new AbortController().signal } as ExtensionContext;
+const extensionContext = { cwd: repoRoot, signal: new AbortController().signal } as ExtensionToolContext;
 const TASK: LaunchTask = { objective: "Reduce the latency without changing the public contract.", scope: "Only the assigned worktree.", doneWhen: ["The assigned objective is complete and verified."] };
 const RESET_ISO = "2026-09-24T12:45:00.000Z";
 const ok = (id: string, result: unknown): JsonEnvelope => ({ id, result });
@@ -44,7 +44,7 @@ function runnerEntry(modelIds: readonly string[]): RunnerEntry {
     quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
     defaults: { timeoutMinutes: 30, sessionPersistence: false, thinking: "low" },
     plumbing: { sessionPersistence: "optional", promptDelivery: "file", skillSelection: "exact", toolSelection: "allowlist" },
-    pools: { tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"], extensions: [], skills: [], plugins: [], mcp: [] },
+    pools: { tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume"], extensions: [], skills: [], plugins: [], mcp: [] },
   };
 }
 
@@ -258,7 +258,7 @@ function toolFor(options: {
   });
 }
 
-async function execute(tool: ReturnType<typeof createLaunchTool>, params: unknown, ctx: ExtensionContext = extensionContext): Promise<AgentToolResult<LaunchResult>> {
+async function execute(tool: ReturnType<typeof createLaunchTool>, params: unknown, ctx: ExtensionToolContext = extensionContext): Promise<AgentToolResult<LaunchResult>> {
   const result = await tool.execute("call", params as never, new AbortController().signal, undefined, ctx);
   if (result.details?.kind !== "launch") throw new Error("expected a launch result");
   return result;
@@ -460,7 +460,7 @@ describe("provider-limit auto-recovery", () => {
     const supervision = stubSupervision();
     const selfClose = fakeSelfClose();
     const quota = vi.fn(async (): Promise<ClaudeQuotaSignal> => ({ retryNotBefore: null, zeroProgressProven: true }));
-    await execute(toolFor({ catalog: twoProviderCatalog(), cli: harness.cli, supervision, handoffs: allocator(), claudeQuotaReader: quota, selfClose: selfClose.tracker }), { ...TASK, label: "recovery-check" }, { cwd: repoRoot } as ExtensionContext);
+    await execute(toolFor({ catalog: twoProviderCatalog(), cli: harness.cli, supervision, handoffs: allocator(), claudeQuotaReader: quota, selfClose: selfClose.tracker }), { ...TASK, label: "recovery-check" }, { cwd: repoRoot } as ExtensionToolContext);
 
     const signal = await supervision.completionSignals[0]!(supervision.bound[0]!.identity);
     expect(signal).toMatchObject({ autoRecovery: { outcome: "relaunched" } });

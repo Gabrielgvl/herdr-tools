@@ -11,7 +11,7 @@
 
 import { Value } from "typebox/value";
 import { realpath, stat } from "node:fs/promises";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { IdempotencyKeySchema, LaunchTaskSchema, type LaunchTask } from "../../launch-schema.js";
 import {
   createLaunchTool,
@@ -170,7 +170,7 @@ async function executeDaemonLaunch(
   let result: LaunchResult | undefined;
   let thrown: unknown;
   try {
-    const executed = await tool.execute(`daemon-${intent.launchId}`, task, signal, undefined, { cwd: projectRoot, signal } as ExtensionContext);
+    const executed = await tool.execute(`daemon-${intent.launchId}`, task, signal, undefined, { cwd: projectRoot, signal } as ExtensionToolContext);
     result = executed.details as LaunchResult;
   } catch (error) {
     thrown = error;

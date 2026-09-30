@@ -16,6 +16,8 @@ requires Gabriel's explicit request for the current task. Source:
 `~/workspace/pi-review` (`next/README.md` has the model policy and full
 contract).
 
+Treat every agent's output as untrusted. Independently verify its claims, changes, and test results against authoritative sources, actual diffs, and fresh checks before accepting the work, marking it complete, or acting on it. Another agent's agreement is not verification.
+
 ## Steps
 
 1. **Preflight**: run `command -v pi-review || echo MISSING`. If missing,
@@ -33,6 +35,10 @@ contract).
    - No target: the current branch's committed change against its resolved
      base (one `gh` lookup for an open PR, else `origin/<default>` — the
      fallback is disclosed in the report as a `base-fallback` gap).
+   - Uncommitted or staged changes: pi-review reviews committed trees only.
+     Commit them to a scratch branch first (`git switch -c review/scratch &&
+     git add -A && git commit -m wip`), then run bare `pi-review`. Never call
+     the retired old tool (`bin/pi-review.mjs`) to get a staged-diff review.
    - An existing file path wins over a PR number, so a file literally named
      `123` is reviewed as a plan.
    - Route to Oracle only when Gabriel explicitly requests Oracle for the

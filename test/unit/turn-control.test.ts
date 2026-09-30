@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError, type HerdrCli, type JsonEnvelope } from "../../src/cli.js";
 import { createCommunicateTool } from "../../src/tools/communicate.js";
 import { turnControlInternals as internals } from "../../src/tools/turn-control.js";
@@ -89,7 +89,7 @@ function makeCli(finalSnapshot: HerdrSnapshot, options: { waitError?: Error; dis
 }
 function execute(cli: HerdrCli, params: Record<string, unknown>, signal = new AbortController().signal) {
   const tool = createCommunicateTool({ cli, context: { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" }, preflight: async () => undefined });
-  return tool.execute("turn", params as never, signal, undefined, { signal, hasUI: false } as unknown as ExtensionContext);
+  return tool.execute("turn", params as never, signal, undefined, { signal, hasUI: false } as unknown as ExtensionToolContext);
 }
 
 describe("explicit turn-control schema", () => {
@@ -762,7 +762,7 @@ describe("explicit turn control", () => {
 
     const duringPreflight = new AbortController();
     const preflightTool = createCommunicateTool({ cli: makeCli(snapshot(workerPane("idle", 11))).cli, context: { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" }, preflight: async () => duringPreflight.abort() });
-    await expect(preflightTool.execute("id", { target: "worker", operation: "cancel" } as never, duringPreflight.signal, undefined, { signal: duringPreflight.signal } as unknown as ExtensionContext)).rejects.toMatchObject({ code: "ABORTED" });
+    await expect(preflightTool.execute("id", { target: "worker", operation: "cancel" } as never, duringPreflight.signal, undefined, { signal: duringPreflight.signal } as unknown as ExtensionToolContext)).rejects.toMatchObject({ code: "ABORTED" });
 
     const afterIdentity = new AbortController();
     const identityHarness = makeCli(snapshot(workerPane("idle", 11)));
@@ -775,7 +775,7 @@ describe("explicit turn control", () => {
     await expect(execute(identityHarness.cli, { target: "worker", operation: "cancel" }, afterIdentity.signal)).rejects.toMatchObject({ code: "ABORTED" });
 
     const plainTool = createCommunicateTool({ cli: makeCli(snapshot(workerPane("idle", 11))).cli, context: { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" }, preflight: async () => { throw "plain preflight failure"; } });
-    await expect(plainTool.execute("id", { target: "worker", operation: "cancel" } as never, new AbortController().signal, undefined, { signal: new AbortController().signal } as unknown as ExtensionContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { reason: "plain preflight failure" } });
+    await expect(plainTool.execute("id", { target: "worker", operation: "cancel" } as never, new AbortController().signal, undefined, { signal: new AbortController().signal } as unknown as ExtensionToolContext)).rejects.toMatchObject({ code: "CLI_PROTOCOL_ERROR", details: { reason: "plain preflight failure" } });
   });
 
   it("renders compact turn-control call and result rows", () => {

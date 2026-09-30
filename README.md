@@ -166,7 +166,7 @@ See [ADR-031](docs/decisions/031-universal-disk-handoff.md).
 {
   "wait": {
     "reviewCadenceMinutes": 5,
-    "reviewerModel": "openai-codex/gpt-6-sol"
+    "reviewerModel": "openai-codex/gpt-6.1-sol"
   }
 }
 ```

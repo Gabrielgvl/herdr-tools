@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import { Value } from "typebox/value";
-import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { CliProtocolError, type JsonEnvelope } from "../../src/cli.js";
 import { parseCatalog, type AvailabilitySubject, type Catalog, type OperatingPoint, type RunnerEntry, type RunnerKind } from "../../src/catalog.js";
 import { PublishedLaunchParamsSchema, LaunchTaskSchema, renderTask, type LaunchTask } from "../../src/launch-schema.js";
@@ -29,7 +29,7 @@ import { stubSupervision, type StubSupervision } from "./supervision-fixtures.js
 /** A real directory: the runtime canonicalizes `cwd` before any effect. */
 const repoRoot = realpathSync(process.cwd());
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
-const extensionContext = { cwd: repoRoot, signal: new AbortController().signal } as ExtensionContext;
+const extensionContext = { cwd: repoRoot, signal: new AbortController().signal } as ExtensionToolContext;
 const TASK = {
   objective: "Reduce the latency without changing the public contract.",
   scope: "Only the assigned worktree.",
@@ -45,7 +45,7 @@ function runnerEntry(modelIds: readonly string[]): RunnerEntry {
     quota: { provider: "test-provider", billingProduct: "test-product", account: "test-account", scope: "project" },
     defaults: { timeoutMinutes: 30, sessionPersistence: false, thinking: "low" },
     plumbing: { sessionPersistence: "optional", promptDelivery: "file", skillSelection: "exact", toolSelection: "allowlist" },
-    pools: { tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"], extensions: [], skills: [], plugins: [], mcp: [] },
+    pools: { tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume"], extensions: [], skills: [], plugins: [], mcp: [] },
   };
 }
 
@@ -1106,11 +1106,11 @@ describe("herdr_launch task cutover", () => {
     const baseCatalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const pi = baseCatalog.runners.get("pi")!;
     const runners = new Map(baseCatalog.runners);
-    runners.set("pi", { ...pi, pools: { ...pi.pools, tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume", "exec_command"] } });
+    runners.set("pi", { ...pi, pools: { ...pi.pools, tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume", "exec_command"] } });
     const catalog: Catalog = { ...baseCatalog, runners };
     const response: TaskModelDecision = {
       ...responseFor(catalog),
-      resources: { pi: { tools: { read: 0.95, bash: 0.95, executor_execute: 0.5, exec_command: 0.5 } } },
+      resources: { pi: { tools: { read: 0.95, bash: 0.95, mcp__executor__execute: 0.5, exec_command: 0.5 } } },
     };
     const routerLog = vi.fn(async () => undefined) as LaunchRouterLog;
     const result = await execute(toolFor({
@@ -1124,7 +1124,7 @@ describe("herdr_launch task cutover", () => {
     expect(routerLog).toHaveBeenCalledWith(expect.objectContaining({
       probabilities: response,
       result: expect.objectContaining({
-        configuration: expect.objectContaining({ runtime: expect.objectContaining({ tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] }) }),
+        configuration: expect.objectContaining({ runtime: expect.objectContaining({ tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume"] }) }),
       }),
     }), expect.anything());
   });
@@ -1991,8 +1991,8 @@ tierChains:
     const i = launchTestInternals as unknown as UnsafeLaunchInternals;
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const piResolved = { index: 0, point: catalog.points![0]!, runner: catalog.runners.get("pi")! };
-    expect(i.allReviewedResources(piResolved)).toMatchObject({ tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"], extensions: [], skills: [], mcp: [] });
-    expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "claude" } })).toMatchObject({ tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"], plugins: [], mcp: [] });
+    expect(i.allReviewedResources(piResolved)).toMatchObject({ tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume"], extensions: [], skills: [], mcp: [] });
+    expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "claude" } })).toMatchObject({ tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume"], plugins: [], mcp: [] });
     expect(i.allReviewedResources({ ...piResolved, runner: { ...piResolved.runner, kind: "agy" } })).toEqual({});
     const session = { source: "herdr:pi", agent: "pi", kind: "id", value: "s" };
     expect(i.launchDiagnosticMessage({ code: "OK", phase: "ready", created: {}, assignmentState: "unconfirmed", paneId: "p", agentStarted: true, promptSubmitted: true, recipientRegistered: false, effectCertainty: "unknown", recoveryGuidance: "Inspect" })).toContain("HERDR_LAUNCH_DIAGNOSTIC");
@@ -2606,7 +2606,7 @@ tierChains:
     const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
     const cli = makeCli();
     const tool = createLaunchTool({ cli: cli.cli, context, preflight: async () => undefined, supervision: stubSupervision(), launchGate: openLaunchGate, handoffs: fakeHandoffs(), specClient: { evaluate: vi.fn(async () => ({ kind: "response" as const, response: responseFor(catalog) })) }, catalog: { load: async () => catalog }, routerLog: vi.fn(async () => undefined) as LaunchRouterLog });
-    const result = await tool.execute("call", task(), undefined, undefined, { cwd: repoRoot, signal: undefined } as unknown as ExtensionContext);
+    const result = await tool.execute("call", task(), undefined, undefined, { cwd: repoRoot, signal: undefined } as unknown as ExtensionToolContext);
     expect(result.details).toMatchObject({ kind: "launch", outcome: "launched", children: [{ state: "launched" }] });
     const executableCli = makeCli();
     Object.assign(executableCli.cli, { exec: vi.fn() });

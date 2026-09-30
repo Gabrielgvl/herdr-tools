@@ -106,8 +106,8 @@ describe("catalog", () => {
     expect(catalog.tierChains).toEqual({
       utility: ["pi:openai-codex/gpt-6-luna:low", "devin:swe-1-7-lightning-medium"],
       economy: ["devin:swe-2-medium", "pi:openai-codex/gpt-6-luna:max", "pi:zai/glm-5.3-flash:low", "claude:sonnet:low"],
-      standard: ["devin:swe-2-high", "pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high", "claude:opus:low", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6-sol:high", "agy:gemini-3.8-flash-low"],
-      strong: ["devin:swe-2-max", "claude:opus:xhigh", "pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high", "pi:openai-codex/gpt-6-sol:xhigh", "pi:zai/glm-5.3-flash:max", "agy:gemini-3.8-flash-high"],
+      standard: ["devin:swe-2-high", "pi:xiaomi-token-plan-sgp/mimo-v2.6-flash:high", "claude:opus:low", "pi:zai/glm-5.3-flash:high", "pi:openai-codex/gpt-6.1-sol:high", "agy:gemini-3.8-flash-low"],
+      strong: ["devin:swe-2-max", "claude:opus:xhigh", "pi:xiaomi-token-plan-sgp/mimo-v2.6-pro:high", "pi:openai-codex/gpt-6.1-sol:xhigh", "pi:zai/glm-5.3-flash:max", "agy:gemini-3.8-flash-high"],
       frontier: ["claude:fable:low", "pi:openai-codex/gpt-6-astra:high", "claude:opus:max", "devin:fusion-gpt-6-astra-high-sidekick-swe-2-medium"],
       max: ["claude:fable:max", "pi:openai-codex/gpt-6-astra:max", "claude:opus:max", "devin:fusion-claude-fable-5-1-high-sidekick-swe-2-medium"],
     });
@@ -118,7 +118,7 @@ describe("catalog", () => {
     // gateway trio, and only the executor server in the reviewed MCP pool —
     // herdr is not a Pi-facing server.
     const pi = catalog.runners.get("pi");
-    expect(pi?.pools.tools).toEqual(["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"]);
+    expect(pi?.pools.tools).toEqual(["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume", "mcp__hindsight__hindsight_sync_status", "mcp__hindsight__hindsight_diagnose", "mcp__hindsight__hindsight_search_knowledge_pages", "mcp__hindsight__hindsight_list_knowledge_pages", "mcp__hindsight__hindsight_read_knowledge_page", "mcp__hindsight__hindsight_reflect", "mcp__hindsight__hindsight_capture_initiative", "mcp__hindsight__hindsight_ingest_document"]);
     expect(pi?.pools.mcp).toEqual(["executor"]);
   });
 
@@ -316,12 +316,12 @@ describe("catalog", () => {
       "pi:openai-codex/gpt-6-luna:high": { costClass: "low", latencyClass: "medium" },
       "pi:openai-codex/gpt-6-luna:xhigh": { costClass: "low", latencyClass: "medium" },
       "pi:openai-codex/gpt-6-luna:max": { costClass: "low", latencyClass: "medium" },
-      "pi:openai-codex/gpt-6-sol:off": { costClass: "high", latencyClass: "medium" },
-      "pi:openai-codex/gpt-6-sol:low": { costClass: "high", latencyClass: "medium" },
-      "pi:openai-codex/gpt-6-sol:medium": { costClass: "high", latencyClass: "medium" },
-      "pi:openai-codex/gpt-6-sol:high": { costClass: "high", latencyClass: "high" },
-      "pi:openai-codex/gpt-6-sol:xhigh": { costClass: "high", latencyClass: "high" },
-      "pi:openai-codex/gpt-6-sol:max": { costClass: "high", latencyClass: "high" },
+      "pi:openai-codex/gpt-6.1-sol:off": { costClass: "high", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6.1-sol:low": { costClass: "high", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6.1-sol:medium": { costClass: "high", latencyClass: "medium" },
+      "pi:openai-codex/gpt-6.1-sol:high": { costClass: "high", latencyClass: "high" },
+      "pi:openai-codex/gpt-6.1-sol:xhigh": { costClass: "high", latencyClass: "high" },
+      "pi:openai-codex/gpt-6.1-sol:max": { costClass: "high", latencyClass: "high" },
       "pi:openai-codex/gpt-6-astra:low": { costClass: "extreme", latencyClass: "high" },
       "pi:openai-codex/gpt-6-astra:medium": { costClass: "extreme", latencyClass: "high" },
       "pi:openai-codex/gpt-6-astra:high": { costClass: "extreme", latencyClass: "extreme" },
@@ -441,12 +441,12 @@ describe("catalog", () => {
       "pi:openai-codex/gpt-6-luna:medium",
       "pi:openai-codex/gpt-6-luna:off",
       "pi:openai-codex/gpt-6-luna:xhigh",
-      "pi:openai-codex/gpt-6-sol:high",
-      "pi:openai-codex/gpt-6-sol:low",
-      "pi:openai-codex/gpt-6-sol:max",
-      "pi:openai-codex/gpt-6-sol:medium",
-      "pi:openai-codex/gpt-6-sol:off",
-      "pi:openai-codex/gpt-6-sol:xhigh",
+      "pi:openai-codex/gpt-6.1-sol:high",
+      "pi:openai-codex/gpt-6.1-sol:low",
+      "pi:openai-codex/gpt-6.1-sol:max",
+      "pi:openai-codex/gpt-6.1-sol:medium",
+      "pi:openai-codex/gpt-6.1-sol:off",
+      "pi:openai-codex/gpt-6.1-sol:xhigh",
       "pi:opencode-go/glm-5.3-flash:high",
       "pi:opencode-go/glm-5.3-flash:low",
       "pi:opencode-go/glm-5.3-flash:max",

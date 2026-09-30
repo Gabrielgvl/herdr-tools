@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { ExecOptions, ExecResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExecOptions, ExecResult, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { boundedEvidence, CliProtocolError, type PiExec } from "../cli.js";
 import type { CurrentContext } from "../targets.js";
 import { readInjectedContext, type EnvironmentState } from "../tool-surface.js";
@@ -29,7 +29,7 @@ export class HostCapabilityError extends Error {
  * upstream tool that starts reading a Pi-only capability cannot silently observe
  * `undefined` on this host.
  */
-export function hostContext(host: HerdrToolHost): ExtensionContext {
+export function hostContext(host: HerdrToolHost): ExtensionToolContext {
   const allowed = new Set<string>(HOST_FIELDS);
   return new Proxy(host, {
     get(target, key) {
@@ -37,7 +37,7 @@ export function hostContext(host: HerdrToolHost): ExtensionContext {
       if (!allowed.has(key)) throw new HostCapabilityError(`MCP host does not provide ${key}`);
       return target[key as keyof HerdrToolHost];
     }
-  }) as unknown as ExtensionContext;
+  }) as unknown as ExtensionToolContext;
 }
 
 export type StartupRefusalReason = "HERDR_ENV" | "INJECTED_CONTEXT" | "PROJECT_DIR";
@@ -83,7 +83,7 @@ export function safeDirectory(value: string | undefined): string | undefined {
  * The project directory is host-agnostic: an explicit `HERDR_PROJECT_DIR`
  * wins, and when it is unset the server's own launch directory anchors the
  * session, which is the directory every observed MCP host (Claude Code,
- * Devin, pi-mcp-adapter) already spawns stdio servers from. An explicit value
+ * Devin, pi's native MCP support) already spawns stdio servers from. An explicit value
  * that fails validation refuses startup rather than silently re-anchoring to
  * the launch directory, and a launch directory of a filesystem root is not a
  * project anchor.

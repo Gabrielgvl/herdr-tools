@@ -169,7 +169,7 @@ function specProbabilities(): Record<string, unknown> {
     intent: { value: "implement", confidence: 0.9, probabilities: { explore: 0.01, reason: 0.01, implement: 0.94, debug: 0.01, verify: 0.01, review: 0.01, coordinate: 0.01 } },
     tier: { value: "standard", confidence: 0.6, probabilities: { utility: 0.02, economy: 0.18, standard: 0.6, strong: 0.15, frontier: 0.04, max: 0.01 } },
     modifiers: { mutation_broad: { probability: 0.8, applied: true, confidence: 0.8 } },
-    resources: { pi: { tools: { read: 0.9, executor_execute: 0.5 } } },
+    resources: { pi: { tools: { read: 0.9, mcp__executor__execute: 0.5 } } },
     fitness: { "0": { utility: 0.9, economy: 0.9, standard: 0.9, strong: 0.9, frontier: 0.9, max: 0.9 } },
     uncertainDimensions: [],
   };
@@ -635,7 +635,7 @@ describe("appendRouterDecision projections", () => {
 
   it("persists allowlisted resource exclusions in result and entry evidence", async () => {
     const root = await tempdir();
-    const exclusions = [{ field: "tools" as const, name: "executor_execute", noul: 0.5 }];
+    const exclusions = [{ field: "tools" as const, name: "mcp__executor__execute", noul: 0.5 }];
     const withExclusions = { ...evidence(), exclusions };
     await appendRouterDecision(entry({ evidence: withExclusions, result: admitted({ evidence: withExclusions }) }), { root });
     const record = (await readRecords(routerLogPaths(root).decisions))[0]!;

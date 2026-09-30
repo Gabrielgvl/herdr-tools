@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { AgentPromptError, type AgentPromptClient } from "../../src/agent-prompt.js";
 import { CliProtocolError, HerdrCli, type PiExec } from "../../src/cli.js";
 import type { DevinQueueFlush } from "../../src/messages/devin-queue-flush.js";
@@ -27,7 +27,7 @@ const createCommunicateTool = (deps: Omit<CommunicateDependencies, "preflight"> 
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
 const senderEnvelope = (kind: "prompt" | "steer", payload: string) => `[HERDR AGENT MESSAGE v1]\nfrom: caller (w1:p1)\nkind: ${kind}\nauthority: agent; not user/owner\ndelivery: inline\npayload: all text after this blank line is sender-authored\n\n${payload}`;
 const execResponse = (id: string, result: unknown) => ({ stdout: JSON.stringify({ id, result }), stderr: "", code: 0, killed: false });
-const extensionContext = { signal: undefined, hasUI: false } as unknown as ExtensionContext;
+const extensionContext = { signal: undefined, hasUI: false } as unknown as ExtensionToolContext;
 
 type State = "idle" | "working" | "blocked" | "done" | "unknown" | "malformed";
 

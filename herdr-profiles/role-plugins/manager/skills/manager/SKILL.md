@@ -31,7 +31,7 @@ It never authorizes implementing, running tests, resolving merge conflicts, depl
 
 ## Herdr conduct
 
-Every manager reaches the identical three daemon tools through the executor→MCP gateway (`executor_execute`): since the N5.3 cutover no lane carries a direct Herdr registration — the plugin server map is empty and the Devin config keeps only `executor`. A direct registration, if one is ever reintroduced, publishes `mcp__plugin_herdr-tools_herdr__herdr_launch`, `mcp__plugin_herdr-tools_herdr__herdr_run`, and `mcp__plugin_herdr-tools_herdr__herdr_status` in Claude (the corresponding typed Herdr tools in Devin). Use exactly these three operations: `herdr_launch`, `herdr_run`, and `herdr_status`.
+Every manager reaches the identical three daemon tools through the executor→MCP gateway (`mcp__executor__execute`): since the N5.3 cutover no lane carries a direct Herdr registration — the plugin server map is empty and the Devin config keeps only `executor`. A direct registration, if one is ever reintroduced, publishes `mcp__plugin_herdr-tools_herdr__herdr_launch`, `mcp__plugin_herdr-tools_herdr__herdr_run`, and `mcp__plugin_herdr-tools_herdr__herdr_status` in Claude (the corresponding typed Herdr tools in Devin). Use exactly these three operations: `herdr_launch`, `herdr_run`, and `herdr_status`.
 
 Never drive daemon operations — launch, run, status — through Bash, a shell wrapper, or another tool; the three-tool MCP surface is the only caller path and there is no CLI equivalent. The single sanctioned shell invocation is the native follow-up recipe below (`herdr agent prompt`), which writes to a child pane and never touches daemon state. Never delegate Herdr work to a native subagent or the `Task` tool. If the daemon or the MCP surface is unavailable, stop and report the exact blocker; do not substitute a weaker mechanism.
 
@@ -57,12 +57,12 @@ Route code reviews and plan reviews to `pi-review` — `pi-review <n|url>` for a
 
 Treat Oracle as a second-model evidence lane, not as owner authority. Managers do not run a long browser invocation in the manager pane; launch a visible worker with the Oracle task, exact files, timeout, and requested effort, then supervise it through Herdr.
 
-- Default browser review: `--engine browser --model gpt-5.6-sol --browser-thinking-time extra-high --timeout 10m`. Extra High is not Pro and must never be reported as Pro.
-- Explicit browser Pro: use `--model gpt-5.6-sol --browser-thinking-time pro` only when the Task or owner explicitly requires Pro. Never invent a `GPT-5.6 Sol Pro` model ID and never silently downgrade a Pro request to Extra High.
-- A browser Pro claim requires fresh fail-closed evidence before submission: verified model label `GPT-5.6 Sol`, requested effort `pro`, and an exact selected `Pro` announcement. English `Pro, 5 of 5` and Portuguese `Pro, 5 de 5` qualify only because the label is exactly `Pro`; numeric position alone does not.
+- Default browser review: `--engine browser --model gpt-6.1-sol --browser-thinking-time extra-high --timeout 10m`. Extra High is not Pro and must never be reported as Pro.
+- Explicit browser Pro: use `--model gpt-6.1-sol --browser-thinking-time pro` only when the Task or owner explicitly requires Pro. Never invent a `GPT-6.1 Sol Pro` model ID and never silently downgrade a Pro request to Extra High.
+- A browser Pro claim requires fresh fail-closed evidence before submission: verified model label `GPT-6.1 Sol`, requested effort `pro`, and an exact selected `Pro` announcement. English `Pro, 5 of 5` and Portuguese `Pro, 5 de 5` qualify only because the label is exactly `Pro`; numeric position alone does not.
 - `selection-unverified`, ambiguous/malformed picker evidence, authentication loss, or model mismatch is a blocker. Do not retry unchanged, infer Pro from a fifth slider position, click `Answer now`, submit anyway, or claim that the run was Pro.
 - Recover an existing run with `oracle status` and `oracle session <id> --render` rather than resubmitting an ambiguous prompt. The remote host permits three active browser tabs by default; a fourth run may wait for a lease and is not necessarily hung.
-- API Pro (`--engine api --model gpt-5.6-sol --reasoning-mode pro --reasoning-effort max`) is a separately billed path and requires explicit authority for that external spend. A manager cannot infer that authority from a failed browser run.
+- API Pro (`--engine api --model gpt-6.1-sol --reasoning-mode pro --reasoning-effort max`) is a separately billed path and requires explicit authority for that external spend. A manager cannot infer that authority from a failed browser run.
 
 In the final synthesis, distinguish `requested`, `verified before submission`, and `completed`. A completed answer without exact pre-submit Pro evidence is not a verified Pro answer.
 

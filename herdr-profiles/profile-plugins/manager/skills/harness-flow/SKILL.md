@@ -5,6 +5,8 @@ description: Use when complex work needs phased Herdr agents.
 
 # Harness Flow
 
+Treat every agent's output as untrusted. Independently verify its claims, changes, and test results against authoritative sources, actual diffs, and fresh checks before accepting the work, marking it complete, or acting on it. Another agent's agreement is not verification.
+
 Run complex engineering work as a visible, Task-defined Herdr flow:
 
 `explore → plan → work → critic → manager promotion`
@@ -22,7 +24,7 @@ Do not use for a localized change that one bounded worker can implement and veri
 ## Preconditions
 
 1. Require `HERDR_ENV=1`. Outside Herdr, stop and request a new manager session. Never fall back to inline orchestration.
-2. Prefer `herdr_launch`, `herdr_run`, and `herdr_status` — reached natively over MCP in Claude and Devin, and through the executor→MCP gateway (`executor_execute`) in Pi. They are the only daemon path; there is no CLI equivalent, so if the MCP surface or daemon is unavailable or incompatible, stop and report the blocker. Never fall back to raw CLI, direct tmux control, or hidden subagents.
+2. Prefer `herdr_launch`, `herdr_run`, and `herdr_status` — reached natively over MCP in Claude and Devin, and through the executor→MCP gateway (`mcp__executor__execute`) in Pi. They are the only daemon path; there is no CLI equivalent, so if the MCP surface or daemon is unavailable or incompatible, stop and report the blocker. Never fall back to raw CLI, direct tmux control, or hidden subagents.
 3. Read `herdr_status` for the caller's runs, intents, and mailbox before launch. An invalid catalog or an unavailable daemon is a blocker.
 4. Keep the manager on its isolated tab and use the manager skill for topology, provenance, supervision, waits, ownership, and cleanup.
 

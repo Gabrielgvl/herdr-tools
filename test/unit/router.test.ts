@@ -27,7 +27,7 @@ function runner(kind: RunnerKind, models: string[]): RunnerEntry {
     quota: { provider: `${kind}-provider`, billingProduct: kind, account: "primary", scope: "account" },
     defaults,
     plumbing,
-    pools: { tools: kind === "pi" ? ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume", "extra"] : kind === "claude" ? ["Read", "Bash", "Write", "Extra"] : [], extensions: [], skills: [], plugins: [], mcp: [] },
+    pools: { tools: kind === "pi" ? ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume", "mcp__hindsight__hindsight_sync_status", "mcp__hindsight__hindsight_diagnose", "mcp__hindsight__hindsight_search_knowledge_pages", "mcp__hindsight__hindsight_list_knowledge_pages", "mcp__hindsight__hindsight_read_knowledge_page", "mcp__hindsight__hindsight_reflect", "mcp__hindsight__hindsight_capture_initiative", "mcp__hindsight__hindsight_ingest_document", "extra"] : kind === "claude" ? ["Read", "Bash", "Write", "Extra"] : [], extensions: [], skills: [], plugins: [], mcp: [] },
   };
 }
 
@@ -137,7 +137,7 @@ describe("tier-chain routing", () => {
       selectedPoint: { id: "pi:s:low", index: 0 },
       evidence: { policyRevision: POLICY_REVISION, intent: { value: "implement" } },
     });
-    expect(seen).toEqual([{ tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] }]);
+    expect(seen).toEqual([{ tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume", "mcp__hindsight__hindsight_sync_status", "mcp__hindsight__hindsight_diagnose", "mcp__hindsight__hindsight_search_knowledge_pages", "mcp__hindsight__hindsight_list_knowledge_pages", "mcp__hindsight__hindsight_read_knowledge_page", "mcp__hindsight__hindsight_reflect", "mcp__hindsight__hindsight_capture_initiative", "mcp__hindsight__hindsight_ingest_document"] }]);
   });
 
   it("deduplicates operating points repeated across tier segments", async () => {
@@ -254,14 +254,14 @@ describe("tier-chain routing", () => {
     await expect(routeTask(input({ compile: async () => { throw new Error("bad"); } }))).resolves.toMatchObject({ kind: "abstained", reason: "catalog_unavailable", component: "configuration" });
   });
 
-  it("pins pi lanes to the five natives plus the executor trio, filtered by the reviewed pool", () => {
-    expect(runnerResourceSelection(response(), "pi")).toEqual({ tools: ["read", "bash", "edit", "write", "ask_user_question", "executor_execute", "executor_skills", "executor_resume"] });
-    expect(runnerResourceSelection(response(), "claude")).toEqual({ tools: ["Read", "Bash", "Write"] });
+  it("pins pi lanes to native MCP tool names, filtered by the reviewed pool", () => {
+    expect(runnerResourceSelection(response(), "pi")).toEqual({ tools: ["read", "bash", "edit", "write", "ask_user_question", "mcp__executor__execute", "mcp__executor__skills", "mcp__executor__resume", "mcp__hindsight__hindsight_sync_status", "mcp__hindsight__hindsight_diagnose", "mcp__hindsight__hindsight_search_knowledge_pages", "mcp__hindsight__hindsight_list_knowledge_pages", "mcp__hindsight__hindsight_read_knowledge_page", "mcp__hindsight__hindsight_reflect", "mcp__hindsight__hindsight_capture_initiative", "mcp__hindsight__hindsight_ingest_document"] });
+    expect(runnerResourceSelection(response(), "claude")).toEqual({ tools: ["Read", "Bash", "Write"], mcp: ["executor", "hindsight"] });
     expect(runnerResourceSelection(response(), "agy")).toEqual({});
     // A pool that does not carry the gateway recipe degrades to the natives alone.
     const sparse = runner("pi", ["x"]);
-    sparse.pools = { ...sparse.pools, tools: ["read", "executor_execute"] };
-    expect(runnerResourceSelection(response(), "pi", sparse)).toEqual({ tools: ["read", "executor_execute"] });
+    sparse.pools = { ...sparse.pools, tools: ["read", "mcp__executor__execute"] };
+    expect(runnerResourceSelection(response(), "pi", sparse)).toEqual({ tools: ["read", "mcp__executor__execute"] });
   });
 
   it("handles empty recovery candidates, degraded candidates, root/clock options, and default replica count", async () => {

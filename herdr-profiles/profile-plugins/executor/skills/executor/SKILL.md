@@ -3,11 +3,11 @@ name: executor
 description: "Use before calling Executor or any configured MCP integration through the Executor gateway."
 ---
 
-Treat Executor as the MCP gateway. Configured integrations are not limited to direct namespaces exposed by the host; discover and call them through the host's Executor tools.
+Treat Executor as the gateway for external services. Hindsight is the exception: use its direct project-scoped MCP tools, never an Executor memory integration. Configured service integrations are not limited to direct namespaces exposed by the host; discover and call them through the host's Executor tools.
 
 Tool names depend on the host:
 
-- Pi: `executor_execute`, `executor_skills`, and `executor_resume`
+- Pi: `mcp__executor__execute`, `mcp__executor__skills`, and `mcp__executor__resume`
 - Claude profile plugin: `mcp__plugin_herdr-executor_executor__execute`, `mcp__plugin_herdr-executor_executor__skills`, and `mcp__plugin_herdr-executor_executor__resume`
 
 When the instructions below name a Pi tool, use the corresponding Claude plugin tool in Claude.
@@ -25,7 +25,7 @@ If no matching skill exists, use the Executor tool description and the normal pr
 
 ## Discover
 
-Call `executor_skills` with `{ name: "execute" }` before writing Executor code. Inside `executor_execute`, use the lazy `tools` proxy:
+Call `mcp__executor__skills` with `{ name: "execute" }` before writing Executor code. Inside `mcp__executor__execute`, use the lazy `tools` proxy:
 
 ```ts
 const { items, total, hasMore } = await tools.search({
@@ -69,7 +69,7 @@ This returns saved connections and health status without credential values. Use 
 - For large collections, filter and summarize in the Executor runtime before returning results.
 - Check the `{ ok, data, error }` result union and return bounded output.
 - For files, emit `ToolFile` or MCP content with `emit(...)`; do not decode base64 manually.
-- If execution returns a resume payload, continue with `executor_resume` using that payload.
+- If execution returns a resume payload, continue with `mcp__executor__resume` using that payload.
 - Mutating actions still require normal user authorization and project-specific gates; Executor availability is not permission to act.
 
 When the required integration is absent or unhealthy, report the exact integration/tool and use the narrowest approved fallback rather than guessing.

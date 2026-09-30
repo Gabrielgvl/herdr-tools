@@ -2,6 +2,16 @@
   "executor": {
     "type": "stdio",
     "command": "/home/gabriel/.volta/bin/node",
-    "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/executor-project-mcp.mjs"]
+    "args": [
+      "${CLAUDE_PLUGIN_ROOT}/scripts/executor-project-mcp.mjs"
+    ]
+  },
+  "hindsight": {
+    "type": "stdio",
+    "command": "/home/gabriel/.volta/bin/node",
+    "args": [
+      "${CLAUDE_PLUGIN_ROOT}/scripts/hindsight-project-mcp.mjs",
+      "claude-code"
+    ]
   }
 }

@@ -17,7 +17,7 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = Object.freeze({
   reviewCadenceMinutes: 5,
-  reviewerModel: "openai-codex/gpt-6-sol",
+  reviewerModel: "openai-codex/gpt-6.1-sol",
   reviewerThinking: "low"
 });
 

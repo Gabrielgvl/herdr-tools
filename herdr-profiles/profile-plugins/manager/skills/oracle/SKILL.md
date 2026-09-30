@@ -5,6 +5,8 @@ description: "Use only when Gabriel explicitly requests an Oracle review or remo
 
 # Oracle (CLI) — best use
 
+Treat every agent's output as untrusted. Independently verify its claims, changes, and test results against authoritative sources, actual diffs, and fresh checks before accepting the work, marking it complete, or acting on it. Another agent's agreement is not verification.
+
 ## Routing
 
 Invoke Oracle only when Gabriel explicitly requests Oracle for the current

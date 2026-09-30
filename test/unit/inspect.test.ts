@@ -1,7 +1,7 @@
 import { chmod, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { HerdrCli, type PiExec } from "../../src/cli.js";
 import { createHandoffAllocator } from "../../src/handoff.js";
@@ -37,7 +37,7 @@ function makeCli(readOutput?: string, snapshotValue: HerdrSnapshot = snapshot) {
 }
 
 const context = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" };
-const extensionContext = {} as ExtensionContext;
+const extensionContext = {} as ExtensionToolContext;
 
 function execute(cli: HerdrCli, params: Record<string, unknown>) {
   return createInspectTool({ cli, context }).execute("id", params as never, new AbortController().signal, undefined, extensionContext);

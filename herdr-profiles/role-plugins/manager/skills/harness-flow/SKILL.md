@@ -76,7 +76,7 @@ Separate facts from hypotheses. Every causal or quantitative claim in the plan i
 
 Check the release path before work starts. State how production would be hotfixed while the flow is in progress: which branch a hotfix deploys from, and which merged flow work would ride along with it. If an emergency deploy would carry unproven flow changes, get the owner's merge-timing decision before any merge.
 
-Persist the DAG with hflow for parallel or multi-flow runs. Write each flow's `plan.json` through `hflow apply` (see the `hflow` skill), stamp `pane_id` from each launch, update node states as results are verified, and serve the dashboard to the owner. A markdown DAG is enough only for a single, sequential flow.
+Persist the DAG with hflow for parallel or multi-flow runs. Write each flow's `plan.json` through `hflow apply` (see the `hflow` skill), stamp `pane_id` from each launch, update node states as results are verified, and serve the dashboard to the owner. A markdown DAG is enough only for a single, sequential flow. When the flow belongs to an initiative the owner tracks as one thing, add each flow, PR, and scout to the initiative's member list as you start it, and launch an `audit` Task at every phase change of a member flow, with one running and at most one queued per initiative (see the `hflow` skill, *Initiative audits*).
 
 Include required documentation, changelog, artifact-path setup, and delivery files in the DAG. Work Tasks may not leave those for promotion.
 

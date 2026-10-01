@@ -31,4 +31,4 @@ jobs:
       # The skill-bundle suite needs external canonical trees absent from CI.
       - run: |
           umask 000
-          npx vitest run --exclude 'test/unit/skill-bundles.test.ts'
+          npx vitest run --coverage --exclude 'test/unit/skill-bundles.test.ts'

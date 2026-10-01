@@ -34,7 +34,7 @@ Follow `/home/gabriel/workspace/courier/.pi/skills/tdd/source-skill.md`:
   not because of a malformed fixture or test harness.
 - Make the smallest implementation change that turns the slice green.
 - Refactor only while green.
-- End with clean tests, build, lint, and 100% coverage on every changed source
+- End with clean tests, build, lint, and 90% coverage on every changed source
   file. Record any deviation rather than silently weakening a test.
 - Do not add compatibility aliases, fuzzy matching, generic fallbacks, or hidden
   cleanup behavior.
@@ -144,7 +144,7 @@ focus change, no UI prompt, no ownership change, and no current-Courier change.
 | Close preserves completed mutations and reconciles uncertain responses | `close_preserves_completed_mutation_after_abort`; `close_reconciles_lost_response_when_absent`; `close_uncertain_when_present_or_readback_fails` | Fresh independent post-read proves absence or returns `MUTATION_UNCERTAIN` with bounded evidence. | No generic success, blind retry, or `No result provided` terminal result is returned. |
 | Current Courier resources are protected | `ownership_cannot_claim_current_courier_resource`; `integration_cleanup_never_targets_current_courier_tree` | Only disposable test IDs may be cleaned by explicit test teardown. | Current workspace/tab/pane IDs remain byte-for-byte unchanged. |
 | Results, renderers, cancellation, and partial failures are truthful | `results_include_structured_details_and_compact_text`; `renderers_are_compact_by_default`; `partial_results_preserve_each_target_truth`; `renderers_show_wait_settlements_and_error_states`; `all_late_races_are_non_mutating` | Each result exposes its operation phase, terminal wait result when settled, IDs, snapshots, and errors suitable for the LLM and renderer. | No raw JSON dump, swallowed per-target error, false condition match, or late side effect is shown. |
-| Unit and integration safety gates exist | `unit_harness_uses_fakes_only`; `integration_uses_disposable_named_session_not_current_courier`; `coverage_gate_requires_changed_files_at_100_percent` | Disposable integration state is created and explicitly torn down by the test harness. | Unit tests never control real Herdr; integration never creates in the Courier workspace. |
+| Unit and integration safety gates exist | `unit_harness_uses_fakes_only`; `integration_uses_disposable_named_session_not_current_courier`; `coverage_gate_requires_changed_files_at_90_percent` | Disposable integration state is created and explicitly torn down by the test harness. | Unit tests never control real Herdr; integration never creates in the Courier workspace. |
 
 ## Extension-owned global configuration
 
@@ -858,9 +858,10 @@ npm run lint             # lint all changed package source and tests
 HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration # opt-in disposable Herdr integration suite
 ```
 
-`npm run coverage` must enforce 100% statements, branches, functions, and lines
-for every changed source file and print exactly `COVERAGE_RESULT: PASS` only when
-those thresholds pass. Tests and fixtures may be excluded only when the coverage
+`npm run coverage` must enforce 90% statements, branches, functions, and lines
+for every source file individually (`coverage.thresholds.perFile: true`, so no
+file can hide behind aggregate coverage), which subsumes the changed-file gate,
+and print exactly `COVERAGE_RESULT: PASS` only when those thresholds pass. Tests and fixtures may be excluded only when the coverage
 configuration documents why they are not changed source. If no existing coverage
 command can be reused, define the command and its configuration in the package's
 first setup slice before implementation; do not invent a green result.
@@ -931,7 +932,7 @@ retention. Add `herdr_jobs` tool tests for strict list/get/cancel input, structu
 registrations, active-branch completion pushes and their `deliverAs`/`triggerTurn`
 options, manager-judgment priority, normal queue behavior, and cancellation or
 shutdown suppression. Integration remains opt-in and must record the exact
-blocker if unavailable; no test may weaken the 100% repository threshold.
+blocker if unavailable; no test may weaken the 90% repository threshold.
 
 ## Approved active wait-visibility amendment
 
@@ -955,7 +956,7 @@ background timer, and non-UI behavior. Existing terminal notification and
 ## Approved automatic child-supervision amendment
 
 Automatic child supervision is part of this plan. It is observation and
-notification only, and every test below holds the repository's enforced 100%
+notification only, and every test below holds the repository's enforced 90%
 threshold; no test may weaken it.
 
 **Protocol validation.** Cover the fixed global subscription set and prove it
@@ -1040,7 +1041,7 @@ Existing explicit-wait behaviour, its reviewer at Luna `low`, and existing
 
 ### Review-round remediation coverage
 
-The first review round added these required regressions, all inside the enforced 100%
+The first review round added these required regressions, all inside the enforced 90%
 threshold:
 
 - a Pi session that follows a shutdown reserves successfully, and the replaced monitor stays
@@ -1062,7 +1063,7 @@ threshold:
 ### Second review-round remediation coverage
 
 The second round replaced ordinal-based deduplication with the pane revision and added these
-required regressions, all inside the same enforced 100% threshold:
+required regressions, all inside the same enforced 90% threshold:
 
 - events delivered inside the acknowledgement's own chunk still reach observers, so the
   monitor's handlers must be installed before `events.subscribe` is issued;

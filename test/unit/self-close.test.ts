@@ -192,6 +192,47 @@ describe("self-close tracker", () => {
     tracker.clear();
   });
 
+  it("fires pane-closed listeners on every proven absence and swallows their errors", () => {
+    const tracker = createSelfCloseTracker();
+    const seen: string[] = [];
+    const failing = vi.fn(() => {
+      throw new Error("cleanup broke");
+    });
+    tracker.onPaneClosed((paneId) => seen.push(paneId));
+    tracker.onPaneClosed(failing);
+    // The consume call itself proves the absence, even with nothing tracked.
+    expect(tracker.consume("p9")).toBe(false);
+    expect(seen).toEqual(["p9"]);
+    expect(failing).toHaveBeenCalledWith("p9");
+    // A readback-confirmed own-close proves the absence again.
+    tracker.begin("p2")(true);
+    expect(seen).toEqual(["p9", "p2"]);
+    // Claiming the confirmed marker is another proof, and the hook failure
+    // still could not corrupt the wake decision.
+    expect(tracker.consume("p2")).toBe(true);
+    expect(seen).toEqual(["p9", "p2", "p2"]);
+    tracker.clear();
+  });
+
+  it("stops notifying an unsubscribed listener and never adds one on a cleared tracker", () => {
+    const tracker = createSelfCloseTracker();
+    const seen: string[] = [];
+    const off = tracker.onPaneClosed((paneId) => seen.push(paneId));
+    tracker.begin("p2")(true);
+    expect(seen).toEqual(["p2"]);
+    off();
+    tracker.begin("p3")(true);
+    expect(seen).toEqual(["p2"]);
+    tracker.clear();
+    // A listener registered after retirement is never stored or fired, and its
+    // unsubscribe is a harmless no-op.
+    const late = vi.fn();
+    const unsubscribe = tracker.onPaneClosed(late);
+    tracker.consume("p4");
+    expect(late).not.toHaveBeenCalled();
+    unsubscribe();
+  });
+
   it("makes a double finish harmless", () => {
     const tracker = createSelfCloseTracker();
     const finish = tracker.begin("p2");

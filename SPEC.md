@@ -683,7 +683,7 @@ Before integration execution, the harness must verify the session name is dispos
 
 ## Testing strategy
 
-Testing is test-first. Tests are written before the corresponding implementation phase and must cover all changed files at 90% changed-file coverage, including branches for fail-closed behavior.
+Testing is test-first. Tests are written before the corresponding implementation phase and must cover all changed files at 90% changed-file coverage, including branches for fail-closed behavior. The coverage configuration enforces the 90% thresholds per file (`thresholds.perFile`), so a poorly covered file cannot hide behind the aggregate.
 
 ### Mocked unit tests
 
@@ -717,7 +717,7 @@ Use a uniquely named Herdr session created for the test run. Exercise the real i
 
 All of the following must pass before implementation is considered complete:
 
-- unit tests pass with 90% coverage for changed files;
+- unit tests pass with 90% coverage enforced per file (changed files included);
 - disposable named-session integration tests pass;
 - typecheck passes;
 - lint passes cleanly;
@@ -775,7 +775,7 @@ The feature is complete only when all of the following are true:
 - Pane and tab topology operations implement the specified defaults, labels, environment behavior, autonomous exact close, protected ancestors, bounded reconciliation, and authoritative post-state.
 - Results are structured and concise, custom rows are compact, and waits/launches stream progress.
 - Abort signals reach CLI and model work.
-- Mocked unit tests achieve 90% changed-file coverage; disposable named-session integration tests, build, lint, and typecheck are clean.
+- Mocked unit tests achieve 90% changed-file coverage under the per-file threshold gate; disposable named-session integration tests, build, lint, and typecheck are clean.
 - Settings are loaded only from the extension-owned `config.json`; an absent file uses the documented defaults, while malformed or invalid present settings fail closed with `INVALID_SETTINGS`, without coercion or fallback, and tool calls/project-local files cannot override them.
 - The extension directory is a standalone Git repository with no remote initially, and its initial commit contains the reviewed `SPEC.md` before implementation proceeds.
 - Only files under `herdr-tools` are introduced for this feature; `herdr-agent-state.ts` and `herdr-question-alert.ts` remain untouched.

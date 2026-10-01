@@ -859,8 +859,9 @@ HERDR_TOOLS_RUN_INTEGRATION=1 npm run test:integration # opt-in disposable Herdr
 ```
 
 `npm run coverage` must enforce 90% statements, branches, functions, and lines
-for every changed source file and print exactly `COVERAGE_RESULT: PASS` only when
-those thresholds pass. Tests and fixtures may be excluded only when the coverage
+for every source file individually (`coverage.thresholds.perFile: true`, so no
+file can hide behind aggregate coverage), which subsumes the changed-file gate,
+and print exactly `COVERAGE_RESULT: PASS` only when those thresholds pass. Tests and fixtures may be excluded only when the coverage
 configuration documents why they are not changed source. If no existing coverage
 command can be reused, define the command and its configuration in the package's
 first setup slice before implementation; do not invent a green result.

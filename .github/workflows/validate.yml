@@ -28,7 +28,7 @@ jobs:
           ln -s "$(command -v node)" /home/gabriel/.volta/tools/image/node/25.9.0/bin/node
       # Permission tests create world-writable fixtures with mkdir(mode: 0777).
       # The runner's umask otherwise makes those fixtures safe and hides the test.
-      # The skill-bundle suite needs external canonical trees absent from CI.
+      # CI skips the one skill-bundle test that reads external canonical trees.
       - run: |
           umask 000
-          npx vitest run --coverage --exclude 'test/unit/skill-bundles.test.ts'
+          npx vitest run --coverage

@@ -47,6 +47,14 @@ describe("DaemonLaunchRequestSchema", () => {
       idempotencyKey: "k",
     })).toBe(true);
   });
+
+  it("accepts the ADR-040 retention field exactly at retire|keep", () => {
+    expect(Value.Check(DaemonLaunchRequestSchema, { task: { ...task, retention: "retire" }, idempotencyKey: "k" })).toBe(true);
+    expect(Value.Check(DaemonLaunchRequestSchema, { task: { ...task, retention: "keep" }, idempotencyKey: "k" })).toBe(true);
+    for (const bad of ["park", "archive", "RETIRE", "", 1, true, null]) {
+      expect(Value.Check(DaemonLaunchRequestSchema, { task: { ...task, retention: bad }, idempotencyKey: "k" }), String(bad)).toBe(false);
+    }
+  });
 });
 
 describe("live launch surface (zero-impact guard)", () => {
@@ -55,6 +63,9 @@ describe("live launch surface (zero-impact guard)", () => {
     expect(Value.Check(LaunchTaskSchema, { ...task, idempotencyKey: "k" })).toBe(false);
     // The removed `replicas` field is now an undeclared key and rejects.
     expect(Value.Check(LaunchTaskSchema, { ...task, replicas: 1 })).toBe(false);
+    // The ADR-040 retention field is part of the task contract on both surfaces.
+    expect(Value.Check(LaunchTaskSchema, { ...task, retention: "keep" })).toBe(true);
+    expect(Value.Check(LaunchTaskSchema, { ...task, retention: "park" })).toBe(false);
     expect(PublishedLaunchParamsSchema).toBe(LaunchTaskSchema);
   });
 });

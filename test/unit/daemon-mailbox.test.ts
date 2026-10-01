@@ -738,8 +738,9 @@ describe("writer wiring seams", () => {
     await vi.waitFor(() => expect(captured).toHaveLength(1));
     expect(captured[0]).toMatchObject({ kind: "job_terminal", runId: "run-7", jobId: "job_1", handoff: { state: "awaiting_handoff" }, actions: ["released"] });
 
-    // A run already recorded `handed_off` emitted its durable outcome: the
-    // trailing supervisor settlement is bookkeeping and writes nothing.
+    // A handed_off run closed by anything other than the daemon retirer still
+    // emits its trailing settlement — only a proven daemon-retired lane (ADR-040)
+    // suppresses the redundant terminal event.
     const handedOff = registry.register({ ...supervisorRequest, label: "supervise handed-off" }, async () => ({ supervision_result: "released" }));
     registry.attachSupervision(handedOff.jobId, {
       view: stubView,
@@ -747,8 +748,25 @@ describe("writer wiring seams", () => {
       handoffEvidence: () => ({ gated: true, runId: "run-8", path: "/run", state: "handed_off" }),
     } as unknown as SupervisionJobPort);
     await handedOff.promise;
+    await vi.waitFor(() => expect(captured).toHaveLength(2));
+    expect(captured[1]).toMatchObject({ kind: "job_terminal", runId: "run-8", handoff: { state: "handed_off" } });
+
+    // A lane the retirer closed emits `lane_retired`, not a second terminal.
+    const retiring = new JobRegistry({
+      idFactory: () => `job_t${++jobSequence}`,
+      clock: { now: () => 1 },
+      eventWriter: writer,
+      laneRetired: (runId) => runId === "run-9",
+    });
+    const daemonRetired = retiring.register({ ...supervisorRequest, label: "supervise retired" }, async () => ({ supervision_result: "released" }));
+    retiring.attachSupervision(daemonRetired.jobId, {
+      view: stubView,
+      takePendingEvents: () => [],
+      handoffEvidence: () => ({ gated: true, runId: "run-9", path: "/run", state: "handed_off" }),
+    } as unknown as SupervisionJobPort);
+    await daemonRetired.promise;
     await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(captured).toHaveLength(1);
+    expect(captured).toHaveLength(2);
 
     // A supervisor job with no gated run resolves no destination.
     const none = registry.register({ ...supervisorRequest, label: "supervise ungated" }, async () => ({ supervision_result: "released" }));
@@ -772,7 +790,7 @@ describe("writer wiring seams", () => {
     const waitJob = registry.register(waitRequest, async () => ({ wait_result: "condition_met", matched: true }));
     await waitJob.promise;
     await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(captured).toHaveLength(1);
+    expect(captured).toHaveLength(2);
 
     // A rejecting writer is contained exactly like onTerminal: settlement is
     // untouched and nothing claims the event persisted.

@@ -40,8 +40,8 @@ import {
   type HandoffState,
 } from "../handoff.js";
 import type { JobRegistry, SupervisionWorkspaceRoot } from "../job-registry.js";
-import { optionalSessionCandidate, requirePromptTargetIdentity, type AgentSessionIdentity } from "../messages/prompt.js";
-import { snapshotIdentityRecords } from "../messages/prompt-target.js";
+import { requirePromptTargetIdentity, type AgentSessionIdentity } from "../messages/prompt.js";
+import { findSessionPane, snapshotIdentityRecords } from "../messages/prompt-target.js";
 import { modelSafeJson } from "../redaction.js";
 import type { SupervisedIdentity } from "../supervision/identity.js";
 import { reviewLogPaths } from "../supervision/review-log.js";
@@ -273,18 +273,8 @@ export interface MatchedRunBindDeps {
 function ownerDestination(provenance: HandoffProvenance, snapshot: HerdrSnapshot | undefined): { paneId: string; session: AgentSessionIdentity | null } {
   const session = currentHandoffOwner(provenance);
   if (session !== null && snapshot !== undefined) {
-    for (const pane of snapshot.panes) {
-      let candidate: AgentSessionIdentity | undefined;
-      try {
-        candidate = optionalSessionCandidate([pane, ...snapshot.agents.filter((agent) => agent.pane_id === pane.pane_id)]);
-      } catch {
-        // A pane whose records prove nothing is skipped, never counted.
-        continue;
-      }
-      if (candidate !== undefined && sameSession(candidate, session)) {
-        return { paneId: pane.pane_id, session };
-      }
-    }
+    const pane = findSessionPane(snapshot, session);
+    if (pane !== undefined) return { paneId: pane.pane_id, session };
   }
   return { paneId: provenance.manager.paneId, session };
 }

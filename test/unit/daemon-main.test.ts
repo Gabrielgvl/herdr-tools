@@ -445,6 +445,91 @@ describe("daemon shutdown order", () => {
     expect(order).toEqual(["flushHandoffs", "stopSupervisors"]);
   });
 
+  it("ticks the ADR-040 sweep on its own cadence, never concurrently, and drains an in-flight sweep before the shutdown steps", async () => {
+    const fx = await fixture();
+    const order: string[] = [];
+    let release: (() => void) | undefined;
+    let sweeps = 0;
+    const retire = {
+      sweep: () => {
+        sweeps += 1;
+        order.push("sweep");
+        return new Promise<void>((resolve) => { release = resolve; });
+      },
+    };
+    const seams: DaemonShutdownSeams = {
+      flushHandoffs: async () => void order.push("flushHandoffs"),
+      stopSupervisors: async () => void order.push("stopSupervisors"),
+    };
+    const daemon = await start(fx, { retire, retireSweepMs: 10, seams });
+    // The first tick is in flight and blocked; every tick behind it is skipped.
+    await vi.waitFor(() => expect(sweeps).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sweeps).toBe(1);
+
+    // Shutdown waits out the in-flight sweep before the §4 steps run.
+    const stopping = daemon.shutdown();
+    await vi.waitFor(() => expect(order).toEqual(["sweep"]));
+    release!();
+    await stopping;
+    expect(order).toEqual(["sweep", "flushHandoffs", "stopSupervisors"]);
+    // No tick lands after the interval cleared: the count is fixed.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sweeps).toBe(1);
+  });
+
+  it("journals a failing retire sweep, keeps ticking, and stays up", async () => {
+    const fx = await fixture();
+    let sweeps = 0;
+    const failures: unknown[] = [
+      "plain failure",
+      null,
+      Object.assign(new Error("bad code"), { code: 7 }),
+      Object.assign(new Error("io"), { code: "LANE_SWEEP_IO" }),
+    ];
+    const retire = {
+      sweep: async () => {
+        sweeps += 1;
+        const failure = failures.shift();
+        if (failure !== undefined) throw failure;
+      },
+    };
+    const daemon = await start(fx, { retire, retireSweepMs: 5 });
+    // Every failure shape is journaled and swallowed; the cadence survives.
+    await vi.waitFor(() => expect(sweeps).toBeGreaterThanOrEqual(5));
+    await daemon.shutdown();
+  });
+
+  it("uses the default retire cadence when retireSweepMs is unset", async () => {
+    const fx = await fixture();
+    let sweeps = 0;
+    const daemon = await start(fx, { retire: { sweep: async () => { sweeps += 1; } } });
+    await untilBound(fx);
+    await daemon.shutdown();
+    // The 60 s default never lands inside a test's lifetime.
+    expect(sweeps).toBe(0);
+  });
+
+  it("continues startup rollback when a rollback step itself fails", async () => {
+    const fx = await fixture();
+    const seams: DaemonShutdownSeams = {
+      flushHandoffs: async () => { throw new Error("flush refused"); },
+      stopSupervisors: async () => Promise.reject("plain failure"),
+    };
+    await expect(startDaemon({ env: fx.env, seams, reattach: async () => { throw new Error("sweep exploded"); } }))
+      .rejects.toThrow("sweep exploded");
+  });
+
+  it("feeds the prior record's heartbeat into the restart sweep", async () => {
+    const fx = await fixture();
+    const first = await start(fx);
+    await untilBound(fx);
+    await first.shutdown();
+    let seen: string | undefined;
+    await start(fx, { reattach: async ({ lastHeartbeat }) => { seen = lastHeartbeat; } });
+    expect(typeof seen).toBe("string");
+  });
+
   it("completes every shutdown step when a seam fails, then rejects with its error", async () => {
     const fx = await fixture();
     const order: string[] = [];

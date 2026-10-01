@@ -27,7 +27,7 @@ import { RuntimeOwnership } from "../ownership.js";
 import { createPaneWriteGuard, resolvePaneWriteNamespace } from "../pane-write-lock.js";
 import { loadSettings, type Settings } from "../settings.js";
 import { createCliTranscriptReader, SupervisionRegistry } from "../supervision/registry.js";
-import type { SelfCloseTracker } from "../supervision/self-close.js";
+import { createSelfCloseTracker, type SelfCloseTracker } from "../supervision/self-close.js";
 import type { ManagerNotifier } from "../supervision/notify.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../targets.js";
 import type { LaunchDependencies } from "../tools/launch.js";
@@ -39,6 +39,7 @@ import { createIntentStore, managerSessionKey, type IntentStore } from "./intent
 import { createOwnership } from "./ownership.js";
 import type { Mailbox, MailboxEventWriter } from "./mailbox.js";
 import type { DaemonNamespace } from "./namespace.js";
+import type { LaneRetirer } from "./retire.js";
 import { DaemonRequestError } from "./protocol.js";
 import type { DaemonRequestHandler } from "./server.js";
 
@@ -175,6 +176,20 @@ export interface DaemonRuntime extends SharedRuntime {
    * op below resolves the bound instance at call time.
    */
   bindMailbox(mailbox: Mailbox): void;
+  /**
+   * The host's own-close ledger — shared between every reserved supervisor
+   * and the ADR-040 lane retirer, so a daemon-owned close correlates with the
+   * supervisor's `pane_closed` wake exactly like a manager-requested one.
+   */
+  readonly selfClose: SelfCloseTracker;
+  /**
+   * The bound lane retirer, once `bindRetirer` runs — `undefined` before.
+   * `handleDaemonStatus` reads its projection; `JobRegistry` consults its
+   * `retiredByDaemon` marker before suppressing a `handed_off` terminal.
+   */
+  readonly retirer: LaneRetirer | undefined;
+  /** Bind the daemon's lane retirer; its marker feeds the JobRegistry seam. */
+  bindRetirer(retirer: LaneRetirer): void;
   /** The daemon's bounded structured diagnostic sink, when the host supplied one. */
   readonly log?: (line: string) => void;
   /** The §8 ownership journal surface: pending transfers, transfer/claim, retarget. */
@@ -193,7 +208,7 @@ export interface DaemonRuntime extends SharedRuntime {
 }
 
 export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
-  const bound: { mailbox?: Mailbox } = { mailbox: deps.mailbox };
+  const bound: { mailbox?: Mailbox; retirer?: LaneRetirer } = { mailbox: deps.mailbox };
   // The daemon's mailbox exists only once `startDaemon` has created its
   // serialized `daemon.json` queue; every op resolves the bound instance at
   // call time so a pre-bind call refuses rather than opening a second,
@@ -219,6 +234,10 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
   // satisfies definite assignment.
   /* c8 ignore next */
   let hints: IdleHintSink = () => undefined;
+  // The daemon always carries an own-close ledger: supervisors consult it for
+  // `pane_closed` wakes and the lane retirer marks its proven closes through
+  // the same instance, so a host that wires none still correlates correctly.
+  let selfClose: SelfCloseTracker = createSelfCloseTracker();
   const shared = createSharedRuntime({
     ...deps,
     wire: (parts) => {
@@ -232,7 +251,18 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
         qualifiedKinds: deps.hintKinds,
         ...(deps.log === undefined ? {} : { log: deps.log }),
       });
-      return { ...host, jobs: host.jobs ?? new JobRegistry({ eventWriter: deferredEventWriter }), hints };
+      if (host.selfClose !== undefined) selfClose = host.selfClose;
+      return {
+        ...host,
+        selfClose,
+        jobs: host.jobs ?? new JobRegistry({
+          eventWriter: deferredEventWriter,
+          // ADR-040: only a run the bound retirer provably closed skips the
+          // trailing `job_terminal`; an unbound retirer marks nothing.
+          laneRetired: (runId) => bound.retirer?.retiredByDaemon(runId) === true,
+        }),
+        hints,
+      };
     },
   });
   const intents = deps.intents ?? createIntentStore({ namespace: deps.namespace, ...(deps.log === undefined ? {} : { log: deps.log }) });
@@ -260,6 +290,13 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     },
     bindMailbox: (next) => {
       bound.mailbox = next;
+    },
+    selfClose,
+    get retirer() {
+      return bound.retirer;
+    },
+    bindRetirer: (next) => {
+      bound.retirer = next;
     },
     ...(deps.log === undefined ? {} : { log: deps.log }),
     daemonOwnership: ownership,

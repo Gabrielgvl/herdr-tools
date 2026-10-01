@@ -1451,6 +1451,38 @@ describe("daemon status handler", () => {
     expect(status.runs.find((run) => run.runId === runPaused)?.review).toBe("paused");
   });
 
+  it("projects the bound retirer's view onto its tracked runs only", async () => {
+    const fx = await harness();
+    const allocation = await boundRun(fx, { terminalId: "t-retired" });
+    const begun = await fx.intents.begin({ managerSessionKey: managerKey, idempotencyKey: "idem-1", task, projectRoot: fx.projectRoot });
+    if (begun.kind !== "launch") throw new Error("expected launch");
+    const effecting = await fx.intents.markEffecting(begun.intent);
+    const ghost = "11111111-2222-3333-4444-555555555555";
+    await fx.intents.recordChildren(effecting, [
+      { name: "task-aa-1", runId: allocation.runId },
+      { name: "c-ghost", runId: ghost },
+    ]);
+    await fx.intents.complete(effecting, [{ name: "task-aa-1", runId: allocation.runId, disposition: "bound" }]);
+
+    // No retirer bound: the projection is absent rather than fabricated.
+    let status = await handleDaemonStatus(fx.runtime, runParams());
+    expect(status.runs.find((run) => run.runId === allocation.runId)?.retire).toBeUndefined();
+
+    const view = { state: "watching" as const, stableForMs: 5_000, at: "2026-10-01T00:00:00.000Z" };
+    fx.runtime.bindRetirer({
+      sweep: async () => undefined,
+      view: (runId) => (runId === allocation.runId || runId === ghost ? view : undefined),
+      retiredByDaemon: () => false,
+    });
+    status = await handleDaemonStatus(fx.runtime, runParams());
+    expect(status.runs.find((run) => run.runId === allocation.runId)?.retire).toEqual(view);
+    // The ghost has no readable sidecar — the `unavailable` stub still carries
+    // the recorded view.
+    const ghostRun = status.runs.find((run) => run.runId === ghost);
+    expect(ghostRun?.lifecycle).toBe("unavailable");
+    expect(ghostRun?.retire).toEqual(view);
+  });
+
   it("F4: a transferred run projects to its v2 current owner — the successor sees it, the recording owner does not", async () => {
     const successorSession: AgentSessionIdentity = { source: "herdr:pi", agent: "pi", kind: "id", value: "succ-session" };
     const fx = await harness({

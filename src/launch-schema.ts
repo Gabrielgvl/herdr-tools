@@ -28,6 +28,10 @@ const TaskItem = Type.String({ minLength: 1, pattern: "^[^\\u0000]*$" });
  * routing, Jev state, Task revision, machine identity, pane naming, tab
  * selection, or target resolution. `cwd` is any accessible directory,
  * canonicalized by the runtime before effects.
+ * `retention` is the ADR-040 lane-retirement opt-out: omitted means the
+ * daemon may close the finished lane's pane after its stability grace;
+ * `keep` parks the lane forever. It never enters routing, Jev evidence, or
+ * the rendered contract.
  * Unknown fields fail validation.
  */
 export const LaunchTaskSchema = Type.Object({
@@ -49,7 +53,11 @@ export const LaunchTaskSchema = Type.Object({
   })),
   recoveryOf: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$", description: "Managed handoff run UUID from the failed child's Herdr supervision receipt, not a child target or launch ID. Recovery forbids cwd; close the failed child first." })),
   label: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\u0000\\r\\n]+$", maxByteLength: 256, description: "Display-only metadata; never enters routing contracts, pane identity, or decision evidence. Bounded at 256 UTF-8 bytes." })),
-  cwd: Type.Optional(Identifier)
+  cwd: Type.Optional(Identifier),
+  retention: Type.Optional(StringEnum(["retire", "keep"] as const, {
+    default: "retire",
+    description: "Lane-retirement policy after the managed handoff is accepted (ADR-040). Omitted or 'retire': the daemon closes the finished lane's pane once it stays idle past the retire grace. 'keep': the lane is never retired — use it for a lane you plan to keep driving with follow-ups."
+  }))
 }, { additionalProperties: false });
 
 /**

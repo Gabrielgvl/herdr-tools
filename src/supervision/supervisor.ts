@@ -10,7 +10,8 @@
  */
 
 import { ReviewerFailure, type ReviewClassification } from "../reviewer.js";
-import { optionalSessionCandidate, type AgentSessionIdentity } from "../messages/prompt.js";
+import { type AgentSessionIdentity } from "../messages/prompt.js";
+import { findSessionPane } from "../messages/prompt-target.js";
 import { renderHandoffContract, type HandoffAllocation } from "../handoff.js";
 import { handoffGateMatches, type HandoffGate, type HandoffInspection, type HandoffRun, type HandoffValidation } from "../handoff-gate.js";
 import type { IdleHintSink } from "../daemon/hints.js";
@@ -1505,21 +1506,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     const owner = this.owner;
     if (owner === undefined) return true;
     if (owner.session === null) return snapshot.panes.some((pane) => pane.pane_id === owner.paneId);
-    const session = owner.session;
-    for (const pane of snapshot.panes) {
-      let candidate: AgentSessionIdentity | undefined;
-      try {
-        candidate = optionalSessionCandidate([pane, ...snapshot.agents.filter((agent) => agent.pane_id === pane.pane_id)]);
-      } catch {
-        continue;
-      }
-      if (candidate !== undefined
-        && candidate.source === session.source
-        && candidate.agent === session.agent
-        && candidate.kind === session.kind
-        && candidate.value === session.value) return true;
-    }
-    return false;
+    return findSessionPane(snapshot, owner.session) !== undefined;
   }
 
   /** Recompute the D5 pause flag from one authoritative snapshot; no owner recorded means never paused. */

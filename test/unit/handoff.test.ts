@@ -575,6 +575,17 @@ describe("provenance record", () => {
     expect((await readHandoffProvenance(untieredRun)).task).not.toHaveProperty("tier");
   });
 
+  it("round-trips the ADR-040 retention field, omitted meaning retire", async () => {
+    const dir = await root();
+    const allocator = allocatorFor(dir);
+    const kept = await allocator.allocate();
+    await allocator.persist(kept, provenanceIdentity, { managerSession: null, task: { ...taskContract, retention: "keep" } });
+    expect((await readHandoffProvenance(kept)).task.retention).toBe("keep");
+    const plain = await allocator.allocate();
+    await allocator.persist(plain, provenanceIdentity, { managerSession: null, task: taskContract });
+    expect((await readHandoffProvenance(plain)).task).not.toHaveProperty("retention");
+  });
+
   it("refuses malformed provenance input before the run directory exists", async () => {
     const dir = await root();
     const allocator = allocatorFor(dir);
@@ -592,6 +603,8 @@ describe("provenance record", () => {
       { managerSession, task: { ...taskContract, cwd: "a\nb" } },
       { managerSession, task: { ...taskContract, objective: "" } },
       { managerSession, task: { ...taskContract, objective: "has\0nul" } },
+      { managerSession, task: { ...taskContract, retention: "park" as never } },
+      { managerSession, task: { ...taskContract, retention: 1 as never } },
     ];
     for (const [index, input] of badInputs.entries()) {
       const attempt = await allocator.allocate();
@@ -702,6 +715,7 @@ describe("provenance record", () => {
       (doc) => { doc.task = { ...originalTask, doneWhen: [] }; },
       (doc) => { doc.task = { ...originalTask, recoveryOf: "not-a-run" }; },
       (doc) => { doc.task = { ...originalTask, label: 5 }; },
+      (doc) => { doc.task = { ...originalTask, retention: "park" }; },
       (doc) => { doc.task = { ...originalTask, foreign: true }; },
       (doc) => { delete doc.task; },
       (doc) => { doc.foreign = true; },

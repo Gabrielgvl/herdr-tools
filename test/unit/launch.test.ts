@@ -698,6 +698,16 @@ describe("herdr_launch task cutover", () => {
     expect(supervision.bound[0]!.handoff!.owner).toEqual({ paneId: "w1:p1", session: managerSession });
   });
 
+  it("carries the ADR-040 retention field into the persisted task", async () => {
+    const harness = makeCli();
+    const catalog = catalogOf([{ runner: "pi", model: "pi-model" }]);
+    const handoffs = fakeHandoffs();
+    const result = await execute(toolFor({ catalog, cli: harness.cli, handoffs, supervision: stubSupervision() }), task({ retention: "keep" }));
+    expect(result.details).toMatchObject({ outcome: "launched" });
+    const provenance = (handoffs.persist as ReturnType<typeof vi.fn>).mock.calls[0]![2] as { task: { retention?: string } };
+    expect(provenance.task).toMatchObject({ ...TASK, retention: "keep" });
+  });
+
   it("persists a null manager session when the caller pane has no native session", async () => {
     const harness = makeCli();
     const handoffs = fakeHandoffs();

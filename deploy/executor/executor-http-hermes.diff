@@ -1,0 +1,11 @@
+--- a/~/.hermes/config.yaml
++++ b/~/.hermes/config.yaml
+@@ -912,7 +912,7 @@
+     elicitation:
+       enabled: false
+   executor:
+-    url: https://dev-server.piranha-palermo.ts.net/mcp
++    url: http://127.0.0.1:4788/mcp/toolkits/coding-agents?artifacts=false
+     headers:
+       Authorization: Bearer ${MCP_EXECUTOR_API_KEY}
+     enabled: true

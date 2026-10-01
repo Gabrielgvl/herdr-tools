@@ -1,0 +1,9 @@
+executor:
+  url: https://dev-server.piranha-palermo.ts.net/mcp
+  headers:
+    Authorization: Bearer ${MCP_EXECUTOR_API_KEY}
+  enabled: true
+  timeout: 180
+  connect_timeout: 60
+  sampling:
+    enabled: false

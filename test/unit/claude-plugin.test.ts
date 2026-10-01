@@ -230,6 +230,40 @@ describe("generated manager profile plugin", () => {
   });
 });
 
+describe("Executor profile plugin server map", () => {
+  const executorRoot = join(repoRoot, "herdr-profiles", "profile-plugins", "executor");
+  const executorMapText = readFileSync(join(executorRoot, "mcp-servers.json"), "utf8");
+  const executorMap = JSON.parse(executorMapText) as Record<string, { type?: string; url?: string; command?: string; args?: string[]; headers?: Record<string, string> }>;
+
+  it("registers executor over Streamable HTTP at the loopback toolkit URL", () => {
+    // ADR-039: the per-session stdio proxy is replaced by a direct HTTP
+    // registration. The toolkit-scoped URL keeps hindsight connections out of
+    // the agent's Executor surface; `artifacts=false` withholds the artifact
+    // surface, matching `executor mcp --no-artifacts`.
+    const entry = executorMap.executor!;
+    expect(Object.keys(entry).sort()).toEqual(["headers", "type", "url"]);
+    expect(entry.type).toBe("http");
+    const url = new URL(entry.url!);
+    expect(url.protocol).toBe("http:");
+    expect(url.host).toBe("127.0.0.1:4788");
+    expect(url.pathname).toBe("/mcp/toolkits/coding-agents");
+    expect(url.searchParams.get("artifacts")).toBe("false");
+  });
+
+  it("carries only the MCP_EXECUTOR_API_KEY placeholder, never a literal token", () => {
+    expect(executorMap.executor!.headers).toEqual({ Authorization: "Bearer ${MCP_EXECUTOR_API_KEY}" });
+    expect(executorMapText).not.toMatch(/Bearer [A-Za-z0-9]{20,}/);
+  });
+
+  it("leaves the hindsight stdio entry untouched", () => {
+    expect(executorMap.hindsight).toEqual({
+      type: "stdio",
+      command: "/home/gabriel/.volta/tools/image/node/25.9.0/bin/node",
+      args: ["${CLAUDE_PLUGIN_ROOT}/scripts/hindsight-project-mcp.mjs", "claude-code"],
+    });
+  });
+});
+
 describe("Herdr manager conduct skill", () => {
   it("declares the frontmatter Claude Code needs to discover it", () => {
     const frontmatter = /^---\n([\s\S]*?)\n---\n/.exec(skill)?.[1] ?? "";

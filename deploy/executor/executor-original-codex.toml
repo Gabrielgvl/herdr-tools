@@ -1,0 +1,3 @@
+[mcp_servers.executor]
+command = "/home/gabriel/.volta/bin/node"
+args = ["/home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/profile-plugins/executor/scripts/executor-project-mcp.mjs"]

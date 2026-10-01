@@ -1,10 +1,10 @@
 {
   "executor": {
-    "type": "stdio",
-    "command": "/home/gabriel/.volta/tools/image/node/25.9.0/bin/node",
-    "args": [
-      "${CLAUDE_PLUGIN_ROOT}/scripts/executor-project-mcp.mjs"
-    ]
+    "type": "http",
+    "url": "http://127.0.0.1:4788/mcp/toolkits/coding-agents?artifacts=false",
+    "headers": {
+      "Authorization": "Bearer ${MCP_EXECUTOR_API_KEY}"
+    }
   },
   "hindsight": {
     "type": "stdio",

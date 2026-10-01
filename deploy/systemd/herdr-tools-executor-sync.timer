@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync the Executor coding-agents toolkit connection set every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:0/10
+Persistent=true
+AccuracySec=30s
+Unit=herdr-tools-executor-sync.service
+
+[Install]
+WantedBy=timers.target

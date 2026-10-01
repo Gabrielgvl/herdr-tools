@@ -75,3 +75,22 @@ Both diffs ride the N5.3 cutover alongside the skill landing: applying them
 before the gateway is live breaks still-live managers' only Herdr reach.
 Until cutover, live configs keep their direct registrations and this
 directory changes nothing.
+
+Executor direct Streamable-HTTP registration (Design A phase 1, ADR-039 — prepared, not applied)
+------------------------------------------------------------------------------------------------
+`executor-http-<harness>.diff` replaces the per-session stdio proxy
+registration with a direct HTTP registration at
+`http://127.0.0.1:4788/mcp/toolkits/coding-agents?artifacts=false` for pi,
+Devin, codex, Claude user scope, and hermes (url-only parity change). Every
+diff carries the single `MCP_EXECUTOR_API_KEY` placeholder — never a literal
+token; the operator exports it host-wide from `~/.hermes/.env` (codex reads it
+via `bearer_token_env_var`; Devin uses its `${env:}` syntax — header
+expansion there is undocumented, see ADR-039 for the static-value fallback).
+`executor-original-*` files hold the pre-change registrations verbatim for
+rollback (`patch -R` works too; both directions were verified against the
+live files). Apply order is owner's choice; enable
+`herdr-tools-executor-sync.timer` (deploy/systemd) before or alongside, since
+the per-spawn toolkit sync goes away with the proxy. The Claude plugin path
+(herdr-profiles/profile-plugins/executor/mcp-servers.json) already ships the
+HTTP entry — new lanes pick it up on next start; running lanes keep their
+proxy until they restart.

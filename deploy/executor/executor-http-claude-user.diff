@@ -1,0 +1,19 @@
+--- a/~/.claude.json
++++ b/~/.claude.json
+@@ -4766,11 +4766,11 @@
+       "env": {}
+     },
+     "executor": {
+-      "type": "stdio",
+-      "command": "/home/gabriel/.volta/bin/node",
+-      "args": [
+-        "/home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/profile-plugins/executor/scripts/executor-project-mcp.mjs"
+-      ]
++      "type": "http",
++      "url": "http://127.0.0.1:4788/mcp/toolkits/coding-agents?artifacts=false",
++      "headers": {
++        "Authorization": "Bearer ${MCP_EXECUTOR_API_KEY}"
++      }
+     },
+     "hindsight": {
+       "command": "/home/gabriel/.volta/bin/node",

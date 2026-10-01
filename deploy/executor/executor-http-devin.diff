@@ -1,0 +1,18 @@
+--- a/~/.config/devin/mcp_config.json
++++ b/~/.config/devin/mcp_config.json
+@@ -1,10 +1,11 @@
+ {
+   "mcpServers": {
+     "executor": {
+-      "command": "/home/gabriel/.volta/bin/node",
+-      "args": [
+-        "/home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/profile-plugins/executor/scripts/executor-project-mcp.mjs"
+-      ]
++      "url": "http://127.0.0.1:4788/mcp/toolkits/coding-agents?artifacts=false",
++      "transport": "http",
++      "headers": {
++        "Authorization": "Bearer ${env:MCP_EXECUTOR_API_KEY}"
++      }
+     },
+     "hindsight": {
+       "command": "/home/gabriel/.volta/bin/node",

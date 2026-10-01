@@ -1,0 +1,12 @@
+"executor": {
+  "command": "/home/gabriel/.volta/bin/node",
+  "args": [
+    "/home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/profile-plugins/executor/scripts/executor-project-mcp.mjs"
+  ],
+  "exposure": "direct",
+  "toolExposure": {
+    "execute": "direct",
+    "skills": "direct",
+    "resume": "direct"
+  }
+}

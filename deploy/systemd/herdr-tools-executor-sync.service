@@ -1,0 +1,15 @@
+# Executor coding-agents toolkit sync (ADR-039). Committed inert — activation
+# is a separate owner gate: `systemctl --user enable --now
+# herdr-tools-executor-sync.timer`. Replaces the per-session sync the stdio
+# proxy did at spawn. The script loads MCP_EXECUTOR_API_KEY from
+# ~/.hermes/.env itself when the unit's environment lacks it, so the token
+# never enters a unit file. The ExecStart pins the real Node binary, not the
+# Volta shim, for the reason recorded in deploy/executor/herdr-mcp-integration.json.
+[Unit]
+Description=Sync the Executor coding-agents toolkit connection set
+ConditionPathExists=%h/.pi/agent/extensions/herdr-tools/herdr-profiles/profile-plugins/executor/scripts/executor-project-mcp.mjs
+
+[Service]
+Type=oneshot
+ExecStart=%h/.volta/tools/image/node/25.9.0/bin/node %h/.pi/agent/extensions/herdr-tools/herdr-profiles/profile-plugins/executor/scripts/executor-project-mcp.mjs --sync
+TimeoutStartSec=180

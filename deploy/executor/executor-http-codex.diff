@@ -1,0 +1,13 @@
+--- a/~/.codex/config.toml
++++ b/~/.codex/config.toml
+@@ -271,8 +271,8 @@
+ url = "https://developers.openai.com/mcp"
+ 
+ [mcp_servers.executor]
+-command = "/home/gabriel/.volta/bin/node"
+-args = ["/home/gabriel/.pi/agent/extensions/herdr-tools/herdr-profiles/profile-plugins/executor/scripts/executor-project-mcp.mjs"]
++url = "http://127.0.0.1:4788/mcp/toolkits/coding-agents?artifacts=false"
++bearer_token_env_var = "MCP_EXECUTOR_API_KEY"
+ 
+ [mcp_servers.hindsight]
+ command = "/home/gabriel/.volta/bin/node"

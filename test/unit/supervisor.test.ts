@@ -3933,7 +3933,9 @@ describe("managed handoff evaluation", () => {
       await writeArtifact(allocation, "done");
       await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
       await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
-      expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true);
+      // The durable handed_off write is visible a beat before the gate promise
+      // resolves into retireAfterHandoff — wait for the log, don't just poll it.
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
 
       // Post-handoff status bookkeeping records locally but earns no wake.
       const wakesBefore = h.wakes.length;
@@ -3956,9 +3958,10 @@ describe("managed handoff evaluation", () => {
       await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 11, stateChangeSeq: 11 })));
       await vi.waitFor(() => expect(h.wakes.at(-1)?.event.type).toBe("work_cycle_completed"));
 
-      // A thin event post-retire folds locally but never pays a reconciliation
-      // read — the scripted queue is empty, so a real read would fail visibly.
-      await h.supervisor.onEvent(thinEvent("pane_closed"));
+      // A thin non-closure event post-retire folds locally but never pays a
+      // reconciliation read — the scripted queue is empty, so a real read
+      // would fail visibly.
+      await h.supervisor.onEvent(thinEvent("pane_agent_detected"));
       await sleep(20);
       expect(h.supervisor.view().monitor.reconciliation).toMatchObject({ consecutiveFailures: 0 });
     } finally {
@@ -3966,6 +3969,58 @@ describe("managed handoff evaluation", () => {
       await rm(allocation.namespaceDir, { recursive: true, force: true });
     }
     expect(h.logs.some((line) => line.startsWith("supervisor_settled job=job_supervisor"))).toBe(true);
+  });
+
+  it("settles a retired supervisor on pane_exited evidence — quietly, so the job can end", async () => {
+    const { h, allocation } = await managed({ log: true, snapshots: [workingOrigin(), snapshot([], [])] });
+    try {
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
+      expect(h.supervisor.view().state).toBe("active");
+
+      // Ordinary thin churn post-handoff pays no reconciliation read — the one
+      // scripted answer below belongs to the lifecycle-ending kinds alone.
+      await h.supervisor.onEvent(thinEvent("pane_agent_detected"));
+      await sleep(20);
+      expect(h.supervisor.view().state).toBe("active");
+      expect(h.supervisor.view().monitor.reconciliation).toMatchObject({ consecutiveFailures: 0 });
+
+      const wakesBefore = h.wakes.length;
+      await h.supervisor.onEvent(thinEvent("pane_exited"));
+      await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
+      await expect(h.supervisor.run()).resolves.toMatchObject({ outcome: "released", reason: "event:pane_exited" });
+      // The close is bookkeeping after handoff: no owner wake, no mailbox.
+      expect(h.wakes).toHaveLength(wakesBefore);
+      expect(h.observers).toBe(0);
+      expect(h.logs.some((line) => line.startsWith("supervisor_settled job=job_supervisor outcome=released"))).toBe(true);
+      // The durable run outcome is never rewritten by the late settle.
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off");
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("settles a retired supervisor on an authoritative absent snapshot", async () => {
+    const { h, allocation } = await managed({ log: true, snapshots: [workingOrigin()] });
+    try {
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
+
+      const wakesBefore = h.wakes.length;
+      await h.supervisor.onReconciliationSnapshot(snapshot([], []));
+      expect(h.supervisor.view().state).toBe("settled");
+      await expect(h.supervisor.run()).resolves.toMatchObject({ outcome: "released", reason: "periodic_snapshot" });
+      expect(h.wakes).toHaveLength(wakesBefore);
+      expect(h.observers).toBe(0);
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
   });
 
   it("re-evaluates an unpersisted handoff outcome on the next terminal observation", async () => {
@@ -3989,7 +4044,7 @@ describe("managed handoff evaluation", () => {
       await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 7, stateChangeSeq: 7 })));
       await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 8, stateChangeSeq: 8 })));
       await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
-      expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true);
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
     } finally {
       h.supervisor.shutdown();
       await rm(allocation.namespaceDir, { recursive: true, force: true });

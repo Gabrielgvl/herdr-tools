@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import { writeIdentityProvenance } from "../agent-identity.js";
+import { insideGitWorkTree } from "../git-worktree.js";
 import type { PromptDispatchEvidence } from "../agent-prompt.js";
 import { boundedEvidence, CliProtocolError, HERDR_AGENT_START_TIMEOUT_MS, type HerdrErrorEnvelope, type JsonEnvelope } from "../cli.js";
 import type { CompatibilityPreflight } from "../health.js";
@@ -525,25 +526,12 @@ function mintChildName(launchId: string, ordinal: number): string {
 
 /**
  * The supervision evidence contract is git-derived, so a cwd outside every git
- * work tree fails closed before any effect: a `.git` entry — a directory, or
- * the pointer file a linked worktree writes — on the directory or any
- * ancestor is the proof. An unreadable ancestor proves nothing either way, so
- * the walk continues and only a path with no `.git` at all refuses.
+ * work tree fails closed before any effect — the shared ancestor probe decides
+ * membership, this boundary keeps its own refusal code.
  */
 async function requireGitWorkTree(resolved: string): Promise<void> {
-  let dir = resolved;
-  while (true) {
-    try {
-      await stat(join(dir, ".git"));
-      return;
-    } catch {
-      const parent = dirname(dir);
-      if (parent === dir) {
-        throw new LaunchError("CWD_NOT_GIT_REPOSITORY", "Launch cwd is not inside a git work tree", { cwd: resolved });
-      }
-      dir = parent;
-    }
-  }
+  if (await insideGitWorkTree(resolved)) return;
+  throw new LaunchError("CWD_NOT_GIT_REPOSITORY", "Launch cwd is not inside a git work tree", { cwd: resolved });
 }
 
 /**

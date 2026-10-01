@@ -483,8 +483,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   /** The bound managed run, retained so its evidence still projects after the gate drops a resolved run. */
   private boundHandoff: { gate: HandoffGate; run: HandoffRun } | undefined;
   /**
-   * True once the bound run recorded `handed_off`: reviews stop, the monitor
-   * observer drops, and material events end — only local history still records.
+   * True once the bound run recorded `handed_off`: the paid review cadence
+   * ends and material events stay local — `blocked` and reopened-cycle
+   * evidence still surfaces. The observer stays attached: reopen detection
+   * needs the folding, and the lifecycle-ending kinds plus authoritative
+   * absence are what still settle a retired supervisor.
    */
   private retired = false;
   /**
@@ -1047,10 +1050,15 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     });
   }
 
+  /**
+   * A retired supervisor still reads periodic snapshots: the run's outcome is
+   * already durable, but an absent or replaced child is the authoritative
+   * evidence that settles it so the registry can remove the job.
+   */
   async onReconciliationSnapshot(snapshot: HerdrSnapshot): Promise<void> {
-    if (this.stopped || this.retired) return;
+    if (this.stopped) return;
     await this.serialize(async () => {
-      if (this.stopped || this.isSettled() || this.retired) return;
+      if (this.stopped || this.isSettled()) return;
       if (this.provisional !== undefined && !this.bindingPublished) {
         this.applyProvisionalSnapshot(snapshot, "periodic_snapshot");
         return;
@@ -1236,6 +1244,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
       // different: its carried exit fact names no occupant, so neither the
       // pane id nor the answering snapshot can bind it to this child — an
       // exit is never a process_exit proof.
+      // A retired supervisor still answers the two lifecycle-ending kinds —
+      // they are the only thin events that can still settle it. Any other thin
+      // event post-handoff is churn that pays no reconciliation read.
+      if (this.retired && event.event !== "pane_closed" && event.event !== "pane_exited") return;
       await this.reconcile(`event:${event.event}`);
       return;
     }
@@ -1441,9 +1453,6 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * read each rather than coalesced.
    */
   private async reconcile(trigger: string): Promise<void> {
-    // Defensive: the observer already dropped at retire, so this only guards a
-    // fold-triggered reconcile racing the handoff commit.
-    if (this.retired) return;
     let snapshot: HerdrSnapshot;
     try {
       snapshot = await this.deps.monitor.snapshot();
@@ -2396,10 +2405,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   /**
    * A `handed_off` run's durable outcome is recorded: the paid review cadence
-   * ends, reconciliation bookkeeping stops, and emissions narrow to `blocked`
-   * and reopened-cycle events — a child that demonstrably worked past the
-   * accepted artifact still surfaces. The observer stays attached so that
-   * reopen is detected; the settled-path teardown still removes it.
+   * ends and emissions narrow to `blocked` and reopened-cycle events — a
+   * child that demonstrably worked past the accepted artifact still surfaces.
+   * The observer stays attached so that reopen is detected and the
+   * lifecycle-ending kinds still settle; the settled-path teardown still
+   * removes it.
    */
   private retireAfterHandoff(runId: string): void {
     this.retired = true;

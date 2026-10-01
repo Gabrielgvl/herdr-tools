@@ -278,6 +278,35 @@ export function createDevinQueueFlush(deps: DevinQueueFlushDeps): DevinQueueFlus
   };
 
   /**
+   * The locked proof-and-key tail both Enter paths share. A second composer
+   * read must still satisfy the caller's own eligibility and equal the
+   * candidate frame — identical on the second read is a settled render, not a
+   * paste still mid-paint that an Enter would submit half-formed — then the
+   * fenced Enter is recorded spent BEFORE dispatch: a crashed or uncertain
+   * send must never invite a retry of the same frame in this or another host.
+   * Resolves to the spent interior on a dispatch so the next press can detect
+   * repaint lag; undefined means refused — no key was sent.
+   */
+  const provenEnter = async (
+    lease: PaneWriteLease,
+    paneId: string,
+    bound: string,
+    candidate: DevinComposer,
+    stillUnsent: (composer: DevinComposer) => boolean,
+    signal: AbortSignal,
+  ): Promise<string | undefined> => {
+    const final = await readComposer(paneId, signal);
+    if (final === undefined || !stillUnsent(final) || final.interior !== candidate.interior) return undefined;
+    const frame = devinFlushFrameDigest(final.interior);
+    if (await lease.fence.isSpent(bound, frame)) return undefined;
+    if (signal.aborted) return undefined;
+    await lease.check();
+    await lease.fence.record(bound, frame);
+    await deps.cli.runJson(["agent", "send-keys", paneId, "enter"], signal);
+    return final.interior;
+  };
+
+  /**
    * One locked proof/key section. Per the approved order, every candidate key
    * is gated by a fresh same-occupant identity join and a fresh idle/done
    * state taken *after* the candidate composer read, then by a final ANSI
@@ -310,17 +339,11 @@ export function createDevinQueueFlush(deps: DevinQueueFlushDeps): DevinQueueFlus
       // An interior identical to the frame this cycle just pressed is repaint
       // lag, not a surviving queue — only a changed frame earns another key.
       if (lastInterior !== undefined && candidate.interior === lastInterior) return undefined;
-      const final = await readComposer(paneId, signal);
-      if (final === undefined || !final.queued || !final.inputEmpty || final.interior !== candidate.interior) return undefined;
-      const frame = devinFlushFrameDigest(final.interior);
-      if (await lease.fence.isSpent(bound, frame)) return undefined;
-      if (signal.aborted) return undefined;
-      await lease.check();
-      // Record the spent frame BEFORE dispatch: a crashed or uncertain send
-      // must never invite a retry of the same frame in this or another host.
-      await lease.fence.record(bound, frame);
-      await deps.cli.runJson(["agent", "send-keys", paneId, "enter"], signal);
-      return final.interior;
+      // A completing press is only ever for a composer still holding the
+      // queued row above an untouched input line. `await` is required inside
+      // the try: a bare `return` would run the release finally while the
+      // proof was still in flight, ending the holder under its own check.
+      return await provenEnter(lease, paneId, bound, candidate, (final) => final.queued && final.inputEmpty, signal);
     } finally {
       await lease.release();
     }
@@ -413,20 +436,11 @@ export function createDevinQueueFlush(deps: DevinQueueFlushDeps): DevinQueueFlus
         const pane = paneFrom((await deps.cli.runJson(["pane", "get", paneId], signal)).result, paneId);
         const fresh = requirePromptTargetIdentity([agent, pane], paneId);
         if (!samePromptTargetIdentity(fresh, submission)) return false;
-        // A frame identical on the second read is a settled render, not a
-        // paste still mid-paint that an Enter would submit half-formed.
-        const final = await readComposer(paneId, signal);
-        if (final === undefined || (!final.queued && final.inputEmpty) || final.interior !== candidate.interior) return false;
         const bound = devinFlushIdentityDigest(fresh);
-        const frame = devinFlushFrameDigest(final.interior);
-        if (await lease.fence.isSpent(bound, frame)) return false;
-        if (signal.aborted) return false;
-        await lease.check();
-        // Record the spent frame BEFORE dispatch, exactly like pressOnce: a
-        // crashed or uncertain send must never invite a retry of this frame.
-        await lease.fence.record(bound, frame);
-        await deps.cli.runJson(["agent", "send-keys", paneId, "enter"], signal);
-        return true;
+        // This caller's eligibility is wider than pressOnce's: any unsent
+        // content — a draft on the input line or a queued row — earns the one
+        // completing Enter.
+        return (await provenEnter(lease, paneId, bound, candidate, (final) => final.queued || !final.inputEmpty, signal)) !== undefined;
       } finally {
         await lease.release();
       }

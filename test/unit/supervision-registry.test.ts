@@ -619,6 +619,31 @@ describe("managed handoff runtime enforcement", () => {
     await f.supervision.shutdown();
   });
 
+  it("settles and removes a retired supervisor when the pane closes after handoff", async () => {
+    const gate = createHandoffGate();
+    const f = fixture({ handoffs: gate, snapshots: [snapshotResult([pane]), snapshotResult([pane]), snapshotResult([])] });
+    const allocation = await managedAllocation();
+    const reservation = await f.supervision.reserve({ child });
+    await reservation.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 2, handoff: { allocation } });
+    await writeArtifact(allocation);
+    f.push(paneUpdated(4, "done"));
+    await waitForLifecycle(allocation, "handed_off");
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ operation_phase: "running" });
+
+    // A pane closing after handoff is still lifecycle evidence: the retired
+    // supervisor reads it, settles `released`, and the registry drops it —
+    // quietly, with no wake and no rewritten run outcome.
+    const wakesBefore = f.wakes.length;
+    f.push(paneClosed);
+    await vi_waitForSettled(f.jobs, reservation.jobId);
+    expect(f.jobs.get(reservation.jobId)).toMatchObject({ supervision_result: "released", supervision_reason: "event:pane_closed" });
+    expect(f.wakes).toHaveLength(wakesBefore);
+    expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off");
+    expect([...(f.supervision as unknown as { supervisors: Set<unknown> }).supervisors]).toHaveLength(0);
+    expect(gate.lookup(identity)).toBeUndefined();
+    await f.supervision.shutdown();
+  });
+
   it("marks unresolved runs recovery_pending on shutdown and fabricates no terminal status", async () => {
     const gate = createHandoffGate();
     const f = fixture({ handoffs: gate });

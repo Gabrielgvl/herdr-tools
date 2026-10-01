@@ -11,8 +11,8 @@
 
 import { Value } from "typebox/value";
 import { realpath, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { insideGitWorkTree } from "../../git-worktree.js";
 import { IdempotencyKeySchema, LaunchTaskSchema, type LaunchTask } from "../../launch-schema.js";
 import {
   createLaunchTool,
@@ -111,17 +111,8 @@ async function verifyProjectRoot(value: unknown): Promise<string> {
     throw new DaemonRequestError("PROJECT_ROOT_UNVERIFIED");
   }
   if (resolved !== value || !stats.isDirectory()) throw new DaemonRequestError("PROJECT_ROOT_UNVERIFIED");
-  let dir = resolved;
-  for (;;) {
-    try {
-      await stat(join(dir, ".git"));
-      return resolved;
-    } catch {
-      const parent = dirname(dir);
-      if (parent === dir) throw new DaemonRequestError("PROJECT_ROOT_NOT_GIT");
-      dir = parent;
-    }
-  }
+  if (!(await insideGitWorkTree(resolved))) throw new DaemonRequestError("PROJECT_ROOT_NOT_GIT");
+  return resolved;
 }
 
 /**

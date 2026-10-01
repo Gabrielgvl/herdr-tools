@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import process from "node:process";
 import { fileURLToPath, URL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -30,17 +30,27 @@ export function executorToolkitUrl(url) {
   return endpoint.toString();
 }
 
-// A dead upstream session is either a transport close (MCP -32000) or the
-// Executor daemon's "Session not found" JSON-RPC -32001 after its restart.
+// MCP Streamable HTTP: a server answers a request on a session it no longer
+// knows — Executor after a daemon restart — with HTTP 404, and the client must
+// re-initialize. The request never ran, so it alone earns the replay. The SDK
+// raises it as StreamableHTTPError code 404; Executor's `-32001 Session not
+// found` body is only its message text. The SDK's own McpError -32001 is a
+// client-side RequestTimeout: it proves nothing and keeps the session.
+function isUnknownSession(error) {
+  return error instanceof StreamableHTTPError && error.code === 404;
+}
+
+// A closed transport (MCP -32000) is dead too, but a mutating `execute` may
+// already have run upstream: it is dropped for the next call, never replayed.
 function isTransportLoss(error) {
-  return error !== null && typeof error === "object" && typeof error.code === "number"
-    && (error.code === ErrorCode.ConnectionClosed || error.code === -32001);
+  return isUnknownSession(error) || (error !== null && typeof error === "object" && error.code === ErrorCode.ConnectionClosed);
 }
 
 export function createProxyHandlers(connectUpstream) {
   // The upstream is lazy and reconnects: an Executor daemon restart leaves the
   // cached client holding a dead HTTP session, so a transport loss drops it and
-  // the next call connects fresh. One reconnect per call, never a retry loop.
+  // the next call connects fresh. One reconnect per call, never a retry loop —
+  // and only a loss that proves the request never ran earns the replay.
   let upstream;
   let opening;
   const ensureUpstream = () => {
@@ -53,11 +63,16 @@ export function createProxyHandlers(connectUpstream) {
     return opening;
   };
   const reconnectable = async call => {
+    let client;
     try {
-      return await call(await ensureUpstream());
+      client = await ensureUpstream();
+      return await call(client);
     } catch (error) {
       if (!isTransportLoss(error)) throw error;
-      upstream = undefined;
+      // Compare-and-clear: a late loss on a superseded client must not drop the
+      // healthy one a concurrent call already installed in its place.
+      if (upstream === client) upstream = undefined;
+      if (!isUnknownSession(error)) throw error;
       return call(await ensureUpstream());
     }
   };

@@ -2,8 +2,9 @@ import type { AgentToolResult, ExtensionContext, ToolExecutionMode } from "@eare
 import type { TSchema } from "typebox";
 import { preflightCompatibility, type CompatibilityPreflight, type HealthCli } from "./health.js";
 import type { CurrentContext } from "./targets.js";
-import type { DaemonClient, DaemonRunInput, DaemonStatusInput } from "./daemon/client.js";
+import type { DaemonClient, DaemonClientSocketOptions, DaemonRunInput, DaemonStatusInput } from "./daemon/client.js";
 import { DaemonRunParamsSchema, DaemonStatusParamsSchema } from "./daemon/client.js";
+import { LAUNCH_REQUEST_TIMEOUT_MS } from "./tools/launch.js";
 import { DaemonLaunchRequestSchema, type DaemonLaunchRequest, type DelegatedCaller } from "./launch-schema.js";
 import { appendToolTelemetry, invalidInputError, monotonicDurationMs, telemetryEffectCertainty, telemetryOperation, type ToolTelemetryEntry } from "./telemetry.js";
 
@@ -99,7 +100,7 @@ export interface HerdrToolSurfaceDependencies {
    * `caller` is the optional delegated-mode assertion (executor gateway);
    * absent it the implementation claims the environment-injected identity.
    */
-  connectDaemon(signal: AbortSignal | undefined, caller?: DelegatedCaller): Promise<DaemonClient>;
+  connectDaemon(signal: AbortSignal | undefined, caller?: DelegatedCaller, options?: DaemonClientSocketOptions): Promise<DaemonClient>;
   /** The tool-telemetry root — the session's project directory. */
   cwd: string;
 }
@@ -162,6 +163,8 @@ function daemonTool(
     label: string;
     description: string;
     parameters: TSchema;
+    /** The request bound this tool's calls need — launch outlives the shared default. */
+    requestTimeoutMs?: number;
     call(client: DaemonClient, params: never): Promise<unknown>;
   },
 ): HerdrToolDefinition {
@@ -174,7 +177,7 @@ function daemonTool(
       // `caller` selects the delegated claim path on executor-gateway serves;
       // validation already ran, so a present value is a {paneId, projectRoot} pair.
       const caller = (params as { caller?: DelegatedCaller }).caller;
-      const client = await deps.connectDaemon(signal, caller);
+      const client = await deps.connectDaemon(signal, caller, options.requestTimeoutMs === undefined ? undefined : { requestTimeoutMs: options.requestTimeoutMs });
       try {
         signal?.addEventListener("abort", () => client.close(), { once: true });
         const reply = await options.call(client, params as never);
@@ -195,8 +198,9 @@ export function createToolSurface(deps: HerdrToolSurfaceDependencies): HerdrTool
   const launch = daemonTool(deps, {
     name: "herdr_launch",
     label: "Herdr Launch",
-    description: "Launch one supervised Herdr agent run under a durable intent. `task` is the flat Task contract (objective, scope, doneWhen, optional constraints/tier/recoveryOf/label/cwd); `idempotencyKey` is required and binds this call to at most one effect — retry with the same key after an interrupted attempt instead of launching again.",
+    description: "Launch one supervised Herdr agent run under a durable intent. `task` is the flat Task contract (objective, scope, doneWhen, optional constraints/tier/recoveryOf/label/cwd); `idempotencyKey` is required and binds this call to at most one effect — retry with the same key after an interrupted attempt instead of launching again. The resolved `cwd` must sit inside a git work tree (CWD_NOT_GIT_REPOSITORY refuses before any effect); a DAEMON_REQUEST_TIMEOUT means the daemon may still be executing — reconcile with the same idempotencyKey before retrying.",
     parameters: DaemonLaunchRequestSchema,
+    requestTimeoutMs: LAUNCH_REQUEST_TIMEOUT_MS,
     call: (client, params: DaemonLaunchRequest) => client.launch(params),
   });
   const run = daemonTool(deps, {

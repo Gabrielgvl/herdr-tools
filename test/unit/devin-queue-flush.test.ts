@@ -492,3 +492,89 @@ describe("cancellation", () => {
     await settle(queueFlush);
   });
 });
+
+describe("submitIfUnsent (launch-time composer resubmission)", () => {
+  it("presses exactly one Enter when the acknowledged identity still holds an unsent draft", async () => {
+    const { queueFlush, calls } = makeCoordinator({ paneView: DRAFT });
+    await expect(queueFlush.submitIfUnsent(PANE, submission, new AbortController().signal)).resolves.toBe(true);
+    expect(sendKeys(calls)).toEqual([["agent", "send-keys", PANE, "enter"]]);
+    // Candidate read, identity join, final proof — then the key.
+    const order = calls.map((argv) => argv.slice(0, 2).join(" "));
+    expect(order).toEqual(["pane read", "agent get", "pane get", "pane read", "agent send-keys"]);
+    await settle(queueFlush);
+  });
+
+  it("presses one Enter for a queued composer row as well", async () => {
+    const { queueFlush, calls } = makeCoordinator({ paneView: QUEUED });
+    await expect(queueFlush.submitIfUnsent(PANE, submission, new AbortController().signal)).resolves.toBe(true);
+    expect(sendKeys(calls)).toEqual([["agent", "send-keys", PANE, "enter"]]);
+    await settle(queueFlush);
+  });
+
+  it("resolves false without touching the pane when the composer is already clean", async () => {
+    const { queueFlush, calls } = makeCoordinator({ paneView: DRAINED });
+    await expect(queueFlush.submitIfUnsent(PANE, submission, new AbortController().signal)).resolves.toBe(false);
+    expect(sendKeys(calls)).toHaveLength(0);
+    expect(reads(calls)).toHaveLength(1);
+    // A clean candidate ends the proof before the identity join costs anything.
+    expect(calls.some((argv) => argv[1] === "get")).toBe(false);
+    await settle(queueFlush);
+  });
+
+  it("resolves false on an unparseable candidate without any join or key", async () => {
+    const { queueFlush, calls } = makeCoordinator({ paneView: GARBAGE });
+    await expect(queueFlush.submitIfUnsent(PANE, submission, new AbortController().signal)).resolves.toBe(false);
+    expect(calls).toEqual([["pane", "read", PANE, "--source", "visible", "--format", "ansi"]]);
+    await settle(queueFlush);
+  });
+
+  it("resolves false when the fresh occupant is not the acknowledged identity", async () => {
+    const { queueFlush, calls } = makeCoordinator({ paneView: DRAFT, sessionId: otherSession });
+    await expect(queueFlush.submitIfUnsent(PANE, submission, new AbortController().signal)).resolves.toBe(false);
+    expect(sendKeys(calls)).toHaveLength(0);
+    await settle(queueFlush);
+  });
+
+  it.each([
+    ["unparseable", GARBAGE],
+    ["already drained", DRAINED],
+    ["repainted mid-proof", QUEUED_MORE],
+  ] as const)("resolves false when the final read is %s", async (_label, finalView) => {
+    const { queueFlush, calls } = makeCoordinator({ paneViews: [DRAFT, finalView] });
+    await expect(queueFlush.submitIfUnsent(PANE, submission, new AbortController().signal)).resolves.toBe(false);
+    expect(sendKeys(calls)).toHaveLength(0);
+    expect(reads(calls)).toHaveLength(2);
+    await settle(queueFlush);
+  });
+
+  it("spends the frame fence: a second attempt on the same content never re-presses", async () => {
+    const { queueFlush, calls } = makeCoordinator({ paneView: DRAFT });
+    await expect(queueFlush.submitIfUnsent(PANE, submission, new AbortController().signal)).resolves.toBe(true);
+    await expect(queueFlush.submitIfUnsent(PANE, submission, new AbortController().signal)).resolves.toBe(false);
+    expect(sendKeys(calls)).toEqual([["agent", "send-keys", PANE, "enter"]]);
+    await settle(queueFlush);
+  });
+
+  it("resolves false when the caller's signal aborts between proof and dispatch", async () => {
+    const controller = new AbortController();
+    const inner = makeCli({ paneView: DRAFT });
+    const cli: DevinQueueFlushCli = {
+      ...inner.cli,
+      runTextResult: async (argv, signal) => {
+        const result = await inner.cli.runTextResult(argv, signal);
+        // Land the abort on the final proof — after both reads, before the key.
+        if (reads(inner.calls).length === 2) controller.abort();
+        return result;
+      },
+    };
+    const dir = mkdtempSync(join(tmpdir(), "herdr-flush-"));
+    dirs.push(dir);
+    const queueFlush = createDevinQueueFlush({
+      cli,
+      guard: createPaneWriteGuard({ namespace: { dir, endpoint: "herdr-test-endpoint" } }),
+    });
+    await expect(queueFlush.submitIfUnsent(PANE, submission, controller.signal)).resolves.toBe(false);
+    expect(sendKeys(inner.calls)).toHaveLength(0);
+    await settle(queueFlush);
+  });
+});

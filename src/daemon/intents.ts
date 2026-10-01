@@ -93,6 +93,8 @@ export interface LaunchIntentRecord {
   effectCertainty?: LaunchEffectCertainty;
   /** Bounded typed failure code (`^[A-Z][A-Z0-9_]{0,63}$`); never message text. */
   failureCode?: string;
+  /** The bounded launch-pipeline phase the failure settled in (`^[a-z][a-z0-9_]{0,63}$`); never message text. */
+  failurePhase?: string;
   resolution?: LaunchIntentResolution;
   /** Present only on `completed` when `reconcile` closed the intent (§8). */
   reconciled?: true;
@@ -124,6 +126,8 @@ export interface FailIntentInput {
   effectCertainty: LaunchEffectCertainty;
   /** Optional bounded typed code; message text is never persisted. */
   failureCode?: string;
+  /** Optional bounded launch phase the failure settled in; message text is never persisted. */
+  failurePhase?: string;
   children?: LaunchIntentChild[];
 }
 
@@ -153,6 +157,8 @@ export interface IntentStoreOptions {
   /** Bound on flock's own contention wait for one intent section. */
   waitMs?: number;
   now?: () => Date;
+  /** Visible transition sink; defaults to stderr. */
+  log?: (line: string) => void;
 }
 
 export const DAEMON_INTENTS_DIR_NAME = "intents";
@@ -162,6 +168,7 @@ const INTENT_LOCK_WAIT_MS = 5_000;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]+$/;
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+const FAILURE_PHASE = /^[a-z][a-z0-9_]{0,63}$/;
 const INTENT_STATES = new Set<LaunchIntentState>(["recorded", "effecting", "completed", "failed", "unresolved"]);
 const CHILD_DISPOSITIONS = new Set<LaunchIntentChildDisposition>(["bound", "identity_lost", "ambiguous"]);
 const EFFECT_CERTAINTIES = new Set<LaunchEffectCertainty>(["absent", "partial", "unknown", "confirmed"]);
@@ -270,6 +277,7 @@ function isIntentRecord(value: unknown): value is LaunchIntentRecord {
     || !Array.isArray(value.children) || !value.children.every(isIntentChild)) return false;
   if (value.effectCertainty !== undefined && (typeof value.effectCertainty !== "string" || !EFFECT_CERTAINTIES.has(value.effectCertainty as LaunchEffectCertainty))) return false;
   if (value.failureCode !== undefined && (typeof value.failureCode !== "string" || !FAILURE_CODE.test(value.failureCode))) return false;
+  if (value.failurePhase !== undefined && (typeof value.failurePhase !== "string" || !FAILURE_PHASE.test(value.failurePhase))) return false;
   if (value.resolution !== undefined && (typeof value.resolution !== "string" || !INTENT_RESOLUTIONS.has(value.resolution as LaunchIntentResolution))) return false;
   if (value.reconciled !== undefined && value.reconciled !== true) return false;
   return true;
@@ -307,6 +315,10 @@ function mergeChildren(current: LaunchIntentChild[], added: LaunchIntentChild[])
 export function createIntentStore(options: IntentStoreOptions): IntentStore {
   const waitMs = options.waitMs ?? INTENT_LOCK_WAIT_MS;
   const now = () => (options.now ?? (() => new Date()))().toISOString();
+  const log = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+  /** One bounded structured line per committed state transition — never message text. */
+  const transitionLine = (intent: LaunchIntentRecord, from: string): string =>
+    `herdr-tools-daemon intent_transition launch=${intent.launchId} mgr=${intent.managerSessionKey.slice(0, 8)} from=${from} to=${intent.state} certainty=${intent.effectCertainty ?? "-"} code=${intent.failureCode ?? "-"} phase=${intent.failurePhase ?? "-"}`;
   let resolved: Promise<DaemonNamespace> | undefined;
   const namespace = (): Promise<DaemonNamespace> => {
     resolved ??= Promise.resolve(typeof options.namespace === "function" ? options.namespace() : options.namespace)
@@ -516,6 +528,7 @@ export function createIntentStore(options: IntentStoreOptions): IntentStore {
       }
       const next = mutate(current);
       await writeIntent(dir, next);
+      if (next.state !== current.state) log(transitionLine(next, current.state));
       return next;
     });
   }
@@ -550,6 +563,7 @@ export function createIntentStore(options: IntentStoreOptions): IntentStore {
             children: [],
           };
           await writeIntent(dir, intent);
+          log(transitionLine(intent, "none"));
           return { kind: "launch", intent, resumed: false };
         }
         if (existing.taskDigest !== digest) {
@@ -585,6 +599,9 @@ export function createIntentStore(options: IntentStoreOptions): IntentStore {
       if (outcome.failureCode !== undefined && !FAILURE_CODE.test(outcome.failureCode)) {
         throw new DaemonIntentError("INTENT_REQUEST_INVALID", "failure code is malformed", { field: "failureCode" });
       }
+      if (outcome.failurePhase !== undefined && !FAILURE_PHASE.test(outcome.failurePhase)) {
+        throw new DaemonIntentError("INTENT_REQUEST_INVALID", "failure phase is malformed", { field: "failurePhase" });
+      }
       const children = outcome.children ?? [];
       assertChildren(children, "children");
       return transition(intent, ["recorded", "effecting"], (current) => {
@@ -594,6 +611,7 @@ export function createIntentStore(options: IntentStoreOptions): IntentStore {
           children: merged,
           effectCertainty: outcome.effectCertainty,
           ...(outcome.failureCode === undefined ? {} : { failureCode: outcome.failureCode }),
+          ...(outcome.failurePhase === undefined ? {} : { failurePhase: outcome.failurePhase }),
           updatedAt: now(),
         };
         // `failed` only with evidence that no child effect exists: absent
@@ -653,6 +671,7 @@ export function createIntentStore(options: IntentStoreOptions): IntentStore {
               updatedAt: now(),
             };
             await writeIntent(dir, next);
+            log(transitionLine(next, intent.state));
             recovered.push(next);
           }
         });

@@ -662,6 +662,9 @@ describe("writer wiring seams", () => {
       // `persistenceFailed` with its event ID — and supervision continued.
       expect(await mailbox.list(mgrA)).toHaveLength(MAILBOX_UNREAD_MAX_FILES);
       await vi.waitFor(async () => expect((await mailbox.degradation()).unpersisted[mgrA]).toMatchObject({ count: 2 }));
+      // The mailbox's ledger settles inside the write; the supervisor's
+      // persistence-failure update lands a microtask after it resolves.
+      await vi.waitFor(() => expect(h.updates.filter((update) => (update.details as { persistenceFailed?: boolean }).persistenceFailed === true)).toHaveLength(2));
       const failures = h.updates.filter((update) => (update.details as { persistenceFailed?: boolean }).persistenceFailed === true);
       expect(failures.map((update) => (update.details as { eventId?: string }).eventId).sort())
         .toEqual(h.wakes.map((wake) => wake.event.eventId).sort());
@@ -729,11 +732,23 @@ describe("writer wiring seams", () => {
     registry.attachSupervision(handle.jobId, {
       view: stubView,
       takePendingEvents: () => [],
-      handoffEvidence: () => ({ gated: true, runId: "run-7", path: "/run", state: "handed_off" }),
+      handoffEvidence: () => ({ gated: true, runId: "run-7", path: "/run", state: "awaiting_handoff" }),
     } as unknown as SupervisionJobPort);
     await handle.promise;
     await vi.waitFor(() => expect(captured).toHaveLength(1));
-    expect(captured[0]).toMatchObject({ kind: "job_terminal", runId: "run-7", jobId: "job_1", handoff: { state: "handed_off" }, actions: ["released"] });
+    expect(captured[0]).toMatchObject({ kind: "job_terminal", runId: "run-7", jobId: "job_1", handoff: { state: "awaiting_handoff" }, actions: ["released"] });
+
+    // A run already recorded `handed_off` emitted its durable outcome: the
+    // trailing supervisor settlement is bookkeeping and writes nothing.
+    const handedOff = registry.register({ ...supervisorRequest, label: "supervise handed-off" }, async () => ({ supervision_result: "released" }));
+    registry.attachSupervision(handedOff.jobId, {
+      view: stubView,
+      takePendingEvents: () => [],
+      handoffEvidence: () => ({ gated: true, runId: "run-8", path: "/run", state: "handed_off" }),
+    } as unknown as SupervisionJobPort);
+    await handedOff.promise;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(captured).toHaveLength(1);
 
     // A supervisor job with no gated run resolves no destination.
     const none = registry.register({ ...supervisorRequest, label: "supervise ungated" }, async () => ({ supervision_result: "released" }));
@@ -766,7 +781,7 @@ describe("writer wiring seams", () => {
     rejecting.attachSupervision(rejected.jobId, {
       view: stubView,
       takePendingEvents: () => [],
-      handoffEvidence: () => ({ gated: true, runId: "run-8", path: "/run", state: "handed_off" }),
+      handoffEvidence: () => ({ gated: true, runId: "run-9", path: "/run", state: "awaiting_handoff" }),
     } as unknown as SupervisionJobPort);
     await rejected.promise;
     expect(rejecting.get(rejected.jobId)?.supervision_result).toBe("released");

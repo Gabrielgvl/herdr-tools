@@ -298,7 +298,7 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
     ...createDaemonJsonPort(namespace.dir),
     write: (patch) => writeStatus(patch as DaemonStatusRecord),
   };
-  const mailbox = options.mailbox ?? createMailbox({ namespace, status, ...(options.ownership === undefined ? {} : { ownership: options.ownership }) });
+  const mailbox = options.mailbox ?? createMailbox({ namespace, status, log, ...(options.ownership === undefined ? {} : { ownership: options.ownership }) });
 
   // The D4 reattach sweep rides this start: classify every recorded child of
   // every `awaiting_handoff`/`recovery_pending` run, reattach the exact
@@ -337,7 +337,8 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
       // its mailbox has room; the record clears only when durably written.
       .then(() => mailbox.retryPendingGaps())
       .catch((error: unknown) => {
-        log(`herdr-tools-daemon heartbeat write failed: ${error instanceof Error ? error.message : String(error)}`);
+        const code = error !== null && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "write_failed";
+        log(`daemon_status_write_failed error_class=${code}`);
       });
   }, options.heartbeatMs ?? DAEMON_HEARTBEAT_MS);
   heartbeat.unref();
@@ -441,6 +442,7 @@ if (process.argv[1] !== undefined) {
           // matter what this set contains. A code default only — the N5.3
           // owner gate still controls activation.
           hintKinds: ["pi", "claude", "devin"],
+          log: (line) => process.stderr.write(`${line}\n`),
         });
         const runs = await resolveHandoffNamespace(env);
         const signal = new AbortController().signal;

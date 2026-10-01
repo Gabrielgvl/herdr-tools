@@ -77,6 +77,12 @@ export interface SharedRuntimeDeps {
    * and job-registry callbacks wire in.
    */
   wire?: (parts: { cli: HerdrCli; queueFlush: DevinQueueFlush }) => SharedRuntimeWiring;
+  /**
+   * Bounded structured diagnostic sink forwarded to the mailbox, intents,
+   * hints, and every reserved supervisor. Lines are `key=value` records —
+   * never free-form wire content.
+   */
+  log?: (line: string) => void;
 }
 
 export interface SharedRuntime {
@@ -113,6 +119,7 @@ export function createSharedRuntime(deps: SharedRuntimeDeps): SharedRuntime {
     monitorOptions: deps.env === undefined ? {} : { env: deps.env },
     ...(wiring.selfClose === undefined ? {} : { selfClose: wiring.selfClose }),
     ...(wiring.hints === undefined ? {} : { hints: wiring.hints }),
+    ...(deps.log === undefined ? {} : { log: deps.log }),
     handoffs,
     repairPrompt: (paneId, text, signal) => cli.prompt(paneId, text, signal),
   });
@@ -168,6 +175,8 @@ export interface DaemonRuntime extends SharedRuntime {
    * op below resolves the bound instance at call time.
    */
   bindMailbox(mailbox: Mailbox): void;
+  /** The daemon's bounded structured diagnostic sink, when the host supplied one. */
+  readonly log?: (line: string) => void;
   /** The §8 ownership journal surface: pending transfers, transfer/claim, retarget. */
   daemonOwnership: DaemonOwnership;
   /** The §11 idle-hint sink the runtime forwarded to its supervision registry. */
@@ -221,11 +230,12 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
         mailbox: deferredMailbox,
         namespace: deps.namespace,
         qualifiedKinds: deps.hintKinds,
+        ...(deps.log === undefined ? {} : { log: deps.log }),
       });
       return { ...host, jobs: host.jobs ?? new JobRegistry({ eventWriter: deferredEventWriter }), hints };
     },
   });
-  const intents = deps.intents ?? createIntentStore({ namespace: deps.namespace });
+  const intents = deps.intents ?? createIntentStore({ namespace: deps.namespace, ...(deps.log === undefined ? {} : { log: deps.log }) });
   const allocator = deps.allocator ?? createHandoffAllocator({ ...(deps.env === undefined ? {} : { env: deps.env }) });
   const ownership = createOwnership({
     namespace: deps.namespace,
@@ -251,6 +261,7 @@ export function createDaemonRuntime(deps: DaemonRuntimeDeps): DaemonRuntime {
     bindMailbox: (next) => {
       bound.mailbox = next;
     },
+    ...(deps.log === undefined ? {} : { log: deps.log }),
     daemonOwnership: ownership,
     hints: sink,
     eventWriter: deferredEventWriter,
@@ -275,9 +286,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** A bounded typed code carried by the cause, else the refusal's own code. */
+/** A bounded typed code: the request refusal's own `daemonCode`, else a carried cause code. */
 function codeOf(error: unknown): string | undefined {
-  const code = isRecord(error) ? error.code : undefined;
+  const code = error instanceof DaemonRequestError ? error.daemonCode : isRecord(error) ? error.code : undefined;
   return typeof code === "string" && DAEMON_CODE.test(code) ? code : undefined;
 }
 
@@ -428,15 +439,45 @@ export function daemonContextResolver(cli: DaemonCli, caller: VerifiedDaemonCall
 /**
  * The daemon request surface (§6): `launch`, `run`, and `status` — the whole
  * N2.1 surface. Unknown methods are a correlated failure, never a connection
- * failure.
+ * failure. Every request emits exactly one bounded structured line — method,
+ * the caller's hashed session prefix, the bounded idempotency key / action /
+ * run identifiers when present, the typed outcome, and the elapsed ms. Wire
+ * content beyond identifiers never logs.
  */
 export function daemonDispatcher(runtime: DaemonRuntime): DaemonRequestHandler {
-  return (request) => {
-    switch (request.method) {
-      case "launch": return handleDaemonLaunch(runtime, request.params);
-      case "run": return handleDaemonRun(runtime, request.params);
-      case "status": return handleDaemonStatus(runtime, request.params);
-      default: throw new DaemonRequestError("DAEMON_UNKNOWN_METHOD", "daemon method is not implemented");
+  return async (request) => {
+    const startedAt = Date.now();
+    const method = safeIdentifier(request.method) ? request.method.slice(0, 64) : "-";
+    const params = isRecord(request.params) ? request.params : {};
+    let mgr = "-";
+    try {
+      const claim = parseCallerClaim(params.identity);
+      if (claim.agentSession !== null) mgr = managerSessionKey(claim.agentSession).slice(0, 8);
+    } catch {
+      // A malformed identity is refused by the handler's own verification path.
+    }
+    const extras: string[] = [];
+    if (safeIdentifier(params.idempotencyKey) && params.idempotencyKey.length <= 128) extras.push(`key=${params.idempotencyKey}`);
+    if (safeIdentifier(params.action) && params.action.length <= 32) extras.push(`action=${params.action}`);
+    if (safeIdentifier(params.runId) && params.runId.length <= 128) extras.push(`run=${params.runId}`);
+    if (safeIdentifier(params.eventId) && params.eventId.length <= 128) extras.push(`event=${params.eventId}`);
+    let outcome = "reply";
+    try {
+      switch (request.method) {
+        case "launch": return await handleDaemonLaunch(runtime, params);
+        case "run": return await handleDaemonRun(runtime, params);
+        case "status": return await handleDaemonStatus(runtime, params);
+        default: throw new DaemonRequestError("DAEMON_UNKNOWN_METHOD", "daemon method is not implemented");
+      }
+    } catch (error) {
+      outcome = codeOf(error) ?? "DAEMON_REQUEST_FAILED";
+      throw error;
+    } finally {
+      try {
+        runtime.log?.(`herdr-tools-daemon request method=${method} mgr=${mgr}${extras.length === 0 ? "" : ` ${extras.join(" ")}`} outcome=${outcome} ms=${Date.now() - startedAt}`);
+      } catch {
+        /* c8 ignore -- the log sink can never fail a request. */
+      }
     }
   };
 }

@@ -1,8 +1,11 @@
-import { mkdtempSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("node:child_process", () => ({ spawn: vi.fn(() => ({ on: vi.fn(), kill: vi.fn() })) }));
 
 const scripts = join(process.cwd(), "herdr-profiles/profile-plugins/executor/scripts");
 const executor = () => import(pathToFileURL(join(scripts, "executor-project-mcp.mjs")).href);
@@ -57,11 +60,141 @@ describe("direct project memory and shared Executor routing", () => {
       listTools: async () => ({ tools: ["execute", "skills", "resume"].map(name => ({ name })) }),
       callTool: async (params: unknown) => { forwarded = params; return { content: [{ type: "text", text: "ok" }] }; },
     };
-    const handlers = createProxyHandlers(upstream);
+    const handlers = createProxyHandlers(async () => upstream);
     expect(executorToolkitUrl("https://executor.example/mcp/toolkits/coding-agents")).toBe("https://executor.example/mcp/toolkits/coding-agents?artifacts=false");
     expect((await handlers.listTools()).tools.map(({ name }: { name: string }) => name)).toEqual(["execute", "skills", "resume"]);
     const params = { name: "execute", arguments: { code: "return 1" } };
     expect(await handlers.callTool({ params })).toEqual({ content: [{ type: "text", text: "ok" }] });
     expect(forwarded).toEqual(params);
+  });
+
+  it("reconnects once after a transport-level session loss, then returns the retry", async () => {
+    const { createProxyHandlers } = await executor();
+    const calls: unknown[] = [];
+    let connects = 0;
+    const sessionLost = () => Object.assign(new Error("Session not found"), { code: -32001 });
+    const clients = [
+      { callTool: async (params: unknown) => { calls.push(params); throw sessionLost(); } },
+      { callTool: async (params: unknown) => { calls.push(params); return { content: [{ type: "text", text: "ok" }] }; } },
+    ];
+    const handlers = createProxyHandlers(async () => clients[connects++]);
+    const params = { name: "execute", arguments: { code: "1" } };
+    expect(await handlers.callTool({ params })).toEqual({ content: [{ type: "text", text: "ok" }] });
+    expect(connects).toBe(2);
+    expect(calls).toEqual([params, params]);
+  });
+
+  it("drops the cached client when its transport closes so the next call reconnects", async () => {
+    const { createProxyHandlers } = await executor();
+    let connects = 0;
+    const clients: Array<{ callTool: () => Promise<unknown>; onclose?: () => void }> = [];
+    const handlers = createProxyHandlers(async () => {
+      connects += 1;
+      const client = { callTool: async () => ({ ok: true }) };
+      clients.push(client);
+      return client;
+    });
+    await handlers.callTool({ params: {} });
+    await handlers.callTool({ params: {} });
+    expect(connects).toBe(1);
+    clients[0]!.onclose!();
+    await handlers.callTool({ params: {} });
+    expect(connects).toBe(2);
+  });
+
+  it("propagates a second transport loss instead of retrying in a loop", async () => {
+    const { createProxyHandlers } = await executor();
+    let connects = 0;
+    const errors = [
+      Object.assign(new Error("Connection closed"), { code: -32000 }),
+      Object.assign(new Error("Session not found"), { code: -32001 }),
+    ];
+    const handlers = createProxyHandlers(async () => { connects += 1; return { callTool: async () => { throw errors[Math.min(connects - 1, errors.length - 1)]; } }; });
+    await expect(handlers.callTool({ params: {} })).rejects.toMatchObject({ code: -32001 });
+    expect(connects).toBe(2);
+  });
+
+  it("propagates non-transport errors without reconnecting", async () => {
+    const { createProxyHandlers } = await executor();
+    let connects = 0;
+    const failures = [Object.assign(new Error("invalid params"), { code: -32602 }), "plain failure", { code: "string-code" }];
+    for (const failure of failures) {
+      const handlers = createProxyHandlers(async () => { connects += 1; return { callTool: async () => { throw failure; } }; });
+      await expect(handlers.callTool({ params: {} })).rejects.toBe(failure);
+    }
+    expect(connects).toBe(3);
+  });
+
+  it("coalesces concurrent first calls into one connection and close() ends the cached upstream", async () => {
+    const { createProxyHandlers } = await executor();
+    let connects = 0;
+    let closed = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const handlers = createProxyHandlers(async () => {
+      connects += 1;
+      await gate;
+      return { callTool: async () => ({}), listTools: async () => ({ tools: [] }), close: async () => { closed = true; } };
+    });
+    const pending = Promise.all([handlers.callTool({ params: {} }), handlers.listTools()]);
+    release();
+    await pending;
+    expect(connects).toBe(1);
+    await handlers.close();
+    expect(closed).toBe(true);
+  });
+});
+
+describe("hindsight wrapper process replacement", () => {
+  function boundLane() {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "hindsight-main-")));
+    const workdir = join(root, "lane");
+    mkdirSync(workdir, { recursive: true });
+    const config = join(root, "config.json");
+    writeFileSync(config, JSON.stringify({ mapPathToBank: { [root]: "bank" } }));
+    const argv = process.argv;
+    process.argv = [argv[0]!, argv[1]!, "pi"];
+    vi.stubEnv("HINDSIGHT_CONFIG", config);
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(workdir);
+    return { workdir, restore: () => { process.argv = argv; vi.unstubAllEnvs(); cwd.mockRestore(); } };
+  }
+
+  it("execve-replaces the wrapper with the real server on the canonical cwd", async () => {
+    const { main } = await hindsight();
+    const { workdir, restore } = boundLane();
+    const chdir = vi.spyOn(process, "chdir").mockImplementation(() => {});
+    const execve = vi.spyOn(process, "execve").mockImplementation(() => undefined as never);
+    try {
+      main();
+      expect(chdir).toHaveBeenCalledWith(workdir);
+      expect(execve).toHaveBeenCalledWith(
+        process.execPath,
+        [process.execPath, expect.stringContaining("mcp-server.js")],
+        expect.objectContaining({ HINDSIGHT_MCP_PROJECT_CWD: workdir, HINDSIGHT_MCP_HARNESS: "pi" }),
+      );
+      expect(vi.mocked(spawn)).not.toHaveBeenCalled();
+    } finally {
+      chdir.mockRestore();
+      execve.mockRestore();
+      restore();
+    }
+  });
+
+  it("keeps the spawn shim only for Node versions without execve", async () => {
+    const { main } = await hindsight();
+    const { workdir, restore } = boundLane();
+    const descriptor = Object.getOwnPropertyDescriptor(process, "execve")!;
+    Object.defineProperty(process, "execve", { configurable: true, writable: true, value: undefined });
+    try {
+      main();
+      expect(vi.mocked(spawn)).toHaveBeenCalledWith(
+        process.execPath,
+        [expect.stringContaining("mcp-server.js")],
+        expect.objectContaining({ cwd: workdir, stdio: "inherit", env: expect.objectContaining({ HINDSIGHT_MCP_HARNESS: "pi" }) }),
+      );
+    } finally {
+      Object.defineProperty(process, "execve", descriptor);
+      restore();
+    }
   });
 });

@@ -42,7 +42,7 @@ import {
   parseDaemonLine,
 } from "./protocol.js";
 
-export type DaemonClientErrorCode = "DAEMON_UNAVAILABLE" | "PROTOCOL_MISMATCH";
+export type DaemonClientErrorCode = "DAEMON_UNAVAILABLE" | "PROTOCOL_MISMATCH" | "DAEMON_REQUEST_TIMEOUT";
 
 export class DaemonClientError extends Error {
   constructor(readonly code: DaemonClientErrorCode, message: string, readonly details: Record<string, unknown> = {}) {
@@ -213,7 +213,13 @@ export class DaemonClientSocket {
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(unavailable("daemon request timed out"));
+        // A request deadline is distinct from a dead socket: the daemon may
+        // still be executing the request, so the rejection names the method
+        // and the caller-supplied idempotency key for the reconcile path.
+        reject(new DaemonClientError("DAEMON_REQUEST_TIMEOUT", "daemon request timed out", {
+          method,
+          ...(typeof params.idempotencyKey === "string" ? { idempotencyKey: params.idempotencyKey } : {}),
+        }));
       }, this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {

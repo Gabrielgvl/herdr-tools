@@ -330,7 +330,59 @@ describe("daemonDispatcher", () => {
       await expect(request(method, {})).rejects.toMatchObject({ daemonCode: "CALLER_IDENTITY_MALFORMED" });
     }
     await expect(request("run", { action: "observe" })).rejects.toMatchObject({ daemonCode: "CALLER_IDENTITY_MALFORMED" });
-    expect(() => request("restart", {})).toThrowError(expect.objectContaining({ daemonCode: "DAEMON_UNKNOWN_METHOD" }));
+    await expect(request("restart", {})).rejects.toMatchObject({ daemonCode: "DAEMON_UNKNOWN_METHOD" });
+  });
+
+  it("emits exactly one bounded request line per request, identifiers only", async () => {
+    const { env, namespace: ns } = await namespace();
+    const stub = execStub();
+    const lines: string[] = [];
+    const runtime = createDaemonRuntime({ exec: stub.exec, env, namespace: ns, log: (line) => lines.push(line) });
+    runtimes.push(runtime);
+    const dispatch = daemonDispatcher(runtime);
+    await expect(dispatch({ id: "r", method: "status", params: {} })).rejects.toMatchObject({ daemonCode: "CALLER_IDENTITY_MALFORMED" });
+    const runId = "232d34d5-426b-424d-9eeb-8de5d93fd91e";
+    await expect(dispatch({ id: "r", method: "run", params: { action: "observe", runId, eventId: "e9" } }))
+      .rejects.toMatchObject({ daemonCode: "CALLER_IDENTITY_MALFORMED" });
+    // A non-identifier method field is scrubbed, and wire content never logs.
+    await expect(dispatch({ id: "r", method: "status\ninjected", params: { task: { objective: "never logged" } } }))
+      .rejects.toMatchObject({ daemonCode: "DAEMON_UNKNOWN_METHOD" });
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/^herdr-tools-daemon request method=status mgr=- outcome=CALLER_IDENTITY_MALFORMED ms=\d+$/);
+    expect(lines[1]).toMatch(new RegExp(`^herdr-tools-daemon request method=run mgr=- action=observe run=${runId} event=e9 outcome=CALLER_IDENTITY_MALFORMED ms=\\d+$`));
+    expect(lines[2]).toMatch(/^herdr-tools-daemon request method=- mgr=- outcome=DAEMON_UNKNOWN_METHOD ms=\d+$/);
+    expect(lines.join("\n")).not.toContain("never logged");
+  });
+
+  it("bounds the request line under hostile inputs and labels a foreign failure", async () => {
+    const { env, namespace: ns } = await namespace();
+    const stub = execStub();
+    const lines: string[] = [];
+    const runtime = createDaemonRuntime({ exec: stub.exec, env, namespace: ns, log: (line) => lines.push(line) });
+    runtimes.push(runtime);
+    const dispatch = daemonDispatcher(runtime);
+
+    // A non-record params degrades to `{}` — the line still emits.
+    await expect(dispatch({ id: "r", method: "status", params: [] as unknown as Record<string, unknown> }))
+      .rejects.toMatchObject({ daemonCode: "CALLER_IDENTITY_MALFORMED" });
+    // A claim carrying the native session resolves the manager prefix (the
+    // request itself may settle either way against the empty test stores).
+    await Promise.resolve(dispatch({ id: "r", method: "status", params: { identity: claim } })).catch(() => undefined);
+    // A safe idempotency key joins the line's bounded extras.
+    await expect(dispatch({ id: "r", method: "launch", params: { idempotencyKey: "idem-boundary" } }))
+      .rejects.toMatchObject({ daemonCode: "CALLER_IDENTITY_MALFORMED" });
+
+    const mgrPrefix = managerSessionKey(managerSession).slice(0, 8);
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/^herdr-tools-daemon request method=status mgr=- outcome=CALLER_IDENTITY_MALFORMED ms=\d+$/);
+    expect(lines[1]).toMatch(new RegExp(`^herdr-tools-daemon request method=status mgr=${mgrPrefix} outcome=[A-Z_]+ ms=\\d+$`));
+    expect(lines[2]).toMatch(/^herdr-tools-daemon request method=launch mgr=- key=idem-boundary outcome=CALLER_IDENTITY_MALFORMED ms=\d+$/);
+
+    // A foreign throw escaping the handler — before any typed wrap runs —
+    // still logs the uncodeable-failure outcome, never a raw error body.
+    const foreign = daemonDispatcher({ log: (line: string) => lines.push(line), get cli(): never { throw new Error("cli exploded"); } } as unknown as DaemonRuntime);
+    await expect(foreign({ id: "r", method: "status", params: {} })).rejects.toThrow("cli exploded");
+    expect(lines[3]).toMatch(/^herdr-tools-daemon request method=status mgr=- outcome=DAEMON_REQUEST_FAILED ms=\d+$/);
   });
 });
 

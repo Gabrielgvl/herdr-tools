@@ -294,6 +294,11 @@ export interface SupervisorDependencies {
    * no hints.
    */
   hints?: IdleHintSink;
+  /**
+   * Bounded structured diagnostic sink for settle/retire decisions. Lines are
+   * `key=value` records — never free-form content.
+   */
+  log?: (line: string) => void;
 }
 
 export class SupervisionBindError extends Error {
@@ -346,6 +351,14 @@ const inertBindingPublication: SupervisionChildBindingPublication = {
 const EVIDENCE_OVERFLOW_CAUSES: ReadonlySet<string> = new Set(["assignment_over_budget", "trace_over_budget", "state_over_budget"]);
 /** The seam-side failures that are those same budgets refusing a window. */
 const EVIDENCE_OVERFLOW_FAILURES: ReadonlySet<string> = new Set(["record_exceeds_budget", "window_exceeds_budget"]);
+
+/**
+ * Hysteresis for reconciliation flapping: an intermittent snapshot must fail
+ * this many times in a row before a `reconciliation_degraded` event announces,
+ * and only an announced episode emits `reconciliation_recovered`. The degraded
+ * flag itself still flips on the first failure so the view stays truthful.
+ */
+const SUPERVISION_RECONCILIATION_DEGRADED_EVENT_THRESHOLD = 3;
 
 /** One emitted Tier-0 wake paired with its closed violation kind, for the durable append that follows it. */
 interface Tier0ViolationReport {
@@ -430,6 +443,8 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private reconciliationLastSuccessAtMs: number | undefined;
   private reconciliationLastFailureAtMs: number | undefined;
   private reconciliationLastFailureReason: ReconciliationFailureReason | undefined;
+  /** The currently-degraded episode crossed the announce threshold and owes a `recovered` event on success. */
+  private reconciliationAnnounced = false;
   private reviewerDegraded = false;
   private lastReviewAtMs: number | undefined;
   private workingSinceMs: number | undefined;
@@ -467,6 +482,11 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private stopped = false;
   /** The bound managed run, retained so its evidence still projects after the gate drops a resolved run. */
   private boundHandoff: { gate: HandoffGate; run: HandoffRun } | undefined;
+  /**
+   * True once the bound run recorded `handed_off`: reviews stop, the monitor
+   * observer drops, and material events end — only local history still records.
+   */
+  private retired = false;
   /**
    * The managed run's recorded owner (D5). While it is absent from the
    * authoritative snapshot `reviewsPaused` holds — reviewer cadence keeps
@@ -1028,9 +1048,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   async onReconciliationSnapshot(snapshot: HerdrSnapshot): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || this.retired) return;
     await this.serialize(async () => {
-      if (this.stopped || this.isSettled()) return;
+      if (this.stopped || this.isSettled() || this.retired) return;
       if (this.provisional !== undefined && !this.bindingPublished) {
         this.applyProvisionalSnapshot(snapshot, "periodic_snapshot");
         return;
@@ -1041,7 +1061,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   onReconciliationFailure(reason: ReconciliationFailureReason): void {
-    if (this.stopped || this.isSettled()) return;
+    if (this.stopped || this.isSettled() || this.retired) return;
     if (this.provisional !== undefined && !this.bindingPublished) {
       this.markProvisionalFailure(`reconciliation_${reason}`);
       return;
@@ -1052,14 +1072,14 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
 
   onMonitorDegraded(reason: string): void {
     // A reservation is not yet supervising anything, so it has no health to report.
-    if (this.stopped || (this.identity === undefined && this.provisional === undefined) || this.isSettled() || this.eventStreamDegraded) return;
+    if (this.stopped || this.retired || (this.identity === undefined && this.provisional === undefined) || this.isSettled() || this.eventStreamDegraded) return;
     this.eventStreamDegraded = true;
     this.refreshActiveState();
     this.emit("monitor_degraded", `supervision lost its Herdr event connection (${reason}) and is retrying`, { reason });
   }
 
   onMonitorRecovered(): void {
-    if (this.stopped || (this.identity === undefined && this.provisional === undefined) || this.isSettled() || !this.eventStreamDegraded) return;
+    if (this.stopped || this.retired || (this.identity === undefined && this.provisional === undefined) || this.isSettled() || !this.eventStreamDegraded) return;
     this.eventStreamDegraded = false;
     this.refreshActiveState();
     this.emit("monitor_recovered", "supervision restored its Herdr event connection");
@@ -1421,6 +1441,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * read each rather than coalesced.
    */
   private async reconcile(trigger: string): Promise<void> {
+    // Defensive: the observer already dropped at retire, so this only guards a
+    // fold-triggered reconcile racing the handoff commit.
+    if (this.retired) return;
     let snapshot: HerdrSnapshot;
     try {
       snapshot = await this.deps.monitor.snapshot();
@@ -1656,10 +1679,16 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.reconciliationConsecutiveFailures = Math.min(Number.MAX_SAFE_INTEGER, this.reconciliationConsecutiveFailures + 1);
     if (this.reconciliationDegraded) {
       this.publish(`authoritative reconciliation remains degraded (${reason})`);
-      return;
+    } else {
+      this.reconciliationDegraded = true;
+      this.refreshActiveState();
     }
-    this.reconciliationDegraded = true;
-    this.refreshActiveState();
+    // Hysteresis: the flag flips on the first failure so the view stays
+    // truthful, but the event — and the mailbox write and owner wake it would
+    // carry — waits for a sustained failure. An intermittent flap stays
+    // publish-only.
+    if (this.reconciliationAnnounced || this.reconciliationConsecutiveFailures < SUPERVISION_RECONCILIATION_DEGRADED_EVENT_THRESHOLD) return;
+    this.reconciliationAnnounced = true;
     this.emit("reconciliation_degraded", "authoritative supervision reconciliation is degraded and will retry", { reason });
   }
 
@@ -1672,6 +1701,10 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (!this.reconciliationDegraded) return;
     this.reconciliationDegraded = false;
     this.refreshActiveState();
+    // An episode that never announced owes no recovery event — the pair is
+    // emitted only when the degradation itself was.
+    if (!this.reconciliationAnnounced) return;
+    this.reconciliationAnnounced = false;
     this.emit("reconciliation_recovered", "authoritative supervision reconciliation recovered");
   }
 
@@ -1738,7 +1771,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     }
     this.workingSinceMs = this.deps.clock.now();
     this.workingRun += 1;
-    this.armReview(this.deps.cadenceMs);
+    // A working transition after handoff reopens the artifact cycle but never
+    // re-arms the paid reviewer — the run's outcome is already durable.
+    if (!this.retired) this.armReview(this.deps.cadenceMs);
   }
 
   private armReview(delayMs: number): void {
@@ -2168,7 +2203,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * re-arming, so a run that is merely waiting for its exact pane keeps ticking.
    */
   private reviewRunLive(run?: number): boolean {
-    if (this.stopped || this.isSettled() || this.status !== "working") return false;
+    if (this.stopped || this.isSettled() || this.retired || this.status !== "working") return false;
     return run === undefined || this.workingRun === run;
   }
 
@@ -2197,6 +2232,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private emit(type: SupervisionEventType, summary: string, details?: Record<string, string | number | boolean>, decision?: MailboxDecision): SupervisionEvent {
     const event = this.log.record(type, this.deps.clock.now(), summary, details);
     this.publish(`${type}: ${summary}`);
+    // After the run hands off, idle/done flaps are bookkeeping: the local
+    // history still records for `view()`/diagnosis, but no mailbox write,
+    // owner wake, or hint follows. `blocked` still emits — a stuck child is
+    // never noise — and so does anything in a reopened artifact cycle, where
+    // the child demonstrably worked past the accepted version.
+    if (this.retired && type !== "blocked" && this.managedRun()?.run.cycleOpen !== true) return event;
     this.persistEmittedEvent(event, decision);
     // The wake payload is fixed at emission: a deferred suppression decision
     // must never re-read an identity the settle in between may have dropped.
@@ -2319,6 +2360,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
     this.completionRetry = undefined;
     this.deps.monitor.removeObserver(this);
+    this.logLine(`supervisor_settled job=${this.deps.jobId} outcome=${outcome} reason=${reason.replace(/\s+/gu, "_").slice(0, 128)}`);
     this.publish(`supervision settled ${outcome}`);
     this.resolveSettled(this.settlement);
   }
@@ -2343,6 +2385,28 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     void this.serialize(() => this.evaluateHandoff()).catch(() => undefined);
   }
 
+  /** The bounded diagnostic sink — a throwing one must never disturb supervision. */
+  private logLine(line: string): void {
+    try {
+      this.deps.log?.(line);
+    } catch {
+      // Diagnostic-only.
+    }
+  }
+
+  /**
+   * A `handed_off` run's durable outcome is recorded: the paid review cadence
+   * ends, reconciliation bookkeeping stops, and emissions narrow to `blocked`
+   * and reopened-cycle events — a child that demonstrably worked past the
+   * accepted artifact still surfaces. The observer stays attached so that
+   * reopen is detected; the settled-path teardown still removes it.
+   */
+  private retireAfterHandoff(runId: string): void {
+    this.retired = true;
+    this.clearReviewTimer();
+    this.logLine(`supervisor_retired job=${this.deps.jobId} run=${runId} outcome=handed_off`);
+  }
+
   /**
    * One managed terminal observation: the current-cycle artifact hands the run
    * off when it validates; otherwise the exact child earns at most one repair
@@ -2351,7 +2415,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * repair signal, never a settlement and never evidence.
    */
   private async evaluateHandoff(): Promise<void> {
-    if (this.stopped || this.isSettled()) return;
+    if (this.stopped || this.isSettled() || this.retired) return;
     if (this.status !== "idle" && this.status !== "done" && this.status !== "blocked") return;
     const managed = this.managedRun();
     if (managed === undefined || managed.run.lifecycle !== "awaiting_handoff") return;
@@ -2363,7 +2427,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         await gate.recordOutcome(run, "handed_off");
       } catch {
         // An unpersisted outcome is re-evaluated by the next observation or shutdown.
+        return;
       }
+      this.retireAfterHandoff(run.runId);
       return;
     }
     // A typed provider limit cannot justify a repair prompt. Before repairing,
@@ -2578,6 +2644,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (this.isSettled()) return;
     this.state = "settled";
     this.settlement = { outcome: "cancelled", reason: "manager_session_shutdown" };
+    this.logLine(`supervisor_settled job=${this.deps.jobId} outcome=cancelled reason=manager_session_shutdown`);
     this.resolveSettled(this.settlement);
   }
 
@@ -2599,6 +2666,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (this.isSettled()) return;
     this.state = "settled";
     this.settlement = { outcome: "failed", reason };
+    this.logLine(`supervisor_settled job=${this.deps.jobId} outcome=failed reason=${reason.replace(/\s+/gu, "_").slice(0, 128)}`);
     this.resolveSettled(this.settlement);
   }
 }

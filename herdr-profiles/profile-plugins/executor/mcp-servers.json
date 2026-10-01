@@ -1,14 +1,14 @@
 {
   "executor": {
     "type": "stdio",
-    "command": "/home/gabriel/.volta/bin/node",
+    "command": "/home/gabriel/.volta/tools/image/node/25.9.0/bin/node",
     "args": [
       "${CLAUDE_PLUGIN_ROOT}/scripts/executor-project-mcp.mjs"
     ]
   },
   "hindsight": {
     "type": "stdio",
-    "command": "/home/gabriel/.volta/bin/node",
+    "command": "/home/gabriel/.volta/tools/image/node/25.9.0/bin/node",
     "args": [
       "${CLAUDE_PLUGIN_ROOT}/scripts/hindsight-project-mcp.mjs",
       "claude-code"

@@ -210,6 +210,15 @@ export interface DevinQueueFlush {
   begin(): void;
   shutdown(): Promise<void>;
   schedule(request: DevinQueueFlushRequest): void;
+  /**
+   * One observed-composer submission for a launch-time initial prompt the ack
+   * cannot prove Devin consumed: under the shared write lock, prove the
+   * acknowledged identity still occupies the pane and the composer still holds
+   * unsent content — non-placeholder input text or a `○` queued row — then
+   * send exactly one Enter, fenced so the same frame can never be pressed
+   * twice. Every missed or refused condition resolves false, no key.
+   */
+  submitIfUnsent(paneId: string, submission: PromptTargetIdentity, signal: AbortSignal): Promise<boolean>;
   writeSection(paneId: string): Promise<PaneWriteLease>;
 }
 
@@ -388,6 +397,39 @@ export function createDevinQueueFlush(deps: DevinQueueFlushDeps): DevinQueueFlus
         // Retire the entry only while nothing newer chained behind this tail.
         if (entry.tail === tail) current.panes.delete(paneId);
       });
+    },
+    async submitIfUnsent(paneId, submission, signal) {
+      const lease = await deps.guard.acquire(paneId, { waitMs: deps.sectionWaitMs ?? PANE_WRITE_LOCK_WAIT_MS });
+      try {
+        const candidate = await readComposer(paneId, signal);
+        // Unsent content is a draft on the input line or a queued row; a clean
+        // composer proves the acknowledged write was already consumed.
+        if (candidate === undefined || (!candidate.queued && candidate.inputEmpty)) return false;
+        // Fresh same-occupant join — the acknowledged identity must still be
+        // the occupant. No state gate: the unsent draft is exactly the case
+        // where the pane reads idle/done, and a working pane with queued
+        // content earns the same completing Enter.
+        const agent = agentFrom((await deps.cli.runJson(["agent", "get", paneId], signal)).result);
+        const pane = paneFrom((await deps.cli.runJson(["pane", "get", paneId], signal)).result, paneId);
+        const fresh = requirePromptTargetIdentity([agent, pane], paneId);
+        if (!samePromptTargetIdentity(fresh, submission)) return false;
+        // A frame identical on the second read is a settled render, not a
+        // paste still mid-paint that an Enter would submit half-formed.
+        const final = await readComposer(paneId, signal);
+        if (final === undefined || (!final.queued && final.inputEmpty) || final.interior !== candidate.interior) return false;
+        const bound = devinFlushIdentityDigest(fresh);
+        const frame = devinFlushFrameDigest(final.interior);
+        if (await lease.fence.isSpent(bound, frame)) return false;
+        if (signal.aborted) return false;
+        await lease.check();
+        // Record the spent frame BEFORE dispatch, exactly like pressOnce: a
+        // crashed or uncertain send must never invite a retry of this frame.
+        await lease.fence.record(bound, frame);
+        await deps.cli.runJson(["agent", "send-keys", paneId, "enter"], signal);
+        return true;
+      } finally {
+        await lease.release();
+      }
     },
     writeSection(paneId) {
       return deps.guard.acquire(paneId, { waitMs: deps.sectionWaitMs ?? PANE_WRITE_LOCK_WAIT_MS });

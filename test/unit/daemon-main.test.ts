@@ -343,7 +343,7 @@ describe("daemon startup and lifecycle record", () => {
       },
     });
     await vi.waitFor(() => {
-      expect(lines.some((line) => line.includes("heartbeat write failed: clock broke"))).toBe(true);
+      expect(lines.some((line) => line.includes("daemon_status_write_failed") && line.includes("error_class="))).toBe(true);
     });
     const client = await connect(fx);
     await expect(client.request("echo", { alive: true })).resolves.toEqual({ alive: true });
@@ -356,7 +356,7 @@ describe("daemon startup and lifecycle record", () => {
     await rm(fx.statusPath);
     await mkdir(fx.statusPath);
     await vi.waitFor(() => {
-      expect(stderr.mock.calls.some(([text]) => String(text).includes("heartbeat write failed"))).toBe(true);
+      expect(stderr.mock.calls.some(([text]) => String(text).includes("daemon_status_write_failed"))).toBe(true);
     });
     const client = await connect(fx);
     await expect(client.request("echo", { alive: true })).resolves.toEqual({ alive: true });
@@ -364,6 +364,19 @@ describe("daemon startup and lifecycle record", () => {
     await rm(fx.statusPath, { recursive: true });
     await daemon.shutdown();
     expect((await readStatus(fx)).lastStoppedAt).toBeDefined();
+  });
+
+  it("forwards the ownership seam to the default mailbox when no mailbox is injected", async () => {
+    const fx = await fixture();
+    const seen: string[] = [];
+    const daemon = await start(fx, {
+      // A run event resolves its destination through this seam — the stub
+      // being consulted proves it reached the internally created mailbox.
+      ownership: { ownerOfRun: async (runId) => { seen.push(runId); return mgr; } },
+    });
+    const written = await daemon.mailbox.writeRunEvent({ kind: "work_cycle_completed", runId: "run-7", jobId: "job-1" });
+    expect(written).toMatchObject({ persisted: true });
+    expect(seen).toEqual(["run-7"]);
   });
 });
 

@@ -11,6 +11,7 @@
 
 import { Value } from "typebox/value";
 import { realpath, stat } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { IdempotencyKeySchema, LaunchTaskSchema, type LaunchTask } from "../../launch-schema.js";
 import {
@@ -74,6 +75,14 @@ function thrownCode(error: unknown): string | undefined {
   return safeCode(isRecord(error) ? error.code : undefined);
 }
 
+/** The bounded launch-pipeline phase a thrown launch carried in its own details. */
+function thrownPhase(error: unknown): string | undefined {
+  const details = isRecord(error) && isRecord(error.details) ? error.details : undefined;
+  const phase = details?.phase;
+  /* c8 ignore next -- the pipeline sets `phase` from a typed union; a foreign shape still settles without one. */
+  return typeof phase === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(phase) ? phase : undefined;
+}
+
 /** The certainty a thrown launch carried in its own details, else fail-closed `unknown`. */
 function thrownCertainty(error: unknown): LaunchEffectCertainty {
   /* c8 ignore next -- the pipeline throws only LaunchError records; a foreign thrown shape stays fail-closed. */
@@ -86,7 +95,10 @@ function thrownCertainty(error: unknown): LaunchEffectCertainty {
 /**
  * The caller's claimed canonical project root (§6 D2a): it must canonicalize
  * to itself and be an accessible directory — the verified value becomes
- * `deps.cwd`, never a silently substituted path.
+ * `deps.cwd`, never a silently substituted path. The evidence contract it
+ * anchors is git-derived, so the same work-tree proof the launch `cwd` check
+ * applies holds here: a `.git` entry (directory or worktree-pointer file) on
+ * the root or an ancestor, else `PROJECT_ROOT_NOT_GIT` before any effect.
  */
 async function verifyProjectRoot(value: unknown): Promise<string> {
   if (typeof value !== "string" || value.length === 0) throw new DaemonRequestError("PROJECT_ROOT_UNVERIFIED");
@@ -99,7 +111,17 @@ async function verifyProjectRoot(value: unknown): Promise<string> {
     throw new DaemonRequestError("PROJECT_ROOT_UNVERIFIED");
   }
   if (resolved !== value || !stats.isDirectory()) throw new DaemonRequestError("PROJECT_ROOT_UNVERIFIED");
-  return resolved;
+  let dir = resolved;
+  for (;;) {
+    try {
+      await stat(join(dir, ".git"));
+      return resolved;
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) throw new DaemonRequestError("PROJECT_ROOT_NOT_GIT");
+      dir = parent;
+    }
+  }
 }
 
 /**
@@ -180,10 +202,12 @@ async function executeDaemonLaunch(
   try {
     if (result === undefined) {
       const failureCode = thrownCode(thrown);
+      const failurePhase = thrownPhase(thrown);
       settled = await runtime.intents.fail(intent, {
         effectCertainty: thrownCertainty(thrown),
         /* c8 ignore next -- the pipeline only throws coded errors; an uncodeable thrown shape still settles without a code. */
         ...(failureCode === undefined ? {} : { failureCode }),
+        ...(failurePhase === undefined ? {} : { failurePhase }),
         children,
       });
     } else if (result.outcome === "failed") {

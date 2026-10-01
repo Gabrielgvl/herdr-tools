@@ -706,11 +706,18 @@ export function createMailbox(options: MailboxOptions): Mailbox {
     const dirs = await managerDirs(key, true);
     /* c8 ignore next -- a manager directory created this section is undefined only if it vanished between mkdir and lstat. */
     if (dirs === undefined) throw failure("Mailbox directory is unavailable");
+    // One bounded structured line per refusal: the hashed manager prefix, the
+    // reason class, and the event ID — never the payload.
+    const refused = (reason: "capacity" | "unavailable" | "collision"): void => {
+      log(`herdr-tools-daemon mailbox_write_refused mgr=${key.slice(0, 8)} reason=${reason} event=${eventId}`);
+    };
     if (atCap(counts, key, Buffer.byteLength(data, "utf8"))) {
       if (hold !== undefined && await recordFailure(key, at, hold)) {
+        refused("capacity");
         return { persisted: false, persistenceFailed: true, eventId, reason: "capacity", at, pendingGap: true };
       }
       await recordFailure(key, at);
+      refused("capacity");
       return { persisted: false, persistenceFailed: true, eventId, reason: "capacity", at };
     }
     let outcome: "written" | "collision";
@@ -718,12 +725,14 @@ export function createMailbox(options: MailboxOptions): Mailbox {
       outcome = await writeEventFile(dirs.unread, eventId, data);
     } catch {
       await recordFailure(key, at);
+      refused("unavailable");
       return { persisted: false, persistenceFailed: true, eventId, reason: "unavailable", at };
     }
     if (outcome === "collision") {
       // Never overwritten; the existing file is left byte-identical and the
       // refusal is accounted as a loss of this payload.
       await recordFailure(key, at);
+      refused("collision");
       return { persisted: false, persistenceFailed: true, eventId, reason: "collision", at };
     }
     await recordCapacity(await scanCounts());
@@ -921,7 +930,10 @@ export function createMailbox(options: MailboxOptions): Mailbox {
       assertManagerSessionKey(key);
       return admissionLocks(key, async () => {
         const counts = await scanCounts();
-        if (atCap(counts, key, 0)) return { ok: false, code: "MAILBOX_CAPACITY", at: now().toISOString() };
+        if (atCap(counts, key, 0)) {
+          log(`herdr-tools-daemon mailbox_write_refused mgr=${key.slice(0, 8)} reason=capacity event=launch`);
+          return { ok: false, code: "MAILBOX_CAPACITY", at: now().toISOString() };
+        }
         return { ok: true };
       });
     },

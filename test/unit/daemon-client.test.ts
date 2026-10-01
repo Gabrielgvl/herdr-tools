@@ -630,7 +630,13 @@ describe("daemon client socket", () => {
     const client = new DaemonClientSocket(stream, { requestTimeoutMs: 5 });
     stream.push(`${JSON.stringify({ type: "ack", version: DAEMON_PROTOCOL_VERSION })}\n`);
     await client.ready;
-    await expect(client.request("echo", {})).rejects.toMatchObject({ code: "DAEMON_UNAVAILABLE" });
+    await expect(client.request("echo", {})).rejects.toMatchObject({ code: "DAEMON_REQUEST_TIMEOUT", details: { method: "echo" } });
+    // The timeout details carry the caller's idempotency key when present —
+    // the same key the caller needs to reconcile a possibly-still-running call.
+    await expect(client.request("launch", { idempotencyKey: "idem-7" })).rejects.toMatchObject({
+      code: "DAEMON_REQUEST_TIMEOUT",
+      details: { method: "launch", idempotencyKey: "idem-7" },
+    });
     expect(client.isClosed()).toBe(false);
   });
 
@@ -860,7 +866,7 @@ describe("daemon typed call layer", () => {
     await expect(absent.launch({ task, idempotencyKey: "key-2" })).resolves.toMatchObject({ state: "failed", children: [] });
   });
 
-  it("projects transport failure, request timeout, and mid-call drop as DAEMON_UNAVAILABLE", async () => {
+  it("projects transport failure and mid-call drop as DAEMON_UNAVAILABLE, a request timeout as DAEMON_REQUEST_TIMEOUT", async () => {
     const ns = await namespace();
     await expect(connectDaemonClient({ dir: join(ns.dir, "absent"), endpoint: ns.endpoint }, caller)).rejects.toMatchObject({ code: "DAEMON_UNAVAILABLE" });
 
@@ -868,7 +874,7 @@ describe("daemon typed call layer", () => {
     const ns2 = await namespace();
     await start(ns2, { handler: () => new Promise(() => undefined) });
     const slow = await connectDaemonClient(ns2, caller, { requestTimeoutMs: 40 });
-    await expect(slow.status()).rejects.toMatchObject({ name: "DaemonCallError", code: "DAEMON_UNAVAILABLE" });
+    await expect(slow.status()).rejects.toMatchObject({ name: "DaemonCallError", code: "DAEMON_REQUEST_TIMEOUT" });
 
     const stream = fakeStream();
     const socket = new DaemonClientSocket(stream);

@@ -1,4 +1,4 @@
-#!/home/gabriel/.volta/bin/node
+#!/home/gabriel/.volta/tools/image/node/25.9.0/bin/node
 /* global AbortSignal, fetch */
 import { realpathSync } from "node:fs";
 import process from "node:process";
@@ -7,7 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 const EXECUTOR_ORIGIN = "https://dev-server.piranha-palermo.ts.net";
 const TOKEN_ENV = "/home/gabriel/.hermes/.env";
@@ -30,8 +30,46 @@ export function executorToolkitUrl(url) {
   return endpoint.toString();
 }
 
-export function createProxyHandlers(upstream) {
-  return { listTools: () => upstream.listTools(), callTool: request => upstream.callTool(request.params) };
+// A dead upstream session is either a transport close (MCP -32000) or the
+// Executor daemon's "Session not found" JSON-RPC -32001 after its restart.
+function isTransportLoss(error) {
+  return error !== null && typeof error === "object" && typeof error.code === "number"
+    && (error.code === ErrorCode.ConnectionClosed || error.code === -32001);
+}
+
+export function createProxyHandlers(connectUpstream) {
+  // The upstream is lazy and reconnects: an Executor daemon restart leaves the
+  // cached client holding a dead HTTP session, so a transport loss drops it and
+  // the next call connects fresh. One reconnect per call, never a retry loop.
+  let upstream;
+  let opening;
+  const ensureUpstream = () => {
+    if (upstream !== undefined) return Promise.resolve(upstream);
+    opening ??= connectUpstream().then(client => {
+      client.onclose = () => { if (upstream === client) upstream = undefined; };
+      upstream = client;
+      return client;
+    }).finally(() => { opening = undefined; });
+    return opening;
+  };
+  const reconnectable = async call => {
+    try {
+      return await call(await ensureUpstream());
+    } catch (error) {
+      if (!isTransportLoss(error)) throw error;
+      upstream = undefined;
+      return call(await ensureUpstream());
+    }
+  };
+  return {
+    listTools: () => reconnectable(client => client.listTools()),
+    callTool: request => reconnectable(client => client.callTool(request.params)),
+    close: async () => {
+      const client = upstream;
+      upstream = undefined;
+      await client?.close();
+    },
+  };
 }
 
 class HttpError extends Error {
@@ -103,16 +141,19 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ toolkit: TOOLKIT, memoryIncluded: false })}\n`);
     return;
   }
-  const upstream = new Client({ name: "executor-coding-agents", version: "1.0.0" });
-  await upstream.connect(new StreamableHTTPClientTransport(
-    new URL(executorToolkitUrl(`${EXECUTOR_ORIGIN}/mcp/toolkits/${TOOLKIT}`)),
-    { requestInit: { headers: { Authorization: `Bearer ${token}` } } },
-  ));
-  const handlers = createProxyHandlers(upstream);
+  const connectUpstream = async () => {
+    const client = new Client({ name: "executor-coding-agents", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(
+      new URL(executorToolkitUrl(`${EXECUTOR_ORIGIN}/mcp/toolkits/${TOOLKIT}`)),
+      { requestInit: { headers: { Authorization: `Bearer ${token}` } } },
+    ));
+    return client;
+  };
+  const handlers = createProxyHandlers(connectUpstream);
   const server = new Server({ name: "executor-coding-agents", version: "1.0.0" }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, handlers.listTools);
   server.setRequestHandler(CallToolRequestSchema, handlers.callTool);
-  server.onclose = () => upstream.close();
+  server.onclose = () => handlers.close();
   await server.connect(new StdioServerTransport());
 }
 

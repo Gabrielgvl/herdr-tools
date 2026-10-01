@@ -388,6 +388,18 @@ describe("MCP tool serving", () => {
     await harness.handle.shutdown();
   });
 
+  it("dials the production connector when no connectDaemon is injected", async () => {
+    // `connectDaemon: undefined` drops the test seam: the connect path falls
+    // through to `connectDaemonClient`, which refuses on the fixture's
+    // missing socket — so the injected fake is never consulted.
+    const harness = await start({ connectDaemon: undefined });
+    const status = await harness.client.callTool({ name: "herdr_status", arguments: {} });
+    expect(status.isError).toBe(true);
+    expect(textOf(status)).toContain("DAEMON_UNAVAILABLE");
+    expect(harness.daemon.calls).toEqual([]);
+    await harness.handle.shutdown();
+  });
+
   it("uses HERDR_PROJECT_DIR as the operational working directory and caller project root", async () => {
     const harness = await start();
     expect(harness.handle.projectDir).toBe(canonicalProjectDir);

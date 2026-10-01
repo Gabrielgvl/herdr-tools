@@ -77,9 +77,11 @@ export interface LaunchDependencies {
   /**
    * The host's shared Devin queue-flush coordinator. A Devin launch's initial
    * prompt write rides its short write section like every other participating
-   * text write; holding it never makes a launch eligible for a flush.
+   * text write, and a Devin confirmation that expires with the pane still
+   * idle/done earns one `submitIfUnsent` observed-composer Enter before the
+   * verdict stands; holding it never makes a launch eligible for a flush.
    */
-  queueFlush?: Pick<DevinQueueFlush, "writeSection">;
+  queueFlush?: Pick<DevinQueueFlush, "writeSection" | "submitIfUnsent">;
   /**
    * Required. Every successful launch creates supervision, so a host that
    * cannot supervise cannot launch. See ADR-019.
@@ -193,7 +195,9 @@ export interface PromptConfirmationEvidence {
   pollIntervalMs: number;
   elapsedMs: number;
   samples: number;
-  reason: "working" | "state_change_seq_advanced" | "timeout" | "caller_aborted" | "identity_changed" | "identity_unavailable" | "contradictory" | "read_failed";
+  reason: "working" | "state_change_seq_advanced" | "composer_resubmitted" | "timeout" | "caller_aborted" | "identity_changed" | "identity_unavailable" | "contradictory" | "read_failed";
+  /** True when the observed-composer resubmission sent one Enter during this confirmation. */
+  resubmitted?: boolean;
   baseline: PromptObservationBaseline;
   last?: Pick<PromptObservation, "status" | "state" | "stateChangeSeq" | "revision" | "screenDetectionSkipped" | "code">;
   sourceCode?: string;
@@ -310,11 +314,29 @@ export interface LaunchResult {
 const SHELL_READINESS_TIMEOUT_MS = 5_000;
 const LAUNCH_READINESS_POLL_INTERVAL_MS = 100;
 const PROMPT_CONFIRMATION_TIMEOUT_MS = 5_000;
+/**
+ * Devin's composer can hold an acknowledged paste unsent (its queue drains
+ * only on Enter), so a Devin confirmation gets a longer window plus exactly
+ * one observed-composer resubmission before the launch reports unconfirmed.
+ */
+const DEVIN_PROMPT_CONFIRMATION_TIMEOUT_MS = 15_000;
 const PROMPT_CONFIRMATION_POLL_INTERVAL_MS = 100;
 const AGENT_PANE_SHELL_SETTLE_MS = 10_000;
 const AGENT_PANE_SHELL_POLL_MS = 150;
 const LAUNCH_RECONCILIATION_TIMEOUT_MS = 5_000;
 const SPEC_EVALUATION_TIMEOUT_MS = 20_000;
+/**
+ * The client bound that must outlive a slow-but-healthy launch: the daemon's
+ * worst-case pipeline — agent start + shell readiness + pane settle + the
+ * Devin confirmation window and its one restart + spec evaluation + launch
+ * reconciliation — plus margin. A request deadline below this can report a
+ * still-running launch as unavailable while the daemon keeps creating the
+ * child.
+ */
+export const LAUNCH_REQUEST_TIMEOUT_MS =
+  HERDR_AGENT_START_TIMEOUT_MS + SHELL_READINESS_TIMEOUT_MS + AGENT_PANE_SHELL_SETTLE_MS
+  + 2 * DEVIN_PROMPT_CONFIRMATION_TIMEOUT_MS + SPEC_EVALUATION_TIMEOUT_MS
+  + LAUNCH_RECONCILIATION_TIMEOUT_MS + 15_000;
 export const LAUNCH_DIAGNOSTIC_MAX_BYTES = 8_192;
 export const LAUNCH_DIAGNOSTIC_MARKER = "HERDR_LAUNCH_DIAGNOSTIC";
 /**
@@ -336,7 +358,7 @@ export const LAUNCH_RECOVERY_GUIDANCE = Object.freeze({
   inspectBeforeRetry: "Inspect the run and your intents with herdr_status and herdr_run observe before retrying; do not assume that no agent started.",
   preserveUnconfirmed: "Inspect the intent and the run with herdr_status and herdr_run observe; do not relaunch, resend, close or reuse the pane, or continue dependent work while assignment consumption is unconfirmed.",
   noEffect: "No launch mutation was dispatched; correct the failure and retry only after validating the request.",
-  unknownEffect: "Inspect the run and your intents with herdr_status and herdr_run observe before any retry; the launch effect is unknown and must not be assumed absent."
+  unknownEffect: "Inspect the run and your intents with herdr_status and herdr_run observe, then call herdr_run reconcile with the same idempotencyKey or retry the launch with that key; the launch effect is unknown and must not be assumed absent."
 } as const);
 
 type LaunchPhase = NonNullable<LaunchDetails["phase"]>;
@@ -502,9 +524,33 @@ function mintChildName(launchId: string, ordinal: number): string {
 }
 
 /**
+ * The supervision evidence contract is git-derived, so a cwd outside every git
+ * work tree fails closed before any effect: a `.git` entry — a directory, or
+ * the pointer file a linked worktree writes — on the directory or any
+ * ancestor is the proof. An unreadable ancestor proves nothing either way, so
+ * the walk continues and only a path with no `.git` at all refuses.
+ */
+async function requireGitWorkTree(resolved: string): Promise<void> {
+  let dir = resolved;
+  while (true) {
+    try {
+      await stat(join(dir, ".git"));
+      return;
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) {
+        throw new LaunchError("CWD_NOT_GIT_REPOSITORY", "Launch cwd is not inside a git work tree", { cwd: resolved });
+      }
+      dir = parent;
+    }
+  }
+}
+
+/**
  * Canonical working directory (D13): the caller's `cwd` (or the host root by
  * default) resolved through realpath before any effect. It must exist, be a
- * directory, and be readable/searchable; anything else fails closed.
+ * directory, be readable/searchable, and sit inside a git work tree; anything
+ * else fails closed.
  */
 async function resolveLaunchCwd(rawCwd: string | undefined, root: string): Promise<string> {
   identifier(root, "cwd");
@@ -525,6 +571,7 @@ async function resolveLaunchCwd(rawCwd: string | undefined, root: string): Promi
   } catch {
     throw new LaunchError("CWD_UNAVAILABLE", "Launch cwd is not an accessible directory");
   }
+  await requireGitWorkTree(resolved);
   return resolved;
 }
 
@@ -1551,18 +1598,21 @@ function compactConfirmationObservation(observation: PromptObservation | undefin
 function promptConfirmationEvidence(
   clock: LaunchClock,
   startedAt: number,
+  timeoutMs: number,
   samples: number,
   reason: PromptConfirmationEvidence["reason"],
   baseline: PromptObservationBaseline,
   last?: PromptObservation,
-  sourceCode?: string
+  sourceCode?: string,
+  resubmitted = false
 ): PromptConfirmationEvidence {
   return {
-    timeoutMs: PROMPT_CONFIRMATION_TIMEOUT_MS,
+    timeoutMs,
     pollIntervalMs: PROMPT_CONFIRMATION_POLL_INTERVAL_MS,
     elapsedMs: monotonicDurationMs(clock, startedAt),
     samples,
     reason,
+    ...(resubmitted ? { resubmitted: true } : {}),
     baseline,
     ...(compactConfirmationObservation(last) ? { last: compactConfirmationObservation(last) } : {}),
     ...(sourceCode === undefined ? {} : { sourceCode })
@@ -1591,55 +1641,80 @@ async function confirmPromptConsumption(
   submission: PromptSubmissionEvidence,
   baseline: PromptObservationBaseline,
   clock: LaunchClock,
-  startedAt: number
+  startedAt: number,
+  submitUnsent?: (signal: AbortSignal) => Promise<boolean>
 ): Promise<{ agent: Record<string, unknown>; pane: Record<string, unknown>; observation: PromptObservation; confirmation: PromptConfirmationEvidence }> {
-  const window = createReadWindow(callerSignal, startedAt + PROMPT_CONFIRMATION_TIMEOUT_MS, clock);
+  // Devin's composer can keep an acknowledged paste unsent — the Enter that
+  // submits it may have arrived before the paste finished rendering — so a
+  // Devin target earns a longer window and exactly one observed-composer
+  // resubmission before the window's verdict stands.
+  const timeoutMs = submission.agentKind === "devin" ? DEVIN_PROMPT_CONFIRMATION_TIMEOUT_MS : PROMPT_CONFIRMATION_TIMEOUT_MS;
   let samples = 0;
   let last: PromptObservation | undefined;
-  try {
-    while (true) {
-      window.assertActive();
-      samples += 1;
-      let agent: Record<string, unknown>;
-      let pane: Record<string, unknown>;
-      try {
-        // The two authoritative reads are deliberately sequential and race one
-        // shared whole-window cancellation. No source from an earlier sample is
-        // carried forward and no prompt/start mutation is retried.
-        agent = agentGetRecord(await readWithinWindow(cli, ["agent", "get", paneId], window));
-        pane = paneRecord(await readWithinWindow(cli, ["pane", "get", paneId], window), paneId);
-      } catch (error) {
-        if (window.cancellation()) throw error;
-        const sourceCode = record(error) && typeof error.code === "string" ? error.code : "POSTSTATE_UNAVAILABLE";
-        const reason: PromptConfirmationEvidence["reason"] = sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "read_failed";
-        throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last, sourceCode), last);
+  let resubmissionAttempted = false;
+  let resubmitted = false;
+  // The first window keeps its budget anchored at the caller's start; only the
+  // resubmission retry earns a fresh window.
+  let deadline = startedAt + timeoutMs;
+  while (true) {
+    const window = createReadWindow(callerSignal, deadline, clock);
+    try {
+      while (true) {
+        window.assertActive();
+        samples += 1;
+        let agent: Record<string, unknown>;
+        let pane: Record<string, unknown>;
+        try {
+          // The two authoritative reads are deliberately sequential and race one
+          // shared whole-window cancellation. No source from an earlier sample is
+          // carried forward and no prompt/start mutation is retried.
+          agent = agentGetRecord(await readWithinWindow(cli, ["agent", "get", paneId], window));
+          pane = paneRecord(await readWithinWindow(cli, ["pane", "get", paneId], window), paneId);
+        } catch (error) {
+          if (window.cancellation()) throw error;
+          const sourceCode = record(error) && typeof error.code === "string" ? error.code : "POSTSTATE_UNAVAILABLE";
+          const reason: PromptConfirmationEvidence["reason"] = sourceCode === "TARGET_IDENTITY_UNAVAILABLE" ? "identity_unavailable" : "read_failed";
+          throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, timeoutMs, samples, reason, baseline, last, sourceCode), last);
+        }
+        last = classifyPromptObservation(agent, submission, baseline, [pane]);
+        if (last.status === "unavailable" && last.code !== "POSTSTATE_UNAVAILABLE") {
+          const reason: PromptConfirmationEvidence["reason"] = last.code === "POSTSTATE_IDENTITY_CHANGED"
+            ? "identity_changed"
+            : last.code === "POSTSTATE_IDENTITY_UNAVAILABLE"
+              ? "identity_unavailable"
+              : "contradictory";
+          throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, timeoutMs, samples, reason, baseline, last, last.code), last);
+        }
+        if (last.consumption === "confirmed") {
+          const reason: PromptConfirmationEvidence["reason"] = resubmitted
+            ? "composer_resubmitted"
+            : last.status === "working" ? "working" : "state_change_seq_advanced";
+          return { agent, pane, observation: last, confirmation: promptConfirmationEvidence(clock, startedAt, timeoutMs, samples, reason, baseline, last, undefined, resubmitted) };
+        }
+        await waitForReadPoll(window, PROMPT_CONFIRMATION_POLL_INTERVAL_MS);
       }
-      last = classifyPromptObservation(agent, submission, baseline, [pane]);
-      if (last.status === "unavailable" && last.code !== "POSTSTATE_UNAVAILABLE") {
-        const reason: PromptConfirmationEvidence["reason"] = last.code === "POSTSTATE_IDENTITY_CHANGED"
-          ? "identity_changed"
-          : last.code === "POSTSTATE_IDENTITY_UNAVAILABLE"
-            ? "identity_unavailable"
-            : "contradictory";
-        throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last, last.code), last);
+    } catch (error) {
+      if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") throw error;
+      // Every non-PromptUnconfirmed escape is the shared window's typed caller or
+      // deadline cancellation. A Devin deadline with a proven idle/done pane earns
+      // exactly one composer resubmission attempt, then one fresh window.
+      if (window.cancellation()?.reason === "deadline"
+        && !resubmissionAttempted
+        && submission.agentKind === "devin"
+        && submitUnsent !== undefined
+        && (last?.state === "idle" || last?.state === "done")) {
+        resubmissionAttempted = true;
+        resubmitted = await submitUnsent(callerSignal).catch(() => false);
+        deadline = clock.now() + timeoutMs;
+        continue;
       }
-      if (last.consumption === "confirmed") {
-        const reason: PromptConfirmationEvidence["reason"] = last.status === "working" ? "working" : "state_change_seq_advanced";
-        return { agent, pane, observation: last, confirmation: promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last) };
+      if (window.cancellation()?.reason === "deadline") {
+        throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, timeoutMs, samples, "timeout", baseline, last, undefined, resubmitted), last);
       }
-      await waitForReadPoll(window, PROMPT_CONFIRMATION_POLL_INTERVAL_MS);
+      throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, timeoutMs, samples, "caller_aborted", baseline, last, "ABORTED", resubmitted), last);
+    } finally {
+      window.cleanup();
     }
-  } catch (error) {
-    if (error instanceof LaunchError && error.code === "PROMPT_UNCONFIRMED") throw error;
-    // Every non-PromptUnconfirmed escape is the shared window's typed caller or
-    // deadline cancellation. The deadline branch is distinct; the remaining
-    // bounded cancellation preserves acknowledged effect as caller abort.
-    if (window.cancellation()?.reason === "deadline") {
-      throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, samples, "timeout", baseline, last), last);
-    }
-    throw promptUnconfirmed(submission, promptConfirmationEvidence(clock, startedAt, samples, "caller_aborted", baseline, last, "ABORTED"), last);
-  } finally {
-    window.cleanup();
   }
 }
 
@@ -1734,7 +1809,7 @@ function agyPromptUnconfirmed(
     promptConsumption: "unconfirmed",
     initialPromptSubmission: agyPromptSubmissionEvidence(acknowledgement),
     ...(last === undefined ? {} : { initialPromptObservation: last }),
-    promptConfirmation: promptConfirmationEvidence(clock, startedAt, samples, reason, baseline, last, sourceCode)
+    promptConfirmation: promptConfirmationEvidence(clock, startedAt, PROMPT_CONFIRMATION_TIMEOUT_MS, samples, reason, baseline, last, sourceCode)
   });
 }
 
@@ -1825,7 +1900,7 @@ async function confirmAgyNativeSession(
           continue;
         }
         last.consumption = "confirmed";
-        const confirmation = promptConfirmationEvidence(clock, startedAt, samples, authoritative.agentStatus === "working" ? "working" : "state_change_seq_advanced", baseline, last);
+        const confirmation = promptConfirmationEvidence(clock, startedAt, PROMPT_CONFIRMATION_TIMEOUT_MS, samples, authoritative.agentStatus === "working" ? "working" : "state_change_seq_advanced", baseline, last);
         return {
           identity,
           agent,
@@ -2899,7 +2974,10 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           provenanceWarning = await writeIdentityProvenance(deps.cli, resolvedPaneId, "launched", sender?.paneId, confirmed.identity.agentSession, abortSignal);
           phase = "prompt_verification";
         } else {
-          const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt);
+          const queueFlush = deps.queueFlush;
+          const submitUnsent = queueFlush === undefined || initialPromptSubmission!.agentKind !== "devin" ? undefined
+            : (signal: AbortSignal) => queueFlush.submitIfUnsent(resolvedPaneId, initialPromptSubmission!, signal);
+          const confirmed = await confirmPromptConsumption(deps.cli, resolvedPaneId, abortSignal, initialPromptSubmission!, baseline, clock, confirmationStartedAt, submitUnsent);
           initialPromptObservation = confirmed.observation;
           promptConfirmation = confirmed.confirmation;
           timing.postAckConfirmationMs = confirmed.confirmation.elapsedMs;

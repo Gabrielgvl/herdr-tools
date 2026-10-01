@@ -235,7 +235,7 @@ describe("idle hints (§11)", () => {
     await f.mailbox.writeGapEvent(ownerKey, { from: "a", to: "b", lost: {} });
     f.hints(hint());
     await vi.waitFor(() => expect(f.prompts).toHaveLength(1));
-    await vi.waitFor(() => expect(f.logs.some((line) => line.includes("hint dropped"))).toBe(true));
+    await vi.waitFor(() => expect(f.logs.some((line) => line.includes("hint_dropped reason=prompt_refused"))).toBe(true));
     f.hints(hint());
     await flush();
     expect(f.calls).toEqual([["pane", "get", "p-owner"]]);
@@ -244,11 +244,38 @@ describe("idle hints (§11)", () => {
     const unreadable = await sinkFixture({ paneGetError: new Error("pane gone") });
     unreadable.hints(hint());
     await vi.waitFor(() => expect(unreadable.calls).toEqual([["pane", "get", "p-owner"]]));
-    await vi.waitFor(() => expect(unreadable.logs.some((line) => line.includes("hint dropped"))).toBe(true));
+    await vi.waitFor(() => expect(unreadable.logs.some((line) => line.includes("hint_dropped reason=unavailable"))).toBe(true));
     // A failed pane read consumed no window — the next event retries fresh.
     unreadable.hints(hint());
     await vi.waitFor(() => expect(unreadable.calls).toHaveLength(2));
     expect(unreadable.prompts).toEqual([]);
+  });
+
+  it("classifies the dropped reason from the fault shape — never its message", async () => {
+    const timeout = Object.assign(new Error("slow"), { name: "TimeoutError" });
+    const named = await sinkFixture({ paneGetError: timeout });
+    named.hints(hint());
+    await vi.waitFor(() => expect(named.logs.some((line) => line.includes("hint_dropped reason=timeout"))).toBe(true));
+
+    const cliTimeout = await sinkFixture({ paneGetError: Object.assign(new Error("t"), { code: "CLI_TIMEOUT" }) });
+    cliTimeout.hints(hint());
+    await vi.waitFor(() => expect(cliTimeout.logs.some((line) => line.includes("hint_dropped reason=timeout"))).toBe(true));
+
+    const absent = await sinkFixture({ paneGetError: Object.assign(new Error("t"), { code: "PANE_NOT_FOUND" }) });
+    absent.hints(hint());
+    await vi.waitFor(() => expect(absent.logs.some((line) => line.includes("hint_dropped reason=owner_pane_absent"))).toBe(true));
+
+    // The typed Herdr envelope nested under a protocol error names the same miss.
+    const enveloped = Object.assign(new Error("t"), { code: "CLI_PROTOCOL_ERROR", details: { errorEnvelope: { error: { code: "pane_not_found" } } } });
+    const nested = await sinkFixture({ paneGetError: enveloped });
+    nested.hints(hint());
+    await vi.waitFor(() => expect(nested.logs.some((line) => line.includes("hint_dropped reason=owner_pane_absent"))).toBe(true));
+
+    // A foreign envelope code carries no pane-absence proof — plain unavailable.
+    const foreign = Object.assign(new Error("t"), { code: "CLI_PROTOCOL_ERROR", details: { errorEnvelope: { error: { code: "RATE_LIMITED" } } } });
+    const other = await sinkFixture({ paneGetError: foreign });
+    other.hints(hint());
+    await vi.waitFor(() => expect(other.logs.some((line) => line.includes("hint_dropped reason=unavailable"))).toBe(true));
   });
 
   it("reads the fresh pane but sends nothing when the owner's mailbox is empty", async () => {
@@ -267,18 +294,18 @@ describe("idle hints (§11)", () => {
     await vi.waitFor(() => expect(f.prompts).toHaveLength(1));
   });
 
-  it("writes the drop record to stderr when no log seam is wired, and stringifies non-Error faults", async () => {
+  it("writes the drop record to stderr when no log seam is wired, and classifies non-Error faults", async () => {
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const f = await sinkFixture({ defaultLog: true, paneGetError: "socket exploded" });
     f.hints(hint());
-    await vi.waitFor(() => expect(stderr.mock.calls.some(([text]) => String(text).includes("hint dropped: socket exploded"))).toBe(true));
+    await vi.waitFor(() => expect(stderr.mock.calls.some(([text]) => String(text).includes("hint_dropped reason=unavailable"))).toBe(true));
     stderr.mockRestore();
   });
 
   it("drops a hint that cannot even be scheduled — a throwing owner getter is logged, never thrown", async () => {
     const f = await sinkFixture();
     expect(() => f.hints({ ...hint(), owner: { paneId: "p-owner", get session(): never { throw new Error("sync-boom"); } } })).not.toThrow();
-    expect(f.logs.some((line) => line.includes("hint dropped: sync-boom"))).toBe(true);
+    expect(f.logs.some((line) => line.includes("hint_dropped reason=unavailable") && line.includes("pane=p-owner"))).toBe(true);
   });
 });
 
@@ -431,6 +458,7 @@ describe("bound supervisor hint destination", () => {
     const jobs = new JobRegistry();
     const hints = vi.fn();
     const gate = createHandoffGate();
+    const logs: string[] = [];
     const supervision = new SupervisionRegistry({
       jobs,
       settingsLoader: async () => ({ reviewCadenceMinutes: 5, reviewerModel: "testmodel", reviewerThinking: "low" }),
@@ -441,6 +469,7 @@ describe("bound supervisor hint destination", () => {
       workspaceRunner: async () => ({ stdout: "", exitCode: 0 }),
       handoffs: gate,
       hints,
+      log: (line) => logs.push(line),
     });
     let supervisor: Supervisor | undefined;
     const attach = jobs.attachSupervision.bind(jobs);
@@ -462,6 +491,8 @@ describe("bound supervisor hint destination", () => {
     await vi.waitFor(() => expect(hints).toHaveBeenCalledTimes(2));
     expect(hints.mock.calls[1]![0]).toMatchObject({ runId: allocation.runId, owner: { paneId: "p-successor", session: successorSession } });
     await supervision.shutdown();
+    // The registry forwards the diagnostic sink into every reserved supervisor.
+    expect(logs.some((line) => line.startsWith("supervisor_settled"))).toBe(true);
     jobs.shutdown();
   });
 });

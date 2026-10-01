@@ -1,4 +1,4 @@
-#!/home/gabriel/.volta/bin/node
+#!/home/gabriel/.volta/tools/image/node/25.9.0/bin/node
 import { spawn } from "node:child_process";
 import console from "node:console";
 import process from "node:process";
@@ -60,15 +60,20 @@ export function resolveHarnessConfig(raw, harness) {
   return { ...raw, ...layer, banks: { ...raw.banks, ...layer.banks } };
 }
 
-function main() {
+export function main() {
   const harness = process.argv[2];
   const raw = JSON.parse(readFileSync(process.env.HINDSIGHT_CONFIG || CONFIG, "utf8"));
   const project = resolveProjectBank(resolveHarnessConfig(raw, harness), process.cwd());
-  const child = spawn(process.execPath, [SERVER], {
-    cwd: project.cwd,
-    env: { ...process.env, HINDSIGHT_MCP_PROJECT_CWD: project.cwd, HINDSIGHT_MCP_HARNESS: harness },
-    stdio: "inherit",
-  });
+  const env = { ...process.env, HINDSIGHT_MCP_PROJECT_CWD: project.cwd, HINDSIGHT_MCP_HARNESS: harness };
+  if (typeof process.execve === "function") {
+    // One process per lane: execve replaces this wrapper with the server in
+    // place, so signals and stdio stay on the same pid — no child to forward.
+    process.chdir(project.cwd);
+    process.execve(process.execPath, [process.execPath, SERVER], env);
+    return;
+  }
+  // Node <24 lacks execve; keep the spawn shim for that case only.
+  const child = spawn(process.execPath, [SERVER], { cwd: project.cwd, env, stdio: "inherit" });
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, () => child.kill(signal));
   child.on("error", () => { console.error("Hindsight MCP server could not start"); process.exitCode = 1; });
   child.on("exit", (code, signal) => { process.exitCode = code ?? (signal ? 1 : 0); });

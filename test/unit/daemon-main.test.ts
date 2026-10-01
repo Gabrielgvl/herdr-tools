@@ -8,7 +8,11 @@ import { connectDaemon, type DaemonClientSocket } from "../../src/daemon/client.
 import { acquireDaemonInstance, DAEMON_INSTANCE_LOCK_NAME } from "../../src/daemon/instance.js";
 import { createIntentStore, DAEMON_INTENTS_DIR_NAME, managerSessionKey } from "../../src/daemon/intents.js";
 import {
+  DAEMON_RETIRE_FOCUS_DEFERS,
+  DAEMON_RETIRE_GRACE_MS,
+  DAEMON_RETIRE_SWEEP_MS,
   DAEMON_STATUS_NAME,
+  retireEnvOptions,
   runDaemonMain,
   startDaemon,
   type DaemonMainOptions,
@@ -636,5 +640,43 @@ describe("daemon entrypoint", () => {
       await expectLockFree(fx.namespace);
       expect(await createDaemonSocketProbe()(fx.socketPath)).not.toBe("answered");
     }
+  });
+});
+
+describe("retireEnvOptions (ADR-040, F10)", () => {
+  const defaults = { enabled: false, graceMs: DAEMON_RETIRE_GRACE_MS, sweepMs: DAEMON_RETIRE_SWEEP_MS, maxFocusDefers: DAEMON_RETIRE_FOCUS_DEFERS };
+
+  it("is dry-run with every knob at its default when nothing is set", () => {
+    expect(retireEnvOptions({})).toEqual(defaults);
+  });
+
+  it("treats empty strings as unset — an empty Environment= line never collapses a knob to 0", () => {
+    expect(retireEnvOptions({
+      HERDR_TOOLS_RETIRE_ENABLED: "",
+      HERDR_TOOLS_RETIRE_GRACE_MS: "",
+      HERDR_TOOLS_RETIRE_SWEEP_MS: "  ",
+      HERDR_TOOLS_RETIRE_FOCUS_DEFERS: "",
+    })).toEqual(defaults);
+  });
+
+  it("refuses a zero or negative grace and a sub-second sweep, keeping the defaults", () => {
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "0" }).graceMs).toBe(DAEMON_RETIRE_GRACE_MS);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "-5" }).graceMs).toBe(DAEMON_RETIRE_GRACE_MS);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_SWEEP_MS: "0" }).sweepMs).toBe(DAEMON_RETIRE_SWEEP_MS);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_SWEEP_MS: "999" }).sweepMs).toBe(DAEMON_RETIRE_SWEEP_MS);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "abc", HERDR_TOOLS_RETIRE_SWEEP_MS: "Infinity" })).toMatchObject({ graceMs: DAEMON_RETIRE_GRACE_MS, sweepMs: DAEMON_RETIRE_SWEEP_MS });
+  });
+
+  it("accepts the bounds themselves and larger values", () => {
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "1", HERDR_TOOLS_RETIRE_SWEEP_MS: "1000", HERDR_TOOLS_RETIRE_FOCUS_DEFERS: "0" }))
+      .toEqual({ enabled: false, graceMs: 1, sweepMs: 1_000, maxFocusDefers: 0 });
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "600000", HERDR_TOOLS_RETIRE_SWEEP_MS: "30000", HERDR_TOOLS_RETIRE_FOCUS_DEFERS: "5" }))
+      .toMatchObject({ graceMs: 600_000, sweepMs: 30_000, maxFocusDefers: 5 });
+  });
+
+  it("enables only on a non-empty value other than 0", () => {
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_ENABLED: "0" }).enabled).toBe(false);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_ENABLED: "1" }).enabled).toBe(true);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_ENABLED: "true" }).enabled).toBe(true);
   });
 });

@@ -2,22 +2,30 @@
  * The ADR-040 lane-retirement sweep (design B3, node B8).
  *
  * Proves the full proof chain — only a `handed_off` run whose exact child
- * stays continuously idle past the grace, carries the launch tokens, manages
- * nothing live, drains its own mailbox, and sits clear of the owner's
- * topology is closed under the pane write lock — plus the dry-run kill
+ * stays continuously idle past the grace with an unchanged lifecycle counter
+ * and detection-screen digest, carries the launch tokens, manages nothing
+ * live, drains its own mailbox, and sits clear of the owner's topology is
+ * closed under the pane write lock and the run flock — plus the dry-run kill
  * switch, the bounded focused deferral, close uncertainty retries, the
  * one-shot `lane_retired` event, and the ledger's replay/idempotency.
+ *
+ * The PR #62 review regressions (F1–F13) each pin a destructive path that
+ * f0ae1ed admitted: stale pane scalars over a fresh agent record, a silent
+ * screen, a `recorded` child launch, a reconciled absence claimed as a close,
+ * an ownership transfer inside the lock window, unreadable keep provenance,
+ * a dead lease, and the env knobs.
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { tokenValue } from "../../src/agent-identity.js";
-import type { JsonEnvelope } from "../../src/cli.js";
+import type { CliTextResult, JsonEnvelope } from "../../src/cli.js";
 import {
   createHandoffAllocator,
+  HANDOFF_PROVENANCE_NAME,
   readHandoffProvenance,
   updateHandoffState,
   writeHandoffProvenance,
@@ -31,15 +39,14 @@ import {
 } from "../../src/handoff.js";
 import type { JobRegistry } from "../../src/job-registry.js";
 import type { AgentSessionIdentity } from "../../src/messages/prompt.js";
-import type { CloseReadbackCli } from "../../src/mutations.js";
-import type { PaneWriteGuard } from "../../src/pane-write-lock.js";
+import { acquireFlockHolder, type PaneWriteGuard } from "../../src/pane-write-lock.js";
 import { createSelfCloseTracker } from "../../src/supervision/self-close.js";
 import { parseSnapshotResult, type HerdrSnapshot } from "../../src/targets.js";
 import { createIntentStore, managerSessionKey, type IntentStore } from "../../src/daemon/intents.js";
 import { createMailbox, type Mailbox } from "../../src/daemon/mailbox.js";
 import type { DaemonNamespace } from "../../src/daemon/namespace.js";
-import { daemonRunOwnership } from "../../src/daemon/ownership.js";
-import { createLaneRetirer, type LaneRetirerDeps } from "../../src/daemon/retire.js";
+import { daemonRunOwnership, OwnershipError } from "../../src/daemon/ownership.js";
+import { createLaneRetirer, type LaneRetirerCli, type LaneRetirerDeps } from "../../src/daemon/retire.js";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -70,6 +77,7 @@ const task: HandoffTaskContract = {
 };
 
 const GRACE_MS = 60_000;
+const SCREEN_READ = ["pane", "read", "p-child", "--source", "detection", "--format", "text"];
 
 const identityFields = (agentName: string): HandoffRunIdentity => ({
   manager: { paneId: "p-owner", display: "pi", source: "agent_name" },
@@ -149,6 +157,19 @@ async function seedRun(
   return { allocation, runId: allocation.runId };
 }
 
+/** Rewrite a run's provenance as v2 with `current` as the open owner entry. */
+async function transferTo(allocation: HandoffAllocation, current: AgentSessionIdentity): Promise<void> {
+  const prior = await readHandoffProvenance(allocation);
+  await writeHandoffProvenance(allocation, {
+    ...prior,
+    v: 2,
+    owners: [
+      { session: ownerSession, from: prior.createdAt, to: "2026-10-01T00:00:00.000Z", reason: "transfer" },
+      { session: current, from: "2026-10-01T00:00:00.000Z", to: null, reason: "transfer" },
+    ],
+  });
+}
+
 /** The launch tokens an accepted lane carries on both its records. */
 function childTokens(session: AgentSessionIdentity = childSession, over: Record<string, unknown> = {}): Record<string, unknown> {
   return { identity_provenance: "launched", identity_actor: "p-owner", identity_session: tokenValue(session.value), ...over };
@@ -196,10 +217,11 @@ function ownerAgent(over: RawRecord = {}): RawRecord {
   return { pane_id: "p-owner", name: "manager", agent: "pi", agent_session: { ...ownerSession }, agent_status: "idle", revision: 1, ...over };
 }
 
-/** The live child records the sweep observes; empty `pane` means it is gone. */
+/** The live child records the sweep observes; empty `pane` means it is gone. `screen` is the detection-screen text. */
 interface Live {
   pane?: RawRecord;
   agent?: RawRecord;
+  screen?: string;
 }
 
 /** Two tabs in one workspace: the lane's own tab cascades, the owner's survives. `omitOwner` drops the owner records entirely. */
@@ -225,17 +247,31 @@ function snapshotFor(live: Live, extras: { panes?: RawRecord[]; agents?: RawReco
   });
 }
 
-interface FakeCli extends CloseReadbackCli {
+interface FakeCli extends LaneRetirerCli {
   calls: string[][];
+}
+
+interface FakeCliOptions {
+  closeError?: unknown;
+  getError?: unknown;
+  getPane?: RawRecord;
+  getAgent?: RawRecord;
+  /** `pane read` throws. */
+  readError?: unknown;
+  /** `pane read` reports a truncated result. */
+  readTruncated?: boolean;
+  /** Runs inside the `pane close` dispatch, before the records clear. */
+  onClose?: () => Promise<void>;
 }
 
 /**
  * A scripted Herdr CLI over the `live` records. `pane close` clears them (so
  * the readback proves absence) unless `closeError` throws first; `pane get` /
  * `agent get` serve the live records, or `getPane`/`getAgent` overrides when a
- * test needs the under-lock records to differ from the snapshot.
+ * test needs the under-lock records to differ from the snapshot; `pane read`
+ * serves `live.screen`. `opts` is read live, so a test can flip it mid-sweep.
  */
-function fakeCli(live: Live, opts: { closeError?: unknown; getError?: unknown; getPane?: RawRecord; getAgent?: RawRecord } = {}): FakeCli {
+function fakeCli(live: Live, opts: FakeCliOptions = {}): FakeCli {
   const calls: string[][] = [];
   return {
     calls,
@@ -254,6 +290,7 @@ function fakeCli(live: Live, opts: { closeError?: unknown; getError?: unknown; g
         return { id: "op", result: { agent } } as JsonEnvelope;
       }
       if (kind === "pane" && verb === "close") {
+        await opts.onClose?.();
         if (opts.closeError !== undefined) throw opts.closeError;
         live.pane = undefined;
         live.agent = undefined;
@@ -261,20 +298,42 @@ function fakeCli(live: Live, opts: { closeError?: unknown; getError?: unknown; g
       }
       throw Object.assign(new Error(`unexpected argv: ${argv.join(" ")}`), { code: "CLI_PROTOCOL_ERROR" });
     },
+    async runTextResult(argv): Promise<CliTextResult> {
+      calls.push([...argv]);
+      if (argv[0] !== "pane" || argv[1] !== "read") throw Object.assign(new Error(`unexpected argv: ${argv.join(" ")}`), { code: "CLI_PROTOCOL_ERROR" });
+      if (opts.readError !== undefined) throw opts.readError;
+      if (live.pane === undefined) throw Object.assign(new Error("pane gone"), { code: "TARGET_NOT_FOUND" });
+      return { value: live.screen ?? "worker> waiting for input", truncated: opts.readTruncated === true };
+    },
   };
 }
 
-/** A pane write guard that needs no flock: acquisition is counted, never contended unless told to fail; `releaseError` makes the lease release reject. */
-function fakePaneLock(opts: { fails?: boolean; releaseError?: unknown } = {}): { guard: PaneWriteGuard; acquired: string[] } {
+interface FakeLockOptions {
+  fails?: boolean;
+  releaseError?: unknown;
+  /** `lease.check()` rejects — the flock holder died or the lock path lost trust. */
+  checkError?: unknown;
+  /** Runs inside `acquire`, after the lock is "taken" and before the lease returns — the transfer window. */
+  onAcquire?: () => Promise<void>;
+}
+
+/** A pane write guard that needs no flock: acquisition and checks are counted, never contended unless told to fail. `opts` is read live. */
+function fakePaneLock(opts: FakeLockOptions = {}): { guard: PaneWriteGuard; acquired: string[]; checks: string[] } {
   const acquired: string[] = [];
+  const checks: string[] = [];
   return {
     acquired,
+    checks,
     guard: {
       async acquire(paneId) {
         if (opts.fails === true) throw Object.assign(new Error("contended"), { code: "PANE_WRITE_LOCK_UNAVAILABLE" });
         acquired.push(paneId);
+        await opts.onAcquire?.();
         return {
-          check: async () => undefined,
+          check: async () => {
+            checks.push(paneId);
+            if (opts.checkError !== undefined) throw opts.checkError;
+          },
           release: async () => {
             if (opts.releaseError !== undefined) throw opts.releaseError;
           },
@@ -319,6 +378,7 @@ function retirerDeps(
     deps: {
       runs: fx.handoffNs,
       allocator: fx.allocator,
+      ownership: daemonRunOwnership(fx.allocator),
       intents: fx.intents,
       mailbox: fx.mailbox,
       cli: fakeCli(live),
@@ -333,6 +393,10 @@ function retirerDeps(
   };
 }
 
+const closes = (deps: LaneRetirerDeps): string[][] => (deps.cli as FakeCli).calls.filter((argv) => argv[1] === "close");
+/** Every CLI call past the per-sweep screen reads — the under-lock `get`s and the close. */
+const lockedCalls = (deps: LaneRetirerDeps): string[][] => (deps.cli as FakeCli).calls.filter((argv) => argv[1] !== "read");
+
 /** Seed `begin`+`markEffecting`+`recordChildren`+`complete` under the child's own session key. */
 async function recordChildIntent(intents: IntentStore, idempotencyKey: string, children: Array<{ name: string; runId?: string }>): Promise<void> {
   const begun = await intents.begin({
@@ -346,6 +410,24 @@ async function recordChildIntent(intents: IntentStore, idempotencyKey: string, c
   await intents.complete(begun.intent, children);
 }
 
+/** `begin` only: the intent stays `recorded` — the state a launch request executes under before `effecting`. */
+async function recordedChildIntent(intents: IntentStore, idempotencyKey: string): Promise<void> {
+  const begun = await intents.begin({
+    managerSessionKey: childKey,
+    idempotencyKey,
+    task: { objective: task.objective, scope: task.scope, doneWhen: task.doneWhen, constraints: task.constraints },
+    projectRoot: "/project",
+  });
+  if (begun.kind !== "launch") throw new Error("expected launch");
+}
+
+/** Sweep once at the clock, then once past the grace. */
+async function sweepPastGrace(retirer: { sweep(): Promise<void> }, clock: { nowMs: number }): Promise<void> {
+  await retirer.sweep();
+  clock.nowMs += GRACE_MS;
+  await retirer.sweep();
+}
+
 describe("lane retirer (ADR-040)", () => {
   it("closes a stable handed_off lane under the lock, confirms self-close, and writes exactly one lane_retired", async () => {
     const fx = await fixture();
@@ -356,6 +438,8 @@ describe("lane retirer (ADR-040)", () => {
 
     await retirer.sweep();
     expect(retirer.view(runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    // The inactivity proof samples the detection screen every sweep.
+    expect((deps.cli as FakeCli).calls).toContainEqual(SCREEN_READ);
 
     clock.nowMs += GRACE_MS;
     await retirer.sweep();
@@ -381,30 +465,20 @@ describe("lane retirer (ADR-040)", () => {
     // A repeated sweep replays nothing: the terminal view short-circuits.
     await retirer.sweep();
     expect(await fx.mailbox.list(ownerKey)).toHaveLength(1);
-    expect((deps.cli as FakeCli).calls.filter((argv) => argv[1] === "close")).toHaveLength(1);
+    expect(closes(deps)).toHaveLength(1);
     expect(fx.lines.filter((line) => line.includes(`run=${runId}`) && line.includes("decision=retired"))).toHaveLength(1);
   });
 
   it("reports the live supervisor's jobId and lands the event in a transferred run's successor mailbox", async () => {
     const fx = await fixture();
     const { allocation, runId } = await seedRun(fx.allocator);
-    const prior = await readHandoffProvenance(allocation);
-    await writeHandoffProvenance(allocation, {
-      ...prior,
-      v: 2,
-      owners: [
-        { session: ownerSession, from: prior.createdAt, to: "2026-10-01T00:00:00.000Z", reason: "transfer" },
-        { session: successorSession, from: "2026-10-01T00:00:00.000Z", to: null, reason: "transfer" },
-      ],
-    });
+    await transferTo(allocation, successorSession);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live, {
       jobs: { activeSupervisorFor: () => ({ jobId: "job_live" }) } as unknown as Pick<JobRegistry, "activeSupervisorFor">,
     });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
 
     expect(retirer.view(runId)).toMatchObject({ state: "retired" });
     const successorKey = managerSessionKey(successorSession);
@@ -421,12 +495,10 @@ describe("lane retirer (ADR-040)", () => {
       const live: Live = { pane: childPane(), agent: childAgent() };
       const { deps, clock } = retirerDeps(fx, live);
       const retirer = createLaneRetirer(deps);
-      await retirer.sweep();
-      clock.nowMs += GRACE_MS;
-      await retirer.sweep();
+      await sweepPastGrace(retirer, clock);
       expect(retirer.view(runId)).toBeUndefined();
       expect(live.pane).not.toBeUndefined();
-      expect((deps.cli as FakeCli).calls.filter((argv) => argv[1] === "close")).toHaveLength(0);
+      expect(closes(deps)).toHaveLength(0);
     }
     expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
   });
@@ -460,9 +532,7 @@ describe("lane retirer (ADR-040)", () => {
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(unbound.runId)).toMatchObject({ state: "refused", reason: "child_identity_unbound" });
     expect(retirer.view(malformed.runId)).toMatchObject({ state: "refused", reason: "child_session_invalid" });
     expect(live.pane).not.toBeUndefined();
@@ -480,9 +550,7 @@ describe("lane retirer (ADR-040)", () => {
       }),
     });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     // Absent: no ledger entry at all — nothing to project or retire.
     expect(retirer.view(absent.runId)).toBeUndefined();
     // Two panes on the recorded terminal is ambiguity, never a close.
@@ -509,7 +577,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // A working status also resets — the lane must stay idle the whole grace.
     live.pane = childPane({ agent_status: "working", state_change_seq: 7 });
-    live.agent = childAgent({ state_change_seq: 7 });
+    live.agent = childAgent({ agent_status: "working", state_change_seq: 7 });
     clock.nowMs += GRACE_MS;
     await retirer.sweep();
     expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "child_active:working" });
@@ -524,21 +592,187 @@ describe("lane retirer (ADR-040)", () => {
     expect(retirer.view(runId)).toMatchObject({ state: "retired" });
   });
 
-  it("defers while no usable state_change_seq is observed", async () => {
+  it("defers while the agent record carries no usable state_change_seq or status, and reads the agent's counter when only the pane lacks one", async () => {
+    // Both records lack the counter.
     const fx = await fixture();
     const { runId } = await seedRun(fx.allocator);
     const pane = childPane();
     const agent = childAgent();
     delete pane.state_change_seq;
     delete agent.state_change_seq;
-    const live: Live = { pane, agent };
-    const { deps, clock } = retirerDeps(fx, live);
-    const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    let live: Live = { pane, agent };
+    let { deps, clock } = retirerDeps(fx, live);
+    let retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "state_change_seq_unavailable" });
     expect(live.pane).not.toBeUndefined();
+
+    // F2/F12: the pane's counter never stands in for a missing agent counter.
+    const fx2 = await fixture();
+    const paneOnly = await seedRun(fx2.allocator);
+    const agentNoSeq = childAgent();
+    delete agentNoSeq.state_change_seq;
+    live = { pane: childPane(), agent: agentNoSeq };
+    ({ deps, clock } = retirerDeps(fx2, live));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(paneOnly.runId)).toMatchObject({ state: "deferred", reason: "state_change_seq_unavailable" });
+    expect(live.pane).not.toBeUndefined();
+
+    // F2/F12: nor does the pane's status stand in for a missing agent status.
+    const fx3 = await fixture();
+    const noStatus = await seedRun(fx3.allocator);
+    const agentNoStatus = childAgent();
+    delete agentNoStatus.agent_status;
+    live = { pane: childPane(), agent: agentNoStatus };
+    ({ deps, clock } = retirerDeps(fx3, live));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(noStatus.runId)).toMatchObject({ state: "deferred", reason: "lifecycle_status_unavailable" });
+    expect(live.pane).not.toBeUndefined();
+
+    // The agent record is the authority: a pane without a counter is fine
+    // while the agent record carries one.
+    const fx4 = await fixture();
+    const agentOnly = await seedRun(fx4.allocator);
+    const paneNoSeq = childPane();
+    delete paneNoSeq.state_change_seq;
+    live = { pane: paneNoSeq, agent: childAgent() };
+    ({ deps, clock } = retirerDeps(fx4, live));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(agentOnly.runId)).toMatchObject({ state: "retired" });
+    expect(live.pane).toBeUndefined();
+  });
+
+  it("F2/F12: a stale idle pane record never outvotes a fresh working or advanced agent record in the sweep", async () => {
+    const cases: Array<{ name: string; agent: RawRecord; reason: string }> = [
+      { name: "pane idle/5, agent working/6", agent: childAgent({ agent_status: "working", state_change_seq: 6 }), reason: "lifecycle_target_identity_contradiction" },
+      { name: "pane idle/5, agent idle/6 (agent-only seq bump)", agent: childAgent({ state_change_seq: 6 }), reason: "lifecycle_target_identity_contradiction" },
+      { name: "pane idle/5, agent working/5", agent: childAgent({ agent_status: "working" }), reason: "lifecycle_target_identity_contradiction" },
+      { name: "pane revision 5, agent revision 6", agent: childAgent({ revision: 6 }), reason: "lifecycle_target_identity_contradiction" },
+      { name: "agent status malformed", agent: childAgent({ agent_status: "spinning" }), reason: "lifecycle_target_record_malformed" },
+    ];
+    for (const entry of cases) {
+      const fx = await fixture();
+      const { runId } = await seedRun(fx.allocator);
+      const live: Live = { pane: childPane(), agent: entry.agent };
+      const { deps, clock } = retirerDeps(fx, live);
+      const retirer = createLaneRetirer(deps);
+      await sweepPastGrace(retirer, clock);
+      clock.nowMs += GRACE_MS;
+      await retirer.sweep();
+      expect(retirer.view(runId), entry.name).toMatchObject({ state: "deferred", reason: entry.reason });
+      expect(live.pane, entry.name).not.toBeUndefined();
+      expect(closes(deps), entry.name).toHaveLength(0);
+    }
+  });
+
+  it("F2/F12: the under-lock re-proof rejects a fresh agent record that contradicts the pane, an agent-only counter bump, and vanished counters", async () => {
+    const cases: Array<{ name: string; getPane?: RawRecord; getAgent?: RawRecord; reason: string }> = [
+      { name: "agent working/6 under lock", getAgent: childAgent({ agent_status: "working", state_change_seq: 6 }), reason: "recheck_lifecycle_target_identity_contradiction" },
+      { name: "agent-only seq bump under lock", getAgent: childAgent({ state_change_seq: 6 }), reason: "recheck_lifecycle_target_identity_contradiction" },
+      { name: "agent status gone under lock", getAgent: (() => { const agent = childAgent(); delete agent.agent_status; return agent; })(), reason: "recheck_lifecycle_status_unavailable" },
+      {
+        name: "both counters gone under lock",
+        getPane: (() => { const pane = childPane(); delete pane.state_change_seq; return pane; })(),
+        getAgent: (() => { const agent = childAgent(); delete agent.state_change_seq; return agent; })(),
+        reason: "recheck_state_change_seq_unavailable",
+      },
+      {
+        name: "agent counter advanced while the pane carries none",
+        getPane: (() => { const pane = childPane(); delete pane.state_change_seq; return pane; })(),
+        getAgent: childAgent({ state_change_seq: 9 }),
+        reason: "recheck_seq",
+      },
+    ];
+    for (const entry of cases) {
+      const fx = await fixture();
+      const { runId } = await seedRun(fx.allocator);
+      const live: Live = { pane: childPane(), agent: childAgent() };
+      const { deps, clock } = retirerDeps(fx, live, {
+        cli: fakeCli(live, { ...(entry.getPane === undefined ? {} : { getPane: entry.getPane }), ...(entry.getAgent === undefined ? {} : { getAgent: entry.getAgent }) }),
+      });
+      const retirer = createLaneRetirer(deps);
+      await sweepPastGrace(retirer, clock);
+      expect(retirer.view(runId), entry.name).toMatchObject({ state: "deferred", reason: entry.reason });
+      expect(live.pane, entry.name).not.toBeUndefined();
+      expect(closes(deps), entry.name).toHaveLength(0);
+      // The clock restarted: the next observation is fresh, not stale.
+      await retirer.sweep();
+      expect(retirer.view(runId), entry.name).toMatchObject({ state: "watching", stableForMs: 0 });
+    }
+  });
+
+  it("F1/F8: the detection-screen digest must stay unchanged through the grace — a change, a failed read, or a truncated read resets or defers", async () => {
+    // A screen change inside the grace restarts the observation even though
+    // status and seq never moved — the stale-telemetry case.
+    const fx = await fixture();
+    const { runId } = await seedRun(fx.allocator);
+    const live: Live = { pane: childPane(), agent: childAgent(), screen: "worker> done" };
+    let { deps, clock } = retirerDeps(fx, live);
+    let retirer = createLaneRetirer(deps);
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    live.screen = "worker> running tests...";
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+
+    // An unreadable screen is no proof: defer and hold the clock.
+    const fx2 = await fixture();
+    const unreadable = await seedRun(fx2.allocator);
+    const live2: Live = { pane: childPane(), agent: childAgent() };
+    ({ deps, clock } = retirerDeps(fx2, live2, { cli: fakeCli(live2, { readError: Object.assign(new Error("read failed"), { code: "CLI_PROTOCOL_ERROR" }) }) }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(unreadable.runId)).toMatchObject({ state: "deferred", reason: "screen_unavailable" });
+    expect(live2.pane).not.toBeUndefined();
+
+    // A truncated screen was not fully observed — it cannot count as unchanged.
+    const fx3 = await fixture();
+    const truncated = await seedRun(fx3.allocator);
+    const live3: Live = { pane: childPane(), agent: childAgent() };
+    ({ deps, clock } = retirerDeps(fx3, live3, { cli: fakeCli(live3, { readTruncated: true }) }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(truncated.runId)).toMatchObject({ state: "deferred", reason: "screen_truncated" });
+    expect(live3.pane).not.toBeUndefined();
+  });
+
+  it("F1/F8: the screen digest is re-read under the lock — a change or an unreadable screen defers and restarts the clock", async () => {
+    // The screen changes inside the lock window: the proof is void.
+    const fx = await fixture();
+    const { runId } = await seedRun(fx.allocator);
+    const live: Live = { pane: childPane(), agent: childAgent(), screen: "worker> done" };
+    const lock = fakePaneLock({ onAcquire: async () => { live.screen = "worker> one more thing"; } });
+    let { deps, clock } = retirerDeps(fx, live, { options: { paneLock: lock.guard } });
+    let retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "recheck_screen" });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
+    // The digest changed, so the clock restarted from the new screen.
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+
+    // The under-lock read fails: defer, never dispatch.
+    const fx2 = await fixture();
+    const unreadable = await seedRun(fx2.allocator);
+    const live2: Live = { pane: childPane(), agent: childAgent() };
+    const cliOpts: FakeCliOptions = {};
+    const lock2 = fakePaneLock({ onAcquire: async () => { cliOpts.readError = Object.assign(new Error("read failed"), { code: "CLI_PROTOCOL_ERROR" }); } });
+    ({ deps, clock } = retirerDeps(fx2, live2, { cli: fakeCli(live2, cliOpts), options: { paneLock: lock2.guard } }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(unreadable.runId)).toMatchObject({ state: "deferred", reason: "recheck_screen_unavailable" });
+    expect(live2.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
   });
 
   it("refuses on missing, adopted, malformed, contradictory, or mismatched launch tokens", async () => {
@@ -586,9 +820,7 @@ describe("lane retirer (ADR-040)", () => {
       const live: Live = { pane: entry.pane, agent: entry.agent };
       const { deps, clock } = retirerDeps(fx, live);
       const retirer = createLaneRetirer(deps);
-      await retirer.sweep();
-      clock.nowMs += GRACE_MS;
-      await retirer.sweep();
+      await sweepPastGrace(retirer, clock);
       expect(retirer.view(runId), entry.name).toMatchObject({ state: "refused", reason: entry.reason });
       expect(live.pane).not.toBeUndefined();
     }
@@ -600,9 +832,7 @@ describe("lane retirer (ADR-040)", () => {
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(keptByTask.runId)).toMatchObject({ state: "kept", reason: "task_retention_keep" });
     expect(live.pane).not.toBeUndefined();
     expect((deps.cli as FakeCli).calls).toHaveLength(0);
@@ -619,10 +849,48 @@ describe("lane retirer (ADR-040)", () => {
     };
     const deps2 = retirerDeps(fx2, live2);
     const retirer2 = createLaneRetirer(deps2.deps);
-    await retirer2.sweep();
-    deps2.clock.nowMs += GRACE_MS;
-    await retirer2.sweep();
+    await sweepPastGrace(retirer2, deps2.clock);
     expect(retirer2.view(keptByToken.runId)).toMatchObject({ state: "kept", reason: "token_retention_keep" });
+  });
+
+  it("F4: an unreadable provenance never overrides a keep opt-out — only a genuinely missing record is legacy", async () => {
+    // Malformed provenance on a kept lane: refuse, never fall back to retire.
+    const fx = await fixture();
+    const kept = await seedRun(fx.allocator, { task: { ...task, retention: "keep" } });
+    await writeFile(join(kept.allocation.toolsDir, HANDOFF_PROVENANCE_NAME), "{not json", { mode: 0o600 });
+    let live: Live = { pane: childPane(), agent: childAgent() };
+    let { deps, clock } = retirerDeps(fx, live);
+    let retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(kept.runId)).toMatchObject({ state: "refused", reason: "provenance_unreadable" });
+    expect(live.pane).not.toBeUndefined();
+    expect((deps.cli as FakeCli).calls).toHaveLength(0);
+
+    // An untrusted (group/world-writable) record refuses the same way.
+    const fx2 = await fixture();
+    const untrusted = await seedRun(fx2.allocator, { task: { ...task, retention: "keep" } });
+    await chmod(join(untrusted.allocation.toolsDir, HANDOFF_PROVENANCE_NAME), 0o666);
+    live = { pane: childPane(), agent: childAgent() };
+    ({ deps, clock } = retirerDeps(fx2, live));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(untrusted.runId)).toMatchObject({ state: "refused", reason: "provenance_unreadable" });
+    expect(live.pane).not.toBeUndefined();
+
+    // A transferred run whose record became unreadable refuses rather than
+    // protecting the original manager pane in the current owner's place.
+    const fx3 = await fixture();
+    const transferred = await seedRun(fx3.allocator);
+    await transferTo(transferred.allocation, successorSession);
+    await writeFile(join(transferred.allocation.toolsDir, HANDOFF_PROVENANCE_NAME), "{not json", { mode: 0o600 });
+    live = { pane: childPane(), agent: childAgent() };
+    ({ deps, clock } = retirerDeps(fx3, live));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(transferred.runId)).toMatchObject({ state: "refused", reason: "provenance_unreadable" });
+    expect(live.pane).not.toBeUndefined();
   });
 
   it("refuses a pane other records name as their manager", async () => {
@@ -636,14 +904,12 @@ describe("lane retirer (ADR-040)", () => {
       }),
     });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "child_is_manager:manages_children" });
     expect(live.pane).not.toBeUndefined();
   });
 
-  it("refuses a caller-policy failure and an open or live intent ledger under the child's session", async () => {
+  it("refuses a caller-policy failure and an open — effecting or merely recorded — intent ledger under the child's session", async () => {
     // Malformed scope evidence makes classification itself refuse.
     const fx = await fixture();
     const policyRun = await seedRun(fx.allocator);
@@ -653,9 +919,7 @@ describe("lane retirer (ADR-040)", () => {
     };
     let { deps, clock } = retirerDeps(fx, live);
     let retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(policyRun.runId)).toMatchObject({ state: "refused", reason: "caller_policy_unavailable" });
 
     // An `effecting` intent under the child's own session key refuses.
@@ -672,10 +936,21 @@ describe("lane retirer (ADR-040)", () => {
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(openRun.runId)).toMatchObject({ state: "refused", reason: "child_intent_open" });
+
+    // F5: a `recorded` intent — its launch request may be executing right
+    // now, with no child token yet to mark the pane a manager — is open too.
+    const fx3 = await fixture();
+    const recordedRun = await seedRun(fx3.allocator);
+    await recordedChildIntent(fx3.intents, "sub-recorded");
+    live = { pane: childPane(), agent: childAgent() };
+    ({ deps, clock } = retirerDeps(fx3, live));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(recordedRun.runId)).toMatchObject({ state: "refused", reason: "child_intent_open" });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
   });
 
   it("refuses a sub-manager with unproven or nonterminal recorded children, then retires once they settle", async () => {
@@ -686,9 +961,7 @@ describe("lane retirer (ADR-040)", () => {
     let live: Live = { pane: childPane(), agent: childAgent() };
     let { deps, clock } = retirerDeps(fx, live);
     let retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(unproven.runId)).toMatchObject({ state: "refused", reason: "child_intent_child_untrusted" });
 
     // A recorded child whose sidecar is not yet terminal refuses the same way.
@@ -699,9 +972,7 @@ describe("lane retirer (ADR-040)", () => {
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(managed.runId)).toMatchObject({ state: "refused", reason: "child_manages_live_intent" });
 
     // Settled recorded children stop refusing — the close proceeds.
@@ -710,9 +981,7 @@ describe("lane retirer (ADR-040)", () => {
     });
     ({ deps, clock } = retirerDeps(fx2, live));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(managed.runId)).toMatchObject({ state: "retired" });
     expect(live.pane).toBeUndefined();
   });
@@ -724,74 +993,64 @@ describe("lane retirer (ADR-040)", () => {
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "child_mailbox_unread" });
     expect(live.pane).not.toBeUndefined();
   });
 
-  it("defers when the intent store or the mailbox cannot be read", async () => {
+  it("F13: reads the child's own ledger directly — the manager enumeration is never consulted — and defers when the ledger or the mailbox cannot be read", async () => {
     const fx = await fixture();
     const { runId } = await seedRun(fx.allocator);
     const live: Live = { pane: childPane(), agent: childAgent() };
 
+    // A broken manager enumeration is irrelevant: only the child's ledger is read.
+    const listed: string[] = [];
     const noManagers: IntentStore = {
       ...fx.intents,
       listManagers: async () => { throw Object.assign(new Error("io"), { code: "INTENT_STORE_UNAVAILABLE" }); },
+      list: async (key) => { listed.push(key); return fx.intents.list(key); },
     };
     let { deps, clock } = retirerDeps(fx, live, { intents: noManagers });
     let retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
-    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "intents_unavailable" });
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+    expect(listed).toContain(childKey);
 
-    // The child is a recorded manager whose own ledger read fails.
-    await recordChildIntent(fx.intents, "sub-led", []);
+    // The child's own ledger read fails — defer.
+    const fx2 = await fixture();
+    const ledgerRun = await seedRun(fx2.allocator);
     const brokenLedger: IntentStore = {
-      ...fx.intents,
-      list: async (key) => (key === childKey ? Promise.reject(Object.assign(new Error("io"), { code: "INTENT_STORE_UNAVAILABLE" })) : fx.intents.list(key)),
+      ...fx2.intents,
+      list: async (key) => (key === childKey ? Promise.reject(Object.assign(new Error("io"), { code: "INTENT_STORE_UNAVAILABLE" })) : fx2.intents.list(key)),
     };
-    ({ deps, clock } = retirerDeps(fx, live, { intents: brokenLedger }));
+    const live2: Live = { pane: childPane(), agent: childAgent() };
+    ({ deps, clock } = retirerDeps(fx2, live2, { intents: brokenLedger }));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
-    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "intents_unavailable" });
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(ledgerRun.runId)).toMatchObject({ state: "deferred", reason: "intents_unavailable" });
+    expect(live2.pane).not.toBeUndefined();
 
     // A mailbox list failure also defers — proof gaps never close.
     const brokenMailbox: Pick<Mailbox, "writeRunEvent" | "list"> = {
-      writeRunEvent: (input) => fx.mailbox.writeRunEvent(input),
+      writeRunEvent: (input) => fx2.mailbox.writeRunEvent(input),
       list: async () => { throw Object.assign(new Error("io"), { code: "MAILBOX_UNAVAILABLE" }); },
     };
-    ({ deps, clock } = retirerDeps(fx, live, { mailbox: brokenMailbox }));
+    ({ deps, clock } = retirerDeps(fx2, live2, { mailbox: brokenMailbox }));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
-    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "mailbox_unavailable" });
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(ledgerRun.runId)).toMatchObject({ state: "deferred", reason: "mailbox_unavailable" });
+    expect(live2.pane).not.toBeUndefined();
   });
 
   it("refuses when the owner's pane sits inside the cascade and defers on invalid topology", async () => {
     // The recorded current owner IS the child pane — the cascade always reaches it.
     const fx = await fixture();
     const { allocation, runId } = await seedRun(fx.allocator);
-    const prior = await readHandoffProvenance(allocation);
-    await writeHandoffProvenance(allocation, {
-      ...prior,
-      v: 2,
-      owners: [
-        { session: ownerSession, from: prior.createdAt, to: "2026-10-01T00:00:00.000Z", reason: "transfer" },
-        { session: childSession, from: "2026-10-01T00:00:00.000Z", to: null, reason: "transfer" },
-      ],
-    });
+    await transferTo(allocation, childSession);
     let live: Live = { pane: childPane(), agent: childAgent() };
     let { deps, clock } = retirerDeps(fx, live);
     let retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "owner_topology_protected" });
     expect(live.pane).not.toBeUndefined();
 
@@ -801,9 +1060,7 @@ describe("lane retirer (ADR-040)", () => {
     live = { pane: childPane({ tab_id: "tab-ghost" }), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(dangling.runId)).toMatchObject({ state: "deferred", reason: "topology_invalid" });
   });
 
@@ -813,9 +1070,7 @@ describe("lane retirer (ADR-040)", () => {
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "retired" });
   });
 
@@ -844,9 +1099,7 @@ describe("lane retirer (ADR-040)", () => {
     let live: Live = { pane: childPane(), agent: childAgent() };
     let { deps, clock } = retirerDeps(fx, live, { cli: fakeCli(live, { getPane: childPane({ focused: true }) }) });
     let retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(focused.runId)).toMatchObject({ state: "deferred", reason: "recheck_focused" });
     expect(live.pane).not.toBeUndefined();
 
@@ -858,23 +1111,19 @@ describe("lane retirer (ADR-040)", () => {
       cli: fakeCli(live, { getAgent: childAgent({ agent_session: { ...childSession, value: "/pi/other.jsonl" } }) }),
     }));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(drifted.runId)).toMatchObject({ state: "deferred", reason: "recheck_identity" });
 
-    // Under-lock status or seq changes defer without spending an attempt.
+    // A coherent working tuple under the lock defers without spending an attempt.
     const fx3 = await fixture();
     const busy = await seedRun(fx3.allocator);
     const moved = await seedRun(fx3.allocator);
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx3, live, {
-      cli: fakeCli(live, { getPane: childPane({ agent_status: "working" }), getAgent: childAgent({ state_change_seq: 9 }) }),
+      cli: fakeCli(live, { getPane: childPane({ agent_status: "working", state_change_seq: 9 }), getAgent: childAgent({ agent_status: "working", state_change_seq: 9 }) }),
     }));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     // Status wins over the seq re-check — both refuse the same way.
     expect(retirer.view(busy.runId)).toMatchObject({ state: "deferred", reason: "recheck_status" });
     expect(retirer.view(moved.runId)).toMatchObject({ state: "deferred", reason: "recheck_status" });
@@ -889,23 +1138,19 @@ describe("lane retirer (ADR-040)", () => {
       cli: fakeCli(live, { getPane: childPane({ terminal_id: "t2" }), getAgent: childAgent({ terminal_id: "t2" }) }),
     });
     let retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(moved.runId)).toMatchObject({ state: "deferred", reason: "recheck_identity" });
     expect(live.pane).not.toBeUndefined();
 
-    // A seq bump observed only under the lock restarts the stability clock.
+    // A coherent seq bump observed only under the lock restarts the stability clock.
     const fx2 = await fixture();
     const { runId } = await seedRun(fx2.allocator);
     live = { pane: childPane(), agent: childAgent() };
     ({ deps, clock } = retirerDeps(fx2, live, {
-      cli: fakeCli(live, { getPane: childPane({ state_change_seq: 9 }) }),
+      cli: fakeCli(live, { getPane: childPane({ state_change_seq: 9 }), getAgent: childAgent({ state_change_seq: 9 }) }),
     }));
     retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "recheck_seq" });
     expect(live.pane).not.toBeUndefined();
     // The clock restarted: the unchanged observation is fresh, not stale.
@@ -924,9 +1169,7 @@ describe("lane retirer (ADR-040)", () => {
       }),
     });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "recheck_tokens" });
     expect(live.pane).not.toBeUndefined();
 
@@ -942,10 +1185,206 @@ describe("lane retirer (ADR-040)", () => {
       }),
     });
     const retirer2 = createLaneRetirer(deps2.deps);
-    await retirer2.sweep();
-    deps2.clock.nowMs += GRACE_MS;
-    await retirer2.sweep();
+    await sweepPastGrace(retirer2, deps2.clock);
     expect(retirer2.view(dropped.runId)).toMatchObject({ state: "deferred", reason: "recheck_tokens" });
+  });
+
+  it("F3: re-resolves the owner, the child's mailbox, and the child's intents under the locks — a transfer inside the lock window refuses the close", async () => {
+    // The owner transfers the run to its own child between approval and the
+    // lock: the fresh provenance makes the child the current owner, and the
+    // topology re-validation refuses exactly as a pre-sweep transfer would.
+    const fx = await fixture();
+    const transferred = await seedRun(fx.allocator);
+    let live: Live = { pane: childPane(), agent: childAgent() };
+    let lock = fakePaneLock({ onAcquire: () => transferTo(transferred.allocation, childSession) });
+    let { deps, clock } = retirerDeps(fx, live, { options: { paneLock: lock.guard } });
+    let retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(transferred.runId)).toMatchObject({ state: "refused", reason: "recheck_owner_topology_protected" });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
+
+    // An event landing in the child's mailbox inside the window refuses.
+    const fx2 = await fixture();
+    const mailed = await seedRun(fx2.allocator);
+    live = { pane: childPane(), agent: childAgent() };
+    lock = fakePaneLock({ onAcquire: async () => { await fx2.mailbox.writeGapEvent(childKey, { from: "2026-10-01T00:00:00.000Z", to: "2026-10-01T01:00:00.000Z", lost: {} }); } });
+    ({ deps, clock } = retirerDeps(fx2, live, { options: { paneLock: lock.guard } }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(mailed.runId)).toMatchObject({ state: "refused", reason: "recheck_child_mailbox_unread" });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
+
+    // A launch intent recorded under the child's key inside the window refuses.
+    const fx3 = await fixture();
+    const launching = await seedRun(fx3.allocator);
+    live = { pane: childPane(), agent: childAgent() };
+    lock = fakePaneLock({ onAcquire: () => recordedChildIntent(fx3.intents, "sub-late") });
+    ({ deps, clock } = retirerDeps(fx3, live, { options: { paneLock: lock.guard } }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(launching.runId)).toMatchObject({ state: "refused", reason: "recheck_child_intent_open" });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
+  });
+
+  it("F3: holds the run flock across the re-proof and the close dispatch, defers without an attempt when it cannot be taken, and keeps a proven close through a release fault", async () => {
+    // The close dispatch runs while the run's native flock is held: a
+    // concurrent transfer (which takes the same flock) cannot interleave.
+    const fx = await fixture();
+    const { allocation, runId } = await seedRun(fx.allocator);
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const probe = async (): Promise<boolean> => {
+      try {
+        const holder = await acquireFlockHolder({ lockPath: allocation.lockPath, wait: "nonblock", readyMarker: "HERDR_RETIRE_TEST_PROBE", subject: "Probe", failure: (message) => new Error(message) });
+        await holder.release();
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    let heldDuringClose: boolean | undefined;
+    const cli = fakeCli(live, { onClose: async () => { heldDuringClose = await probe(); } });
+    let { deps, clock } = retirerDeps(fx, live, { cli });
+    let retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+    expect(heldDuringClose).toBe(true);
+    // Released afterwards — the lane_retired write took the same flock and landed.
+    expect(await probe()).toBe(false);
+    expect(await fx.mailbox.list(ownerKey)).toHaveLength(1);
+
+    // An unacquirable run flock defers before any under-lock read and spends
+    // no attempt: the first real close failure afterwards is still a retry.
+    const fx2 = await fixture();
+    const contended = await seedRun(fx2.allocator);
+    const live2: Live = { pane: childPane(), agent: childAgent() };
+    const real = daemonRunOwnership(fx2.allocator);
+    const gate = { fail: true };
+    const flaky: LaneRetirerDeps["ownership"] = {
+      withRunFlock: (id, section) => (gate.fail ? Promise.reject(new OwnershipError("OWNERSHIP_UNAVAILABLE")) : real.withRunFlock(id, section)),
+    };
+    const cliOpts: FakeCliOptions = { closeError: Object.assign(new Error("socket dropped"), { code: "CLI_UNAVAILABLE" }) };
+    ({ deps, clock } = retirerDeps(fx2, live2, { ownership: flaky, cli: fakeCli(live2, cliOpts), options: { maxAttempts: 2 } }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(contended.runId)).toMatchObject({ state: "deferred", reason: "run_lock_unavailable" });
+    expect(lockedCalls(deps)).toHaveLength(0);
+    gate.fail = false;
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(contended.runId)).toMatchObject({ state: "deferred", reason: "close_MUTATION_UNCERTAIN" });
+    expect(closes(deps)).toHaveLength(1);
+
+    // A release fault after the section ran cannot recall a proven close:
+    // the recorded outcome stands and the event is written.
+    const fx3 = await fixture();
+    const faulting = await seedRun(fx3.allocator);
+    const live3: Live = { pane: childPane(), agent: childAgent() };
+    const real3 = daemonRunOwnership(fx3.allocator);
+    const leaky: LaneRetirerDeps["ownership"] = {
+      withRunFlock: async (id, section) => {
+        await real3.withRunFlock(id, section);
+        throw new OwnershipError("OWNERSHIP_UNAVAILABLE");
+      },
+    };
+    ({ deps, clock } = retirerDeps(fx3, live3, { ownership: leaky }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(faulting.runId)).toMatchObject({ state: "retired" });
+    expect(retirer.retiredByDaemon(faulting.runId)).toBe(true);
+    expect(await fx3.mailbox.list(ownerKey)).toHaveLength(1);
+  });
+
+  it("F3: re-reads the sidecar and the provenance under the locks — a released or unreadable run, an unreadable record, or a late keep never closes", async () => {
+    // The run left `handed_off` inside the window.
+    const fx = await fixture();
+    const released = await seedRun(fx.allocator);
+    let live: Live = { pane: childPane(), agent: childAgent() };
+    let lock = fakePaneLock({ onAcquire: async () => { await updateHandoffState(released.allocation, (state) => { state.lifecycle.state = "cancelled"; }); } });
+    let { deps, clock } = retirerDeps(fx, live, { options: { paneLock: lock.guard } });
+    let retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(released.runId)).toMatchObject({ state: "deferred", reason: "recheck_lifecycle" });
+    expect(live.pane).not.toBeUndefined();
+    expect(lockedCalls(deps)).toHaveLength(0);
+
+    // The sidecar became unreadable inside the window.
+    const fx2 = await fixture();
+    const broken = await seedRun(fx2.allocator);
+    live = { pane: childPane(), agent: childAgent() };
+    lock = fakePaneLock({ onAcquire: () => writeFile(broken.allocation.statePath, "{not json", { mode: 0o600 }) });
+    ({ deps, clock } = retirerDeps(fx2, live, { options: { paneLock: lock.guard } }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(broken.runId)).toMatchObject({ state: "deferred", reason: "recheck_sidecar" });
+    expect(live.pane).not.toBeUndefined();
+
+    // The provenance became unreadable inside the window.
+    const fx3 = await fixture();
+    const corrupted = await seedRun(fx3.allocator);
+    live = { pane: childPane(), agent: childAgent() };
+    lock = fakePaneLock({ onAcquire: () => writeFile(join(corrupted.allocation.toolsDir, HANDOFF_PROVENANCE_NAME), "{not json", { mode: 0o600 }) });
+    ({ deps, clock } = retirerDeps(fx3, live, { options: { paneLock: lock.guard } }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(corrupted.runId)).toMatchObject({ state: "deferred", reason: "recheck_provenance_unreadable" });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
+
+    // A keep that appears under the lock — in the task contract or as a pane
+    // token — parks the lane instead of closing it.
+    const fx4 = await fixture();
+    const lateKeep = await seedRun(fx4.allocator);
+    live = { pane: childPane(), agent: childAgent() };
+    lock = fakePaneLock({ onAcquire: async () => {
+      const prior = await readHandoffProvenance(lateKeep.allocation);
+      await writeHandoffProvenance(lateKeep.allocation, { ...prior, v: 2, owners: [{ session: ownerSession, from: prior.createdAt, to: null, reason: "launch" }], task: { ...prior.task, retention: "keep" } });
+    } });
+    ({ deps, clock } = retirerDeps(fx4, live, { options: { paneLock: lock.guard } }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(lateKeep.runId)).toMatchObject({ state: "kept", reason: "task_retention_keep" });
+    expect(live.pane).not.toBeUndefined();
+
+    const fx5 = await fixture();
+    const tokenKeep = await seedRun(fx5.allocator);
+    live = { pane: childPane(), agent: childAgent() };
+    ({ deps, clock } = retirerDeps(fx5, live, {
+      cli: fakeCli(live, {
+        getPane: childPane({ tokens: childTokens(childSession, { retention: "keep" }) }),
+        getAgent: childAgent({ tokens: childTokens(childSession, { retention: "keep" }) }),
+      }),
+    }));
+    retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(tokenKeep.runId)).toMatchObject({ state: "kept", reason: "token_retention_keep" });
+    expect(live.pane).not.toBeUndefined();
+  });
+
+  it("F7: checks the lease immediately before dispatch — a lost lease defers without spending an attempt", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx.allocator);
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const lockOpts: FakeLockOptions = { checkError: Object.assign(new Error("holder is not live"), { code: "PANE_WRITE_LOCK_UNAVAILABLE" }) };
+    const lock = fakePaneLock(lockOpts);
+    const cliOpts: FakeCliOptions = { closeError: Object.assign(new Error("socket dropped"), { code: "CLI_UNAVAILABLE" }) };
+    const { deps, clock } = retirerDeps(fx, live, { cli: fakeCli(live, cliOpts), options: { paneLock: lock.guard, maxAttempts: 2 } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(lock.checks).toEqual(["p-child"]);
+    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "pane_lock_lost" });
+    expect(closes(deps)).toHaveLength(0);
+    expect(live.pane).not.toBeUndefined();
+    // No attempt was spent: with the lease live again, the first real close
+    // failure is a retry, not the terminal `failed`.
+    lockOpts.checkError = undefined;
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(lock.checks).toEqual(["p-child", "p-child"]);
+    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "close_MUTATION_UNCERTAIN" });
+    expect(closes(deps)).toHaveLength(1);
   });
 
   it("retires a lane whose artifact carries no recorded digest, omitting artifactSha256", async () => {
@@ -954,9 +1393,7 @@ describe("lane retirer (ADR-040)", () => {
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live);
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "retired" });
     const unread = await fx.mailbox.list(ownerKey);
     expect(unread).toHaveLength(1);
@@ -977,9 +1414,7 @@ describe("lane retirer (ADR-040)", () => {
       options: { paneLock: fakePaneLock({ releaseError: new Error("flock release lost") }).guard },
     });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "retired" });
     expect(live.pane).toBeUndefined();
     expect(await fx.mailbox.list(ownerKey)).toHaveLength(1);
@@ -993,9 +1428,7 @@ describe("lane retirer (ADR-040)", () => {
       snapshot: async () => snapshotFor(live, { omitOwner: true }),
     });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     // Nothing the close could cascade into — the absent owner protects nothing.
     expect(retirer.view(runId)).toMatchObject({ state: "retired" });
     expect(live.pane).toBeUndefined();
@@ -1005,16 +1438,17 @@ describe("lane retirer (ADR-040)", () => {
     expect(await fx.mailbox.read(ownerKey, unread[0]!)).toMatchObject({ kind: "lane_retired", runId });
   });
 
-  it("bounds journal fragments and runs on the default clock and sink", async () => {
+  it("defers a malformed pane record, bounds journal fragments, and runs on the default clock and sink", async () => {
     const fx = await fixture();
     const { runId } = await seedRun(fx.allocator);
-    // A non-string status is evidence, never journal text — and with no
-    // injected clock or sink the retirer runs on its defaults.
+    // A non-string status is malformed lifecycle evidence — a bounded
+    // deferral, never journal text — and with no injected clock or sink the
+    // retirer runs on its defaults.
     const live: Live = { pane: childPane({ agent_status: 7 }), agent: childAgent() };
     const { deps } = retirerDeps(fx, live, { now: undefined, log: undefined });
     const retirer = createLaneRetirer(deps);
     await retirer.sweep();
-    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "child_active:unavailable" });
+    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "lifecycle_target_record_malformed" });
     expect(live.pane).not.toBeUndefined();
 
     // A rejection that is not an error object at all still journals as ERROR.
@@ -1029,7 +1463,7 @@ describe("lane retirer (ADR-040)", () => {
 
     // A defect escaping evaluate — an injected clock that throws — is
     // journaled as a sweep error and never strands the sweep.
-    const { deps: deps3 } = retirerDeps(fx, live, {
+    const { deps: deps3 } = retirerDeps(fx, { pane: childPane(), agent: childAgent() }, {
       now: () => {
         throw Object.assign(new Error("clock broke"), { code: "CLOCK_STOPPED" });
       },
@@ -1044,14 +1478,13 @@ describe("lane retirer (ADR-040)", () => {
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live, { options: { enabled: false } });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     clock.nowMs += GRACE_MS;
     await retirer.sweep();
     expect(retirer.view(runId)).toMatchObject({ state: "disabled" });
     expect(live.pane).not.toBeUndefined();
-    expect((deps.cli as FakeCli).calls).toHaveLength(0);
+    // Only the per-sweep screen reads — nothing under a lock, no close.
+    expect(lockedCalls(deps)).toHaveLength(0);
     expect(fx.lines.filter((line) => line.includes(`run=${runId}`) && line.includes("decision=would_retire"))).toHaveLength(1);
     expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
   });
@@ -1069,54 +1502,56 @@ describe("lane retirer (ADR-040)", () => {
       await retirer.sweep();
     }
     // Three close attempts — the initial plus two retries — then failed.
-    expect((deps.cli as FakeCli).calls.filter((argv) => argv[1] === "close")).toHaveLength(3);
+    expect(closes(deps)).toHaveLength(3);
     expect(retirer.view(runId)).toMatchObject({ state: "failed", reason: "close_MUTATION_UNCERTAIN" });
     expect(retirer.retiredByDaemon(runId)).toBe(false);
     expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
     expect(live.pane).not.toBeUndefined();
     clock.nowMs += GRACE_MS;
     await retirer.sweep();
-    expect((deps.cli as FakeCli).calls.filter((argv) => argv[1] === "close")).toHaveLength(3);
+    expect(closes(deps)).toHaveLength(3);
   });
 
-  it("defers without spending attempts when the pane lock or the get re-reads fail", async () => {
+  it("defers without spending attempts when the pane lock cannot be acquired", async () => {
     const fx = await fixture();
     const { runId } = await seedRun(fx.allocator);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const { deps, clock } = retirerDeps(fx, live, { options: { paneLock: fakePaneLock({ fails: true }).guard } });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "pane_lock_unavailable" });
-    expect((deps.cli as FakeCli).calls).toHaveLength(0);
+    expect(lockedCalls(deps)).toHaveLength(0);
   });
 
-  it("records an absent-after-mutation-error close as retired without a confirmed marker", async () => {
+  it("F6/F9: a reconciled absence is another actor's close — no retired marker, no lane_retired, and the next sweep drops the vanished child", async () => {
     const fx = await fixture();
     const { runId } = await seedRun(fx.allocator);
     const live: Live = { pane: childPane(), agent: childAgent() };
     const selfClose = createSelfCloseTracker();
-    const cli = fakeCli(live, { closeError: Object.assign(new Error("socket dropped mid-close"), { code: "CLI_UNAVAILABLE" }) });
-    // The transport error raced a real close: the readback finds the pane gone.
-    const realRunJson = cli.runJson.bind(cli);
-    cli.runJson = async (argv, signal, preserve) => {
-      if (argv[0] === "pane" && argv[1] === "close") {
+    // The transport error raced a real close by someone else: the readback
+    // finds the pane gone, but no mutation of ours proved it.
+    const cli = fakeCli(live, {
+      closeError: Object.assign(new Error("socket dropped mid-close"), { code: "CLI_UNAVAILABLE" }),
+      onClose: async () => {
         live.pane = undefined;
         live.agent = undefined;
-      }
-      return realRunJson(argv, signal, preserve);
-    };
+      },
+    });
     const { deps, clock } = retirerDeps(fx, live, { cli, selfClose });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
-    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
-    expect(retirer.retiredByDaemon(runId)).toBe(true);
-    // reconciled=true — the absence was not proven to be this host's mutation.
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "close_reconciled_absent" });
+    // Not this daemon's retirement: JobRegistry must still emit job_terminal.
+    expect(retirer.retiredByDaemon(runId)).toBe(false);
+    // The own-close ledger holds no confirmed marker — the pane_closed wake lands normally.
     expect(await selfClose.consume("p-child")).toBe(false);
-    expect(await fx.mailbox.list(ownerKey)).toHaveLength(1);
+    expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
+    expect(fx.lines.some((line) => line.includes(`run=${runId}`) && line.includes("decision=deferred reason=close_reconciled_absent"))).toBe(true);
+    // The next sweep observes the absence and stops tracking the run.
+    await retirer.sweep();
+    expect(retirer.view(runId)).toBeUndefined();
+    expect(retirer.retiredByDaemon(runId)).toBe(false);
+    expect(await fx.mailbox.list(ownerKey)).toHaveLength(0);
   });
 
   it("still retires when the lane_retired event cannot persist, and journals the loss", async () => {
@@ -1129,9 +1564,7 @@ describe("lane retirer (ADR-040)", () => {
     };
     const { deps, clock } = retirerDeps(fx, live, { mailbox: refusing });
     const retirer = createLaneRetirer(deps);
-    await retirer.sweep();
-    clock.nowMs += GRACE_MS;
-    await retirer.sweep();
+    await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "retired" });
     expect(retirer.retiredByDaemon(runId)).toBe(true);
     expect(fx.lines.some((line) => line.includes("decision=retired_event_unpersisted reason=capacity"))).toBe(true);
@@ -1145,15 +1578,13 @@ describe("lane retirer (ADR-040)", () => {
     };
     const deps2 = retirerDeps(fx2, live2, { mailbox: throwing });
     const retirer2 = createLaneRetirer(deps2.deps);
-    await retirer2.sweep();
-    deps2.clock.nowMs += GRACE_MS;
-    await retirer2.sweep();
+    await sweepPastGrace(retirer2, deps2.clock);
     expect(retirer2.view(thrown.runId)).toMatchObject({ state: "retired" });
   });
 
   it("survives a failed snapshot, an absent or unreadable runs dir, and a mid-sweep fault", async () => {
     const fx = await fixture();
-    const { runId } = await seedRun(fx.allocator);
+    const { allocation, runId } = await seedRun(fx.allocator);
     const live: Live = { pane: childPane(), agent: childAgent() };
 
     // Snapshot failure: no classification is ever inferred.
@@ -1171,13 +1602,14 @@ describe("lane retirer (ADR-040)", () => {
     await createLaneRetirer(deps3.deps).sweep();
     expect(deps3.clock.nowMs).toBeGreaterThan(0);
 
-    // A mid-evaluate fault — the get re-read throws — defers that run only.
+    // A mid-evaluate fault — the get re-read throws — defers that run only,
+    // and the run flock it threw under is released.
     const deps4 = retirerDeps(fx, live, { cli: fakeCli(live, { getError: Object.assign(new Error("gone"), { code: "CLI_PROTOCOL_ERROR" }) }) });
     const retirer4 = createLaneRetirer(deps4.deps);
-    await retirer4.sweep();
-    deps4.clock.nowMs += GRACE_MS;
-    await retirer4.sweep();
+    await sweepPastGrace(retirer4, deps4.clock);
     expect(retirer4.view(runId)).toMatchObject({ state: "deferred", reason: "sweep_error:CLI_PROTOCOL_ERROR" });
+    const released = await acquireFlockHolder({ lockPath: allocation.lockPath, wait: "nonblock", readyMarker: "HERDR_RETIRE_TEST_PROBE", subject: "Probe", failure: (message) => new Error(message) });
+    await released.release();
 
     // A vanished run directory drops its ledger entry entirely.
     const deps5 = retirerDeps(fx, live);

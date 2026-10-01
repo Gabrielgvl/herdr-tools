@@ -6,17 +6,23 @@
  * One sweep takes exactly one authoritative `api snapshot`, enumerates the
  * endpoint's run sidecars, and for every `handed_off` run proves, in order:
  *
- * 1. sidecar parses, `child.terminalId` and `nativeSession` bound;
- * 2. `classifyChild` exact match, pane `idle`/`done`, and the agent record's
- *    `state_change_seq` continuously unchanged for `graceMs` (in-memory
- *    `runId → {seq, since}` — a changed seq, an active status, or an absence
- *    resets the clock; restarts conservatively re-observe);
+ * 1. sidecar parses, `child.terminalId` and `nativeSession` bound; a missing
+ *    provenance record is a legacy run, any other unreadable one refuses;
+ * 2. `classifyChild` exact match; the agent record's own lifecycle tuple —
+ *    admitted only when the supervision join proves it coherent with the pane
+ *    record — reads `idle`/`done`, and both its `state_change_seq` and the
+ *    digest of the pane's detection screen (`pane read --source detection`)
+ *    stay continuously unchanged for `graceMs` (in-memory
+ *    `runId → {seq, screen, since}` — a changed counter or screen, an active or
+ *    contradictory status, an unreadable screen, or an absence resets the
+ *    clock; restarts conservatively re-observe);
  * 3. pane tokens prove `identity_provenance=launched` and `identity_session`
  *    equals the recorded session — advisory evidence, secondary to the exact
  *    match, and fail-closed when missing, malformed, or contradictory;
  * 4. the pane is no manager: `classifyCaller` must yield a launched leaf, its
- *    session key must hold no open intent ledger and no nonterminal children,
- *    and its own mailbox `unread/` must be empty;
+ *    session key must hold no open intent ledger (`recorded`, `effecting`, or
+ *    `unresolved`) and no nonterminal children, and its own mailbox `unread/`
+ *    must be empty;
  * 5. owner topology: the current owner (provenance v2) resolved to a live pane
  *    by exact session — `state.manager.paneId` as the fallback — must not sit
  *    inside the close's cascade (`PROTECTED_RESOURCE` refuses,
@@ -27,23 +33,32 @@
  *    never retires; the kill switch turns an otherwise-eligible close into a
  *    journaled `would_retire` and a `disabled` view.
  *
- * The close itself runs under the pane write lock: `pane get`/`agent get`
- * re-prove identity, tokens, status, and focus; `selfClose.begin` correlates
- * the supervisor's own `pane_closed` wake; `closeWithReadback` proves the
- * pane absent. A failed close retries on later sweeps and stops at
- * `maxAttempts` with state `failed`. A proven close marks the run retired —
- * the `retiredByDaemon` marker `JobRegistry` consults before suppressing the
- * trailing `job_terminal` — and emits exactly one `lane_retired` event to the
- * run's current owner mailbox.
+ * The close itself runs under the pane write lock and the run flock — the
+ * lock ownership transfers and sidecar mutations take — and re-proves the
+ * whole chain there: the sidecar, `pane get`/`agent get` identity, tokens,
+ * lifecycle and counter, the current owner, the child's intents and mailbox,
+ * the owner topology, focus, the screen digest, and the lease itself.
+ * `selfClose.begin` correlates the supervisor's own `pane_closed` wake;
+ * `closeWithReadback` proves the pane absent. A failed close retries on
+ * later sweeps and stops at `maxAttempts` with state `failed`. Only a close
+ * whose own mutation the readback confirmed (`reconciled === false`) marks
+ * the run retired — the `retiredByDaemon` marker `JobRegistry` consults
+ * before suppressing the trailing `job_terminal` — and emits exactly one
+ * `lane_retired` event to the run's current owner mailbox; an absence the
+ * readback found without that proof is another actor's close, journaled and
+ * never claimed.
  */
 
+import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { tokenValue } from "../agent-identity.js";
 import { classifyCaller, mergedToken } from "../caller-policy.js";
+import type { CliTextResult } from "../cli.js";
 import { paneCloseTopology, topologySummary, validateClose, type CloseTopology } from "../close.js";
 import {
   currentHandoffOwner,
+  HandoffError,
   readHandoffProvenance,
   readHandoffState,
   RUN_ID_PATTERN,
@@ -59,11 +74,11 @@ import { requirePromptTargetIdentity, type AgentSessionIdentity } from "../messa
 import { agentFrom, findSessionPane, paneFrom, snapshotIdentityRecords } from "../messages/prompt-target.js";
 import { closeWithReadback, type CloseReadbackCli } from "../mutations.js";
 import type { PaneWriteGuard, PaneWriteLease } from "../pane-write-lock.js";
-import type { SupervisedIdentity } from "../supervision/identity.js";
+import { joinTargetRecords, type SupervisedIdentity } from "../supervision/identity.js";
 import type { SelfCloseTracker } from "../supervision/self-close.js";
 import type { HerdrSnapshot } from "../targets.js";
 import { managerSessionKey, type IntentStore, type LaunchIntentRecord } from "./intents.js";
-import type { Mailbox } from "./mailbox.js";
+import type { Mailbox, MailboxRunOwnership } from "./mailbox.js";
 import { classifyChild } from "./reattach.js";
 
 /** The `retire` projection `DaemonStatusRun` carries (durable-supervisor §7). */
@@ -86,20 +101,27 @@ export interface LaneRetirer {
   retiredByDaemon(runId: string): boolean;
 }
 
+/** The retirer's CLI surface: the readback-proven close plus the detection-screen read. */
+export interface LaneRetirerCli extends CloseReadbackCli {
+  runTextResult(argv: string[], signal: AbortSignal): Promise<CliTextResult>;
+}
+
 export interface LaneRetirerDeps {
   /** The endpoint's handoff run namespace, enumerated directly each sweep. */
   runs: HandoffNamespace;
   allocator: HandoffAllocator;
+  /** The run flock ownership transfers take — held across the under-lock re-proof and the close. */
+  ownership: Required<Pick<MailboxRunOwnership, "withRunFlock">>;
   intents: IntentStore;
   /** `writeRunEvent` for `lane_retired`; `list` for the child-mailbox guard. */
   mailbox: Pick<Mailbox, "writeRunEvent" | "list">;
-  /** `pane get`/`agent get` re-proofs and the readback-proven `pane close`. */
-  cli: CloseReadbackCli;
+  /** `pane get`/`agent get`/`pane read` proofs and the readback-proven `pane close`. */
+  cli: LaneRetirerCli;
   /** Shared with the supervision registry: this host's own-close ledger. */
   selfClose: SelfCloseTracker;
   /** Live-supervisor lookup for the `lane_retired` jobId. */
   jobs: Pick<JobRegistry, "activeSupervisorFor">;
-  /** One fresh authoritative snapshot per sweep and per close readback. */
+  /** One fresh authoritative snapshot per sweep, per under-lock re-proof, and per close readback. */
   snapshot(): Promise<HerdrSnapshot>;
   options: {
     /** The kill switch: false journals `would_retire` and closes nothing. */
@@ -133,7 +155,9 @@ const TERMINAL_VIEWS = new Set<RetireView["state"]>(["retired", "failed", "kept"
 interface LaneEntry {
   /** The continuously observed `state_change_seq` — the stability clock's value. */
   seq?: number;
-  /** `now()` when the current seq+status observation began; cleared on reset. */
+  /** The continuously observed detection-screen digest — the inactivity proof. */
+  screen?: string;
+  /** `now()` when the current observation began; cleared on reset. */
   sinceMs?: number;
   /** Consecutive focused deferrals while otherwise eligible. */
   focusDefers: number;
@@ -144,13 +168,31 @@ interface LaneEntry {
   journaled?: string;
 }
 
+/** One coherent lifecycle observation: the agent record's own status and counter. */
+interface Lifecycle {
+  status: string;
+  seq: number;
+}
+
+/** A veto from the owner-side chain — the view state it demands and its bounded reason. */
+interface Veto {
+  state: "refused" | "deferred";
+  reason: string;
+}
+
+/** What the under-lock section decided; the proven-close event write happens after the run flock releases. */
+type LockedOutcome =
+  | { kind: "settled" }
+  | { kind: "closed"; reconciled: boolean }
+  | { kind: "faulted"; error: unknown };
+
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
 
 /** A bounded single-line reason fragment — journal text never carries free-form detail. */
-function bounded(value: unknown): string {
-  return (typeof value === "string" ? value : "unavailable").replace(/[^\x20-\x7e]/gu, "_").slice(0, 64);
+function bounded(value: string): string {
+  return value.replace(/[^\x20-\x7e]/gu, "_").slice(0, 64);
 }
 
 function codeOf(error: unknown): string {
@@ -165,13 +207,20 @@ function sameSession(left: AgentSessionIdentity, right: AgentSessionIdentity): b
     && left.value === right.value;
 }
 
-/** The agent record's `state_change_seq`, falling back to the pane record's. */
-function observedSeq(records: readonly Record<string, unknown>[]): number | undefined {
-  for (const candidate of records) {
-    const seq = candidate.state_change_seq;
-    if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) return seq;
-  }
-  return undefined;
+/**
+ * The agent record's lifecycle tuple, admitted only once the supervision join
+ * proves it coherent with the pane record: a contradictory or malformed pair
+ * and a missing status or counter are bounded refusals — the pane's scalars
+ * never stand in for the agent record's.
+ */
+function lifecycleOf(pane: Record<string, unknown>, agent: Record<string, unknown>): Lifecycle | { refusal: string } {
+  const joined = joinTargetRecords(pane, agent);
+  if (joined.kind === "invalid") return { refusal: `lifecycle_${joined.reason}` };
+  const status = agent.agent_status;
+  if (typeof status !== "string") return { refusal: "lifecycle_status_unavailable" };
+  const seq = agent.state_change_seq;
+  if (typeof seq !== "number") return { refusal: "state_change_seq_unavailable" };
+  return { status, seq };
 }
 
 export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
@@ -179,6 +228,7 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
   const log = deps.log ?? (() => undefined);
   const maxFocusDefers = deps.options.maxFocusDefers ?? DEFAULT_MAX_FOCUS_DEFERS;
   const maxAttempts = deps.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const signal = new AbortController().signal;
   const ledger = new Map<string, LaneEntry>();
   /** Runs this daemon provably closed — the `job_terminal` suppression marker. */
   const retired = new Set<string>();
@@ -204,17 +254,49 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
 
   function resetClock(entry: LaneEntry): void {
     entry.seq = undefined;
+    entry.screen = undefined;
     entry.sinceMs = undefined;
+  }
+
+  /**
+   * The independent inactivity proof: sha256 over the pane's detection-screen
+   * text. A failed or truncated read is a refusal, never a digest — the
+   * screen must be fully observed to count as unchanged.
+   */
+  async function screenDigest(paneId: string): Promise<{ digest: string } | { refusal: string }> {
+    let read: CliTextResult;
+    try {
+      read = await deps.cli.runTextResult(["pane", "read", paneId, "--source", "detection", "--format", "text"], signal);
+    } catch {
+      return { refusal: "screen_unavailable" };
+    }
+    if (read.truncated) return { refusal: "screen_truncated" };
+    return { digest: createHash("sha256").update(read.value, "utf8").digest("hex") };
+  }
+
+  /**
+   * The run's provenance. Only a genuinely missing record is a legacy run with
+   * no owner history; a malformed, untrusted, oversized, or unreadable one
+   * refuses — it may hide a `retention: "keep"` or a transferred owner.
+   */
+  async function readProvenance(run: HandoffAllocation): Promise<{ provenance: HandoffProvenance | undefined } | { refusal: string }> {
+    try {
+      return { provenance: await readHandoffProvenance(run) };
+    } catch (error) {
+      if (error instanceof HandoffError && error.details.reason === "missing") return { provenance: undefined };
+      return { refusal: "provenance_unreadable" };
+    }
   }
 
   /**
    * A sub-manager protection check: `undefined` only when every intent under
    * the candidate's own session key is closed and every recorded child run is
-   * in a terminal lifecycle. Anything open or unproven refuses.
+   * in a terminal lifecycle. Anything open or unproven refuses — including a
+   * `recorded` intent, whose launch request may already be executing.
    */
   async function managedChildrenReason(intents: LaunchIntentRecord[]): Promise<string | undefined> {
     for (const intent of intents) {
-      if (intent.state === "unresolved" || intent.state === "effecting") return "child_intent_open";
+      if (intent.state === "recorded" || intent.state === "unresolved" || intent.state === "effecting") return "child_intent_open";
       for (const child of intent.children) {
         if (child.runId === undefined) continue;
         let lifecycle: HandoffLifecycleState;
@@ -230,44 +312,159 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
   }
 
   /**
-   * The under-lock re-proof: `pane get`/`agent get` records must still carry
-   * the recorded identity, the launch tokens, an idle/done status, an
-   * unchanged `state_change_seq`, and — while its defer bound holds — no
-   * focused flag. Returns the bounded refusal reason, or `undefined` to close.
+   * The owner-side veto chain, proven against one snapshot and the current
+   * provenance: the child's own ledger holds no open intent and no nonterminal
+   * child, its mailbox is drained, and the current owner's pane — the v2
+   * owner's session resolved to a live pane, else the launch record's manager
+   * pane — sits outside the close's cascade. Re-run under the locks
+   * immediately before dispatch.
    */
-  function recheck(records: Record<string, unknown>[], paneId: string, state: HandoffState, entry: LaneEntry): string | undefined {
+  async function vetoes(snapshot: HerdrSnapshot, paneId: string, tabId: string, childKey: string, state: HandoffState, provenance: HandoffProvenance | undefined): Promise<Veto | undefined> {
+    const childIntents = await deps.intents.list(childKey).catch(() => undefined);
+    if (childIntents === undefined) return { state: "deferred", reason: "intents_unavailable" };
+    const managed = await managedChildrenReason(childIntents);
+    if (managed !== undefined) return { state: "refused", reason: managed };
+    const unread = await deps.mailbox.list(childKey).catch(() => undefined);
+    if (unread === undefined) return { state: "deferred", reason: "mailbox_unavailable" };
+    if (unread.length > 0) return { state: "refused", reason: "child_mailbox_unread" };
+
+    const owner = provenance === undefined ? null : currentHandoffOwner(provenance);
+    const ownerPaneId = (owner === null ? undefined : findSessionPane(snapshot, owner)?.pane_id) ?? state.manager.paneId;
+    const ownerRecord = snapshot.panes.find((candidate) => candidate.pane_id === ownerPaneId);
+    const caller: CloseTopology["caller"] = {
+      paneId: ownerPaneId,
+      ...(ownerRecord?.tab_id === undefined ? {} : { tabId: ownerRecord.tab_id }),
+      ...(ownerRecord?.workspace_id === undefined ? {} : { workspaceId: ownerRecord.workspace_id }),
+    };
+    const close = validateClose(paneCloseTopology(snapshot, caller), { kind: "pane", id: paneId, parentId: tabId });
+    if (close.allowed) return undefined;
+    return close.code === "PROTECTED_RESOURCE"
+      ? { state: "refused", reason: "owner_topology_protected" }
+      : { state: "deferred", reason: "topology_invalid" };
+  }
+
+  /**
+   * The under-lock re-proof — holding the pane write lock and the run flock —
+   * and the close. The sidecar must still read `handed_off` for the matched
+   * child; `pane get`/`agent get` must still carry the recorded identity, the
+   * launch tokens, an idle/done lifecycle and the clock's unchanged counter;
+   * the current owner, the child's intents and mailbox, and the owner
+   * topology must still permit the close; the pane must not be focused
+   * within its defer bound; the screen digest must be unchanged; and the
+   * lease must still be held. Every refusal sets its view and settles
+   * without spending an attempt.
+   */
+  async function lockedClose(runId: string, run: HandoffAllocation, identity: SupervisedIdentity, childKey: string, lease: PaneWriteLease, entry: LaneEntry): Promise<LockedOutcome> {
+    const paneId = identity.paneId;
+    const settle = (state: Exclude<RetireView["state"], "retired">, reason: string): LockedOutcome => {
+      setView(runId, entry, state, reason);
+      return { kind: "settled" };
+    };
+    let state: HandoffState;
+    try {
+      state = await readHandoffState(run);
+    } catch {
+      return settle("deferred", "recheck_sidecar");
+    }
+    if (state.lifecycle.state !== "handed_off"
+      || state.child.terminalId !== identity.terminalId
+      || state.child.agentName !== identity.agentName
+      || state.child.agentKind !== identity.agentKind
+      || state.nativeSession === null
+      || !sameSession(state.nativeSession, identity.agentSession)) return settle("deferred", "recheck_lifecycle");
+
+    const paneGet = await deps.cli.runJson(["pane", "get", paneId], signal);
+    const agentGet = await deps.cli.runJson(["agent", "get", paneId], signal);
+    const pane = paneFrom(paneGet.result, paneId);
+    const agent = agentFrom(agentGet.result);
+    const records = [pane, agent];
     let live;
     try {
       live = requirePromptTargetIdentity(records, paneId);
     } catch {
-      return "recheck_identity";
+      return settle("deferred", "recheck_identity");
     }
-    if (live.terminalId !== state.child.terminalId
-      || live.agentName !== state.child.agentName
-      || live.agentKind !== state.child.agentKind
-      || !sameSession(live.agentSession, state.nativeSession!)) return "recheck_identity";
+    if (live.terminalId !== identity.terminalId
+      || live.agentName !== identity.agentName
+      || live.agentKind !== identity.agentKind
+      || !sameSession(live.agentSession, identity.agentSession)) return settle("deferred", "recheck_identity");
     const provenanceToken = mergedToken(records, "identity_provenance");
-    if (provenanceToken.state !== "value" || provenanceToken.value !== "launched") return "recheck_tokens";
+    if (provenanceToken.state !== "value" || provenanceToken.value !== "launched") return settle("deferred", "recheck_tokens");
     const sessionToken = mergedToken(records, "identity_session");
-    const expected = tokenValue(state.nativeSession!.value);
-    if (sessionToken.state !== "value" || expected === undefined || sessionToken.value !== expected) return "recheck_tokens";
-    const pane = records[0]!;
-    const status = pane.agent_status;
-    if (status !== "idle" && status !== "done") return "recheck_status";
-    const seq = observedSeq(records);
-    if (seq !== undefined && entry.seq !== seq) {
+    if (sessionToken.state !== "value" || sessionToken.value !== tokenValue(identity.agentSession.value)) return settle("deferred", "recheck_tokens");
+    const lifecycle = lifecycleOf(pane, agent);
+    if ("refusal" in lifecycle) {
+      resetClock(entry);
+      return settle("deferred", `recheck_${lifecycle.refusal}`);
+    }
+    if (lifecycle.status !== "idle" && lifecycle.status !== "done") {
+      resetClock(entry);
+      return settle("deferred", "recheck_status");
+    }
+    if (lifecycle.seq !== entry.seq) {
       // The lane worked between the sweep's observation and this lock — the
       // stability clock restarts; nothing about the pane is as observed.
       resetClock(entry);
-      return "recheck_seq";
+      return settle("deferred", "recheck_seq");
     }
-    if (pane.focused === true && entry.focusDefers < maxFocusDefers) return "recheck_focused";
-    return undefined;
+
+    const provenance = await readProvenance(run);
+    if ("refusal" in provenance) return settle("deferred", `recheck_${provenance.refusal}`);
+    if (provenance.provenance?.task.retention === "keep") return settle("kept", "task_retention_keep");
+    const retentionToken = mergedToken(records, "retention");
+    if (retentionToken.state === "value" && retentionToken.value === "keep") return settle("kept", "token_retention_keep");
+    // The owner chain against a fresh snapshot: a transfer that landed since
+    // the sweep's approval — it holds the run flock we now hold — shows here.
+    const snapshot = await deps.snapshot();
+    const veto = await vetoes(snapshot, paneId, pane.tab_id as string, childKey, state, provenance.provenance);
+    if (veto !== undefined) return settle(veto.state, `recheck_${veto.reason}`);
+    if (pane.focused === true && entry.focusDefers < maxFocusDefers) return settle("deferred", "recheck_focused");
+
+    const screen = await screenDigest(paneId);
+    if ("refusal" in screen) {
+      resetClock(entry);
+      return settle("deferred", `recheck_${screen.refusal}`);
+    }
+    if (screen.digest !== entry.screen) {
+      // Something printed since the sweep observed the screen: the lane is
+      // not provably inactive, whatever its lifecycle fields say.
+      resetClock(entry);
+      return settle("deferred", "recheck_screen");
+    }
+    try {
+      await lease.check();
+    } catch {
+      // The flock holder died or the lock path lost trust during the reads —
+      // the proof above was taken under exclusion that no longer exists.
+      return settle("deferred", "pane_lock_lost");
+    }
+
+    const finish = deps.selfClose.begin(paneId);
+    entry.attempts += 1;
+    try {
+      const closed = await closeWithReadback<HerdrSnapshot>({
+        cli: deps.cli,
+        argv: ["pane", "close", paneId],
+        signal,
+        targetId: paneId,
+        readback: () => deps.snapshot(),
+        targetPresent: (after) => after.panes.some((candidate) => candidate.pane_id === paneId),
+        summarize: topologySummary,
+      });
+      // Only the close's own readback-proven success confirms the marker the
+      // supervisor consults; an absent-without-mutation outcome lets the
+      // pane_closed wake land normally.
+      finish(closed.reconciled === false);
+      return { kind: "closed", reconciled: closed.reconciled };
+    } catch (error) {
+      finish(false);
+      const code = `close_${codeOf(error)}`;
+      return settle(entry.attempts >= maxAttempts ? "failed" : "deferred", code);
+    }
   }
 
-  async function closeLane(runId: string, run: HandoffAllocation, state: HandoffState, identity: SupervisedIdentity, entry: LaneEntry): Promise<void> {
+  async function closeLane(runId: string, run: HandoffAllocation, state: HandoffState, identity: SupervisedIdentity, childKey: string, entry: LaneEntry): Promise<void> {
     const paneId = identity.paneId;
-    const signal = new AbortController().signal;
     let lease: PaneWriteLease;
     try {
       lease = await deps.options.paneLock.acquire(paneId);
@@ -277,40 +474,35 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
       return;
     }
     try {
-      const paneGet = await deps.cli.runJson(["pane", "get", paneId], signal);
-      const agentGet = await deps.cli.runJson(["agent", "get", paneId], signal);
-      // Pane record first, matching snapshotIdentityRecords' order — the
-      // stability clock reads the same `state_change_seq` source both ways.
-      const records = [paneFrom(paneGet.result, paneId), agentFrom(agentGet.result)];
-      const refusal = recheck(records, paneId, state, entry);
-      if (refusal !== undefined) {
-        setView(runId, entry, "deferred", refusal);
+      // The run flock serializes the re-proof and the close against ownership
+      // transfers and sidecar mutations. `lane_retired` is written only after
+      // it releases: the mailbox resolves the owner under the same flock.
+      let outcome: LockedOutcome | undefined;
+      try {
+        await deps.ownership.withRunFlock(runId, async () => {
+          try {
+            outcome = await lockedClose(runId, run, identity, childKey, lease, entry);
+          } catch (error) {
+            outcome = { kind: "faulted", error };
+          }
+        });
+      } catch {
+        // Only an unacquired flock leaves no outcome; a release fault after the
+        // section ran cannot recall what it did, so the recorded outcome stands.
+      }
+      if (outcome === undefined) {
+        setView(runId, entry, "deferred", "run_lock_unavailable");
         return;
       }
-      const finish = deps.selfClose.begin(paneId);
-      entry.attempts += 1;
-      try {
-        const closed = await closeWithReadback<HerdrSnapshot>({
-          cli: deps.cli,
-          argv: ["pane", "close", paneId],
-          signal,
-          targetId: paneId,
-          readback: () => deps.snapshot(),
-          targetPresent: (after) => after.panes.some((candidate) => candidate.pane_id === paneId),
-          summarize: topologySummary,
-        });
-        // Only the close's own readback-proven success confirms the marker the
-        // supervisor consults; an absent-without-mutation outcome reports
-        // `retired` but lets the pane_closed wake land normally.
-        finish(closed.reconciled === false);
-      } catch (error) {
-        finish(false);
-        const code = `close_${codeOf(error)}`;
-        if (entry.attempts >= maxAttempts) {
-          setView(runId, entry, "failed", code);
-        } else {
-          setView(runId, entry, "deferred", code);
-        }
+      if (outcome.kind === "faulted") throw outcome.error;
+      if (outcome.kind === "settled") return;
+      if (outcome.reconciled) {
+        // The pane is gone, but no mutation of ours proved it: another actor
+        // closed it in the window. Neither the marker nor a `lane_retired`
+        // claim — the supervisor's own pane_closed path settles the run and
+        // its job_terminal still emits; the next sweep observes the absence.
+        resetClock(entry);
+        setView(runId, entry, "deferred", "close_reconciled_absent");
         return;
       }
       retired.add(runId);
@@ -366,14 +558,12 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     }
     const childSession = state.nativeSession;
 
-    let provenance: HandoffProvenance | undefined;
-    try {
-      provenance = await readHandoffProvenance(run);
-    } catch {
-      // A legacy or untrusted provenance still leaves the launch record's
-      // manager pane as the topology fallback — it simply records no owner.
-      provenance = undefined;
+    const provenanceRead = await readProvenance(run);
+    if ("refusal" in provenanceRead) {
+      setView(runId, entry, "refused", provenanceRead.refusal);
+      return;
     }
+    const provenance = provenanceRead.provenance;
     // The ADR-040 opt-out precedes live-identity work: a kept run never
     // retires, so nothing past this point is worth proving for it.
     if (provenance?.task.retention === "keep") {
@@ -406,21 +596,27 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     const pane = snapshot.panes.find((candidate) => candidate.pane_id === paneId)!;
     const records = snapshotIdentityRecords(snapshot, paneId);
 
-    const status = pane.agent_status;
-    if (status !== "idle" && status !== "done") {
+    const lifecycle = lifecycleOf(records[0]!, records[1]!);
+    if ("refusal" in lifecycle) {
       resetClock(entry);
-      setView(runId, entry, "deferred", `child_active:${bounded(status)}`);
+      setView(runId, entry, "deferred", lifecycle.refusal);
       return;
     }
-    const seq = observedSeq(records);
-    if (seq === undefined) {
+    if (lifecycle.status !== "idle" && lifecycle.status !== "done") {
       resetClock(entry);
-      setView(runId, entry, "deferred", "state_change_seq_unavailable");
+      setView(runId, entry, "deferred", `child_active:${bounded(lifecycle.status)}`);
+      return;
+    }
+    const screen = await screenDigest(paneId);
+    if ("refusal" in screen) {
+      resetClock(entry);
+      setView(runId, entry, "deferred", screen.refusal);
       return;
     }
     const nowMs = now().getTime();
-    if (entry.seq !== seq || entry.sinceMs === undefined) {
-      entry.seq = seq;
+    if (entry.seq !== lifecycle.seq || entry.screen !== screen.digest || entry.sinceMs === undefined) {
+      entry.seq = lifecycle.seq;
+      entry.screen = screen.digest;
       entry.sinceMs = nowMs;
     }
     const stableForMs = nowMs - entry.sinceMs;
@@ -462,46 +658,9 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
       setView(runId, entry, "refused", `child_is_manager:${policy.basis}`);
       return;
     }
-    const managers = await deps.intents.listManagers().catch(() => undefined);
-    if (managers === undefined) {
-      setView(runId, entry, "deferred", "intents_unavailable");
-      return;
-    }
-    if (managers.includes(childKey)) {
-      const childIntents = await deps.intents.list(childKey).catch(() => undefined);
-      if (childIntents === undefined) {
-        setView(runId, entry, "deferred", "intents_unavailable");
-        return;
-      }
-      const managed = await managedChildrenReason(childIntents);
-      if (managed !== undefined) {
-        setView(runId, entry, "refused", managed);
-        return;
-      }
-    }
-    const unread = await deps.mailbox.list(childKey).catch(() => undefined);
-    if (unread === undefined) {
-      setView(runId, entry, "deferred", "mailbox_unavailable");
-      return;
-    }
-    if (unread.length > 0) {
-      setView(runId, entry, "refused", "child_mailbox_unread");
-      return;
-    }
-
-    // Owner topology: the v2 current owner's session resolved to a live pane,
-    // else the launch record's manager pane — the cascade may never reach it.
-    const owner = provenance === undefined ? null : currentHandoffOwner(provenance);
-    const ownerPaneId = (owner === null ? undefined : findSessionPane(snapshot, owner)?.pane_id) ?? state.manager.paneId;
-    const ownerRecord = snapshot.panes.find((candidate) => candidate.pane_id === ownerPaneId);
-    const caller: CloseTopology["caller"] = {
-      paneId: ownerPaneId,
-      ...(ownerRecord?.tab_id === undefined ? {} : { tabId: ownerRecord.tab_id }),
-      ...(ownerRecord?.workspace_id === undefined ? {} : { workspaceId: ownerRecord.workspace_id }),
-    };
-    const close = validateClose(paneCloseTopology(snapshot, caller), { kind: "pane", id: paneId, parentId: pane.tab_id });
-    if (!close.allowed) {
-      setView(runId, entry, close.code === "PROTECTED_RESOURCE" ? "refused" : "deferred", close.code === "PROTECTED_RESOURCE" ? "owner_topology_protected" : "topology_invalid");
+    const veto = await vetoes(snapshot, paneId, pane.tab_id, childKey, state, provenance);
+    if (veto !== undefined) {
+      setView(runId, entry, veto.state, veto.reason);
       return;
     }
 
@@ -520,7 +679,7 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     }
     setView(runId, entry, "eligible", undefined, stableForMs);
     try {
-      await closeLane(runId, run, state, identity, entry);
+      await closeLane(runId, run, state, identity, childKey, entry);
     } catch (error) {
       // A close-path fault the lease's finally already unwound — the run
       // keeps its spent attempts and retries on a later sweep.

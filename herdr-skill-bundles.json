@@ -11,7 +11,7 @@
   "bundles": {
     "herdr-profiles/profile-plugins/manager/skills/manager": {
       "source": "./herdr-profiles/role-plugins/manager/skills/manager",
-      "treeHash": "67de9d67456e69f4fccde2c54eed19a6ddaa6759e83123dfb706e8e2f5563d7a"
+      "treeHash": "84d88e3ce9914ea264f1a8ca698d95094dafa7a890cc36acf9edc72fb57532de"
     },
     "herdr-profiles/profile-plugins/manager/skills/harness-flow": {
       "source": "./herdr-profiles/role-plugins/manager/skills/harness-flow",

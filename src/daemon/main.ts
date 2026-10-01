@@ -58,6 +58,47 @@ export const DAEMON_STATUS_NAME = "daemon.json";
 export const DAEMON_HEARTBEAT_MS = 30_000;
 /** ADR-040 lane-retirement cadence — `HERDR_TOOLS_RETIRE_SWEEP_MS` overrides. */
 export const DAEMON_RETIRE_SWEEP_MS = 60_000;
+/** ADR-040 stability grace — `HERDR_TOOLS_RETIRE_GRACE_MS` overrides. */
+export const DAEMON_RETIRE_GRACE_MS = 15 * 60_000;
+/** ADR-040 bounded focused deferrals — `HERDR_TOOLS_RETIRE_FOCUS_DEFERS` overrides. */
+export const DAEMON_RETIRE_FOCUS_DEFERS = 60;
+
+/** The ADR-040 retirement knobs the daemon reads from its environment. */
+export interface RetireEnvOptions {
+  enabled: boolean;
+  graceMs: number;
+  sweepMs: number;
+  maxFocusDefers: number;
+}
+
+/**
+ * A numeric retirement knob: an unset or empty variable is the default, and a
+ * value below `min` — a zero grace would make every finished lane eligible on
+ * first sight, a sub-second sweep would hammer the endpoint — is the default
+ * too, never a silently collapsed `0`.
+ */
+function retireEnvNumber(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+}
+
+/**
+ * ADR-040 env surface. `HERDR_TOOLS_RETIRE_ENABLED` unset, empty, or `0`
+ * means dry-run — the sweep journals `would_retire` and closes nothing until
+ * the operator enables it. Empty strings are unset for every knob; the grace
+ * must be positive and the sweep at least one second, else the default.
+ */
+export function retireEnvOptions(env: NodeJS.ProcessEnv): RetireEnvOptions {
+  const enabled = env.HERDR_TOOLS_RETIRE_ENABLED;
+  return {
+    enabled: enabled !== undefined && enabled.trim() !== "" && enabled !== "0",
+    graceMs: retireEnvNumber(env, "HERDR_TOOLS_RETIRE_GRACE_MS", DAEMON_RETIRE_GRACE_MS, 1),
+    sweepMs: retireEnvNumber(env, "HERDR_TOOLS_RETIRE_SWEEP_MS", DAEMON_RETIRE_SWEEP_MS, 1_000),
+    maxFocusDefers: retireEnvNumber(env, "HERDR_TOOLS_RETIRE_FOCUS_DEFERS", DAEMON_RETIRE_FOCUS_DEFERS, 0),
+  };
+}
 
 /**
  * The N2.x runtime seams the shutdown order drains. Neither may write to the
@@ -481,17 +522,13 @@ if (process.argv[1] !== undefined) {
         });
         const runs = await resolveHandoffNamespace(env);
         const signal = new AbortController().signal;
-        // ADR-040 env surface: unset/`0` means dry-run — the sweep journals
-        // `would_retire` and closes nothing until the operator enables it.
-        const retireEnabled = env.HERDR_TOOLS_RETIRE_ENABLED !== undefined && env.HERDR_TOOLS_RETIRE_ENABLED !== "0";
-        const retireMs = (name: string, fallback: number): number => {
-          const parsed = env[name] === undefined ? Number.NaN : Number(env[name]);
-          return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-        };
-        const retireGraceMs = retireMs("HERDR_TOOLS_RETIRE_GRACE_MS", 15 * 60_000);
+        const retire = retireEnvOptions(env);
+        // The same run flock every sidecar mutation and ownership transfer takes.
+        const ownership = daemonRunOwnership(runtime.allocator);
         const retirer = createLaneRetirer({
           runs,
           allocator: runtime.allocator,
+          ownership,
           intents: runtime.intents,
           mailbox: {
             writeRunEvent: (input) => requireDaemonMailbox(runtime).writeRunEvent(input),
@@ -502,10 +539,10 @@ if (process.argv[1] !== undefined) {
           jobs: runtime.jobs,
           snapshot: async () => parseSnapshotResult((await runtime.cli.runJson(["api", "snapshot"], signal)).result),
           options: {
-            enabled: retireEnabled,
-            graceMs: retireGraceMs,
+            enabled: retire.enabled,
+            graceMs: retire.graceMs,
             paneLock: createPaneWriteGuard({ namespace: () => resolvePaneWriteNamespace(env) }),
-            ...(env.HERDR_TOOLS_RETIRE_FOCUS_DEFERS === undefined ? {} : { maxFocusDefers: retireMs("HERDR_TOOLS_RETIRE_FOCUS_DEFERS", 60) }),
+            maxFocusDefers: retire.maxFocusDefers,
           },
           log: (line) => process.stderr.write(`${line}\n`),
         });
@@ -513,9 +550,9 @@ if (process.argv[1] !== undefined) {
         return runDaemonMain({
           namespace,
           handler: daemonDispatcher(runtime),
-          ownership: daemonRunOwnership(runtime.allocator),
+          ownership,
           retire: retirer,
-          retireSweepMs: retireMs("HERDR_TOOLS_RETIRE_SWEEP_MS", DAEMON_RETIRE_SWEEP_MS),
+          retireSweepMs: retire.sweepMs,
           reattach: ({ mailbox, startedAt, lastHeartbeat }) => {
             // The runtime's §8 ownership and §11 hint ops resolve the mailbox
             // lazily — the serialized status queue exists only now.

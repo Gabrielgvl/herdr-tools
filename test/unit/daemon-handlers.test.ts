@@ -225,6 +225,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   const env = { HERDR_SOCKET_PATH: endpoint };
   const namespace = await resolveDaemonNamespace(env);
   await mkdir(join(root, "project"));
+  await mkdir(join(root, "project", ".git"));
   const projectRoot = await realpath(join(root, "project"));
 
   const children: Child[] = [];
@@ -445,6 +446,10 @@ describe("daemon launch handler — verified identity (D2a)", () => {
       .rejects.toMatchObject({ daemonCode: "PROJECT_ROOT_UNVERIFIED" });
     await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { projectRoot: `${fx.projectRoot}/` })))
       .rejects.toMatchObject({ daemonCode: "PROJECT_ROOT_UNVERIFIED" });
+    const notGit = await realpath(await mkdtemp(join(tmpdir(), "herdr-nogit-")));
+    dirs.push(notGit);
+    await expect(handleDaemonLaunch(fx.runtime, launchParams(notGit)))
+      .rejects.toMatchObject({ daemonCode: "PROJECT_ROOT_NOT_GIT" });
     await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { idempotencyKey: 7 })))
       .rejects.toMatchObject({ daemonCode: "REQUEST_INVALID" });
     await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { task: { objective: "x" } })))
@@ -567,7 +572,7 @@ describe("daemon launch handler — intent-gated execution", () => {
     await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { task: { ...task, objective: "different work entirely" } })))
       .rejects.toMatchObject({ daemonCode: "IDEMPOTENCY_KEY_CONFLICT" });
     const otherDir = join(fx.projectRoot, "..", "other-project");
-    await mkdir(otherDir);
+    await mkdir(join(otherDir, ".git"), { recursive: true });
     const otherRoot = await realpath(otherDir);
     await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { projectRoot: otherRoot })))
       .rejects.toMatchObject({ daemonCode: "IDEMPOTENCY_KEY_CONFLICT" });
@@ -797,6 +802,21 @@ describe("daemon launch handler — intent-gated execution", () => {
     // LAUNCH_FROZEN carries no effectCertainty in its details — normalized to unknown.
     expect(intent.effectCertainty).toBe("unknown");
     expect(intent.failureCode).toBe("LAUNCH_FROZEN");
+  });
+
+  it("settles an intent fail-closed when the launch pipeline throws a foreign error shape", async () => {
+    const fx = await harness();
+    // A lease missing `release` makes the gate's catch path throw a raw
+    // TypeError out of `tool.execute` — the thrown shape carries neither a
+    // typed code nor a phase, and the settle must not invent either.
+    fx.runtime.launchDeps!.launchGate = async () => ({ check: async () => { throw new Error("refused"); } }) as never;
+    await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot)))
+      .rejects.toMatchObject({ daemonCode: "LAUNCH_FAILED" });
+    const intent = (await fx.intents.list(managerKey))[0]!;
+    expect(intent.state).toBe("unresolved");
+    expect(intent.effectCertainty).toBe("unknown");
+    expect(intent.failureCode).toBeUndefined();
+    expect(intent.failurePhase).toBeUndefined();
   });
 
   it("executes through every pipeline default when the runtime wires no launch seams", async () => {

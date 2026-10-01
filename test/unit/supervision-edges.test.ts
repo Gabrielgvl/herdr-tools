@@ -169,6 +169,10 @@ describe("supervisor guards after settlement", () => {
     (supervisor as unknown as { paneId: string }).paneId = "p1";
     (supervisor as unknown as { state: string }).state = "active";
     stopper.current = () => supervisor.shutdown();
+    // The degraded episode announces on its third consecutive failure, so the
+    // snapshot-driven failure below is the one whose wake stops the supervisor.
+    supervisor.onReconciliationFailure("request_failed");
+    supervisor.onReconciliationFailure("request_failed");
     await supervisor.onEvent(thinEvent("pane_closed", "p1"));
     expect(await supervisor.run()).toEqual({ outcome: "cancelled", reason: "manager_session_shutdown" });
   });

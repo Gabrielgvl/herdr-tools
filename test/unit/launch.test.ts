@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
@@ -185,6 +185,8 @@ function makeCli(options: {
   readinessError?: unknown;
   agentId?: string;
   prompt?: (target: string, text: string) => JsonEnvelope;
+  /** Models a Devin-style composer that swallowed the acknowledged Enter: the pane stays idle past the write. */
+  promptLeavesUnsent?: boolean;
   metadataError?: unknown;
   existingPane?: Child;
   tabWithoutPane?: boolean;
@@ -219,11 +221,11 @@ function makeCli(options: {
       calls.push(["agent", "prompt", target]);
       prompts.push(text);
       if (options.prompt !== undefined) {
-        if (active !== undefined) active.prompt = true;
+        if (active !== undefined && options.promptLeavesUnsent !== true) active.prompt = true;
         return options.prompt(target, text);
       }
       if (active === undefined) throw new Error("no active child");
-      active.prompt = true;
+      if (options.promptLeavesUnsent !== true) active.prompt = true;
       return ok("prompt", { type: "agent_prompted", agent: agentRecord(active) });
     }),
     runJson: vi.fn(async (argv, signal) => {
@@ -610,6 +612,7 @@ describe("herdr_launch task cutover", () => {
     supervision.reserve = vi.fn(async (value) => { requests.push(value); return reserve(value); });
 
     const real = mkdtempSync(join(tmpdir(), "herdr-launch-cwd-"));
+    mkdirSync(join(real, ".git"));
     const link = join(tmpdir(), `herdr-launch-cwd-link-${randomUUID()}`);
     symlinkSync(real, link, "dir");
     const file = join(real, "file");
@@ -762,6 +765,10 @@ describe("herdr_launch task cutover", () => {
     } = {}): Promise<{ run: HandoffAllocation; allocator: HandoffAllocator; namespaceDir: string; workspaceDir: string }> {
       const namespaceDir = realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-ns-")));
       const workspaceDir = options.workspaceDir ?? realpathSync(mkdtempSync(join(tmpdir(), "herdr-recovery-ws-")));
+      // A `.git` entry (dir or pointer file) makes the workspace a git work
+      // tree; a deliberately-missing recorded workspace stays missing.
+      if (existsSync(workspaceDir)) mkdirSync(join(workspaceDir, ".git"), { recursive: true });
+      if (options.worktree !== undefined) mkdirSync(join(options.worktree, ".git"), { recursive: true });
       const allocator = createHandoffAllocator({ namespace: { dir: namespaceDir, endpoint: options.endpoint ?? "test-endpoint" } });
       const run = await allocator.allocate();
       const operatingPointId = options.operatingPointId ?? "pi:primary:low";
@@ -1148,6 +1155,7 @@ describe("herdr_launch task cutover", () => {
     expect(harness.calls.filter((call) => call[0] === "agent" && call[1] === "start")).toHaveLength(2);
 
     const root = mkdtempSync(join(tmpdir(), "herdr-launch-availability-"));
+    mkdirSync(join(root, ".git"));
     try {
       const persistedHarness = makeCli({
         failedPane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", agent_status: "unknown" },
@@ -1166,6 +1174,7 @@ describe("herdr_launch task cutover", () => {
 
   it("falls through an AGY quota-class pre-spawn failure and reports the launched PI child", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdr-launch-quota-fallback-"));
+    mkdirSync(join(root, ".git"));
     try {
       const catalog = catalogOf(
         [{ runner: "agy", model: "flash-low" }, { runner: "pi", model: "luna" }],
@@ -1197,6 +1206,7 @@ describe("herdr_launch task cutover", () => {
 
   it("falls through an AGY spawn deadline after authoritative no-agent proof", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdr-launch-timeout-fallback-"));
+    mkdirSync(join(root, ".git"));
     try {
       const catalog = catalogOf(
         [{ runner: "agy", model: "flash-low" }, { runner: "pi", model: "luna" }],
@@ -1355,6 +1365,7 @@ describe("herdr_launch task cutover", () => {
 
   it("appends the router decision through the default log when none is injected", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdr-launch-routerlog-"));
+    mkdirSync(join(root, ".git"));
     try {
       const catalog = catalogOf([{ runner: "pi", model: "primary" }]);
       const result = await execute(toolFor({ catalog, cli: makeCli().cli, routerLog: null, cwd: root }), task());
@@ -2119,9 +2130,9 @@ tierChains:
     const observation = { status: "working", state: "working", stateChangeSeq: 2, revision: 3, screenDetectionSkipped: true, code: "OK" };
     expect(i.compactConfirmationObservation(observation)).toMatchObject({ status: "working", stateChangeSeq: 2 });
     const baseline = { state: "idle", stateChangeSeq: 1, revision: 2 };
-    expect(i.promptConfirmationEvidence(clock, 10, 1, "working", baseline, observation)).toMatchObject({ reason: "working", baseline });
+    expect(i.promptConfirmationEvidence(clock, 10, 1, 1, "working", baseline, observation)).toMatchObject({ reason: "working", baseline });
     const submission = { confirmed: true, paneId: "p", terminalId: "t", agentName: "worker", agentKind: "pi", agentSession: session, revision: 2 };
-    expect(i.promptUnconfirmed(submission, i.promptConfirmationEvidence(clock, 10, 1, "timeout", baseline))).toMatchObject({ code: "PROMPT_UNCONFIRMED" });
+    expect(i.promptUnconfirmed(submission, i.promptConfirmationEvidence(clock, 10, 1, 1, "timeout", baseline))).toMatchObject({ code: "PROMPT_UNCONFIRMED" });
     const agyAck = { operationId: "op", identity: { paneId: "p", terminalId: "t", agentName: "worker", agentKind: "agy" }, revision: 2, agentSession: undefined };
     expect(i.agyPromptSubmissionEvidence(agyAck)).toMatchObject({ confirmed: true, operationId: "op", interactiveReady: true });
     expect(i.agyPromptSubmissionEvidence({ ...agyAck, stateChangeSeq: 1, screenDetectionSkipped: true })).toMatchObject({ stateChangeSeq: 1, screenDetectionSkipped: true });
@@ -2227,6 +2238,144 @@ tierChains:
     aborted.abort();
     await expect(i.confirmPromptConsumption(cli, "p", aborted.signal, submission, baseline, { now: () => 10 }, 0)).rejects.toMatchObject({ code: "PROMPT_UNCONFIRMED", details: { promptConfirmation: { reason: "caller_aborted" } } });
     await expect(i.confirmPromptConsumption(cli, "p", new AbortController().signal, submission, baseline, { now: () => 5_000 }, 0)).rejects.toMatchObject({ code: "PROMPT_UNCONFIRMED", details: { promptConfirmation: { reason: "timeout" } } });
+  });
+
+  it("resubmits an unsent Devin composer once, then reports composer_resubmitted", async () => {
+    const i = launchTestInternals as unknown as UnsafeLaunchInternals;
+    const session = { source: "herdr:devin", agent: "devin", kind: "id", value: "resubmit" };
+    const submission = { confirmed: true, paneId: "p", terminalId: "t0", agentName: "worker", agentKind: "devin", agentSession: session, revision: 2, stateChangeSeq: 1 };
+    const baseline = { state: "idle", stateChangeSeq: 1, revision: 2 };
+    const pendingAgent = { pane_id: "p", name: "worker", agent: "devin", terminal_id: "t0", agent_session: session, agent_status: "idle", state_change_seq: 1, revision: 2 };
+    const pendingPane = { pane_id: "p", tab_id: "t", workspace_id: "w", agent_name: "worker", agent: "devin", terminal_id: "t0", agent_session: session, agent_status: "idle", state_change_seq: 1, revision: 2 };
+    const sentAgent = { ...pendingAgent, state_change_seq: 3, revision: 4 };
+    const sentPane = { ...pendingPane, state_change_seq: 3, revision: 4 };
+
+    // First window proves an idle, unadvanced pane, then expires on the next
+    // sample; the resubmission earns one fresh window in which the send lands.
+    let now = 0;
+    let sent = false;
+    let agentReads = 0;
+    const submitUnsent = vi.fn(async () => { sent = true; now = 0; return true; });
+    const cli: LaunchCli = { runJson: vi.fn(async (argv) => {
+      if (argv[0] === "agent") {
+        agentReads += 1;
+        if (!sent && agentReads >= 2) now = 20_000;
+        return ok("agent", { agent: sent ? sentAgent : pendingAgent });
+      }
+      return ok("pane", { pane: sent ? sentPane : pendingPane });
+    }), prompt: vi.fn() };
+    const confirmed = await i.confirmPromptConsumption(cli, "p", new AbortController().signal, submission, baseline, { now: () => now }, 0, submitUnsent);
+    expect(submitUnsent).toHaveBeenCalledTimes(1);
+    expect(confirmed.confirmation).toMatchObject({ reason: "composer_resubmitted", resubmitted: true });
+  });
+
+  it("bounds the Devin resubmission: one attempt, guarded by state and runner", async () => {
+    const i = launchTestInternals as unknown as UnsafeLaunchInternals;
+    const session = { source: "herdr:devin", agent: "devin", kind: "id", value: "resubmit-bound" };
+    const submission = { confirmed: true, paneId: "p", terminalId: "t0", agentName: "worker", agentKind: "devin", agentSession: session, revision: 2, stateChangeSeq: 1 };
+    const baseline = { state: "idle", stateChangeSeq: 1, revision: 2 };
+    const pendingAgent = { pane_id: "p", name: "worker", agent: "devin", terminal_id: "t0", agent_session: session, agent_status: "idle", state_change_seq: 1, revision: 2 };
+    const pendingPane = { pane_id: "p", tab_id: "t", workspace_id: "w", agent_name: "worker", agent: "devin", terminal_id: "t0", agent_session: session, agent_status: "idle", state_change_seq: 1, revision: 2 };
+    // The window expires only once a full observation has established `last`.
+    const expireAfterFirstSample = (clock: { value: number }, agent: Record<string, unknown>, pane: Record<string, unknown>): LaunchCli => {
+      let agentReads = 0;
+      return { runJson: vi.fn(async (argv) => {
+        if (argv[0] === "agent") {
+          agentReads += 1;
+          if (agentReads >= 2) clock.value += 20_000;
+          return ok("agent", { agent });
+        }
+        return ok("pane", { pane });
+      }), prompt: vi.fn() };
+    };
+
+    // A failed resubmission still earns exactly one attempt — the second
+    // window times out as PROMPT_UNCONFIRMED, not another Enter.
+    const thrownClock = { value: 0 };
+    const throwing = vi.fn(async () => { throw new Error("write section busy"); });
+    await expect(i.confirmPromptConsumption(expireAfterFirstSample(thrownClock, pendingAgent, pendingPane), "p", new AbortController().signal, submission, baseline, { now: () => thrownClock.value }, 0, throwing))
+      .rejects.toMatchObject({ code: "PROMPT_UNCONFIRMED", details: { promptConfirmation: { reason: "timeout" } } });
+    expect(throwing).toHaveBeenCalledTimes(1);
+
+    // A working pane has already consumed — the composer being stale is no
+    // reason to press Enter again.
+    const workingClock = { value: 0 };
+    const workingCli = expireAfterFirstSample(workingClock, { ...pendingAgent, agent_status: "working" }, { ...pendingPane, agent_status: "working" });
+    const workingSubmit = vi.fn(async () => true);
+    await expect(i.confirmPromptConsumption(workingCli, "p", new AbortController().signal, submission, baseline, { now: () => workingClock.value }, 0, workingSubmit))
+      .rejects.toMatchObject({ code: "PROMPT_UNCONFIRMED", details: { promptConfirmation: { reason: "timeout" } } });
+    expect(workingSubmit).not.toHaveBeenCalled();
+
+    // Without a composer sink a Devin deadline is terminal on the first window.
+    const noSinkClock = { value: 0 };
+    await expect(i.confirmPromptConsumption(expireAfterFirstSample(noSinkClock, pendingAgent, pendingPane), "p", new AbortController().signal, submission, baseline, { now: () => noSinkClock.value }, 0))
+      .rejects.toMatchObject({ code: "PROMPT_UNCONFIRMED", details: { promptConfirmation: { reason: "timeout" } } });
+
+    // Other runners never resubmit, even with a sink wired.
+    const piSession = { source: "herdr:pi", agent: "pi", kind: "id", value: "resubmit-pi" };
+    const piSubmission = { ...submission, agentKind: "pi", agentSession: piSession };
+    const piAgent = { pane_id: "p", name: "worker", agent: "pi", terminal_id: "t0", agent_session: piSession, agent_status: "idle", state_change_seq: 1, revision: 2 };
+    const piPane = { pane_id: "p", tab_id: "t", workspace_id: "w", agent_name: "worker", agent: "pi", terminal_id: "t0", agent_session: piSession, agent_status: "idle", state_change_seq: 1, revision: 2 };
+    const piClock = { value: 0 };
+    const piCli = expireAfterFirstSample(piClock, piAgent, piPane);
+    const piSubmit = vi.fn(async () => true);
+    await expect(i.confirmPromptConsumption(piCli, "p", new AbortController().signal, piSubmission, baseline, { now: () => piClock.value }, 0, piSubmit))
+      .rejects.toMatchObject({ code: "PROMPT_UNCONFIRMED", details: { promptConfirmation: { reason: "timeout" } } });
+    expect(piSubmit).not.toHaveBeenCalled();
+  });
+
+  it("wires one Devin composer resubmission through the launch's queue flush", async () => {
+    const devinCatalog = parseCatalog(`version: 2
+runners:
+  devin:
+    models: [{model: devin-model}]
+    quota: {provider: cognition, billingProduct: devin, account: primary, scope: account}
+    defaults: {permissionMode: dangerous, timeoutMinutes: 30, sessionPersistence: true}
+    plumbing: {sessionPersistence: required, promptDelivery: none, skillSelection: ambient, toolSelection: ambient}
+skills: []
+plugins: []
+mcp: {}
+quotaSources:
+  - {name: reactive-cooldowns, kind: floor}
+pointPolicy:
+  devin:devin-model: {costClass: medium, latencyClass: medium}
+tierChains:
+  utility: [devin:devin-model]
+  economy: [devin:devin-model]
+  standard: [devin:devin-model]
+  strong: [devin:devin-model]
+  frontier: [devin:devin-model]
+  max: [devin:devin-model]
+`, { path: "/tmp/devin-catalog.yaml", scopeRoot: "/tmp" });
+    const harness = makeCli({ promptLeavesUnsent: true });
+    // The window expires only after a full idle observation has landed: the
+    // clock jumps once the second post-prompt `agent get` returns.
+    let now = 0;
+    let prompted = false;
+    let agentReads = 0;
+    const prompt0 = harness.cli.prompt.bind(harness.cli);
+    harness.cli.prompt = async (target, text, signal) => { prompted = true; return prompt0(target, text, signal); };
+    const runJson0 = harness.cli.runJson.bind(harness.cli);
+    harness.cli.runJson = vi.fn(async (argv: string[], signal: AbortSignal, preserve?: boolean) => {
+      if (prompted && argv[0] === "agent" && argv[1] === "get" && ++agentReads >= 2) now += 20_000;
+      return runJson0(argv, signal, preserve);
+    });
+    const lease = { release: vi.fn(async () => undefined) };
+    const submitIfUnsent = vi.fn(async (paneId: string, submission: unknown, signal: AbortSignal): Promise<boolean> => {
+      now = 0;
+      return paneId.length > 0 && submission !== undefined && !signal.aborted;
+    });
+    const queueFlush = { writeSection: vi.fn(async () => lease), submitIfUnsent };
+    const res = await execute(toolFor({
+      catalog: devinCatalog,
+      cli: harness.cli,
+      queueFlush: queueFlush as unknown as LaunchDependencies["queueFlush"],
+      clock: { now: () => now },
+    }), task());
+    expect(submitIfUnsent).toHaveBeenCalledTimes(1);
+    expect(submitIfUnsent.mock.calls[0]?.[0]).toBe("w1:p2");
+    expect(submitIfUnsent.mock.calls[0]?.[1]).toMatchObject({ confirmed: true, agentKind: "devin", paneId: "w1:p2" });
+    expect(res.details).toMatchObject({ outcome: "failed", children: [{ state: "failed", error: { code: "PROMPT_UNCONFIRMED" } }] });
   });
 
   it("covers confirmation polling and AGY acknowledgement fail-closed branches", async () => {
@@ -2474,14 +2623,18 @@ tierChains:
     expect(i.mintedNameTaken(taken, "label")).toBe(true);
     expect(i.mintedNameTaken(taken, "free")).toBe(false);
     const cwdDir = mkdtempSync(join(tmpdir(), "herdr-launch-cwd-x-"));
+    mkdirSync(join(cwdDir, ".git"));
+    const notGit = realpathSync(mkdtempSync(join(tmpdir(), "herdr-launch-nogit-")));
     try {
       await expect(i.resolveLaunchCwd(cwdDir, repoRoot)).resolves.toBe(realpathSync(cwdDir));
       await expect(i.resolveLaunchCwd(undefined, repoRoot)).resolves.toBe(repoRoot);
       await expect(i.resolveLaunchCwd("missing-dir", repoRoot)).rejects.toMatchObject({ code: "CWD_UNAVAILABLE" });
       await expect(i.resolveLaunchCwd("/nonexistent/herdr-x", repoRoot)).rejects.toMatchObject({ code: "CWD_UNAVAILABLE" });
       await expect(i.resolveLaunchCwd(undefined, "bad\0cwd")).rejects.toMatchObject({ code: "INVALID_INPUT" });
+      await expect(i.resolveLaunchCwd(notGit, repoRoot)).rejects.toMatchObject({ code: "CWD_NOT_GIT_REPOSITORY" });
     } finally {
       rmSync(cwdDir, { recursive: true, force: true });
+      rmSync(notGit, { recursive: true, force: true });
     }
     expect(i.workloadTabOrdinal("implement", "workload:implement")).toBe(1);
     expect(i.workloadTabOrdinal("implement", "workload:implement:3")).toBe(3);

@@ -29,6 +29,8 @@ import type { DaemonNamespace } from "./namespace.js";
 export const IDLE_HINT_COALESCE_MS = 5_000;
 /** A hint attempt is bounded so a wedged endpoint cannot pin the writer's tail. */
 const IDLE_HINT_TIMEOUT_MS = 10_000;
+/** One classified drop log per owner session per window — a dead pane must not spam. */
+const HINT_DROP_LOG_MS = 3_600_000;
 
 /** Kinds structurally incapable of consuming a pane prompt — never hinted, even if qualified. */
 const UNSUPPORTED_KINDS = new Set(["agy"]);
@@ -97,8 +99,27 @@ function sameSession(value: unknown, session: AgentSessionIdentity): boolean {
     && value.value === session.value;
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/**
+ * The bounded reason class a dropped hint reports — never the error's message.
+ * A pane-read refusal whose typed code proves the target is gone is
+ * `owner_pane_absent`; a failure inside the `agent.prompt` dispatch is
+ * `prompt_refused`; a deadline is `timeout`; anything else is `unavailable`.
+ */
+type HintDropReason = "owner_pane_absent" | "prompt_refused" | "timeout" | "unavailable";
+
+function classifyHintDrop(error: unknown, stage: "read" | "prompt"): HintDropReason {
+  const name = record(error) ? error.name : undefined;
+  if (name === "TimeoutError" || name === "AbortError") return "timeout";
+  const code = record(error) && typeof error.code === "string" ? error.code : undefined;
+  if (code === "CLI_TIMEOUT" || code === "ABORTED") return "timeout";
+  if (code === "TARGET_IDENTITY_UNAVAILABLE" || code === "PANE_NOT_FOUND" || code === "TARGET_NOT_FOUND") return "owner_pane_absent";
+  // The typed Herdr envelope code inside a CLI_PROTOCOL_ERROR names the pane miss.
+  const details = record(error) && record(error.details) ? error.details : undefined;
+  const envelope = details !== undefined && record(details.errorEnvelope) ? details.errorEnvelope : undefined;
+  const envelopeCode = envelope !== undefined && record(envelope.error) && typeof envelope.error.code === "string" ? envelope.error.code : undefined;
+  if (envelopeCode !== undefined && /not_found|absent|missing/u.test(envelopeCode)) return "owner_pane_absent";
+  if (stage === "prompt") return "prompt_refused";
+  return "unavailable";
 }
 
 export function createIdleHints(options: IdleHintsOptions): IdleHintSink {
@@ -108,27 +129,47 @@ export function createIdleHints(options: IdleHintsOptions): IdleHintSink {
   const log = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   /** managerSessionKey → last send attempt; one send per window, bursts coalesce. */
   const lastSent = new Map<string, number>();
+  /** managerSessionKey → last classified drop log; dead owners must not spam. */
+  const lastDropLog = new Map<string, number>();
   /** Keys with an in-flight delivery; the in-flight send's fresh reads cover the burst. */
   const inflight = new Set<string>();
+
+  const drop = (paneId: string, key: string | undefined, reason: HintDropReason): void => {
+    const at = now();
+    const prior = key === undefined ? undefined : lastDropLog.get(key);
+    if (key !== undefined && prior !== undefined && at - prior < HINT_DROP_LOG_MS) return;
+    if (key !== undefined) lastDropLog.set(key, at);
+    try {
+      log(`herdr-tools-daemon hint_dropped reason=${reason} pane=${paneId}${key === undefined ? "" : ` mgr=${key.slice(0, 8)}`}`);
+    } catch {
+      // The drop log is diagnostic-only; a throwing sink never reaches the sink caller.
+    }
+  };
 
   async function deliver(owner: IdleHintOwner, session: AgentSessionIdentity, key: string): Promise<void> {
     const signal = options.signal === undefined
       ? AbortSignal.timeout(IDLE_HINT_TIMEOUT_MS)
       : AbortSignal.any([options.signal, AbortSignal.timeout(IDLE_HINT_TIMEOUT_MS)]);
-    // Fresh read every event — a cached pane state is not proof of idle.
-    const pane = paneFrom((await options.cli.runJson(["pane", "get", owner.paneId], signal)).result, owner.paneId);
-    // Unproven: the pane no longer holds the recorded owner session.
-    if (!sameSession(pane.agent_session, session)) return;
-    const state = stateOf(pane);
-    if (state !== "idle" && state !== "done") return;
-    const ids = await options.mailbox.list(key);
-    if (ids.length === 0) return;
-    const unread = join(options.namespace.dir, "mailbox", key, "unread");
-    // §11: the pointer is the caller's own MCP surface — herdr_status carries
-    // the read projection and herdr_run the ack; there is no CLI path.
-    const body = `herdr mailbox: ${ids.length} unread (${ids.join(", ")}) at ${unread}; read via your MCP surface (herdr_status / executor → MCP)`;
-    lastSent.set(key, now());
-    await options.cli.prompt(owner.paneId, body, signal);
+    let stage: "read" | "prompt" = "read";
+    try {
+      // Fresh read every event — a cached pane state is not proof of idle.
+      const pane = paneFrom((await options.cli.runJson(["pane", "get", owner.paneId], signal)).result, owner.paneId);
+      // Unproven: the pane no longer holds the recorded owner session.
+      if (!sameSession(pane.agent_session, session)) return;
+      const state = stateOf(pane);
+      if (state !== "idle" && state !== "done") return;
+      const ids = await options.mailbox.list(key);
+      if (ids.length === 0) return;
+      const unread = join(options.namespace.dir, "mailbox", key, "unread");
+      // §11: the pointer is the caller's own MCP surface — herdr_status carries
+      // the read projection and herdr_run the ack; there is no CLI path.
+      const body = `herdr mailbox: ${ids.length} unread (${ids.join(", ")}) at ${unread}; read via your MCP surface (herdr_status / executor → MCP)`;
+      lastSent.set(key, now());
+      stage = "prompt";
+      await options.cli.prompt(owner.paneId, body, signal);
+    } catch (error) {
+      drop(owner.paneId, key, classifyHintDrop(error, stage));
+    }
   }
 
   return (hint) => {
@@ -142,13 +183,11 @@ export function createIdleHints(options: IdleHintsOptions): IdleHintSink {
       const last = lastSent.get(key);
       if (last !== undefined && now() - last < coalesceMs) return;
       inflight.add(key);
-      void deliver(hint.owner, session, key)
-        .catch((error: unknown) => log(`herdr-tools-daemon hint dropped: ${errorText(error)}`))
-        .finally(() => inflight.delete(key));
-    } catch (error) {
+      void deliver(hint.owner, session, key).finally(() => inflight.delete(key));
+    } catch {
       // A hint that cannot even be scheduled is dropped visibly, never thrown
       // into the supervisor's event path.
-      log(`herdr-tools-daemon hint dropped: ${errorText(error)}`);
+      drop(hint.owner.paneId, undefined, "unavailable");
     }
   };
 }

@@ -8,7 +8,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import type { PiExec } from "../cli.js";
 import { HerdrCli } from "../cli.js";
 import { resolveManagerSession } from "../context.js";
-import { connectDaemonClient, DaemonCallError, type DaemonCallerContext, type DaemonClient } from "../daemon/client.js";
+import { connectDaemonClient, DaemonCallError, type DaemonCallerContext, type DaemonClient, type DaemonClientSocketOptions } from "../daemon/client.js";
 import { resolveDaemonNamespace, type DaemonNamespace } from "../daemon/namespace.js";
 import type { DelegatedCaller } from "../launch-schema.js";
 import { parseSnapshotResult, type CurrentContext } from "../targets.js";
@@ -29,7 +29,7 @@ export interface McpRunDependencies {
   /** The daemon namespace resolver — injectable so tests never touch the endpoint filesystem. */
   resolveNamespace?: (env: NodeJS.ProcessEnv) => Promise<DaemonNamespace>;
   /** The daemon socket seam — injectable so tests never open a real socket. */
-  connectDaemon?: (namespace: DaemonNamespace, caller: DaemonCallerContext) => Promise<DaemonClient>;
+  connectDaemon?: (namespace: DaemonNamespace, caller: DaemonCallerContext, options?: DaemonClientSocketOptions) => Promise<DaemonClient>;
   writeStderr?: (line: string) => void;
   exit?: (code: number) => void;
   onSignal?: (signal: "SIGINT" | "SIGTERM", handler: () => void) => void;
@@ -145,7 +145,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
     }
   };
 
-  const connect = async (signal: AbortSignal | undefined, callerArg?: DelegatedCaller): Promise<DaemonClient> => {
+  const connect = async (signal: AbortSignal | undefined, callerArg?: DelegatedCaller, options?: DaemonClientSocketOptions): Promise<DaemonClient> => {
     const requestSignal = signal ?? new AbortController().signal;
     // The policy gates precede any socket or CLI traffic, so a refused call
     // leaves no trace on either boundary.
@@ -190,7 +190,7 @@ export async function runHerdrMcpServer(deps: McpRunDependencies = {}): Promise<
         projectRoot: await canonicalCallerRoot(callerArg.projectRoot),
       };
     }
-    return (deps.connectDaemon ?? connectDaemonClient)(namespace, caller);
+    return (deps.connectDaemon ?? connectDaemonClient)(namespace, caller, options);
   };
 
   const surface = createToolSurface({ connectDaemon: connect, cwd: startup.projectDir });

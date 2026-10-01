@@ -8,7 +8,6 @@ version: 2
 
 # Reviewed skill trees (Pi `--skill` units), relative to the package root.
 skills:
-  - herdr-profiles/pi-skills/context-mode
   - herdr-profiles/pi-skills/tmux-background-tasks
   - herdr-profiles/profile-plugins/executor/skills/executor
   - herdr-profiles/profile-plugins/manager/skills/decision-batch
@@ -132,7 +131,6 @@ runners:
       # The reviewed Pi extension set is empty today.
       extensions: []
       skills:
-        - herdr-profiles/pi-skills/context-mode
         - herdr-profiles/pi-skills/tmux-background-tasks
         - herdr-profiles/profile-plugins/executor/skills/executor
         - herdr-profiles/profile-plugins/manager/skills/decision-batch

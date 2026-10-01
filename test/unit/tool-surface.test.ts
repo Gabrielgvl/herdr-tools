@@ -5,6 +5,7 @@ import { DaemonRunParamsSchema, DaemonStatusParamsSchema } from "../../src/daemo
 import { DaemonLaunchRequestSchema } from "../../src/launch-schema.js";
 import { CORE_TOOL_NAMES, createPreflight, createToolSurface, readInjectedContext, type HerdrToolSurfaceDependencies } from "../../src/tool-surface.js";
 import { TOOL_DIAGNOSTIC_MARKER } from "../../src/telemetry.js";
+import { LAUNCH_REQUEST_TIMEOUT_MS } from "../../src/tools/launch.js";
 
 const health = { client: { version: "0.8.0", protocol: 22 }, server: { status: "running", version: "0.8.0", protocol: 22, compatible: true } };
 const context = { workspaceId: "w", tabId: "w:t", paneId: "w:p" };
@@ -28,12 +29,13 @@ function fakeDaemon(replies: { launch?: unknown; run?: unknown; status?: unknown
 function surfaceFor(overrides: Partial<HerdrToolSurfaceDependencies> = {}, replies: Parameters<typeof fakeDaemon>[0] = {}) {
   const daemon = fakeDaemon(replies);
   let connects = 0;
+  const connectOptions: unknown[] = [];
   const deps: HerdrToolSurfaceDependencies = {
-    connectDaemon: async () => { connects += 1; return daemon.client; },
+    connectDaemon: async (_signal, _caller, options) => { connects += 1; connectOptions.push(options); return daemon.client; },
     cwd: "/project",
     ...overrides
   };
-  return { surface: createToolSurface(deps), daemon, connects: () => connects, deps };
+  return { surface: createToolSurface(deps), daemon, connects: () => connects, connectOptions, deps };
 }
 
 const extensionContext = { cwd: "/unused-host-cwd", signal: new AbortController().signal, modelRegistry: { find: () => undefined, getAll: () => [] } } as unknown as ExtensionContext;
@@ -70,12 +72,14 @@ describe("shared tool surface", () => {
       run: { kind: "run", action: "ack", eventId: "evt-1", result: "acked" },
       status: { kind: "status", daemon: { status: "running" } },
     };
-    const { surface, daemon, connects } = surfaceFor({}, replies);
+    const { surface, daemon, connects, connectOptions } = surfaceFor({}, replies);
     const signal = new AbortController().signal;
 
     const launchArgs = { task: { objective: "o", scope: "s", doneWhen: ["done"] }, idempotencyKey: "idem-1" };
     const launched = await surface.launch.execute("id", launchArgs, signal, undefined, extensionContext);
     expect(daemon.calls.at(-1)).toEqual({ method: "launch", params: launchArgs });
+    // Launch's request window outlives the shared default; the rest keep it.
+    expect(connectOptions.at(-1)).toEqual({ requestTimeoutMs: LAUNCH_REQUEST_TIMEOUT_MS });
     expect(launched.details).toEqual(replies.launch);
     expect(JSON.parse((launched.content[0] as { text: string }).text)).toEqual(replies.launch);
 
@@ -88,6 +92,7 @@ describe("shared tool surface", () => {
     const status = await surface.status.execute("id", statusArgs, signal, undefined, extensionContext);
     expect(daemon.calls.at(-1)).toEqual({ method: "status", params: statusArgs });
     expect(status.details).toEqual(replies.status);
+    expect(connectOptions.at(-1)).toBeUndefined();
 
     // Three calls, three fresh connections, every one closed.
     expect(connects()).toBe(3);

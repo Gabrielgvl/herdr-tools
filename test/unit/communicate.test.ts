@@ -700,7 +700,7 @@ describe("herdr_communicate", () => {
           fence: { isSpent: async () => false, record: async () => undefined, rearm: async () => undefined },
         };
       });
-      return { schedule, writeSection, flush: { begin: vi.fn(), shutdown: vi.fn(async () => undefined), schedule, writeSection } };
+      return { schedule, writeSection, flush: { begin: vi.fn(), shutdown: vi.fn(async () => undefined), schedule, writeSection, submitIfUnsent: vi.fn(async () => false) } };
     };
 
     // A Devin steer acknowledged on a busy pane: the write rides the section

@@ -1331,6 +1331,9 @@ export class JobRegistry {
     if (writer === undefined) return;
     const handoff = record.supervision?.handoffEvidence?.();
     if (handoff === undefined || !handoff.gated) return;
+    // A run that already recorded `handed_off` emitted its durable outcome;
+    // the trailing supervisor settlement is bookkeeping, not owner news.
+    if (handoff.state === "handed_off") return;
     void Promise.resolve(writer.writeRunEvent({
       kind: "job_terminal",
       runId: handoff.runId,

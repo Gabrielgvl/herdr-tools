@@ -107,6 +107,19 @@ describe("D1 durable record", () => {
     await writeFile(join(mgrDir, "k1.json"), JSON.stringify(migrated), { mode: 0o600 });
     await expect(store.get(mgrA, "k1")).rejects.toMatchObject({ code: "INTENT_MALFORMED" });
   });
+
+  it("refuses a persisted record whose failurePhase is malformed", async () => {
+    const { store, namespace } = await fixture();
+    await store.begin(begin(mgrA, "k1"));
+    const mgrDir = join(namespace.dir, DAEMON_INTENTS_DIR_NAME, mgrA);
+    const persisted = await rawRecord(namespace, mgrA, "k1");
+    for (const failurePhase of [42, "Free Text!"]) {
+      await writeFile(join(mgrDir, "k1.json"), JSON.stringify({ ...persisted, failurePhase }), { mode: 0o600 });
+      await expect(store.get(mgrA, "k1")).rejects.toMatchObject({ code: "INTENT_MALFORMED" });
+    }
+    await writeFile(join(mgrDir, "k1.json"), JSON.stringify({ ...persisted, failurePhase: "prompt_confirmation" }), { mode: 0o600 });
+    await expect(store.get(mgrA, "k1")).resolves.toMatchObject({ failurePhase: "prompt_confirmation" });
+  });
 });
 
 describe("D3 crash windows", () => {
@@ -334,6 +347,32 @@ describe("transitions, reads, and request validation", () => {
     await expect(store.markEffecting({ ...launched.intent, launchId: "00000000-0000-0000-0000-000000000000" })).rejects.toMatchObject({
       code: "INTENT_STATE_CONFLICT",
     });
+  });
+
+  it("emits one bounded transition line per committed state change", async () => {
+    const { namespace } = await fixture();
+    const lines: string[] = [];
+    const store = createIntentStore({ namespace, log: (line) => lines.push(line) });
+    const launched = await store.begin(begin(mgrA, "k-log"));
+    if (launched.kind !== "launch") throw new Error("expected launch");
+    const effecting = await store.markEffecting(launched.intent);
+    // recordChildren mutates children but not state — no transition line.
+    await store.recordChildren(effecting, [{ name: "task-x-1" }]);
+    // Certainty `partial` with a recorded child settles as `unresolved`, and
+    // the typed failure code/phase ride the line — never message text.
+    await store.fail(effecting, { effectCertainty: "partial", failureCode: "LAUNCH_FROZEN", failurePhase: "prompt_confirmation" });
+    // `fail` validates synchronously — a malformed phase never reaches disk.
+    let invalidPhase: unknown;
+    try {
+      store.fail(effecting, { effectCertainty: "partial", failurePhase: "Free Text!" });
+    } catch (error) {
+      invalidPhase = error;
+    }
+    expect(invalidPhase).toMatchObject({ code: "INTENT_REQUEST_INVALID", details: { field: "failurePhase" } });
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/^herdr-tools-daemon intent_transition launch=[0-9a-f-]{36} mgr=[0-9a-f]{8} from=none to=recorded certainty=- code=- phase=-$/);
+    expect(lines[1]).toContain("from=recorded to=effecting certainty=- code=- phase=-");
+    expect(lines[2]).toContain("from=effecting to=unresolved certainty=partial code=LAUNCH_FROZEN phase=prompt_confirmation");
   });
 
   it("merges recorded children by name, filling the run ID once known", async () => {

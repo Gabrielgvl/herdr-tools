@@ -1,13 +1,13 @@
-#!/home/gabriel/.volta/bin/node
+#!/home/gabriel/.volta/tools/image/node/25.9.0/bin/node
 /* global AbortSignal, fetch */
 import { realpathSync } from "node:fs";
 import process from "node:process";
 import { fileURLToPath, URL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 const EXECUTOR_ORIGIN = "https://dev-server.piranha-palermo.ts.net";
 const TOKEN_ENV = "/home/gabriel/.hermes/.env";
@@ -30,8 +30,61 @@ export function executorToolkitUrl(url) {
   return endpoint.toString();
 }
 
-export function createProxyHandlers(upstream) {
-  return { listTools: () => upstream.listTools(), callTool: request => upstream.callTool(request.params) };
+// MCP Streamable HTTP: a server answers a request on a session it no longer
+// knows — Executor after a daemon restart — with HTTP 404, and the client must
+// re-initialize. The request never ran, so it alone earns the replay. The SDK
+// raises it as StreamableHTTPError code 404; Executor's `-32001 Session not
+// found` body is only its message text. The SDK's own McpError -32001 is a
+// client-side RequestTimeout: it proves nothing and keeps the session.
+function isUnknownSession(error) {
+  return error instanceof StreamableHTTPError && error.code === 404;
+}
+
+// A closed transport (MCP -32000) is dead too, but a mutating `execute` may
+// already have run upstream: it is dropped for the next call, never replayed.
+function isTransportLoss(error) {
+  return isUnknownSession(error) || (error !== null && typeof error === "object" && error.code === ErrorCode.ConnectionClosed);
+}
+
+export function createProxyHandlers(connectUpstream) {
+  // The upstream is lazy and reconnects: an Executor daemon restart leaves the
+  // cached client holding a dead HTTP session, so a transport loss drops it and
+  // the next call connects fresh. One reconnect per call, never a retry loop —
+  // and only a loss that proves the request never ran earns the replay.
+  let upstream;
+  let opening;
+  const ensureUpstream = () => {
+    if (upstream !== undefined) return Promise.resolve(upstream);
+    opening ??= connectUpstream().then(client => {
+      client.onclose = () => { if (upstream === client) upstream = undefined; };
+      upstream = client;
+      return client;
+    }).finally(() => { opening = undefined; });
+    return opening;
+  };
+  const reconnectable = async call => {
+    let client;
+    try {
+      client = await ensureUpstream();
+      return await call(client);
+    } catch (error) {
+      if (!isTransportLoss(error)) throw error;
+      // Compare-and-clear: a late loss on a superseded client must not drop the
+      // healthy one a concurrent call already installed in its place.
+      if (upstream === client) upstream = undefined;
+      if (!isUnknownSession(error)) throw error;
+      return call(await ensureUpstream());
+    }
+  };
+  return {
+    listTools: () => reconnectable(client => client.listTools()),
+    callTool: request => reconnectable(client => client.callTool(request.params)),
+    close: async () => {
+      const client = upstream;
+      upstream = undefined;
+      await client?.close();
+    },
+  };
 }
 
 class HttpError extends Error {
@@ -103,16 +156,19 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ toolkit: TOOLKIT, memoryIncluded: false })}\n`);
     return;
   }
-  const upstream = new Client({ name: "executor-coding-agents", version: "1.0.0" });
-  await upstream.connect(new StreamableHTTPClientTransport(
-    new URL(executorToolkitUrl(`${EXECUTOR_ORIGIN}/mcp/toolkits/${TOOLKIT}`)),
-    { requestInit: { headers: { Authorization: `Bearer ${token}` } } },
-  ));
-  const handlers = createProxyHandlers(upstream);
+  const connectUpstream = async () => {
+    const client = new Client({ name: "executor-coding-agents", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(
+      new URL(executorToolkitUrl(`${EXECUTOR_ORIGIN}/mcp/toolkits/${TOOLKIT}`)),
+      { requestInit: { headers: { Authorization: `Bearer ${token}` } } },
+    ));
+    return client;
+  };
+  const handlers = createProxyHandlers(connectUpstream);
   const server = new Server({ name: "executor-coding-agents", version: "1.0.0" }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, handlers.listTools);
   server.setRequestHandler(CallToolRequestSchema, handlers.callTool);
-  server.onclose = () => upstream.close();
+  server.onclose = () => handlers.close();
   await server.connect(new StdioServerTransport());
 }
 

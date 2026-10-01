@@ -5,7 +5,6 @@
     "/home/gabriel/.local/share/agent-skills",
     "/home/gabriel/.pi/agent/skills",
     "/home/gabriel/.pi/agent/git/github.com/DietrichGebert/ponytail/skills",
-    "/home/gabriel/workspace/context-mode-pi-runtime/skills",
     "/home/gabriel/workspace/courier/.agents/skills",
     "/home/gabriel/workspace/courier/aicodeflow/common/skills"
   ],
@@ -157,10 +156,6 @@
     "herdr-profiles/profile-plugins/executor/skills/executor": {
       "source": "/home/gabriel/workspace/courier/.agents/skills/executor",
       "treeHash": "c8e84724381b264bb51513be45b0f8052fcc8ceb7865bcb21008f55952dbc131"
-    },
-    "herdr-profiles/pi-skills/context-mode": {
-      "source": "/home/gabriel/workspace/context-mode-pi-runtime/skills/context-mode",
-      "treeHash": "a3896427a62d98c5d67bf260157a8852794153dc3047df38a9568e7345718f2d"
     },
     "herdr-profiles/pi-skills/tmux-background-tasks": {
       "source": "skills/tmux-background-tasks",

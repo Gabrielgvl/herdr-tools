@@ -97,6 +97,8 @@ export interface SupervisionRegistryDependencies {
   /** The reserve-time and cadence workspace command seam. */
   workspaceRunner?: WorkspaceCommandRunner;
   idFactory?: () => string;
+  /** Bounded structured diagnostic sink forwarded to every supervisor (settle/retire decisions). */
+  log?: (line: string) => void;
   targetGenerationRefFactory?: () => string;
 }
 
@@ -248,6 +250,7 @@ export class SupervisionRegistry implements SupervisionCoordinator {
         ...(this.deps.handoffs ? { handoffs: this.deps.handoffs } : {}),
         ...(this.deps.repairPrompt ? { repairPrompt: this.deps.repairPrompt } : {}),
         ...(this.deps.hints === undefined ? {} : { hints: this.deps.hints }),
+        ...(this.deps.log === undefined ? {} : { log: this.deps.log }),
         readTranscript: this.deps.readTranscript,
         ...(this.deps.idFactory ? { idFactory: this.deps.idFactory } : {}),
         update,

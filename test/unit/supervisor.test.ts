@@ -101,6 +101,8 @@ interface Harness {
   reviewRequests: SupervisionReviewRequest[];
   /** Every entry the supervisor handed the review-log seam, in order — reviews and violation batches alike. */
   logged: SupervisionLogEntry[];
+  /** Every bounded diagnostic line the `log` dep received — populated only when `options.log` wires it. */
+  logs: string[];
   observers: number;
   degradeMonitor(): void;
   recoverMonitor(): void;
@@ -134,6 +136,8 @@ interface HarnessOptions {
   workspaceRunner?: WorkspaceCommandRunner;
   /** The local sensitive-context scan. */
   evidenceScanner?: EvidenceScanner;
+  /** Wire the bounded diagnostic sink into the deps and collect its lines. */
+  log?: boolean;
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -153,6 +157,7 @@ function harness(options: HarnessOptions = {}): Harness {
   const reviewedPanes: string[] = [];
   const reviewRequests: SupervisionReviewRequest[] = [];
   const logged: SupervisionLogEntry[] = [];
+  const logs: string[] = [];
   const readTranscript: SupervisorDependencies["readTranscript"] = options.transcript ?? (async () => ["line"]);
   const traceFile = typeof options.traceFile === "string" || options.traceFile === undefined
     ? new TextEncoder().encode(options.traceFile ?? "")
@@ -202,6 +207,7 @@ function harness(options: HarnessOptions = {}): Harness {
     ...(options.workspaceBase === undefined ? {} : { workspaceBase: options.workspaceBase }),
     ...(options.workspaceRunner === undefined ? {} : { workspaceRunner: options.workspaceRunner }),
     ...(options.evidenceScanner === undefined ? {} : { evidenceScanner: options.evidenceScanner }),
+    ...(options.log === undefined ? {} : { log: (line: string) => logs.push(line) }),
     idFactory: (() => { let id = 0; return () => `e${++id}`; })(),
     update: (text) => { progress.push(text); },
   };
@@ -218,6 +224,7 @@ function harness(options: HarnessOptions = {}): Harness {
     reviewedPanes,
     reviewRequests,
     logged,
+    logs,
     get observers() { return observers; },
     degradeMonitor: () => { degraded = true; },
     recoverMonitor: () => { degraded = false; },
@@ -1413,6 +1420,8 @@ describe("supervisor folding", () => {
     regressed.supervisor.shutdown();
 
     const snapshotRegression = await exactAgyBound();
+    snapshotRegression.supervisor.onReconciliationFailure("request_failed");
+    snapshotRegression.supervisor.onReconciliationFailure("request_failed");
     await snapshotRegression.supervisor.onReconciliationSnapshot(agyExactSnapshot({ revision: 4, state_change_seq: 4, agent_status: "blocked" }));
     expect(types(snapshotRegression.wakes)).toEqual(["reconciliation_degraded"]);
     expect(snapshotRegression.supervisor.view()).toMatchObject({ state: "degraded", status: "working", monitor: { reconciliation: { lastFailureReason: "revision_regressed" } } });
@@ -1420,6 +1429,8 @@ describe("supervisor folding", () => {
 
     const moved = agyPaneRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 });
     const move = await exactAgyBound([snapshot([moved], [agyAgentRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 })])]);
+    move.supervisor.onReconciliationFailure("request_failed");
+    move.supervisor.onReconciliationFailure("request_failed");
     await move.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     expect(types(move.wakes)).toEqual(["reconciliation_degraded"]);
     expect(move.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
@@ -1487,6 +1498,8 @@ describe("supervisor folding", () => {
     const regressedDestination = agyPaneRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 });
     const pending = await exactAgyBound([invalidDestination(), snapshot([regressedDestination], [agyAgentRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 })])]);
     await pending.supervisor.onEvent(paneEvent("pane_moved", regressedDestination, { previous_pane_id: "p1" }));
+    pending.supervisor.onReconciliationFailure("request_failed");
+    pending.supervisor.onReconciliationFailure("request_failed");
     await pending.supervisor.onReconciliationSnapshot(snapshot([regressedDestination], [agyAgentRecord({ pane_id: "p2", agent_session: agySession, agent_status: "working", revision: 1, state_change_seq: 4 })]));
     expect(types(pending.wakes)).toEqual(["reconciliation_degraded"]);
     expect(pending.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
@@ -1606,6 +1619,8 @@ describe("supervisor folding", () => {
 
   it("keeps supervising when reconciliation itself is unavailable", async () => {
     const h = await bound({ snapshots: [Object.assign(new Error("down"), { code: "SUPERVISION_SOCKET_CLOSED" })] });
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(thinEvent("pane_exited"));
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
     expect(h.progress.some((line) => line.includes("reconciliation_degraded"))).toBe(true);
@@ -1619,6 +1634,9 @@ describe("supervisor folding", () => {
       const candidate = await bound();
       const error = Object.assign(new Error("down"), { code });
       (candidate.supervisor as unknown as { deps: { monitor: { snapshot: () => Promise<HerdrSnapshot> } } }).deps.monitor.snapshot = async () => { throw error; };
+      // The episode announces on its third consecutive failure.
+      await candidate.supervisor.onEvent(thinEvent("pane_exited"));
+      await candidate.supervisor.onEvent(thinEvent("pane_exited"));
       await candidate.supervisor.onEvent(thinEvent("pane_exited"));
       expect(candidate.wakes[0]?.event.details).toMatchObject({ reason });
     }
@@ -1677,6 +1695,8 @@ describe("supervisor pane moves", () => {
     const lower = paneRecord({ paneId: "p2", status: "idle", revision: 1, stateChangeSeq: 7 });
     const h = harness({ snapshots: [snapshot([origin]), snapshot([lower], [{ pane_id: "p2", name: "worker" }])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
     expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
@@ -1704,6 +1724,8 @@ describe("supervisor pane moves", () => {
     const h = harness({ snapshots: [snapshot([origin]), snapshot([lower], [{ pane_id: "p2", name: "worker" }])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
 
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
@@ -1739,6 +1761,8 @@ describe("supervisor pane moves", () => {
     const h = harness({ snapshots: [snapshot([origin]), snapshot([destination], [{ pane_id: "p2", name: "worker" }])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
 
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
@@ -1836,6 +1860,8 @@ describe("supervisor pane moves", () => {
     expect(await unproven.supervisor.run()).toMatchObject({ reason: "move_continuity_unproven" });
 
     const invalid = await bound([snapshot([paneRecord({ paneId: "p2" }), paneRecord({ paneId: "p2" })])]);
+    invalid.supervisor.onReconciliationFailure("request_failed");
+    invalid.supervisor.onReconciliationFailure("request_failed");
     await invalid.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 6 }), { previous_pane_id: "p1" }));
     expect(invalid.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
     expect(types(invalid.wakes)).toEqual(["reconciliation_degraded"]);
@@ -1844,6 +1870,8 @@ describe("supervisor pane moves", () => {
   it("follows a retained move destination once a later read of it is valid", async () => {
     const destination = paneRecord({ paneId: "p2", revision: 1, status: "idle" });
     const h = await bound([invalidDestination(), invalidDestination(), snapshot([destination], [{ pane_id: "p2", name: "worker" }])]);
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", destination, { previous_pane_id: "p1" }));
     expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
 
@@ -1866,6 +1894,8 @@ describe("supervisor pane moves", () => {
 
   it("settles replacement when the retained destination holds a different agent", async () => {
     const h = await bound([invalidDestination()]);
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 6 }), { previous_pane_id: "p1" }));
     // The origin pane is absent because this very move emptied it. Judging that
     // absence would settle `pane_closed` on a child that is alive in p2.
@@ -1876,6 +1906,8 @@ describe("supervisor pane moves", () => {
 
   it("settles pane_closed only when the retained destination is itself absent", async () => {
     const h = await bound([invalidDestination()]);
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 6 }), { previous_pane_id: "p1" }));
     await h.supervisor.onReconciliationSnapshot(snapshot([], []));
     expect(await h.supervisor.run()).toEqual({ outcome: "released", reason: "periodic_snapshot" });
@@ -1885,6 +1917,8 @@ describe("supervisor pane moves", () => {
   it("reconciles a retained destination's own events instead of folding them on the origin watermark", async () => {
     const destination = paneRecord({ paneId: "p2", revision: 1, status: "blocked" });
     const h = await bound([invalidDestination(), snapshot([destination], [{ pane_id: "p2", name: "worker" }])]);
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1, status: "blocked" }), { previous_pane_id: "p1" }));
     // The destination is routed here from the moment it is retained: its events
     // are this child's, and without them the move could never be completed by
@@ -1908,6 +1942,8 @@ describe("supervisor pane moves", () => {
     const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([destination], [{ pane_id: "p3", name: "worker" }])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
     await h.supervisor.onEvent(paneEvent("pane_moved", regressed, { previous_pane_id: "p2" }));
 
@@ -1929,6 +1965,7 @@ describe("supervisor pane moves", () => {
     const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([contradictory], [{ pane_id: "p3", name: "worker" }])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
     await h.supervisor.onEvent(paneEvent("pane_moved", regressed, { previous_pane_id: "p2" }));
 
@@ -1952,6 +1989,7 @@ describe("supervisor pane moves", () => {
     const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), snapshot([destination], [{ pane_id: "p3", name: "worker" }])] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
     await h.supervisor.onEvent(paneEvent("pane_moved", contradictory, { previous_pane_id: "p2" }));
 
@@ -1975,6 +2013,7 @@ describe("supervisor pane moves", () => {
     const h = harness({ snapshots: [snapshot([origin]), invalidDestination(), invalidDestination("p3")] });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
 
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", first, { previous_pane_id: "p1" }));
     await h.supervisor.onEvent(paneEvent("pane_moved", second, { previous_pane_id: "p2" }));
     await h.supervisor.onReconciliationSnapshot(snapshot([destination], [{ pane_id: "p3", name: "worker" }]));
@@ -1994,6 +2033,7 @@ describe("supervisor pane moves", () => {
       invalidDestination("p3"),
       snapshot([paneRecord({ paneId: "p3", revision: 2, status: "idle" })], [{ pane_id: "p3", name: "worker" }]),
     ]);
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(paneEvent("pane_moved", paneRecord({ paneId: "p2", revision: 1 }), { previous_pane_id: "p1" }));
     expect(h.supervisor.view()).toMatchObject({ state: "degraded", child: { paneId: "p1" } });
 
@@ -2118,12 +2158,14 @@ describe("supervisor reconnect and monitor health", () => {
 
   it("rejects regressed snapshot revisions and recovers only from valid current evidence", async () => {
     const h = await bound();
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onReconciliationSnapshot(snapshot([paneRecord({ status: "idle", revision: 4 })]));
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
     expect(h.supervisor.view()).toMatchObject({
       state: "degraded",
       status: "working",
-      monitor: { reconciliation: { degraded: true, consecutiveFailures: 1, lastFailureReason: "revision_regressed" } },
+      monitor: { reconciliation: { degraded: true, consecutiveFailures: 3, lastFailureReason: "revision_regressed" } },
     });
     expect(h.supervisor.view().transitions).toEqual([]);
 
@@ -2146,11 +2188,12 @@ describe("supervisor reconnect and monitor health", () => {
     const h = await bound();
     await h.supervisor.onReconciliationSnapshot(invalid);
     await h.supervisor.onReconciliationSnapshot(invalid);
+    await h.supervisor.onReconciliationSnapshot(invalid);
     expect(h.supervisor.childLive()).toBe(true);
     expect(h.supervisor.view()).toMatchObject({
       state: "degraded",
       status: "working",
-      monitor: { reconciliation: { degraded: true, consecutiveFailures: 2, lastFailureReason: reason } },
+      monitor: { reconciliation: { degraded: true, consecutiveFailures: 3, lastFailureReason: reason } },
     });
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
     expect(JSON.stringify(h.supervisor.view().events)).not.toContain("backend");
@@ -2179,6 +2222,8 @@ describe("supervisor reconnect and monitor health", () => {
 
   it("keeps subscription and reconciliation health independent and aggregate", async () => {
     const h = await bound();
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     h.supervisor.onReconciliationFailure("request_failed");
     expect(h.supervisor.view()).toMatchObject({ state: "degraded", monitor: { connected: true, degraded: true, reconciliation: { degraded: true } } });
     h.supervisor.onMonitorDegraded("SUPERVISION_SOCKET_UNAVAILABLE");
@@ -3712,6 +3757,8 @@ describe("self-close wake suppression", () => {
     });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi" });
     tracker.begin("p1")(true);
+    h.supervisor.onReconciliationFailure("request_failed");
+    h.supervisor.onReconciliationFailure("request_failed");
     await h.supervisor.onEvent(thinEvent("pane_exited"));
     expect(types(h.wakes)).toEqual(["reconciliation_degraded"]);
     await h.supervisor.onEvent(thinEvent("pane_closed"));
@@ -3750,6 +3797,8 @@ describe("self-close wake suppression", () => {
     // A marker on the origin pane must not suppress the destination's closure.
     const stray = harness({ selfClose: tracker, snapshots: [snapshot([origin]), invalidDestination()] });
     await stray.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    stray.supervisor.onReconciliationFailure("request_failed");
+    stray.supervisor.onReconciliationFailure("request_failed");
     await stray.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     tracker.begin("p1")(true);
     await stray.supervisor.onReconciliationSnapshot(absent());
@@ -3759,6 +3808,8 @@ describe("self-close wake suppression", () => {
     // The marker on the destination itself does suppress it.
     const held = harness({ selfClose: tracker, snapshots: [snapshot([origin]), invalidDestination()] });
     await held.supervisor.bind({ identity, operatingPointId: "worker-pi" });
+    held.supervisor.onReconciliationFailure("request_failed");
+    held.supervisor.onReconciliationFailure("request_failed");
     await held.supervisor.onEvent(paneEvent("pane_moved", moved, { previous_pane_id: "p1" }));
     tracker.begin("p2")(true);
     await held.supervisor.onReconciliationSnapshot(absent());
@@ -3827,12 +3878,13 @@ describe("managed handoff evaluation", () => {
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
   const workingOrigin = () => snapshot([paneRecord({ status: "working", revision: 5, stateChangeSeq: 5 })]);
 
-  async function managed(options: { snapshots?: Array<HerdrSnapshot | Error | Promise<HerdrSnapshot>>; repairPrompt?: SupervisorDependencies["repairPrompt"] } = {}) {
+  async function managed(options: { snapshots?: Array<HerdrSnapshot | Error | Promise<HerdrSnapshot>>; repairPrompt?: SupervisorDependencies["repairPrompt"]; log?: boolean } = {}) {
     const gate = createHandoffGate();
     const h = harness({
       snapshots: options.snapshots ?? [workingOrigin()],
       handoffs: gate,
       ...(options.repairPrompt ? { repairPrompt: options.repairPrompt } : {}),
+      ...(options.log ? { log: true } : {}),
     });
     await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
     const allocation = await managedAllocation();
@@ -3869,6 +3921,130 @@ describe("managed handoff evaluation", () => {
       await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
       expect(prompts).toHaveLength(0);
       expect(h.wakes.filter((wake) => wake.event.type === "provider_limit")).toHaveLength(1);
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retires after handoff: bookkeeping stays local, blocked and reopened cycles still surface", async () => {
+    const { h, allocation, run } = await managed({ log: true });
+    try {
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+      // The durable handed_off write is visible a beat before the gate promise
+      // resolves into retireAfterHandoff — wait for the log, don't just poll it.
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
+
+      // Post-handoff status bookkeeping records locally but earns no wake.
+      const wakesBefore = h.wakes.length;
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "idle", revision: 7, stateChangeSeq: 7 })));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 8, stateChangeSeq: 8 })));
+      await sleep(20);
+      expect(h.wakes).toHaveLength(wakesBefore);
+      expect(h.supervisor.view().events.map((event) => event.type)).toContain("work_cycle_completed");
+      expect(run.cycleOpen).toBe(false);
+
+      // A stuck child is never noise, even post-handoff.
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 9, stateChangeSeq: 9 })));
+      await vi.waitFor(() => expect(h.wakes.length).toBeGreaterThan(wakesBefore));
+      expect(h.wakes.at(-1)?.event.type).toBe("blocked");
+
+      // A reopened artifact cycle — the child demonstrably working past the
+      // accepted version — surfaces ordinary wakes again.
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "working", revision: 10, stateChangeSeq: 10 })));
+      expect(run.cycleOpen).toBe(true);
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 11, stateChangeSeq: 11 })));
+      await vi.waitFor(() => expect(h.wakes.at(-1)?.event.type).toBe("work_cycle_completed"));
+
+      // A thin non-closure event post-retire folds locally but never pays a
+      // reconciliation read — the scripted queue is empty, so a real read
+      // would fail visibly.
+      await h.supervisor.onEvent(thinEvent("pane_agent_detected"));
+      await sleep(20);
+      expect(h.supervisor.view().monitor.reconciliation).toMatchObject({ consecutiveFailures: 0 });
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+    expect(h.logs.some((line) => line.startsWith("supervisor_settled job=job_supervisor"))).toBe(true);
+  });
+
+  it("settles a retired supervisor on pane_exited evidence — quietly, so the job can end", async () => {
+    const { h, allocation } = await managed({ log: true, snapshots: [workingOrigin(), snapshot([], [])] });
+    try {
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
+      expect(h.supervisor.view().state).toBe("active");
+
+      // Ordinary thin churn post-handoff pays no reconciliation read — the one
+      // scripted answer below belongs to the lifecycle-ending kinds alone.
+      await h.supervisor.onEvent(thinEvent("pane_agent_detected"));
+      await sleep(20);
+      expect(h.supervisor.view().state).toBe("active");
+      expect(h.supervisor.view().monitor.reconciliation).toMatchObject({ consecutiveFailures: 0 });
+
+      const wakesBefore = h.wakes.length;
+      await h.supervisor.onEvent(thinEvent("pane_exited"));
+      await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
+      await expect(h.supervisor.run()).resolves.toMatchObject({ outcome: "released", reason: "event:pane_exited" });
+      // The close is bookkeeping after handoff: no owner wake, no mailbox.
+      expect(h.wakes).toHaveLength(wakesBefore);
+      expect(h.observers).toBe(0);
+      expect(h.logs.some((line) => line.startsWith("supervisor_settled job=job_supervisor outcome=released"))).toBe(true);
+      // The durable run outcome is never rewritten by the late settle.
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off");
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("settles a retired supervisor on an authoritative absent snapshot", async () => {
+    const { h, allocation } = await managed({ log: true, snapshots: [workingOrigin()] });
+    try {
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
+
+      const wakesBefore = h.wakes.length;
+      await h.supervisor.onReconciliationSnapshot(snapshot([], []));
+      expect(h.supervisor.view().state).toBe("settled");
+      await expect(h.supervisor.run()).resolves.toMatchObject({ outcome: "released", reason: "periodic_snapshot" });
+      expect(h.wakes).toHaveLength(wakesBefore);
+      expect(h.observers).toBe(0);
+    } finally {
+      h.supervisor.shutdown();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("re-evaluates an unpersisted handoff outcome on the next terminal observation", async () => {
+    const { gate, h, allocation } = await managed({ log: true });
+    try {
+      let failed = false;
+      const real = gate.recordOutcome.bind(gate);
+      gate.recordOutcome = async (r, outcome, detail) => {
+        if (!failed) { failed = true; throw new Error("persist died"); }
+        return real(r, outcome, detail);
+      };
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(() => expect(failed).toBe(true));
+      await sleep(20);
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("awaiting_handoff");
+      expect(h.logs.some((line) => line.startsWith("supervisor_retired"))).toBe(false);
+
+      // A repeated same-status event never re-evaluates — a real transition
+      // does: blocked then done again retries the durable record, then retires.
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "blocked", revision: 7, stateChangeSeq: 7 })));
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 8, stateChangeSeq: 8 })));
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
     } finally {
       h.supervisor.shutdown();
       await rm(allocation.namespaceDir, { recursive: true, force: true });

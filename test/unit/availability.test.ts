@@ -19,7 +19,7 @@ import {
   type CooldownRecord,
   type LaunchFailureClass
 } from "../../src/availability.js";
-import type { AvailabilitySubject, QuotaKey, RunnerEntry, RunnerKind } from "../../src/catalog.js";
+import { loadCatalog, type AvailabilitySubject, type QuotaKey, type RunnerEntry, type RunnerKind } from "../../src/catalog.js";
 
 /** fs failures the filesystem alone cannot schedule deterministically. */
 const fsControl = vi.hoisted(() => ({
@@ -668,6 +668,23 @@ describe("availability", () => {
     const result = await availability(piCandidate, runner("pi"), { root, now: at(60_000) });
     expect(result.status).toBe("known-exhausted");
     expect(result.retryNotBefore).toBe(signal);
+  });
+
+  it("cools every Devin point of the shipped catalog from one account-wide limit record", async () => {
+    const root = await tempdir();
+    const catalog = await loadCatalog(join(process.cwd(), "herdr-profiles", "catalog.yaml"));
+    const devin = catalog.runners.get("devin")!;
+    const points = catalog.points!.filter((point) => point.runner === "devin");
+    expect(points.length).toBeGreaterThan(2);
+    const reset = new Date(T0 + 26 * 60_000).toISOString();
+    await recordLaunchFailure(points[0]!, devin, { code: "DEVIN_PROVIDER_LIMIT", causeCode: "rate_limit", retryNotBefore: reset }, { root, now: at(0) });
+    for (const point of points) {
+      expect(await availability(point, devin, { root, now: at(60_000) })).toMatchObject({ status: "known-exhausted", retryNotBefore: reset });
+      expect((await availability(point, devin, { root, now: at(26 * 60_000 + 1) })).status).not.toBe("known-exhausted");
+    }
+    // Other providers never share Devin's account.
+    const claude = catalog.points!.find((point) => point.runner === "claude")!;
+    expect((await availability(claude, catalog.runners.get("claude")!, { root, now: at(60_000) })).status).toBe("unknown");
   });
 
   it("shares the cooldown across runner names but not across accounts", async () => {

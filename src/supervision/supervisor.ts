@@ -391,11 +391,20 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private state: SupervisionState = "reserved";
   private paneId: string | undefined;
   private identity: SupervisedIdentity | undefined;
-  private completionSignal?: (identity: SupervisedIdentity) => Promise<ProviderLimitSignal>;
+  private completionSignal?: (identity: SupervisedIdentity, cycleStartedMs?: number) => Promise<ProviderLimitSignal>;
+  /** A limit recorded for the current work cycle; every authoritative working transition opens a fresh one. */
   private completionRecorded = false;
   private completionLogDegraded = false;
   private completionAttempts = 0;
   private completionRetry?: NodeJS.Timeout;
+  /** When the current cycle's working transition was folded — the completion signal's evidence window. */
+  private cycleStartedMs: number | undefined;
+  /**
+   * A `work_cycle_completed` held back while the bounded completion-signal
+   * reads run: a cycle the provider limited is a `provider_limit`, not a
+   * completion, so the completion wake waits for the verdict.
+   */
+  private pendingCycleEvent: { summary: string; details: Record<string, string | number> } | undefined;
   private provisional: ProvisionalSupervisionBinding | undefined;
   private provisionalFailure: string | undefined;
   private provisionalNativeIdentity: SupervisedIdentity | undefined;
@@ -898,7 +907,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   /** Bound before prompt dispatch; also checks a child already observed as terminal. */
-  onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<ProviderLimitSignal>): void {
+  onCompletionSignal(signal: (identity: SupervisedIdentity, cycleStartedMs?: number) => Promise<ProviderLimitSignal>): void {
     if (this.completionSignal !== undefined || !this.bindingPublished || this.isSettled()) return;
     this.completionSignal = signal;
     this.scheduleCompletionSignal();
@@ -908,11 +917,13 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     /* c8 ignore next -- the schedule/serialize guards check all three conditions; this re-guard only closes the queue window between them. */
     if (this.completionRecorded || this.completionSignal === undefined || this.identity === undefined) return;
     try {
-      const result = await this.completionSignal(this.identity);
+      const result = await this.completionSignal(this.identity, this.cycleStartedMs);
       if (result === false) return;
       this.completionRecorded = true;
+      this.pendingCycleEvent = undefined;
+      const managed = this.managedRun();
       /* c8 ignore next -- a published binding always carries its managed run. */
-      const runId = this.managedRun()?.run.runId;
+      const runId = managed?.run.runId;
       this.emit("provider_limit", "child hit a typed provider limit after start; close it before recovery", {
         code: "PROVIDER_LIMIT",
         /* c8 ignore next -- a bound supervisor selected its operating point before the signal could register. */
@@ -926,6 +937,9 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         this.completionLogDegraded = true;
         this.emit("evidence_gap", "Claude quota cooldown could not be recorded", { reason: "availability_record_unavailable" });
       }
+      // The limit is durable on the run so lane retirement refuses the
+      // stalled lane; a failed write still leaves the reopened-cycle mark.
+      if (managed !== undefined) await managed.gate.markCycle(managed.run, "provider_limit").catch(() => undefined);
     } catch {
       // Missing or untrusted native evidence never becomes a provider failure.
       if (!this.completionLogDegraded) {
@@ -953,11 +967,20 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         }, 250);
         this.completionRetry.unref();
       } else if (!this.completionRecorded && this.completionAttempts >= 3) {
+        this.flushPendingCycleEvent();
         const last = this.transitions.last()?.to;
         // Claude can normalize done → idle without another transition.
         if (last === this.status || (last === "done" && this.status === "idle")) this.scheduleHandoffEvaluation();
       }
     }).catch(/* c8 ignore next -- a rejection reaches the swallow only on a serialize-queue fault */ () => undefined);
+  }
+
+  /** The held completion wake, once the bounded reads found no provider limit. */
+  private flushPendingCycleEvent(): void {
+    const pending = this.pendingCycleEvent;
+    if (pending === undefined) return;
+    this.pendingCycleEvent = undefined;
+    this.emit("work_cycle_completed", pending.summary, pending.details);
   }
 
   /** Resolve when the supervisor settles. This is the supervisor job's run body. */
@@ -1731,11 +1754,23 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     this.completionAttempts = 0;
     if (this.completionRetry !== undefined) clearTimeout(this.completionRetry);
     this.completionRetry = undefined;
+    // A held completion wake outlives its window only until the next
+    // transition: the cycle it describes is over either way.
+    this.flushPendingCycleEvent();
     if (next === "working") {
       // An authoritative working transition opens a fresh artifact cycle: the
-      // previously accepted handoff version is stale from this point on.
+      // previously accepted handoff version is stale from this point on, and
+      // so is any provider limit recorded for the previous cycle.
+      this.completionRecorded = false;
+      this.cycleStartedMs = this.deps.clock.now();
       const managed = this.managedRun();
-      if (managed !== undefined) managed.gate.beginCycle(managed.run);
+      if (managed !== undefined) {
+        managed.gate.beginCycle(managed.run);
+        // A follow-up on a handed-off run is durable: lane retirement must
+        // not close a lane the accepted artifact no longer describes. A
+        // fresh acceptance clears the mark.
+        if (managed.run.lifecycle === "handed_off") void managed.gate.markCycle(managed.run, "cycle_reopened").catch(() => undefined);
+      }
     }
     this.enterStatus(next);
     if (next === "idle" || next === "done" || next === "blocked") {
@@ -1749,6 +1784,12 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
     if (material === undefined) {
       // Working starts and every other non-material change are recorded silently.
       this.publish(`child ${from} → ${next}`);
+      return;
+    }
+    if (material === "work_cycle_completed" && this.completionSignal !== undefined && !this.completionRecorded) {
+      // The bounded completion reads decide whether this cycle completed or
+      // hit a provider limit; the wake follows that verdict.
+      this.pendingCycleEvent = { summary: `child ${from} → ${next}`, details: { from, to: next, revision } };
       return;
     }
     this.emit(material, `child ${from} → ${next}`, { from, to: next, revision });
@@ -2315,6 +2356,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   }
 
   private async settleWithEvent(type: SupervisionEventType, outcome: SupervisionResult, trigger: string, summary: string): Promise<void> {
+    this.flushPendingCycleEvent();
     if (type === "pane_closed" && this.deps.selfClose !== undefined) {
       // A manager-requested close is successful bookkeeping, not an event for
       // that same manager. Wait for the bounded close proof before deciding so
@@ -2348,6 +2390,7 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
         await this.recordCompletionSignal();
       }
     }
+    this.flushPendingCycleEvent();
     // The managed run's outcome is durable before the supervisor settles.
     await this.persistHandoffOutcome(outcome, reason);
     this.state = "settled";
@@ -2412,23 +2455,30 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
    * repair signal, never a settlement and never evidence.
    */
   private async evaluateHandoff(): Promise<void> {
-    if (this.stopped || this.isSettled() || this.retired) return;
+    if (this.stopped || this.isSettled()) return;
     if (this.status !== "idle" && this.status !== "done" && this.status !== "blocked") return;
     const managed = this.managedRun();
-    if (managed === undefined || managed.run.lifecycle !== "awaiting_handoff") return;
+    // A retired run is re-evaluated only once a follow-up cycle reopened it:
+    // a fresh artifact re-hands it off (clearing the reopened-cycle mark);
+    // anything less earns no repair prompt.
+    const reopened = this.retired && managed?.run.lifecycle === "handed_off" && managed.run.cycleOpen;
+    if (managed === undefined || (managed.run.lifecycle !== "awaiting_handoff" && !reopened)) return;
     const { gate, run } = managed;
     const validation: HandoffValidation | undefined = await gate.validate(run).catch(() => undefined);
     if (validation === undefined) return;
     if (handoffGateMatches(validation, "terminal", this.status)) {
       try {
-        await gate.recordOutcome(run, "handed_off");
+        // A limit recorded in this same cycle outlives the acceptance: the
+        // artifact is accepted, but the lane is still stalled for retirement.
+        await gate.recordOutcome(run, "handed_off", this.completionRecorded ? "provider_limit" : undefined);
       } catch {
         // An unpersisted outcome is re-evaluated by the next observation or shutdown.
         return;
       }
-      this.retireAfterHandoff(run.runId);
+      if (!this.retired) this.retireAfterHandoff(run.runId);
       return;
     }
+    if (this.retired) return;
     // A typed provider limit cannot justify a repair prompt. Before repairing,
     // give the existing bounded native-session reads time to see a late 429;
     // a valid artifact above still wins without waiting.
@@ -2463,17 +2513,26 @@ export class Supervisor implements SupervisionObserver, SupervisionJobPort {
   private async persistHandoffOutcome(outcome: SupervisionResult, reason: string): Promise<void> {
     if (outcome !== "released" && outcome !== "identity_replaced") return;
     const managed = this.managedRun();
-    if (managed === undefined || managed.run.lifecycle !== "awaiting_handoff") return;
+    if (managed === undefined) return;
+    // A close after a recorded provider limit fails the run: the stalled
+    // cycle — even a follow-up on a run handed off earlier — is terminal
+    // evidence, so `recoveryOf` can reopen the workspace.
+    const limited = this.completionRecorded && (managed.run.lifecycle === "awaiting_handoff" || managed.run.lifecycle === "handed_off");
+    if (managed.run.lifecycle !== "awaiting_handoff" && !limited) return;
     let handedOff = false;
-    try {
-      // Authoritative exit has no remaining raw agent state to correlate. Any
-      // current valid terminal artifact wins over the Tools-authored fallback.
-      handedOff = (await managed.gate.validate(managed.run)).state === "accepted";
-    } catch {
-      // An unreadable artifact does not weaken the authoritative exit.
+    if (managed.run.lifecycle === "awaiting_handoff") {
+      try {
+        // Authoritative exit has no remaining raw agent state to correlate. Any
+        // current valid terminal artifact wins over the Tools-authored fallback.
+        handedOff = (await managed.gate.validate(managed.run)).state === "accepted";
+      } catch {
+        // An unreadable artifact does not weaken the authoritative exit.
+      }
     }
     try {
-      await managed.gate.recordOutcome(managed.run, handedOff ? "handed_off" : "cancelled", reason);
+      if (handedOff) await managed.gate.recordOutcome(managed.run, "handed_off", reason);
+      else if (limited) await managed.gate.recordOutcome(managed.run, "failed", "provider_limit");
+      else await managed.gate.recordOutcome(managed.run, "cancelled", reason);
     } catch {
       // A failed write leaves the run unresolved; recovery owns it from here.
     }

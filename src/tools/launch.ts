@@ -32,7 +32,8 @@ import type { SupervisionWorkspaceRoot } from "../job-registry.js";
 import type { SupervisionCoordinator, SupervisionReservation } from "../supervision/registry.js";
 import type { ProvisionalSupervisedIdentity, SupervisedIdentity } from "../supervision/identity.js";
 import { SupervisionBindError, type ProviderLimitRecoveryEvidence } from "../supervision/supervisor.js";
-import { claudeQuotaSignal, type ClaudeQuotaEvidence } from "../supervision/claude-quota.js";
+import { claudeQuotaSignal, type ClaudeQuotaEvidence, type ClaudeQuotaSignal } from "../supervision/claude-quota.js";
+import { devinQuotaSignal } from "../supervision/devin-quota.js";
 import { topologySummary } from "../close.js";
 import { closeWithReadback } from "../mutations.js";
 import type { MailboxEventWriter } from "../daemon/mailbox.js";
@@ -107,6 +108,8 @@ export interface LaunchDependencies {
   availabilityFailureRecorder?: (candidate: AvailabilitySubject, runner: RunnerEntry, failure: LaunchFailureSignal, options: RecordLaunchFailureOptions) => Promise<unknown>;
   /** Native Claude session reader; injectable for bounded post-start evidence checks. */
   claudeQuotaReader?: typeof claudeQuotaSignal;
+  /** Native Devin process-log reader; the Devin counterpart of `claudeQuotaReader`. */
+  devinQuotaReader?: typeof devinQuotaSignal;
   /**
    * The one-shot decision-log append sink, run once per spec decision before
    * any child mutation. Defaults to the local JSONL record rooted at the
@@ -2814,9 +2817,20 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       const promptSubmissionWallMs = Date.now();
       // A child may fail and exit while the prompt RPC is awaiting its ack.
       // Bind the typed session reader before dispatch so supervision can record
-      // that failure before it settles, without replaying the prompt.
-      if (chosenRuntime.kind === "claude") {
+      // that failure before it settles, without replaying the prompt. The
+      // reader runs on every work cycle: a follow-up cycle's window starts at
+      // its own working transition, never before this prompt.
+      if (chosenRuntime.kind === "claude" || chosenRuntime.kind === "devin") {
         const selectedRunner = chainCandidates.find((entry) => entry.point.id === chosenContract!.candidate.id)!.runner;
+        const readQuota = chosenRuntime.kind === "claude"
+          ? (identity: SupervisedIdentity, sinceMs: number) => (deps.claudeQuotaReader ?? claudeQuotaSignal)(identity.agentSession, launchCwd!, sinceMs)
+          // Devin's limit is account-wide and a stalled turn keeps its
+          // mid-task progress: the limit is recorded, never auto-recovered.
+          : async (identity: SupervisedIdentity, sinceMs: number): Promise<ClaudeQuotaSignal> => {
+            const limit = await (deps.devinQuotaReader ?? devinQuotaSignal)(identity.agentSession, sinceMs);
+            return limit === false ? false : { retryNotBefore: limit.retryNotBefore, zeroProgressProven: false };
+          };
+        const limitCode = chosenRuntime.kind === "claude" ? "CLAUDE_API_ERROR" : "DEVIN_PROVIDER_LIMIT";
         /**
          * The typed provider source proves the limit and — for a child that
          * died on its first turn — that no task activity ever happened. Only
@@ -2893,13 +2907,13 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
             return { outcome: "failed", code: error instanceof LaunchError ? error.code : "RECOVERY_FAILED" };
           }
         };
-        reservation!.onCompletionSignal(async (identity) => {
-          const quota = await (deps.claudeQuotaReader ?? claudeQuotaSignal)(identity.agentSession, launchCwd!, promptSubmissionWallMs);
+        reservation!.onCompletionSignal(async (identity, cycleStartedMs) => {
+          const quota = await readQuota(identity, Math.max(promptSubmissionWallMs, cycleStartedMs ?? 0));
           if (quota === false) return false;
           let cooldownRecorded: boolean;
           try {
             await (deps.availabilityFailureRecorder ?? recordLaunchFailure)(chosenContract!.candidate, selectedRunner,
-              { code: "CLAUDE_API_ERROR", causeCode: "rate_limit", retryNotBefore: quota.retryNotBefore }, { root: deps.cwd ?? ctx.cwd });
+              { code: limitCode, causeCode: "rate_limit", retryNotBefore: quota.retryNotBefore }, { root: deps.cwd ?? ctx.cwd });
             cooldownRecorded = true;
           } catch {
             cooldownRecorded = false;

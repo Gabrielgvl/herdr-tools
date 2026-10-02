@@ -666,7 +666,7 @@ describe("daemon launch handler — intent-gated execution", () => {
     // A well-formed but nonexistent run: `deps.handoffs.open` resolves, the
     // state read fails, and the recovery refuses before any effect.
     await expect(handleDaemonLaunch(fx.runtime, launchParams(fx.projectRoot, { task: { ...task, recoveryOf: "11111111-2222-3333-4444-555555555555" } })))
-      .rejects.toMatchObject({ daemonCode: "RECOVERY_UNRESOLVABLE" });
+      .rejects.toMatchObject({ daemonCode: "RECOVERY_UNRESOLVABLE", reason: "state_unreadable" });
     const intent = (await fx.intents.list(managerKey))[0]!;
     // The thrown launch carried its own absent certainty — a proven no-effect failure.
     expect(intent.state).toBe("failed");

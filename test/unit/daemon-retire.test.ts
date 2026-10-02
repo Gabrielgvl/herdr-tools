@@ -127,6 +127,8 @@ async function seedRun(
     owner?: AgentSessionIdentity | null;
     provenance?: boolean;
     digest?: boolean;
+    /** A cycle mark on the lifecycle detail. */
+    detail?: string;
   } = {},
 ): Promise<{ allocation: HandoffAllocation; runId: string }> {
   const allocation = await allocator.allocate();
@@ -142,6 +144,7 @@ async function seedRun(
     state.nativeSession = { ...(options.session ?? childSession) };
     state.lifecycle.watermark = { stateChangeSeq: 4, revision: 2 };
     state.lifecycle.state = options.lifecycle ?? "handed_off";
+    if (options.detail !== undefined) state.lifecycle.detail = options.detail;
   });
   const content = artifactBody(allocation.runId);
   await writeFile(allocation.artifactPath, content, { mode: 0o600 });
@@ -524,6 +527,45 @@ describe("lane retirer (ADR-040)", () => {
     const unread = await fx.mailbox.list(ownerKey);
     expect(unread).toHaveLength(1);
     expect(await fx.mailbox.read(ownerKey, unread[0]!)).toMatchObject({ kind: "lane_retired", runId, jobId: "job_live" });
+  });
+
+  it("refuses a handed_off run marked provider_limit or cycle_reopened, in the sweep and under the lock", async () => {
+    const fx = await fixture();
+    // The current cycle stalled on a typed provider limit: the manager decides.
+    const limited = await seedRun(fx.allocator, { detail: "provider_limit" });
+    // A follow-up cycle reopened the run after the acceptance: the accepted
+    // artifact no longer describes the lane until a fresh acceptance clears it.
+    const reopened = await seedRun(fx.allocator, { detail: "cycle_reopened", paneId: "p-child-2", terminalId: "t2", session: { ...childSession, value: "/pi/child-2.jsonl" } });
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const second: Live = {
+      pane: childPane({ pane_id: "p-child-2", terminal_id: "t2", agent_session: { ...childSession, value: "/pi/child-2.jsonl" }, tokens: childTokens({ ...childSession, value: "/pi/child-2.jsonl" }) }),
+      agent: childAgent({ pane_id: "p-child-2", terminal_id: "t2", agent_session: { ...childSession, value: "/pi/child-2.jsonl" }, tokens: childTokens({ ...childSession, value: "/pi/child-2.jsonl" }) }),
+    };
+    const { deps, clock } = retirerDeps(fx, live, { snapshot: async () => snapshotFor(live, { panes: second.pane === undefined ? [] : [second.pane], agents: second.agent === undefined ? [] : [second.agent] }) });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(limited.runId)).toMatchObject({ state: "refused", reason: "provider_limit" });
+    expect(retirer.view(reopened.runId)).toMatchObject({ state: "refused", reason: "cycle_reopened" });
+    expect(closes(deps)).toEqual([]);
+    // Each refusal journals once, not every sweep.
+    await retirer.sweep();
+    expect(fx.lines.filter((line) => line.includes("reason=provider_limit"))).toHaveLength(1);
+    expect(fx.lines.filter((line) => line.includes("reason=cycle_reopened"))).toHaveLength(1);
+
+    // A fresh acceptance clears the mark, and the lane retires on a later sweep.
+    await updateHandoffState(limited.allocation, (state) => { delete state.lifecycle.detail; });
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(limited.runId)).toMatchObject({ state: "retired" });
+
+    // The under-lock re-read refuses a mark that lands in the lock window.
+    const late = await seedRun(fx.allocator, { paneId: "p-child-2", terminalId: "t2", session: { ...childSession, value: "/pi/child-2.jsonl" } });
+    await updateHandoffState(reopened.allocation, (state) => { state.lifecycle.state = "cancelled"; });
+    const lock = fakePaneLock({ onAcquire: async () => { await updateHandoffState(late.allocation, (state) => { state.lifecycle.detail = "cycle_reopened"; }); } });
+    const lateDeps = retirerDeps(fx, second, { options: { paneLock: lock.guard } });
+    const lateRetirer = createLaneRetirer(lateDeps.deps);
+    await sweepPastGrace(lateRetirer, lateDeps.clock);
+    expect(lateRetirer.view(late.runId)).toMatchObject({ state: "refused", reason: "recheck_cycle_reopened" });
+    expect(closes(lateDeps.deps)).toEqual([]);
   });
 
   it("never retires a run whose lifecycle is not handed_off", async () => {

@@ -6,8 +6,12 @@
  * One sweep takes exactly one authoritative `api snapshot`, enumerates the
  * endpoint's run sidecars, and for every `handed_off` run proves, in order:
  *
- * 1. sidecar parses, `child.terminalId` and `nativeSession` bound; a missing
- *    provenance record is a legacy run, any other unreadable one refuses;
+ * 1. sidecar parses, `child.terminalId` and `nativeSession` bound, and the
+ *    lifecycle carries no cycle mark (`provider_limit`: the current cycle
+ *    stalled on a typed provider limit; `cycle_reopened`: the child worked
+ *    again after the acceptance — a follow-up the accepted artifact never
+ *    covered — until a fresh acceptance clears it); a missing provenance
+ *    record is a legacy run, any other unreadable one refuses;
  * 2. `classifyChild` exact match; the agent record's own lifecycle tuple —
  *    admitted only when the supervision join proves it coherent with the pane
  *    record — reads `idle`/`done`, and both its `state_change_seq` and the
@@ -71,6 +75,7 @@ import {
   type HandoffProvenance,
   type HandoffState,
 } from "../handoff.js";
+import { HANDOFF_CYCLE_MARKS } from "../handoff-gate.js";
 import type { JobRegistry } from "../job-registry.js";
 import { requirePromptTargetIdentity, type AgentSessionIdentity } from "../messages/prompt.js";
 import { agentFrom, findSessionPane, paneFrom, snapshotIdentityRecords } from "../messages/prompt-target.js";
@@ -388,6 +393,7 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
       || state.child.agentKind !== identity.agentKind
       || state.nativeSession === null
       || !sameSession(state.nativeSession, identity.agentSession)) return settle("deferred", "recheck_lifecycle");
+    if (state.lifecycle.detail !== undefined && HANDOFF_CYCLE_MARKS.has(state.lifecycle.detail)) return settle("refused", `recheck_${state.lifecycle.detail}`);
 
     const paneGet = await deps.cli.runJson(["pane", "get", paneId], signal);
     const agentGet = await deps.cli.runJson(["agent", "get", paneId], signal);
@@ -582,6 +588,13 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     ledger.set(runId, entry);
     if (state.child.terminalId === null || state.nativeSession === null) {
       setView(runId, entry, "refused", "child_identity_unbound");
+      return;
+    }
+    // A cycle mark: the lane stalled on a typed provider limit (the manager
+    // decides between a nudge after reset and a recovery), or a follow-up
+    // cycle reopened the handed-off run and only a fresh acceptance clears it.
+    if (state.lifecycle.detail !== undefined && HANDOFF_CYCLE_MARKS.has(state.lifecycle.detail)) {
+      setView(runId, entry, "refused", state.lifecycle.detail);
       return;
     }
     const childSession = state.nativeSession;

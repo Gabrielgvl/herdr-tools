@@ -134,7 +134,7 @@ export interface SupervisionReservation {
   bindProvisional(binding: ProvisionalSupervisionBinding): Promise<void>;
   strengthen(binding: SupervisionBinding): Promise<void>;
   /** Observe typed post-prompt completion evidence on the exact bound child. */
-  onCompletionSignal(signal: (identity: SupervisedIdentity) => Promise<ProviderLimitSignal>): void;
+  onCompletionSignal(signal: (identity: SupervisedIdentity, cycleStartedMs?: number) => Promise<ProviderLimitSignal>): void;
   release(reason: string): void;
 }
 

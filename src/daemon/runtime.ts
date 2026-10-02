@@ -40,7 +40,7 @@ import { createOwnership } from "./ownership.js";
 import type { Mailbox, MailboxEventWriter } from "./mailbox.js";
 import type { DaemonNamespace } from "./namespace.js";
 import type { LaneRetirer } from "./retire.js";
-import { DaemonRequestError } from "./protocol.js";
+import { DAEMON_REASON_TOKEN, DaemonRequestError } from "./protocol.js";
 import type { DaemonRequestHandler } from "./server.js";
 
 /** The narrow CLI surface daemon request plumbing needs — `HerdrCli` satisfies it. */
@@ -329,9 +329,15 @@ function codeOf(error: unknown): string | undefined {
   return typeof code === "string" && DAEMON_CODE.test(code) ? code : undefined;
 }
 
-/** Map any failure into the wire's typed refusal shape. */
+/** The failure's bounded sub-code token (`details.reason`), else undefined. */
+function reasonOf(error: unknown): string | undefined {
+  const reason = isRecord(error) && isRecord(error.details) ? error.details.reason : undefined;
+  return typeof reason === "string" && DAEMON_REASON_TOKEN.test(reason) ? reason : undefined;
+}
+
+/** Map any failure into the wire's typed refusal shape: the code plus its bounded reason token. */
 export function daemonRequestError(error: unknown, fallback = "DAEMON_REQUEST_FAILED"): DaemonRequestError {
-  return error instanceof DaemonRequestError ? error : new DaemonRequestError(codeOf(error) ?? fallback);
+  return error instanceof DaemonRequestError ? error : new DaemonRequestError(codeOf(error) ?? fallback, undefined, reasonOf(error));
 }
 
 /** The thin client's claimed identity (§6 D2a): never trusted until verified. */

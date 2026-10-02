@@ -925,6 +925,35 @@ describe("lane retirer (ADR-040)", () => {
     expect(retirer.retiredByDaemon(keptByTask.runId)).toBe(false);
   });
 
+  it("F16: a token-kept lane accrues no grace across kept sweeps — clearing keep starts a full window", async () => {
+    const fx = await fixture();
+    const kept = await seedRun(fx.allocator);
+    const live: Live = {
+      pane: childPane({ tokens: childTokens(childSession, { retention: "keep" }) }),
+      agent: childAgent({ tokens: childTokens(childSession, { retention: "keep" }) }),
+    };
+    const { deps, clock } = retirerDeps(fx, live);
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(kept.runId)).toMatchObject({ state: "kept", reason: "token_retention_keep" });
+    // Still kept a sweep later: the keep is read before any clock work.
+    clock.nowMs += 60_000;
+    await retirer.sweep();
+    expect(retirer.view(kept.runId)).toMatchObject({ state: "kept", reason: "token_retention_keep" });
+    // Clear the token one full grace later: no grace accrued while kept.
+    live.pane = childPane();
+    live.agent = childAgent();
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(kept.runId)).toMatchObject({ state: "watching" });
+    expect(live.pane).not.toBeUndefined();
+    expect(closes(deps)).toHaveLength(0);
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(live.pane).toBeUndefined();
+    expect(retirer.view(kept.runId)).toMatchObject({ state: "retired" });
+  });
+
   it("F4: an unreadable provenance never overrides a keep opt-out — only a genuinely missing record is legacy", async () => {
     // Malformed provenance on a kept lane: refuse, never fall back to retire.
     const fx = await fixture();

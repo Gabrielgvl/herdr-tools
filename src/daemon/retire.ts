@@ -419,7 +419,10 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     if ("refusal" in provenance) return settle("deferred", `recheck_${provenance.refusal}`);
     if (provenance.provenance?.task.retention === "keep") return settle("kept", TASK_KEEP_REASON);
     const retentionToken = mergedToken(records, "retention");
-    if (retentionToken.state === "value" && retentionToken.value === "keep") return settle("kept", "token_retention_keep");
+    if (retentionToken.state === "value" && retentionToken.value === "keep") {
+      resetClock(entry);
+      return settle("kept", "token_retention_keep");
+    }
     // The owner chain against a fresh snapshot: a transfer that landed since
     // the sweep's approval — it holds the run flock we now hold — shows here.
     const snapshot = await deps.snapshot();
@@ -612,6 +615,17 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     const pane = snapshot.panes.find((candidate) => candidate.pane_id === paneId)!;
     const records = snapshotIdentityRecords(snapshot, paneId);
 
+    // The cooperative no-contract opt-out (design B3 fallback): a `retention=keep`
+    // pane token parks the lane exactly like the task field. It is read before
+    // any clock work so a kept lane accrues no grace: every kept sweep resets
+    // the window, and clearing the token starts a full grace from scratch.
+    const retentionToken = mergedToken(records, "retention");
+    if (retentionToken.state === "value" && retentionToken.value === "keep") {
+      resetClock(entry);
+      setView(runId, entry, "kept", "token_retention_keep");
+      return;
+    }
+
     const lifecycle = lifecycleOf(records[0]!, records[1]!);
     if ("refusal" in lifecycle) {
       resetClock(entry);
@@ -655,17 +669,6 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
       setView(runId, entry, "refused", "token_session_mismatch");
       return;
     }
-    // The cooperative no-contract opt-out (design B3 fallback): a `retention=keep`
-    // pane token parks the lane exactly like the task field.
-    const retentionToken = mergedToken(records, "retention");
-    if (retentionToken.state === "value" && retentionToken.value === "keep") {
-      // A kept lane accrues no grace: clearing the token restarts the full
-      // stability window, so the person who released it gets the grace too.
-      resetClock(entry);
-      setView(runId, entry, "kept", "token_retention_keep");
-      return;
-    }
-
     let policy;
     try {
       policy = classifyCaller(snapshot, paneId);

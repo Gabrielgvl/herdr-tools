@@ -1,0 +1,10 @@
+2026-10-02T01:33:02.876339Z  INFO run_acp_server:session_db_call:session_db_job: chisel_agent::session_db: Created new session: tidal-vase
+2026-10-02T01:33:02.878187Z  INFO run_acp_server:session_db_call:session_db_job: chisel_agent::session_db: Saved 4 message nodes (starting from 0) for session tidal-vase
+2026-10-02T01:33:02.967422Z  INFO run_acp_server:session_db_call:session_db_job: chisel_agent::session_db: Saved 10 message nodes (starting from 14) for session tidal-vase
+2026-10-02T01:33:03.685383Z  WARN affogato::agent::control_loop: attempt=1 max=3 error=Inference(ServerError(message=Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different model. Your limit will reset in 26 minutes. (trace ID: 0000000000000000))) Transient inference error; retrying on next iteration
+2026-10-02T01:33:03.686861Z  INFO run_acp_server:session_db_call:session_db_job: chisel_agent::session_db: Saved 10 message nodes (starting from 24) for session tidal-vase
+2026-10-02T01:33:04.164293Z  WARN affogato::agent::control_loop: attempt=2 max=3 error=Inference(ServerError(message=Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different model. Your limit will reset in 26 minutes. (trace ID: 0000000000000000))) Transient inference error; retrying on next iteration
+2026-10-02T01:33:04.164341Z  INFO run_acp_server:session_db_call:session_db_job: chisel_agent::session_db: Saved 0 message nodes (starting from 34) for session tidal-vase
+2026-10-02T01:33:04.421266Z ERROR affogato::agent::control_loop: attempts=3 error=Inference(ServerError(message=Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different model. Your limit will reset in 26 minutes. (trace ID: 0000000000000000))) Exhausted inference retries; stopping turn
+2026-10-02T01:33:04.421357Z  INFO run_acp_server:session_db_call:session_db_job: chisel_agent::session_db: Saved 0 message nodes (starting from 34) for session tidal-vase
+2026-10-02T01:33:27.083310Z  INFO run_acp_server:session_db_call:session_db_job: chisel_agent::session_db: Saved 1 message nodes (starting from 34) for session tidal-vase

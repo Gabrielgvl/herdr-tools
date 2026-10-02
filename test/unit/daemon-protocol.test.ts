@@ -39,6 +39,13 @@ describe("daemon protocol framing", () => {
     expect(parseDaemonLine(encodeDaemonResult("id-1", undefined).trimEnd())).toEqual({ kind: "reply", id: "id-1", result: null });
     const failure = parseDaemonLine(encodeDaemonFailure("id-1", "SOME_CODE", "it failed").trimEnd());
     expect(failure).toEqual({ kind: "failure", id: "id-1", error: { code: "SOME_CODE", message: "it failed" } });
+    // The refusal's bounded sub-code token rides the failure; prose never does.
+    expect(parseDaemonLine(encodeDaemonFailure("id-1", "RECOVERY_UNRESOLVABLE", "refused", "lifecycle_non_terminal").trimEnd()))
+      .toEqual({ kind: "failure", id: "id-1", error: { code: "RECOVERY_UNRESOLVABLE", message: "refused", reason: "lifecycle_non_terminal" } });
+    expect(parseDaemonLine(encodeDaemonFailure("id-1", "RECOVERY_UNRESOLVABLE", "refused", "not a token").trimEnd()))
+      .toEqual({ kind: "failure", id: "id-1", error: { code: "RECOVERY_UNRESOLVABLE", message: "refused" } });
+    expect(parseDaemonLine(JSON.stringify({ id: "id-1", error: { code: "X", message: "m", reason: "Bad Reason" } })))
+      .toEqual({ kind: "failure", id: "id-1", error: { code: "X", message: "m" } });
   });
 
   it("refuses unencodable or oversized frames before they are written", () => {

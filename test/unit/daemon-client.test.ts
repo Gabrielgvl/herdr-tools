@@ -815,6 +815,18 @@ describe("daemon typed call layer", () => {
     await expect(client.launch({ task, idempotencyKey: "key-1" })).rejects.toMatchObject({ name: "DaemonCallError", code: "DAEMON_PROTOCOL_ERROR" });
   });
 
+  it("carries a refusal's bounded reason token into details, still without wire text", async () => {
+    const { client } = await typedClient(() => { throw new DaemonRequestError("RECOVERY_UNRESOLVABLE", "daemon-internal refusal text that must not cross", "lifecycle_non_terminal"); });
+    const error = await client.launch({ task, idempotencyKey: "key-1" }).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(DaemonCallError);
+    expect(error).toMatchObject({ code: "RECOVERY_UNRESOLVABLE", details: { effectCertainty: "unknown", reason: "lifecycle_non_terminal" } });
+    expect((error as Error).message).not.toContain("must not cross");
+    // A refusal without a reason projects none.
+    const bare = await typedClient(() => { throw new DaemonRequestError("RECOVERY_UNRESOLVABLE", "refused"); });
+    const plain = await bare.client.launch({ task, idempotencyKey: "key-1" }).catch((failure: unknown) => failure);
+    expect((plain as DaemonCallError).details).toEqual({ effectCertainty: "unknown" });
+  });
+
   it("projects launch refusals fail-closed: effectCertainty is never absent and wire text never crosses", async () => {
     // The daemon's wire refusal carries only a bounded code; the launcher's
     // true certainty lives in the intent record. A bare code can never prove

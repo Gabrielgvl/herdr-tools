@@ -11,6 +11,8 @@ import type { TaskModelDecision } from "../../src/router.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { createHandoffAllocator, readHandoffProvenance, readHandoffState, type HandoffAllocator } from "../../src/handoff.js";
 import { availability, recordLaunchFailure } from "../../src/availability.js";
+import { updateHandoffState } from "../../src/handoff.js";
+import type { DevinQuotaSignal } from "../../src/supervision/devin-quota.js";
 import type { SelfCloseTracker } from "../../src/supervision/self-close.js";
 import type { ClaudeQuotaSignal } from "../../src/supervision/claude-quota.js";
 import { stubSupervision } from "./supervision-fixtures.js";
@@ -59,18 +61,31 @@ function claudeRunner(modelIds: readonly string[]): RunnerEntry {
   };
 }
 
+function devinRunner(modelIds: readonly string[]): RunnerEntry {
+  return {
+    kind: "devin",
+    models: modelIds.map((model) => ({ model })),
+    quota: { provider: "cognition", billingProduct: "devin", account: "primary", scope: "account" },
+    defaults: { timeoutMinutes: 30, sessionPersistence: true, permissionMode: "dangerous" },
+    plumbing: { sessionPersistence: "required", promptDelivery: "none", skillSelection: "ambient", toolSelection: "ambient" },
+    pools: { tools: [], extensions: [], skills: [], plugins: [], mcp: [] },
+  };
+}
+
 function catalogOf(subjects: readonly AvailabilitySubject[], runners?: ReadonlyMap<RunnerKind, RunnerEntry>): Catalog {
   const resolvedRunners = runners ?? new Map<RunnerKind, RunnerEntry>([["pi", runnerEntry(subjects.filter((s) => s.runner === "pi").map((s) => s.model))]]);
   const points = subjects.map((subject): OperatingPoint => {
     const runner = resolvedRunners.get(subject.runner)!;
     const reasoning = subject.runner === "pi" || subject.runner === "claude" ? ("low" as const) : undefined;
+    // Devin points share the runner's account-wide quota tuple, as the shipped catalog does.
+    const provider = subject.runner === "devin" ? runner.quota.provider : `${runner.quota.provider}-${subject.model}`;
     return {
       id: reasoning === undefined ? `${subject.runner}:${subject.model}` : `${subject.runner}:${subject.model}:${reasoning}`,
       runner: subject.runner,
       model: subject.model,
       ...(reasoning === undefined ? {} : { reasoning }),
-      provider: `${runner.quota.provider}-${subject.model}`,
-      quota: { ...runner.quota, provider: `${runner.quota.provider}-${subject.model}` },
+      provider,
+      quota: { ...runner.quota, provider },
       costClass: "low",
       latencyClass: "low",
     };
@@ -235,6 +250,7 @@ function toolFor(options: {
   supervision?: ReturnType<typeof stubSupervision>;
   handoffs?: HandoffAllocator;
   claudeQuotaReader?: LaunchDependencies["claudeQuotaReader"];
+  devinQuotaReader?: LaunchDependencies["devinQuotaReader"];
   availabilityFailureRecorder?: LaunchDependencies["availabilityFailureRecorder"];
   specClient?: LaunchDependencies["specClient"];
   selfClose?: SelfCloseTracker;
@@ -251,6 +267,7 @@ function toolFor(options: {
     ...(options.handoffs === undefined ? {} : { handoffs: options.handoffs }),
     availabilityFailureRecorder: options.availabilityFailureRecorder ?? vi.fn(async () => undefined),
     ...(options.claudeQuotaReader === undefined ? {} : { claudeQuotaReader: options.claudeQuotaReader }),
+    ...(options.devinQuotaReader === undefined ? {} : { devinQuotaReader: options.devinQuotaReader }),
     ...(options.selfClose === undefined ? {} : { selfClose: options.selfClose }),
     ...(options.beforeFirstEffect === undefined ? {} : { beforeFirstEffect: options.beforeFirstEffect }),
     routerLog: vi.fn(async () => undefined),
@@ -276,6 +293,62 @@ const fakeSelfClose = (): { tracker: SelfCloseTracker; finishers: ReturnType<typ
     } as unknown as SelfCloseTracker,
   };
 };
+
+describe("Devin provider limit", () => {
+  const devinCatalog = () => catalogOf(
+    [{ runner: "devin", model: "swe-2-max" }, { runner: "devin", model: "swe-2-high" }, { runner: "pi", model: "a" }],
+    new Map<RunnerKind, RunnerEntry>([["devin", devinRunner(["swe-2-max", "swe-2-high"])], ["pi", runnerEntry(["a"])]]),
+  );
+
+  it("records the account-wide cooldown from Devin's log on any cycle, never auto-recovers, and recovers after the manager's close", async () => {
+    const harness = makeCli();
+    const supervision = stubSupervision();
+    const handoffs = allocator();
+    const availabilityRoot = realpathSync(mkdtempSync(join(tmpdir(), "herdr-availability-")));
+    dirs.push(availabilityRoot);
+    const recorder = vi.fn(async (candidate: Parameters<typeof recordLaunchFailure>[0], runner: Parameters<typeof recordLaunchFailure>[1], failure: Parameters<typeof recordLaunchFailure>[2]) => recordLaunchFailure(candidate, runner, failure, { root: availabilityRoot }));
+    const quota = vi.fn(async (): Promise<DevinQuotaSignal> => ({ retryNotBefore: RESET_ISO }));
+    const result = await execute(toolFor({ catalog: devinCatalog(), cli: harness.cli, supervision, handoffs, availabilityFailureRecorder: recorder, devinQuotaReader: quota }), TASK);
+    expect(result.details!.children[0]).toMatchObject({ state: "launched", operatingPointId: "devin:swe-2-max" });
+    const stalled = supervision.bound[0]!;
+    expect(stalled.identity.agentSession).toMatchObject({ source: "herdr:devin", agent: "devin" });
+
+    // A follow-up cycle's window starts at its own working transition.
+    const cycleStartedMs = Date.now() + 60_000;
+    const signal = await supervision.completionSignals[0]!(stalled.identity, cycleStartedMs);
+    expect(quota).toHaveBeenLastCalledWith(stalled.identity.agentSession, cycleStartedMs);
+    expect(signal).toEqual({ cooldownRecorded: true, retryNotBefore: RESET_ISO });
+    expect(recorder).toHaveBeenCalledWith(expect.objectContaining({ runner: "devin", model: "swe-2-max" }), expect.anything(), { code: "DEVIN_PROVIDER_LIMIT", causeCode: "rate_limit", retryNotBefore: RESET_ISO }, { root: repoRoot });
+    // One record cools every Devin point until the provider's reset; other providers stay open.
+    const before = () => new Date(Date.parse(RESET_ISO) - 60_000);
+    for (const point of devinCatalog().points!.filter((candidate) => candidate.runner === "devin")) {
+      expect(await availability(point, devinRunner(["swe-2-max", "swe-2-high"]), { root: availabilityRoot, now: before })).toMatchObject({ status: "known-exhausted", retryNotBefore: RESET_ISO });
+    }
+    expect(await availability(devinCatalog().points![2]!, runnerEntry(["a"]), { root: availabilityRoot, now: before })).toMatchObject({ status: "unknown" });
+    expect((await availability(devinCatalog().points![0]!, devinRunner(["swe-2-max"]), { root: availabilityRoot, now: () => new Date(Date.parse(RESET_ISO) + 1) })).status).not.toBe("known-exhausted");
+    // Mid-task progress stays in the pane: no close, no relaunch.
+    expect(harness.starts()).toBe(1);
+    expect(harness.calls.filter((argv) => argv[1] === "close")).toEqual([]);
+    // The first cycle's window is the prompt itself.
+    await supervision.completionSignals[0]!(stalled.identity, undefined);
+    expect((quota.mock.calls.at(-1) as unknown as [unknown, number])[1]).toBeLessThanOrEqual(Date.now());
+    // No evidence, no verdict.
+    quota.mockResolvedValueOnce(false);
+    expect(await supervision.completionSignals[0]!(stalled.identity, cycleStartedMs)).toBe(false);
+
+    // The manager closes the stalled pane; supervision fails the run with the
+    // limit as its detail — that is the terminal lineage `recoveryOf` needs.
+    await updateHandoffState(stalled.handoff!.allocation, (state) => {
+      state.lifecycle.state = "failed";
+      state.lifecycle.detail = "provider_limit";
+    });
+    const recovered = await execute(toolFor({ catalog: devinCatalog(), cli: harness.cli, supervision, handoffs, availabilityFailureRecorder: recorder, devinQuotaReader: quota }), { ...TASK, recoveryOf: stalled.handoff!.allocation.runId });
+    expect(recovered.details!.outcome).toBe("launched");
+    // The failed provider's points are excluded from the recovery route.
+    expect(recovered.details!.children[0]).toMatchObject({ state: "launched", operatingPointId: "pi:a:low" });
+    expect((await readHandoffProvenance(supervision.bound[1]!.handoff!.allocation)).task).toMatchObject({ recoveryOf: stalled.handoff!.allocation.runId });
+  });
+});
 
 describe("provider-limit auto-recovery", () => {
   it("closes the dead pane, marks the run terminal, and relaunches through recoveryOf with the failed provider excluded", async () => {
@@ -333,6 +406,24 @@ describe("provider-limit auto-recovery", () => {
     expect(recoveredState.child.route?.operatingPointId).toBe("pi:a:low");
     const provenance = await readHandoffProvenance(recovered.handoff!.allocation);
     expect(provenance.task).toMatchObject({ objective: TASK.objective, retention: "keep", recoveryOf: dead.handoff!.allocation.runId });
+  });
+
+  it("never auto-recovers a follow-up cycle, even when its own window reads as zero progress (F5)", async () => {
+    const harness = makeCli();
+    const supervision = stubSupervision();
+    const recorder = vi.fn(async () => undefined);
+    const quota = vi.fn(async (): Promise<ClaudeQuotaSignal> => ({ retryNotBefore: RESET_ISO, zeroProgressProven: true }));
+    await execute(toolFor({ catalog: twoProviderCatalog(), cli: harness.cli, supervision, handoffs: allocator(), availabilityFailureRecorder: recorder, claudeQuotaReader: quota }), TASK);
+    const child = supervision.bound[0]!;
+    // A follow-up window (the previous cycle's end) proves nothing about the
+    // task's earlier progress: detect, cool, wake — and leave the pane alone.
+    const signal = await supervision.completionSignals[0]!(child.identity, Date.now() - 1_000);
+    expect(signal).toEqual({ cooldownRecorded: true, retryNotBefore: RESET_ISO });
+    expect(quota).toHaveBeenCalledWith(child.identity.agentSession, repoRoot, expect.any(Number));
+    expect(recorder).toHaveBeenCalledTimes(1);
+    expect(harness.starts()).toBe(1);
+    expect(harness.calls.filter((argv) => argv[0] === "pane" && argv[1] === "close")).toEqual([]);
+    expect(harness.live()).toHaveLength(1);
   });
 
   it("keeps the manual contract when zero progress is not provable, and records the 15-minute default when no reset signal exists", async () => {

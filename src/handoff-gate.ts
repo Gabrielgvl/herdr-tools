@@ -56,6 +56,9 @@ export interface HandoffValidation {
 
 /** Runtime-authored terminal marks; `handed_off` is the agent-authored record. */
 export type HandoffOutcome = Exclude<HandoffLifecycleState, "awaiting_handoff">;
+/** Cycle marks persisted on `lifecycle.detail` without changing the lifecycle state. */
+export type HandoffCycleMark = "provider_limit" | "cycle_reopened";
+export const HANDOFF_CYCLE_MARKS: ReadonlySet<string> = new Set<HandoffCycleMark>(["provider_limit", "cycle_reopened"]);
 
 /** The bounded projection surfaced through waits, jobs, and inspection. */
 export interface HandoffRunEvidence {
@@ -194,8 +197,17 @@ export interface HandoffGate {
    * is already fenced or the attempt bound is spent — the caller must not send.
    */
   beginRepair(run: HandoffRun): Promise<{ version: number; token: string } | null>;
-  /** Persist a terminal outcome (`handed_off`/`cancelled`/`failed`/`recovery_pending`). */
+  /**
+   * Persist a terminal outcome (`handed_off`/`cancelled`/`failed`/`recovery_pending`)
+   * with its detail; a prior detail never outlives the outcome it described.
+   */
   recordOutcome(run: HandoffRun, outcome: HandoffOutcome, detail?: string): Promise<void>;
+  /**
+   * Persist a cycle mark on the run without changing its lifecycle state: a
+   * typed provider limit, or a follow-up cycle reopened after `handed_off`.
+   * Lane retirement refuses a marked run until a fresh outcome replaces it.
+   */
+  markCycle(run: HandoffRun, mark: HandoffCycleMark): Promise<void>;
   /** The bounded evidence projection for jobs and inspection. */
   evidence(run: HandoffRun): HandoffRunEvidence;
   /** Mark every still-unresolved run `recovery_pending`; best effort at teardown. */
@@ -208,7 +220,15 @@ export function createHandoffGate(): HandoffGate {
   async function recordOutcome(run: HandoffRun, outcome: HandoffOutcome, detail?: string): Promise<void> {
     const state = await updateHandoffState(run.allocation, (current) => {
       current.lifecycle.state = outcome;
-      if (detail !== undefined) current.lifecycle.detail = detail.slice(0, 256);
+      if (detail === undefined) delete current.lifecycle.detail;
+      else current.lifecycle.detail = detail.slice(0, 256);
+    });
+    mirror(run, state);
+  }
+
+  async function markCycle(run: HandoffRun, mark: HandoffCycleMark): Promise<void> {
+    const state = await updateHandoffState(run.allocation, (current) => {
+      current.lifecycle.detail = mark;
     });
     mirror(run, state);
   }
@@ -313,6 +333,7 @@ export function createHandoffGate(): HandoffGate {
     },
 
     recordOutcome,
+    markCycle,
 
     evidence(run) {
       return {

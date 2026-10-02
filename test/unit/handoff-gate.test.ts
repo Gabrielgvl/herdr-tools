@@ -326,6 +326,20 @@ describe("handoff gate repair and outcomes", () => {
     expect(gate.evidence(run)).toMatchObject({ runId: run.runId, state: "failed" });
   });
 
+  it("marks a cycle without changing the lifecycle state, and a fresh outcome clears the mark", async () => {
+    const { run, gate } = await boundRun();
+    await gate.markCycle(run, "provider_limit");
+    expect((await readHandoffState(run.allocation)).lifecycle).toMatchObject({ state: "awaiting_handoff", detail: "provider_limit" });
+    expect(run.lifecycle).toBe("awaiting_handoff");
+    await artifact(run);
+    await gate.validate(run);
+    await gate.recordOutcome(run, "handed_off");
+    expect((await readHandoffState(run.allocation)).lifecycle).toEqual({ state: "handed_off", watermark: { stateChangeSeq: 3, revision: 1 } });
+    await gate.markCycle(run, "cycle_reopened");
+    expect((await readHandoffState(run.allocation)).lifecycle).toMatchObject({ state: "handed_off", detail: "cycle_reopened" });
+    expect(gate.evidence(run)).toMatchObject({ state: "handed_off" });
+  });
+
   it("marks unresolved runs recovery_pending on shutdown and leaves resolved ones", async () => {
     const { run, gate } = await boundRun();
     const { run: settled } = await boundRun();

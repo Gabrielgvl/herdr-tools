@@ -44,7 +44,8 @@ export class DaemonProtocolError extends Error {
 export class DaemonRequestError extends Error {
   readonly code = "DAEMON_REQUEST_FAILED" as const;
 
-  constructor(readonly daemonCode: string, message = "Daemon request was rejected") {
+  /** `reason` is the refusal's bounded sub-code token — the only detail that crosses the wire. */
+  constructor(readonly daemonCode: string, message = "Daemon request was rejected", readonly reason?: string) {
     super(message);
     this.name = "DaemonRequestError";
   }
@@ -53,7 +54,11 @@ export class DaemonRequestError extends Error {
 export interface DaemonWireError {
   code: string;
   message: string;
+  reason?: string;
 }
+
+/** A refusal's sub-code: one lowercase snake token, never prose. */
+export const DAEMON_REASON_TOKEN = /^[a-z][a-z0-9_]{0,63}$/u;
 
 /** A line validated at the daemon protocol boundary. */
 export type DaemonLine =
@@ -88,7 +93,8 @@ function requiredVersion(value: unknown): number {
 
 function wireError(value: unknown): DaemonWireError {
   if (!record(value)) throw new DaemonProtocolError("daemon socket error is malformed", { field: "error" });
-  return { code: requiredString(value.code, "error.code"), message: requiredString(value.message, "error.message") };
+  const reason = typeof value.reason === "string" && DAEMON_REASON_TOKEN.test(value.reason) ? value.reason : undefined;
+  return { code: requiredString(value.code, "error.code"), message: requiredString(value.message, "error.message"), ...(reason === undefined ? {} : { reason }) };
 }
 
 function bounded(value: string): string {
@@ -142,9 +148,9 @@ export function encodeDaemonResult(id: string, result: unknown): string {
 }
 
 /** A correlated failure reply: `{"id","error":{"code","message"}}`. */
-export function encodeDaemonFailure(id: string, code: string, message: string): string {
+export function encodeDaemonFailure(id: string, code: string, message: string, reason?: string): string {
   requiredString(id, "id");
-  return frame({ id, error: { code: bounded(code), message: bounded(message) } });
+  return frame({ id, error: { code: bounded(code), message: bounded(message), ...(reason !== undefined && DAEMON_REASON_TOKEN.test(reason) ? { reason } : {}) } });
 }
 
 /**

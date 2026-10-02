@@ -34,6 +34,7 @@ import type { DaemonNamespace } from "./namespace.js";
 import {
   DAEMON_MAX_LINE_BYTES,
   DAEMON_PROTOCOL_VERSION,
+  DAEMON_REASON_TOKEN,
   DAEMON_SOCKET_NAME,
   DaemonProtocolError,
   DaemonRequestError,
@@ -179,7 +180,7 @@ export class DaemonClientSocket {
     this.pending.delete(parsed.id);
     clearTimeout(request.timer);
     if (parsed.kind === "failure") {
-      request.reject(new DaemonRequestError(parsed.error.code));
+      request.reject(new DaemonRequestError(parsed.error.code, undefined, parsed.error.reason));
       return true;
     }
     request.resolve(parsed.result);
@@ -396,10 +397,12 @@ function projectCallError(method: string, error: unknown): DaemonCallError {
   // state stays readable through `status`/`run observe`.
   const certainty = method === "launch" ? { effectCertainty: "unknown" as const } : {};
   if (error instanceof DaemonRequestError) {
+    // The refusal's own sub-code token is the one detail that crosses: a
+    // `RECOVERY_UNRESOLVABLE` without its `reason` is unactionable.
     return new DaemonCallError(
       typeof error.daemonCode === "string" && DAEMON_CALL_CODE.test(error.daemonCode) ? error.daemonCode : "DAEMON_REQUEST_FAILED",
       `daemon ${method} call was refused`,
-      certainty,
+      { ...certainty, ...(error.reason !== undefined && DAEMON_REASON_TOKEN.test(error.reason) ? { reason: error.reason } : {}) },
     );
   }
   // Typed peers — DaemonClientError, DaemonProtocolError, DaemonMailboxError,

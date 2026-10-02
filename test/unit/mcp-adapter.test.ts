@@ -621,6 +621,13 @@ describe("MCP error mapping", () => {
     expect(text).not.toContain("attached-secret");
   });
 
+  it("keeps a refusal's bounded reason token for the caller and drops prose reasons", () => {
+    const refused = errorOutcome("RECOVERY_UNRESOLVABLE", "daemon launch call was refused", { effectCertainty: "unknown", reason: "lifecycle_non_terminal" }, "herdr_launch");
+    expect(payload(refused).details).toEqual({ tool: "herdr_launch", effectCertainty: "unknown", reason: "lifecycle_non_terminal" });
+    const prose = errorOutcome("RECOVERY_UNRESOLVABLE", "daemon launch call was refused", { effectCertainty: "unknown", reason: "wire-secret prose" }, "herdr_launch");
+    expect(payload(prose).details).toEqual({ tool: "herdr_launch", effectCertainty: "unknown" });
+  });
+
   it("keeps the launcher effect certainty visible when no diagnostic record exists", () => {
     // The fail-closed wire path: a refusal that cannot prove the launch had no
     // effect must still surface `unknown` — never a bare failure that reads

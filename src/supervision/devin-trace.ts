@@ -71,11 +71,16 @@ const utf8 = new TextDecoder("utf-8", { fatal: true });
 const ATIF_V1 = /^ATIF-v1\.\d+$/;
 const HEX_64 = /^[0-9a-f]{64}$/;
 
-/** Devin's record directory: `$XDG_DATA_HOME/devin/cli/transcripts`. */
-function defaultTranscriptsDir(): string {
+/** Devin's CLI data directory: `$XDG_DATA_HOME/devin/cli` (default `~/.local/share/devin/cli`). */
+export function devinCliDataDir(): string {
   const dataHome = process.env.XDG_DATA_HOME;
   const base = dataHome === undefined || dataHome === "" ? join(homedir(), ".local", "share") : dataHome;
-  return join(base, "devin", "cli", "transcripts");
+  return join(base, "devin", "cli");
+}
+
+/** Devin's record directory: `$XDG_DATA_HOME/devin/cli/transcripts`. */
+function defaultTranscriptsDir(): string {
+  return join(devinCliDataDir(), "transcripts");
 }
 
 const nodeFileReader = createNodeFileReader();

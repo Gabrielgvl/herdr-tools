@@ -202,16 +202,16 @@ class DaemonServerConnection {
           }
         },
         (error) => {
-          if (error instanceof DaemonRequestError) this.fail(request.id, error.daemonCode, error.message);
+          if (error instanceof DaemonRequestError) this.fail(request.id, error.daemonCode, error.message, error.reason);
           else this.fail(request.id, "DAEMON_REQUEST_FAILED", "daemon request failed");
         },
       );
   }
 
-  private fail(id: string, code: string, message: string): void {
+  private fail(id: string, code: string, message: string, reason?: string): void {
     if (this.closed) return;
     try {
-      this.stream.write(encodeDaemonFailure(id, code, message));
+      this.stream.write(encodeDaemonFailure(id, code, message, reason));
     } catch {
       // The failure line itself cannot be framed — nothing bounded remains to
       // send, so the connection is simply dropped.

@@ -3,6 +3,7 @@ import { modelSafeJson } from "../redaction.js";
 import type { HerdrToolDefinition, HerdrToolSurface } from "../tool-surface.js";
 import { hostContext, type HerdrToolHost } from "./host.js";
 import { LAUNCH_DIAGNOSTIC_MARKER, LAUNCH_RECOVERY_GUIDANCE, type LaunchEffectCertainty } from "../tools/launch.js";
+import { DAEMON_REASON_TOKEN } from "../daemon/protocol.js";
 import { appendToolTelemetry, invalidInputError, monotonicDurationMs, telemetryOperation, type ToolInputError } from "../telemetry.js";
 
 /** Total response bound for one MCP tool result. */
@@ -331,6 +332,8 @@ function launchRecoveryDetails(details: unknown): Record<string, unknown> {
   if (certainty !== undefined) recovery.effectCertainty = certainty;
   const dispatch = promptDispatchPayload(details.promptDispatch);
   if (dispatch !== undefined) recovery.promptDispatch = dispatch;
+  // The refusal's bounded sub-code (e.g. `RECOVERY_UNRESOLVABLE` → `lifecycle_non_terminal`).
+  if (typeof details.reason === "string" && DAEMON_REASON_TOKEN.test(details.reason)) recovery.reason = details.reason;
   return recovery;
 }
 

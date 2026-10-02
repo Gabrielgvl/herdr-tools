@@ -4003,6 +4003,39 @@ describe("managed handoff evaluation", () => {
     }
   });
 
+  it("releases a handed_off lane whose pane the daemon retired — the shared self-close marker suppresses the close wake", async () => {
+    const tracker = createSelfCloseTracker();
+    const gate = createHandoffGate();
+    // The absent second snapshot is the confirmation read the close triggers.
+    const h = harness({ selfClose: tracker, handoffs: gate, snapshots: [workingOrigin(), snapshot([], [])], log: true });
+    await h.supervisor.bind({ identity, operatingPointId: "worker-pi", stateChangeSeq: 5 });
+    const allocation = await managedAllocation();
+    await gate.bind(allocation, identity);
+    try {
+      await writeArtifact(allocation, "done");
+      await h.supervisor.onEvent(paneEvent("pane_updated", paneRecord({ status: "done", revision: 6, stateChangeSeq: 6 })));
+      await vi.waitFor(async () => expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off"));
+      await vi.waitFor(() => expect(h.logs.some((line) => line.startsWith("supervisor_retired job=job_supervisor"))).toBe(true));
+
+      const wakesBefore = h.wakes.length;
+      const eventsBefore = h.supervisor.view().events.length;
+      // The retirer's own close carries the daemon's confirmed marker: the
+      // supervisor settles released without a pane_closed wake or ledger event,
+      // and the durable handed_off outcome is never rewritten.
+      tracker.begin("p1")(true);
+      await h.supervisor.onEvent(thinEvent("pane_closed"));
+      await vi.waitFor(() => expect(h.supervisor.view().state).toBe("settled"));
+      await expect(h.supervisor.run()).resolves.toMatchObject({ outcome: "released", reason: "event:pane_closed" });
+      expect(h.wakes).toHaveLength(wakesBefore);
+      expect(h.supervisor.view().events).toHaveLength(eventsBefore);
+      expect((await readHandoffState(allocation)).lifecycle.state).toBe("handed_off");
+    } finally {
+      h.supervisor.shutdown();
+      tracker.clear();
+      await rm(allocation.namespaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("settles a retired supervisor on an authoritative absent snapshot", async () => {
     const { h, allocation } = await managed({ log: true, snapshots: [workingOrigin()] });
     try {

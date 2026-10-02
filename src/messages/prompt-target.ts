@@ -5,8 +5,8 @@
  * tool does without importing tool internals.
  */
 
-import { PromptIdentityError } from "./prompt.js";
-import type { HerdrSnapshot } from "../targets.js";
+import { optionalSessionCandidate, PromptIdentityError, type AgentSessionIdentity } from "./prompt.js";
+import type { HerdrSnapshot, PaneRecord } from "../targets.js";
 
 export type CommunicateState = "idle" | "working" | "blocked" | "done" | "unknown";
 
@@ -56,6 +56,30 @@ export function agentFrom(value: unknown): Record<string, unknown> {
     throw new PromptIdentityError("TARGET_IDENTITY_UNAVAILABLE", "Fresh Herdr agent identity is unavailable");
   }
   return (value as { agent: Record<string, unknown> }).agent;
+}
+
+/**
+ * The pane whose merged pane+agent records prove it carries exactly `session`
+ * — the D5 owner-session rule shared by the supervisor's owner-present check,
+ * the restart sweep's owner destination, and the lane retirer's owner
+ * topology. A pane whose records prove nothing never matches.
+ */
+export function findSessionPane(snapshot: HerdrSnapshot, session: AgentSessionIdentity): PaneRecord | undefined {
+  for (const pane of snapshot.panes) {
+    let candidate: AgentSessionIdentity | undefined;
+    try {
+      candidate = optionalSessionCandidate([pane, ...snapshot.agents.filter((agent) => agent.pane_id === pane.pane_id)]);
+    } catch {
+      // A pane whose records prove nothing is skipped, never counted.
+      continue;
+    }
+    if (candidate !== undefined
+      && candidate.source === session.source
+      && candidate.agent === session.agent
+      && candidate.kind === session.kind
+      && candidate.value === session.value) return pane;
+  }
+  return undefined;
 }
 
 export function snapshotIdentityRecords(snapshot: HerdrSnapshot, paneId: string): Record<string, unknown>[] {

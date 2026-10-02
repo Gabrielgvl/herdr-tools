@@ -286,7 +286,7 @@ describe("provider-limit auto-recovery", () => {
     dirs.push(availabilityRoot);
     const recorder = vi.fn(async (candidate: Parameters<typeof recordLaunchFailure>[0], runner: Parameters<typeof recordLaunchFailure>[1], failure: Parameters<typeof recordLaunchFailure>[2]) => recordLaunchFailure(candidate, runner, failure, { root: availabilityRoot }));
     const quota = vi.fn(async (): Promise<ClaudeQuotaSignal> => ({ retryNotBefore: RESET_ISO, zeroProgressProven: true }));
-    const result = await execute(toolFor({ catalog: twoProviderCatalog(), cli: harness.cli, supervision, handoffs, availabilityFailureRecorder: recorder, claudeQuotaReader: quota }), TASK);
+    const result = await execute(toolFor({ catalog: twoProviderCatalog(), cli: harness.cli, supervision, handoffs, availabilityFailureRecorder: recorder, claudeQuotaReader: quota }), { ...TASK, retention: "keep" });
     expect(result.details!.outcome).toBe("launched");
     expect(result.details!.children[0]).toMatchObject({ state: "launched", operatingPointId: "claude:c:low" });
     const dead = supervision.bound[0]!;
@@ -332,7 +332,7 @@ describe("provider-limit auto-recovery", () => {
     const recoveredState = await readHandoffState(recovered.handoff!.allocation);
     expect(recoveredState.child.route?.operatingPointId).toBe("pi:a:low");
     const provenance = await readHandoffProvenance(recovered.handoff!.allocation);
-    expect(provenance.task).toMatchObject({ objective: TASK.objective, recoveryOf: dead.handoff!.allocation.runId });
+    expect(provenance.task).toMatchObject({ objective: TASK.objective, retention: "keep", recoveryOf: dead.handoff!.allocation.runId });
   });
 
   it("keeps the manual contract when zero progress is not provable, and records the 15-minute default when no reset signal exists", async () => {

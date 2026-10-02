@@ -151,14 +151,24 @@ export function classifySnapshotTarget(snapshot: HerdrSnapshot, paneId: string):
   }
   if (panes.length > 1) return { kind: "invalid", reason: "duplicate_target_pane" };
   if (agents.length > 1) return { kind: "invalid", reason: "duplicate_target_agent" };
+  return joinTargetRecords(panes[0]!, agents[0]);
+}
 
+/**
+ * Join one pane record with its target-local agent record — the record-level
+ * rule `classifySnapshotTarget` applies once uniqueness holds, shared so a
+ * `pane get`/`agent get` pair proves the same coherence a snapshot does. A
+ * malformed field is `target_record_malformed`; an identity or lifecycle
+ * field the two records disagree on (name, terminal, kind, session,
+ * revision, status, `state_change_seq`) is `target_identity_contradiction`.
+ * The agent record's counter wins the join; the pane's is the fallback.
+ */
+export function joinTargetRecords(paneRecord: Record<string, unknown>, agentRecord: Record<string, unknown> | undefined): Exclude<SnapshotTargetEvidence, { kind: "absent" }> {
   try {
-    const paneRecord = panes[0]!;
     const pane = parsePaneRecord(paneRecord);
     const paneName = optionalIdentityString(paneRecord, "agent_name") ?? optionalIdentityString(paneRecord, "name");
-    if (agents.length === 0) return { kind: "unique", occupant: { pane, agentPresent: false, ...(paneName === undefined ? {} : { agentName: paneName }), ...(pane.stateChangeSeq === undefined ? {} : { stateChangeSeq: pane.stateChangeSeq }) } };
+    if (agentRecord === undefined) return { kind: "unique", occupant: { pane, agentPresent: false, ...(paneName === undefined ? {} : { agentName: paneName }), ...(pane.stateChangeSeq === undefined ? {} : { stateChangeSeq: pane.stateChangeSeq }) } };
 
-    const agentRecord = agents[0]!;
     const agentName = optionalIdentityString(agentRecord, "name") ?? optionalIdentityString(agentRecord, "agent_name");
     const agentTerminal = optionalIdentityString(agentRecord, "terminal_id");
     const agentKind = optionalIdentityString(agentRecord, "agent");

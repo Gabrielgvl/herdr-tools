@@ -8,7 +8,11 @@ import { connectDaemon, type DaemonClientSocket } from "../../src/daemon/client.
 import { acquireDaemonInstance, DAEMON_INSTANCE_LOCK_NAME } from "../../src/daemon/instance.js";
 import { createIntentStore, DAEMON_INTENTS_DIR_NAME, managerSessionKey } from "../../src/daemon/intents.js";
 import {
+  DAEMON_RETIRE_FOCUS_DEFERS,
+  DAEMON_RETIRE_GRACE_MS,
+  DAEMON_RETIRE_SWEEP_MS,
   DAEMON_STATUS_NAME,
+  retireEnvOptions,
   runDaemonMain,
   startDaemon,
   type DaemonMainOptions,
@@ -445,6 +449,91 @@ describe("daemon shutdown order", () => {
     expect(order).toEqual(["flushHandoffs", "stopSupervisors"]);
   });
 
+  it("ticks the ADR-040 sweep on its own cadence, never concurrently, and drains an in-flight sweep before the shutdown steps", async () => {
+    const fx = await fixture();
+    const order: string[] = [];
+    let release: (() => void) | undefined;
+    let sweeps = 0;
+    const retire = {
+      sweep: () => {
+        sweeps += 1;
+        order.push("sweep");
+        return new Promise<void>((resolve) => { release = resolve; });
+      },
+    };
+    const seams: DaemonShutdownSeams = {
+      flushHandoffs: async () => void order.push("flushHandoffs"),
+      stopSupervisors: async () => void order.push("stopSupervisors"),
+    };
+    const daemon = await start(fx, { retire, retireSweepMs: 10, seams });
+    // The first tick is in flight and blocked; every tick behind it is skipped.
+    await vi.waitFor(() => expect(sweeps).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sweeps).toBe(1);
+
+    // Shutdown waits out the in-flight sweep before the §4 steps run.
+    const stopping = daemon.shutdown();
+    await vi.waitFor(() => expect(order).toEqual(["sweep"]));
+    release!();
+    await stopping;
+    expect(order).toEqual(["sweep", "flushHandoffs", "stopSupervisors"]);
+    // No tick lands after the interval cleared: the count is fixed.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sweeps).toBe(1);
+  });
+
+  it("journals a failing retire sweep, keeps ticking, and stays up", async () => {
+    const fx = await fixture();
+    let sweeps = 0;
+    const failures: unknown[] = [
+      "plain failure",
+      null,
+      Object.assign(new Error("bad code"), { code: 7 }),
+      Object.assign(new Error("io"), { code: "LANE_SWEEP_IO" }),
+    ];
+    const retire = {
+      sweep: async () => {
+        sweeps += 1;
+        const failure = failures.shift();
+        if (failure !== undefined) throw failure;
+      },
+    };
+    const daemon = await start(fx, { retire, retireSweepMs: 5 });
+    // Every failure shape is journaled and swallowed; the cadence survives.
+    await vi.waitFor(() => expect(sweeps).toBeGreaterThanOrEqual(5));
+    await daemon.shutdown();
+  });
+
+  it("uses the default retire cadence when retireSweepMs is unset", async () => {
+    const fx = await fixture();
+    let sweeps = 0;
+    const daemon = await start(fx, { retire: { sweep: async () => { sweeps += 1; } } });
+    await untilBound(fx);
+    await daemon.shutdown();
+    // The 60 s default never lands inside a test's lifetime.
+    expect(sweeps).toBe(0);
+  });
+
+  it("continues startup rollback when a rollback step itself fails", async () => {
+    const fx = await fixture();
+    const seams: DaemonShutdownSeams = {
+      flushHandoffs: async () => { throw new Error("flush refused"); },
+      stopSupervisors: async () => Promise.reject("plain failure"),
+    };
+    await expect(startDaemon({ env: fx.env, seams, reattach: async () => { throw new Error("sweep exploded"); } }))
+      .rejects.toThrow("sweep exploded");
+  });
+
+  it("feeds the prior record's heartbeat into the restart sweep", async () => {
+    const fx = await fixture();
+    const first = await start(fx);
+    await untilBound(fx);
+    await first.shutdown();
+    let seen: string | undefined;
+    await start(fx, { reattach: async ({ lastHeartbeat }) => { seen = lastHeartbeat; } });
+    expect(typeof seen).toBe("string");
+  });
+
   it("completes every shutdown step when a seam fails, then rejects with its error", async () => {
     const fx = await fixture();
     const order: string[] = [];
@@ -551,5 +640,43 @@ describe("daemon entrypoint", () => {
       await expectLockFree(fx.namespace);
       expect(await createDaemonSocketProbe()(fx.socketPath)).not.toBe("answered");
     }
+  });
+});
+
+describe("retireEnvOptions (ADR-040, F10)", () => {
+  const defaults = { enabled: false, graceMs: DAEMON_RETIRE_GRACE_MS, sweepMs: DAEMON_RETIRE_SWEEP_MS, maxFocusDefers: DAEMON_RETIRE_FOCUS_DEFERS };
+
+  it("is dry-run with every knob at its default when nothing is set", () => {
+    expect(retireEnvOptions({})).toEqual(defaults);
+  });
+
+  it("treats empty strings as unset — an empty Environment= line never collapses a knob to 0", () => {
+    expect(retireEnvOptions({
+      HERDR_TOOLS_RETIRE_ENABLED: "",
+      HERDR_TOOLS_RETIRE_GRACE_MS: "",
+      HERDR_TOOLS_RETIRE_SWEEP_MS: "  ",
+      HERDR_TOOLS_RETIRE_FOCUS_DEFERS: "",
+    })).toEqual(defaults);
+  });
+
+  it("refuses a zero or negative grace and a sub-second sweep, keeping the defaults", () => {
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "0" }).graceMs).toBe(DAEMON_RETIRE_GRACE_MS);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "-5" }).graceMs).toBe(DAEMON_RETIRE_GRACE_MS);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_SWEEP_MS: "0" }).sweepMs).toBe(DAEMON_RETIRE_SWEEP_MS);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_SWEEP_MS: "999" }).sweepMs).toBe(DAEMON_RETIRE_SWEEP_MS);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "abc", HERDR_TOOLS_RETIRE_SWEEP_MS: "Infinity" })).toMatchObject({ graceMs: DAEMON_RETIRE_GRACE_MS, sweepMs: DAEMON_RETIRE_SWEEP_MS });
+  });
+
+  it("accepts the bounds themselves and larger values", () => {
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "1", HERDR_TOOLS_RETIRE_SWEEP_MS: "1000", HERDR_TOOLS_RETIRE_FOCUS_DEFERS: "0" }))
+      .toEqual({ enabled: false, graceMs: 1, sweepMs: 1_000, maxFocusDefers: 0 });
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_GRACE_MS: "600000", HERDR_TOOLS_RETIRE_SWEEP_MS: "30000", HERDR_TOOLS_RETIRE_FOCUS_DEFERS: "5" }))
+      .toMatchObject({ graceMs: 600_000, sweepMs: 30_000, maxFocusDefers: 5 });
+  });
+
+  it("enables only on a non-empty value other than 0", () => {
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_ENABLED: "0" }).enabled).toBe(false);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_ENABLED: "1" }).enabled).toBe(true);
+    expect(retireEnvOptions({ HERDR_TOOLS_RETIRE_ENABLED: "true" }).enabled).toBe(true);
   });
 });

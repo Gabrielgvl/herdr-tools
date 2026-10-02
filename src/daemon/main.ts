@@ -27,7 +27,9 @@ import { daemonRunOwnership, reattachDaemonRuns } from "./reattach.js";
 import { parseSnapshotResult } from "../targets.js";
 import { createDaemonJsonPort, createMailbox, type DaemonJsonPort, type Mailbox, type MailboxRunOwnership } from "./mailbox.js";
 import { resolveDaemonNamespace, type DaemonNamespace } from "./namespace.js";
-import { createDaemonRuntime, daemonDispatcher } from "./runtime.js";
+import { createPaneWriteGuard, resolvePaneWriteNamespace } from "../pane-write-lock.js";
+import { createLaneRetirer } from "./retire.js";
+import { createDaemonRuntime, daemonDispatcher, requireDaemonMailbox } from "./runtime.js";
 import {
   startDaemonServer,
   type DaemonRequestHandler,
@@ -54,6 +56,49 @@ export interface DaemonStatusRecord {
 
 export const DAEMON_STATUS_NAME = "daemon.json";
 export const DAEMON_HEARTBEAT_MS = 30_000;
+/** ADR-040 lane-retirement cadence — `HERDR_TOOLS_RETIRE_SWEEP_MS` overrides. */
+export const DAEMON_RETIRE_SWEEP_MS = 60_000;
+/** ADR-040 stability grace — `HERDR_TOOLS_RETIRE_GRACE_MS` overrides. */
+export const DAEMON_RETIRE_GRACE_MS = 15 * 60_000;
+/** ADR-040 bounded focused deferrals — `HERDR_TOOLS_RETIRE_FOCUS_DEFERS` overrides. */
+export const DAEMON_RETIRE_FOCUS_DEFERS = 60;
+
+/** The ADR-040 retirement knobs the daemon reads from its environment. */
+export interface RetireEnvOptions {
+  enabled: boolean;
+  graceMs: number;
+  sweepMs: number;
+  maxFocusDefers: number;
+}
+
+/**
+ * A numeric retirement knob: an unset or empty variable is the default, and a
+ * value below `min` — a zero grace would make every finished lane eligible on
+ * first sight, a sub-second sweep would hammer the endpoint — is the default
+ * too, never a silently collapsed `0`.
+ */
+function retireEnvNumber(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+}
+
+/**
+ * ADR-040 env surface. `HERDR_TOOLS_RETIRE_ENABLED` unset, empty, or `0`
+ * means dry-run — the sweep journals `would_retire` and closes nothing until
+ * the operator enables it. Empty strings are unset for every knob; the grace
+ * must be positive and the sweep at least one second, else the default.
+ */
+export function retireEnvOptions(env: NodeJS.ProcessEnv): RetireEnvOptions {
+  const enabled = env.HERDR_TOOLS_RETIRE_ENABLED;
+  return {
+    enabled: enabled !== undefined && enabled.trim() !== "" && enabled !== "0",
+    graceMs: retireEnvNumber(env, "HERDR_TOOLS_RETIRE_GRACE_MS", DAEMON_RETIRE_GRACE_MS, 1),
+    sweepMs: retireEnvNumber(env, "HERDR_TOOLS_RETIRE_SWEEP_MS", DAEMON_RETIRE_SWEEP_MS, 1_000),
+    maxFocusDefers: retireEnvNumber(env, "HERDR_TOOLS_RETIRE_FOCUS_DEFERS", DAEMON_RETIRE_FOCUS_DEFERS, 0),
+  };
+}
 
 /**
  * The N2.x runtime seams the shutdown order drains. Neither may write to the
@@ -102,6 +147,15 @@ export interface DaemonMainOptions {
    * children does not run.
    */
   reattach?: (context: { mailbox: Mailbox; startedAt: string; lastHeartbeat?: string }) => Promise<unknown>;
+  /**
+   * The ADR-040 lane-retirement sweep (B3). Absent means no cadence runs.
+   * Present, it ticks every `retireSweepMs` from server bind until shutdown;
+   * a tick still in flight when the next falls due is skipped, and one in
+   * flight at shutdown drains before the §4 steps run.
+   */
+  retire?: { sweep(): Promise<void> };
+  /** The retirement cadence; production passes `HERDR_TOOLS_RETIRE_SWEEP_MS` or the 60 s default. */
+  retireSweepMs?: number;
   heartbeatMs?: number;
   now?: () => Date;
   /** Diagnostic sink for lifecycle write failures and shutdown steps; defaults to stderr. */
@@ -343,11 +397,33 @@ export async function startDaemon(options: DaemonMainOptions = {}): Promise<Runn
   }, options.heartbeatMs ?? DAEMON_HEARTBEAT_MS);
   heartbeat.unref();
 
+  // ADR-040: the lane-retirement cadence. One sweep at a time — a tick that
+  // arrives while the last is still holding a pane lock or readback is
+  // skipped, and the in-flight sweep drains before shutdown's §4 steps so no
+  // close outlives the supervisor drain it correlates with.
+  let retireInflight: Promise<void> | undefined;
+  const retirer = options.retire;
+  const retireInterval = retirer === undefined ? undefined : setInterval(() => {
+    if (retireInflight !== undefined) return;
+    retireInflight = Promise.resolve()
+      .then(() => retirer.sweep())
+      .catch((error: unknown) => {
+        const code = error !== null && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "sweep_failed";
+        log(`herdr-tools-daemon lane_retire decision=sweep_failed reason=${code}`);
+      })
+      .finally(() => {
+        retireInflight = undefined;
+      });
+  }, options.retireSweepMs ?? DAEMON_RETIRE_SWEEP_MS);
+  retireInterval?.unref();
+
   let stopping: Promise<void> | undefined;
   const shutdown = (): Promise<void> => {
     stopping ??= (async () => {
       // Stop the cadence first so no heartbeat can land after `lastStoppedAt`.
       clearInterval(heartbeat);
+      if (retireInterval !== undefined) clearInterval(retireInterval);
+      await retireInflight;
       const steps: Array<[string, () => Promise<void>]> = [
         ["flushHandoffs", seams.flushHandoffs],
         ["stopSupervisors", seams.stopSupervisors],
@@ -446,10 +522,37 @@ if (process.argv[1] !== undefined) {
         });
         const runs = await resolveHandoffNamespace(env);
         const signal = new AbortController().signal;
+        const retire = retireEnvOptions(env);
+        // The same run flock every sidecar mutation and ownership transfer takes.
+        const ownership = daemonRunOwnership(runtime.allocator);
+        const retirer = createLaneRetirer({
+          runs,
+          allocator: runtime.allocator,
+          ownership,
+          intents: runtime.intents,
+          mailbox: {
+            writeRunEvent: (input) => requireDaemonMailbox(runtime).writeRunEvent(input),
+            list: (key) => requireDaemonMailbox(runtime).list(key),
+          },
+          cli: runtime.cli,
+          selfClose: runtime.selfClose,
+          jobs: runtime.jobs,
+          snapshot: async () => parseSnapshotResult((await runtime.cli.runJson(["api", "snapshot"], signal)).result),
+          options: {
+            enabled: retire.enabled,
+            graceMs: retire.graceMs,
+            paneLock: createPaneWriteGuard({ namespace: () => resolvePaneWriteNamespace(env) }),
+            maxFocusDefers: retire.maxFocusDefers,
+          },
+          log: (line) => process.stderr.write(`${line}\n`),
+        });
+        runtime.bindRetirer(retirer);
         return runDaemonMain({
           namespace,
           handler: daemonDispatcher(runtime),
-          ownership: daemonRunOwnership(runtime.allocator),
+          ownership,
+          retire: retirer,
+          retireSweepMs: retire.sweepMs,
           reattach: ({ mailbox, startedAt, lastHeartbeat }) => {
             // The runtime's §8 ownership and §11 hint ops resolve the mailbox
             // lazily — the serialized status queue exists only now.

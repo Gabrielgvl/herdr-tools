@@ -392,6 +392,13 @@ export interface JobRegistryOptions {
    * failed persist is accounted there and never claimed as persisted.
    */
   eventWriter?: MailboxEventWriter;
+  /**
+   * ADR-040 daemon-retirement marker: true only for runs the lane retirer
+   * provably closed. A `handed_off` run the daemon retired emits no trailing
+   * `job_terminal` — the `lane_retired` event already carries the artifact;
+   * a `handed_off` run closed by any other mechanism still emits it.
+   */
+  laneRetired?: (runId: string) => boolean;
   onChange?: () => void | Promise<void>;
   /** Maximum time allowed to observe runner/callback quiescence after cancellation. */
   quiescenceMs?: number;
@@ -1209,6 +1216,7 @@ export class JobRegistry {
   private readonly clock: JobClock;
   private readonly onTerminal?: (detail: JobDetail) => void | Promise<void>;
   private readonly eventWriter?: MailboxEventWriter;
+  private readonly laneRetired?: (runId: string) => boolean;
   private readonly onChange?: () => void | Promise<void>;
   private readonly quiescenceMs: number;
   private sequence = 0;
@@ -1220,6 +1228,7 @@ export class JobRegistry {
     this.clock = options.clock ?? { now: () => Date.now() };
     this.onTerminal = options.onTerminal;
     this.eventWriter = options.eventWriter;
+    this.laneRetired = options.laneRetired;
     this.onChange = options.onChange;
     const quiescenceMs = options.quiescenceMs;
     this.quiescenceMs = typeof quiescenceMs === "number" && Number.isFinite(quiescenceMs) && quiescenceMs >= 0 ? quiescenceMs : 1_000;
@@ -1331,9 +1340,10 @@ export class JobRegistry {
     if (writer === undefined) return;
     const handoff = record.supervision?.handoffEvidence?.();
     if (handoff === undefined || !handoff.gated) return;
-    // A run that already recorded `handed_off` emitted its durable outcome;
-    // the trailing supervisor settlement is bookkeeping, not owner news.
-    if (handoff.state === "handed_off") return;
+    // ADR-040: only a run the daemon's lane retirer provably closed skips the
+    // trailing terminal — its `lane_retired` event already carried the
+    // artifact. A `handed_off` run closed by any other mechanism still emits.
+    if (handoff.state === "handed_off" && this.laneRetired?.(handoff.runId) === true) return;
     void Promise.resolve(writer.writeRunEvent({
       kind: "job_terminal",
       runId: handoff.runId,

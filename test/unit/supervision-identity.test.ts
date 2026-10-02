@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyProvisionalSnapshotTarget,
   classifySnapshotTarget,
+  joinTargetRecords,
   movedIdentity,
   occupantContinuity,
   paneContinuity,
@@ -241,5 +242,32 @@ describe("supervised identity continuity", () => {
     expect(movedIdentity(identity, moved, { pane: pane({ paneId: "p2" }), agentPresent: true, agentName: "other" })).toBeUndefined();
     // An agent-free destination is not move continuity.
     expect(movedIdentity(identity, moved, { pane: pane({ paneId: "p2" }), agentPresent: false })).toBeUndefined();
+  });
+});
+
+describe("joinTargetRecords", () => {
+  const rawPane = (): Record<string, unknown> => ({ pane_id: "p1", terminal_id: "t1", tab_id: "tab1", workspace_id: "w1", agent_status: "idle", revision: 5, state_change_seq: 5, agent: "pi", agent_session: session });
+  const agent: Record<string, unknown> = { pane_id: "p1", name: "worker", agent: "pi", terminal_id: "t1", agent_session: session, agent_status: "idle", revision: 5, state_change_seq: 5 };
+
+  it("is the record-level rule classifySnapshotTarget applies — the lane retirer reuses it on pane get/agent get pairs", () => {
+    expect(joinTargetRecords(rawPane(), agent)).toEqual({ kind: "unique", occupant: expect.objectContaining({ agentPresent: true, agentName: "worker", stateChangeSeq: 5 }) });
+    // The agent record's counter wins the join; the pane's is the fallback.
+    const paneNoSeq = rawPane();
+    delete paneNoSeq.state_change_seq;
+    expect(joinTargetRecords(paneNoSeq, { ...agent, state_change_seq: 7 })).toMatchObject({ kind: "unique", occupant: { stateChangeSeq: 7 } });
+    const agentNoSeq = { ...agent };
+    delete agentNoSeq.state_change_seq;
+    expect(joinTargetRecords(rawPane(), agentNoSeq)).toMatchObject({ kind: "unique", occupant: { stateChangeSeq: 5 } });
+    // A lone pane record joins as agent-absent.
+    expect(joinTargetRecords(rawPane(), undefined)).toMatchObject({ kind: "unique", occupant: { agentPresent: false, stateChangeSeq: 5 } });
+  });
+
+  it("rejects a stale pane record contradicted by a fresh agent record on status, counter, or revision", () => {
+    expect(joinTargetRecords(rawPane(), { ...agent, agent_status: "working", state_change_seq: 6 })).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
+    expect(joinTargetRecords(rawPane(), { ...agent, state_change_seq: 6 })).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
+    expect(joinTargetRecords(rawPane(), { ...agent, agent_status: "working" })).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
+    expect(joinTargetRecords(rawPane(), { ...agent, revision: 6 })).toEqual({ kind: "invalid", reason: "target_identity_contradiction" });
+    expect(joinTargetRecords({ ...rawPane(), agent_status: 7 }, agent)).toEqual({ kind: "invalid", reason: "target_record_malformed" });
+    expect(joinTargetRecords(rawPane(), { ...agent, state_change_seq: -1 })).toEqual({ kind: "invalid", reason: "target_record_malformed" });
   });
 });

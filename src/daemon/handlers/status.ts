@@ -16,6 +16,7 @@ import { daemonRequestError, parseCallerClaim, requireDaemonMailbox, verifyDaemo
 import { managerSessionKey, type LaunchIntentChild, type LaunchIntentRecord, type LaunchIntentState } from "../intents.js";
 import { DAEMON_MAILBOX_DIR_NAME, type MailboxEvent } from "../mailbox.js";
 import { DaemonRequestError } from "../protocol.js";
+import type { RetireView } from "../retire.js";
 
 export interface DaemonStatusIntent {
   launchId: string;
@@ -44,6 +45,8 @@ export interface DaemonStatusRun {
   };
   /** `active` while a live, unpaused supervisor job is bound to the run in this daemon. */
   review: "active" | "paused";
+  /** The bound lane retirer's view — present only while a sweep tracks the run (ADR-040). */
+  retire?: RetireView;
 }
 
 /** One frozen transfer journal awaiting completion — the §8 pendingTransfers projection. */
@@ -248,10 +251,13 @@ export async function handleDaemonStatus(runtime: DaemonRuntime, params: Record<
     // nothing on disk stays a recorder-side `unavailable` stub.
     if (ownerKey !== caller.managerSessionKey) continue;
     const review = reviews.get(runId) ?? "paused";
+    // The ADR-040 retirement projection — read-only; the view a bound retirer
+    // already recorded, or absent while no sweep tracks the run.
+    const retire = runtime.retirer?.view(runId);
     if (state === undefined) {
-      runs.push({ runId, lifecycle: "unavailable", child: { agentName: "", agentKind: "", presence: "absent" }, review });
+      runs.push({ runId, lifecycle: "unavailable", child: { agentName: "", agentKind: "", presence: "absent" }, review, ...(retire === undefined ? {} : { retire }) });
     } else {
-      runs.push({ runId, lifecycle: state.lifecycle.state, child: childPresence(state, caller.snapshot), review });
+      runs.push({ runId, lifecycle: state.lifecycle.state, child: childPresence(state, caller.snapshot), review, ...(retire === undefined ? {} : { retire }) });
     }
   }
   // §7 mailbox projection — `list`/`read` are pure reads: no mkdir, no flock,

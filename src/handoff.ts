@@ -237,7 +237,8 @@ export interface HandoffRunIdentity {
  * four semantic fields are what the canonical render — and therefore the child —
  * received; `tier`, `recoveryOf`, `label`, and `cwd` complete the
  * launch contract. Text fields are unbounded caller text by design: the record
- * bound, not per-field limits, is the size authority.
+ * bound, not per-field limits, is the size authority. `retention` is the
+ * ADR-040 lane-retirement opt-out: `keep` parks the finished lane forever.
  */
 export interface HandoffTaskContract {
   objective: string;
@@ -248,6 +249,7 @@ export interface HandoffTaskContract {
   recoveryOf?: string;
   label?: string;
   cwd?: string;
+  retention?: "retire" | "keep";
 }
 
 /** The pre-launch provenance `persist` records beside the state sidecar. */
@@ -501,7 +503,8 @@ export function createHandoffAllocator(options: {
           ...(provenance.task.tier === undefined ? {} : { tier: provenance.task.tier }),
           ...(provenance.task.recoveryOf === undefined ? {} : { recoveryOf: provenance.task.recoveryOf }),
           ...(provenance.task.label === undefined ? {} : { label: provenance.task.label }),
-          ...(provenance.task.cwd === undefined ? {} : { cwd: provenance.task.cwd })
+          ...(provenance.task.cwd === undefined ? {} : { cwd: provenance.task.cwd }),
+          ...(provenance.task.retention === undefined ? {} : { retention: provenance.task.retention })
         }
       } satisfies HandoffProvenance);
       if (serializedProvenance !== undefined && Buffer.byteLength(serializedProvenance, "utf8") > HANDOFF_PROVENANCE_MAX_BYTES) {
@@ -731,7 +734,7 @@ export async function readHandoffState(run: HandoffAllocation): Promise<HandoffS
 const SESSION_KEYS = new Set(["source", "agent", "kind", "value"]);
 const PROVENANCE_KEYS = new Set(["v", "runId", "endpoint", "createdAt", "manager", "task"]);
 const PROVENANCE_MANAGER_KEYS = new Set(["paneId", "display", "source", "session"]);
-const PROVENANCE_TASK_KEYS = new Set(["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd"]); // `replicas` stays accepted for old records; nothing writes it
+const PROVENANCE_TASK_KEYS = new Set(["objective", "scope", "doneWhen", "constraints", "tier", "replicas", "recoveryOf", "label", "cwd", "retention"]); // `replicas` stays accepted for old records; nothing writes it
 /** The display-source values `resolveSender` can emit for a manager record. */
 const MANAGER_SOURCES = new Set(["agent_name", "pane_agent_name", "label", "agent_kind", "pane_id"]);
 const PROVENANCE_CREATED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -779,7 +782,8 @@ function validTaskContract(value: unknown): value is HandoffTaskContract {
     && (value.replicas === undefined || (Number.isSafeInteger(value.replicas) && (value.replicas as number) >= 1 && (value.replicas as number) <= 8)) // an old record's replica count still must be shape-valid
     && (value.recoveryOf === undefined || (typeof value.recoveryOf === "string" && RUN_ID_PATTERN.test(value.recoveryOf)))
     && (value.label === undefined || (safeLine(value.label) && Buffer.byteLength(value.label, "utf8") <= 256))
-    && (value.cwd === undefined || safeLine(value.cwd));
+    && (value.cwd === undefined || safeLine(value.cwd))
+    && (value.retention === undefined || value.retention === "retire" || value.retention === "keep");
 }
 
 function validProvenanceInput(input: HandoffProvenanceInput): boolean {

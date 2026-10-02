@@ -1,18 +1,22 @@
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExecResult } from "@earendil-works/pi-coding-agent";
 import type { JsonEnvelope, PiExec } from "../../src/cli.js";
 import { ContextResolutionError } from "../../src/context.js";
 import { createHandoffAllocator } from "../../src/handoff.js";
 import { createRuntime } from "../../index.js";
-import { JobRegistry } from "../../src/job-registry.js";
+import { JobRegistry, type SupervisorJobRequestSnapshot } from "../../src/job-registry.js";
 import type { LaunchTask } from "../../src/launch-schema.js";
 import { RuntimeOwnership } from "../../src/ownership.js";
 import { SupervisionRegistry } from "../../src/supervision/registry.js";
+import { createSelfCloseTracker } from "../../src/supervision/self-close.js";
+import type { SupervisionJobPort, SupervisionJobView } from "../../src/supervision/state.js";
 import type { HerdrSnapshot } from "../../src/targets.js";
 import { createIntentStore, DaemonIntentError, DAEMON_INTENTS_DIR_NAME, managerSessionKey, type IntentStore, type LaunchIntentRecord } from "../../src/daemon/intents.js";
+import type { Mailbox } from "../../src/daemon/mailbox.js";
+import type { LaneRetirer } from "../../src/daemon/retire.js";
 import { resolveDaemonNamespace, type DaemonNamespace } from "../../src/daemon/namespace.js";
 import { DaemonRequestError } from "../../src/daemon/protocol.js";
 import {
@@ -301,6 +305,75 @@ describe("createDaemonRuntime", () => {
     expect(runtime.allocator).toBe(allocator);
     expect(runtime.launchDeps).toBe(launchDeps);
     expect(runtime.inflight.size).toBe(0);
+  });
+
+  it("shares the own-close ledger with host override, and the default registry consults the bound retirer before suppressing a handed_off terminal", async () => {
+    const { env, namespace: ns } = await namespace();
+    const stub = execStub();
+    const runtime = createDaemonRuntime({ exec: stub.exec, env, namespace: ns });
+    runtimes.push(runtime);
+
+    // The daemon mints the ledger by default; a host-wired one replaces it —
+    // the retirer and every reserved supervisor always share one book.
+    expect(runtime.retirer).toBeUndefined();
+    const custom = createSelfCloseTracker();
+    const wired = createDaemonRuntime({ exec: stub.exec, env, namespace: ns, wire: () => ({ selfClose: custom }) });
+    runtimes.push(wired);
+    expect(wired.selfClose).toBe(custom);
+    expect(runtime.selfClose).not.toBe(custom);
+
+    // The default job registry's laneRetired seam reads the bound retirer at
+    // call time: unbound, a handed_off settlement still emits job_terminal.
+    const writes: string[] = [];
+    runtime.bindMailbox({
+      writeRunEvent: async (input: { runId: string }) => {
+        writes.push(input.runId);
+        return { persisted: true, eventId: "e", path: "/x" };
+      },
+    } as unknown as Mailbox);
+    const request = (label: string): SupervisorJobRequestSnapshot => ({
+      kind: "supervisor",
+      label,
+      targets: ["p1"],
+      targetIds: ["p1"],
+      child: { agentName: "worker", agentKind: "pi", operatingPointId: "worker-pi" },
+      settings: { reviewCadenceMinutes: 1, reviewerModel: "testmodel" },
+    });
+    const stubView = (): SupervisionJobView => ({
+      monitor: { connected: true, degraded: false, generation: 1, evidenceGaps: 0 },
+      reviewer: { model: "testmodel", cadenceMinutes: 1, degraded: false, reviews: [], truncatedReviews: 0 },
+      transitions: [],
+      truncatedTransitions: 0,
+      events: [],
+      truncatedEvents: 0,
+      unobservedEvents: 0,
+      state: "settled",
+    });
+    const port = (runId: string): SupervisionJobPort => ({
+      view: stubView,
+      takePendingEvents: () => [],
+      shutdown: () => undefined,
+      handoffEvidence: () => ({ gated: true, runId, path: "/run", state: "handed_off" }),
+    }) as unknown as SupervisionJobPort;
+
+    const unmarked = runtime.jobs.register(request("unmarked lane"), async () => ({ supervision_result: "released" }));
+    runtime.jobs.attachSupervision(unmarked.jobId, port("run-unmarked"));
+    await unmarked.promise;
+    await vi.waitFor(() => expect(writes).toEqual(["run-unmarked"]));
+
+    // Bound and marked: the daemon-retired run emits no second terminal.
+    const marker: LaneRetirer = {
+      sweep: async () => undefined,
+      view: () => undefined,
+      retiredByDaemon: (runId) => runId === "run-retired",
+    };
+    runtime.bindRetirer(marker);
+    expect(runtime.retirer).toBe(marker);
+    const marked = runtime.jobs.register(request("daemon-retired lane"), async () => ({ supervision_result: "released" }));
+    runtime.jobs.attachSupervision(marked.jobId, port("run-retired"));
+    await marked.promise;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(writes).toEqual(["run-unmarked"]);
   });
 });
 

@@ -2574,7 +2574,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
           ...(params.tier === undefined ? {} : { tier: params.tier }),
           ...(params.recoveryOf === undefined ? {} : { recoveryOf: params.recoveryOf }),
           ...(params.label === undefined ? {} : { label: params.label }),
-          ...(params.cwd === undefined ? {} : { cwd: params.cwd })
+          ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
+          ...(params.retention === undefined ? {} : { retention: params.retention })
         }
       });
 
@@ -2866,6 +2867,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
               constraints: [...params.constraints],
               tier: params.tier,
               ...(params.label === undefined ? {} : { label: params.label }),
+              ...(params.retention === undefined ? {} : { retention: params.retention }),
               recoveryOf: handoffRun.runId
             }, recoverySignal, undefined, ctx, randomUUID());
             /* c8 ignore next -- executeRequest always emits a details record. */

@@ -63,7 +63,7 @@ export interface WorkerCaller {
 
 export type CallerPolicy = UnrestrictedCaller | WorkerCaller;
 
-type TokenEvidence =
+export type TokenEvidence =
   | { readonly state: "absent" }
   | { readonly state: "value"; readonly value: string }
   | { readonly state: "malformed" }
@@ -96,8 +96,9 @@ function tokenString(value: unknown): value is string {
  * Merge one identity token key across a pane's pane and agent records. Any
  * malformed observation poisons the merge, and two distinct well-formed values
  * are contradictory — policy evidence is never selected by record order.
+ * Exported for the lane retirer's secondary token gate (ADR-040).
  */
-function mergedToken(records: readonly Record<string, unknown>[], key: string): TokenEvidence {
+export function mergedToken(records: readonly Record<string, unknown>[], key: string): TokenEvidence {
   const values = new Set<string>();
   let malformed = false;
   for (const candidate of records) {

@@ -328,6 +328,29 @@ describe("tail scan: source trust and pointers", () => {
     await expect(tailScan(PI, ANCHOR, history, faulting)).rejects.toBeInstanceOf(TypeError);
   });
 
+  it("F3: a descriptor read failure is the bounded unreadable refusal, while a non-I/O read fault still propagates", async () => {
+    const dir = await root();
+    await writeJsonl(piPath(dir), PI_QUIET);
+    await writeDoc(devinPath(dir), devinDoc(DEVIN_QUIET));
+    const piHistory = await capture(PI, depsFor(dir));
+    const devinHistory = await capture(DEVIN, depsFor(dir));
+    const failing = (error: unknown): TraceTailDeps => depsFor(dir, {
+      openFile: async (path, options) => {
+        const opened = await openTrustedTraceFile(path, options);
+        const handle = new Proxy(opened.handle, { get: (target, prop) => (prop === "read" ? async () => { throw error; } : Reflect.get(target, prop)) });
+        return { handle: handle as typeof opened.handle, stat: opened.stat };
+      },
+    });
+    const eio = Object.assign(new Error("input/output error"), { code: "EIO" });
+    expect(await tailScan(PI, ANCHOR, piHistory, failing(eio))).toEqual({ kind: "failure", failure: "source_unreadable", reason: "unreadable:read:EIO" });
+    expect(await tailScan(DEVIN, ANCHOR, devinHistory, failing(Object.assign(new Error("stale"), { code: "ESTALE" })))).toEqual({ kind: "failure", failure: "source_unreadable", reason: "unreadable:read:ESTALE" });
+    expect(await captureTraceHistory({ agentKind: "pi", agentSession: piSession }, undefined, signal(), failing(eio))).toBeUndefined();
+    expect(await captureTraceHistory({ agentKind: "devin", agentSession: devinSession }, undefined, signal(), failing(eio))).toBeUndefined();
+    await expect(tailScan(PI, ANCHOR, piHistory, failing(new TypeError("bug")))).rejects.toBeInstanceOf(TypeError);
+    await expect(tailScan(DEVIN, ANCHOR, devinHistory, failing(new TypeError("bug")))).rejects.toBeInstanceOf(TypeError);
+    await expect(captureTraceHistory({ agentKind: "pi", agentSession: piSession }, undefined, signal(), failing(new TypeError("bug")))).rejects.toBeInstanceOf(TypeError);
+  });
+
   it("session pointers that cannot key a source refuse before any read", async () => {
     const dir = await root();
     const cases: Array<{ target: TraceTailTarget; reason: string }> = [

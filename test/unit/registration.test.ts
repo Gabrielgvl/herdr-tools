@@ -239,13 +239,19 @@ describe("global extension registration", () => {
       ping: vi.fn(async () => undefined),
       close: vi.fn(),
     };
-    createRuntime(pi, process.env, { promptClient });
+    const runtime = createRuntime(pi, process.env, { promptClient });
+    // The repair prompt rides the shared pane-write section (ADR-040 amendment,
+    // R2); this file mocks node:fs/promises, so the section is stubbed here.
+    const lease = { release: vi.fn(async () => undefined) };
+    const writeSection = vi.spyOn(runtime.queueFlush, "writeSection").mockResolvedValue(lease as never);
     // The gate's repair prompt must reach the exact child through the same
     // authenticated prompt transport every other send uses.
     const repairPrompt = registryOptions.last!.repairPrompt as (paneId: string, text: string, signal: AbortSignal) => Promise<unknown>;
     const signal = new AbortController().signal;
     await expect(repairPrompt("w1:p2", "repair the handoff artifact", signal)).resolves.toMatchObject({ id: "cli:agent:prompt" });
     expect(promptClient.prompt).toHaveBeenCalledWith("w1:p2", "repair the handoff artifact", signal);
+    expect(writeSection).toHaveBeenCalledWith("w1:p2");
+    expect(lease.release).toHaveBeenCalledTimes(1);
     expect(pi.exec).not.toHaveBeenCalled();
   });
 

@@ -46,7 +46,10 @@
  *    turn timestamped at or after the persisted `artifact.mtimeMs` anchor and
  *    no unterminated bytes (`trace_*` refusals, `src/supervision/trace-follow-up.ts`);
  *    and a Devin composer read through the exact ansi visible read shows no
- *    queued input or draft (`composer_*`).
+ *    queued input or draft (`composer_*`). Under the lock it is the last read
+ *    before dispatch; every daemon-mediated prompt takes the same pane-write
+ *    lease, so only a raw client outside the daemon can land in the window
+ *    between that read and the close (residual R2).
  *
  * The close itself runs under the pane write lock and the run flock — the
  * lock ownership transfers and sidecar mutations take — and re-proves the
@@ -430,10 +433,6 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
       || state.nativeSession === null
       || !sameSession(state.nativeSession, identity.agentSession)) return settle("deferred", "recheck_lifecycle");
     if (state.lifecycle.detail !== undefined && HANDOFF_CYCLE_MARKS.has(state.lifecycle.detail)) return settle("refused", `recheck_${state.lifecycle.detail}`);
-    // A prompt delivered between the sweep's approval and this lock is either
-    // a complete user record or pending bytes; both refuse before any close.
-    const trace = await traceVeto(run, state, paneId, "recheck_");
-    if (trace !== undefined) return settle(trace.state, trace.reason);
 
     const paneGet = await deps.cli.runJson(["pane", "get", paneId], signal);
     const agentGet = await deps.cli.runJson(["agent", "get", paneId], signal);
@@ -502,6 +501,18 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
       // The flock holder died or the lock path lost trust during the reads —
       // the proof above was taken under exclusion that no longer exists.
       return settle("deferred", "pane_lock_lost");
+    }
+    // The ADR-040 amendment proof is the LAST read before dispatch: every
+    // daemon-mediated prompt takes this same pane-write lease, so a follow-up
+    // acknowledged before we held it is already in the trace (a complete user
+    // record, or pending bytes), and none can be acknowledged between this
+    // read and the close. Only a raw client outside the daemon can still land
+    // in the remaining window (ADR-040 residual R2). The clock resets like
+    // every other refusal that leaves the lane unobserved.
+    const trace = await traceVeto(run, state, paneId, "recheck_");
+    if (trace !== undefined) {
+      resetClock(entry);
+      return settle(trace.state, trace.reason);
     }
 
     const finish = deps.selfClose.begin(paneId);
@@ -679,23 +690,28 @@ export function createLaneRetirer(deps: LaneRetirerDeps): LaneRetirer {
     const pane = snapshot.panes.find((candidate) => candidate.pane_id === paneId)!;
     const records = snapshotIdentityRecords(snapshot, paneId);
 
-    // The ADR-040 amendment proof runs as soon as the child is proven present
-    // — before the clock work, so a follow-up mid-grace flips the view on the
-    // next tick — and only for a present child (an absent lane reads no trace).
-    const trace = await traceVeto(run, state, paneId, "");
-    if (trace !== undefined) {
-      setView(runId, entry, trace.state, trace.reason);
-      return;
-    }
-
     // The cooperative no-contract opt-out (design B3 fallback): a `retention=keep`
     // pane token parks the lane exactly like the task field. It is read before
-    // any clock work so a kept lane accrues no grace: every kept sweep resets
-    // the window, and clearing the token starts a full grace from scratch.
+    // any clock work — and before any trace I/O, since a kept lane never
+    // retires — so a kept lane accrues no grace: every kept sweep resets the
+    // window, and clearing the token starts a full grace from scratch.
     const retentionToken = mergedToken(records, "retention");
     if (retentionToken.state === "value" && retentionToken.value === "keep") {
       resetClock(entry);
       setView(runId, entry, "kept", "token_retention_keep");
+      return;
+    }
+
+    // The ADR-040 amendment proof runs as soon as the child is proven present
+    // — before the clock work, so a follow-up mid-grace flips the view on the
+    // next tick — and only for a present child (an absent lane reads no trace).
+    // A veto skips this sweep's lifecycle and screen observation, so the
+    // continuous-grace clock restarts exactly as it does for an unreadable
+    // screen: recovery from a refusal always costs a fresh full grace.
+    const trace = await traceVeto(run, state, paneId, "");
+    if (trace !== undefined) {
+      resetClock(entry);
+      setView(runId, entry, trace.state, trace.reason);
       return;
     }
 

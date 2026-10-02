@@ -42,7 +42,8 @@ import {
 import type { JobRegistry } from "../../src/job-registry.js";
 import { devinComposerReadArgv } from "../../src/messages/devin-queue-flush.js";
 import type { AgentSessionIdentity } from "../../src/messages/prompt.js";
-import { acquireFlockHolder, type PaneWriteGuard } from "../../src/pane-write-lock.js";
+import { createDevinQueueFlush } from "../../src/messages/devin-queue-flush.js";
+import { acquireFlockHolder, createPaneWriteGuard, PaneWriteLockError, type PaneWriteGuard } from "../../src/pane-write-lock.js";
 import { createSelfCloseTracker } from "../../src/supervision/self-close.js";
 import type { TailScanner } from "../../src/supervision/trace-follow-up.js";
 import { captureTraceHistory, tailScan, type TailScan, type TraceTailDeps } from "../../src/supervision/trace-tail.js";
@@ -385,6 +386,8 @@ interface FakeCliOptions {
   readTruncated?: boolean;
   /** Runs inside the `pane close` dispatch, before the records clear. */
   onClose?: () => Promise<void>;
+  /** Runs after every detection-screen read is served. */
+  onRead?: () => Promise<void>;
 }
 
 /**
@@ -427,6 +430,7 @@ function fakeCli(live: Live, opts: FakeCliOptions = {}): FakeCli {
       if (opts.readError !== undefined) throw opts.readError;
       if (live.pane === undefined) throw Object.assign(new Error("pane gone"), { code: "TARGET_NOT_FOUND" });
       if (argv.includes("ansi")) return { value: live.ansi ?? COMPOSER_DRAINED, truncated: opts.readTruncated === true };
+      await opts.onRead?.();
       return { value: live.screen ?? "worker> waiting for input", truncated: opts.readTruncated === true };
     },
   };
@@ -2006,6 +2010,132 @@ describe("lane retirer follow-up proof (ADR-040 amendment)", () => {
     await appendFile(tracePath(fx, "pi", childSession), `${at(-1_000)}","message":{"role":"assistant","content":"redacted"}}\n`);
     await sweepPastGrace(retirer, clock);
     expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+  });
+
+  it("F1: a follow-up landing after the under-lock lifecycle and screen reads is caught by the final veto, and the clock restarts", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx);
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const lock = fakePaneLock();
+    let injected = false;
+    const cli = fakeCli(live, {
+      onRead: async () => {
+        // The lock's own screen read has just been served: the pane is proven
+        // idle and unchanged, and only the final veto stands between here and
+        // the close dispatch.
+        if (lock.acquired.length === 0 || injected) return;
+        injected = true;
+        await appendTrace(fx, "pi", childSession, [piEntry("user", 1_000)]);
+      },
+    });
+    const counting = countingScan();
+    const { deps, clock } = retirerDeps(fx, live, { cli, trace: { scan: counting.scan, trace: traceDepsFor(fx) }, options: { paneLock: lock.guard } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(injected).toBe(true);
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "recheck_trace_follow_up" });
+    expect(closes(deps)).toEqual([]);
+    expect(live.pane).not.toBeUndefined();
+    // The veto was the last read: it ran after the lock's pane/agent gets and screen read.
+    const calls = (deps.cli as FakeCli).calls;
+    expect(calls.filter((argv) => argv[1] === "get")).toHaveLength(2);
+    expect(counting.calls).toHaveLength(3);
+    // F2: the lock-window refusal left the lane unobserved — the clock restarted.
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "refused", reason: "trace_follow_up" });
+  });
+
+  it("F1: a daemon-mediated prompt cannot take the pane-write section while the close holds it", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx);
+    const live: Live = { pane: childPane(), agent: childAgent() };
+    const lockDir = join(fx.traceRoot, "..", "pane-locks");
+    await mkdir(lockDir, { recursive: true, mode: 0o700 });
+    const guard = createPaneWriteGuard({ namespace: { dir: lockDir, endpoint: join(fx.traceRoot, "..", "herdr.sock") } });
+    let section: unknown = "not attempted";
+    const cli = fakeCli(live, {
+      onClose: async () => {
+        // Every daemon prompt path (communicate, wakes, launch, hints, the
+        // repair prompt) takes this section first; mid-dispatch it is held.
+        const flush = createDevinQueueFlush({ cli: deps.cli, guard, sectionWaitMs: 200 });
+        try {
+          const lease = await flush.writeSection("p-child");
+          await lease.release();
+          section = "acquired";
+        } catch (error) {
+          section = error;
+        }
+      },
+    });
+    const { deps, clock } = retirerDeps(fx, live, { cli, options: { paneLock: guard } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+    expect(section).toBeInstanceOf(PaneWriteLockError);
+    expect((section as PaneWriteLockError).code).toBe("PANE_WRITE_LOCK_UNAVAILABLE");
+    // Released with the close: the section is free again.
+    const after = await createDevinQueueFlush({ cli: deps.cli, guard, sectionWaitMs: 200 }).writeSection("p-child");
+    await after.release();
+  }, 20_000);
+
+  it("F2: a veto that skips the observation restarts the grace — recovery needs a fresh full grace", async () => {
+    // A Devin lane whose composer frame becomes unreadable mid-grace.
+    const fx = await fixture();
+    const { runId } = await seedRun(fx, { agentKind: "devin" });
+    const live = liveFor("devin");
+    const { deps, clock } = retirerDeps(fx, live);
+    const retirer = createLaneRetirer(deps);
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    live.ansi = "no composer here\n";
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "deferred", reason: "composer_unreadable" });
+    delete live.ansi;
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    expect(live.pane).not.toBeUndefined();
+    clock.nowMs += GRACE_MS;
+    await retirer.sweep();
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+
+    // The same for a transient trace refusal on a Pi lane.
+    const fx2 = await fixture();
+    const second = await seedRun(fx2);
+    const live2: Live = { pane: childPane(), agent: childAgent() };
+    const deps2 = retirerDeps(fx2, live2);
+    const retirer2 = createLaneRetirer(deps2.deps);
+    await retirer2.sweep();
+    await appendTrace(fx2, "pi", childSession, [], '{"type":"message","id":"u","timestamp":"');
+    deps2.clock.nowMs += GRACE_MS;
+    await retirer2.sweep();
+    expect(retirer2.view(second.runId)).toMatchObject({ state: "refused", reason: "trace_pending_tail" });
+    await appendFile(tracePath(fx2, "pi", childSession), `${at(-1_000)}","message":{"role":"assistant","content":"redacted"}}\n`);
+    await retirer2.sweep();
+    expect(retirer2.view(second.runId)).toMatchObject({ state: "watching", stableForMs: 0 });
+    expect(live2.pane).not.toBeUndefined();
+    deps2.clock.nowMs += GRACE_MS;
+    await retirer2.sweep();
+    expect(retirer2.view(second.runId)).toMatchObject({ state: "retired" });
+  });
+
+  it("F4: a token-kept lane performs no trace read or composer read", async () => {
+    const fx = await fixture();
+    const { runId } = await seedRun(fx, { agentKind: "devin" });
+    const live = liveFor("devin");
+    live.pane = childPane({ ...live.pane, tokens: childTokens(devinSession, { retention: "keep" }) });
+    const counting = countingScan();
+    const { deps, clock } = retirerDeps(fx, live, { trace: { scan: counting.scan, trace: traceDepsFor(fx) } });
+    const retirer = createLaneRetirer(deps);
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "kept", reason: "token_retention_keep" });
+    expect(counting.calls).toEqual([]);
+    expect((deps.cli as FakeCli).calls.filter((argv) => argv.includes("ansi"))).toEqual([]);
+    // Clearing the token starts a fresh grace and the proof runs from then on.
+    live.pane = childPane({ ...live.pane, tokens: childTokens(devinSession) });
+    await sweepPastGrace(retirer, clock);
+    expect(retirer.view(runId)).toMatchObject({ state: "retired" });
+    expect(counting.calls.length).toBeGreaterThan(0);
   });
 
   it("a Devin composer read that throws defers as unreadable", async () => {

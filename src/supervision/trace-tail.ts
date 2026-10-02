@@ -189,11 +189,24 @@ function unreadable(error: unknown): TailScan {
   throw error;
 }
 
+/**
+ * A positional read that fills `length` bytes or stops at EOF. A descriptor
+ * I/O failure (EIO, ESTALE, EBADF, …: any error carrying an errno-style code)
+ * becomes the bounded `unreadable` refusal; anything else is a programming
+ * defect and propagates.
+ */
 async function pread(handle: { read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number }> }, position: number, length: number): Promise<Buffer> {
   const buffer = Buffer.alloc(length);
   let filled = 0;
   while (filled < length) {
-    const { bytesRead } = await handle.read(buffer, filled, length - filled, position + filled);
+    let bytesRead: number;
+    try {
+      ({ bytesRead } = await handle.read(buffer, filled, length - filled, position + filled));
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      if (typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code)) throw new TraceFileError("unreadable", `read:${code}`);
+      throw error;
+    }
     if (bytesRead === 0) break;
     filled += bytesRead;
   }
@@ -249,6 +262,8 @@ async function scanJsonl(located: Extract<Located, { kind: "claude-jsonl" | "pi-
     // F14: a partial tail is proven only once it reached the slack boundary.
     if (start > 0 && !reachedSlack) return { kind: "ambiguous", reason: "scan_budget" };
     return scan;
+  } catch (error) {
+    return unreadable(error);
   } finally {
     await handle.close().catch(ignoreClose);
   }
@@ -288,6 +303,8 @@ async function scanDevin(located: Extract<Located, { kind: "devin-session" }>, a
     }
     // The whole document was read: `none` needs no slack boundary.
     return scanBackwards(turns, anchorMs).scan;
+  } catch (error) {
+    return unreadable(error);
   } finally {
     await handle.close().catch(ignoreClose);
   }
@@ -355,6 +372,11 @@ export async function captureTraceHistory(
     /* c8 ignore next -- the prefix lies inside the file by construction; a short read means the file shrank mid-capture. */
     if (prefix.length !== span) return undefined;
     return { kind, session, position: { path: located.kind === "pi-jsonl" ? identity.agentSession.value : located.path, offset, anchor: sha256Hex(prefix) } };
+  } catch (error) {
+    // A descriptor read failure is a failed capture (the lane then refuses
+    // `trace_history_missing`); a programming defect still propagates.
+    if (error instanceof TraceFileError) return undefined;
+    throw error;
   } finally {
     await handle.close().catch(ignoreClose);
   }

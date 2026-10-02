@@ -2938,7 +2938,8 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
         let promptResponse: JsonEnvelope;
         try {
           promptResponse = await dispatchMutation(async () => {
-            if (capturedIdentity.agentKind !== "devin" || deps.queueFlush === undefined) return runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
+            // Every kind's initial prompt rides the shared pane-write section (ADR-040 amendment, R2).
+            if (deps.queueFlush === undefined) return runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal);
             const lease = await deps.queueFlush.writeSection(resolvedPaneId);
             try { return await runPrompt(deps.cli, resolvedPaneId, envelope, abortSignal); } finally { await lease.release(); }
           });

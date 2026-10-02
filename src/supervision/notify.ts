@@ -259,19 +259,19 @@ export function createMcpHostWake(deps: McpHostWakeDeps): McpHostWake {
       const submission = parsePromptSubmission(await deps.cli.prompt(paneId, envelope, signal), identity);
       return { submission, sentState };
     };
-    // A Devin write rides inside the shared pane-write section so a flush's
+    // Every write rides inside the shared pane-write section: a Devin flush's
     // proof/Enter in another host cannot interleave with the bracketed-paste
-    // submission; other kinds keep their unguarded write.
-    const sent = resolved === "devin"
-      ? await (async () => {
-        const lease = await deps.queueFlush.writeSection(paneId);
-        try {
-          return await sendWake();
-        } finally {
-          await lease.release();
-        }
-      })()
-      : await sendWake();
+    // submission, and a lane-retirement close holding the same lease cannot
+    // dispatch between its final trace read and this acknowledgement (ADR-040
+    // amendment, R2).
+    const sent = await (async () => {
+      const lease = await deps.queueFlush.writeSection(paneId);
+      try {
+        return await sendWake();
+      } finally {
+        await lease.release();
+      }
+    })();
     // Devin queues a write submitted mid-turn instead of steering it, and that
     // queue survives the turn end until an Enter flushes it — observed live as
     // wake envelopes sitting unconsumed on an idle composer. Scheduling the

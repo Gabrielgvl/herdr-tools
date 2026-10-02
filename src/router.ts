@@ -162,8 +162,12 @@ export interface TaskRouteInput {
   compile?: CompileGate;
   now?: () => Date;
   workspaceState?: WorkspaceState;
-  /** Prior-run lineage: its provider is excluded and the start is at least one tier above its route. */
-  recovery?: { priorOperatingPointId: string; priorRouteTier: QualityTier };
+  /**
+   * Prior-run lineage: its provider is excluded and the start is at least one
+   * tier above its route — unless the prior run failed on a provider limit,
+   * which carries no task-difficulty signal and keeps the prior route tier.
+   */
+  recovery?: { priorOperatingPointId: string; priorRouteTier: QualityTier; priorFailureCause?: "provider_limit" };
 }
 
 interface ParsedBinary { probability: number; confidence: number }
@@ -265,7 +269,12 @@ export async function routeTask(input: TaskRouteInput): Promise<SpecDecision> {
   if (chains === undefined || points.length === 0) return abstain("catalog_unavailable", "tierChains");
   const pointById = new Map(points.map((point) => [point.id, point]));
   const requestedTier = input.task.tier;
-  const effectiveTier = effectiveStartTier(tier.value, requestedTier, input.recovery === undefined ? undefined : nextTier(input.recovery.priorRouteTier));
+  // A provider-limit failure says nothing about task difficulty: its recovery
+  // minimum is the prior route tier itself, not one tier above (adr-037-p6).
+  const recoveryMinimum = input.recovery === undefined
+    ? undefined
+    : input.recovery.priorFailureCause === "provider_limit" ? input.recovery.priorRouteTier : nextTier(input.recovery.priorRouteTier);
+  const effectiveTier = effectiveStartTier(tier.value, requestedTier, recoveryMinimum);
   const ids = [...new Set(QUALITY_TIERS.slice(tierRank(effectiveTier)).flatMap((name) => chains[name]))];
   if (ids.some((id) => !pointById.has(id))) return abstain("catalog_unavailable", "tierChains");
 

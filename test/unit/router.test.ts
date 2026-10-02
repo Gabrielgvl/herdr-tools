@@ -157,7 +157,7 @@ describe("tier-chain routing", () => {
     const intentProbabilities = { explore: 0, reason: 0, implement: 0, debug: 1, verify: 0, review: 0, coordinate: 0 };
     const tierProbabilities = { utility: 0, economy: 0, standard: 0, strong: 0, frontier: 1, max: 0 };
     const result = await routeTask(input({ response: response({ intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, tier: { value: "frontier", confidence: 0, probabilities: tierProbabilities } }) }));
-    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "frontier", evidence: { policyRevision: "adr-037-p5", intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, workload: { intent: "debug" } } });
+    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "frontier", evidence: { policyRevision: "adr-037-p6", intent: { value: "debug", confidence: 0.2, probabilities: intentProbabilities }, workload: { intent: "debug" } } });
 
     // A persisted historical unknown intent stays readable.
     await expect(routeTask(input({ response: response({ intent: { value: "unknown", confidence: 0.9 } }) }))).resolves.toMatchObject({ kind: "admitted", evidence: { intent: { value: "unknown" }, workload: { intent: "unknown" } } });
@@ -209,6 +209,16 @@ describe("tier-chain routing", () => {
     expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "standard", chain: ["claude:s2:low", "agy:h", "claude:m:low"] });
     if (result.kind === "admitted") expect(result.evidence.chainExclusions?.map((entry) => entry.id)).toEqual(["pi:s:low", "pi:f:low"]);
     await expect(routeTask(input({ recovery: { priorOperatingPointId: "missing", priorRouteTier: "economy" } }))).resolves.toMatchObject({ kind: "abstained", component: "recovery" });
+  });
+
+  it("keeps the prior route tier on a provider-limit recovery and still excludes the limited provider", async () => {
+    // Prior route standard on p-s2: a limited provider says nothing about
+    // task difficulty, so the start stays standard instead of lifting.
+    const result = await routeTask(input({ recovery: { priorOperatingPointId: "claude:s2:low", priorRouteTier: "standard", priorFailureCause: "provider_limit" } }));
+    expect(result).toMatchObject({ kind: "admitted", effectiveStartTier: "standard", chain: ["pi:s:low", "agy:h", "pi:f:low", "claude:m:low"] });
+    if (result.kind === "admitted") expect(result.evidence.chainExclusions).toEqual([{ id: "claude:s2:low", provider: "p-s2", reasons: ["recovery_excluded"] }]);
+    // Every other recovery cause — an absent cause included — keeps the lift.
+    await expect(routeTask(input({ recovery: { priorOperatingPointId: "claude:s2:low", priorRouteTier: "standard" } }))).resolves.toMatchObject({ effectiveStartTier: "strong", chain: ["agy:h", "pi:f:low", "claude:m:low"] });
   });
 
   it("skips known-unavailable quota domains and local-capacity runners within one admission", async () => {

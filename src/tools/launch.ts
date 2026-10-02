@@ -567,6 +567,13 @@ async function resolveLaunchCwd(rawCwd: string | undefined, root: string): Promi
 }
 
 /**
+ * Lifecycle details proving the prior run's terminal failure was a provider
+ * limit: the failure says nothing about task difficulty, so the recovery
+ * route keeps the prior route tier instead of lifting one (ADR-037).
+ */
+const PROVIDER_LIMIT_FAILURE_DETAILS: ReadonlySet<string> = new Set(["provider_limit", "provider_limit_zero_progress"]);
+
+/**
  * Prior-run lineage resolved from the managed handoff record `recoveryOf`
  * names (ADR-037): the derived workspace state, the resumed managed workspace,
  * and the route evidence the recovery's routing policy consumes.
@@ -580,6 +587,8 @@ interface RecoveryContext {
   priorOperatingPointId: string;
   priorPolicyRevision: string;
   priorWorkload: WorkloadProfile;
+  /** Present only when the prior run's terminal failure was a provider limit. */
+  priorFailureCause?: "provider_limit";
 }
 
 /**
@@ -657,7 +666,8 @@ async function resolveRecoveryOf(params: NormalizedLaunchTask, handoffs: Handoff
     priorRouteTier: route.tier,
     priorOperatingPointId: route.operatingPointId,
     priorPolicyRevision: route.policyRevision,
-    priorWorkload: route.workload
+    priorWorkload: route.workload,
+    ...(lifecycle === "failed" && PROVIDER_LIMIT_FAILURE_DETAILS.has(prior.lifecycle.detail ?? "") ? { priorFailureCause: "provider_limit" as const } : {})
   };
 }
 
@@ -2346,8 +2356,10 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
       };
     }
 
-    // The router lifts a recovery's start one tier over the prior route; the
-    // Task, its state digest, and the model request keep the caller's tier.
+    // The router lifts a recovery's start one tier over the prior route —
+    // unless the prior run failed on a provider limit, which keeps the prior
+    // tier; the Task, its state digest, and the model request keep the
+    // caller's tier.
     const state = taskRouterState(task, catalog);
     const binding = launchBinding(launchId, state);
     // The compiled contract label is runtime-owned; the caller's label is
@@ -2380,7 +2392,7 @@ export function createLaunchTool<T extends LaunchDependencies>(deps: T): ToolDef
     if (evaluation.kind === "response") {
       response = evaluation.response;
       try {
-        decision = await routeTask({ task, spec, catalog, response: evaluation.response, root, availability: availabilityGate, ...(workspaceState === undefined ? {} : { workspaceState }), ...(recovery === undefined ? {} : { recovery: { priorOperatingPointId: recovery.priorOperatingPointId, priorRouteTier: recovery.priorRouteTier } }) });
+        decision = await routeTask({ task, spec, catalog, response: evaluation.response, root, availability: availabilityGate, ...(workspaceState === undefined ? {} : { workspaceState }), ...(recovery === undefined ? {} : { recovery: { priorOperatingPointId: recovery.priorOperatingPointId, priorRouteTier: recovery.priorRouteTier, ...(recovery.priorFailureCause === undefined ? {} : { priorFailureCause: recovery.priorFailureCause }) } }) });
       } catch {
         decision = { kind: "abstained", reason: "invalid_response", component: "routing" };
       }

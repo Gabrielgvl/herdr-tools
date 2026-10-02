@@ -763,6 +763,7 @@ describe("herdr_launch task cutover", () => {
      */
     async function seedRecoveryRun(options: {
       lifecycle?: HandoffState["lifecycle"]["state"];
+      lifecycleDetail?: string;
       artifactStatus?: HandoffStatus;
       routeTier?: QualityTier;
       operatingPointId?: string;
@@ -802,6 +803,7 @@ describe("herdr_launch task cutover", () => {
       });
       await updateHandoffState(run, (state) => {
         state.lifecycle.state = options.lifecycle ?? "handed_off";
+        if (options.lifecycleDetail !== undefined) state.lifecycle.detail = options.lifecycleDetail;
         if (options.artifactStatus !== undefined) state.artifact.status = options.artifactStatus;
       });
       return { run, allocator, namespaceDir, workspaceDir };
@@ -890,6 +892,32 @@ describe("herdr_launch task cutover", () => {
       // The logged record carries the catalog revision and the recovery
       // lineage pair — the recovered run and the failed point it excludes.
       expect(routerLog.mock.calls[0]![0]).toMatchObject({ catalogRevision: catalog.catalogRevision, recoveryOf: run.runId, priorOperatingPointId: "pi:primary:low" });
+    });
+
+    it("keeps the prior route tier when the prior run failed on a provider limit", async () => {
+      for (const detail of ["provider_limit", "provider_limit_zero_progress"]) {
+        const { run, allocator } = await seedRecoveryRun({ lifecycle: "failed", lifecycleDetail: detail, routeTier: "standard", operatingPointId: "pi:primary:low" });
+        const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+        const routerLog = vi.fn<LaunchRouterLog>(async () => undefined);
+        const result = await execute(toolFor({ catalog, cli: makeCli().cli, handoffs: allocator, routerLog }), task({ recoveryOf: run.runId }));
+
+        // No lift: a limited provider says nothing about task difficulty, so
+        // the start stays at the prior route tier — the provider's points are
+        // still excluded, leaving the fallback to run.
+        expect(result.details, detail).toMatchObject({ outcome: "launched", effectiveTier: "standard" });
+        expect(result.details!.children[0], detail).toMatchObject({ state: "launched", operatingPointId: "pi:fallback:low" });
+        expect(routerLog.mock.calls[0]![0].result, detail).toMatchObject({ effectiveStartTier: "standard" });
+      }
+    });
+
+    it("still lifts one tier when the prior failure was not a provider limit", async () => {
+      // A foreign failure detail — and an absent one — defaults to the lift.
+      for (const lifecycleDetail of ["supervisor_exit", undefined]) {
+        const { run, allocator } = await seedRecoveryRun({ lifecycle: "failed", lifecycleDetail, routeTier: "standard" });
+        const catalog = catalogOf([{ runner: "pi", model: "primary" }, { runner: "pi", model: "fallback" }]);
+        const result = await execute(toolFor({ catalog, cli: makeCli().cli, handoffs: allocator }), task({ recoveryOf: run.runId }));
+        expect(result.details, String(lifecycleDetail)).toMatchObject({ outcome: "launched", effectiveTier: "strong" });
+      }
     });
 
     it("derives a partial workspace from an unresolved prior lifecycle and lifts the floor", async () => {
